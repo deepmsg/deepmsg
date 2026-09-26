@@ -50,5 +50,12 @@ name = "c_driver_terminate"
 path = "interop/c_driver_terminate.rs"
 required-features = ["interop"]
 
+# The command/response loop: add a subscription, match its ready response, and
+# prove the keepalive keeps the client alive.
+[[test]]
+name = "c_driver_client"
+path = "interop/c_driver_client.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

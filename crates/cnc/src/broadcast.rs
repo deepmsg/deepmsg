@@ -63,8 +63,7 @@ pub enum Received {
 ///
 /// Constructed from the **whole** region — the record area *and* its trailer —
 /// because the descriptor lives at the end of it.
-pub struct ToClientsReceiver<'a> {
-    buffer: AtomicBuffer<'a, ReadOnly>,
+pub struct ToClientsReceiver {
     /// The record area: everything before the trailer.
     capacity: usize,
     mask: usize,
@@ -93,14 +92,14 @@ pub struct ToClientsReceiver<'a> {
     malformed: u64,
 }
 
-impl<'a> ToClientsReceiver<'a> {
+impl ToClientsReceiver {
     /// The reference's initial scratch size
     /// (`aeron-client/src/main/c/concurrent/aeron_broadcast_receiver.h:24`).
     /// It grows on demand; the cap the writer enforces is a better bound.
     const INITIAL_SCRATCH: usize = 4096;
 
     /// Wrap a region, or `None` if it cannot be a ring.
-    pub fn new(region: AtomicBuffer<'a, ReadOnly>) -> Option<Self> {
+    pub fn new(region: &AtomicBuffer<ReadOnly>) -> Option<Self> {
         let capacity = region.len().checked_sub(layout::BROADCAST_TRAILER_LENGTH)?;
 
         // The reference requires a power of two (`aeron_broadcast_descriptor.h:43`)
@@ -114,7 +113,6 @@ impl<'a> ToClientsReceiver<'a> {
             region.load_i64_acquire(trailer + layout::BROADCAST_LATEST_COUNTER_OFFSET)?;
 
         Some(Self {
-            buffer: region,
             capacity,
             mask: capacity - 1,
             trailer,
@@ -173,8 +171,8 @@ impl<'a> ToClientsReceiver<'a> {
     }
 
     /// Advance at most one record and copy its payload out.
-    pub fn receive(&mut self) -> Received {
-        let Some(tail) = self.load_counter(layout::BROADCAST_TAIL_COUNTER_OFFSET) else {
+    pub fn receive(&mut self, region: &AtomicBuffer<ReadOnly>) -> Received {
+        let Some(tail) = self.load_counter(region, layout::BROADCAST_TAIL_COUNTER_OFFSET) else {
             return Received::Empty;
         };
 
@@ -185,25 +183,27 @@ impl<'a> ToClientsReceiver<'a> {
 
         let mut offset = self.index_of(cursor);
 
-        if !self.slot_is_live(cursor) {
+        if !self.slot_is_live(region, cursor) {
             // Overtaken. Resync to the newest record — forwards only, never
             // backwards, which is why a cursor ahead of a restarted driver's
             // counters has no recovery path.
             self.lapped += 1;
-            let Some(latest) = self.load_counter(layout::BROADCAST_LATEST_COUNTER_OFFSET) else {
+            let Some(latest) = self.load_counter(region, layout::BROADCAST_LATEST_COUNTER_OFFSET)
+            else {
                 return Received::Empty;
             };
             cursor = latest;
             offset = self.index_of(cursor);
         }
 
-        let Some(length) = self.record_length(offset) else {
+        let Some(length) = self.record_length(region, offset) else {
             self.malformed += 1;
             // Nowhere safe to go: this header is not a length the writer could
             // have produced, so where the next record starts is unknowable.
             return Received::Empty;
         };
-        let Some(type_id) = self.load_i32(offset + layout::RECORD_MSG_TYPE_ID_OFFSET) else {
+        let Some(type_id) = self.load_i32(region, offset + layout::RECORD_MSG_TYPE_ID_OFFSET)
+        else {
             self.malformed += 1;
             return Received::Empty;
         };
@@ -217,11 +217,11 @@ impl<'a> ToClientsReceiver<'a> {
             // the message is the record at zero — whose **own** length moves
             // the cursor past it. Reading the padding's length instead would
             // land in the middle of the message.
-            let Some(first_length) = self.record_length(0) else {
+            let Some(first_length) = self.record_length(region, 0) else {
                 self.malformed += 1;
                 return Received::Empty;
             };
-            let Some(first_type) = self.load_i32(layout::RECORD_MSG_TYPE_ID_OFFSET) else {
+            let Some(first_type) = self.load_i32(region, layout::RECORD_MSG_TYPE_ID_OFFSET) else {
                 self.malformed += 1;
                 return Received::Empty;
             };
@@ -229,16 +229,16 @@ impl<'a> ToClientsReceiver<'a> {
             self.cursor = self.next_record;
             self.next_record += layout::align_up(first_length, layout::RECORD_ALIGNMENT) as i64;
             self.record_offset = 0;
-            return self.finish(0, first_type);
+            return self.finish(region, 0, first_type);
         }
 
         self.record_offset = offset;
-        self.finish(offset, type_id)
+        self.finish(region, offset, type_id)
     }
 
     /// Copy the record at `offset` into the scratch buffer, then validate.
-    fn finish(&mut self, offset: usize, type_id: i32) -> Received {
-        let Some(length) = self.record_length(offset) else {
+    fn finish(&mut self, region: &AtomicBuffer<ReadOnly>, offset: usize, type_id: i32) -> Received {
+        let Some(length) = self.record_length(region, offset) else {
             self.malformed += 1;
             return Received::Empty;
         };
@@ -248,8 +248,7 @@ impl<'a> ToClientsReceiver<'a> {
             self.scratch.resize(payload, 0);
         }
 
-        if self
-            .buffer
+        if region
             .copy_out(
                 offset + layout::RECORD_HEADER_LENGTH,
                 &mut self.scratch[..payload],
@@ -265,7 +264,7 @@ impl<'a> ToClientsReceiver<'a> {
         // After the copy, not before — see the module docs. `self.cursor` is
         // the record just read; `next_record` has already moved past it, so
         // there is no retry and the message is simply dropped.
-        if !self.slot_is_live(self.cursor) {
+        if !self.slot_is_live(region, self.cursor) {
             self.discarded += 1;
             return Received::Discarded;
         }
@@ -275,8 +274,8 @@ impl<'a> ToClientsReceiver<'a> {
 
     /// A record's total length in bytes, if it is one the writer could have
     /// produced.
-    fn record_length(&self, offset: usize) -> Option<usize> {
-        let length = self.load_i32(offset + layout::RECORD_LENGTH_OFFSET)?;
+    fn record_length(&self, region: &AtomicBuffer<ReadOnly>, offset: usize) -> Option<usize> {
+        let length = self.load_i32(region, offset + layout::RECORD_LENGTH_OFFSET)?;
 
         // The writer caps a payload at `capacity / 8` and stores the length
         // *including* the 8-byte header. Anything outside that is not a record,
@@ -291,8 +290,8 @@ impl<'a> ToClientsReceiver<'a> {
 
     /// Whether the slot at `cursor` has not yet been (or is not about to be)
     /// overwritten.
-    fn slot_is_live(&self, cursor: i64) -> bool {
-        self.load_counter(layout::BROADCAST_TAIL_INTENT_COUNTER_OFFSET)
+    fn slot_is_live(&self, region: &AtomicBuffer<ReadOnly>, cursor: i64) -> bool {
+        self.load_counter(region, layout::BROADCAST_TAIL_INTENT_COUNTER_OFFSET)
             .is_none_or(|intent| cursor + self.capacity as i64 > intent)
     }
 
@@ -306,16 +305,16 @@ impl<'a> ToClientsReceiver<'a> {
         (cursor as u32 as usize) & self.mask
     }
 
-    fn load_counter(&self, field: usize) -> Option<i64> {
-        self.buffer.load_i64_acquire(self.trailer + field)
+    fn load_counter(&self, region: &AtomicBuffer<ReadOnly>, field: usize) -> Option<i64> {
+        region.load_i64_acquire(self.trailer + field)
     }
 
-    fn load_i32(&self, offset: usize) -> Option<i32> {
-        self.buffer.load_i32_acquire(offset)
+    fn load_i32(&self, region: &AtomicBuffer<ReadOnly>, offset: usize) -> Option<i32> {
+        region.load_i32_acquire(offset)
     }
 }
 
-impl std::fmt::Debug for ToClientsReceiver<'_> {
+impl std::fmt::Debug for ToClientsReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToClientsReceiver")
             .field("capacity", &self.capacity)
@@ -362,16 +361,13 @@ mod tests {
         }
 
         /// Run `f` with a writer and a receiver over one ring.
-        fn with<T>(
-            &mut self,
-            f: impl FnOnce(&mut Writer<'_>, &mut ToClientsReceiver<'_>) -> T,
-        ) -> T {
+        fn with<T>(&mut self, f: impl FnOnce(&mut Writer<'_>, &mut ToClientsReceiver) -> T) -> T {
             let mut writer = Writer {
                 buffer: AtomicBuffer::from_slice_mut(&mut self.bytes.0).expect("aligned region"),
                 next: 0,
             };
             let mut receiver =
-                ToClientsReceiver::new(writer.buffer.as_read_only()).expect("a valid ring");
+                ToClientsReceiver::new(&writer.buffer.as_read_only()).expect("a valid ring");
 
             f(&mut writer, &mut receiver)
         }
@@ -381,7 +377,7 @@ mod tests {
         fn attach_late<T>(
             &mut self,
             publish: impl FnOnce(&mut Writer<'_>),
-            f: impl FnOnce(&mut ToClientsReceiver<'_>) -> T,
+            f: impl FnOnce(&mut Writer<'_>, &mut ToClientsReceiver) -> T,
         ) -> T {
             let mut writer = Writer {
                 buffer: AtomicBuffer::from_slice_mut(&mut self.bytes.0).expect("aligned region"),
@@ -389,9 +385,11 @@ mod tests {
             };
             publish(&mut writer);
 
+            // Attached only now, so its cursor is read from a ring that has
+            // already carried traffic.
             let mut receiver =
-                ToClientsReceiver::new(writer.buffer.as_read_only()).expect("a valid ring");
-            f(&mut receiver)
+                ToClientsReceiver::new(&writer.buffer.as_read_only()).expect("a valid ring");
+            f(&mut writer, &mut receiver)
         }
     }
 
@@ -474,8 +472,11 @@ mod tests {
     fn a_fresh_ring_yields_nothing() {
         let mut fixture = Fixture::new();
 
-        fixture.with(|_writer, receiver| {
-            assert_eq!(Received::Empty, receiver.receive());
+        fixture.with(|writer, receiver| {
+            assert_eq!(
+                Received::Empty,
+                receiver.receive(&writer.buffer.as_read_only())
+            );
             assert_eq!(0, receiver.lapped());
         });
     }
@@ -488,15 +489,21 @@ mod tests {
             writer.publish(0x0F07, b"first");
             writer.publish(0x0F08, b"second");
 
-            assert_eq!(Received::Message { type_id: 0x0F07 }, receiver.receive());
+            assert_eq!(
+                Received::Message { type_id: 0x0F07 },
+                receiver.receive(&writer.buffer.as_read_only())
+            );
             assert_eq!(b"first", receiver.message());
 
-            assert_eq!(Received::Message { type_id: 0x0F08 }, receiver.receive());
+            assert_eq!(
+                Received::Message { type_id: 0x0F08 },
+                receiver.receive(&writer.buffer.as_read_only())
+            );
             assert_eq!(b"second", receiver.message());
 
             assert_eq!(
                 Received::Empty,
-                receiver.receive(),
+                receiver.receive(&writer.buffer.as_read_only()),
                 "one per call, and nothing once caught up"
             );
         });
@@ -516,8 +523,11 @@ mod tests {
             |writer| {
                 writer.publish(0x0F07, b"old");
             },
-            |receiver| {
-                assert_eq!(Received::Message { type_id: 0x0F07 }, receiver.receive());
+            |writer, receiver| {
+                assert_eq!(
+                    Received::Message { type_id: 0x0F07 },
+                    receiver.receive(&writer.buffer.as_read_only())
+                );
                 assert_eq!(b"old", receiver.message());
             },
         );
@@ -529,7 +539,10 @@ mod tests {
 
         fixture.with(|writer, receiver| {
             writer.publish(0x0F07, b"first");
-            assert_eq!(Received::Message { type_id: 0x0F07 }, receiver.receive());
+            assert_eq!(
+                Received::Message { type_id: 0x0F07 },
+                receiver.receive(&writer.buffer.as_read_only())
+            );
 
             // The threshold at which the writer has overwritten the slot this
             // reader would read next: where the reader stands, plus one ring.
@@ -552,7 +565,10 @@ mod tests {
             // Resyncing lands on the newest record, so "second" is skipped --
             // which is what a lap means and why the count is of events, not of
             // messages.
-            assert_eq!(Received::Message { type_id: 0x0F09 }, receiver.receive());
+            assert_eq!(
+                Received::Message { type_id: 0x0F09 },
+                receiver.receive(&writer.buffer.as_read_only())
+            );
             assert_eq!(b"third", receiver.message());
             assert_eq!(1, receiver.lapped(), "the lap is counted");
         });
@@ -571,7 +587,7 @@ mod tests {
 
                 assert_eq!(
                     Received::Empty,
-                    receiver.receive(),
+                    receiver.receive(&writer.buffer.as_read_only()),
                     "length {hostile} is not a record"
                 );
                 assert!(receiver.malformed() > 0, "and it is counted");
@@ -585,12 +601,12 @@ mod tests {
         const ODD: usize = 1000 + layout::BROADCAST_TRAILER_LENGTH;
         let mut odd = Bytes::<ODD>([0u8; ODD]);
         let buffer = AtomicBuffer::from_slice_mut(&mut odd.0).expect("aligned region");
-        assert!(ToClientsReceiver::new(buffer.as_read_only()).is_none());
+        assert!(ToClientsReceiver::new(&buffer.as_read_only()).is_none());
 
         // And a region too short to hold a trailer at all.
         const TINY: usize = layout::BROADCAST_TRAILER_LENGTH;
         let mut tiny = Bytes::<TINY>([0u8; TINY]);
         let buffer = AtomicBuffer::from_slice_mut(&mut tiny.0).expect("aligned region");
-        assert!(ToClientsReceiver::new(buffer.as_read_only()).is_none());
+        assert!(ToClientsReceiver::new(&buffer.as_read_only()).is_none());
     }
 }

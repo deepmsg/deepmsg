@@ -214,6 +214,16 @@ impl<'a, Access> CountersReader<'a, Access> {
     }
 }
 
+/// `AERON_COUNTER_CLIENT_HEARTBEAT_TIMESTAMP_TYPE_ID`
+/// (`aeron-client/src/main/c/aeron_counters.h:98`).
+///
+/// One per client, allocated when the driver first sees that client's
+/// `client_id`, with the client id as its registration id. A client writes it
+/// to stay alive: the driver reaps a client — and destroys every subscription
+/// it owns — once the counter's age exceeds `aeron.client.liveness.timeout`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1038-1055`).
+pub const CLIENT_HEARTBEAT_TYPE_ID: i32 = 11;
+
 /// The write half, available only on counters built from writable memory.
 impl<'a> CountersReader<'a, ReadWrite> {
     /// Write a counter's value.
