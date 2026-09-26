@@ -32,6 +32,12 @@ path = "integration/termination_handshake.rs"
 name = "cnc_fixture"
 path = "integration/cnc_fixture.rs"
 
+# The writer's side of the same contract `cnc_fixture` reads: a file this
+# build creates, compared byte for byte with a real driver's.
+[[test]]
+name = "cnc_create"
+path = "integration/cnc_create.rs"
+
 # The termination preconditions, against synthetic CnC files. No driver needed,
 # so unlike `c_driver_basic` this one runs in CI.
 [[test]]
