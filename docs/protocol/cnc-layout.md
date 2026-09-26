@@ -262,3 +262,82 @@ A reader must not:
 - write any broadcast counter;
 - assume a region's length is page-aligned, or that the metadata struct is as
   long as the metadata region.
+
+## Reading the responses
+
+The to-clients ring is a **broadcast**, not a queue: every client reads the
+whole stream, including responses addressed to other clients. That is the
+opposite of the to-driver ring, which is many-to-one, and it decides how a
+client has to behave.
+
+`aeron-client/src/main/c/concurrent/aeron_broadcast_receiver.c`:
+
+- **The cursor starts at `latest_counter`, not `tail_counter`.** `tail` is one
+  *past* the newest record, so starting there would skip the only message a
+  late joiner could have seen. There is no history and no way to ask for any.
+- **One message per call.** Java's Agrona drains in a loop; the C does not, and
+  neither does this. The caller's duty cycle is where timeouts, command
+  processing and liveness checks live, and a drain loop would change how long
+  each of them waits.
+- **Copy first, validate after.** The check is `cursor + capacity >
+  tail_intent_counter`, and it means "the writer has not yet announced a write
+  past this slot". Doing it *before* the copy would guard nothing — the window
+  that matters is the copy itself. The writer raises its intent before it
+  destroys, so a validating load that does not see the flag proves the
+  destructive write was not ordered before the copy. A failed validate
+  **discards** the message; the cursor has already advanced and there is no
+  retry.
+
+A reader owns no descriptor field — unlike the MPSC consumer, which publishes
+`head_position` and zeroes what it consumed. So a slow reader cannot block the
+writer, and loss is discovered only after the fact. `lapped` counts *events*,
+never messages: there is no way to know how many were missed.
+
+### Matching
+
+A response is matched to a request by the `correlation_id` the request carried,
+which the driver echoes. A response matching nothing pending — another client's,
+or one whose request already expired — is dropped silently, as the reference
+does at every one of its handlers.
+
+`ON_SUBSCRIPTION_READY` (`0x0F07`) is 12 bytes:
+`{ int64 correlation_id; int32 channel_status_indicator_id }`. The status field
+is a **counter id**, and it is `-1` for IPC and spy subscriptions because no
+channel-status counter was allocated for them. Treating that as an error gets
+IPC wrong.
+
+A fresh client's *first* response is its own `ON_COUNTER_READY` (`0x0F08`), with
+its **client id** in the correlation field — the driver emits it while creating
+the client record, before any command's reply. Matching on the correlation id
+rather than on arrival order is what makes that harmless.
+
+### Staying alive
+
+`aeron_driver_conductor_get_or_add_client` creates a client record on first
+sight of a `client_id` — there is no registration command in this protocol —
+and allocates a heartbeat counter for it: type id `11`, registration id equal
+to the client id
+(`aeron-driver/src/main/c/aeron_driver_conductor.c:994-998`).
+
+The driver reaps that client once the counter's age exceeds
+`aeron.client.liveness.timeout`, **10 s by default**, and reaping destroys every
+subscription, publication and counter the client owned
+(`aeron_driver_conductor.c:1038-1055`, `:1233-1283`). It announces the fact as
+`ON_CLIENT_TIMEOUT` (`0x0F0A`).
+
+A client writes that counter directly on every duty cycle — the reference does
+the same (`aeron-client/src/main/c/aeron_client_conductor.c:1345-1387`) and does
+*not* send `CLIENT_KEEPALIVE`, which the driver would ignore anyway for a client
+it has not yet seen.
+
+The counter does not exist until the first command reaches the driver, so a
+client's first poll or two will not find it. That is normal and must not be
+treated as an error.
+
+### A leak in the reference, recorded rather than copied
+
+When a command's deadline expires, the reference marks it timed out and sends
+nothing (`aeron_client_conductor.c:1451-1481`). The driver keeps whatever it
+created, so a subscription can exist that the client believes failed — and its
+registration id, which is the correlation id, is the only handle on it. That is
+why the timeout error here carries the correlation id.
