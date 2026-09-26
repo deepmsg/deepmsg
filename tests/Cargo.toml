@@ -43,5 +43,12 @@ name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"
 required-features = ["interop"]
 
+# The two-sided termination oracle: refused by default, accepted when the
+# driver is started with an allowing validator.
+[[test]]
+name = "c_driver_terminate"
+path = "interop/c_driver_terminate.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true
