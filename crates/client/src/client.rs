@@ -19,13 +19,31 @@
 //! send: the reference writes the counter directly
 //! (`aeron-client/src/main/c/aeron_client_conductor.c:1345-1387`), and that is
 //! what this does.
+//!
+//! # One response per poll, and why that is load-bearing
+//!
+//! [`Client::poll`] takes at most one message off the broadcast per call. That
+//! is not a simplification: the driver sends `ON_SUBSCRIPTION_READY` and then,
+//! if a matching publication already exists, `ON_AVAILABLE_IMAGE` for it. The
+//! image is matched against a subscription this type only registers *after* the
+//! ready response is seen, so draining both in one call would drop the image.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use deepmsg_cnc::command::{ADD_SUBSCRIPTION_TYPE_ID, AddSubscription, Response, decode_response};
+use deepmsg_cnc::command::{
+    ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddPublication, AddSubscription, Response,
+    decode_response,
+};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
+
+use crate::image::{Fragment, Image};
+use crate::publication::Publication;
+use crate::subscription::Subscription;
 
 /// How long to wait between polls while a command is outstanding.
 ///
@@ -38,6 +56,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// `AERON_CONTEXT_DRIVER_TIMEOUT_MS_DEFAULT`
 /// (`aeron-client/src/main/c/aeron_context.c:35`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default fragment budget for one poll, matching
+/// `AERON_IMAGE_FRAGMENT_LIMIT_DEFAULT`.
+pub const FRAGMENT_LIMIT: usize = 10;
 
 /// Why a client could not connect.
 #[derive(Debug)]
@@ -90,6 +112,18 @@ pub enum CommandError {
         /// Its description, lossily decoded.
         message: String,
     },
+    /// The driver accepted the command but the log buffer it named could not be
+    /// mapped.
+    ///
+    /// A *local* failure, distinct from the driver refusing: the driver has
+    /// created the resource, so the caller owns something it cannot use. In
+    /// practice this means the path did not exist or held no usable metadata.
+    LogBuffer {
+        /// The path the driver sent.
+        path: PathBuf,
+        /// Why the mapping failed.
+        source: io::Error,
+    },
 }
 
 impl std::fmt::Display for CommandError {
@@ -103,23 +137,40 @@ impl std::fmt::Display for CommandError {
                  created the resource"
             ),
             Self::Driver { code, message } => write!(f, "the driver refused it: {code} {message}"),
+            Self::LogBuffer { path, source } => {
+                write!(
+                    f,
+                    "the log buffer {} could not be mapped: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for CommandError {}
 
+/// What a completed command handed back.
+#[derive(Debug)]
+enum Ready {
+    /// A subscription exists.
+    Subscription { channel_status_indicator_id: i32 },
+    /// A publication exists, and its log buffer can now be mapped.
+    Publication {
+        registration_id: i64,
+        session_id: i32,
+        stream_id: i32,
+        position_limit_counter_id: i32,
+        channel_status_indicator_id: i32,
+        log_file: PathBuf,
+    },
+}
+
 /// A pending command, waiting for the response that completes it.
 struct Pending {
     correlation_id: i64,
     deadline: Instant,
-    outcome: Option<Result<SubscriptionReady, CommandError>>,
-}
-
-/// The fields of `ON_SUBSCRIPTION_READY` this client uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SubscriptionReady {
-    channel_status_indicator_id: i32,
+    outcome: Option<Result<Ready, CommandError>>,
 }
 
 /// A client connected to a running driver.
@@ -132,10 +183,14 @@ pub struct Client {
     client_id: i64,
     receiver: ToClientsReceiver,
     pending: Vec<Pending>,
+    subscriptions: Vec<Subscription>,
+    publications: Vec<Publication>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
     unknown_responses: u64,
+    /// Images that arrived for a subscription this client did not have yet.
+    orphan_images: u64,
 }
 
 impl Client {
@@ -169,8 +224,11 @@ impl Client {
             client_id,
             receiver,
             pending: Vec::new(),
+            subscriptions: Vec::new(),
+            publications: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
+            orphan_images: 0,
         })
     }
 
@@ -188,9 +246,43 @@ impl Client {
         self.unknown_responses
     }
 
+    /// Images that named a subscription this client does not have.
+    ///
+    /// Not an error and not necessarily a bug: the driver can link a
+    /// subscription and send the image in the same breath as the ready
+    /// response, and a client that has not yet registered the subscription —
+    /// or that has since dropped it — has nowhere to put it.
+    pub const fn orphan_images(&self) -> u64 {
+        self.orphan_images
+    }
+
     /// Messages discarded because the driver overwrote them mid-read.
     pub const fn discarded(&self) -> u64 {
         self.receiver.discarded()
+    }
+
+    /// The subscriptions this client holds.
+    pub fn subscriptions(&self) -> &[Subscription] {
+        &self.subscriptions
+    }
+
+    /// The publications this client holds.
+    pub fn publications(&self) -> &[Publication] {
+        &self.publications
+    }
+
+    /// A subscription by registration id.
+    pub fn subscription(&self, registration_id: i64) -> Option<&Subscription> {
+        self.subscriptions
+            .iter()
+            .find(|subscription| subscription.registration_id() == registration_id)
+    }
+
+    /// A publication by registration id.
+    pub fn publication(&self, registration_id: i64) -> Option<&Publication> {
+        self.publications
+            .iter()
+            .find(|publication| publication.registration_id() == registration_id)
     }
 
     /// Run one duty cycle: refresh the heartbeat, then take at most one
@@ -205,7 +297,9 @@ impl Client {
         if let Some(region) = self.cnc.to_clients_region() {
             if let Received::Message { type_id } = self.receiver.receive(&region) {
                 // The payload is a scratch copy, valid only until the next
-                // receive, so it is consumed here rather than handed out.
+                // receive, so it is copied out before anything else touches the
+                // receiver — and the response is decoded from the copy, which
+                // is also where a log path's bytes come from.
                 let payload = self.receiver.message().to_vec();
                 self.handle(type_id, &payload);
                 worked = true;
@@ -223,6 +317,10 @@ impl Client {
     /// the request used — the driver echoes it in the ready response and uses
     /// it as the registration id thereafter.
     ///
+    /// The subscription is registered with this client only once the ready
+    /// response has been seen, so a caller must keep polling afterwards for
+    /// `ON_AVAILABLE_IMAGE` to be attached — see [`Client::poll`].
+    ///
     /// # Errors
     ///
     /// [`CommandError`] if the command could not be sent, the driver refused
@@ -238,7 +336,9 @@ impl Client {
         let command = AddSubscription {
             client_id: self.client_id,
             correlation_id,
-            // A field the driver never reads; the reference sends -1.
+            // A field the driver never reads; the reference sends -1
+            // (`aeron_client_conductor.c:2000-2004` writes the other four
+            // fields and leaves these eight as whatever the ring held).
             registration_correlation_id: -1,
             stream_id,
             channel,
@@ -249,13 +349,219 @@ impl Client {
             return Err(CommandError::Encoding);
         }
 
+        self.send(ADD_SUBSCRIPTION_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let ready = self.wait(correlation_id)?;
+        let Ready::Subscription {
+            channel_status_indicator_id,
+        } = ready
+        else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.subscriptions.push(Subscription::new(
+            correlation_id,
+            channel.to_owned(),
+            stream_id,
+            channel_status_indicator_id,
+        ));
+
+        Ok(correlation_id)
+    }
+
+    /// Add a publication and wait for the driver to confirm it.
+    ///
+    /// Returns the publication's registration id — the correlation id the
+    /// request used, and the id the driver names the log file after
+    /// (`aeron_fileutil.c:1208-1214`). The log buffer is mapped before this
+    /// returns, so [`Client::offer`] is usable immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it, no reply arrived within `timeout`, or the log buffer it named could
+    /// not be mapped.
+    pub fn add_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = AddPublication {
+            client_id: self.client_id,
+            correlation_id,
+            stream_id,
+            channel,
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(ADD_PUBLICATION_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let ready = self.wait(correlation_id)?;
+        let Ready::Publication {
+            registration_id,
+            session_id,
+            stream_id,
+            position_limit_counter_id,
+            channel_status_indicator_id,
+            log_file,
+        } = ready
+        else {
+            return Err(CommandError::Encoding);
+        };
+
+        let publication = Publication::open(
+            &log_file,
+            registration_id,
+            session_id,
+            stream_id,
+            position_limit_counter_id,
+            channel_status_indicator_id,
+        )
+        .map_err(|source| CommandError::LogBuffer {
+            path: log_file,
+            source,
+        })?;
+
+        self.publications.push(publication);
+
+        Ok(registration_id)
+    }
+
+    /// Offer a payload on a publication.
+    ///
+    /// Returns `None` if there is no such publication. Otherwise the typed
+    /// outcome — see [`deepmsg_core::logbuffer::append::Appended`], whose
+    /// `EndOfLog` means the log rotated and the caller should retry, not that
+    /// anything failed.
+    ///
+    /// The window limit is read from the counter the driver maintains, here and
+    /// per call, because that counter is the only thing standing between a
+    /// producer and overwriting data a subscriber has not read. Reading it once
+    /// and caching it is how a producer silently outruns its consumer.
+    pub fn offer(
+        &self,
+        registration_id: i64,
+        payload: &[u8],
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.publication(registration_id)?;
+
+        // The limit counter is in the CnC file; the log buffer is the
+        // publication's own mapping. Disjoint, so both borrows are shared.
+        let limit = self
+            .cnc
+            .counters()
+            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+            .unwrap_or(0);
+
+        Some(publication.offer(limit, payload))
+    }
+
+    /// Read up to `fragment_limit` fragments from one image.
+    ///
+    /// Returns how many were delivered, or `None` if there is no such
+    /// subscription or image.
+    ///
+    /// The image's reader position is published to its counter **after** the
+    /// handler has returned, never before — and that publication is not
+    /// optional. The driver computes the publisher's window limit from the
+    /// minimum of these counters (`aeron_ipc_publication.c:296-313`), so an
+    /// image that is read but not reported eventually blocks the publisher.
+    pub fn poll_image<F>(
+        &mut self,
+        subscription_id: i64,
+        image_registration_id: i64,
+        fragment_limit: usize,
+        handler: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        let (counter_id, position, read) = {
+            let subscription = self
+                .subscriptions
+                .iter_mut()
+                .find(|s| s.registration_id() == subscription_id)?;
+            let image = subscription
+                .images_mut()
+                .iter_mut()
+                .find(|i| i.registration_id() == image_registration_id)?;
+
+            let read = image.poll(fragment_limit, handler);
+
+            (image.subscriber_position_id(), image.position(), read)
+        };
+
+        if let Some(counters) = self.cnc.counters_writable() {
+            counters.set_value(counter_id, position);
+        }
+
+        Some(read)
+    }
+
+    /// Read up to `fragment_limit` fragments from every image of a
+    /// subscription.
+    ///
+    /// Convenience for the common case; [`Client::poll_image`] is the same
+    /// thing for one image.
+    pub fn poll_subscription<F>(
+        &mut self,
+        subscription_id: i64,
+        fragment_limit: usize,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        let mut total = 0;
+
+        let Some(subscription) = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            return 0;
+        };
+
+        for image in subscription.images_mut() {
+            let remaining = fragment_limit.saturating_sub(total);
+            if 0 == remaining {
+                break;
+            }
+
+            total += image.poll(remaining, &mut handler);
+
+            // Published before moving to the next image rather than after all
+            // of them: each image's position is its own, and holding it back
+            // would delay the publisher's window for no benefit.
+            if let Some(counters) = self.cnc.counters_writable() {
+                counters.set_value(image.subscriber_position_id(), image.position());
+            }
+        }
+
+        total
+    }
+
+    /// Send a command and register it as pending with a deadline.
+    fn send(
+        &mut self,
+        type_id: i32,
+        payload: &[u8],
+        correlation_id: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
         {
             let ring = self
                 .cnc
                 .to_driver_ring()
                 .ok_or(CommandError::Claim(ClaimError::Invalid))?;
-            ring.write(ADD_SUBSCRIPTION_TYPE_ID, &payload)
-                .map_err(CommandError::Claim)?;
+            ring.write(type_id, payload).map_err(CommandError::Claim)?;
         }
 
         self.pending.push(Pending {
@@ -264,9 +570,15 @@ impl Client {
             outcome: None,
         });
 
-        // Drive the loop the caller would otherwise have to write. This is what
-        // the reference's own test helper does (aeron_test_base.h:116-131) and
-        // what the C++ wrapper's blocking addSubscription is.
+        Ok(())
+    }
+
+    /// Drive the loop until `correlation_id` completes or its deadline passes.
+    ///
+    /// This is what the reference's own test helper does
+    /// (`aeron_test_base.h:116-131`) and what the C++ wrapper's blocking
+    /// `addSubscription` is.
+    fn wait(&mut self, correlation_id: i64) -> Result<Ready, CommandError> {
         loop {
             self.poll();
 
@@ -282,7 +594,7 @@ impl Client {
 
             if let Some(outcome) = self.pending[index].outcome.take() {
                 self.pending.swap_remove(index);
-                return outcome.map(|_ready| correlation_id);
+                return outcome;
             }
 
             if Instant::now() >= self.pending[index].deadline {
@@ -315,7 +627,7 @@ impl Client {
         counters.set_value(counter_id, now_ms()).is_some()
     }
 
-    /// Take one decoded response and match it to a pending command.
+    /// Take one decoded response and act on it.
     fn handle(&mut self, type_id: i32, payload: &[u8]) {
         match decode_response(type_id, payload) {
             Response::SubscriptionReady {
@@ -324,10 +636,62 @@ impl Client {
             } => {
                 self.complete(
                     correlation_id,
-                    Ok(SubscriptionReady {
+                    Ok(Ready::Subscription {
                         channel_status_indicator_id,
                     }),
                 );
+            }
+            Response::PublicationReady {
+                correlation_id,
+                registration_id,
+                session_id,
+                stream_id,
+                position_limit_counter_id,
+                channel_status_indicator_id,
+                log_file,
+            } => {
+                self.complete(
+                    correlation_id,
+                    Ok(Ready::Publication {
+                        registration_id,
+                        session_id,
+                        stream_id,
+                        position_limit_counter_id,
+                        channel_status_indicator_id,
+                        log_file: path_from_bytes(log_file),
+                    }),
+                );
+            }
+            Response::AvailableImage {
+                publication_registration_id,
+                session_id,
+                stream_id,
+                subscriber_registration_id,
+                subscriber_position_id,
+                log_file,
+                ..
+            } => {
+                self.attach_image(
+                    subscriber_registration_id,
+                    publication_registration_id,
+                    session_id,
+                    stream_id,
+                    subscriber_position_id,
+                    &path_from_bytes(log_file),
+                );
+            }
+            Response::UnavailableImage {
+                publication_registration_id,
+                subscription_registration_id,
+                ..
+            } => {
+                if let Some(subscription) = self
+                    .subscriptions
+                    .iter_mut()
+                    .find(|s| s.registration_id() == subscription_registration_id)
+                {
+                    subscription.remove_image(publication_registration_id);
+                }
             }
             Response::Error {
                 offending_command_correlation_id,
@@ -355,7 +719,55 @@ impl Client {
         }
     }
 
-    fn complete(&mut self, correlation_id: i64, outcome: Result<SubscriptionReady, CommandError>) {
+    /// Map an image's log buffer and attach it to its subscription.
+    fn attach_image(
+        &mut self,
+        subscription_id: i64,
+        publication_registration_id: i64,
+        session_id: i32,
+        stream_id: i32,
+        subscriber_position_id: i32,
+        path: &Path,
+    ) {
+        // Where to start reading. The driver writes the join position into the
+        // counter as part of linking the subscription
+        // (`aeron_driver_conductor.c:3547-3575`), and it does so *before*
+        // sending this message — so the counter, not the message, is the
+        // authority on where this subscriber starts.
+        let join_position = self
+            .cnc
+            .counters()
+            .and_then(|counters| counters.value(subscriber_position_id))
+            .unwrap_or(0);
+
+        let image = match Image::open(
+            path,
+            publication_registration_id,
+            session_id,
+            stream_id,
+            subscriber_position_id,
+            join_position,
+        ) {
+            Ok(image) => image,
+            Err(_) => {
+                self.orphan_images += 1;
+                return;
+            }
+        };
+
+        let Some(subscription) = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            self.orphan_images += 1;
+            return;
+        };
+
+        subscription.add_image(image);
+    }
+
+    fn complete(&mut self, correlation_id: i64, outcome: Result<Ready, CommandError>) {
         if let Some(pending) = self
             .pending
             .iter_mut()
@@ -392,6 +804,15 @@ impl Client {
     }
 }
 
+/// A path from the raw bytes the driver sent.
+///
+/// Lossy conversion would corrupt a path that is not valid UTF-8, and the
+/// driver sends whatever it was given; on Linux a path *is* bytes, so take them
+/// as they are.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
 fn now_ms() -> i64 {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -407,6 +828,8 @@ impl std::fmt::Debug for Client {
         f.debug_struct("Client")
             .field("client_id", &self.client_id)
             .field("pending", &self.pending.len())
+            .field("subscriptions", &self.subscriptions.len())
+            .field("publications", &self.publications.len())
             .field("unknown_responses", &self.unknown_responses)
             .finish()
     }

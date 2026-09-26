@@ -63,5 +63,12 @@ name = "c_driver_client"
 path = "interop/c_driver_client.rs"
 required-features = ["interop"]
 
+# P0's acceptance test: an IPC payload written by one client and read by
+# another, through a log buffer the driver created and both processes mapped.
+[[test]]
+name = "c_driver_pubsub"
+path = "interop/c_driver_pubsub.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

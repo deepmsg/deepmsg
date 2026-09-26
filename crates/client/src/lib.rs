@@ -15,6 +15,7 @@ pub mod conductor;
 pub mod counter;
 pub mod fragment_assembler;
 pub mod image;
+pub mod log_buffer;
 pub mod publication;
 pub mod subscription;
 pub mod terminate;

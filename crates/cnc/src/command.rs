@@ -227,6 +227,71 @@ impl<'c> AddSubscription<'c> {
     }
 }
 
+/// `AERON_COMMAND_ADD_PUBLICATION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:26`).
+pub const ADD_PUBLICATION_TYPE_ID: i32 = 0x01;
+
+/// The publish payload before its channel.
+///
+/// Eight bytes shorter than a subscribe: there is no
+/// `registration_correlation_id`, because a publication has no subscription to
+/// register against (`aeron_control_protocol.h:91-98` for the subscribe shape,
+/// `:62-67` for this one).
+pub const ADD_PUBLICATION_HEADER_LENGTH: usize = 24;
+
+/// `AERON_RESPONSE_ON_PUBLICATION_READY`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:48`).
+pub const ON_PUBLICATION_READY_TYPE_ID: i32 = 0x0F03;
+
+/// The fixed part of `ON_PUBLICATION_READY`, before the log path.
+///
+/// **36 bytes**, and the path that follows it is *not* aligned and *not*
+/// NUL-terminated — unlike `ON_AVAILABLE_IMAGE`, whose tail pads to four bytes
+/// between two strings. The two messages look similar and are laid out
+/// differently; this constant and [`IMAGE_BUFFERS_READY_LENGTH`] are the pair
+/// to check against.
+pub const PUBLICATION_BUFFERS_READY_LENGTH: usize = 36;
+
+/// A publication request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddPublication<'c> {
+    /// The client this belongs to.
+    pub client_id: i64,
+    /// Becomes the publication's registration id and is echoed back.
+    pub correlation_id: i64,
+    /// The stream to publish on.
+    pub stream_id: i32,
+    /// The channel URI, e.g. `aeron:ipc`.
+    pub channel: &'c str,
+}
+
+impl<'c> AddPublication<'c> {
+    /// How many bytes this command occupies in a record payload.
+    pub const fn encoded_length(&self) -> usize {
+        ADD_PUBLICATION_HEADER_LENGTH + self.channel.len()
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`AddPublication::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        let Ok(channel_length) = i32::try_from(self.channel.len()) else {
+            return false;
+        };
+
+        out[0..8].copy_from_slice(&self.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlation_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.stream_id.to_le_bytes());
+        out[20..24].copy_from_slice(&channel_length.to_le_bytes());
+        out[ADD_PUBLICATION_HEADER_LENGTH..].copy_from_slice(self.channel.as_bytes());
+
+        true
+    }
+}
+
 /// `AERON_RESPONSE_ON_SUBSCRIPTION_READY`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:52`).
 pub const ON_SUBSCRIPTION_READY_TYPE_ID: i32 = 0x0F07;
@@ -239,6 +304,33 @@ pub const ON_COUNTER_READY_TYPE_ID: i32 = 0x0F08;
 
 /// `AERON_RESPONSE_ON_CLIENT_TIMEOUT` (`aeron_control_protocol.h:55`).
 pub const ON_CLIENT_TIMEOUT_TYPE_ID: i32 = 0x0F0A;
+
+/// `AERON_RESPONSE_ON_AVAILABLE_IMAGE` (`aeron_control_protocol.h:47`).
+pub const ON_AVAILABLE_IMAGE_TYPE_ID: i32 = 0x0F02;
+
+/// `AERON_RESPONSE_ON_UNAVAILABLE_IMAGE` (`aeron_control_protocol.h:50`).
+pub const ON_UNAVAILABLE_IMAGE_TYPE_ID: i32 = 0x0F05;
+
+/// The fixed part of `ON_AVAILABLE_IMAGE`: the 28 bytes before the log path.
+///
+/// **28, not 32.** The struct is inside a `#pragma pack(4)`, so its two
+/// `int64_t`s are 4-byte aligned and `subscriber_registration_id` lands at
+/// offset 16 rather than 24 (`aeron_control_protocol.h:107-115`, confirmed by
+/// `ImageBuffersReadyFlyweight.java:60-65`). Reading it as a naturally-aligned
+/// struct puts every field after `stream_id` four bytes out.
+pub const IMAGE_BUFFERS_READY_LENGTH: usize = 28;
+
+/// The fixed part of `ON_UNAVAILABLE_IMAGE`.
+pub const IMAGE_MESSAGE_LENGTH: usize = 24;
+
+/// `AERON_COUNTER_SUBSCRIPTION_POSITION_TYPE_ID`
+/// (`aeron-client/src/main/c/aeron_counters.h:81`).
+///
+/// The counter a subscriber advances to say how far it has read. The driver
+/// reads it back to compute the publisher's limit
+/// (`aeron-driver/src/main/c/aeron_ipc_publication.c:289-317`), so a client
+/// that never advances it eventually stops the publisher for everyone.
+pub const SUBSCRIPTION_POSITION_TYPE_ID: i32 = 4;
 
 /// `AERON_CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`
 /// (`aeron-driver/src/main/c/aeron_driver_common.h:25`).
@@ -288,6 +380,69 @@ pub enum Response<'a> {
         /// A human-readable description, borrowed from the payload.
         message: &'a [u8],
     },
+    /// A publication was created.
+    ///
+    /// Carries the publication's **own** registration id separately from the
+    /// correlation id that matched this request: the first names the log file
+    /// and keys every image built on it, the second is only how this reply
+    /// found its way back.
+    PublicationReady {
+        /// Echoes the `correlation_id` of the request.
+        correlation_id: i64,
+        /// The publication's registration id — what the log file is named
+        /// after, and what an image reports as its own `correlation_id`.
+        registration_id: i64,
+        /// The publication's session id.
+        session_id: i32,
+        /// The publication's stream id.
+        stream_id: i32,
+        /// The counter holding how far this publication may write. The driver
+        /// is the only writer.
+        position_limit_counter_id: i32,
+        /// The channel-status counter, or `-1` where none exists.
+        channel_status_indicator_id: i32,
+        /// The log buffer's path: raw bytes, **not** aligned and **not**
+        /// NUL-terminated.
+        log_file: &'a [u8],
+    },
+    /// An image became available: a publication this subscription matches now
+    /// exists, and its log buffer can be mapped.
+    ///
+    /// Carries **two** ids and they are not interchangeable:
+    /// [`Self::AvailableImage::publication_registration_id`] identifies the log
+    /// buffer, and
+    /// [`Self::AvailableImage::subscriber_registration_id`] is *your* subscription.
+    /// Keying on the wrong one silently pairs an image with the wrong
+    /// subscription.
+    AvailableImage {
+        /// The **publication's** registration id — the log file is named after
+        /// it.
+        publication_registration_id: i64,
+        /// The publication's session id.
+        session_id: i32,
+        /// The publication's stream id.
+        stream_id: i32,
+        /// **This subscription's** registration id.
+        subscriber_registration_id: i64,
+        /// The counter a reader advances to report how far it has read.
+        subscriber_position_id: i32,
+        /// The log buffer's path, as raw bytes: length-prefixed, four-byte
+        /// aligned, and **not** NUL-terminated.
+        log_file: &'a [u8],
+        /// Where the data came from. `aeron:ipc` for an IPC channel.
+        source_identity: &'a [u8],
+    },
+    /// An image went away.
+    UnavailableImage {
+        /// The publication that is gone.
+        publication_registration_id: i64,
+        /// The subscription it was attached to.
+        subscription_registration_id: i64,
+        /// The stream id.
+        stream_id: i32,
+        /// The subscription's channel, raw bytes, not NUL-terminated.
+        channel: &'a [u8],
+    },
     /// A response this build does not model. Counted by the caller, never fatal
     /// — ADR-0003's rule, and a deliberate divergence from the reference, which
     /// reports it to the error handler and whose default handler exits.
@@ -320,6 +475,39 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
             },
             _ => Response::Other { type_id },
         },
+        ON_PUBLICATION_READY_TYPE_ID => decode_publication_ready(payload),
+        ON_AVAILABLE_IMAGE_TYPE_ID => decode_available_image(payload),
+        ON_UNAVAILABLE_IMAGE_TYPE_ID => {
+            let publication_registration_id = le_i64(payload, 0);
+            let subscription_registration_id = le_i64(payload, 8);
+            let stream_id = le_i32(payload, 16);
+            let channel_length = le_i32(payload, 20);
+
+            match (
+                publication_registration_id,
+                subscription_registration_id,
+                stream_id,
+                channel_length,
+            ) {
+                (
+                    Some(publication_registration_id),
+                    Some(subscription_registration_id),
+                    Some(stream_id),
+                    Some(channel_length),
+                ) if channel_length >= 0 => {
+                    let end = IMAGE_MESSAGE_LENGTH
+                        .saturating_add(channel_length as usize)
+                        .min(payload.len());
+                    Response::UnavailableImage {
+                        publication_registration_id,
+                        subscription_registration_id,
+                        stream_id,
+                        channel: &payload[IMAGE_MESSAGE_LENGTH.min(payload.len())..end],
+                    }
+                }
+                _ => Response::Other { type_id },
+            }
+        }
         ON_CLIENT_TIMEOUT_TYPE_ID => match le_i64(payload, 0) {
             Some(client_id) => Response::ClientTimeout { client_id },
             None => Response::Other { type_id },
@@ -349,6 +537,135 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
         }
         _ => Response::Other { type_id },
     }
+}
+
+/// Decode `ON_PUBLICATION_READY`, whose path is appended with no alignment.
+fn decode_publication_ready(payload: &[u8]) -> Response<'_> {
+    let (
+        Some(correlation_id),
+        Some(registration_id),
+        Some(session_id),
+        Some(stream_id),
+        Some(position_limit_counter_id),
+        Some(channel_status_indicator_id),
+        Some(log_file_length),
+    ) = (
+        le_i64(payload, 0),
+        le_i64(payload, 8),
+        le_i32(payload, 16),
+        le_i32(payload, 20),
+        le_i32(payload, 24),
+        le_i32(payload, 28),
+        le_i32(payload, 32),
+    )
+    else {
+        return Response::Other {
+            type_id: ON_PUBLICATION_READY_TYPE_ID,
+        };
+    };
+
+    let start = PUBLICATION_BUFFERS_READY_LENGTH;
+    let end = start.saturating_add(log_file_length.max(0) as usize);
+    if log_file_length < 0 || end > payload.len() {
+        return Response::Other {
+            type_id: ON_PUBLICATION_READY_TYPE_ID,
+        };
+    }
+
+    Response::PublicationReady {
+        correlation_id,
+        registration_id,
+        session_id,
+        stream_id,
+        position_limit_counter_id,
+        channel_status_indicator_id,
+        log_file: &payload[start..end],
+    }
+}
+
+/// Decode `ON_AVAILABLE_IMAGE`, whose variable tail is two length-prefixed
+/// strings with four-byte alignment between them.
+fn decode_available_image(payload: &[u8]) -> Response<'_> {
+    let publication_registration_id = le_i64(payload, 0);
+    let session_id = le_i32(payload, 8);
+    let stream_id = le_i32(payload, 12);
+    let subscriber_registration_id = le_i64(payload, 16);
+    let subscriber_position_id = le_i32(payload, 24);
+    let log_file_length = le_i32(payload, IMAGE_BUFFERS_READY_LENGTH);
+
+    let (
+        Some(publication_registration_id),
+        Some(session_id),
+        Some(stream_id),
+        Some(subscriber_registration_id),
+        Some(subscriber_position_id),
+        Some(log_file_length),
+    ) = (
+        publication_registration_id,
+        session_id,
+        stream_id,
+        subscriber_registration_id,
+        subscriber_position_id,
+        log_file_length,
+    )
+    else {
+        return Response::Other {
+            type_id: ON_AVAILABLE_IMAGE_TYPE_ID,
+        };
+    };
+
+    if log_file_length < 0 {
+        return Response::Other {
+            type_id: ON_AVAILABLE_IMAGE_TYPE_ID,
+        };
+    }
+
+    let log_file_start = IMAGE_BUFFERS_READY_LENGTH + 4;
+    let log_file_end = log_file_start.saturating_add(log_file_length as usize);
+    if log_file_end > payload.len() {
+        return Response::Other {
+            type_id: ON_AVAILABLE_IMAGE_ID_FOR_MALFORMED,
+        };
+    }
+
+    // The path is padded to a four-byte boundary before the next length, and
+    // skipping that padding is what keeps the source identity from being read
+    // as garbage.
+    let identity_length_offset = align_up_four(log_file_end);
+    let Some(identity_length) = le_i32(payload, identity_length_offset) else {
+        return Response::Other {
+            type_id: ON_AVAILABLE_IMAGE_ID_FOR_MALFORMED,
+        };
+    };
+    if identity_length < 0 {
+        return Response::Other {
+            type_id: ON_AVAILABLE_IMAGE_ID_FOR_MALFORMED,
+        };
+    }
+
+    let identity_start = identity_length_offset + 4;
+    let identity_end = identity_start
+        .saturating_add(identity_length as usize)
+        .min(payload.len());
+
+    Response::AvailableImage {
+        publication_registration_id,
+        session_id,
+        stream_id,
+        subscriber_registration_id,
+        subscriber_position_id,
+        log_file: &payload[log_file_start..log_file_end],
+        source_identity: &payload[identity_start.min(payload.len())..identity_end],
+    }
+}
+
+/// The `msg_type_id` a malformed available-image is reported under.
+const ON_AVAILABLE_IMAGE_ID_FOR_MALFORMED: i32 = ON_AVAILABLE_IMAGE_TYPE_ID;
+
+/// Round up to a four-byte boundary, the alignment the reference uses between
+/// the two strings (`AERON_ALIGN(x, sizeof(int32_t))`).
+const fn align_up_four(value: usize) -> usize {
+    (value + 3) & !3
 }
 
 fn le_i32(payload: &[u8], offset: usize) -> Option<i32> {
