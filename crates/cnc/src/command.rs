@@ -166,3 +166,319 @@ mod tests {
         assert!(command.encode_into(&mut out));
     }
 }
+
+/// `AERON_COMMAND_ADD_SUBSCRIPTION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:30`).
+pub const ADD_SUBSCRIPTION_TYPE_ID: i32 = 0x04;
+
+/// The subscribe payload before its channel: the 16-byte correlated header,
+/// a `registration_correlation_id`, and the stream id and channel length
+/// (`aeron_control_protocol.h:91-98`).
+pub const ADD_SUBSCRIPTION_HEADER_LENGTH: usize = 32;
+
+/// A subscription request.
+///
+/// The channel is **not** a NUL-terminated string on the wire: it is
+/// `channel_length` raw bytes immediately after the header, and the driver
+/// reads exactly that many (`aeron_driver_conductor.c:2959-2964`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddSubscription<'c> {
+    /// The client this belongs to. The driver does not validate it against a
+    /// registration — there is no registration — and creates a client record
+    /// on first sight.
+    pub client_id: i64,
+    /// Becomes the subscription's registration id, and is echoed back in the
+    /// ready response.
+    pub correlation_id: i64,
+    /// A field the driver never reads. The reference sends `-1`
+    /// (`aeron-driver/src/test/c/aeron_driver_conductor_test.h:451`).
+    pub registration_correlation_id: i64,
+    /// The stream to subscribe to.
+    pub stream_id: i32,
+    /// The channel URI, e.g. `aeron:ipc`.
+    pub channel: &'c str,
+}
+
+impl<'c> AddSubscription<'c> {
+    /// How many bytes this command occupies in a record payload.
+    pub const fn encoded_length(&self) -> usize {
+        ADD_SUBSCRIPTION_HEADER_LENGTH + self.channel.len()
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`AddSubscription::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        let Ok(channel_length) = i32::try_from(self.channel.len()) else {
+            return false;
+        };
+
+        out[0..8].copy_from_slice(&self.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.registration_correlation_id.to_le_bytes());
+        out[24..28].copy_from_slice(&self.stream_id.to_le_bytes());
+        out[28..32].copy_from_slice(&channel_length.to_le_bytes());
+        out[ADD_SUBSCRIPTION_HEADER_LENGTH..].copy_from_slice(self.channel.as_bytes());
+
+        true
+    }
+}
+
+/// `AERON_RESPONSE_ON_SUBSCRIPTION_READY`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:52`).
+pub const ON_SUBSCRIPTION_READY_TYPE_ID: i32 = 0x0F07;
+
+/// `AERON_RESPONSE_ON_ERROR` (`aeron_control_protocol.h:46`).
+pub const ON_ERROR_TYPE_ID: i32 = 0x0F01;
+
+/// `AERON_RESPONSE_ON_COUNTER_READY` (`aeron_control_protocol.h:53`).
+pub const ON_COUNTER_READY_TYPE_ID: i32 = 0x0F08;
+
+/// `AERON_RESPONSE_ON_CLIENT_TIMEOUT` (`aeron_control_protocol.h:55`).
+pub const ON_CLIENT_TIMEOUT_TYPE_ID: i32 = 0x0F0A;
+
+/// `AERON_CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`
+/// (`aeron-driver/src/main/c/aeron_driver_common.h:25`).
+///
+/// What an IPC or spy subscription reports, because no channel-status counter
+/// was allocated for it. It is **not** an error, and a reader that treats a
+/// negative counter id as one gets IPC wrong.
+pub const CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED: i32 = -1;
+
+/// A decoded driver→client response.
+///
+/// The to-clients ring is a single broadcast every client reads in full, so a
+/// client sees responses to other clients' commands and must match on the
+/// correlation id. A response that matches nothing is dropped silently, which
+/// is what the reference does at every one of its handlers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Response<'a> {
+    /// A subscription was created. `channel_status_indicator_id` is a *counter
+    /// id*, and is [`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`] for channels that
+    /// have none.
+    SubscriptionReady {
+        /// Echoes the `correlation_id` of the request.
+        correlation_id: i64,
+        /// The channel status counter, or `-1`.
+        channel_status_indicator_id: i32,
+    },
+    /// A counter was allocated. A fresh client's *first* event is this one, for
+    /// its own heartbeat counter, with `correlation_id == client_id`.
+    CounterReady {
+        /// Echoes the `correlation_id` of the request — or the client id, when
+        /// the driver allocated the counter itself.
+        correlation_id: i64,
+        /// The counter's id, for `CountersReader`.
+        counter_id: i32,
+    },
+    /// The driver gave up on a client and destroyed everything it owned.
+    ClientTimeout {
+        /// Which client.
+        client_id: i64,
+    },
+    /// A command failed. The message is not NUL-terminated.
+    Error {
+        /// The `correlation_id` of the command that failed, or zero.
+        offending_command_correlation_id: i64,
+        /// The reference's error code.
+        error_code: i32,
+        /// A human-readable description, borrowed from the payload.
+        message: &'a [u8],
+    },
+    /// A response this build does not model. Counted by the caller, never fatal
+    /// — ADR-0003's rule, and a deliberate divergence from the reference, which
+    /// reports it to the error handler and whose default handler exits.
+    Other {
+        /// The `msg_type_id` that arrived.
+        type_id: i32,
+    },
+}
+
+/// Decode a response payload.
+///
+/// A payload too short for its own type is reported as [`Response::Other`]
+/// rather than trusted: these bytes come from another process, and the
+/// reference checks the length before casting in every case.
+pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
+    match type_id {
+        ON_SUBSCRIPTION_READY_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(channel_status_indicator_id)) => {
+                Response::SubscriptionReady {
+                    correlation_id,
+                    channel_status_indicator_id,
+                }
+            }
+            _ => Response::Other { type_id },
+        },
+        ON_COUNTER_READY_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(counter_id)) => Response::CounterReady {
+                correlation_id,
+                counter_id,
+            },
+            _ => Response::Other { type_id },
+        },
+        ON_CLIENT_TIMEOUT_TYPE_ID => match le_i64(payload, 0) {
+            Some(client_id) => Response::ClientTimeout { client_id },
+            None => Response::Other { type_id },
+        },
+        ON_ERROR_TYPE_ID => {
+            let offending = le_i64(payload, 0);
+            let code = le_i32(payload, 8);
+            let length = le_i32(payload, 12);
+
+            match (offending, code, length) {
+                (Some(offending_command_correlation_id), Some(error_code), Some(length))
+                    if length >= 0 =>
+                {
+                    // The transport pads the record, so the declared length is
+                    // the authority on where the message ends — and it may run
+                    // past what arrived, which is a truncated message rather
+                    // than a reason to read beyond it.
+                    let end = (16usize).saturating_add(length as usize).min(payload.len());
+                    Response::Error {
+                        offending_command_correlation_id,
+                        error_code,
+                        message: &payload[16.min(payload.len())..end],
+                    }
+                }
+                _ => Response::Other { type_id },
+            }
+        }
+        _ => Response::Other { type_id },
+    }
+}
+
+fn le_i32(payload: &[u8], offset: usize) -> Option<i32> {
+    let bytes = payload.get(offset..offset + 4)?;
+    Some(i32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn le_i64(payload: &[u8], offset: usize) -> Option<i64> {
+    let bytes = payload.get(offset..offset + 8)?;
+    Some(i64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    fn payload(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn decodes_a_subscription_ready() {
+        let bytes = payload(&[&7i64.to_le_bytes(), &(-1i32).to_le_bytes()]);
+        assert_eq!(
+            Response::SubscriptionReady {
+                correlation_id: 7,
+                channel_status_indicator_id: CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
+            },
+            decode_response(ON_SUBSCRIPTION_READY_TYPE_ID, &bytes)
+        );
+    }
+
+    #[test]
+    fn decodes_the_counter_ready_that_precedes_it() {
+        // A fresh client's first event is its own heartbeat counter, with the
+        // *client id* in the correlation field.
+        let bytes = payload(&[&42i64.to_le_bytes(), &9i32.to_le_bytes()]);
+        assert_eq!(
+            Response::CounterReady {
+                correlation_id: 42,
+                counter_id: 9
+            },
+            decode_response(ON_COUNTER_READY_TYPE_ID, &bytes)
+        );
+    }
+
+    #[test]
+    fn decodes_an_error_with_its_message() {
+        let message = b"unknown subscription";
+        let mut bytes = payload(&[
+            &3i64.to_le_bytes(),
+            &(-5i32).to_le_bytes(),
+            &(message.len() as i32).to_le_bytes(),
+        ]);
+        bytes.extend_from_slice(message);
+
+        match decode_response(ON_ERROR_TYPE_ID, &bytes) {
+            Response::Error {
+                offending_command_correlation_id,
+                error_code,
+                message: text,
+            } => {
+                assert_eq!(3, offending_command_correlation_id);
+                assert_eq!(-5, error_code);
+                assert_eq!(b"unknown subscription", text);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_claiming_more_text_than_arrived_is_truncated_not_overrun() {
+        let mut bytes = payload(&[
+            &0i64.to_le_bytes(),
+            &(-5i32).to_le_bytes(),
+            &4096i32.to_le_bytes(),
+        ]);
+        bytes.extend_from_slice(b"short");
+
+        match decode_response(ON_ERROR_TYPE_ID, &bytes) {
+            Response::Error { message, .. } => assert_eq!(b"short", message),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_too_short_for_its_own_type_is_not_trusted() {
+        // Every one of these arrives from another process, so a short frame is
+        // a thing that happens rather than a thing that cannot.
+        for (type_id, bytes) in [
+            (ON_SUBSCRIPTION_READY_TYPE_ID, vec![0u8; 8]),
+            (ON_COUNTER_READY_TYPE_ID, vec![0u8; 4]),
+            (ON_CLIENT_TIMEOUT_TYPE_ID, vec![0u8; 7]),
+            (ON_ERROR_TYPE_ID, vec![0u8; 12]),
+        ] {
+            assert!(
+                matches!(decode_response(type_id, &bytes), Response::Other { .. }),
+                "type {type_id:#x} with {} bytes should not decode",
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_type_is_reported_not_swallowed() {
+        assert_eq!(
+            Response::Other { type_id: 0x0F03 },
+            decode_response(0x0F03, &[0u8; 32]),
+            "the caller counts these; the decoder does not hide them"
+        );
+    }
+
+    #[test]
+    fn encodes_a_subscription_without_a_terminator() {
+        let command = AddSubscription {
+            client_id: 1,
+            correlation_id: 2,
+            registration_correlation_id: -1,
+            stream_id: 1001,
+            channel: "aeron:ipc",
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(32 + 9, out.len(), "the header plus the raw channel bytes");
+        assert_eq!(1i64.to_le_bytes(), out[0..8]);
+        assert_eq!(2i64.to_le_bytes(), out[8..16]);
+        assert_eq!((-1i64).to_le_bytes(), out[16..24], "the dead field");
+        assert_eq!(1001i32.to_le_bytes(), out[24..28]);
+        assert_eq!(9i32.to_le_bytes(), out[28..32]);
+        assert_eq!(b"aeron:ipc", &out[32..], "no NUL, exactly the length");
+    }
+}

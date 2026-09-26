@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::pal::MappedFile;
 use deepmsg_core::version::{self, CncVersionCompatibility};
 
@@ -248,6 +249,24 @@ impl CncFile {
             .region(self.layout.error_log.start, self.layout.error_log.len())?;
 
         Some(ErrorLogReader::new(buffer))
+    }
+
+    /// A **writable** view over the counters, for a client's own heartbeat.
+    ///
+    /// `None` on a read-only file, as [`CncFile::to_driver_ring`] is: the
+    /// ability to write follows from how the file was opened, not from which
+    /// method was called.
+    pub fn counters_writable(&self) -> Option<CountersReader<'_, ReadWrite>> {
+        let metadata = self.mapping.region_mut(
+            self.layout.counters_metadata.start,
+            self.layout.counters_metadata.len(),
+        )?;
+        let values = self.mapping.region_mut(
+            self.layout.counters_values.start,
+            self.layout.counters_values.len(),
+        )?;
+
+        Some(CountersReader::new(metadata, values))
     }
 
     /// A producer over the to-driver command ring.
