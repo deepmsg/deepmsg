@@ -2,7 +2,7 @@
 //!
 //! The open sequence matters as much as the offsets do. The driver fills every
 //! other metadata field first and only then publishes `cnc_version` with a
-//! release store (`aeron-client/src/main/c/aeron_driver.c:252-260`, then
+//! release store (`aeron-driver/src/main/c/aeron_driver.c:252-260`, then
 //! `:972`); a reader that reads the version with an acquire, and refuses to
 //! look at anything else until it is non-zero, gets a coherent view of the
 //! whole block for free. Reading the other fields first would be reading
@@ -247,7 +247,7 @@ impl CncFile {
 
     /// Whether the driver looks alive as of `now_ms`.
     ///
-    /// The reference's rule (`aeron-client/src/main/c/aeron_driver_context.c:1625-1643`)
+    /// The reference's rule (`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`)
     /// is that the heartbeat's age must not exceed the timeout. A heartbeat of
     /// [`layout::NULL_VALUE`] means the driver stopped deliberately — it wrote
     /// that value on the way out

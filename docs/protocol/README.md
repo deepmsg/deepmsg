@@ -5,7 +5,7 @@ Byte-contract documentation, rewritten from the reference implementation
 
 | File | Contents | Reference source |
 |---|---|---|
-| `cnc-layout.md` | CnC metadata block, version field, TOC walking, heartbeat | `aeron-client/src/main/c/aeron_cnc_file_descriptor.h` |
+| `cnc-layout.md` **(written)** | CnC metadata block, version and acceptance, regions, ring trailers, counters, error log, ordering | `aeron-client/src/main/c/aeron_cnc_file_descriptor.h`, `CncFileDescriptor.java` |
 | `term-layout.md` | log-buffer metadata, frame descriptor, position math | `aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h` |
 | `wire-frames.md` | data/setup/SM/NAK/RTTM frame layouts | `aeron-client/src/main/c/protocol/aeron_udp_protocol.h` |
 | `recording-log.md` | 48-byte entries, INVALID bit, 64-byte alignment, append/restore | `aeron-cluster/src/main/java/io/aeron/cluster/RecordingLog.java` |
