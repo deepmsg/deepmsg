@@ -159,6 +159,19 @@ pub const COUNTER_VALUE_OFFSET: usize = 0;
 /// `registration_id` within a value record (`int64`, volatile).
 pub const COUNTER_REGISTRATION_ID_OFFSET: usize = 8;
 
+/// `owner_id` within a value record (`int64`).
+pub const COUNTER_OWNER_ID_OFFSET: usize = 16;
+
+/// `reference_id` within a value record (`int64`).
+pub const COUNTER_REFERENCE_ID_OFFSET: usize = 24;
+
+/// Value written into the to-driver ring's consumer heartbeat by a driver
+/// shutting down cleanly (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`,
+/// `AERON_NULL_VALUE` at `aeron-client/src/main/c/aeronc.h:30`). A heartbeat
+/// of `-1` therefore means "was alive, stopped on purpose", which is a
+/// different thing from "never started" (zero) or "died" (a stale timestamp).
+pub const NULL_VALUE: i64 = -1;
+
 /// `state` within a metadata record (`int32`, volatile).
 pub const COUNTER_STATE_OFFSET: usize = 0;
 

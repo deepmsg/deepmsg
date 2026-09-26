@@ -73,6 +73,16 @@ pub enum CncError {
         /// Bytes actually present.
         file_length: usize,
     },
+    /// A region is smaller than the structure that has to live inside it — a
+    /// ring whose region cannot contain its own trailer, say.
+    RegionTooSmall {
+        /// The undersized region.
+        region: Region,
+        /// Its length as read.
+        length: usize,
+        /// The smallest length that could work.
+        minimum: usize,
+    },
     /// A region starts on an address that its accessors cannot use. Every
     /// field the reader touches is at least 4 bytes wide and the widest is 8,
     /// so each region base must be 8-byte aligned.
@@ -114,6 +124,14 @@ impl std::fmt::Display for CncError {
             } => write!(
                 f,
                 "regions need {required} bytes but the file is {file_length}"
+            ),
+            Self::RegionTooSmall {
+                region,
+                length,
+                minimum,
+            } => write!(
+                f,
+                "{region} region is {length} bytes, smaller than the {minimum} it must hold"
             ),
             Self::RegionUnaligned { region, offset } => {
                 write!(f, "{region} region starts at {offset}, not 8-byte aligned")

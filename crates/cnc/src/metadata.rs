@@ -162,6 +162,42 @@ impl RegionLayout {
             }
         }
 
+        for (region, length, minimum) in [
+            (
+                Region::ToDriver,
+                to_driver_len,
+                layout::MPSC_RB_TRAILER_LENGTH,
+            ),
+            (
+                Region::ToClients,
+                to_clients_len,
+                layout::BROADCAST_TRAILER_LENGTH,
+            ),
+            (
+                Region::CountersMetadata,
+                counters_metadata_len,
+                layout::COUNTER_METADATA_LENGTH,
+            ),
+            (
+                Region::CountersValues,
+                counters_values_len,
+                layout::COUNTER_VALUE_LENGTH,
+            ),
+            (
+                Region::ErrorLog,
+                error_log_len,
+                layout::ERROR_LOG_HEADER_LENGTH,
+            ),
+        ] {
+            if length < minimum as u64 {
+                return Err(CncError::RegionTooSmall {
+                    region,
+                    length: length as usize,
+                    minimum,
+                });
+            }
+        }
+
         if end > file_length as u64 {
             return Err(CncError::RegionsExceedFile {
                 required: end as usize,
