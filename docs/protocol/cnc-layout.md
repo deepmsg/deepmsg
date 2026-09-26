@@ -48,13 +48,16 @@ The reference applies two rules, and they come from different implementations:
 | Rule | Source | Fatal? |
 |---|---|---|
 | major must match | `aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103` | yes |
-| the file's minor must be ≥ ours | `aeron-client/src/main/java/io/aeron/CommonContext.java:1432` | yes |
+| the file's minor must be ≥ ours | `aeron-client/src/main/java/io/aeron/CommonContext.java:1432`, `aeron-client/src/main/c/aeron_context.c:617` | yes |
 
-**The C client does not implement the second rule; only the Java client does.**
-ADR-0001 makes C the authority wherever both exist, so this is a genuine
-divergence between the two references rather than a detail either one forgot.
-`deepmsg` follows the stricter one, and
-`deepmsg_core::version::check_cnc_version` records which rule came from where.
+**The C reference is inconsistent with itself here.** Its *read* path checks
+only the major; its *command* path (`aeron_context.c:617-624`, in
+`aeron_context_request_driver_termination`) checks both, as does the Java
+client. `deepmsg` applies both everywhere, which matches the C command path —
+so this is not a case of being stricter than C, but of picking one of C's two
+answers. `deepmsg_core::version::check_cnc_version` is the single place that
+decides, and the negative-version case is a third such disagreement, recorded
+in `tests/integration/cnc_terminate.rs`.
 
 A driver newer than the client — a *higher* minor — is tolerated. Patch is
 never compared.
@@ -144,13 +147,58 @@ published after the body and is the completeness signal. `latest_counter` lags
 
 **Record header**, both rings: `{ int32 length; int32 msg_type_id }`, 8 bytes.
 The struct is `#pragma pack(4)`, so its *alignment* is 4; record *starts* are
-8-aligned via `AERON_RB_ALIGNMENT` (`aeron_rb.h:52`). `msg_type_id == -1` marks
+8-aligned via `AERON_RB_ALIGNMENT` (`aeron-client/src/main/c/concurrent/aeron_rb.h:52`). `msg_type_id == -1` marks
 a padding record; `length <= 0` ends a scan.
 
 > The broadcast region is laid out here but has no reader in `deepmsg-cnc`. The
 > reference's own `aeron_cnc_t` never constructs a broadcast receiver — that is
 > the client conductor's job — so lap detection would have no consumer and no
 > oracle until P0-b.
+
+## Writing a command
+
+A client sends a command by claiming a record in the to-driver ring and filling
+it in place (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:143-202`). The claim
+reserves `align_up(payload + 8, 8)` bytes of index space; the record is then:
+
+| # | Store | Ordering |
+|---|---|---|
+| 1 | `length = -record_length` | release |
+| 2 | payload | plain |
+| 3 | `msg_type_id` | plain |
+| 4 | `length = +record_length` | release |
+
+**Step 4 is the publication.** A consumer acquire-loads the length and stops at
+anything `<= 0`, so between 1 and 4 the record is invisible and everything after
+it is correctly fenced off. The consumer never compares indices.
+
+A record that would straddle the end of the ring is replaced by a **padding
+record** — `msg_type_id = -1`, `length = capacity - tail_index` — and the
+message restarts at index 0. The tail is advanced past the padding *before* the
+padding header is published, so a consumer arriving in that window sees a zero
+length and waits; `aeron_mpsc_rb_unblock` exists to break that stall if a
+producer dies in it.
+
+The producer writes exactly two descriptor fields: `tail_position`, by
+compare-and-exchange, and `head_cache_position`. `head_position` and
+`consumer_heartbeat` are the consumer's, and the producer must not zero
+anything — the consumer zeroes what it consumes, and that ordering is what lets
+a producer assume freshly claimed space starts zeroed.
+
+### The command payload
+
+`TERMINATE_DRIVER` (`aeron-client/src/main/c/command/aeron_control_protocol.h:40`, `0x0E`) carries
+`{ int64 client_id; int64 correlation_id; int32 token_length; byte token[] }`
+— 20 bytes plus the token (`:213-218`).
+
+**The command type is in the record header's `msg_type_id`, not in the
+payload.** The Java client puts a `commandTypeId` field inside its encoding, so
+a port written from the Java side produces a payload four bytes too long that
+the driver misparses.
+
+Both correlation fields are filled from consecutive increments of the ring's
+`correlation_counter`, and the driver never reads either one for this command.
+They are ceremony the wire format requires — there is no reply to correlate.
 
 ## Counters
 
@@ -210,7 +258,7 @@ still being written by another process.
 A reader must not:
 
 - advance `head_position` or zero the MPSC ring — that is the driver's job as
-  the ring's single consumer (`aeron_mpsc_rb.c:242-246`);
+  the ring's single consumer (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:242-246`);
 - write any broadcast counter;
 - assume a region's length is page-aligned, or that the metadata struct is as
   long as the metadata region.

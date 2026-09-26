@@ -186,6 +186,22 @@ impl ReferenceDriver {
     /// configuration is self-contained instead of depending on the ambient
     /// environment — which is also why inherited `AERON_*` are removed.
     pub fn start(binary: &Path, test_name: &str) -> Result<Self, DriverError> {
+        Self::start_with(binary, test_name, &[])
+    }
+
+    /// Spawn a driver with additional `-D` properties.
+    ///
+    /// `aeronmd` turns each `-Dname=value` into an environment variable with
+    /// the name uppercased and its dots replaced by underscores
+    /// (`aeron-driver/src/main/c/aeronmd.c:72-81`), so this is how a test
+    /// changes driver behaviour without touching the ambient environment —
+    /// which it could not usefully do anyway, since inherited `AERON_*` are
+    /// removed below.
+    pub fn start_with(
+        binary: &Path,
+        test_name: &str,
+        extra_properties: &[&str],
+    ) -> Result<Self, DriverError> {
         let aeron_dir = temp_aeron_dir(test_name);
         let _ = std::fs::remove_dir_all(&aeron_dir);
 
@@ -196,12 +212,13 @@ impl ReferenceDriver {
         // `delete.on.shutdown` is not merely tidiness: the driver removes its
         // own directory on a clean signal, which is what keeps a day of test
         // runs from filling /dev/shm.
-        let properties = [
+        let mut properties: Vec<String> = vec![
             format!("-Daeron.dir={}", aeron_dir.display()),
             "-Daeron.dir.delete.on.start=true".to_string(),
             "-Daeron.dir.delete.on.shutdown=true".to_string(),
             "-Daeron.print.configuration=false".to_string(),
         ];
+        properties.extend(extra_properties.iter().map(|p| (*p).to_string()));
 
         let mut command = Command::new(binary);
         command

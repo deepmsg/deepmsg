@@ -28,15 +28,19 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod command;
 pub mod counters;
 pub mod error;
 pub mod error_log;
 pub mod file;
 pub mod layout;
 pub mod metadata;
+pub mod ring;
 
+pub use command::{MAX_TOKEN_LENGTH, TERMINATE_DRIVER_TYPE_ID, TerminateDriver};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use error::{CncError, Region};
 pub use error_log::{ErrorLogEntry, ErrorLogReader, ErrorLogScan};
 pub use file::{CNC_FILE_NAME, CncFile, CncOpenError, RETRY_INTERVAL};
 pub use metadata::{CncMetadata, RegionLayout};
+pub use ring::{ClaimError, ToDriverRing};

@@ -16,3 +16,4 @@ pub mod fragment_assembler;
 pub mod image;
 pub mod publication;
 pub mod subscription;
+pub mod terminate;

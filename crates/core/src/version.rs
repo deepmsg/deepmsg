@@ -48,11 +48,13 @@ pub const CNC_VERSION: i32 = semantic_version_compose(
 /// - **The major must match.** `aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103`
 ///   — the C reader's check, and the authority wherever both languages have
 ///   one (ADR-0001).
-/// - **The file's minor must be at least ours.** `aeron-client/src/main/java/io/aeron/CommonContext.java:1432`
-///   — the Java client's *additional* check. The C client does not implement
-///   it, so the two references genuinely diverge here and this build follows
-///   the stricter one. The divergence is written down in
-///   `docs/protocol/cnc-layout.md`.
+/// - **The file's minor must be at least ours.** `aeron-client/src/main/java/io/aeron/CommonContext.java:1432`,
+///   and also `aeron-client/src/main/c/aeron_context.c:617-624` — the C
+///   client's *command* path. Its *read* path
+///   (`aeron_cnc_file_descriptor.c:103`) checks only the major, so the C
+///   reference is inconsistent with itself here rather than silent on the
+///   rule. Applying both everywhere matches its command path and the Java
+///   client; the disagreement is written down in `docs/protocol/cnc-layout.md`.
 ///
 /// The patch component is never compared. A file is classified in the
 /// reference's order — readiness first — so a driver that has not published

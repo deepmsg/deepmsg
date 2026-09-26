@@ -99,6 +99,46 @@ pub const MPSC_RB_TRAILER_LENGTH: usize = 768;
 /// cache lines, so they sit at 128, 256, 384, 512 and 640.
 pub const MPSC_CONSUMER_HEARTBEAT_OFFSET: usize = 640;
 
+/// Offset of `tail_position` within the MPSC trailer: the byte counter a
+/// **producer** advances by compare-and-exchange. Unbounded — it is masked into
+/// an index at each use, never stored masked.
+pub const MPSC_TAIL_POSITION_OFFSET: usize = 128;
+
+/// Offset of `head_cache_position`: a cache of `head_position` that producers
+/// publish to each other, and the field a producer writes besides the tail.
+///
+/// A stale value here is harmless by construction: `head_position` only ever
+/// grows, so a producer can publish an over-conservative head, and the next one
+/// that finds space tight re-reads the authoritative field.
+pub const MPSC_HEAD_CACHE_POSITION_OFFSET: usize = 256;
+
+/// Offset of `head_position`: the **consumer's** field, advanced only after it
+/// has zeroed the bytes it consumed. A producer reads it and never writes it.
+pub const MPSC_HEAD_POSITION_OFFSET: usize = 384;
+
+/// Offset of `correlation_counter`: shared by every producer of the ring,
+/// including producers in other processes, and advanced by fetch-and-add.
+pub const MPSC_CORRELATION_COUNTER_OFFSET: usize = 512;
+
+/// The smallest legal ring capacity, and the value at which
+/// `max_message_length` collapses to zero:
+/// `AERON_MPSC_RB_MIN_CAPACITY = AERON_RB_RECORD_HEADER_LENGTH`
+/// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.h:22`).
+pub const MPSC_MIN_CAPACITY: usize = RECORD_HEADER_LENGTH;
+
+/// `length` within a ring record header (`int32`, volatile).
+pub const RECORD_LENGTH_OFFSET: usize = 0;
+
+/// `msg_type_id` within a ring record header (`int32`).
+pub const RECORD_MSG_TYPE_ID_OFFSET: usize = 4;
+
+/// The record header's alignment and the stride records advance by:
+/// `AERON_RB_ALIGNMENT` (`aeron-client/src/main/c/concurrent/aeron_rb.h:52`).
+///
+/// Note this is **not** the header struct's alignment, which `#pragma pack(4)`
+/// makes 4 — it is the granularity the writer rounds a record length up to.
+pub const RECORD_ALIGNMENT: usize = 8;
+
 // Twelve cache lines: a two-line leading pad, then five fields each padded
 // out to a two-line block (5 * 2 + 2). Writing it as `6 * CACHE_LINE_LENGTH`
 // is the arithmetic error this assertion exists to catch.

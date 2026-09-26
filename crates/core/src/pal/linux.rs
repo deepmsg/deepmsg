@@ -12,7 +12,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use crate::buffer::AtomicBuffer;
+use crate::buffer::{AtomicBuffer, ReadWrite};
 
 /// Map `length` bytes of `fd` read-only and shared.
 ///
@@ -25,21 +25,29 @@ use crate::buffer::AtomicBuffer;
 /// `length` must be greater than zero and no greater than the size of the file
 /// behind `fd`, and `fd` must be open for the duration of the call. The
 /// returned mapping must be unmapped exactly once with the same `length`.
-unsafe fn mmap_readonly(fd: i32, length: usize) -> io::Result<*const u8> {
+unsafe fn mmap_impl(fd: i32, length: usize, writable: bool) -> io::Result<*const u8> {
+    // The protection follows the mode the caller asked for. The reference
+    // chooses between the same two at `aeron_fileutil.c:839`, and its write
+    // path (`aeron_context_request_driver_termination`) takes the writable one.
+    let protection = if writable {
+        libc::PROT_READ | libc::PROT_WRITE
+    } else {
+        libc::PROT_READ
+    };
+
     // SAFETY: the caller guarantees `length` is non-zero and within the file,
     // so the kernel's length check cannot turn a caller error into memory
     // unsafety; every other argument is kernel-validated. `MAP_SHARED` rather
-    // than `MAP_PRIVATE` is load-bearing: the CnC file is written by another
-    // process while we read it, and `MAP_PRIVATE` would hand us a
-    // copy-on-write snapshot that never sees those writes. The reference makes
-    // the same choice at `aeron_fileutil.c:828` (`flags = MAP_SHARED`) with
-    // `PROT_READ` for the read-only case at `:839`. Failure is reported only as
+    // than `MAP_PRIVATE` is load-bearing either way: the CnC file is written by
+    // another process while we use it, and `MAP_PRIVATE` would hand us a
+    // copy-on-write snapshot that never sees those writes — the reference makes
+    // the same choice at `aeron_fileutil.c:828`. Failure is reported only as
     // `MAP_FAILED`.
     let addr = unsafe {
         libc::mmap(
             std::ptr::null_mut::<c_void>(),
             length,
-            libc::PROT_READ,
+            protection,
             libc::MAP_SHARED,
             fd,
             0,
@@ -60,6 +68,15 @@ unsafe fn mmap_readonly(fd: i32, length: usize) -> io::Result<*const u8> {
 pub struct MappedFile {
     addr: *const u8,
     len: usize,
+    /// Whether this mapping was taken with write access. Tracked as a value
+    /// rather than encoded in the type because the one caller that needs both
+    /// modes — the CnC reader, which validates a file and then, for the command
+    /// path, writes a record into it — would otherwise have to be generic over
+    /// a distinction it rarely cares about. The cost is that
+    /// [`MappedFile::region_mut`] returns `None` on a read-only mapping instead
+    /// of failing to compile; the benefit is that a mistaken call cannot fault
+    /// on a read-only page.
+    writable: bool,
 }
 
 impl MappedFile {
@@ -70,7 +87,30 @@ impl MappedFile {
     /// Fails if the file cannot be opened or stat-ed, if it is empty, if its
     /// length does not fit in a `usize`, or if the mapping itself fails.
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
+        Self::open_with(path, false)
+    }
+
+    /// Open `path` and map it read-write, shared with every other process.
+    ///
+    /// The CnC command path needs this — a client writes a record into the
+    /// to-driver ring — and the reference maps the file read-write for exactly
+    /// that reason (`aeron-client/src/main/c/aeron_context.c:587`). Prefer
+    /// [`MappedFile::open_readonly`] everywhere else: a read-only mapping is
+    /// the one a bug cannot corrupt, and it is what every reader uses.
+    ///
+    /// # Errors
+    ///
+    /// As [`MappedFile::open_readonly`], plus a permission failure if the file
+    /// or the filesystem is not writable.
+    pub fn open_readwrite(path: &Path) -> io::Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, writable: bool) -> io::Result<Self> {
+        // The descriptor's own access mode has to match the mapping's: a
+        // read-only fd cannot produce a `PROT_WRITE` mapping.
+        let file = File::options().read(true).write(writable).open(path)?;
+
         let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -89,10 +129,14 @@ impl MappedFile {
         // the duration of this call, and `len` came from `metadata()` on that
         // same file, which establishes both that it is non-zero and that it is
         // within the file's size. Those are exactly the preconditions
-        // `mmap_readonly` documents.
-        let addr = unsafe { mmap_readonly(file.as_raw_fd(), len)? };
+        // `mmap_impl` documents.
+        let addr = unsafe { mmap_impl(file.as_raw_fd(), len, writable)? };
 
-        Ok(Self { addr, len })
+        Ok(Self {
+            addr,
+            len,
+            writable,
+        })
     }
 
     /// A checked window into the mapping, for reading through atomics.
@@ -120,6 +164,35 @@ impl MappedFile {
         // 8-byte aligned exactly when `offset` is; `from_raw` checks that and
         // rejects otherwise.
         unsafe { AtomicBuffer::from_raw(self.addr.add(offset), len) }
+    }
+
+    /// A checked **writable** window into the mapping.
+    ///
+    /// Returns `None` if the range is out of bounds, off the 8-byte grid, or if
+    /// this mapping was taken read-only — so a mistaken call is a `None`, not a
+    /// fault on a read-only page. The window is the only way to write into a
+    /// mapping; there is no `as_mut_slice`, for the same reason there is no
+    /// `as_slice` (see [`crate::buffer`]).
+    pub fn region_mut(&self, offset: usize, len: usize) -> Option<AtomicBuffer<'_, ReadWrite>> {
+        if !self.writable {
+            return None;
+        }
+        if offset.checked_add(len)? > self.len {
+            return None;
+        }
+
+        // SAFETY: the range was just proven to lie inside a mapping this
+        // process holds with write access, and `base + offset` stays valid for
+        // the returned window's borrow — which is `&self`'s — because the
+        // mapping is unmapped only in `Drop`, and `Drop` takes `&mut self`.
+        // The base is page-aligned by construction, so `base + offset` is
+        // 8-byte aligned exactly when `offset` is; `from_raw_mut` checks that.
+        unsafe { AtomicBuffer::from_raw_mut(self.addr.cast_mut().add(offset), len) }
+    }
+
+    /// Whether this mapping may be written through.
+    pub const fn is_writable(&self) -> bool {
+        self.writable
     }
 
     /// Length of the mapping in bytes.

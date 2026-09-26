@@ -20,6 +20,7 @@ use crate::error::CncError;
 use crate::error_log::ErrorLogReader;
 use crate::layout;
 use crate::metadata::{CncMetadata, RegionLayout};
+use crate::ring::ToDriverRing;
 
 /// Name of the CnC file inside an aeron directory
 /// (`aeron-client/src/main/java/io/aeron/CncFileDescriptor.java:6`).
@@ -103,8 +104,28 @@ impl CncFile {
     /// Retryable outcomes are returned rather than looped on, so that a caller
     /// watching a child process can poll both. [`CncFile::open`] is the loop.
     pub fn try_open(aeron_dir: &Path) -> Result<Self, CncOpenError> {
+        Self::try_open_with(aeron_dir, false)
+    }
+
+    /// Open `<aeron_dir>/cnc.dat` read-write, for the command path.
+    ///
+    /// Same validation as [`CncFile::try_open`] — a client that cannot read a
+    /// file has no business writing to it — with a mapping that
+    /// [`CncFile::to_driver_ring`] can hand out a writable window over. Nothing
+    /// else about the type changes: a `CncFile` opened this way still refuses
+    /// to expose a writable window for any region but the command ring.
+    pub fn try_open_writable(aeron_dir: &Path) -> Result<Self, CncOpenError> {
+        Self::try_open_with(aeron_dir, true)
+    }
+
+    fn try_open_with(aeron_dir: &Path, writable: bool) -> Result<Self, CncOpenError> {
         let path = aeron_dir.join(CNC_FILE_NAME);
-        let mapping = MappedFile::open_readonly(&path).map_err(CncOpenError::Io)?;
+        let mapping = if writable {
+            MappedFile::open_readwrite(&path)
+        } else {
+            MappedFile::open_readonly(&path)
+        }
+        .map_err(CncOpenError::Io)?;
 
         // Strictly greater: a file of exactly the metadata length has no room
         // for a region. The reference uses the same comparison
@@ -227,6 +248,23 @@ impl CncFile {
             .region(self.layout.error_log.start, self.layout.error_log.len())?;
 
         Some(ErrorLogReader::new(buffer))
+    }
+
+    /// A producer over the to-driver command ring.
+    ///
+    /// `None` if this file was opened read-only — the window is writable or it
+    /// is not, and a read-only mapping returned here would fault on the first
+    /// store — or if the region cannot be a ring at all.
+    ///
+    /// `deepmsg-codec`, `deepmsg-client` and `deepmsg-archive` all forbid
+    /// `unsafe`, and this is how they get to write a command without needing
+    /// it: the window is built where the mapping's mode is known.
+    pub fn to_driver_ring(&self) -> Option<ToDriverRing<'_>> {
+        let region = self
+            .mapping
+            .region_mut(self.layout.to_driver.start, self.layout.to_driver.len())?;
+
+        ToDriverRing::new(region)
     }
 
     /// The to-driver ring's consumer heartbeat, epoch milliseconds.
