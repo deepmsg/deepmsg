@@ -100,6 +100,25 @@ pub struct CncFile {
 }
 
 impl CncFile {
+    /// Assemble a `CncFile` from a mapping this crate created.
+    ///
+    /// Crate-private on purpose: the only caller is [`CncFile::create`], and it
+    /// has already decoded the bytes it wrote and laid the regions out over
+    /// them. This is the last step of that validation, not a way around it.
+    pub(crate) fn from_parts(
+        mapping: MappedFile,
+        metadata: CncMetadata,
+        layout: RegionLayout,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            mapping,
+            metadata,
+            layout,
+            path,
+        }
+    }
+
     /// Open `<aeron_dir>/cnc.dat` once.
     ///
     /// Retryable outcomes are returned rather than looped on, so that a caller

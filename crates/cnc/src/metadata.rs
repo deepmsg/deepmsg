@@ -80,6 +80,70 @@ impl CncMetadata {
             file_page_size: le_i32(block, layout::FILE_PAGE_SIZE_OFFSET),
         })
     }
+
+    /// Write this metadata into a snapshot block.
+    ///
+    /// The inverse of [`CncMetadata::decode`], and the whole of the writer's
+    /// side except the release store that publishes it: the reference fills
+    /// every field plainly and only then stores `cnc_version`
+    /// (`aeron-driver/src/main/c/aeron_driver.c:250-269`, then `:972`), so
+    /// `cnc_version` here is written like any other field and the caller
+    /// decides when it becomes visible. [`crate::CncFile::create`] writes the
+    /// block with the version still zero and publishes afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`CncError::FileTooShort`] if `block` is shorter than the metadata
+    /// region — the same bound `decode` applies, for the same reason: 52 bytes
+    /// is the struct, 128 is what a block has to be.
+    pub fn encode(&self, block: &mut [u8]) -> Result<(), CncError> {
+        if block.len() < layout::VERSION_AND_METADATA_LENGTH {
+            return Err(CncError::FileTooShort {
+                length: block.len(),
+            });
+        }
+
+        put_i32(block, layout::CNC_VERSION_OFFSET, self.cnc_version);
+        put_i32(
+            block,
+            layout::TO_DRIVER_BUFFER_LENGTH_OFFSET,
+            self.to_driver_buffer_length,
+        );
+        put_i32(
+            block,
+            layout::TO_CLIENTS_BUFFER_LENGTH_OFFSET,
+            self.to_clients_buffer_length,
+        );
+        put_i32(
+            block,
+            layout::COUNTER_METADATA_BUFFER_LENGTH_OFFSET,
+            self.counter_metadata_buffer_length,
+        );
+        put_i32(
+            block,
+            layout::COUNTER_VALUES_BUFFER_LENGTH_OFFSET,
+            self.counter_values_buffer_length,
+        );
+        put_i32(
+            block,
+            layout::ERROR_LOG_BUFFER_LENGTH_OFFSET,
+            self.error_log_buffer_length,
+        );
+        put_i64(
+            block,
+            layout::CLIENT_LIVENESS_TIMEOUT_OFFSET,
+            self.client_liveness_timeout_ns,
+        );
+        put_i64(
+            block,
+            layout::START_TIMESTAMP_OFFSET,
+            self.start_timestamp_ms,
+        );
+        put_i64(block, layout::PID_OFFSET, self.pid);
+        put_i32(block, layout::FILE_PAGE_SIZE_OFFSET, self.file_page_size);
+
+        Ok(())
+    }
 }
 
 /// Where each region of the file lives.
@@ -245,6 +309,19 @@ fn le_i64(block: &[u8], offset: usize) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
+/// Write a little-endian `i32` into a snapshot.
+///
+/// Indexing is safe because every caller has already established that the
+/// block is at least as long as the metadata region.
+fn put_i32(block: &mut [u8], offset: usize, value: i32) {
+    block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write a little-endian `i64` into a snapshot.
+fn put_i64(block: &mut [u8], offset: usize, value: i64) {
+    block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,59 +347,10 @@ mod tests {
         f(&mut metadata);
 
         let mut block = [0u8; layout::VERSION_AND_METADATA_LENGTH];
-        put_i32(&mut block, layout::CNC_VERSION_OFFSET, metadata.cnc_version);
-        put_i32(
-            &mut block,
-            layout::TO_DRIVER_BUFFER_LENGTH_OFFSET,
-            metadata.to_driver_buffer_length,
-        );
-        put_i32(
-            &mut block,
-            layout::TO_CLIENTS_BUFFER_LENGTH_OFFSET,
-            metadata.to_clients_buffer_length,
-        );
-        put_i32(
-            &mut block,
-            layout::COUNTER_METADATA_BUFFER_LENGTH_OFFSET,
-            metadata.counter_metadata_buffer_length,
-        );
-        put_i32(
-            &mut block,
-            layout::COUNTER_VALUES_BUFFER_LENGTH_OFFSET,
-            metadata.counter_values_buffer_length,
-        );
-        put_i32(
-            &mut block,
-            layout::ERROR_LOG_BUFFER_LENGTH_OFFSET,
-            metadata.error_log_buffer_length,
-        );
-        put_i64(
-            &mut block,
-            layout::CLIENT_LIVENESS_TIMEOUT_OFFSET,
-            metadata.client_liveness_timeout_ns,
-        );
-        put_i64(
-            &mut block,
-            layout::START_TIMESTAMP_OFFSET,
-            metadata.start_timestamp_ms,
-        );
-        put_i64(&mut block, layout::PID_OFFSET, metadata.pid);
-        put_i32(
-            &mut block,
-            layout::FILE_PAGE_SIZE_OFFSET,
-            metadata.file_page_size,
-        );
+        metadata
+            .encode(&mut block)
+            .expect("the block is exactly one metadata region");
         block
-    }
-
-    /// Write a little-endian `i32` into a block under construction.
-    fn put_i32(block: &mut [u8], offset: usize, value: i32) {
-        block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    /// Write a little-endian `i64` into a block under construction.
-    fn put_i64(block: &mut [u8], offset: usize, value: i64) {
-        block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     /// The length a well-formed file would have.
@@ -351,6 +379,32 @@ mod tests {
         assert_eq!(1_700_000_000_000, metadata.start_timestamp_ms);
         assert_eq!(4242, metadata.pid);
         assert_eq!(4096, metadata.file_page_size);
+    }
+
+    #[test]
+    fn encode_then_decode_is_the_identity() {
+        let original = CncMetadata::decode(&block_with(|m| {
+            m.to_driver_buffer_length = 999_992;
+            m.error_log_buffer_length = 5 * 1024 * 1024;
+        }))
+        .expect("decode");
+
+        let mut block = [0u8; layout::VERSION_AND_METADATA_LENGTH];
+        original.encode(&mut block).expect("encode");
+
+        assert_eq!(Ok(original), CncMetadata::decode(&block));
+    }
+
+    #[test]
+    fn encode_refuses_a_block_shorter_than_the_region() {
+        let mut block = [0u8; layout::METADATA_STRUCT_LENGTH];
+        let metadata = CncMetadata::decode(&block_with(|_| {})).expect("decode");
+
+        assert_eq!(
+            Err(CncError::FileTooShort { length: 52 }),
+            metadata.encode(&mut block),
+            "the same bound decode applies, and the same reason"
+        );
     }
 
     #[test]
