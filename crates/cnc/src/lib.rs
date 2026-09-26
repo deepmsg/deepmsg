@@ -28,6 +28,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod broadcast;
 pub mod command;
 pub mod counters;
 pub mod error;
@@ -37,6 +38,7 @@ pub mod layout;
 pub mod metadata;
 pub mod ring;
 
+pub use broadcast::{Received, ToClientsReceiver};
 pub use command::{MAX_TOKEN_LENGTH, TERMINATE_DRIVER_TYPE_ID, TerminateDriver};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use error::{CncError, Region};

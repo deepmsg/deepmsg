@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 use deepmsg_core::version::{self, CncVersionCompatibility};
 
@@ -248,6 +249,35 @@ impl CncFile {
             .region(self.layout.error_log.start, self.layout.error_log.len())?;
 
         Some(ErrorLogReader::new(buffer))
+    }
+
+    /// A read-only window over the to-clients broadcast region.
+    ///
+    /// Rebuilt per call rather than held. A window is a pointer and a length,
+    /// so this costs nothing, and handing one out for the client's whole life
+    /// would make a self-referential type out of it — the receiver's *state*
+    /// lives in the client, the ring does not.
+    pub fn to_clients_region(&self) -> Option<AtomicBuffer<'_, ReadOnly>> {
+        self.mapping
+            .region(self.layout.to_clients.start, self.layout.to_clients.len())
+    }
+
+    /// A **writable** view over the counters, for a client's own heartbeat.
+    ///
+    /// `None` on a read-only file, as [`CncFile::to_driver_ring`] is: the
+    /// ability to write follows from how the file was opened, not from which
+    /// method was called.
+    pub fn counters_writable(&self) -> Option<CountersReader<'_, ReadWrite>> {
+        let metadata = self.mapping.region_mut(
+            self.layout.counters_metadata.start,
+            self.layout.counters_metadata.len(),
+        )?;
+        let values = self.mapping.region_mut(
+            self.layout.counters_values.start,
+            self.layout.counters_values.len(),
+        )?;
+
+        Some(CountersReader::new(metadata, values))
     }
 
     /// A producer over the to-driver command ring.

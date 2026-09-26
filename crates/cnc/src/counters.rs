@@ -9,7 +9,7 @@
 //! `aeron-client/src/main/c/concurrent/aeron_counters_manager.c:284-321`
 //! exactly, including the parts that look like bugs and are not.
 
-use deepmsg_core::buffer::AtomicBuffer;
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 
 use crate::layout;
 
@@ -49,21 +49,25 @@ pub struct CounterScan {
     pub unknown_state: u32,
 }
 
-/// A read-only view over the two counter regions.
-pub struct CountersReader<'a> {
-    metadata: AtomicBuffer<'a>,
-    values: AtomicBuffer<'a>,
+/// A view over the two counter regions.
+///
+/// Read-only by default, and writable only when built from writable memory —
+/// the same access level as the windows it holds, so a reader cannot acquire
+/// the ability to write by asking for a different constructor.
+pub struct CountersReader<'a, Access = ReadOnly> {
+    metadata: AtomicBuffer<'a, Access>,
+    values: AtomicBuffer<'a, Access>,
     max_counter_id: i32,
 }
 
-impl<'a> CountersReader<'a> {
+impl<'a, Access> CountersReader<'a, Access> {
     /// Pair the two regions up.
     ///
     /// A trailing partial value record is ignored rather than rejected: the
     /// reference derives the same ceiling by integer division
     /// (`aeron_counters_manager.h:170`), and a partial record cannot be a
     /// counter that was ever allocated.
-    pub fn new(metadata: AtomicBuffer<'a>, values: AtomicBuffer<'a>) -> Self {
+    pub fn new(metadata: AtomicBuffer<'a, Access>, values: AtomicBuffer<'a, Access>) -> Self {
         #[allow(clippy::cast_possible_truncation)] // a region length, bounded by i32::MAX
         let max_counter_id = (values.len() / layout::COUNTER_VALUE_LENGTH) as i32 - 1;
 
@@ -120,6 +124,26 @@ impl<'a> CountersReader<'a> {
         }
 
         scan
+    }
+
+    /// The id of the counter with this type id **and** this registration id.
+    ///
+    /// How a client finds its own heartbeat counter: the driver allocates it
+    /// with type `11` and the client's id as the registration
+    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:994-1006`), and the
+    /// reference finds it the same way
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1337-1340`).
+    pub fn find_by_type_and_registration(&self, type_id: i32, registration_id: i64) -> Option<i32> {
+        let mut found = None;
+        self.for_each(|counter| {
+            if found.is_none()
+                && counter.type_id == type_id
+                && counter.registration_id == registration_id
+            {
+                found = Some(counter.counter_id);
+            }
+        });
+        found
     }
 
     /// The first allocated counter with this type id.
@@ -187,6 +211,39 @@ impl<'a> CountersReader<'a> {
                 .load_i64_relaxed(value_offset + layout::COUNTER_REFERENCE_ID_OFFSET)?,
             label: String::from_utf8_lossy(&label).into_owned(),
         })
+    }
+}
+
+/// `AERON_COUNTER_CLIENT_HEARTBEAT_TIMESTAMP_TYPE_ID`
+/// (`aeron-client/src/main/c/aeron_counters.h:98`).
+///
+/// One per client, allocated when the driver first sees that client's
+/// `client_id`, with the client id as its registration id. A client writes it
+/// to stay alive: the driver reaps a client — and destroys every subscription
+/// it owns — once the counter's age exceeds `aeron.client.liveness.timeout`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1038-1055`).
+pub const CLIENT_HEARTBEAT_TYPE_ID: i32 = 11;
+
+/// The write half, available only on counters built from writable memory.
+impl<'a> CountersReader<'a, ReadWrite> {
+    /// Write a counter's value.
+    ///
+    /// Release, matching `aeron_counter_set_release`: the driver reads these
+    /// with an acquire when it decides whether a client is still alive.
+    ///
+    /// A client writes its heartbeat counter directly rather than sending a
+    /// `CLIENT_KEEPALIVE` command — that is what the reference does
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1345-1387`), and the
+    /// driver would ignore the command anyway for a client it has not yet seen
+    /// (`aeron_driver_conductor.c:5271-5278`).
+    pub fn set_value(&self, counter_id: i32, value: i64) -> Option<()> {
+        if counter_id < 0 || counter_id > self.max_counter_id {
+            return None;
+        }
+
+        let offset = counter_id as usize * layout::COUNTER_VALUE_LENGTH;
+        self.values
+            .store_i64_release(offset + layout::COUNTER_VALUE_OFFSET, value)
     }
 }
 

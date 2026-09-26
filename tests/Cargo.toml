@@ -38,6 +38,12 @@ path = "integration/cnc_fixture.rs"
 name = "cnc_terminate"
 path = "integration/cnc_terminate.rs"
 
+# The client's matching loop against fabricated replies. Runs in CI, which the
+# interop suite cannot.
+[[test]]
+name = "client_round_trip"
+path = "integration/client_round_trip.rs"
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"
@@ -48,6 +54,13 @@ required-features = ["interop"]
 [[test]]
 name = "c_driver_terminate"
 path = "interop/c_driver_terminate.rs"
+required-features = ["interop"]
+
+# The command/response loop: add a subscription, match its ready response, and
+# prove the keepalive keeps the client alive.
+[[test]]
+name = "c_driver_client"
+path = "interop/c_driver_client.rs"
 required-features = ["interop"]
 
 [lints]
