@@ -34,9 +34,11 @@ pub mod error_log;
 pub mod file;
 pub mod layout;
 pub mod metadata;
+pub mod ring;
 
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use error::{CncError, Region};
 pub use error_log::{ErrorLogEntry, ErrorLogReader, ErrorLogScan};
 pub use file::{CNC_FILE_NAME, CncFile, CncOpenError, RETRY_INTERVAL};
 pub use metadata::{CncMetadata, RegionLayout};
+pub use ring::{ClaimError, ToDriverRing};
