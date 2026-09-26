@@ -16,6 +16,7 @@
 
 pub mod conductor;
 pub mod config;
+pub mod dir;
 pub mod flowcontrol;
 pub mod loss;
 pub mod media;
