@@ -13,9 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install the pinned toolchain and CI's components
+        # rust-toolchain.toml pins the channel and `cargo` resolves to it, so
+        # rustfmt and clippy have to be installed *for that channel*. Installing
+        # components on the default stable toolchain instead is what made every
+        # run fail with "'cargo-fmt' is not installed for the toolchain '1.95.0'".
+        # Reading the channel from the file keeps the version in one place.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --component rustfmt --component clippy --no-self-update
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
