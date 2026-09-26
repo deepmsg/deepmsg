@@ -43,12 +43,19 @@
 //! written by another process, so the access must be atomic even when it needs
 //! no ordering of its own.
 //!
-//! # What is deliberately absent
+//! # The write half
 //!
-//! There are no store or read-modify-write accessors. Nothing in P0-a writes to
-//! a CnC file, and unwritten unsafe is unreviewable unsafe; the writer's half
-//! of this API belongs to the change that has a writer, and to a `// SAFETY:`
-//! comment written by someone who can reason about that writer.
+//! Stores and read-modify-write accessors arrived with the first writer — the
+//! CnC command ring. They were absent while nothing wrote, and deliberately so:
+//! unwritten unsafe is unreviewable unsafe, and the `// SAFETY:` comment for a
+//! store belongs to whoever can reason about the reader it publishes to.
+//!
+//! The paired orderings matter as much as the values do. A publisher that
+//! release-stores a length *after* filling a record is telling a reader the
+//! bytes are complete; a reader that acquire-loads that length is accepting
+//! that promise. Getting the pairing wrong is the bug this module exists to
+//! make visible at the call site — which is why the accessors are named after
+//! the ordering rather than after the C macro they mirror.
 //!
 //! Every `unsafe` block here carries a `// SAFETY:` comment naming the
 //! invariant and the ordering rationale; clippy `undocumented_unsafe_blocks`
@@ -70,25 +77,45 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 /// and adding those impls is a claim about how the *borrowed* memory may be
 /// shared, which belongs to whatever change needs it. Nothing in P0-a shares
 /// one across threads.
-pub struct AtomicBuffer<'a> {
+/// Marker: this window cannot be written through.
+///
+/// The default, so that `AtomicBuffer<'_>` keeps meaning "read-only" and no
+/// existing signature had to change when the write half arrived.
+pub struct ReadOnly;
+
+/// Marker: this window may be written through.
+///
+/// Produced only by a writable mapping — see [`crate::pal`] — so the ability to
+/// write is a property of where the bytes came from, not of a flag someone
+/// passed.
+pub struct ReadWrite;
+
+pub struct AtomicBuffer<'a, Access = ReadOnly> {
     base: *const u8,
     len: usize,
     /// Ties the window to the borrow of the bytes behind it. `&[u8]` rather
     /// than `&()` so the variance is the one a reader of bytes expects.
     _borrow: PhantomData<&'a [u8]>,
+    /// Ties the window to its access level. Without this, `Access` would be an
+    /// unused parameter and the two windows would be the same type.
+    _access: PhantomData<Access>,
 }
 
-impl<'a> AtomicBuffer<'a> {
-    /// A view over a byte slice.
+impl<'a> AtomicBuffer<'a, ReadOnly> {
+    /// A read-only view over a byte slice.
     ///
     /// Takes `&'a [u8]` and not a raw pointer on purpose: a safe borrow
     /// already proves the bytes are valid for `'a`, so the only thing left to
     /// check is alignment. This is also the constructor that makes the
     /// accessors testable under miri, which cannot map a file.
     ///
+    /// Returns [`ReadOnly`] and not `Access`: a shared borrow of bytes is not a
+    /// licence to write them, so this can never produce a window with the write
+    /// methods on it.
+    ///
     /// Returns `None` if the slice does not start on an 8-byte boundary, which
     /// is what the widest accessor needs.
-    pub fn from_slice(region: &'a [u8]) -> Option<Self> {
+    pub fn from_slice(region: &'a [u8]) -> Option<AtomicBuffer<'a, ReadOnly>> {
         // SAFETY: `region` is a live borrow for `'a`, so its pointer is
         // non-null and `len` bytes are readable for at least that long, which
         // is the whole of what `from_raw` requires beyond the alignment check
@@ -106,18 +133,30 @@ impl<'a> AtomicBuffer<'a> {
     /// the memory will not be unmapped or freed in that window — which is why
     /// the only in-crate caller is `pal`, where a mapping's `Drop` guarantees
     /// it.
-    pub(crate) unsafe fn from_raw(base: *const u8, len: usize) -> Option<Self> {
-        if base.is_null() || 0 != base.align_offset(8) {
-            return None;
-        }
+    pub(crate) unsafe fn from_raw(
+        base: *const u8,
+        len: usize,
+    ) -> Option<AtomicBuffer<'a, ReadOnly>> {
+        build(base, len)
+    }
+}
 
-        Some(Self {
-            base,
-            len,
-            _borrow: PhantomData,
-        })
+/// The shared construction path, so both access levels check the same things —
+/// null, and the 8-byte base alignment the widest slot needs.
+fn build<'a, Access>(base: *const u8, len: usize) -> Option<AtomicBuffer<'a, Access>> {
+    if base.is_null() || 0 != base.align_offset(8) {
+        return None;
     }
 
+    Some(AtomicBuffer {
+        base,
+        len,
+        _borrow: PhantomData,
+        _access: PhantomData,
+    })
+}
+
+impl<'a, Access> AtomicBuffer<'a, Access> {
     /// Length of the window in bytes.
     pub const fn len(&self) -> usize {
         self.len
@@ -218,7 +257,121 @@ impl<'a> AtomicBuffer<'a> {
     }
 }
 
-impl std::fmt::Debug for AtomicBuffer<'_> {
+/// The write half, available only on windows built from writable memory.
+///
+/// The reference reaches for sequential consistency here — `lock xaddq` for the
+/// correlation counter (`aeron-client/src/main/c/concurrent/aeron_atomic64_gcc_x86_64.h:52-63`)
+/// and `__sync_bool_compare_and_swap`/`atomic_compare_exchange_strong` for the
+/// tail position (`concurrent/aeron_mpsc_rb.c:97-100`) — so these use
+/// `Ordering::SeqCst` rather than the lighter `AcqRel`. On x86-64 they compile
+/// to the same instruction; on a weaker architecture the faithfulness is worth
+/// more than the fence, because the ring's correctness argument is written in
+/// terms of the reference's primitives.
+impl<'a> AtomicBuffer<'a, ReadWrite> {
+    /// A writable view over memory this process does not exclusively own.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be non-null, valid for reads and writes of `len` bytes for
+    /// as long as the returned value lives, and the caller is responsible for
+    /// knowing it will not be unmapped or freed in that window. The memory must
+    /// actually be writable by this process — a read-only mapping handed here
+    /// would fault on the first store. [`crate::pal`] is the only caller, and
+    /// it knows which mapping mode it took.
+    pub(crate) unsafe fn from_raw_mut(
+        base: *mut u8,
+        len: usize,
+    ) -> Option<AtomicBuffer<'a, ReadWrite>> {
+        build(base.cast_const(), len)
+    }
+
+    /// A writable view over a byte slice this process owns exclusively.
+    ///
+    /// Safe, unlike [`AtomicBuffer::from_raw_mut`]: an `&'a mut [u8]` already
+    /// proves both that the bytes are valid for `'a` and that nothing else in
+    /// this process can alias them. Cross-process aliasing is the problem that
+    /// constructor exists for, and it is what `pal`'s mappings carry.
+    ///
+    /// Returns `None` if the slice does not start on an 8-byte boundary.
+    pub fn from_slice_mut(region: &'a mut [u8]) -> Option<AtomicBuffer<'a, ReadWrite>> {
+        build(region.as_mut_ptr().cast_const(), region.len())
+    }
+
+    /// Store a 4-byte field the reference writes without an ordering of its
+    /// own, because a later release on a neighbouring field publishes it.
+    ///
+    /// Atomic all the same. The bytes are shared with another process, so a
+    /// plain store would be a data race, not a faster store.
+    pub fn store_i32_relaxed(&self, offset: usize, value: i32) -> Option<()> {
+        self.slot_i32(offset)?.store(value, Ordering::Relaxed);
+        Some(())
+    }
+
+    /// Store a 4-byte field under `AERON_SET_RELEASE`.
+    pub fn store_i32_release(&self, offset: usize, value: i32) -> Option<()> {
+        self.slot_i32(offset)?.store(value, Ordering::Release);
+        Some(())
+    }
+
+    /// Store an 8-byte field under `AERON_SET_RELEASE`.
+    pub fn store_i64_release(&self, offset: usize, value: i64) -> Option<()> {
+        self.slot_i64(offset)?.store(value, Ordering::Release);
+        Some(())
+    }
+
+    /// Compare and exchange an 8-byte field.
+    ///
+    /// `Some(true)` if it held `expected` and now holds `new`; `Some(false)` if
+    /// it held something else, in which case the caller re-reads and retries —
+    /// which is exactly the shape of the ring's claim loop. `None` if the
+    /// offset is out of bounds or misaligned.
+    pub fn compare_exchange_i64(&self, offset: usize, expected: i64, new: i64) -> Option<bool> {
+        Some(
+            self.slot_i64(offset)?
+                .compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+        )
+    }
+
+    /// Add to an 8-byte field, returning the value it held **before**.
+    ///
+    /// Mirrors `AERON_GET_AND_ADD_INT64`, whose previous-value return is what
+    /// makes it usable as an id allocator.
+    pub fn fetch_add_i64(&self, offset: usize, value: i64) -> Option<i64> {
+        Some(self.slot_i64(offset)?.fetch_add(value, Ordering::SeqCst))
+    }
+
+    /// Copy bytes into the window, or `None` if the range is out of bounds.
+    ///
+    /// The counterpart of [`AtomicBuffer::copy_out`] and the same reasoning in
+    /// reverse: a variable-length record has no single atomic access, so a
+    /// publisher fills it and *then* publishes the length with a release. That
+    /// release is what makes these bytes visible to a reader which
+    /// acquire-loads the length — the copy on its own publishes nothing.
+    pub fn copy_in(&self, offset: usize, src: &[u8]) -> Option<()> {
+        if offset.checked_add(src.len())? > self.len {
+            return None;
+        }
+
+        // SAFETY: the range was just proven to be inside the window, and `src`
+        // is a distinct live allocation, so source and destination cannot
+        // overlap. The window is writable by construction — this method only
+        // exists on a window built from a writable mapping — and the caller
+        // publishes these bytes with a release afterwards, which is what a
+        // reader synchronises with.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                self.base.add(offset).cast_mut(),
+                src.len(),
+            );
+        }
+
+        Some(())
+    }
+}
+
+impl<Access> std::fmt::Debug for AtomicBuffer<'_, Access> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicBuffer")
             .field("base", &format_args!("{:p}", self.base))
@@ -347,19 +500,112 @@ mod tests {
         // unit test gets to the cross-process case; the ordering itself is
         // what `Acquire`/`Release` mean, and is asserted here by behaviour
         // rather than by tooling -- loom cannot see a foreign process either.
-        let bytes = Aligned([0u8; 64]);
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+            assert_eq!(Some(0), writer.load_i64_acquire(0));
+            // Release, the ordering a publisher would use.
+            assert_eq!(Some(()), writer.store_i64_release(0, 1234));
+        }
+
+        // A separate read view, and the exclusive borrow is gone by now — the
+        // same shape a reader in another process sees.
         let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
-        let writer = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
-
-        assert_eq!(Some(0), view.load_i64_acquire(0));
-
-        // SAFETY-free path: reach the slot through the crate-internal slot
-        // accessor and store with Release, the ordering a publisher would use.
-        writer
-            .slot_i64(0)
-            .expect("8-aligned, in bounds")
-            .store(1234, Ordering::Release);
-
         assert_eq!(Some(1234), view.load_i64_acquire(0));
+    }
+
+    #[test]
+    fn stores_land_where_a_reader_expects_them() {
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+            assert_eq!(Some(()), writer.store_i32_release(0, 42));
+            assert_eq!(Some(()), writer.store_i32_relaxed(4, -7));
+            assert_eq!(Some(()), writer.store_i64_release(8, i64::MIN));
+        }
+
+        let reader = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
+        assert_eq!(Some(42), reader.load_i32_acquire(0));
+        assert_eq!(Some(-7), reader.load_i32_relaxed(4));
+        assert_eq!(Some(i64::MIN), reader.load_i64_acquire(8));
+    }
+
+    #[test]
+    fn stores_refuse_bad_offsets_rather_than_writing_past_the_window() {
+        let mut bytes = Aligned([0u8; 64]);
+        let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+
+        assert_eq!(None, writer.store_i64_release(64, 1), "at the end");
+        assert_eq!(None, writer.store_i64_release(60, 1), "60..68 runs past it");
+        assert_eq!(None, writer.store_i64_release(4, 1), "off the 8-byte grid");
+        assert_eq!(None, writer.store_i32_release(2, 1), "off the 4-byte grid");
+        assert_eq!(
+            None,
+            writer.store_i32_release(usize::MAX, 1),
+            "offset arithmetic must not wrap"
+        );
+    }
+
+    #[test]
+    fn compare_and_exchange_reports_whether_it_swapped() {
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+            assert_eq!(
+                Some(false),
+                writer.compare_exchange_i64(0, 1, 2),
+                "it held 0, not the expected 1, so nothing was swapped"
+            );
+            assert_eq!(Some(true), writer.compare_exchange_i64(0, 0, 99));
+            assert_eq!(
+                Some(false),
+                writer.compare_exchange_i64(0, 0, 1),
+                "the previous call left 99 there"
+            );
+        }
+
+        let reader = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
+        assert_eq!(Some(99), reader.load_i64_acquire(0));
+    }
+
+    #[test]
+    fn fetch_add_returns_the_value_it_replaced() {
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+            // The previous value, which is what makes this usable as an id
+            // allocator: the first caller gets 0 and the second gets 1, even
+            // though the field already reads 1 by the time the second returns.
+            assert_eq!(Some(0), writer.fetch_add_i64(0, 1));
+            assert_eq!(Some(1), writer.fetch_add_i64(0, 1));
+            assert_eq!(Some(2), writer.fetch_add_i64(0, 100));
+        }
+
+        let reader = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
+        assert_eq!(Some(102), reader.load_i64_acquire(0));
+    }
+
+    #[test]
+    fn copies_bytes_in_where_a_read_view_finds_them() {
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+            assert_eq!(Some(()), writer.copy_in(3, b"hello"));
+            assert_eq!(
+                None,
+                writer.copy_in(60, b"does not fit in the tail"),
+                "a copy that runs past the window must not be attempted"
+            );
+        }
+
+        let reader = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
+        let mut out = [0u8; 5];
+        assert_eq!(Some(()), reader.copy_out(3, &mut out));
+        assert_eq!(b"hello", &out);
     }
 }
