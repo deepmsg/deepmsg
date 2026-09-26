@@ -19,8 +19,9 @@ ordinary safe code.
    `libc`, which is FFI and permitted by README principle 2.
 2. `deepmsg-core::buffer` — atomic views over shared memory,
 3. `deepmsg-cnc` — CnC file layout access,
-4. `deepmsg-driver` media syscall shim (`sys`, when it appears: sendmmsg /
-   recvmmsg and friends) — under an explicit, documented `#[allow]`.
+4. `deepmsg-driver` syscall shim (`sys`): the process's signal seam today, and
+   the media syscalls (`sendmmsg` / `recvmmsg` and friends) when the data
+   plane arrives — under an explicit, documented `#[allow]`.
 
 `pal` and `buffer` are separate zones because they sit on different axes:
 `pal` is platform-specific address-space bookkeeping, one implementation per
@@ -62,3 +63,14 @@ Within the zones:
   `PROT_READ | MAP_SHARED` because a reader must observe the driver's later
   writes, and the write half of the accessor set stays unwritten until
   something actually writes to a CnC file.
+- **2026-09-26** — zone 4 has its first occupant, and it is not the one the
+  zone was written for: `deepmsg-driver::sys` installs a `SIGINT`/`SIGTERM`
+  handler, because a driver process has to be stoppable from outside and
+  `libc::signal` takes a C function pointer. The zone's *name* is broadened
+  from "media syscall shim" to "syscall shim" rather than opening a fifth zone
+  for one `signal(2)`: the axis that decides a zone is *whose boundary it is*
+  — here, the kernel's interface to this process — and signals and `recvmmsg`
+  are the same boundary. The handler does one atomic store and nothing else,
+  which is the whole discipline the zone needs: an async-signal-safe handler
+  may not allocate, lock, or block. Zone 3 (`deepmsg-cnc`) still contains no
+  `unsafe` at all, and the point of naming it was that it did not have to.
