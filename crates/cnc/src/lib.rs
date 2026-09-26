@@ -47,4 +47,4 @@ pub use error::{CncError, Region};
 pub use error_log::{ErrorLogEntry, ErrorLogReader, ErrorLogScan};
 pub use file::{CNC_FILE_NAME, CncFile, CncOpenError, RETRY_INTERVAL};
 pub use metadata::{CncMetadata, RegionLayout};
-pub use ring::{ClaimError, ToDriverRing};
+pub use ring::{ClaimError, ToDriverRing, ToDriverRingConsumer};

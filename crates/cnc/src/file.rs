@@ -316,6 +316,20 @@ impl CncFile {
         ToDriverRing::new(region)
     }
 
+    /// The whole to-driver region, writable — the driver's side of the ring.
+    ///
+    /// The producer's view is [`CncFile::to_driver_ring`], which is what a
+    /// client takes; this is the bare region, which is what
+    /// [`crate::ToDriverRingConsumer`] needs. That type holds no borrow — its
+    /// cursor is `head_position` in the trailer — so a driver can own the
+    /// `CncFile` and still consume from it, taking the window per call.
+    ///
+    /// `None` on a read-only mapping, exactly as [`CncFile::to_driver_ring`] is.
+    pub fn to_driver_region(&self) -> Option<AtomicBuffer<'_, ReadWrite>> {
+        self.mapping
+            .region_mut(self.layout.to_driver.start, self.layout.to_driver.len())
+    }
+
     /// The to-driver ring's consumer heartbeat, epoch milliseconds.
     ///
     /// This is the field the reference reads to decide liveness — there is no
