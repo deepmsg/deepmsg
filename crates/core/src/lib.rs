@@ -6,7 +6,7 @@
 //! versioning. It carries no protocol knowledge of its own.
 //!
 //! Unsafe policy (ADR-0002): `unsafe` is confined to named zones — here,
-//! only [`buffer`] — and every other crate in the workspace forbids it
+//! [`buffer`] and [`pal`] — and every other crate in the workspace forbids it
 //! outright.
 
 pub mod buffer;
@@ -14,5 +14,6 @@ pub mod concurrent;
 pub mod counters;
 pub mod error;
 pub mod logbuffer;
+pub mod pal;
 pub mod uri;
 pub mod version;

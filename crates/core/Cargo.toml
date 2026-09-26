@@ -8,3 +8,10 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# The platform seam (`pal`) needs the raw `mmap`/`munmap` calls. `libc` is
+# preferred over a memory-mapping wrapper because it is nothing but `extern
+# "C"` declarations: the mapping logic stays inside ADR-0002's audited zone
+# rather than arriving pre-written and unreviewed. See `docs/adr/0002`.
+libc = "0.2"
