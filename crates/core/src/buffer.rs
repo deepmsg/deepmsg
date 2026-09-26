@@ -285,6 +285,27 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         build(base.cast_const(), len)
     }
 
+    /// A read-only window on the same bytes, with the same lifetime.
+    ///
+    /// Narrowing, so it cannot fail and cannot introduce an access the holder
+    /// did not already have. The lifetime is the *original* borrow's, not the
+    /// borrow of `self`, which is what makes it usable: a caller holding one
+    /// exclusive borrow of a region can take a writable window and a read-only
+    /// one from it at the same time, and hand the second to something that
+    /// should not be able to write.
+    ///
+    /// The CnC client is exactly that caller — the same mapping carries the
+    /// command ring it writes and the event ring it only reads — and so is a
+    /// test playing both ends of a ring.
+    pub fn as_read_only(&self) -> AtomicBuffer<'a, ReadOnly> {
+        AtomicBuffer {
+            base: self.base,
+            len: self.len,
+            _borrow: PhantomData,
+            _access: PhantomData,
+        }
+    }
+
     /// A writable view over a byte slice this process owns exclusively.
     ///
     /// Safe, unlike [`AtomicBuffer::from_raw_mut`]: an `&'a mut [u8]` already
