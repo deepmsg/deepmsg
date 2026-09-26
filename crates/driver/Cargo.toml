@@ -9,6 +9,14 @@ rust-version.workspace = true
 [dependencies]
 deepmsg-core = { path = "../core" }
 deepmsg-cnc = { path = "../cnc" }
+# The signal seam, and later the media syscall shim. ADR-0002 zone 4 belongs
+# to this crate, and `sys` is the module that holds it.
+libc = "0.2"
+
+[dev-dependencies]
+# The lifecycle test drives the driver with the client P0 proved against the
+# reference driver: a known-good peer, not a second unknown.
+deepmsg-client = { path = "../client" }
 
 [lints]
 workspace = true

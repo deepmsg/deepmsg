@@ -5,15 +5,24 @@ A from-scratch Rust implementation of the
 driver and archive — built for low-latency trading workloads and byte-level
 compatibility with Aeron **1.53.2**.
 
-Status: **P0 complete** (see `docs/roadmap.md`). The client talks to the
-reference C `aeronmd` 1.53.2 for real: it negotiates the CnC file, keeps
-itself alive, and moves payloads over `aeron:ipc` through a log buffer the
-driver created — see `tests/interop/c_driver_pubsub.rs`. The media driver
-(P1) is next; there is no Rust driver yet, so the reference `aeronmd` is
-still what everything runs against. Premium features (Cluster Standby and
-friends) are explicitly out of scope for now; the seams they need (cluster
-schemas, reserved counter ids, the `crates/cluster` placeholder) are
-preserved so they can be added later without rework.
+Status: **P0 complete, P1 in progress** (see `docs/roadmap.md`).
+
+P0: the client talks to the reference C `aeronmd` 1.53.2 for real — it
+negotiates the CnC file, keeps itself alive, and moves payloads over
+`aeron:ipc` through a log buffer the driver created
+(`tests/interop/c_driver_pubsub.rs`).
+
+P1-0: `deepmsg-driver` is a media driver. It creates the CnC file — byte for
+byte what a real driver writes, compared against a capture from one in
+`tests/integration/cnc_create.rs` — runs the conductor's duty cycle, answers a
+client with the client P0 proved, and stops cleanly on command, on a signal, or
+by reclaiming a dead driver's directory. Counter allocation, the to-clients
+broadcast and the UDP data plane are the slices after it.
+
+Premium features (Cluster Standby and friends) are explicitly out of scope for
+now; the seams they need (cluster schemas, reserved counter ids, the
+`crates/cluster` placeholder) are preserved so they can be added later without
+rework.
 
 Principles:
 

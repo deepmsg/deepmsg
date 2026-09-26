@@ -464,6 +464,36 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
 
         Some(())
     }
+
+    /// Write zeroes over `len` bytes starting at `offset`.
+    ///
+    /// The MPSC consumer's obligation rather than an optimisation: the
+    /// reference zeroes what it consumed *before* it publishes `head_position`
+    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:236-238`), and the
+    /// producer's claim path is written against that — freshly claimed space is
+    /// assumed to start zero, and a stale positive record length left behind
+    /// would look to the next claim like a record that is already published.
+    ///
+    /// # Errors
+    ///
+    /// `None` if the range is out of bounds.
+    pub fn zero(&self, offset: usize, len: usize) -> Option<()> {
+        if offset.checked_add(len)? > self.len {
+            return None;
+        }
+
+        // SAFETY: the range was just proven to be inside a window this process
+        // holds with write access — the method exists only on `ReadWrite` — and
+        // writing zeroes is an ordinary write to those bytes. `write_bytes`
+        // requires only a valid, non-overlapping destination, which a range
+        // inside the window is; the value written makes no demands on what was
+        // there before.
+        unsafe {
+            std::ptr::write_bytes(self.base.add(offset).cast_mut(), 0, len);
+        }
+
+        Some(())
+    }
 }
 
 impl<Access> std::fmt::Debug for AtomicBuffer<'_, Access> {

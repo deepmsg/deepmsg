@@ -34,3 +34,20 @@ Rules:
   tracks cross-component versions only.
 - Changing anything in this table without extending the interop suite first
   is a review-blocking offence.
+
+## Configuration names
+
+The driver reads the reference's settings under both spellings: the property
+name the reference documents, and deepmsg's prefix for the same name — so
+`aeron.dir` and `deepmsg.dir` are the same setting, as a `-D` argument or in
+the environment (`AERON_DIR` / `DEEPMSG_DIR`). Deepmsg's own spelling wins,
+then its environment variable, then the reference's, which is the order a
+one-off override wants. The suffixes are the reference's, including the three
+environment names that are *not* the property name in capitals:
+`aeron.to.conductor.buffer.length` is `AERON_CONDUCTOR_BUFFER_LENGTH`
+(`aeronmd.h:97`), not `AERON_TO_CONDUCTOR_BUFFER_LENGTH`. A deployment's
+existing configuration therefore works unchanged, which is the point.
+
+The table is `crates/driver/src/config.rs`, and its tests pin every name; the
+one divergence is recorded there too — the reference warns and clamps a value
+it cannot parse, and this refuses.

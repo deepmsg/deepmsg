@@ -61,7 +61,41 @@ unsafe fn mmap_impl(fd: i32, length: usize, writable: bool) -> io::Result<*const
     Ok(addr.cast::<u8>().cast_const())
 }
 
-/// A read-only, shared mapping of a file, unmapped on drop.
+/// Allocate `length` bytes of real space for `fd`.
+///
+/// Private for the same reason [`mmap_impl`] is: it is only ever the second
+/// half of [`MappedFile::create`], and nothing else needs raw allocation.
+///
+/// `posix_fallocate` reports failure as a return value instead of through
+/// `errno`, which is why this is a function rather than an inline call.
+fn allocate(fd: i32, length: usize) -> io::Result<()> {
+    let length = libc::off_t::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "length does not fit in an off_t",
+        )
+    })?;
+
+    // SAFETY: `fd` is open for the duration of the call and was just created by
+    // `MappedFile::create`, so the range starts at the file's beginning and
+    // covers nothing that another process could be holding. The call only
+    // reserves space; the bytes it reserves read as zero, which is what makes
+    // the zero-fill guarantee a kernel property rather than an assumption about
+    // what was on the disk before.
+    let rc = unsafe { libc::posix_fallocate(fd, 0, length) };
+
+    if 0 != rc {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+
+    Ok(())
+}
+
+/// A shared mapping of a file, unmapped on drop.
+///
+/// Created read-only, read-write, or as a brand-new file of a given length;
+/// the mode is fixed at construction and [`MappedFile::is_writable`] reports
+/// which one this is.
 ///
 /// This is the safe face of the seam: nothing above it needs to know about
 /// `mmap`, and nothing above it can pick the wrong flags.
@@ -104,6 +138,78 @@ impl MappedFile {
     /// or the filesystem is not writable.
     pub fn open_readwrite(path: &Path) -> io::Result<Self> {
         Self::open_with(path, true)
+    }
+
+    /// Create `path` at exactly `length` bytes and map it read-write, shared.
+    ///
+    /// Exclusive by construction: an existing file is an error rather than
+    /// something to overwrite, which is what the reference asks the kernel for
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:967` opens
+    /// `O_RDWR|O_CREAT|O_EXCL`). A caller that has to cope with a leftover file
+    /// — a media driver finding a stale aeron directory — deletes it
+    /// deliberately, in the open, rather than by accident here.
+    ///
+    /// The length is *allocated*, not merely declared, and that is deliberate:
+    /// the reference fills with zeroes for the CnC file
+    /// (`aeron-driver/src/main/c/aeron_driver.c:313` passes `true`), which
+    /// selects a non-sparse file (`aeron_fileutil.c:1135`, where the flag is
+    /// inverted) and then touches every page (`aeron_fileutil.c:1123-1132`).
+    /// `posix_fallocate` standing in for `fallocate` (`:985`) is the same
+    /// bargain: space that reads as zero, and no page-fault storm when a client
+    /// first writes forty megabytes into the counters region.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file already exists, if it cannot be created or allocated,
+    /// or if the mapping itself fails. A file this call created and then
+    /// abandoned is removed before returning, so no partial `cnc.dat` is left
+    /// behind.
+    pub fn create(path: &Path, length: usize) -> io::Result<Self> {
+        if 0 == length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to create a zero-length mapping",
+            ));
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+
+        // The two halves of "the file is there and it is really there": space,
+        // then size. On Linux the first usually implies the second; the
+        // reference separates them the same way (`aeron_fileutil.c:985` then
+        // `:1015`), and a mapping taken over a short file would be a fault
+        // waiting for the first reader.
+        let prepared =
+            allocate(file.as_raw_fd(), length).and_then(|()| file.set_len(length as u64));
+        if let Err(error) = prepared {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+
+        // SAFETY: `file` is open, so `as_raw_fd` yields a live descriptor for
+        // the duration of this call, and `length` was just allocated and
+        // declared on that same file, which establishes that it is non-zero and
+        // within the file's size. Those are exactly the preconditions
+        // `mmap_impl` documents.
+        let addr = match unsafe { mmap_impl(file.as_raw_fd(), length, true) } {
+            Ok(addr) => addr,
+            Err(error) => {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            addr,
+            len: length,
+            writable: true,
+        })
     }
 
     fn open_with(path: &Path, writable: bool) -> io::Result<Self> {
@@ -190,6 +296,41 @@ impl MappedFile {
         unsafe { AtomicBuffer::from_raw_mut(self.addr.cast_mut().add(offset), len) }
     }
 
+    /// Flush the mapping to durable storage.
+    ///
+    /// `MAP_SHARED` already makes writes visible to every other process without
+    /// this call. What it adds is durability, and the reference makes the same
+    /// distinction: it writes the ready version and then calls `aeron_msync`
+    /// over the whole CnC file (`aeron-driver/src/main/c/aeron_driver.c:973`),
+    /// so a reader that attaches *because* the version appeared cannot find a
+    /// `cnc.dat` that is ready in memory and absent after a crash.
+    ///
+    /// # Errors
+    ///
+    /// The underlying `msync` error, if any. Callers that are publishing a
+    /// readiness signal should treat a failure as fatal; the rest can ignore
+    /// it, because the bytes are already shared.
+    pub fn sync(&self) -> io::Result<()> {
+        // SAFETY: `addr` and `len` describe a live mapping owned by `self` and
+        // are passed to `msync` unchanged, which is the pairing that call
+        // requires. `mmap` chose the base, so it is page-aligned as `msync`
+        // demands, and `len` is non-zero because no constructor of this type
+        // accepts zero.
+        let rc = unsafe {
+            libc::msync(
+                self.addr.cast_mut().cast::<c_void>(),
+                self.len,
+                libc::MS_SYNC,
+            )
+        };
+
+        if 0 != rc {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
     /// Whether this mapping may be written through.
     pub const fn is_writable(&self) -> bool {
         self.writable
@@ -242,15 +383,19 @@ mod tests {
     struct TempFile(std::path::PathBuf);
 
     impl TempFile {
-        fn with_bytes(bytes: &[u8]) -> Self {
+        /// A path in the temp directory that no file occupies yet.
+        fn vacant() -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("deepmsg-pal-{}-{n}.bin", std::process::id()));
-            let mut file = File::create(&path).expect("create temp file");
+            Self(std::env::temp_dir().join(format!("deepmsg-pal-{}-{n}.bin", std::process::id())))
+        }
+
+        fn with_bytes(bytes: &[u8]) -> Self {
+            let temp = Self::vacant();
+            let mut file = File::create(&temp.0).expect("create temp file");
             file.write_all(bytes).expect("write temp file");
             file.sync_all().expect("sync temp file");
-            Self(path)
+            temp
         }
     }
 
@@ -315,6 +460,98 @@ mod tests {
         let path = std::env::temp_dir().join("deepmsg-pal-does-not-exist");
         let error = MappedFile::open_readonly(&path).expect_err("missing file must fail");
         assert_eq!(io::ErrorKind::NotFound, error.kind());
+    }
+
+    #[test]
+    fn creates_a_zero_filled_file_of_the_requested_length() {
+        let temp = TempFile::vacant();
+        let mapped = MappedFile::create(&temp.0, 8192).expect("create");
+
+        assert_eq!(8192, mapped.len());
+        assert!(mapped.is_writable());
+
+        // Space, not just a declared size: the file is its full length on disk
+        // before anything writes to it, which is what keeps the first write
+        // into a 46 MB counter region from faulting a page per 4 KB.
+        assert_eq!(8192, std::fs::metadata(&temp.0).expect("stat").len());
+
+        let mut head = [1u8; 8];
+        mapped
+            .region(0, 8)
+            .expect("region")
+            .copy_out(0, &mut head)
+            .expect("copy");
+        assert_eq!([0u8; 8], head, "a freshly created file reads as zero");
+
+        let mut tail = [1u8; 8];
+        mapped
+            .region(8184, 8)
+            .expect("region")
+            .copy_out(0, &mut tail)
+            .expect("copy");
+        assert_eq!([0u8; 8], tail, "and so does its last page");
+    }
+
+    #[test]
+    fn a_created_mapping_can_be_written_through() {
+        let temp = TempFile::vacant();
+        let mapped = MappedFile::create(&temp.0, 4096).expect("create");
+
+        assert_eq!(
+            Some(()),
+            mapped
+                .region_mut(64, 8)
+                .expect("writable window")
+                .store_i64_release(0, 0x0102_0304_0506_0708)
+        );
+        assert_eq!(
+            Some(0x0102_0304_0506_0708),
+            mapped.region(64, 8).expect("window").load_i64_acquire(0)
+        );
+    }
+
+    #[test]
+    fn refuses_to_create_over_an_existing_file() {
+        let temp = TempFile::with_bytes(b"already here");
+
+        let error = MappedFile::create(&temp.0, 64).expect_err("must not clobber");
+
+        assert_eq!(io::ErrorKind::AlreadyExists, error.kind());
+        assert_eq!(
+            b"already here".as_slice(),
+            std::fs::read(&temp.0).expect("read").as_slice(),
+            "and the file it refused to touch is untouched"
+        );
+    }
+
+    #[test]
+    fn refuses_a_zero_length_create() {
+        let temp = TempFile::vacant();
+
+        let error = MappedFile::create(&temp.0, 0).expect_err("zero is not a length");
+
+        assert_eq!(io::ErrorKind::InvalidInput, error.kind());
+        assert!(!temp.0.exists(), "and it leaves no file behind");
+    }
+
+    #[test]
+    fn sync_puts_a_write_on_the_device() {
+        // The mapping is shared either way, so this is not about visibility. It
+        // is about the file the driver hands a client: what `sync` adds is that
+        // reading the file through a second path — a fresh `open`, after a
+        // crash — sees the write too.
+        let temp = TempFile::vacant();
+        let mapped = MappedFile::create(&temp.0, 4096).expect("create");
+
+        mapped
+            .region_mut(0, 8)
+            .expect("window")
+            .store_i64_release(0, 42)
+            .expect("store");
+        mapped.sync().expect("sync");
+
+        let bytes = std::fs::read(&temp.0).expect("read");
+        assert_eq!(&42i64.to_le_bytes(), &bytes[0..8]);
     }
 
     #[test]

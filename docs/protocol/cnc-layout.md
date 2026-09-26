@@ -85,6 +85,44 @@ little-endian.
 A file of exactly 128 bytes is not enough: the reference requires *strictly*
 more (`aeron_cnc_file_descriptor.c:70,88`).
 
+## Who creates it
+
+Only a media driver creates a CnC file. The reference has no client-side
+creation path: `aeron_cnc_length` is a function of the *driver's* context
+(`aeron-driver/src/main/c/aeron_driver_context.c:1690`), and a client only
+ever maps a file that is already there (`aeron-client/src/main/c/aeron_context.c:220`
+unmaps the one it was handed). A client that finds an aeron directory with no
+`cnc.dat` in it is looking at a dead driver, not at a job to do.
+
+Creation is exclusive — `open(O_RDWR|O_CREAT|O_EXCL, 0666)`
+(`aeron-client/src/main/c/util/aeron_fileutil.c:967`) — so a driver pointed at
+a directory another driver holds fails rather than sharing the file. What to
+do about that directory is decided *before* the create, by the driver's
+directory discipline (`aeron-driver/src/main/c/aeron_driver.c:136-235`): a
+heartbeat inside the driver timeout means `EBUSY`, and anything else means the
+directory is deleted and rebuilt.
+
+The length is allocated rather than merely declared: the CnC file is mapped
+with `fill_with_zeroes = true` (`aeron-driver.c:313`), which selects a
+non-sparse file (`aeron_fileutil.c:1135`) and then touches every page
+(`:1123-1132`). The fields are written plainly and the version is stored last
+with a release (`aeron-driver.c:972`), then the whole file is flushed (`:973`).
+deepmsg splits that into `CncFile::create` and `CncFile::publish`, because
+there is work that belongs between them: the driver writes its first heartbeat
+one line before the version (`:971`), and a client that passes the version
+gate must not then find a heartbeat of zero.
+
+Two rules bind a writer that a reader never has to know, because they are
+about the *ring* rather than the region. The to-driver capacity — the region
+length less its 768-byte trailer — must be a power of two, at least
+`AERON_MPSC_RB_MIN_CAPACITY`, and below `INT32_MAX`
+(`aeron-client/src/main/c/concurrent/aeron_rb.h:79-82`); the to-clients
+capacity — the region less its 128-byte trailer — must be a power of two
+(`concurrent/aeron_broadcast_descriptor.h:43`). A region length that is a
+round number of mebibytes fails both, and the reference reports it only later,
+from conductor init: `Invalid capacity: 2096384`
+(`concurrent/aeron_mpsc_rb.c:37`).
+
 ## Regions
 
 Five regions, contiguous, beginning immediately after the metadata region. No
