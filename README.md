@@ -5,9 +5,14 @@ A from-scratch Rust implementation of the
 driver and archive — built for low-latency trading workloads and byte-level
 compatibility with Aeron **1.53.2**.
 
-Status: **skeleton** (see `docs/roadmap.md`). Premium features (Cluster
-Standby and friends) are explicitly out of scope for now; the seams they need
-(cluster schemas, reserved counter ids, the `crates/cluster` placeholder) are
+Status: **P0 complete** (see `docs/roadmap.md`). The client talks to the
+reference C `aeronmd` 1.53.2 for real: it negotiates the CnC file, keeps
+itself alive, and moves payloads over `aeron:ipc` through a log buffer the
+driver created — see `tests/interop/c_driver_pubsub.rs`. The media driver
+(P1) is next; there is no Rust driver yet, so the reference `aeronmd` is
+still what everything runs against. Premium features (Cluster Standby and
+friends) are explicitly out of scope for now; the seams they need (cluster
+schemas, reserved counter ids, the `crates/cluster` placeholder) are
 preserved so they can be added later without rework.
 
 Principles:

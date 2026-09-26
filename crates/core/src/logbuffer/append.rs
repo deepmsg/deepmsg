@@ -53,6 +53,23 @@ pub enum Appended {
     /// The producer's window is used up. The caller waits for the driver to
     /// raise the limit.
     BackPressured,
+    /// Nobody is subscribed, so there is no window to write into.
+    ///
+    /// Distinct from [`Appended::BackPressured`] and produced the same way the
+    /// reference does: both mean "position is at or past the limit", and which
+    /// one it is comes from the log's `is_connected` byte
+    /// (`aeron-client/src/main/c/aeron_publication.h:76-95`). A caller that
+    /// conflates them reports "slow subscriber" for "no subscriber".
+    NotConnected,
+    /// The payload is larger than one frame, so the reference would split it
+    /// across several. **This port does not fragment yet**, and refuses rather
+    /// than writing one oversized frame — which would be a layout the reference
+    /// never produces, and invisible to any test that only reads back its own
+    /// writes.
+    NeedsFragmentation,
+    /// The payload is beyond `max_message_length`, which the reference refuses
+    /// too (`aeron_publication.c:515-524`).
+    MessageTooLarge,
     /// The metadata does not describe a usable log.
     Malformed,
 }
@@ -69,6 +86,11 @@ pub struct Appender<'a> {
     term_length: i32,
     initial_term_id: i32,
     bits_to_shift: u32,
+    /// `mtu_length - DATA_HEADER_LENGTH`: the largest payload that fits one
+    /// frame. Beyond it the reference fragments.
+    max_payload_length: usize,
+    /// `min(term_length / 8, 16 MiB)`: the largest message of any shape.
+    max_message_length: usize,
 }
 
 impl<'a> Appender<'a> {
@@ -90,13 +112,43 @@ impl<'a> Appender<'a> {
 
         let initial_term_id = metadata.load_i32(descriptor::INITIAL_TERM_ID_OFFSET)?;
 
+        // The MTU is what decides whether a payload fits one frame. A log with
+        // no MTU is not one the driver would have created — every publication
+        // gets one — so treat zero as refusing everything rather than as "no
+        // bound", which would silently write frames the reference fragments.
+        let mtu_length = metadata.load_i32(descriptor::MTU_LENGTH_OFFSET)?;
+        let max_payload_length = mtu_length.saturating_sub(DATA_HEADER_LENGTH as i32);
+        if max_payload_length <= 0 {
+            return None;
+        }
+
         Some(Self {
             metadata,
             term,
             term_length,
             initial_term_id,
             bits_to_shift,
+            #[allow(clippy::cast_sign_loss)]
+            max_payload_length: max_payload_length as usize,
+            #[allow(clippy::cast_sign_loss)]
+            max_message_length: position::max_message_length(term_length) as usize,
         })
+    }
+
+    /// Whether the driver considers this log connected to a subscriber.
+    ///
+    /// Read with **acquire**: the driver sets it with a release when a
+    /// subscription links (`aeron_ipc_publication.h:130-138`), and this is what
+    /// separates "nobody is listening" from "somebody is slow".
+    pub fn is_connected(&self) -> Option<bool> {
+        self.metadata
+            .load_i32_acquire(descriptor::IS_CONNECTED_OFFSET)
+            .map(|value| 1 == value)
+    }
+
+    /// The largest payload that fits a single frame.
+    pub const fn max_payload_length(&self) -> usize {
+        self.max_payload_length
     }
 
     /// The term length every offset here is relative to.
@@ -154,6 +206,15 @@ impl<'a> Appender<'a> {
         position_limit: i64,
         payload: &[u8],
     ) -> Appended {
+        // The reference's order, and it matters. The message cap is checked
+        // before anything is read (`aeron_publication.c:515-524`); then the
+        // limit; and only *then*, once the window is known to be exhausted, is
+        // the reason classified. Checking either size bound after the claim
+        // would leave a claimed span abandoned without a padding frame.
+        if payload.len() > self.max_message_length {
+            return Appended::MessageTooLarge;
+        }
+
         let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
             return Appended::Malformed;
         };
@@ -175,11 +236,27 @@ impl<'a> Appender<'a> {
         );
         let end_position = Position::from_raw(position.raw() + aligned_length as i64);
 
-        if end_position.raw() >= position::max_possible_position(self.term_length) {
-            return Appended::MaxPositionExceeded;
-        }
+        // At or past the limit means the offer does not happen at all — nothing
+        // is written and the tail does not move (`aeron_publication.h:76-95`).
+        // The classification is the reference's, in its order: an exhausted
+        // stream outranks a closed window, and whether anyone is listening
+        // decides between the other two.
         if position.raw() >= position_limit {
-            return Appended::BackPressured;
+            if end_position.raw() >= position::max_possible_position(self.term_length) {
+                return Appended::MaxPositionExceeded;
+            }
+
+            return match self.is_connected() {
+                Some(true) => Appended::BackPressured,
+                Some(false) => Appended::NotConnected,
+                None => Appended::Malformed,
+            };
+        }
+
+        // The window is open, so this is the first point at which the payload's
+        // *shape* can matter. Refused rather than written oversized.
+        if payload.len() > self.max_payload_length {
+            return Appended::NeedsFragmentation;
         }
 
         // Claim. The offset this returns is where *this* producer writes; the
@@ -453,6 +530,13 @@ mod tests {
                     .expect("in range");
                 meta.store_i32_relaxed(descriptor::INITIAL_TERM_ID_OFFSET, INITIAL_TERM_ID)
                     .expect("in range");
+                // A real log always has one: the driver writes the publication's
+                // MTU at creation, and without it no payload fits a frame.
+                meta.store_i32_relaxed(
+                    descriptor::MTU_LENGTH_OFFSET,
+                    descriptor::MTU_LENGTH_DEFAULT,
+                )
+                .expect("in range");
             }
 
             log
@@ -464,6 +548,15 @@ mod tests {
                 AtomicBuffer::from_slice_mut(&mut self.term.0).expect("aligned"),
             )
             .expect("a usable log")
+        }
+
+        /// Set the byte the reference uses to tell "slow subscriber" from "no
+        /// subscriber". In a real log the driver writes it.
+        fn set_connected(&mut self, connected: bool) {
+            let meta = AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned");
+            let value = i32::from(connected);
+            meta.store_i32_relaxed(descriptor::IS_CONNECTED_OFFSET, value)
+                .expect("in range");
         }
 
         /// Force the current partition's tail, standing in for a term that has
@@ -605,8 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn back_pressure_is_reported_rather_than_written_through() {
+    fn an_exhausted_window_is_reported_rather_than_written_through() {
         let mut log = Log::new();
+        log.set_connected(true);
+
         let appender = log.appender();
         appender
             .initialise_tails(initial_term_id())
@@ -624,6 +719,108 @@ mod tests {
             Step::NotReady { offset: 0 },
             log.first_step(),
             "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_closed_window_is_distinguished_from_a_slow_subscriber() {
+        // Both are "position is at the limit". The reference tells them apart
+        // with the log's `is_connected` byte and so does this, because a caller
+        // that conflates them waits for a subscriber that does not exist
+        // (`aeron-client/src/main/c/aeron_publication.h:76-95`).
+        let mut log = Log::new();
+        log.set_connected(false);
+
+        let appender = log.appender();
+        appender
+            .initialise_tails(initial_term_id())
+            .then_some(())
+            .expect("tails initialised");
+
+        assert_eq!(Some(false), appender.is_connected());
+        let outcome = appender.append(11, 22, 0, b"hello");
+        assert!(matches!(outcome, Appended::NotConnected), "got {outcome:?}");
+
+        // The same append with the window open goes through, so the difference
+        // above is the classification and not the limit.
+        let outcome = appender.append(11, 22, i64::MAX, b"hello");
+        assert!(matches!(outcome, Appended::Ok { .. }), "got {outcome:?}");
+    }
+
+    #[test]
+    fn a_payload_the_reference_would_fragment_is_refused_not_written_oversized() {
+        // The most dangerous possible bug in this module: one frame of 2000
+        // bytes where the reference writes two. Every test that reads back its
+        // own writes agrees with the wrong layout, and only a real subscriber
+        // or a captured buffer would notice.
+        let mut log = Log::new();
+        log.set_connected(true);
+
+        // Scoped: an appender borrows the log mutably, so the reader below
+        // cannot run while one is alive.
+        let max_payload = {
+            let appender = log.appender();
+            appender
+                .initialise_tails(initial_term_id())
+                .then_some(())
+                .expect("tails initialised");
+
+            let max_payload = appender.max_payload_length();
+            assert_eq!(
+                (descriptor::MTU_LENGTH_DEFAULT - DATA_HEADER_LENGTH as i32) as usize,
+                max_payload,
+                "one MTU less a data header"
+            );
+
+            let too_big = vec![0u8; max_payload + 1];
+            let outcome = appender.append(11, 22, i64::MAX, &too_big);
+            assert!(
+                matches!(outcome, Appended::NeedsFragmentation),
+                "got {outcome:?}"
+            );
+
+            max_payload
+        };
+
+        assert_eq!(
+            Step::NotReady { offset: 0 },
+            log.first_step(),
+            "nothing may be written for a payload this shape cannot carry"
+        );
+
+        // Exactly at the bound it still fits one frame.
+        {
+            let appender = log.appender();
+            let exact = vec![0u8; max_payload];
+            let outcome = appender.append(11, 22, i64::MAX, &exact);
+            assert!(matches!(outcome, Appended::Ok { .. }), "got {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_payload_beyond_max_message_length_is_refused_as_the_reference_does() {
+        let mut log = Log::new();
+        log.set_connected(true);
+
+        let appender = log.appender();
+        appender
+            .initialise_tails(initial_term_id())
+            .then_some(())
+            .expect("tails initialised");
+
+        // Beyond `term_length / 8`, which for a 64 KiB term is 8 KiB — and
+        // therefore also beyond what one frame holds. That both bounds are
+        // exceeded is the point: the message cap is checked first, so the
+        // answer is `MessageTooLarge` and not `NeedsFragmentation`
+        // (`aeron_publication.c:515-524`, before the append).
+        assert_eq!(8192, position::max_message_length(TERM_LENGTH));
+        assert!(8192 > appender.max_payload_length());
+
+        let oversized = vec![0u8; position::max_message_length(TERM_LENGTH) as usize + 1];
+        let outcome = appender.append(11, 22, i64::MAX, &oversized);
+        assert!(
+            matches!(outcome, Appended::MessageTooLarge),
+            "got {outcome:?}"
         );
     }
 
