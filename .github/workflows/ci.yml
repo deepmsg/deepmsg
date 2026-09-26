@@ -28,3 +28,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # The interop tests cannot *run* here — they need the reference driver
+      # from a sibling checkout — but they must still compile and lint, or a
+      # few hundred lines of test code would get no coverage at all until
+      # someone happens to run them locally. Neither of these needs `../aeron`.
+      - name: Compile the interop targets
+        run: cargo test -p deepmsg-tests --features interop --no-run
+      - name: Lint the interop targets
+        run: cargo clippy -p deepmsg-tests --all-targets --features interop -- -D warnings
