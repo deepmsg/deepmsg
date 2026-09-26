@@ -16,12 +16,16 @@ Principles:
    and the archive on-disk formats follow the 1.53.2 reference; the interop
    suite (`tests/interop`, feature `interop`) diffs against the reference
    implementation (ADR-0001).
-2. **Pure Rust, no async runtime, no FFI.** Threads with idle strategies,
+2. **Pure Rust by default, no async runtime.** Threads with idle strategies,
    mirroring the reference agent model; hot paths stay allocation-free
-   (ADR-0003).
-3. **Unsafe has an address.** Raw shared-memory access lives only in
-   `deepmsg-core::buffer`, `deepmsg-cnc`, and the driver's syscall shim
-   (ADR-0002); every other crate forbids it outright.
+   (ADR-0003). FFI is not a red line: the operating system's own interfaces are
+   reachable no other way, so `libc` carries the memory-mapping seam today and
+   the batching syscalls later, and a kernel-bypass transport would be FFI
+   throughout. Each use is an exception that names what it buys — never the
+   default, and never a substitute for a Rust implementation that would do.
+3. **Unsafe has an address.** Raw memory and syscall access lives only in
+   `deepmsg-core::pal`, `deepmsg-core::buffer`, `deepmsg-cnc`, and the
+   driver's syscall shim (ADR-0002); every other crate forbids it outright.
 
 ## Layout
 
