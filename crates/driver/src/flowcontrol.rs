@@ -1,6 +1,6 @@
 //! Sender-side flow-control strategies (M10).
 //!
-//! P1 scope, mirroring `aeron-driver/src/main/c/flow_control/`:
+//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_flow_control.c`:
 //!
 //! - `max` (unicast default), `min` (multicast, with the new-receiver
 //!   admission gate and setup-catchup window freeze), `tagged`,

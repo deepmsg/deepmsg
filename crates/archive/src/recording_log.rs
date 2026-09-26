@@ -8,4 +8,6 @@
 //! - appends advance from the 64-byte-aligned tail; restore rewrites
 //!   entries in place.
 //!
-//! Reference: `aeron-archive/src/main/java/io/aeron/archive/RecordingLog.java`.
+//! Reference: `aeron-cluster/src/main/java/io/aeron/cluster/RecordingLog.java`
+//! — the cluster module, not `aeron-archive`, whose own on-disk formats are
+//! `Catalog.java` and `ArchiveMarkFile.java`.
