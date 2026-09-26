@@ -16,8 +16,9 @@
 //! counter goes stale (`aeron.client.liveness.timeout`, 10 s by default). So
 //! [`Client::poll`] refreshes it, and a caller who stops polling loses
 //! everything the client created. There is no separate keepalive command to
-//! send: the reference writes the counter directly
-//! (`aeron-client/src/main/c/aeron_client_conductor.c:1345-1387`), and that is
+//! send: the reference writes the counter directly, in
+//! `aeron_client_conductor_check_liveness`
+//! (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`), and that is
 //! what this does.
 //!
 //! # One response per poll, and why that is load-bearing

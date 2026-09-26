@@ -232,9 +232,11 @@ impl<'a> CountersReader<'a, ReadWrite> {
     /// with an acquire when it decides whether a client is still alive.
     ///
     /// A client writes its heartbeat counter directly rather than sending a
-    /// `CLIENT_KEEPALIVE` command — that is what the reference does
-    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1345-1387`), and the
-    /// driver would ignore the command anyway for a client it has not yet seen
+    /// `CLIENT_KEEPALIVE` command — that is what the reference does, in
+    /// `aeron_client_conductor_check_liveness`
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`; the write
+    /// is the `aeron_counter_set_release` at `:1373`), and the driver would
+    /// ignore the command anyway for a client it has not yet seen
     /// (`aeron_driver_conductor.c:5271-5278`).
     pub fn set_value(&self, counter_id: i32, value: i64) -> Option<()> {
         if counter_id < 0 || counter_id > self.max_counter_id {
