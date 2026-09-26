@@ -32,6 +32,12 @@ path = "integration/termination_handshake.rs"
 name = "cnc_fixture"
 path = "integration/cnc_fixture.rs"
 
+# The termination preconditions, against synthetic CnC files. No driver needed,
+# so unlike `c_driver_basic` this one runs in CI.
+[[test]]
+name = "cnc_terminate"
+path = "integration/cnc_terminate.rs"
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"
