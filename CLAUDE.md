@@ -20,6 +20,19 @@ Interop tests additionally need the reference checkout (`docs/reference.md`):
 
 `just` wraps all of these (`just lint`, `just test`, `just interop`, …).
 
+## Branch discipline
+
+`main` is what the world clones, so **never commit to it directly**. Every
+change — a feature, a bug fix, a documentation edit, a config tweak — goes on
+a branch and lands through a pull request, so CI runs on it:
+
+    git switch -c <type>/<short-slug>     # feat/ fix/ docs/ chore/ refactor/
+    … commit …
+    git push -u origin <branch>
+    gh pr create --fill
+
+If a change looks too small to need a branch, it is still not too small.
+
 ## Non-negotiables
 
 Each rule has one authority. Read that file, not this table.
