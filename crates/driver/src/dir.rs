@@ -262,7 +262,7 @@ mod tests {
     /// — what a driver that ran and stopped, or is still running, leaves
     /// behind.
     fn cnc_with_heartbeat(dir: &Path, heartbeat_ms: i64) {
-        let cnc = CncFile::create(
+        let mut cnc = CncFile::create(
             dir,
             &layout(),
             &CncIdentity {
@@ -279,6 +279,10 @@ mod tests {
         consumer
             .write_consumer_heartbeat(&region, heartbeat_ms)
             .expect("write the heartbeat");
+
+        // The version last, as a driver publishes it: a file with a heartbeat
+        // and no version is not one this driver would read as a live peer.
+        cnc.publish().expect("publish");
     }
 
     #[test]

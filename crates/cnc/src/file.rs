@@ -17,6 +17,7 @@ use deepmsg_core::pal::MappedFile;
 use deepmsg_core::version::{self, CncVersionCompatibility};
 
 use crate::counters::CountersReader;
+use crate::create::CncCreateError;
 use crate::error::CncError;
 use crate::error_log::ErrorLogReader;
 use crate::layout;
@@ -117,6 +118,72 @@ impl CncFile {
             layout,
             path,
         }
+    }
+
+    /// Store the version — and with it, make the file readable.
+    ///
+    /// The one release store in the block, exactly where the reference puts it
+    /// (`aeron-driver/src/main/c/aeron_driver.c:972`, through the inline store
+    /// at `aeron_driver_context.h:456-459`), followed by the same flush
+    /// (`:973`).
+    ///
+    /// Taking `&mut self` is the point: what this type reports is what the file
+    /// holds, so a `CncFile` cannot claim to be published without having
+    /// published.
+    ///
+    /// # Errors
+    ///
+    /// [`CncCreateError::Io`] if the mapping cannot be flushed, or
+    /// [`CncCreateError::VersionNotPublished`] if the store does not read back
+    /// as a version this build accepts.
+    pub fn publish(&mut self) -> Result<(), CncCreateError> {
+        let head = self
+            .mapping
+            .region_mut(0, layout::VERSION_AND_METADATA_LENGTH)
+            .ok_or(CncCreateError::FileLengthTooLarge {
+                length: self.mapping.len(),
+            })?;
+
+        head.store_i32_release(
+            layout::CNC_VERSION_OFFSET,
+            deepmsg_core::version::CNC_VERSION,
+        )
+        .ok_or(CncCreateError::FileLengthTooLarge {
+            length: self.mapping.len(),
+        })?;
+        self.mapping.sync()?;
+
+        let read_back = head.load_i32_acquire(layout::CNC_VERSION_OFFSET).ok_or(
+            CncCreateError::FileLengthTooLarge {
+                length: self.mapping.len(),
+            },
+        )?;
+
+        if deepmsg_core::version::CncVersionCompatibility::Compatible
+            != deepmsg_core::version::check_cnc_version(read_back)
+        {
+            return Err(CncCreateError::VersionNotPublished { read_back });
+        }
+
+        self.metadata.cnc_version = read_back;
+
+        Ok(())
+    }
+
+    /// Flush the mapping to durable storage.
+    ///
+    /// The driver calls this after it writes something another process has to
+    /// be able to rely on: the ready version ([`CncFile::publish`]) and the
+    /// shutdown signal (`aeron-driver/src/main/c/aeron_driver_conductor.c:3494`,
+    /// after the heartbeat is set to `NULL_VALUE` at `:3493`). For a driver
+    /// about to exit, the second one is what the *next* driver reads to decide
+    /// whether this one is still alive.
+    ///
+    /// # Errors
+    ///
+    /// The underlying `msync` error, if any.
+    pub fn sync(&self) -> io::Result<()> {
+        self.mapping.sync()
     }
 
     /// Open `<aeron_dir>/cnc.dat` once.

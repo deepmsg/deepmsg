@@ -10,6 +10,7 @@
 //! outright.
 
 pub mod buffer;
+pub mod clock;
 pub mod concurrent;
 pub mod counters;
 pub mod error;

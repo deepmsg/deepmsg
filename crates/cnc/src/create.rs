@@ -22,11 +22,18 @@
 //! (`crate::file`), so this order is what lets the block be read as plain
 //! little-endian bytes rather than field by field.
 //!
-//! The reference has one more beat that we do not reproduce as a separate
-//! step: it publishes between *creating* the file and *starting its agent
-//! threads*. deepmsg has nothing to put in that gap yet, so [`CncFile::create`]
-//! publishes before it returns. The bytes a reader sees are the same either
-//! way; the gap is where the driver's threads will go when they exist.
+//! # Publishing is a step of its own
+//!
+//! [`CncFile::create`] leaves the version at zero and [`CncFile::publish`]
+//! stores it, because the version is the gate for *everything* in the block,
+//! not just for the fields written beside it. The reference puts work in that
+//! gap — the conductor, the sender and the receiver all start between the
+//! metadata being written and the version being stored — and one piece of that
+//! work is the first heartbeat on the to-driver ring
+//! (`aeron-driver/src/main/c/aeron_driver.c:971`, one line before the version
+//! at `:972`). A client that passes the version gate must not then find a
+//! heartbeat of zero and conclude the driver is dead, so the same gap has to
+//! exist here even though it is currently one call deep.
 
 use std::io;
 use std::path::Path;
@@ -384,11 +391,11 @@ impl CncFile {
     /// is called (`aeron-driver/src/main/c/aeron_driver.c:136-235`). Creating
     /// parents here would quietly make that decision for the caller.
     ///
-    /// The file is left mapped read-write and validated by the same code path a
-    /// reader uses, so a `CncFile` from here behaves exactly like one from
-    /// [`CncFile::try_open_writable`] — with one deliberate difference: reading
-    /// the version back is part of creating it, so this call is what turns a
-    /// zero version into a published one.
+    /// The file is left mapped read-write and its layout is validated by the
+    /// same code the reader uses, so a `CncFile` from here behaves exactly like
+    /// one from [`CncFile::try_open_writable`] — with one deliberate
+    /// difference: **the version is still zero**, because nothing may read the
+    /// block until [`CncFile::publish`] says so.
     ///
     /// # Errors
     ///
@@ -433,25 +440,20 @@ impl CncFile {
                 length: file_length,
             })?;
 
-        // Plain bytes for the fields, then the one release store for the
-        // version — the reference's order (`aeron_driver.c:250-269` then `:972`).
+        // Plain bytes for the fields, and no release store: the version stays
+        // zero until `publish`, which is what keeps this block unreadable
+        // while it is still being filled (`aeron_driver.c:250-269`).
         head.copy_in(0, &block)
             .ok_or(CncCreateError::FileLengthTooLarge {
                 length: file_length,
             })?;
-        head.store_i32_release(
-            layout::CNC_VERSION_OFFSET,
-            deepmsg_core::version::CNC_VERSION,
-        )
-        .ok_or(CncCreateError::FileLengthTooLarge {
-            length: file_length,
-        })?;
-        mapping.sync()?;
 
         // Read back what the mapping actually holds, with the reader's own
         // rules, rather than trusting the values we meant to write. Cheap (one
         // 128-byte copy) and it makes "create produced a file this build cannot
-        // open" unshippable rather than merely unlikely.
+        // lay out" unshippable rather than merely unlikely. The version is not
+        // checked here because it is deliberately still zero; `publish` is
+        // where it becomes a value, and where it is checked.
         let mut reread = [0u8; layout::VERSION_AND_METADATA_LENGTH];
         mapping
             .region(0, layout::VERSION_AND_METADATA_LENGTH)
@@ -461,13 +463,6 @@ impl CncFile {
             })?;
 
         let metadata = CncMetadata::decode(&reread).map_err(CncCreateError::NotReadable)?;
-        if deepmsg_core::version::CncVersionCompatibility::Compatible
-            != deepmsg_core::version::check_cnc_version(metadata.cnc_version)
-        {
-            return Err(CncCreateError::VersionNotPublished {
-                read_back: metadata.cnc_version,
-            });
-        }
         let region_layout =
             RegionLayout::compute(&metadata, file_length).map_err(CncCreateError::NotReadable)?;
 
@@ -484,6 +479,7 @@ fn as_i32(length: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file::CncOpenError;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -720,14 +716,26 @@ mod tests {
     }
 
     #[test]
-    fn creates_a_file_the_reader_accepts() {
+    fn creates_a_file_the_reader_accepts_once_it_is_published() {
         let dir = TempDir::new();
         let layout = small();
-        let created = CncFile::create(&dir.0, &layout, &identity()).expect("create");
+        let mut created = CncFile::create(&dir.0, &layout, &identity()).expect("create");
 
         assert_eq!(layout.file_length().expect("fit"), created.file_length());
-        assert_eq!(deepmsg_core::version::CNC_VERSION, created.cnc_version());
         assert!(created.to_driver_ring().is_some(), "read-write mapping");
+
+        // Created is not readable, and that is the gate doing its job: the
+        // version is still zero, so a reader must be told to retry rather than
+        // handed a block whose fields are still being filled.
+        assert_eq!(0, created.cnc_version());
+        assert!(matches!(
+            CncFile::try_open_writable(&dir.0),
+            Err(CncOpenError::NotReady)
+        ));
+
+        created.publish().expect("publish");
+
+        assert_eq!(deepmsg_core::version::CNC_VERSION, created.cnc_version());
 
         // The same file, through the path a client takes.
         let reopened = CncFile::try_open_writable(&dir.0).expect("reopen");
@@ -782,7 +790,10 @@ mod tests {
     #[test]
     fn a_second_driver_cannot_create_over_the_first() {
         let dir = TempDir::new();
-        CncFile::create(&dir.0, &small(), &identity()).expect("first");
+        CncFile::create(&dir.0, &small(), &identity())
+            .expect("first")
+            .publish()
+            .expect("publish");
 
         let error = CncFile::create(&dir.0, &small(), &identity()).expect_err("must not clobber");
 
@@ -791,6 +802,21 @@ mod tests {
         assert!(!matches!(error, CncCreateError::NotReadable(_)));
         assert_eq!(io::ErrorKind::AlreadyExists, io_error(&error).kind());
         assert!(CncFile::try_open_writable(&dir.0).is_ok());
+    }
+
+    #[test]
+    fn publishing_twice_is_just_the_same_store_twice() {
+        let dir = TempDir::new();
+        let mut created = CncFile::create(&dir.0, &small(), &identity()).expect("create");
+
+        created.publish().expect("first");
+        created.publish().expect("second");
+
+        assert_eq!(deepmsg_core::version::CNC_VERSION, created.cnc_version());
+        assert!(
+            CncFile::try_open_writable(&dir.0).is_ok(),
+            "the file is still the one this type describes"
+        );
     }
 
     #[test]
