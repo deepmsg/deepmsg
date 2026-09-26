@@ -1,0 +1,2 @@
+# Formatting is near-default by policy; anything set here must be deliberate.
+edition = "2024"

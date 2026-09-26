@@ -1,0 +1,14 @@
+[package]
+name = "deepmsg-driver"
+description = "deepmsg media driver: CnC owner and UDP data plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-core = { path = "../core" }
+deepmsg-cnc = { path = "../cnc" }
+
+[lints]
+workspace = true

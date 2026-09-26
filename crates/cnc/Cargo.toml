@@ -1,0 +1,13 @@
+[package]
+name = "deepmsg-cnc"
+description = "The CnC file contract: shared-memory interface between client and driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-core = { path = "../core" }
+
+[lints]
+workspace = true

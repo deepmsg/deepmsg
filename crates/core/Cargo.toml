@@ -1,0 +1,10 @@
+[package]
+name = "deepmsg-core"
+description = "Protocol-agnostic foundation shared by the deepmsg client and driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

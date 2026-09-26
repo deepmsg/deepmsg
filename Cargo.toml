@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cnc",
+    "crates/codec",
+    "crates/client",
+    "crates/driver",
+    "crates/archive",
+    "crates/tools",
+    "crates/bench",
+    "examples",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+# Workspace lint baseline (see docs/adr/0002-unsafe-policy.md).
+# `unsafe_code` is deliberately NOT set here: the crates that own the unsafe
+# boundary (deepmsg-core, deepmsg-cnc, and the driver's syscall shim) permit
+# it locally; every other crate forbids it at crate level.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -1,0 +1,15 @@
+[package]
+name = "deepmsg-archive"
+description = "deepmsg archive: recording, replay, replication and catalog (P2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-core = { path = "../core" }
+deepmsg-client = { path = "../client" }
+deepmsg-codec = { path = "../codec" }
+
+[lints]
+workspace = true

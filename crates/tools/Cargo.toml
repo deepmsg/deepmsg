@@ -1,0 +1,15 @@
+[package]
+name = "deepmsg-tools"
+description = "Operational tooling: CnC/error-log/recording-log inspection and live stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-core = { path = "../core" }
+deepmsg-cnc = { path = "../cnc" }
+deepmsg-archive = { path = "../archive" }
+
+[lints]
+workspace = true

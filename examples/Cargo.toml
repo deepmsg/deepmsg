@@ -1,0 +1,32 @@
+[package]
+name = "deepmsg-examples"
+description = "Runnable examples for the deepmsg client and archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+deepmsg-client = { path = "../crates/client" }
+
+# Example sources are top-level files (path = "<name>.rs") to avoid an
+# examples/examples/ nesting inside a workspace member named "examples".
+[[example]]
+name = "ping"
+path = "ping.rs"
+
+[[example]]
+name = "pong"
+path = "pong.rs"
+
+[[example]]
+name = "pub_sub"
+path = "pub_sub.rs"
+
+[[example]]
+name = "record_replay"
+path = "record_replay.rs"
+
+[lints]
+workspace = true

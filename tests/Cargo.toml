@@ -1,0 +1,34 @@
+[package]
+name = "deepmsg-tests"
+description = "Cross-crate integration and interop tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Tests that require the reference C driver from the Aeron 1.53.2 checkout
+# (see docs/reference.md for the expected sibling-directory layout).
+interop = []
+
+[dependencies]
+deepmsg-core = { path = "../crates/core" }
+deepmsg-client = { path = "../crates/client" }
+deepmsg-driver = { path = "../crates/driver" }
+
+[[test]]
+name = "basic_roundtrip"
+path = "integration/basic_roundtrip.rs"
+
+[[test]]
+name = "termination_handshake"
+path = "integration/termination_handshake.rs"
+
+[[test]]
+name = "c_driver_basic"
+path = "interop/c_driver_basic.rs"
+required-features = ["interop"]
+
+[lints]
+workspace = true

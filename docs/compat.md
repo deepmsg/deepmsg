@@ -1,0 +1,27 @@
+# Compatibility matrix
+
+deepmsg targets byte-level compatibility with Aeron **1.53.2** (ADR-0001).
+Every row below is a testable contract; a row counts as verified only when
+the interop suite (`tests/interop`, feature `interop`) or a golden byte test
+covers it.
+
+| Surface | Constant | Value | Reference source |
+|---|---|---|---|
+| CnC semantic version | `AERON_CNC_VERSION` | **0.2.0** | `aeron-client/src/main/c/aeron_cnc_file_descriptor.h:26` |
+| Archive protocol SBE | schema id / version | 101 / 14 (semanticVersion 5.2) | `schemas/aeron-archive-codecs.xml` |
+| Archive mark SBE | schema id / version | 100 / 2 (semanticVersion 5.2) | `schemas/aeron-archive-mark-codecs.xml` |
+| Cluster protocol SBE | schema id / version | 111 / 17 (semanticVersion 5.4) | `schemas/aeron-cluster-codecs.xml` |
+| Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
+| Cluster node-state SBE | schema id / version | 112 / 10 | `schemas/aeron-cluster-node-state-codecs.xml` |
+| Frame byte order | SBE `byteOrder` | little-endian; only the socket API converts (ports/addresses) | `schemas/*.xml` |
+| Archive `recording.log` | — | hand-rolled: 48-byte entries, INVALID bit 31, 64-byte alignment, no file header | `aeron-cluster/src/main/java/io/aeron/cluster/RecordingLog.java` |
+
+Rules:
+
+- A CnC file is accepted when the major component matches and the file's
+  minor is >= ours; a major mismatch is fatal (reference behaviour).
+- Wire-protocol constants (frame types, header layouts) live in
+  `deepmsg-core::logbuffer` and `docs/protocol/` once migrated; this file
+  tracks cross-component versions only.
+- Changing anything in this table without extending the interop suite first
+  is a review-blocking offence.

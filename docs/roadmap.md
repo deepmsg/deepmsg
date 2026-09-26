@@ -1,0 +1,19 @@
+# Roadmap
+
+Phases map to crates; acceptance is defined by the interop suite and the
+reference tooling, never by prose.
+
+| Phase | Scope (crates) | Acceptance | Reference sources |
+|---|---|---|---|
+| P0 | core, cnc, codec, client | deepmsg client against the reference C `aeronmd` 1.53.2: pub/sub roundtrip, counters, clean termination; CnC 0.2.0 negotiation verified | `aeron-client/src/main/c/` |
+| P1 | driver | pure-Rust end-to-end (deepmsg client + deepmsg driver); reference C client against deepmsg driver; latency baseline in bench | `aeron-driver/src/main/c/` |
+| P2 | archive | record one stream + replay + a catalog the reference Java `ArchiveTool` reads byte-identically | `aeron-archive/src/main/java/`, `aeron-archive/src/main/c/` |
+| P3 | cluster (placeholder) | out of scope for now; premium (Standby) deferred, seams preserved | `aeron-cluster/src/main/java/` |
+
+Cross-cutting gates that apply from day one:
+
+- `cargo clippy --workspace --all-targets -- -D warnings` stays clean.
+- No `unsafe` outside the zones listed in ADR-0002.
+- Schema drift vs `schemas/` must be reflected in `docs/compat.md`.
+- Every byte-level claim cites a reference source (file, with `:line` where
+  it matters).

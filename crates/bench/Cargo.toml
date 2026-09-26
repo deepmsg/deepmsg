@@ -1,0 +1,22 @@
+[package]
+name = "deepmsg-bench"
+description = "Micro-benchmarks and the latency harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+deepmsg-core = { path = "../core" }
+deepmsg-client = { path = "../client" }
+
+# Criterion and hdrhistogram land here with P0 (kept out until then so the
+# skeleton builds without network access).
+
+[[bench]]
+name = "micro"
+harness = false
+
+[lints]
+workspace = true
