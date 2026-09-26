@@ -36,3 +36,15 @@ it silently, since the shape of the mistake is the reusable part.
 - **There is no `aeron_dist/` directory** at 1.53.2. The distributed-log
   structures sit directly under `concurrent/` — ring buffers, concurrent
   queues, term scanners and rebuilder.
+
+## Auditing
+
+This file quotes the bad paths verbatim, so a repo-wide grep for upstream
+paths matches this file too. Exclude this directory when auditing, or the
+audit will appear to still be failing long after everything is fixed:
+
+    grep -rhoE '`aeron-[a-z]+/src/[^`]*`' --include="*.rs" --include="*.md" \
+         --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude .
+
+One trap in that command: `grep -h` suppresses file names, so filtering its
+*output* by path text excludes nothing. Filter by directory, as above.

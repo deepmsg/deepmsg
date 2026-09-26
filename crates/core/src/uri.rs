@@ -10,5 +10,5 @@
 //!   verbatim so the canonical form round-trips,
 //! - the canonical channel identity uses the raw parameter text.
 //!
-//! Reference: `aeron-client/src/main/c/util/aeron_uri.c`,
-//! `aeron-client/src/main/c/media/aeron_udp_channel.c`.
+//! Reference: `aeron-client/src/main/c/uri/aeron_uri.c`,
+//! `aeron-driver/src/main/c/media/aeron_udp_channel.c`.

@@ -1,6 +1,6 @@
 //! Sender data-plane thread.
 //!
-//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_sender.c` (M10):
+//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_driver_sender.c` (M10):
 //!
 //! - flywheel duty cycle over network publications,
 //! - sendmmsg batching: one frame per datagram (batch the syscall, not the

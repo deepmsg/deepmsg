@@ -5,7 +5,7 @@
 //! locks; correctness depends on strict acquire/release discipline and on
 //! seqlock-style read patterns (term append CAS loops, counter reads).
 //!
-//! P0 will provide, mirroring `aeron-client/src/main/c/concurrent/aeron_atomics.{c,h}`:
+//! P0 will provide, mirroring `aeron-client/src/main/c/concurrent/aeron_atomic.{c,h}`:
 //!
 //! - a bounds-checked byte-slice view with atomic accessors
 //!   (`get_volatile` / `set_ordered` / `compare_and_set` and friends),

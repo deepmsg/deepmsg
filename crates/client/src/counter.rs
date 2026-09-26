@@ -5,5 +5,5 @@
 //! references pass the 4-byte registration id and the reader opens the
 //! counter on its own CnC (M20).
 //!
-//! Reference: counter sources under `aeron-client/src/main/c/` and
-//! `aeron-client/src/main/c/concurrent/aeron_dist/counter.{c,h}`.
+//! Reference: `aeron-client/src/main/c/aeron_counter.{c,h}` and
+//! `aeron-client/src/main/c/concurrent/aeron_counters_manager.{c,h}`.

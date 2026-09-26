@@ -1,6 +1,6 @@
 //! Receiver data-plane thread.
 //!
-//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_receiver.c` (M11):
+//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_driver_receiver.c` (M11):
 //!
 //! - poll strategy threshold: linear recvmmsg path vs epoll/poll path
 //!   (the reference switches at 5 concurrent transports),

@@ -1,8 +1,8 @@
 //! Driver conductor: the single-threaded control-plane core.
 //!
 //! P1 scope, mirroring
-//! `aeron-driver/src/main/c/concurrent/aeron_driver_conductor.c` and the
-//! agent loop (M08 / M09):
+//! `aeron-driver/src/main/c/aeron_driver_conductor.c` and the agent loop
+//! (M08 / M09):
 //!
 //! - command drain from the CnC many-to-one ring; the reference drains at
 //!   most one command per cycle (the control-latency lower bound) and allows
