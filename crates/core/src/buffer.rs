@@ -62,7 +62,7 @@
 //! is denied workspace-wide.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicI32, AtomicI64, AtomicU8, Ordering};
 
 /// A window onto `len` bytes, read through atomics with an explicit ordering.
 ///
@@ -168,6 +168,38 @@ impl<'a, Access> AtomicBuffer<'a, Access> {
         0 == self.len
     }
 
+    /// The single byte at `offset`, or `None` if it is out of bounds.
+    fn slot_u8(&self, offset: usize) -> Option<&AtomicU8> {
+        if offset >= self.len {
+            return None;
+        }
+
+        // SAFETY: `offset < len` was just established, so the byte is inside
+        // the window; a single byte has no alignment requirement beyond the one
+        // byte itself. The pointer derives from `base`, which the constructor's
+        // caller guaranteed valid for reads for `'a`, and the returned
+        // reference is bounded by `&self`.
+        Some(unsafe { &*self.base.add(offset).cast::<AtomicU8>() })
+    }
+
+    /// The 2-byte slot at `offset`, or `None` if it is out of bounds or not
+    /// 2-byte aligned.
+    fn slot_i16(&self, offset: usize) -> Option<&AtomicI16> {
+        if 0 != offset % 2 {
+            return None;
+        }
+        if offset.checked_add(2)? > self.len {
+            return None;
+        }
+
+        // SAFETY: the range is inside the window and the address is 2-byte
+        // aligned — `offset` is even and the base is 8-byte aligned — which is
+        // `AtomicI16`'s requirement. As with the wider slots, the pointer
+        // derives from a base the caller guaranteed, and no `&mut` to these
+        // bytes exists anywhere in this module.
+        Some(unsafe { &*self.base.add(offset).cast::<AtomicI16>() })
+    }
+
     /// The 4-byte slot at `offset`, or `None` if it is out of bounds or not
     /// 4-byte aligned.
     fn slot_i32(&self, offset: usize) -> Option<&AtomicI32> {
@@ -202,6 +234,30 @@ impl<'a, Access> AtomicBuffer<'a, Access> {
         // SAFETY: as `slot_i32`, with the 8-byte alignment the base and the
         // offset together provide, which is `AtomicI64`'s requirement.
         Some(unsafe { &*self.base.add(offset).cast::<AtomicI64>() })
+    }
+
+    /// Load a single byte.
+    ///
+    /// Relaxed: a byte is never a publication gate on its own. The frame header
+    /// is the case that needs this — its version and flags are bytes that the
+    /// *frame length* publishes.
+    pub fn load_u8(&self, offset: usize) -> Option<u8> {
+        Some(self.slot_u8(offset)?.load(Ordering::Relaxed))
+    }
+
+    /// Load a 2-byte field, relaxed.
+    pub fn load_i16(&self, offset: usize) -> Option<i16> {
+        Some(self.slot_i16(offset)?.load(Ordering::Relaxed))
+    }
+
+    /// Load a 4-byte field with no ordering of its own.
+    pub fn load_i32(&self, offset: usize) -> Option<i32> {
+        self.load_i32_relaxed(offset)
+    }
+
+    /// Load an 8-byte field with no ordering of its own.
+    pub fn load_i64(&self, offset: usize) -> Option<i64> {
+        self.load_i64_relaxed(offset)
     }
 
     /// Load a 4-byte field the reference reads under `AERON_GET_ACQUIRE`.
@@ -325,6 +381,24 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     /// plain store would be a data race, not a faster store.
     pub fn store_i32_relaxed(&self, offset: usize, value: i32) -> Option<()> {
         self.slot_i32(offset)?.store(value, Ordering::Relaxed);
+        Some(())
+    }
+
+    /// Store a single byte, relaxed.
+    pub fn store_u8_relaxed(&self, offset: usize, value: u8) -> Option<()> {
+        self.slot_u8(offset)?.store(value, Ordering::Relaxed);
+        Some(())
+    }
+
+    /// Store a 2-byte field, relaxed.
+    pub fn store_i16_relaxed(&self, offset: usize, value: i16) -> Option<()> {
+        self.slot_i16(offset)?.store(value, Ordering::Relaxed);
+        Some(())
+    }
+
+    /// Store an 8-byte field with no ordering of its own.
+    pub fn store_i64_relaxed(&self, offset: usize, value: i64) -> Option<()> {
+        self.slot_i64(offset)?.store(value, Ordering::Relaxed);
         Some(())
     }
 
