@@ -16,6 +16,7 @@ interop = []
 deepmsg-core = { path = "../crates/core" }
 deepmsg-client = { path = "../crates/client" }
 deepmsg-driver = { path = "../crates/driver" }
+deepmsg-cnc = { path = "../crates/cnc" }
 
 [[test]]
 name = "basic_roundtrip"
@@ -24,6 +25,12 @@ path = "integration/basic_roundtrip.rs"
 [[test]]
 name = "termination_handshake"
 path = "integration/termination_handshake.rs"
+
+# Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
+# real driver's CnC header, not the reference checkout.
+[[test]]
+name = "cnc_fixture"
+path = "integration/cnc_fixture.rs"
 
 [[test]]
 name = "c_driver_basic"

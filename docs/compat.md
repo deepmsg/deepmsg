@@ -18,8 +18,16 @@ covers it.
 
 Rules:
 
-- A CnC file is accepted when the major component matches and the file's
-  minor is >= ours; a major mismatch is fatal (reference behaviour).
+- A CnC file is accepted when its major matches
+  (`aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103`) **and** its minor
+  is >= ours
+  (`aeron-client/src/main/java/io/aeron/CommonContext.java:1432`). The C client
+  implements only the first rule and the Java client both, so the two
+  references genuinely diverge here; `deepmsg` follows the stricter pair. The
+  divergence is written down in `docs/protocol/cnc-layout.md`, and the rules
+  are covered by unit tests in `crates/core/src/version.rs` — they have to be,
+  because the reference driver only ever writes 0.2.0 and the interop suite can
+  reach no other branch of the table.
 - Wire-protocol constants (frame types, header layouts) live in
   `deepmsg-core::logbuffer` and `docs/protocol/` once migrated; this file
   tracks cross-component versions only.

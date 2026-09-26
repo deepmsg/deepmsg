@@ -1,5 +1,6 @@
-# cargo-deny policy. The workspace currently has no third-party dependencies;
-# this file exists so the policy is in place before any arrive.
+# cargo-deny policy. The workspace gained its first third-party dependency with
+# P0-a (`libc`, for the memory-mapping seam in `deepmsg-core::pal`); this file
+# is what decides whether any further one is acceptable.
 
 [licenses]
 allow = ["Apache-2.0", "MIT", "ISC", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
