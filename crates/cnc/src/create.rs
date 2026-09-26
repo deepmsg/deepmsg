@@ -33,7 +33,7 @@ use std::path::Path;
 
 use deepmsg_core::pal::MappedFile;
 
-use crate::error::CncError;
+use crate::error::{CncError, Region};
 use crate::file::{CNC_FILE_NAME, CncFile};
 use crate::layout;
 use crate::metadata::{CncMetadata, RegionLayout};
@@ -206,6 +206,42 @@ impl CncLayout {
             });
         }
 
+        // A ring is not its region. The capacity is what is left after the
+        // trailer, and both rings mask with `capacity - 1`, so a capacity that
+        // is not a power of two computes an index that is not where the record
+        // is. The reference checks this when it *builds* each ring
+        // (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:27` via
+        // `aeron_rb.h:79-82`; `aeron_broadcast_transmitter.c:29` via
+        // `aeron_broadcast_descriptor.h:43`), which is why
+        // `-Daeron.to.conductor.buffer.length=2m` — a round number that leaves
+        // a capacity 768 bytes short of one — starts a driver that dies in
+        // conductor init with "Invalid capacity". Checking it while the length
+        // is still the thing being reported says which setting is wrong.
+        for (region, length, trailer, minimum) in [
+            (
+                Region::ToDriver,
+                self.to_driver_length,
+                layout::MPSC_RB_TRAILER_LENGTH,
+                layout::MPSC_MIN_CAPACITY,
+            ),
+            (
+                Region::ToClients,
+                self.to_clients_length,
+                layout::BROADCAST_TRAILER_LENGTH,
+                1,
+            ),
+        ] {
+            let capacity = length.saturating_sub(trailer);
+
+            if !capacity.is_power_of_two() || capacity < minimum || capacity >= i32::MAX as usize {
+                return Err(CncCreateError::RingCapacityInvalid {
+                    region,
+                    length,
+                    capacity,
+                });
+            }
+        }
+
         // Every length is at most INT32_MAX and there are five of them, so this
         // cannot overflow a usize on any platform this runs on; the check is
         // for the *metadata field*, which is an int32.
@@ -250,6 +286,16 @@ pub enum CncCreateError {
         /// What it was set to.
         value: usize,
     },
+    /// A ring region whose capacity — its length less the trailer — is not one
+    /// the ring can be built over.
+    RingCapacityInvalid {
+        /// The region whose length is wrong.
+        region: Region,
+        /// The region length that was configured.
+        length: usize,
+        /// The capacity it implies, after the trailer.
+        capacity: usize,
+    },
     /// The regions add up to more than the `int32` length field can hold.
     FileLengthTooLarge {
         /// The length that would have been written.
@@ -286,6 +332,14 @@ impl std::fmt::Display for CncCreateError {
             Self::InvalidPageSize { value } => {
                 write!(f, "page size {value} is not a power of two")
             }
+            Self::RingCapacityInvalid {
+                region,
+                length,
+                capacity,
+            } => write!(
+                f,
+                "{region} region is {length} bytes, a capacity of {capacity} that is not one the ring can use"
+            ),
             Self::FileLengthTooLarge { length } => {
                 write!(f, "CnC file length {length} does not fit in an int32")
             }
@@ -308,6 +362,7 @@ impl std::error::Error for CncCreateError {
             Self::NotReadable(error) => Some(error),
             Self::LengthOutOfRange { .. }
             | Self::InvalidPageSize { .. }
+            | Self::RingCapacityInvalid { .. }
             | Self::FileLengthTooLarge { .. }
             | Self::VersionNotPublished { .. } => None,
         }
@@ -582,6 +637,57 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_ring_whose_capacity_is_not_a_power_of_two() {
+        // `-Daeron.to.conductor.buffer.length=2m` is the mistake this exists
+        // for: two mebibytes of region leave a capacity 768 bytes short of a
+        // power of two, and the reference dies on it in conductor init with
+        // "Invalid capacity".
+        let error = CncLayout {
+            to_driver_length: 2 * 1024 * 1024,
+            ..small()
+        }
+        .validate()
+        .expect_err("2 MiB of region is not a legal ring");
+
+        assert!(matches!(
+            error,
+            CncCreateError::RingCapacityInvalid {
+                region: Region::ToDriver,
+                ..
+            }
+        ));
+
+        // The same mistake on the broadcast region, where the trailer is 128
+        // rather than 768: 2 MiB of region leaves 128 bytes short of one.
+        let error = CncLayout {
+            to_clients_length: 2 * 1024 * 1024,
+            ..small()
+        }
+        .validate()
+        .expect_err("2 MiB of region is not a legal broadcast ring");
+
+        assert!(matches!(
+            error,
+            CncCreateError::RingCapacityInvalid {
+                region: Region::ToClients,
+                ..
+            }
+        ));
+
+        // And the legal spelling of the same intent: a gibibyte of capacity,
+        // plus its trailer, is a length no round-number setting would give
+        // you.
+        assert!(
+            CncLayout {
+                to_clients_length: (1 << 30) + layout::BROADCAST_TRAILER_LENGTH,
+                ..small()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn rejects_a_page_size_that_is_not_a_power_of_two() {
         let layout = CncLayout {
             page_size: 4096 + 8,
@@ -599,10 +705,11 @@ mod tests {
 
     #[test]
     fn rejects_a_total_that_does_not_fit_an_int32() {
-        // Two rings at the ceiling: legal lengths, illegal total.
+        // Two rings of a gibibyte each: legal capacities, and a total the
+        // int32 length fields cannot describe.
         let layout = CncLayout {
-            to_driver_length: i32::MAX as usize,
-            to_clients_length: i32::MAX as usize,
+            to_driver_length: (1 << 30) + layout::MPSC_RB_TRAILER_LENGTH,
+            to_clients_length: (1 << 30) + layout::BROADCAST_TRAILER_LENGTH,
             ..small()
         };
 
