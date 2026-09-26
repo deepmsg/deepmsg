@@ -38,6 +38,12 @@ path = "integration/cnc_fixture.rs"
 name = "cnc_terminate"
 path = "integration/cnc_terminate.rs"
 
+# The client's matching loop against fabricated replies. Runs in CI, which the
+# interop suite cannot.
+[[test]]
+name = "client_round_trip"
+path = "integration/client_round_trip.rs"
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"
