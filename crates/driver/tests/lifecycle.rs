@@ -264,22 +264,37 @@ fn a_signal_stops_the_driver_and_reports_the_signal() {
 
 #[test]
 fn a_signal_during_startup_still_takes_the_clean_path() {
-    // The signal handler is installed *before* the directory work, so the
-    // window in which a SIGTERM kills the process outright is the few
-    // microseconds between `exec` and the install — not the whole of a 46 MB
-    // create or a `remove_dir_all` of a stale tree. The stale tree here is what
-    // makes that window observable: `dir.delete.on.start` gives the driver real
-    // work to do before its loop, and the signal arrives while it is doing it.
+    // The signal handler is installed *before* the directory work, so a SIGTERM
+    // that arrives while the driver is settling its directory takes the clean
+    // path out instead of killing the process outright.
+    //
+    // That window is made deterministic rather than raced for: a `cnc.dat` with
+    // no published version puts `prepare` into its liveness spin for the whole
+    // driver timeout, so a signal sent half a second in is provably *inside*
+    // `prepare` — long past the point where a driver that installed its handler
+    // after the directory work would have died. (The first version of this test
+    // signalled as soon as the process existed and was caught by CI: on a loaded
+    // runner the signal can beat `exec` and the handler both, which fails for a
+    // reason that has nothing to do with the order being tested.)
     let dir = TempDir::new();
-    std::fs::create_dir_all(&dir.0).expect("mkdir");
-    for n in 0..1_000 {
-        std::fs::write(dir.0.join(format!("stale-{n}")), b"").expect("a stale file");
-    }
 
-    let mut driver = Driver::start(&dir.0, &["-Ddeepmsg.dir.delete.on.start=true"]);
+    // Version zero: not a live driver, and not one this driver can read — which
+    // is exactly the state its liveness question waits out.
+    std::fs::create_dir_all(&dir.0).expect("the directory the driver will settle");
+    std::fs::write(dir.0.join("cnc.dat"), vec![0u8; 4_096]).expect("a version-zero CnC file");
 
-    // Straight away, with no wait for a CnC file: this is a signal during
-    // startup, which is the whole point.
+    let mut driver = Driver::start(
+        &dir.0,
+        &[
+            // Milliseconds, and long enough to still be spinning in half a
+            // second — the driver's own create window is what it is waiting for.
+            "-Ddeepmsg.driver.timeout=3000",
+            "-Ddeepmsg.counters.values.buffer.length=1m",
+        ],
+    );
+
+    std::thread::sleep(Duration::from_millis(500));
+
     let signal = Command::new("kill")
         .arg("-TERM")
         .arg(driver.child.id().to_string())
