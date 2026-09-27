@@ -115,8 +115,7 @@ impl std::error::Error for TransmitError {}
 ///
 /// The driver is its only user, and the only writer on this ring in the whole
 /// system — clients never transmit on it.
-pub struct ToClientsTransmitter<'a> {
-    buffer: AtomicBuffer<'a, ReadWrite>,
+pub struct ToClientsTransmitter {
     capacity: usize,
     /// Where the next record starts, in the ring's unbounded counter space.
     ///
@@ -129,13 +128,13 @@ pub struct ToClientsTransmitter<'a> {
     next_record: i64,
 }
 
-impl<'a> ToClientsTransmitter<'a> {
+impl ToClientsTransmitter {
     /// Wrap a region, or `None` if it cannot be a ring.
     ///
     /// The capacity rule is the reader's (`aeron_broadcast_descriptor.h:43`):
     /// a power of two, and non-zero, because a record's offset is the counter
     /// masked with `capacity - 1`.
-    pub fn new(region: AtomicBuffer<'a, ReadWrite>) -> Option<Self> {
+    pub fn new(region: &AtomicBuffer<ReadWrite>) -> Option<Self> {
         let capacity = region.len().checked_sub(layout::BROADCAST_TRAILER_LENGTH)?;
 
         if !capacity.is_power_of_two() || 0 == capacity {
@@ -146,7 +145,6 @@ impl<'a> ToClientsTransmitter<'a> {
             region.load_i64_acquire(capacity + layout::BROADCAST_TAIL_COUNTER_OFFSET)?;
 
         Some(Self {
-            buffer: region,
             capacity,
             next_record,
         })
@@ -180,7 +178,12 @@ impl<'a> ToClientsTransmitter<'a> {
     /// 5. `latest_counter` (the start of this record), then `tail_counter`
     ///    (one past its end), each with a release. The second is the
     ///    publication.
-    pub fn transmit(&mut self, type_id: i32, payload: &[u8]) -> Result<(), TransmitError> {
+    pub fn transmit(
+        &mut self,
+        region: &AtomicBuffer<ReadWrite>,
+        type_id: i32,
+        payload: &[u8],
+    ) -> Result<(), TransmitError> {
         if type_id < 1 {
             return Err(TransmitError::InvalidTypeId { type_id });
         }
@@ -202,17 +205,19 @@ impl<'a> ToClientsTransmitter<'a> {
         let mut offset = self.index_of(self.next_record);
 
         if to_end_of_buffer < aligned {
-            self.signal_tail_intent(new_tail + to_end_of_buffer as i64)?;
+            self.signal_tail_intent(region, new_tail + to_end_of_buffer as i64)?;
 
             // The padding's own length is its distance to the end of the ring,
             // which is not a multiple of the alignment in general — a reader
             // steps over it without aligning, and the record after it starts
             // at offset 0.
             self.store_i32(
+                region,
                 offset + layout::RECORD_MSG_TYPE_ID_OFFSET,
                 layout::PADDING_MSG_TYPE_ID,
             )?;
             self.store_i32(
+                region,
                 offset + layout::RECORD_LENGTH_OFFSET,
                 i32::try_from(to_end_of_buffer).map_err(|_| TransmitError::OutOfRange)?,
             )?;
@@ -220,23 +225,29 @@ impl<'a> ToClientsTransmitter<'a> {
             tail += to_end_of_buffer as i64;
             offset = 0;
         } else {
-            self.signal_tail_intent(new_tail)?;
+            self.signal_tail_intent(region, new_tail)?;
         }
 
         let record_length = payload.len() + layout::RECORD_HEADER_LENGTH;
         self.store_i32(
+            region,
             offset + layout::RECORD_LENGTH_OFFSET,
             i32::try_from(record_length).map_err(|_| TransmitError::OutOfRange)?,
         )?;
-        self.store_i32(offset + layout::RECORD_MSG_TYPE_ID_OFFSET, type_id)?;
-        self.buffer
+        self.store_i32(region, offset + layout::RECORD_MSG_TYPE_ID_OFFSET, type_id)?;
+        region
             .copy_in(offset + layout::RECORD_HEADER_LENGTH, payload)
             .ok_or(TransmitError::OutOfRange)?;
 
         // `latest_counter` lags `tail_counter` by exactly one record; both are
         // releases, and the second is what publishes the record body.
-        self.store_i64(self.trailer(layout::BROADCAST_LATEST_COUNTER_OFFSET), tail)?;
         self.store_i64(
+            region,
+            self.trailer(layout::BROADCAST_LATEST_COUNTER_OFFSET),
+            tail,
+        )?;
+        self.store_i64(
+            region,
             self.trailer(layout::BROADCAST_TAIL_COUNTER_OFFSET),
             tail + aligned as i64,
         )?;
@@ -250,8 +261,13 @@ impl<'a> ToClientsTransmitter<'a> {
     ///
     /// The fence is not decoration: a release store orders what came *before*
     /// it, and the guarantee the receiver needs is about what comes *after*.
-    fn signal_tail_intent(&self, new_tail: i64) -> Result<(), TransmitError> {
+    fn signal_tail_intent(
+        &self,
+        region: &AtomicBuffer<ReadWrite>,
+        new_tail: i64,
+    ) -> Result<(), TransmitError> {
         self.store_i64(
+            region,
             self.trailer(layout::BROADCAST_TAIL_INTENT_COUNTER_OFFSET),
             new_tail,
         )?;
@@ -272,20 +288,30 @@ impl<'a> ToClientsTransmitter<'a> {
         self.capacity + field
     }
 
-    fn store_i32(&self, offset: usize, value: i32) -> Result<(), TransmitError> {
-        self.buffer
+    fn store_i32(
+        &self,
+        region: &AtomicBuffer<ReadWrite>,
+        offset: usize,
+        value: i32,
+    ) -> Result<(), TransmitError> {
+        region
             .store_i32_relaxed(offset, value)
             .ok_or(TransmitError::OutOfRange)
     }
 
-    fn store_i64(&self, offset: usize, value: i64) -> Result<(), TransmitError> {
-        self.buffer
+    fn store_i64(
+        &self,
+        region: &AtomicBuffer<ReadWrite>,
+        offset: usize,
+        value: i64,
+    ) -> Result<(), TransmitError> {
+        region
             .store_i64_release(offset, value)
             .ok_or(TransmitError::OutOfRange)
     }
 }
 
-impl std::fmt::Debug for ToClientsTransmitter<'_> {
+impl std::fmt::Debug for ToClientsTransmitter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToClientsTransmitter")
             .field("capacity", &self.capacity)
@@ -598,7 +624,8 @@ mod tests {
     /// driver never does: forging a header no writer would produce, and
     /// overtaking a reader.
     struct Writer<'a> {
-        transmitter: ToClientsTransmitter<'a>,
+        buffer: AtomicBuffer<'a, ReadWrite>,
+        transmitter: ToClientsTransmitter,
     }
 
     impl Fixture {
@@ -637,17 +664,18 @@ mod tests {
 
     impl<'a> Writer<'a> {
         fn new(bytes: &'a mut [u8]) -> Self {
+            let buffer = AtomicBuffer::from_slice_mut(bytes).expect("aligned region");
+            let transmitter = ToClientsTransmitter::new(&buffer).expect("a valid ring");
+
             Self {
-                transmitter: ToClientsTransmitter::new(
-                    AtomicBuffer::from_slice_mut(bytes).expect("aligned region"),
-                )
-                .expect("a valid ring"),
+                buffer,
+                transmitter,
             }
         }
 
         /// A read-only window on the same bytes, for a receiver.
         fn as_read_only(&self) -> AtomicBuffer<'a, ReadOnly> {
-            self.transmitter.buffer.as_read_only()
+            self.buffer.as_read_only()
         }
 
         /// Where the next record starts, in the ring's counter space.
@@ -661,20 +689,17 @@ mod tests {
 
         /// One of the ring's three counters, read the way a reader reads it.
         fn counter(&self, field: usize) -> i64 {
-            self.transmitter
-                .buffer
+            self.buffer
                 .load_i64_acquire(self.trailer(field))
                 .expect("in range")
         }
 
         fn record_header(&self, offset: usize) -> (i32, i32) {
             let length = self
-                .transmitter
                 .buffer
                 .load_i32_acquire(offset + layout::RECORD_LENGTH_OFFSET)
                 .expect("in range");
             let type_id = self
-                .transmitter
                 .buffer
                 .load_i32_acquire(offset + layout::RECORD_MSG_TYPE_ID_OFFSET)
                 .expect("in range");
@@ -683,23 +708,27 @@ mod tests {
 
         fn store_i64(&self, field: usize, value: i64) {
             self.transmitter
-                .store_i64(self.trailer(field), value)
+                .store_i64(&self.buffer, self.trailer(field), value)
                 .expect("in range");
         }
 
         fn set_header(&self, offset: usize, type_id: i32, length: i32) {
             self.transmitter
-                .store_i32(offset + layout::RECORD_LENGTH_OFFSET, length)
+                .store_i32(&self.buffer, offset + layout::RECORD_LENGTH_OFFSET, length)
                 .expect("in range");
             self.transmitter
-                .store_i32(offset + layout::RECORD_MSG_TYPE_ID_OFFSET, type_id)
+                .store_i32(
+                    &self.buffer,
+                    offset + layout::RECORD_MSG_TYPE_ID_OFFSET,
+                    type_id,
+                )
                 .expect("in range");
         }
 
         /// Publish one record — the real transmitter, not a stand-in.
         fn publish(&mut self, type_id: i32, payload: &[u8]) {
             self.transmitter
-                .transmit(type_id, payload)
+                .transmit(&self.buffer, type_id, payload)
                 .expect("the payload fits and the type id is real");
         }
 
@@ -850,14 +879,14 @@ mod tests {
         let mut odd = Bytes::<ODD>([0u8; ODD]);
         let buffer = AtomicBuffer::from_slice_mut(&mut odd.0).expect("aligned region");
         assert!(ToClientsReceiver::new(&buffer.as_read_only()).is_none());
-        assert!(ToClientsTransmitter::new(buffer).is_none());
+        assert!(ToClientsTransmitter::new(&buffer).is_none());
 
         // And a region too short to hold a trailer at all.
         const TINY: usize = layout::BROADCAST_TRAILER_LENGTH;
         let mut tiny = Bytes::<TINY>([0u8; TINY]);
         let buffer = AtomicBuffer::from_slice_mut(&mut tiny.0).expect("aligned region");
         assert!(ToClientsReceiver::new(&buffer.as_read_only()).is_none());
-        assert!(ToClientsTransmitter::new(buffer).is_none());
+        assert!(ToClientsTransmitter::new(&buffer).is_none());
     }
 
     #[test]
@@ -959,7 +988,7 @@ mod tests {
             for hostile in [0, -1, i32::MIN] {
                 assert_eq!(
                     Err(TransmitError::InvalidTypeId { type_id: hostile }),
-                    writer.transmitter.transmit(hostile, b"x"),
+                    writer.transmitter.transmit(&writer.buffer, hostile, b"x"),
                     "type id {hostile} is not a message"
                 );
             }
@@ -983,12 +1012,16 @@ mod tests {
                     length: max + 1,
                     max,
                 }),
-                writer.transmitter.transmit(0x0F08, &too_long)
+                writer
+                    .transmitter
+                    .transmit(&writer.buffer, 0x0F08, &too_long)
             );
 
             assert_eq!(
                 Ok(()),
-                writer.transmitter.transmit(0x0F08, &too_long[..max]),
+                writer
+                    .transmitter
+                    .transmit(&writer.buffer, 0x0F08, &too_long[..max]),
                 "the limit itself is accepted"
             );
         });

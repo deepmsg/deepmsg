@@ -15,8 +15,8 @@
 
 #![deny(unsafe_code)]
 
-pub mod conductor;
 pub mod clients;
+pub mod conductor;
 pub mod config;
 pub mod dir;
 pub mod flowcontrol;

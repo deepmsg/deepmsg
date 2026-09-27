@@ -44,7 +44,13 @@ pub mod metadata;
 pub mod ring;
 
 pub use broadcast::{Received, ToClientsReceiver, ToClientsTransmitter, TransmitError};
-pub use command::{MAX_TOKEN_LENGTH, TERMINATE_DRIVER_TYPE_ID, TerminateDriver};
+pub use command::{
+    AddCounter, CLIENT_TIMEOUT_LENGTH, CORRELATED_COMMAND_LENGTH, COUNTER_UPDATE_LENGTH,
+    Correlated, MAX_TOKEN_LENGTH, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, RemoveCounter, TERMINATE_DRIVER_TYPE_ID, TerminateDriver,
+    decode_add_counter, decode_correlated, decode_remove_counter, encode_client_timeout,
+    encode_counter_update,
+};
 pub use counter_manager::{CounterManager, CounterRegions};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use create::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncIdentity, CncLayout};

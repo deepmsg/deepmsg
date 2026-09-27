@@ -55,6 +55,21 @@ pub trait ClientEvents {
     fn client_timed_out(&mut self, client_id: i64);
 }
 
+/// What one pass of the client pool did.
+///
+/// Two numbers rather than one because two different things are counted: every
+/// expired client is reaped, and only the ones that did not close themselves
+/// are *announced* as timed out and counted in system counter 24
+/// (`aeron_driver_conductor.c:1038-1056`). Collapsing them would make a client
+/// that shut down cleanly look like one that died.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CounterTimeouts {
+    /// Clients whose records were freed.
+    pub reaped: usize,
+    /// Clients reaped for silence, as opposed to a `CLIENT_CLOSE`.
+    pub timed_out: usize,
+}
+
 /// One counter a client owns, by the id the client knows it as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CounterLink {
@@ -114,7 +129,9 @@ impl Clients {
 
     /// The record for a client, if there is one.
     pub fn find(&self, client_id: i64) -> Option<&ClientRecord> {
-        self.records.iter().find(|record| record.client_id == client_id)
+        self.records
+            .iter()
+            .find(|record| record.client_id == client_id)
     }
 
     /// The record for a client, for a caller about to change it.
@@ -147,8 +164,13 @@ impl Clients {
 
         let label = format!("client-heartbeat: id={client_id}");
         let key = client_id.to_le_bytes();
-        let heartbeat_counter_id =
-            manager.allocate(regions, CLIENT_HEARTBEAT_TYPE_ID, &key, label.as_bytes(), now_ms)?;
+        let heartbeat_counter_id = manager.allocate(
+            regions,
+            CLIENT_HEARTBEAT_TYPE_ID,
+            &key,
+            label.as_bytes(),
+            now_ms,
+        )?;
 
         manager.set_registration_id(regions, heartbeat_counter_id, client_id)?;
         manager.set_owner_id(regions, heartbeat_counter_id, client_id)?;
@@ -214,16 +236,14 @@ impl Clients {
 
     /// One pass of the reference's `aeron_client_on_time_event`
     /// (`:1038-1056`), followed by the reaping of anything that just expired.
-    ///
-    /// Returns how many clients were reaped.
     pub fn on_time_event(
         &mut self,
         now_ms: i64,
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
-    ) -> usize {
-        let mut reaped = 0;
+    ) -> CounterTimeouts {
+        let mut outcome = CounterTimeouts::default();
         let mut index = self.records.len();
 
         while index > 0 {
@@ -240,6 +260,7 @@ impl Clients {
 
                         if !record.closed_by_command {
                             events.client_timed_out(record.client_id);
+                            outcome.timed_out += 1;
                         }
                         events.counter_unavailable(record.client_id, record.heartbeat_counter_id);
                     }
@@ -249,11 +270,11 @@ impl Clients {
             if self.records[index].reached_end_of_life {
                 self.reap(index, now_ms, manager, regions, events);
                 self.records.swap_remove(index);
-                reaped += 1;
+                outcome.reaped += 1;
             }
         }
 
-        reaped
+        outcome
     }
 
     /// Free everything one client owned, announcing each counter as it goes
@@ -323,7 +344,8 @@ mod tests {
         }
 
         fn counter_unavailable(&mut self, registration_id: i64, counter_id: i32) {
-            self.0.push(format!("unavailable:{registration_id}:{counter_id}"));
+            self.0
+                .push(format!("unavailable:{registration_id}:{counter_id}"));
         }
 
         fn client_timed_out(&mut self, client_id: i64) {
@@ -375,7 +397,11 @@ mod tests {
         assert_eq!(7, record.client_id);
         assert!(!record.closed_by_command);
         assert_eq!(10_000, record.liveness_timeout_ms);
-        assert_eq!(vec!["ready:7:0"], events.0, "the heartbeat goes out at once");
+        assert_eq!(
+            vec!["ready:7:0"],
+            events.0,
+            "the heartbeat goes out at once"
+        );
 
         // The counter is a heartbeat: type 11, the client id as key,
         // registration and owner, and it already reads as alive.
@@ -404,7 +430,11 @@ mod tests {
             .get_or_add(7, 2_000, TIMEOUT_NS, &mut manager, &regions, &mut events)
             .expect("still registered");
         assert_eq!(1, clients.len());
-        assert_eq!(vec!["ready:7:0"], events.0, "and nothing was announced twice");
+        assert_eq!(
+            vec!["ready:7:0"],
+            events.0,
+            "and nothing was announced twice"
+        );
     }
 
     #[test]
@@ -469,20 +499,30 @@ mod tests {
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
-            .get_or_add(7, NOW + 1_000, TIMEOUT_NS, &mut manager, &regions, &mut events)
+            .get_or_add(
+                7,
+                NOW + 1_000,
+                TIMEOUT_NS,
+                &mut manager,
+                &regions,
+                &mut events,
+            )
             .expect("registered");
         events.0.clear();
 
         // Not yet: the timeout is ten seconds and the value is one second old.
         assert_eq!(
-            0,
+            CounterTimeouts::default(),
             clients.on_time_event(NOW + 11_000, &mut manager, &regions, &mut events)
         );
         assert!(events.0.is_empty());
 
         // One millisecond past the deadline.
         assert_eq!(
-            1,
+            CounterTimeouts {
+                reaped: 1,
+                timed_out: 1,
+            },
             clients.on_time_event(NOW + 11_001, &mut manager, &regions, &mut events)
         );
         assert_eq!(
@@ -514,9 +554,12 @@ mod tests {
         events.0.clear();
 
         assert_eq!(
-            1,
+            CounterTimeouts {
+                reaped: 1,
+                timed_out: 0,
+            },
             clients.on_time_event(NOW + 1, &mut manager, &regions, &mut events),
-            "a zeroed heartbeat expires on the next tick"
+            "a zeroed heartbeat expires on the next tick, without a timeout"
         );
         assert_eq!(
             vec!["unavailable:7:0"],

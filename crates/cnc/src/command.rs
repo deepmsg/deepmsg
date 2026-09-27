@@ -9,6 +9,8 @@
 //! reading produces a payload four bytes too long which the driver misparses
 //! into nonsense. The C layout is the authority here (ADR-0001).
 
+use crate::layout;
+
 /// The `client_id` and `correlation_id` every correlated command starts with:
 /// `aeron-client/src/main/c/command/aeron_control_protocol.h:64-70`.
 pub const CORRELATED_COMMAND_LENGTH: usize = 16;
@@ -452,6 +454,132 @@ pub enum Response<'a> {
     },
 }
 
+/// `AERON_RESPONSE_ON_UNAVAILABLE_COUNTER` (`aeron_control_protocol.h:54`).
+///
+/// The *removal* message. There is no in-band "this counter is gone" value: a
+/// driver that frees a counter announces it with this type and the same
+/// twelve-byte payload `ON_COUNTER_READY` carries
+/// (`aeron_driver_conductor.c:2489-2500`). A client that reads a `-1` value as
+/// a removal is reading something the protocol does not say, which is why this
+/// constant exists here before a client uses it.
+pub const ON_UNAVAILABLE_COUNTER_TYPE_ID: i32 = 0x0F09;
+
+/// The payload of `ON_COUNTER_READY` and `ON_UNAVAILABLE_COUNTER`
+/// (`aeron_counter_update_t`, `aeron_control_protocol.h:185-190`): an `int64`
+/// correlation id and an `int32` counter id, packed to **12** not 16.
+pub const COUNTER_UPDATE_LENGTH: usize = 12;
+
+/// The payload of `ON_CLIENT_TIMEOUT` (`aeron_client_timeout_t`,
+/// `aeron_control_protocol.h:203-207`): the client id, and nothing else.
+pub const CLIENT_TIMEOUT_LENGTH: usize = 8;
+
+/// Encode a counter announcement, for either of the two types that carry one.
+pub fn encode_counter_update(correlation_id: i64, counter_id: i32) -> [u8; COUNTER_UPDATE_LENGTH] {
+    let mut out = [0u8; COUNTER_UPDATE_LENGTH];
+    out[..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..].copy_from_slice(&counter_id.to_le_bytes());
+    out
+}
+
+/// Encode `ON_CLIENT_TIMEOUT`.
+///
+/// The client id goes in the one field the message has — the receiver reads it
+/// as the correlation id, because that is what the struct's first member is
+/// (`aeron_driver_conductor.c:2542-2554`).
+pub fn encode_client_timeout(client_id: i64) -> [u8; CLIENT_TIMEOUT_LENGTH] {
+    client_id.to_le_bytes()
+}
+
+/// The head every client command that names a client starts with
+/// (`aeron_correlated_command_t`, `aeron_control_protocol.h:64-69`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Correlated {
+    /// Which client sent it.
+    pub client_id: i64,
+    /// What it wants matched back to it.
+    pub correlation_id: i64,
+}
+
+/// Decode the head of a correlated command.
+pub fn decode_correlated(payload: &[u8]) -> Option<Correlated> {
+    Some(Correlated {
+        client_id: le_i64(payload, 0)?,
+        correlation_id: le_i64(payload, 8)?,
+    })
+}
+
+/// `ADD_COUNTER` (`0x09`), decoded.
+///
+/// The wire form is `aeron_counter_command_t` — a correlated head and an
+/// `int32 type_id` — followed by a key and a label, each with its own length
+/// and the key padded to four bytes
+/// (`aeron_client_conductor.c:2035-2052` writes exactly this shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddCounter<'a> {
+    /// Who is asking, and what to answer with.
+    pub correlated: Correlated,
+    /// The counter's type, which is what a reader uses to interpret the key.
+    pub type_id: i32,
+    /// The key: free-form bytes whose meaning belongs to `type_id`.
+    pub key: &'a [u8],
+    /// The label: free-form text, **not** NUL-terminated.
+    pub label: &'a [u8],
+}
+
+/// Where `ADD_COUNTER`'s key begins: the correlated head, the `int32` type id
+/// (`aeron_control_protocol.h:178-183`) and the `int32` key length.
+const ADD_COUNTER_KEY_OFFSET: usize = CORRELATED_COMMAND_LENGTH + 4 + 4;
+
+/// Decode `ADD_COUNTER`.
+///
+/// Lengths are read as *signed* and refused when negative, and every slice is
+/// taken with `get` rather than by slicing: these bytes come from another
+/// process, and a length field is the one place a hostile or buggy client can
+/// make arithmetic overflow. The reference checks only the fixed head
+/// (`aeron_driver_conductor.c:3096-3108`) and trusts the rest.
+pub fn decode_add_counter(payload: &[u8]) -> Option<AddCounter<'_>> {
+    let correlated = decode_correlated(payload)?;
+    let type_id = le_i32(payload, CORRELATED_COMMAND_LENGTH)?;
+
+    let key_length = usize::try_from(le_i32(payload, CORRELATED_COMMAND_LENGTH + 4)?).ok()?;
+    let key_start = ADD_COUNTER_KEY_OFFSET;
+    let key = payload.get(key_start..key_start.checked_add(key_length)?)?;
+
+    let label_length_offset = key_start.checked_add(layout::align_up(key_length, 4))?;
+    let label_length = usize::try_from(le_i32(payload, label_length_offset)?).ok()?;
+    let label_start = label_length_offset.checked_add(4)?;
+    let label = payload.get(label_start..label_start.checked_add(label_length)?)?;
+
+    Some(AddCounter {
+        correlated,
+        type_id,
+        key,
+        label,
+    })
+}
+
+/// `REMOVE_COUNTER` (`0x0A`), decoded.
+///
+/// It names the counter by the **client's registration id**, not by its
+/// counter id (`aeron_remove_counter_command_t`,
+/// `aeron_control_protocol.h:131-136`): the driver looks the link up in the
+/// asking client's own list and is what stops one client removing another's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoveCounter {
+    /// Who is asking, and what to answer with.
+    pub correlated: Correlated,
+    /// The registration id the counter was allocated under.
+    pub registration_id: i64,
+}
+
+/// Decode `REMOVE_COUNTER`.
+pub fn decode_remove_counter(payload: &[u8]) -> Option<RemoveCounter> {
+    Some(RemoveCounter {
+        correlated: decode_correlated(payload)?,
+        registration_id: le_i64(payload, CORRELATED_COMMAND_LENGTH)?,
+    })
+}
+
 /// Decode a response payload.
 ///
 /// A payload too short for its own type is reported as [`Response::Other`]
@@ -767,6 +895,97 @@ mod response_tests {
                 bytes.len()
             );
         }
+    }
+
+    #[test]
+    fn decodes_an_add_counter_with_the_key_padded_to_four() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7i64.to_le_bytes()); // client_id
+        payload.extend_from_slice(&9i64.to_le_bytes()); // correlation_id
+        payload.extend_from_slice(&11i32.to_le_bytes()); // type_id
+        payload.extend_from_slice(&5i32.to_le_bytes()); // key_length
+        payload.extend_from_slice(b"abcde"); // key, five bytes
+        payload.extend_from_slice(&[0, 0, 0]); // padded to eight
+        payload.extend_from_slice(&3i32.to_le_bytes()); // label_length
+        payload.extend_from_slice(b"lbl");
+
+        let decoded = decode_add_counter(&payload).expect("decodes");
+        assert_eq!(
+            Correlated {
+                client_id: 7,
+                correlation_id: 9,
+            },
+            decoded.correlated
+        );
+        assert_eq!(11, decoded.type_id);
+        assert_eq!(b"abcde", decoded.key);
+        assert_eq!(b"lbl", decoded.label);
+
+        // A payload shorter than its own lengths claim is refused rather than
+        // sliced out of range.
+        let mut truncated = payload.clone();
+        truncated.truncate(payload.len() - 1);
+        assert!(decode_add_counter(&truncated).is_none());
+
+        // And a negative length is not a length.
+        let mut negative = payload.clone();
+        negative[20..24].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(decode_add_counter(&negative).is_none());
+        assert!(
+            decode_add_counter(&[0u8; 12]).is_none(),
+            "no room for a head"
+        );
+    }
+
+    #[test]
+    fn decodes_a_remove_counter_by_registration_id() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7i64.to_le_bytes());
+        payload.extend_from_slice(&9i64.to_le_bytes());
+        payload.extend_from_slice(&42i64.to_le_bytes());
+
+        assert_eq!(
+            Some(RemoveCounter {
+                correlated: Correlated {
+                    client_id: 7,
+                    correlation_id: 9,
+                },
+                registration_id: 42,
+            }),
+            decode_remove_counter(&payload)
+        );
+        assert!(decode_remove_counter(&payload[..20]).is_none());
+    }
+
+    #[test]
+    fn the_encoders_round_trip_through_the_decoder() {
+        let ready = encode_counter_update(7, 42);
+        assert_eq!(12, ready.len(), "packed(4), so twelve and not sixteen");
+        assert_eq!(
+            Response::CounterReady {
+                correlation_id: 7,
+                counter_id: 42,
+            },
+            decode_response(ON_COUNTER_READY_TYPE_ID, &ready)
+        );
+
+        // The removal type carries the same twelve bytes. This build's decoder
+        // does not model it yet — the client's counter lifecycle is P1-3 — so
+        // it arrives as `Other`, which is the right answer for a response a
+        // client has nothing to do with.
+        assert_eq!(
+            Response::Other {
+                type_id: ON_UNAVAILABLE_COUNTER_TYPE_ID,
+            },
+            decode_response(ON_UNAVAILABLE_COUNTER_TYPE_ID, &ready)
+        );
+
+        let timeout = encode_client_timeout(9);
+        assert_eq!(8, timeout.len());
+        assert_eq!(
+            Response::ClientTimeout { client_id: 9 },
+            decode_response(ON_CLIENT_TIMEOUT_TYPE_ID, &timeout)
+        );
     }
 
     #[test]
