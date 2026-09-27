@@ -144,6 +144,52 @@ const RUNTIME_SUFFIXES: [(i32, &str); 3] = [
     ),
 ];
 
+/// The counters a driver allocated for itself, in the order it allocated them.
+///
+/// A value rather than a range constant: the release path gives back *what was
+/// allocated* rather than what this build happens to allocate, so a count that
+/// changes between the two — a slice that adds one, an init that stops halfway
+/// — cannot make the shutdown free the wrong slots. It also gives the release
+/// something to check: every id it holds was handed out by this process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemCounters {
+    ids: Vec<i32>,
+}
+
+impl SystemCounters {
+    /// The ids, in allocation order.
+    pub fn ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.ids.iter().copied()
+    }
+
+    /// How many counters the driver owns.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the driver owns none — only true before init.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Return every one of them to the pool, and say how many went back.
+    ///
+    /// A count rather than nothing, because the caller is a shutdown: a counter
+    /// that would not release is an inconsistency worth surfacing, and a `bool`
+    /// per counter is what [`CounterManager::free`] already reports.
+    pub fn release_all(
+        &self,
+        manager: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+    ) -> usize {
+        self.ids
+            .iter()
+            .filter(|counter_id| manager.free(regions, **counter_id, now_ms))
+            .count()
+    }
+}
+
 /// Why the system counters could not be allocated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemCounterError {
@@ -202,6 +248,8 @@ impl std::error::Error for SystemCounterError {}
 /// number is the file's length. That is a runtime value rather than a byte
 /// contract, and it is the honest one for a driver with no loss report yet.
 ///
+/// Returns what it allocated, so the shutdown can give back exactly that.
+///
 /// # Errors
 ///
 /// [`SystemCounterError`] — see its variants. Every one of them means the CnC
@@ -211,7 +259,9 @@ pub fn allocate_all(
     regions: &CounterRegions<'_>,
     now_ms: i64,
     bytes_mapped: i64,
-) -> Result<(), SystemCounterError> {
+) -> Result<SystemCounters, SystemCounterError> {
+    let mut allocated = Vec::with_capacity(COUNT);
+
     for (index, label) in LABELS.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)] // COUNT ids, far below i32::MAX
         let expected = index as i32;
@@ -232,6 +282,8 @@ pub fn allocate_all(
             .ok_or(SystemCounterError::RegionTooSmall {
                 counter_id: expected,
             })?;
+
+        allocated.push(expected);
     }
 
     for (counter_id, suffix) in RUNTIME_SUFFIXES {
@@ -258,7 +310,7 @@ pub fn allocate_all(
             .ok_or(SystemCounterError::ValueNotWritten { counter_id })?;
     }
 
-    Ok(())
+    Ok(SystemCounters { ids: allocated })
 }
 
 /// Add one to a counter, the way the reference's `aeron_counter_increment_release`

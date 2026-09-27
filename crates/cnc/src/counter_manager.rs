@@ -20,11 +20,19 @@
 //! (`:109-121`). That single release is what makes a half-filled record
 //! invisible, and it is the only reason a reader may trust the rest.
 //!
-//! **The free list is in this process's heap, not in the file.** `:72-88` holds
-//! it in the manager struct, so it dies with the driver and ids restart from
-//! the high-water mark. Nothing in the CnC marks a slot "on the list"; the
-//! durable half of reclamation is `state = RECLAIMED` plus the reuse deadline,
-//! which is all a *reader* ever sees.
+//! **The allocator's whole state is in this process's heap, not in the file.**
+//! `:72-88` holds both the free list and the high-water mark in the manager
+//! struct, so both die with the driver. Nothing in the CnC marks a slot "on the
+//! list", and nothing records how many ids were handed out: the durable half of
+//! reclamation is `state = RECLAIMED` plus the reuse deadline, which is all a
+//! *reader* ever sees. The consequence for a **restart** is worth stating
+//! plainly, because it is easy to assume otherwise: the fallback scan starts
+//! from id zero again and hands out ids whose records the file still shows as
+//! `ALLOCATED` — it never consults the file's state
+//! (`aeron_counters_manager.c:207-244` does the same). A crashed driver's
+//! counters are not reconciled by the allocator; they are reconciled by the
+//! directory discipline, which gives the file to the next driver only when the
+//! old one is provably gone.
 //!
 //! **Reuse is a deadline, not a reference count.** `next_counter_id`
 //! (`:207-244`) takes the first entry on the list whose
@@ -401,8 +409,12 @@ impl CounterManager {
                 .load_i64_acquire(offset + layout::COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET)?;
 
             if now_ms >= deadline {
-                self.free_list.remove(index);
+                // Reset first, remove second: if the reset cannot be written
+                // the id must stay on the list, or it is stranded — reclaimed
+                // in the file, absent from the list, and never handed out
+                // again.
                 self.reset_value(regions, counter_id)?;
+                self.free_list.remove(index);
                 return Some(counter_id);
             }
         }
@@ -736,6 +748,34 @@ mod tests {
             manager.value(&regions, reused),
             "reset to zero on reuse"
         );
+    }
+
+    #[test]
+    fn a_recycled_id_stays_on_the_list_until_its_record_is_cleared() {
+        // The reset is what makes a recycled slot safe to hand out, so it
+        // happens *before* the id leaves the free list: an id that left the
+        // list and then failed to reset would be stranded — reclaimed in the
+        // file, absent from the list, never handed out again. The visible
+        // half of that promise is that the list only ever shrinks when the
+        // value record has been cleared, which is what this checks.
+        let mut fixture = Fixture::new(2);
+        let (mut manager, regions) = fixture.open(0);
+
+        let first = manager
+            .allocate(&regions, 0, &[], b"first", 0)
+            .expect("an id");
+        manager.set_value(&regions, first, 7).expect("in range");
+        assert!(manager.free(&regions, first, 0));
+        assert_eq!(1, manager.free_list_len());
+
+        // Cooled (the timeout is zero), so the next allocation recycles it —
+        // and the value it held is gone by the time anyone can see the id.
+        let reused = manager
+            .allocate(&regions, 0, &[], b"again", 0)
+            .expect("an id");
+        assert_eq!(first, reused);
+        assert_eq!(Some(0), manager.value(&regions, reused));
+        assert_eq!(0, manager.free_list_len());
     }
 
     #[test]

@@ -304,6 +304,58 @@ pub const ON_ERROR_TYPE_ID: i32 = 0x0F01;
 /// `AERON_RESPONSE_ON_COUNTER_READY` (`aeron_control_protocol.h:53`).
 pub const ON_COUNTER_READY_TYPE_ID: i32 = 0x0F08;
 
+/// `AERON_RESPONSE_ON_OPERATION_SUCCEEDED`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:48`).
+///
+/// The **completion signal** for a command that changes something and has no
+/// reply of its own — a removal, a destination change, a session id request.
+/// A real client blocks on it, matched by correlation id, which is why a driver
+/// that acts on the command and stays silent leaves that client waiting for a
+/// deadline it will then report as a timeout.
+pub const ON_OPERATION_SUCCEEDED_TYPE_ID: i32 = 0x0F04;
+
+/// The payload of `ON_OPERATION_SUCCEEDED`: the command's correlation id, and
+/// nothing else (`aeron_operation_succeeded_t`, `aeron_control_protocol.h:117-121`).
+pub const OPERATION_SUCCEEDED_LENGTH: usize = 8;
+
+/// The fixed head of `ON_ERROR` (`aeron_error_response_t`, `:123-129`): the
+/// correlation id of the command that failed, the error code, and the length of
+/// the message that follows it.
+pub const ERROR_RESPONSE_HEADER_LENGTH: usize = 16;
+
+/// `AERON_ERROR_CODE_UNKNOWN_COUNTER`
+/// (`aeron-client/src/main/c/aeron_client_error.h:15`).
+pub const ERROR_CODE_UNKNOWN_COUNTER: i32 = 5;
+
+/// `AERON_ERROR_CODE_GENERIC_ERROR` (`aeron_client_error.h:21`).
+///
+/// What the reference sends when a command fails for a reason it has no code
+/// for — an `ADD_COUNTER` whose client could not be registered or whose id
+/// could not be allocated, for instance, where the C appends an error string
+/// and leaves the code as it found it.
+pub const ERROR_CODE_GENERIC_ERROR: i32 = 11;
+
+/// Encode `ON_OPERATION_SUCCEEDED`.
+pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
+    correlation_id.to_le_bytes()
+}
+
+/// Encode `ON_ERROR`.
+///
+/// The message is free text, **not** NUL-terminated, and its length is in the
+/// header (`aeron_driver_conductor.c:2244-2260`). Allocating here is fine: this
+/// is an error path, and the reference keeps a kilobyte of stack for it.
+pub fn encode_error(correlation_id: i64, error_code: i32, message: &[u8]) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)] // a message this build writes, far below i32::MAX
+    let mut out = vec![0u8; ERROR_RESPONSE_HEADER_LENGTH + message.len()];
+    out[..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..12].copy_from_slice(&error_code.to_le_bytes());
+    out[12..16].copy_from_slice(&(message.len() as i32).to_le_bytes());
+    out[ERROR_RESPONSE_HEADER_LENGTH..].copy_from_slice(message);
+
+    out
+}
+
 /// `AERON_RESPONSE_ON_CLIENT_TIMEOUT` (`aeron_control_protocol.h:55`).
 pub const ON_CLIENT_TIMEOUT_TYPE_ID: i32 = 0x0F0A;
 

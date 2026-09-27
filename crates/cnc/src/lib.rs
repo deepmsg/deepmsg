@@ -46,10 +46,12 @@ pub mod ring;
 pub use broadcast::{Received, ToClientsReceiver, ToClientsTransmitter, TransmitError};
 pub use command::{
     AddCounter, CLIENT_TIMEOUT_LENGTH, CORRELATED_COMMAND_LENGTH, COUNTER_UPDATE_LENGTH,
-    Correlated, MAX_TOKEN_LENGTH, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
-    ON_UNAVAILABLE_COUNTER_TYPE_ID, RemoveCounter, TERMINATE_DRIVER_TYPE_ID, TerminateDriver,
-    decode_add_counter, decode_correlated, decode_remove_counter, encode_client_timeout,
-    encode_counter_update,
+    Correlated, ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ERROR_RESPONSE_HEADER_LENGTH,
+    MAX_TOKEN_LENGTH, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID, OPERATION_SUCCEEDED_LENGTH,
+    RemoveCounter, TERMINATE_DRIVER_TYPE_ID, TerminateDriver, decode_add_counter,
+    decode_correlated, decode_remove_counter, encode_client_timeout, encode_counter_update,
+    encode_error, encode_operation_succeeded,
 };
 pub use counter_manager::{CounterManager, CounterRegions};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
