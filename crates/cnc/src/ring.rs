@@ -72,10 +72,7 @@ impl<'a> ToDriverRing<'a> {
     pub fn new(region: AtomicBuffer<'a, ReadWrite>) -> Option<Self> {
         let capacity = region.len().checked_sub(layout::MPSC_RB_TRAILER_LENGTH)?;
 
-        if !capacity.is_power_of_two()
-            || capacity < layout::MPSC_MIN_CAPACITY
-            || capacity >= i32::MAX as usize
-        {
+        if !layout::ring_capacity_is_valid(capacity, layout::MPSC_MIN_CAPACITY) {
             return None;
         }
 
@@ -408,13 +405,13 @@ impl<'a> ToDriverRing<'a> {
 ///
 /// Stateless in the way that matters: the cursor is the trailer's
 /// `head_position`, which the reference reads at the top of every read
-/// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:203`). A driver that
+/// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:207`). A driver that
 /// restarts resumes exactly where the file says it stopped, and there is no
 /// cursor to hand across a process boundary. What this type does own is the
 /// discipline, which is the part that is easy to get wrong:
 ///
 /// - **It zeroes what it consumed, and only then publishes `head_position`.**
-///   That is the reference's order (`:236-238`) and the reason the producer may
+///   That is the reference's order (`:244-245`) and the reason the producer may
 ///   assume claimed space starts zeroed.
 /// - **It stops at the first record whose length is not positive**, which is
 ///   what makes a claim still in flight invisible, and it never compares
@@ -460,10 +457,7 @@ impl ToDriverRingConsumer {
     pub fn new(region: &AtomicBuffer<ReadOnly>) -> Option<Self> {
         let capacity = region.len().checked_sub(layout::MPSC_RB_TRAILER_LENGTH)?;
 
-        if !capacity.is_power_of_two()
-            || capacity < layout::MPSC_MIN_CAPACITY
-            || capacity >= i32::MAX as usize
-        {
+        if !layout::ring_capacity_is_valid(capacity, layout::MPSC_MIN_CAPACITY) {
             return None;
         }
 
@@ -529,7 +523,7 @@ impl ToDriverRingConsumer {
     /// Read at most `limit` records, handing each to `handler`.
     ///
     /// Returns how many messages were delivered, matching the reference's
-    /// `messages_read` (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:241`).
+    /// `messages_read` (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:248`).
     /// Padding records do not count: they are skipped, and their bytes are
     /// consumed like any other.
     ///
@@ -751,7 +745,7 @@ impl ToDriverRingConsumer {
     /// Whether every record header from `from` back to `limit` reads zero.
     ///
     /// The counterpart of the reference's `scan_back_to_confirm_still_zeroed`
-    /// (`concurrent/aeron_mpsc_rb.c:425-445`), and the reason the gap case is
+    /// (`concurrent/aeron_mpsc_rb.c:351-367`), and the reason the gap case is
     /// safe to write at all: the producer may have claimed the gap between the
     /// scan and the store, and this is what says it did not.
     ///

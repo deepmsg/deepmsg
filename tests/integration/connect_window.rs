@@ -45,6 +45,8 @@ fn connecting_waits_for_a_driver_that_is_still_starting() {
     let publisher = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(40));
         let mut cnc = CncFile::create(&path, &layout(), &identity()).expect("create the CnC file");
+        cnc.write_consumer_heartbeat(clock::epoch_millis())
+            .expect("the ring is writable");
         cnc.publish().expect("publish");
     });
 

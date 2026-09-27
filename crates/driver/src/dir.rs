@@ -112,23 +112,81 @@ impl std::error::Error for DirError {
     }
 }
 
+/// A directory this process made ready: created here, or taken over because
+/// nobody else was living in it.
+///
+/// Holding one is the only way to [`PreparedDir::remove`], so a failure arm
+/// cannot delete a directory this process never prepared — which is what the
+/// binary's error paths used to do, and how a driver that lost an `O_EXCL` race
+/// could delete the winner's directory.
+#[derive(Debug)]
+pub struct PreparedDir {
+    path: PathBuf,
+    notices: Vec<Notice>,
+    delete_on_shutdown: bool,
+}
+
+/// Something the caller may want to say out loud.
+///
+/// Data rather than a sentence: an operator-facing string is the binary's
+/// business, and a library that formats warnings is a library that cannot be
+/// used by anything which wants to log them differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// The directory was already there.
+    DirectoryExists {
+        /// Which directory.
+        path: PathBuf,
+    },
+}
+
+impl PreparedDir {
+    /// The directory this process prepared.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// What happened on the way, in order.
+    pub fn notices(&self) -> &[Notice] {
+        &self.notices
+    }
+
+    /// Delete the directory, if the configuration asks for it on shutdown.
+    ///
+    /// The reference deletes on shutdown only when configured to
+    /// (`aeron.dir.delete.on.shutdown`), and so does this — including on the
+    /// failure paths, which is why they call the same method.
+    ///
+    /// # Errors
+    ///
+    /// [`DirError::Io`] if the directory is there and cannot be removed.
+    pub fn remove(self) -> Result<(), DirError> {
+        if !self.delete_on_shutdown || !self.path.is_dir() {
+            return Ok(());
+        }
+
+        remove_dir_all(&self.path)
+    }
+}
+
 /// Make `aeron_dir` ready for a new CnC file.
 ///
-/// Returns the lines the reference would have logged while doing it, in order,
-/// for the caller to print. `now_ms` is passed in rather than read so that a
-/// test can age a heartbeat without waiting for one.
+/// `now_ms` is passed in rather than read so that a test can age a heartbeat
+/// without waiting for one.
 ///
 /// # Errors
 ///
 /// [`DirError::Busy`] if a live driver owns the directory, or
 /// [`DirError::Io`] if it could not be inspected, removed or created.
-pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<Vec<String>, DirError> {
+pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<PreparedDir, DirError> {
     let dir = config.aeron_dir.as_path();
-    let mut messages = Vec::new();
+    let mut notices = Vec::new();
 
     if dir.is_dir() {
         if config.warn_if_dirs_exist {
-            messages.push(format!("WARNING: {} exists", dir.display()));
+            notices.push(Notice::DirectoryExists {
+                path: dir.to_owned(),
+            });
         }
 
         if config.dirs_delete_on_start {
@@ -143,25 +201,11 @@ pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<Vec<String>, DirErr
     create_dir(&dir.join(PUBLICATIONS_DIR))?;
     create_dir(&dir.join(IMAGES_DIR))?;
 
-    Ok(messages)
-}
-
-/// Delete the directory if the configuration asks for it.
-///
-/// # Errors
-///
-/// [`DirError::Io`] if the directory is there and cannot be removed.
-pub fn remove(config: &DriverConfig) -> Result<(), DirError> {
-    if !config.dirs_delete_on_shutdown {
-        return Ok(());
-    }
-
-    let dir = config.aeron_dir.as_path();
-    if dir.is_dir() {
-        remove_dir_all(dir)?;
-    }
-
-    Ok(())
+    Ok(PreparedDir {
+        path: dir.to_owned(),
+        notices,
+        delete_on_shutdown: config.dirs_delete_on_shutdown,
+    })
 }
 
 /// Refuse the directory if a driver in it looks alive.
@@ -201,14 +245,19 @@ fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), Dir
     loop {
         match CncFile::try_open(dir) {
             Ok(cnc) => {
-                let heartbeat_ms = cnc
-                    .consumer_heartbeat_ms()
-                    .unwrap_or(deepmsg_cnc::layout::NULL_VALUE);
+                // One read, one verdict: the heartbeat this reports on is the
+                // heartbeat the answer was made from (`CncFile::driver_liveness`).
+                let liveness = cnc
+                    .driver_liveness(now_ms, config.driver_timeout_ms)
+                    .unwrap_or(deepmsg_cnc::Liveness {
+                        heartbeat_ms: deepmsg_cnc::layout::NULL_VALUE,
+                        active: false,
+                    });
 
-                if cnc.driver_is_active(now_ms, config.driver_timeout_ms) {
+                if liveness.active {
                     return Err(DirError::Busy {
                         path: dir.to_owned(),
-                        heartbeat_ms,
+                        heartbeat_ms: liveness.heartbeat_ms,
                         timeout_ms: config.driver_timeout_ms,
                     });
                 }
@@ -452,9 +501,10 @@ mod tests {
         let temp = TempDir::new();
         let config = config(temp.path());
 
-        let messages = prepare(&config, NOW_MS).expect("prepare");
+        let prepared = prepare(&config, NOW_MS).expect("prepare");
 
-        assert!(messages.is_empty());
+        assert!(prepared.notices().is_empty());
+        assert_eq!(temp.path(), prepared.path());
         assert!(temp.path().is_dir());
         assert!(temp.path().join(PUBLICATIONS_DIR).is_dir());
         assert!(temp.path().join(IMAGES_DIR).is_dir());
@@ -571,11 +621,15 @@ mod tests {
             ..config(temp.path())
         };
 
-        let messages = prepare(&config, NOW_MS).expect("prepare");
+        let prepared = prepare(&config, NOW_MS).expect("prepare");
 
-        assert_eq!(1, messages.len());
-        assert!(messages[0].contains("WARNING"));
-        assert!(messages[0].contains(&temp.path().display().to_string()));
+        assert_eq!(
+            [Notice::DirectoryExists {
+                path: temp.path().to_owned(),
+            }],
+            prepared.notices(),
+            "the fact, not a sentence about it"
+        );
     }
 
     #[test]
@@ -588,35 +642,54 @@ mod tests {
             ..config(temp.path())
         };
 
-        let messages = prepare(&config, NOW_MS).expect("prepare");
+        let prepared = prepare(&config, NOW_MS).expect("prepare");
 
-        assert_eq!(1, messages.len(), "the directory existed when it was asked");
+        assert_eq!(
+            1,
+            prepared.notices().len(),
+            "the directory existed when it was asked"
+        );
     }
 
     #[test]
     fn removal_only_happens_when_it_is_configured() {
         let temp = TempDir::new();
-        prepare(&config(temp.path()), NOW_MS).expect("prepare");
 
-        remove(&config(temp.path())).expect("remove");
+        // Off by default: a prepared directory is left where it is.
+        prepare(&config(temp.path()), NOW_MS)
+            .expect("prepare")
+            .remove()
+            .expect("remove");
         assert!(temp.path().is_dir(), "delete.on.shutdown is off by default");
 
-        let config = DriverConfig {
+        // With it on, the same call removes it.
+        let removing = DriverConfig {
             dirs_delete_on_shutdown: true,
             ..config(temp.path())
         };
-        remove(&config).expect("remove");
+        prepare(&removing, NOW_MS)
+            .expect("prepare")
+            .remove()
+            .expect("remove");
         assert!(!temp.path().exists());
     }
 
     #[test]
     fn removal_of_an_absent_directory_is_not_an_error() {
         let temp = TempDir::new();
-        let config = DriverConfig {
+        let removing = DriverConfig {
             dirs_delete_on_shutdown: true,
             ..config(temp.path())
         };
 
-        remove(&config).expect("nothing to remove is nothing to fail");
+        // Prepared, then removed by something else, then removed again: the
+        // guard's job is to delete what is there, and nothing being there is
+        // not a failure.
+        let prepared = prepare(&removing, NOW_MS).expect("prepare");
+        std::fs::remove_dir_all(temp.path()).expect("someone else got there first");
+
+        prepared
+            .remove()
+            .expect("nothing to remove is nothing to fail");
     }
 }

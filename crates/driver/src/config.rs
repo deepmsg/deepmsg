@@ -14,9 +14,11 @@
 //! AERON_DIR=/tmp/aeron
 //! ```
 //!
-//! A `-D` argument beats the environment, and a deepmsg name beats the
-//! reference's, which is the precedence a one-off override wants: the more
-//! specific spelling wins. Unknown properties are ignored rather than
+//! Within one dialect a `-D` argument beats the environment, and across the two
+//! the **whole deepmsg chain beats the whole reference chain** — so
+//! `DEEPMSG_DIR` beats `-Daeron.dir`. That is the precedence the lookup table
+//! implements and the one a one-off override wants: the deployment sets the
+//! reference's names, and a deepmsg name is how somebody overrides them. Unknown properties are ignored rather than
 //! rejected, because a reference deployment's configuration file will carry
 //! settings this driver has no use for yet, and refusing to start over one of
 //! them would make the alias worse than useless.
@@ -50,6 +52,14 @@ pub const TIMER_INTERVAL_NS_DEFAULT: i64 = 1_000_000_000;
 /// directory as abandoned: `AERON_DRIVER_TIMEOUT_MS_DEFAULT (10 * 1000)`
 /// (`aeron-driver/src/main/c/aeron_driver_context.c:217`).
 pub const DRIVER_TIMEOUT_MS_DEFAULT: i64 = 10 * 1000;
+
+/// The largest tier period this driver accepts: one hour.
+///
+/// Not the reference's limit — it has none — but ours, and for a reason the
+/// reference gets away with because it clamps everywhere and this does not: a
+/// deadline is `now + period`, and a period near `i64::MAX` makes that sum
+/// wrap. One hour is a cadence no deployment asks for deliberately.
+pub const MAX_TIMER_INTERVAL_NS: i64 = 60 * 60 * 1_000_000_000;
 
 /// How long a reclaimed counter stays out of reuse: one second, the reference's
 /// `AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_NS_DEFAULT`
@@ -240,7 +250,13 @@ impl DriverConfig {
         // a bad value is reported before the directory is touched.
         config.layout.validate().map_err(ConfigError::Layout)?;
 
-        if config.timer_interval_ns <= 0 {
+        // A tier period is a cadence, and everything above an hour is a typo
+        // rather than a configuration. It also keeps every deadline this
+        // driver computes provably inside an `i64`: the reference parses its
+        // own interval up to `INT64_MAX` and then adds it to a nanosecond
+        // clock, which is where a value like 8e18 turns into a wrapped
+        // deadline and a driver that busy-spins a core while looking healthy.
+        if config.timer_interval_ns <= 0 || config.timer_interval_ns > MAX_TIMER_INTERVAL_NS {
             return Err(ConfigError::OutOfRange {
                 name: Setting::TIMER_INTERVAL.property,
                 value: config.timer_interval_ns.to_string(),

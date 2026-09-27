@@ -342,12 +342,15 @@ impl Conductor {
                 .map_err(ConductorError::SystemCounters)?;
         }
 
-        // A producer's view, taken for one call and dropped: the id the driver
-        // burns at startup belongs to the same counter a client takes its
-        // client id from.
-        if let Some(ring) = cnc.to_driver_ring() {
-            let _ = ring.next_correlation_id();
-        }
+        // The id the driver burns at startup belongs to the same counter a
+        // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
+        // which is why the first client sees id 1 rather than 0. The ring was
+        // proved readable twenty lines above, so a `None` here means the file
+        // changed underneath this process — and starting anyway would hand that
+        // first client id 0, a byte-level divergence with no other symptom.
+        let ring = cnc.to_driver_ring().ok_or(ConductorError::NoCommandRing)?;
+        ring.next_correlation_id()
+            .ok_or(ConductorError::NoCommandRing)?;
 
         // Where the command ring stands now, so that the stall detector starts
         // from a position rather than from zero: the reference seeds the same
@@ -367,7 +370,7 @@ impl Conductor {
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
             clock,
-            clock_update_deadline_ns: now_ns + CLOCK_UPDATE_INTERVAL_NS,
+            clock_update_deadline_ns: now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS),
             // Seeded to now, so the first pass runs the timeout tier: the
             // reference does the same (`aeron_driver_conductor.c:824`), and it
             // means the heartbeat is set before anything can read the version.
@@ -402,7 +405,7 @@ impl Conductor {
 
         if now_ns > self.clock_update_deadline_ns {
             self.now_ms = self.clock.update(now_ns);
-            self.clock_update_deadline_ns = now_ns + CLOCK_UPDATE_INTERVAL_NS;
+            self.clock_update_deadline_ns = now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS);
         }
 
         if now_ns > self.timeout_check_deadline_ns {

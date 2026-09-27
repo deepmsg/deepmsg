@@ -32,15 +32,40 @@ fn identity() -> CncIdentity {
     }
 }
 
+/// A written CnC file: how long it is, and the metadata block at the front.
+///
+/// The block is read and the length is measured, rather than reading the file
+/// into memory: a default driver's file is 46 MB and nothing here looks past
+/// its first 128 bytes. What the length is *for* is the region arithmetic —
+/// the same thing the capture's own length proves — and that comes from the
+/// file system just as well.
+struct Written {
+    length: usize,
+    block: Vec<u8>,
+}
+
 /// A CnC file as a default-configured driver writes it.
-fn created() -> (TempDir, Vec<u8>) {
+fn created() -> (TempDir, Written) {
     let dir = TempDir::new("deepmsg-create");
     let mut cnc = CncFile::create(dir.path(), &CncLayout::default(), &identity())
         .expect("the default layout is one a driver may be configured with");
+
+    // The driver's first heartbeat, then the version: the order `publish`
+    // insists on, and the reason it can.
+    cnc.write_consumer_heartbeat(1_700_000_000_000)
+        .expect("the ring is writable");
     cnc.publish().expect("publish");
 
-    let bytes = std::fs::read(dir.path().join(deepmsg_cnc::CNC_FILE_NAME)).expect("read it back");
-    (dir, bytes)
+    let path = dir.path().join(deepmsg_cnc::CNC_FILE_NAME);
+    let length = std::fs::metadata(&path).expect("measure it").len() as usize;
+    let mut block = vec![0u8; 128];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open(&path).expect("open it"),
+        &mut block,
+    )
+    .expect("read the metadata block");
+
+    (dir, Written { length, block })
 }
 
 #[test]
@@ -55,8 +80,8 @@ fn the_default_layout_is_the_one_the_capture_came_from() {
 
 #[test]
 fn a_written_file_reproduces_the_reference_metadata_field_by_field() {
-    let (_dir, bytes) = created();
-    let written = CncMetadata::decode(&bytes).expect("decode what we wrote");
+    let (_dir, file) = created();
+    let written = CncMetadata::decode(&file.block).expect("decode what we wrote");
     let reference = CncMetadata::decode(HEADER).expect("decode the capture");
 
     // Field by field first, so that a mismatch names the field rather than
@@ -97,29 +122,29 @@ fn a_written_file_reproduces_the_reference_metadata_field_by_field() {
     // is still compared.
     assert_eq!(
         HEADER[..START_TIMESTAMP.start],
-        bytes[..START_TIMESTAMP.start]
+        file.block[..START_TIMESTAMP.start]
     );
-    assert_eq!(HEADER[PID.end..52], bytes[PID.end..52]);
+    assert_eq!(HEADER[PID.end..52], file.block[PID.end..52]);
     assert_eq!(
         HEADER[52..128],
-        bytes[52..128],
+        file.block[52..128],
         "the rest of the metadata region is reserved and stays zero"
     );
     assert_eq!(
         [0u8; 76],
-        bytes[52..128],
+        file.block[52..128],
         "and that is what zero looks like"
     );
 }
 
 #[test]
 fn a_written_file_is_the_length_and_shape_the_capture_was() {
-    let (_dir, bytes) = created();
+    let (_dir, file) = created();
 
-    assert_eq!(CAPTURED_FILE_LENGTH, bytes.len());
+    assert_eq!(CAPTURED_FILE_LENGTH, file.length);
 
-    let written = CncMetadata::decode(&bytes).expect("decode");
-    let regions = RegionLayout::compute(&written, bytes.len()).expect("the regions fit");
+    let written = CncMetadata::decode(&file.block).expect("decode");
+    let regions = RegionLayout::compute(&written, file.length).expect("the regions fit");
 
     // The offsets a real driver's file has, to the byte: 128 + the to-driver
     // region, then the five regions end to end.

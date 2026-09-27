@@ -53,6 +53,11 @@ use crate::subscription::Subscription;
 /// core.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The wait between the first polls of [`Client::wait`], doubling up to
+/// [`POLL_INTERVAL`]: short enough that a fast reply is not paid for with a
+/// frame of latency, and the same 16 ms ceiling as before for one that is slow.
+const MIN_POLL_INTERVAL: Duration = Duration::from_micros(50);
+
 /// Default deadline for a command's reply, matching
 /// `AERON_CONTEXT_DRIVER_TIMEOUT_MS_DEFAULT`
 /// (`aeron-client/src/main/c/aeron_context.c:35`).
@@ -612,6 +617,13 @@ impl Client {
     /// (`aeron_test_base.h:116-131`) and what the C++ wrapper's blocking
     /// `addSubscription` is.
     fn wait(&mut self, correlation_id: i64) -> Result<Ready, CommandError> {
+        // The first wait is short and doubles to [`POLL_INTERVAL`]. A driver
+        // answers in well under a millisecond — its command tier runs every
+        // pass — so a fixed frame-length sleep after every poll made each
+        // command cost the caller a frame of its latency budget. A reply that
+        // is genuinely late still backs off to the same cadence as before.
+        let mut wait = MIN_POLL_INTERVAL;
+
         loop {
             self.poll();
 
@@ -635,7 +647,8 @@ impl Client {
                 return Err(CommandError::TimedOut { correlation_id });
             }
 
-            std::thread::sleep(POLL_INTERVAL);
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(POLL_INTERVAL);
         }
     }
 
