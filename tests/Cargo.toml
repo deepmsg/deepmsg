@@ -96,5 +96,13 @@ name = "aeron_stat_counters"
 path = "interop/aeron_stat_counters.rs"
 required-features = ["interop"]
 
+# The other direction of the pair above: the reference's own client samples
+# against a driver *this* build wrote. Needs the reference build for the
+# samples, and our own driver binary for the driver.
+[[test]]
+name = "own_driver_reference_client"
+path = "interop/own_driver_reference_client.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

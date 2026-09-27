@@ -591,7 +591,27 @@ impl IpcPublications {
             // this pass has *become* lingering, and its lingering case runs on
             // the next turn — which is what makes a revoked publication
             // readable for one more tier than a removed one.
+            let before = self.publications[index].state();
             work += usize::from(self.publications[index].on_time_event(counters, regions, now_ns));
+
+            // The moment a publication finishes draining, its readers are told
+            // the image is gone: they hold a mapping of a log buffer that is
+            // about to be deleted (`aeron_ipc_publication.c:561-577` sends one
+            // message per linked subscription, naming the *constant* channel
+            // rather than the one the client subscribed with).
+            if before == State::Draining && self.publications[index].state() == State::Linger {
+                let registration_id = self.publications[index].registration_id;
+                let stream_id = self.publications[index].stream_id;
+
+                for link in subscriptions.readers_of(registration_id) {
+                    events.unavailable_image(
+                        registration_id,
+                        link.registration_id,
+                        stream_id,
+                        IPC_CHANNEL,
+                    );
+                }
+            }
         }
 
         // And the ones that have reached the end of their life go.

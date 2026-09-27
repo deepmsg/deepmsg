@@ -2896,6 +2896,19 @@ mod tests {
             conductor.do_work();
         }
 
+        // And the reader was told, at the moment the publication finished
+        // draining: it holds a mapping of a log buffer that is about to be
+        // deleted (`aeron_ipc_publication.c:561-577`). The channel in that
+        // message is the *constant*, not the one the client subscribed with.
+        let events = drain(&cnc, &mut receiver);
+        let unavailable = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_UNAVAILABLE_IMAGE_TYPE_ID)
+            .expect("the reader has to hear the stream is over");
+        assert_eq!(42i64.to_le_bytes(), unavailable.1[0..8], "the publication");
+        assert_eq!(9i64.to_le_bytes(), unavailable.1[8..16], "the subscription");
+        assert_eq!(b"aeron:ipc", &unavailable.1[24..]);
+
         assert!(conductor.publications().publications().is_empty());
 
         // The log buffer goes with it, on the agent thread.
