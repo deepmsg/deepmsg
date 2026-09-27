@@ -9,12 +9,14 @@
 //! - name-resolution offload and asynchronous resource reclamation.
 //!
 //! Unsafe is denied at crate root, and exactly one module carries the
-//! documented allow ADR-0002 zone 4 provides for: [`sys`], which is the
-//! process's signal seam today and the media syscall shim (`sendmmsg`,
+//! documented allow ADR-0002 zone 4 provides for: [`sys`], which holds the
+//! kernel seam — signals, the socket probe a log buffer's metadata is written
+//! from, randomness — and grows into the media syscall shim (`sendmmsg`,
 //! `recvmmsg`) when the data plane arrives.
 
 #![deny(unsafe_code)]
 
+pub mod channel_uri;
 pub mod clients;
 pub mod conductor;
 pub mod config;
@@ -22,15 +24,17 @@ pub mod dir;
 pub mod flowcontrol;
 pub mod idle;
 pub mod ipc_publication;
+pub mod ipc_publications;
 pub mod loss;
 pub mod media;
 pub mod native_resource_agent;
 pub mod position;
+pub mod publication_params;
 pub mod receiver;
 pub mod sender;
 pub mod subscribable;
-/// The process's signal seam: the one `unsafe` in this crate, and the only
-/// place the allow appears. ADR-0002 zone 4.
+/// The kernel seam: the one `unsafe` in this crate, and the only place the
+/// allow appears. ADR-0002 zone 4.
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod system_counters;

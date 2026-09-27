@@ -156,6 +156,13 @@ impl NativeResourceAgent {
     /// for and never collected is still created and does not become a mapping
     /// nobody can name.
     pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// The same, for a caller that holds the agent behind a borrow and cannot
+    /// give it up: the thread is joined and the value is left inert, so a
+    /// second call does nothing.
+    pub fn shutdown(&mut self) {
         let _ = self.requests.send(Request::Stop);
 
         if let Some(thread) = self.thread.take() {

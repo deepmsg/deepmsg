@@ -30,7 +30,9 @@ use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{self, Position, RawTail};
 
+use crate::publication_params::PublicationParams;
 use crate::subscribable::{Subscribable, SubscribableHooks, TetherablePosition};
+use crate::sys::SocketBufferLengths;
 
 /// Where a publication is in its life
 /// (`aeron_ipc_publication.h:26-33`).
@@ -44,17 +46,6 @@ pub enum State {
     /// Drained: waiting out the linger timeout before it is removed.
     Linger,
 }
-
-/// The defaults an IPC publication's metadata block is initialised with.
-///
-/// The values the reference's `aeron_ipc_publication_create` call site passes
-/// (`aeron_ipc_publication.c:106-141`) with the context's defaults filled in.
-/// The two `os_*` socket-buffer pairs are written as **zero** here where the
-/// reference queries the operating system — recorded in `docs/compat.md`, and
-/// harmless on this path because only the network transport reads them.
-pub const UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS: i64 = 5_000_000_000;
-/// `AERON_UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:216`).
-pub const UNTETHERED_RESTING_TIMEOUT_NS: i64 = 10_000_000_000;
 
 /// One client's publication.
 pub struct IpcPublication {
@@ -71,14 +62,29 @@ pub struct IpcPublication {
     pub initial_term_id: i32,
     /// How long each term is.
     pub term_length: i32,
+    /// The largest frame, which is in the log buffer's metadata and is what a
+    /// second publication on this channel has to agree about before it may
+    /// share this one (`aeron_confirm_publication_match`,
+    /// `aeron_driver_conductor.c:1109-1136`).
+    pub mtu_length: i32,
     /// `log2(term_length)`.
     pub bits_to_shift: u32,
+    /// The term a resumed stream resumed in — the initial term id when the
+    /// stream did not resume (`aeron_ipc_publication.c:168`).
+    pub starting_term_id: i32,
+    /// How far into it.
+    pub starting_term_offset: i64,
     /// The channel as the client sent it, which is what the counters' keys and
     /// labels carry.
     pub channel: Vec<u8>,
     /// Whether this publication has exactly one producer
     /// (`log_meta_data->type`).
     pub is_exclusive: bool,
+    /// Which request this channel answers, resolved at creation. It is one of
+    /// the four things two `ADD_PUBLICATION`s have to agree about before the
+    /// second may share the first (`aeron_driver_conductor.c:1770-1784`), and
+    /// it is the value the **first** one was created with.
+    pub response_correlation_id: i64,
     /// The log buffer itself.
     pub log: Box<LogFile>,
     /// `pub-pos`: written every pass from the log's tail.
@@ -89,6 +95,14 @@ pub struct IpcPublication {
     pub subscribers: Subscribable,
     /// Half a term by default: the slack the limit is computed from.
     pub term_window_length: i32,
+    /// How long a drained publication lingers before it is removed.
+    pub linger_timeout_ns: i64,
+    /// How long a subscription may stall the limit before it stops counting.
+    pub untethered_window_limit_timeout_ns: i64,
+    /// The same for the lingering half of the tether cycle.
+    pub untethered_linger_timeout_ns: i64,
+    /// And the resting half.
+    pub untethered_resting_timeout_ns: i64,
     /// Where the limit may next jump to (`aeron_ipc_publication.h:172`).
     trip_gain: i32,
     trip_limit: i64,
@@ -102,6 +116,129 @@ pub struct IpcPublication {
     has_reached_end_of_life: bool,
 }
 
+/// Why a second publication on the same channel may not share the first.
+///
+/// One variant per parameter `aeron_confirm_publication_match` compares, so
+/// that the error a client is sent names the field rather than the channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareMismatch {
+    /// The URI named a session the existing publication does not have.
+    SessionId {
+        /// The publication's.
+        existing: i32,
+        /// What the URI asked for.
+        requested: i32,
+    },
+    /// The URI named a different MTU.
+    Mtu {
+        /// The publication's.
+        existing: i32,
+        /// What the URI asked for.
+        requested: i32,
+    },
+    /// The URI named a different term length.
+    TermLength {
+        /// The publication's.
+        existing: i32,
+        /// What the URI asked for.
+        requested: i32,
+    },
+    /// The URI named a position in a different stream.
+    InitialTermId {
+        /// The publication's.
+        existing: i32,
+        /// What the URI asked for.
+        requested: i32,
+    },
+    /// The URI named a different term to resume in.
+    TermId {
+        /// The publication's.
+        existing: i32,
+        /// What the URI asked for.
+        requested: i32,
+    },
+    /// And a different offset inside it.
+    TermOffset {
+        /// The publication's.
+        existing: i64,
+        /// What the URI asked for.
+        requested: i64,
+    },
+}
+
+impl std::fmt::Display for ShareMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionId {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different session-id: existing={existing} requested={requested}"
+            ),
+            Self::Mtu {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different mtu: existing={existing} requested={requested}"
+            ),
+            Self::TermLength {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different term-length: existing={existing} requested={requested}"
+            ),
+            Self::InitialTermId {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different init-term-id: existing={existing} requested={requested}"
+            ),
+            Self::TermId {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different term-id: existing={existing} requested={requested}"
+            ),
+            Self::TermOffset {
+                existing,
+                requested,
+            } => write!(
+                f,
+                "existing publication has different term-offset: existing={existing} requested={requested}"
+            ),
+        }
+    }
+}
+
+/// What the driver knows about a publication before its log buffer is mapped.
+///
+/// The parts of an `ADD_PUBLICATION` that are not channel parameters: who asked,
+/// what to call the result, and whether it may be shared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationIdentity {
+    /// The id the log file is named after, and what every image built on it
+    /// reports as its publication.
+    pub registration_id: i64,
+    /// The client that owns it — the counter's `owner_id`, and whose death
+    /// takes the publication with it.
+    pub client_id: i64,
+    /// The session the stream runs under.
+    pub session_id: i32,
+    /// The stream id.
+    pub stream_id: i32,
+    /// The channel as the client wrote it, which the position counters quote
+    /// back in their keys and labels.
+    pub channel: Vec<u8>,
+    /// Whether this publication is exclusive: one producer, no sharing, and a
+    /// different `pub-pos` label and log type.
+    pub is_exclusive: bool,
+}
+
 impl IpcPublication {
     /// Take ownership of a freshly mapped log buffer and make it a publication.
     ///
@@ -111,93 +248,132 @@ impl IpcPublication {
     /// tails are written *before* the metadata, because that is the order the
     /// reference's caller uses and nothing in the tails needs the metadata.
     ///
-    /// `mtu_length` and `term_window_length` come from the driver's
-    /// configuration; `page_size` is the file's.
-    #[allow(clippy::too_many_arguments)]
+    /// Every value written comes from `params`, which is the URI resolved
+    /// against the driver's configuration (`crate::publication_params`), and
+    /// from `socket_buffers`, which is what the kernel reports: the six
+    /// socket-buffer fields are not zeroes, and two of them are the machine's
+    /// own receive and send buffer sizes (`aeron_ipc_publication.c:117-124`).
+    #[allow(clippy::too_many_arguments)] // one per source of a written field
     pub fn create(
         log: Box<LogFile>,
-        registration_id: i64,
-        client_id: i64,
-        session_id: i32,
-        stream_id: i32,
-        initial_term_id: i32,
-        channel: Vec<u8>,
-        is_exclusive: bool,
-        term_length: i32,
-        mtu_length: i32,
-        term_window_length: i32,
+        identity: PublicationIdentity,
+        params: &PublicationParams,
         page_size: i32,
-    ) -> Option<Self> {
+        socket_buffers: SocketBufferLengths,
+        pub_pos_counter_id: i32,
+        pub_lmt_counter_id: i32,
+    ) -> Result<Self, Box<LogFile>> {
         // The term length is the caller's, not the metadata's: this function is
         // what writes the metadata, so reading it here would read zero.
-        let bits_to_shift = position::bits_to_shift(term_length)?;
+        //
+        // Every refusal below hands the mapping back rather than dropping it:
+        // a log buffer this function could not make a publication of is a
+        // *file* the caller has to remove, and dropping the mapping would
+        // leave it behind (`aeron_driver_conductor.c:3913-3916` frees the
+        // counters, and the command's own free removes the file).
+        let Some(bits_to_shift) = position::bits_to_shift(params.term_length) else {
+            return Err(log);
+        };
 
-        if !log.initialise_tails(initial_term_id, None) {
-            return None;
+        // A stream that resumes starts its tails at the term the URI named;
+        // one that does not starts at the initial term id.
+        let start_term_id = params
+            .starting_position
+            .map_or(params.initial_term_id, |position| position.term_id);
+        #[allow(clippy::cast_possible_truncation)] // bounded by a term length
+        let start = params
+            .starting_position
+            .map(|position| (position.term_id, position.term_offset as i32));
+
+        if !log.initialise_tails(params.initial_term_id, start) {
+            return Err(log);
         }
 
         {
-            let metadata = log.metadata()?;
+            let Some(metadata) = log.metadata() else {
+                return Err(log);
+            };
             let init = descriptor::LogMetadataInit {
                 end_of_stream_position: i64::MAX,
                 is_connected: 0,
                 active_transport_count: 0,
-                correlation_id: registration_id,
-                initial_term_id,
-                mtu_length,
-                term_length,
+                correlation_id: identity.registration_id,
+                initial_term_id: params.initial_term_id,
+                mtu_length: params.mtu_length,
+                term_length: params.term_length,
                 page_size,
-                publication_window_length: term_window_length,
+                publication_window_length: params.publication_window_length,
+                // The receiver window is an image's field: an IPC publication
+                // has no flow control to advertise.
                 receiver_window_length: 0,
+                // An IPC publication has no socket, so the three "this
+                // channel's" lengths stay zero — but the three the kernel was
+                // asked about are the kernel's answer, not zero
+                // (`aeron_ipc_publication.c:117-124`).
                 socket_sndbuf_length: 0,
-                os_default_socket_sndbuf_length: 0,
+                os_default_socket_sndbuf_length: socket_buffers.sndbuf,
                 os_max_socket_sndbuf_length: 0,
                 socket_rcvbuf_length: 0,
-                os_default_socket_rcvbuf_length: 0,
+                os_default_socket_rcvbuf_length: socket_buffers.rcvbuf,
                 os_max_socket_rcvbuf_length: 0,
-                max_resend: 0,
-                session_id,
-                stream_id,
-                entity_tag: 0,
-                response_correlation_id: 0,
-                linger_timeout_ns: 0,
-                untethered_window_limit_timeout_ns: UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS,
-                untethered_linger_timeout_ns: deepmsg_cnc::layout::NULL_VALUE,
-                untethered_resting_timeout_ns: UNTETHERED_RESTING_TIMEOUT_NS,
+                max_resend: params.max_resend,
+                session_id: identity.session_id,
+                stream_id: identity.stream_id,
+                entity_tag: params.entity_tag,
+                response_correlation_id: params.response_correlation_id,
+                linger_timeout_ns: params.linger_timeout_ns,
+                untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
+                untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
+                untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
                 group: 0,
                 is_response: false,
                 rejoin: false,
                 reliable: false,
-                sparse: false,
-                signal_eos: false,
-                spies_simulate_connection: false,
+                sparse: params.is_sparse,
+                signal_eos: params.signal_eos,
+                spies_simulate_connection: params.spies_simulate_connection,
                 tether: false,
-                is_exclusive,
+                is_exclusive: identity.is_exclusive,
             };
 
-            descriptor::initialise(&metadata, &init)?;
+            if descriptor::initialise(&metadata, &init).is_none() {
+                return Err(log);
+            }
         }
 
-        // Nothing has been written, so the first term is where cleanup starts.
+        // Nothing has been written, so the producer, the consumer and cleanup
+        // all start where the tails say the stream is — which for a resumed
+        // stream is not zero (`aeron_ipc_publication.h:162-173` computes the
+        // same position from the same raw tail).
         let clean_position =
-            Position::new(initial_term_id, 0, bits_to_shift, initial_term_id).raw();
+            Position::new(start_term_id, 0, bits_to_shift, params.initial_term_id).raw();
 
-        Some(Self {
-            registration_id,
-            client_id,
-            session_id,
-            stream_id,
-            initial_term_id,
-            term_length,
+        Ok(Self {
+            registration_id: identity.registration_id,
+            client_id: identity.client_id,
+            session_id: identity.session_id,
+            stream_id: identity.stream_id,
+            initial_term_id: params.initial_term_id,
+            term_length: params.term_length,
+            mtu_length: params.mtu_length,
             bits_to_shift,
-            channel,
-            is_exclusive,
+            starting_term_id: start_term_id,
+            starting_term_offset: params
+                .starting_position
+                .map_or(0, |position| position.term_offset),
+            channel: identity.channel,
+            is_exclusive: identity.is_exclusive,
+            response_correlation_id: params.response_correlation_id,
             log,
-            pub_pos_counter_id: 0,
-            pub_lmt_counter_id: 0,
-            subscribers: Subscribable::new(registration_id),
-            term_window_length,
-            trip_gain: term_window_length / 8,
+            pub_pos_counter_id,
+            pub_lmt_counter_id,
+            subscribers: Subscribable::new(identity.registration_id),
+            term_window_length: params.publication_window_length,
+            linger_timeout_ns: params.linger_timeout_ns,
+            untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
+            untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
+            untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
+            trip_gain: params.publication_window_length / 8,
             trip_limit: 0,
             consumer_position: clean_position,
             clean_position,
@@ -205,6 +381,85 @@ impl IpcPublication {
             state: State::Active,
             has_reached_end_of_life: false,
         })
+    }
+
+    /// Whether a publication this driver already has can serve `params`, and
+    /// why not when it cannot (`aeron_confirm_publication_match`,
+    /// `aeron_driver_conductor.c:1109-1177`).
+    ///
+    /// Only what the URI **named** is compared: a second client that says
+    /// nothing about the MTU is served the existing publication whatever its
+    /// MTU is, and one that names a different MTU is refused rather than given
+    /// a publication whose log buffer disagrees with it.
+    pub fn can_be_shared_with(&self, params: &PublicationParams) -> Result<(), ShareMismatch> {
+        if let Some(requested) = params.session_id {
+            if requested != self.session_id {
+                return Err(ShareMismatch::SessionId {
+                    existing: self.session_id,
+                    requested,
+                });
+            }
+        }
+
+        if params.mtu_length_named && params.mtu_length != self.mtu_length {
+            return Err(ShareMismatch::Mtu {
+                existing: self.mtu_length,
+                requested: params.mtu_length,
+            });
+        }
+
+        if params.term_length_named && params.term_length != self.term_length {
+            return Err(ShareMismatch::TermLength {
+                existing: self.term_length,
+                requested: params.term_length,
+            });
+        }
+
+        if let Some(position) = params.starting_position {
+            if position.initial_term_id != self.initial_term_id {
+                return Err(ShareMismatch::InitialTermId {
+                    existing: self.initial_term_id,
+                    requested: position.initial_term_id,
+                });
+            }
+            if position.term_id != self.starting_term_id {
+                return Err(ShareMismatch::TermId {
+                    existing: self.starting_term_id,
+                    requested: position.term_id,
+                });
+            }
+            if position.term_offset != self.starting_term_offset {
+                return Err(ShareMismatch::TermOffset {
+                    existing: self.starting_term_offset,
+                    requested: position.term_offset,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The log buffer's path, as the bytes a reply carries.
+    ///
+    /// Borrowed rather than copied: `ON_PUBLICATION_READY` is the path the
+    /// driver formed, byte for byte, and it is sent inside the same pass that
+    /// knows the publication.
+    pub fn path_bytes(&self) -> &[u8] {
+        self.log.path().as_os_str().as_encoded_bytes()
+    }
+
+    /// One more client holds a link to this publication
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_INCREF`,
+    /// `aeron-driver/src/main/c/aeron_driver_common.h:183`).
+    pub fn incref(&mut self) {
+        self.refcount += 1;
+    }
+
+    /// One fewer. `true` when that was the last link, which is when the
+    /// reference closes the publication (`aeron_driver_common.h:196-214`).
+    pub fn decref(&mut self) -> bool {
+        self.refcount -= 1;
+        0 == self.refcount
     }
 
     /// Where the publication is in its life.
@@ -541,6 +796,31 @@ mod tests {
         }
     }
 
+    /// The parameters a bare `aeron:ipc` channel resolves to, with this
+    /// module's small term length instead of the 64 MiB default.
+    fn publication_params() -> PublicationParams {
+        PublicationParams {
+            term_length: TERM_LENGTH,
+            term_length_named: false,
+            mtu_length: MTU,
+            mtu_length_named: false,
+            publication_window_length: TERM_LENGTH / 2,
+            max_resend: 0,
+            entity_tag: -1,
+            response_correlation_id: -1,
+            session_id: None,
+            linger_timeout_ns: 5_000_000_000,
+            untethered_window_limit_timeout_ns: 5_000_000_000,
+            untethered_linger_timeout_ns: 5_000_000_000,
+            untethered_resting_timeout_ns: 10_000_000_000,
+            is_sparse: true,
+            signal_eos: true,
+            spies_simulate_connection: false,
+            starting_position: None,
+            initial_term_id: 17,
+        }
+    }
+
     /// A publication with its two counters allocated **in the caller's
     /// regions**, as the conductor leaves it.
     ///
@@ -561,21 +841,23 @@ mod tests {
             .expect("a log buffer"),
         );
 
-        let mut publication = IpcPublication::create(
-            log,
-            99,
-            7,
-            100,
-            1001,
-            17,
-            b"aeron:ipc".to_vec(),
-            false,
-            TERM_LENGTH,
-            MTU,
-            TERM_LENGTH / 2,
-            PAGE_SIZE,
-        )
-        .expect("a publication");
+        let identity = PublicationIdentity {
+            registration_id: 99,
+            client_id: 7,
+            session_id: 100,
+            stream_id: 1001,
+            channel: b"aeron:ipc".to_vec(),
+            is_exclusive: false,
+        };
+        let params = publication_params();
+        let socket_buffers = SocketBufferLengths {
+            rcvbuf: 212_992,
+            sndbuf: 212_992,
+        };
+
+        let mut publication =
+            IpcPublication::create(log, identity, &params, PAGE_SIZE, socket_buffers, 0, 0)
+                .expect("a publication");
 
         publication.pub_pos_counter_id = crate::position::allocate_publisher_position(
             manager,
@@ -720,10 +1002,66 @@ mod tests {
             metadata.load_i64_relaxed(descriptor::CORRELATION_ID_OFFSET),
             "the publication's registration id names the log"
         );
+        // The untethered linger timeout is -1 in the configuration and 5 s in
+        // the file: an unset value means "the window limit timeout", and that
+        // substitution happens as the parameters are resolved
+        // (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:414-427`).
         assert_eq!(
-            Some(deepmsg_cnc::layout::NULL_VALUE),
+            Some(5_000_000_000),
             metadata.load_i64_unaligned(descriptor::UNTETHERED_LINGER_TIMEOUT_NS_OFFSET),
-            "the operator has not set a linger timeout"
+            "an unset linger timeout falls back to the window limit timeout"
+        );
+        assert_eq!(
+            Some(-1),
+            metadata.load_i64_relaxed(descriptor::ENTITY_TAG_OFFSET),
+            "no entity tag in the URI is the reference's invalid tag"
+        );
+        assert_eq!(
+            Some(-1),
+            metadata.load_i64_relaxed(descriptor::RESPONSE_CORRELATION_ID_OFFSET),
+            "this is nobody's response channel"
+        );
+        assert_eq!(
+            Some(1),
+            metadata.load_u8(descriptor::SPARSE_OFFSET),
+            "aeron.term.buffer.sparse.file defaults true, and the byte says so"
+        );
+        assert_eq!(
+            Some(1),
+            metadata.load_u8(descriptor::SIGNAL_EOS_OFFSET),
+            "eos defaults true"
+        );
+        assert_eq!(
+            Some(0),
+            metadata.load_u8(descriptor::SPIES_SIMULATE_CONNECTION_OFFSET)
+        );
+
+        // The socket buffer lengths are the kernel's answer, not zeroes: two
+        // of the six are what a fresh socket reports, and the other four are
+        // about a socket this publication does not have.
+        let socket_buffers = SocketBufferLengths {
+            rcvbuf: 212_992,
+            sndbuf: 212_992,
+        };
+        assert_eq!(
+            Some(i64::from(socket_buffers.rcvbuf)),
+            metadata
+                .load_i32_relaxed(descriptor::OS_DEFAULT_SOCKET_RCVBUF_LENGTH_OFFSET)
+                .map(i64::from)
+        );
+        assert_eq!(
+            Some(i64::from(socket_buffers.sndbuf)),
+            metadata
+                .load_i32_relaxed(descriptor::OS_DEFAULT_SOCKET_SNDBUF_LENGTH_OFFSET)
+                .map(i64::from)
+        );
+        assert_eq!(
+            Some(0),
+            metadata.load_i32_relaxed(descriptor::SOCKET_SNDBUF_LENGTH_OFFSET)
+        );
+        assert_eq!(
+            Some(0),
+            metadata.load_i32_relaxed(descriptor::SOCKET_RCVBUF_LENGTH_OFFSET)
         );
 
         // The session and the stream are in the template header — the metadata

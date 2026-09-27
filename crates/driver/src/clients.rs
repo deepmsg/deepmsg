@@ -35,6 +35,7 @@
 //! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
 //! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
 
+use deepmsg_cnc::command::PublicationBuffersReady;
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -71,6 +72,14 @@ pub trait ClientEvents {
 
     /// `ON_ERROR`: the command with this correlation id failed.
     fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]);
+
+    /// `ON_PUBLICATION_READY` or `ON_EXCLUSIVE_PUBLICATION_READY`: the log
+    /// buffer exists and the client may map it.
+    ///
+    /// Which of the two type ids is sent says whether the log buffer may be
+    /// shared with another producer, so it is part of the message rather than
+    /// something the client can work out for itself.
+    fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool);
 }
 
 /// One counter a client owns, by the id the client knows it as.
@@ -98,6 +107,22 @@ pub struct ClientRecord {
     pub liveness_timeout_ms: i64,
     /// Counters this client allocated, in allocation order.
     pub counter_links: Vec<CounterLink>,
+    /// Publications this client holds, in the order it asked for them.
+    pub publication_links: Vec<PublicationLink>,
+}
+
+/// One client's hold on a publication (`aeron_publication_link_t`,
+/// `aeron-driver/src/main/c/aeron_driver_common.h:212-217`).
+///
+/// Two ids, and they are not interchangeable: the first is what the client
+/// called this `ADD_PUBLICATION`, the second is the publication itself. A
+/// removal is matched by the first and acted on the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationLink {
+    /// The client's correlation id for the `ADD_PUBLICATION` that made it.
+    pub registration_id: i64,
+    /// The publication's own registration id — the log file's name.
+    pub publication_registration_id: i64,
 }
 
 /// The clients this driver knows about.
@@ -189,6 +214,7 @@ impl Clients {
             heartbeat_counter_id,
             liveness_timeout_ms: liveness_timeout_ms(liveness_timeout_ns),
             counter_links: Vec::new(),
+            publication_links: Vec::new(),
         });
 
         events.counter_ready(client_id, heartbeat_counter_id);
@@ -410,6 +436,13 @@ mod tests {
 
         fn error(&mut self, correlation_id: i64, error_code: i32, _message: &[u8]) {
             self.0.push(format!("error:{correlation_id}:{error_code}"));
+        }
+
+        fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
+            self.0.push(format!(
+                "publication:{}:{}:exclusive={is_exclusive}",
+                ready.correlation_id, ready.registration_id
+            ));
         }
     }
 
@@ -768,6 +801,12 @@ mod tests {
             fn counter_unavailable(&mut self, _registration_id: i64, _counter_id: i32) {}
             fn operation_succeeded(&mut self, _correlation_id: i64) {}
             fn error(&mut self, _correlation_id: i64, _error_code: i32, _message: &[u8]) {}
+            fn publication_ready(
+                &mut self,
+                _ready: &PublicationBuffersReady<'_>,
+                _is_exclusive: bool,
+            ) {
+            }
 
             fn client_timed_out(&mut self, _client_id: i64) {
                 self.seen.push(

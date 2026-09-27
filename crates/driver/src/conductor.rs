@@ -54,6 +54,7 @@ use deepmsg_cnc::command::{
     ON_UNAVAILABLE_COUNTER_TYPE_ID, decode_add_counter, decode_correlated, decode_remove_counter,
     encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
 };
+use deepmsg_cnc::command::{PublicationBuffersReady, decode_add_publication};
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, ToClientsTransmitter, ToDriverRingConsumer,
@@ -63,6 +64,7 @@ use deepmsg_core::clock::{self, CachedClock};
 
 use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
+use crate::ipc_publications::{IpcPublications, Now};
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -191,6 +193,9 @@ pub enum ConductorError {
     /// A system counter could not be allocated — see [`SystemCounterError`].
     /// The file must not be published: the counters are the contract.
     SystemCounters(SystemCounterError),
+    /// The native resource agent — the thread that creates log buffers — could
+    /// not be started. Nothing can be published without it.
+    Agent(std::io::Error),
 }
 
 impl std::fmt::Display for ConductorError {
@@ -205,6 +210,7 @@ impl std::fmt::Display for ConductorError {
             Self::SystemCounters(error) => {
                 write!(f, "the system counters were not published: {error}")
             }
+            Self::Agent(error) => write!(f, "the native resource agent did not start: {error}"),
         }
     }
 }
@@ -214,6 +220,7 @@ impl std::error::Error for ConductorError {
         match self {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
+            Self::Agent(error) => Some(error),
             Self::NoCommandRing | Self::NoEventRing | Self::NoCounterRegions => None,
         }
     }
@@ -270,10 +277,18 @@ impl ClientEvents for Transmit<'_> {
         let payload = encode_error(correlation_id, error_code, message);
         self.send(ON_ERROR_TYPE_ID, &payload);
     }
+
+    fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
+        let payload = ready.encode();
+        self.send(PublicationBuffersReady::type_id(is_exclusive), &payload);
+    }
 }
 
 /// The driver's control plane.
 pub struct Conductor {
+    /// The settings every publication's parameters default to, kept because
+    /// they are read on the command path and not only at start-up.
+    config: DriverConfig,
     cnc: CncFile,
     commands: ToDriverRingConsumer,
     transmitter: ToClientsTransmitter,
@@ -282,6 +297,9 @@ pub struct Conductor {
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
     clients: Clients,
+    /// The publications this driver owns, and the thread that maps their log
+    /// buffers.
+    publications: IpcPublications,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -301,6 +319,8 @@ pub struct Conductor {
     pending_broadcast_failures: u64,
     broadcast_failures: u64,
     counter_failures: u64,
+    /// `ADD_PUBLICATION`s this driver could not serve.
+    publication_failures: u64,
     malformed: u64,
     unknown_counters: u64,
     unhandled: u64,
@@ -376,13 +396,24 @@ impl Conductor {
             .and_then(|region| commands.consume_position(&region))
             .unwrap_or(0);
 
+        // The agent thread comes up before the CnC file is published: a driver
+        // that cannot create log buffers is a driver that must not claim to be
+        // ready.
+        let publications = IpcPublications::start(
+            config.publication_reserved_session_id_low,
+            config.publication_reserved_session_id_high,
+        )
+        .map_err(ConductorError::Agent)?;
+
         let mut conductor = Self {
+            config: config.clone(),
             cnc,
             commands,
             transmitter,
             counters,
             system_counters: owned_counters,
             clients: Clients::new(),
+            publications,
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -400,6 +431,7 @@ impl Conductor {
             pending_broadcast_failures: 0,
             broadcast_failures: 0,
             counter_failures: 0,
+            publication_failures: 0,
             malformed: 0,
             unknown_counters: 0,
             unhandled: 0,
@@ -433,9 +465,51 @@ impl Conductor {
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
 
-        let work = work_count + self.process_commands();
+        let work = work_count + self.process_commands(now_ns) + self.poll_publications();
         self.flush_broadcast_failures();
         work
+    }
+
+    /// Take the native resource agent's completions: this is where a
+    /// publication whose log buffer was still being created becomes one, and
+    /// where its client is answered.
+    ///
+    /// The reference polls its agent from the same duty cycle
+    /// (`aeron_driver_conductor.c:4042-4067` calls it from `do_work`'s main
+    /// sequence), and for the same reason: the create has to happen on the
+    /// conductor's thread, where the command ring and the counters are.
+    fn poll_publications(&mut self) -> usize {
+        if self.publications.pending() == 0 {
+            return 0;
+        }
+
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let now = Now {
+            ms: self.now_ms,
+            ns: clock::epoch_nano_time(),
+            client_liveness_timeout_ns: self.liveness_timeout_ns,
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+        };
+
+        self.publications.poll(
+            &self.config,
+            &mut self.counters,
+            &counter_regions,
+            &mut self.clients,
+            now,
+            &mut transmit,
+        )
     }
 
     /// Whether the driver should keep running.
@@ -452,6 +526,16 @@ impl Conductor {
     /// The clients this driver knows about.
     pub const fn clients(&self) -> &Clients {
         &self.clients
+    }
+
+    /// The publications this driver owns.
+    pub const fn publications(&self) -> &IpcPublications {
+        &self.publications
+    }
+
+    /// `ADD_PUBLICATION`s this driver could not serve.
+    pub const fn publication_failures(&self) -> u64 {
+        self.publication_failures
     }
 
     /// Commands that are in the protocol and not implemented here yet.
@@ -526,6 +610,13 @@ impl Conductor {
             ));
         };
 
+        // The publications go first: each one gives its counters back and
+        // hands its log buffer to the agent, which is the order the reference
+        // closes in (`:3427-3436`) and the reason its shutdown leaves no
+        // publication counters behind.
+        self.publications
+            .close(&mut self.counters, &regions, self.now_ms);
+
         let released = self
             .system_counters
             .release_all(&mut self.counters, &regions, self.now_ms);
@@ -541,7 +632,7 @@ impl Conductor {
     }
 
     /// Drain at most [`COMMAND_DRAIN_LIMIT`] commands and act on them.
-    fn process_commands(&mut self) -> usize {
+    fn process_commands(&mut self, now_ns: i64) -> usize {
         // Borrows split by field rather than through `&mut self`, because the
         // read takes a window from the file while the handler writes state.
         let cnc = &self.cnc;
@@ -551,6 +642,9 @@ impl Conductor {
         let clients = &mut self.clients;
         let running = &mut self.running;
         let termination = self.termination;
+        let config = &self.config;
+        let publications = &mut self.publications;
+        let publication_failures = &mut self.publication_failures;
         let now_ms = self.now_ms;
         let liveness_timeout_ns = self.liveness_timeout_ns;
         let pending_failures = &mut self.pending_broadcast_failures;
@@ -602,6 +696,48 @@ impl Conductor {
                 // Nothing is freed here: the heartbeat is zeroed so the next
                 // timeout tier collects the client, which is also what stops
                 // that tier from announcing a timeout (`:6321-6331`).
+                // A publication: parse the URI, resolve its parameters against
+                // the driver's settings, and either share an existing
+                // publication or ask the agent for a log buffer. The reply
+                // follows from whichever of those happened
+                // (`aeron_driver_conductor.c:3956-4080`).
+                command @ (Command::AddPublication | Command::AddExclusivePublication) => {
+                    let is_exclusive = matches!(command, Command::AddExclusivePublication);
+
+                    match decode_add_publication(payload) {
+                        Some(request) => {
+                            let now = Now {
+                                ms: now_ms,
+                                ns: now_ns,
+                                client_liveness_timeout_ns: liveness_timeout_ns,
+                            };
+
+                            if let Err(error) = publications.add_publication(
+                                &request,
+                                is_exclusive,
+                                config,
+                                counters,
+                                &counter_regions,
+                                clients,
+                                now,
+                                &mut transmit,
+                            ) {
+                                // The error code is the reference's, derived
+                                // from what failed rather than from where: a
+                                // channel it cannot parse is a different
+                                // answer from one whose parameters do not add
+                                // up (`aeron_driver_conductor.c:2344-2352`).
+                                *publication_failures += 1;
+                                transmit.error(
+                                    request.correlation_id,
+                                    error.error_code(),
+                                    error.to_string().as_bytes(),
+                                );
+                            }
+                        }
+                        None => *malformed += 1,
+                    }
+                }
                 Command::ClientClose => match decode_correlated(payload) {
                     Some(correlated) => {
                         clients.on_close(correlated.client_id, counters, &counter_regions);
@@ -920,7 +1056,17 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deepmsg_cnc::command::{
+        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ERROR_CODE_INVALID_CHANNEL,
+        ERROR_CODE_NOT_SUPPORTED, ON_ERROR_TYPE_ID, ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
+        ON_PUBLICATION_READY_TYPE_ID,
+    };
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
+    use deepmsg_core::logbuffer::{descriptor, frame};
+
+    use crate::config::{
+        PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT, PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
+    };
     use deepmsg_cnc::layout::NULL_VALUE;
     use deepmsg_cnc::{CncIdentity, CncLayout, TerminateDriver};
     use deepmsg_cnc::{Received, ToClientsReceiver};
@@ -1080,6 +1226,81 @@ mod tests {
         out.extend_from_slice(&(label.len() as i32).to_le_bytes());
         out.extend_from_slice(label);
         out
+    }
+
+    /// A directory a publication can be created in, and the settings to
+    /// create it with.
+    ///
+    /// The term length is a test's rather than the driver's: the default is
+    /// 64 MiB, and a log buffer is three terms and a metadata page — 192 MiB
+    /// per publication, which is not what a unit test should write to a disk.
+    ///
+    /// The directory itself is made by [`crate::dir::prepare`], which is the
+    /// driver's own start-up step and the thing that creates `publications/`:
+    /// a test that only made the CnC file would be testing a driver whose
+    /// agent cannot create anything.
+    fn publication_config(dir: &std::path::Path) -> DriverConfig {
+        let config = DriverConfig {
+            aeron_dir: dir.to_owned(),
+            ipc_term_buffer_length: 64 * 1024,
+            ..DriverConfig::default()
+        };
+        crate::dir::prepare(&config, clock::epoch_millis()).expect("the directory is prepared");
+
+        config
+    }
+
+    /// `ADD_PUBLICATION`'s wire form, written by the client-side encoder so
+    /// that the two directions of the protocol are checked against each other
+    /// in every test that sends one.
+    fn add_publication_payload(
+        client_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        channel: &str,
+    ) -> Vec<u8> {
+        let command = deepmsg_cnc::command::AddPublication {
+            client_id,
+            correlation_id,
+            stream_id,
+            channel,
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        out
+    }
+
+    /// Drive the conductor until an event of `type_id` turns up, and return
+    /// its payload.
+    ///
+    /// A publication's log buffer is created by the agent thread, so its reply
+    /// lands a pass or two after the command: draining once would be asserting
+    /// on the speed of a file system, and a deadline is what makes the
+    /// assertion about the driver instead.
+    fn await_event(
+        conductor: &mut Conductor,
+        cnc: &CncFile,
+        receiver: &mut ToClientsReceiver,
+        type_id: i32,
+    ) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            for (received_id, payload) in drain(cnc, receiver) {
+                if received_id == type_id {
+                    return payload;
+                }
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no event with type {type_id} arrived"
+            );
+
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// `REMOVE_COUNTER`'s wire form: the correlated head and the **counter's**
@@ -1667,5 +1888,310 @@ mod tests {
             ),
             "and it was past the threshold"
         );
+    }
+    #[test]
+    fn an_add_publication_creates_a_log_buffer_and_answers_the_client() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        let registration_id = 42;
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, registration_id, 1001, "aeron:ipc"),
+        );
+
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        // The fixed head, then the log buffer's path with no padding.
+        let path = temp.0.join("publications").join("42.logbuffer");
+        let path = path.to_str().expect("a path in the temp directory");
+        assert_eq!(36 + path.len(), payload.len());
+        assert_eq!(registration_id.to_le_bytes(), payload[0..8], "the request");
+        assert_eq!(
+            registration_id.to_le_bytes(),
+            payload[8..16],
+            "and the publication it made, which is what names the file"
+        );
+        assert_eq!(1001i32.to_le_bytes(), payload[20..24], "the stream");
+        assert_eq!(
+            (-1i32).to_le_bytes(),
+            payload[28..32],
+            "an IPC channel has no status counter"
+        );
+        assert_eq!(path.as_bytes(), &payload[36..]);
+        assert_eq!(0, conductor.publication_failures());
+
+        // The session id is one the driver speculated, so it is not one of the
+        // ids it keeps for itself.
+        let session_id = i32::from_le_bytes(payload[16..20].try_into().expect("four bytes"));
+        // The session id is one the driver speculated, so it is outside the
+        // range the driver keeps for itself — and the range is on *both* sides
+        // of zero, because the cursor starts from a random `i32`.
+        assert!(
+            !(PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT
+                ..=PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT)
+                .contains(&session_id),
+            "session {session_id} is inside the reserved range"
+        );
+
+        // The reply names the limit counter, and it is a real one.
+        let limit_counter_id = i32::from_le_bytes(payload[24..28].try_into().expect("four bytes"));
+        let publication = &conductor.publications().publications()[0];
+        assert_eq!(publication.pub_lmt_counter_id, limit_counter_id);
+        assert_eq!(publication.session_id, session_id);
+
+        let regions = counter_regions(&conductor);
+        let limit = conductor
+            .counters()
+            .value(&regions, limit_counter_id)
+            .expect("the counter is readable");
+        assert_eq!(0, limit, "nothing has been published yet");
+
+        // Both counters are in the file for `AeronStat`, under the labels the
+        // reference gives them: `name: <registration> <session> <stream>
+        // <channel>`, with the session the one the reply named.
+        let reader = regions.reader();
+        assert_eq!(
+            format!("pub-pos (concurrent): 42 {session_id} 1001 aeron:ipc"),
+            reader
+                .find_by_type_id(crate::position::type_id::PUBLISHER_POSITION)
+                .expect("pub-pos")
+                .label
+        );
+        assert_eq!(
+            format!("pub-lmt: 42 {session_id} 1001 aeron:ipc"),
+            reader
+                .find_by_type_id(crate::position::type_id::PUBLISHER_LIMIT)
+                .expect("pub-lmt")
+                .label
+        );
+
+        // And the log buffer is there, describing the same stream.
+        let log = std::fs::read(path).expect("the file the reply named");
+        let metadata = &log[log.len() - descriptor::METADATA_LENGTH..];
+
+        // The socket buffer lengths in it are the kernel's answer, put there by
+        // the driver's own probe rather than by a test: this is the end of the
+        // chain that starts at `default_socket_buffers`, and a driver that
+        // wrote zeroes would fail here on any machine with a kernel.
+        assert_eq!(
+            config.socket_buffers.rcvbuf.to_le_bytes(),
+            metadata[descriptor::OS_DEFAULT_SOCKET_RCVBUF_LENGTH_OFFSET
+                ..descriptor::OS_DEFAULT_SOCKET_RCVBUF_LENGTH_OFFSET + 4]
+        );
+        assert_eq!(
+            config.socket_buffers.sndbuf.to_le_bytes(),
+            metadata[descriptor::OS_DEFAULT_SOCKET_SNDBUF_LENGTH_OFFSET
+                ..descriptor::OS_DEFAULT_SOCKET_SNDBUF_LENGTH_OFFSET + 4]
+        );
+        assert_eq!(
+            (64 * 1024i32).to_le_bytes(),
+            metadata[descriptor::TERM_LENGTH_OFFSET..descriptor::TERM_LENGTH_OFFSET + 4]
+        );
+        assert_eq!(
+            1408i32.to_le_bytes(),
+            metadata[descriptor::MTU_LENGTH_OFFSET..descriptor::MTU_LENGTH_OFFSET + 4]
+        );
+        assert_eq!(
+            session_id.to_le_bytes(),
+            metadata[descriptor::DEFAULT_FRAME_HEADER_OFFSET + frame::SESSION_ID_FIELD_OFFSET
+                ..descriptor::DEFAULT_FRAME_HEADER_OFFSET + frame::SESSION_ID_FIELD_OFFSET + 4]
+        );
+    }
+
+    #[test]
+    fn a_second_publication_on_the_same_stream_shares_the_first_log_buffer() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        // The same client asking again for the same stream gets the *existing*
+        // publication: its correlation id comes back in the first field and the
+        // publication's own — 42, not 43 — in the second.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1001, "aeron:ipc"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(43i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            42i64.to_le_bytes(),
+            payload[8..16],
+            "the shared publication"
+        );
+        assert_eq!(1, conductor.publications().publications().len());
+        assert_eq!(
+            2,
+            conductor
+                .clients()
+                .find(7)
+                .expect("the client")
+                .publication_links
+                .len(),
+            "both requests are links the client holds"
+        );
+
+        // An *exclusive* publication is a different stream by contract, so it
+        // gets its own log buffer and its own reply type.
+        send(
+            &conductor,
+            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 44, 1001, "aeron:ipc"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(44i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(44i64.to_le_bytes(), payload[8..16], "its own publication");
+        assert_eq!(2, conductor.publications().publications().len());
+        assert!(temp.0.join("publications").join("44.logbuffer").exists());
+    }
+
+    #[test]
+    fn a_session_id_that_is_taken_by_a_stream_this_cannot_share_is_a_clash() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        // An exclusive publication holds session 5000 on stream 1001. It is
+        // not shareable, so the session id it holds cannot be handed out again
+        // — and the check that says so runs *after* the sharing lookup, which
+        // is what makes this a clash rather than a link.
+        send(
+            &conductor,
+            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc?session-id=5000"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
+        );
+        assert_eq!(
+            5000i32.to_le_bytes(),
+            payload[16..20],
+            "a session the URI named is the session it gets"
+        );
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1001, "aeron:ipc?session-id=5000"),
+        );
+        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+
+        assert_eq!(43i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            ERROR_CODE_INVALID_CHANNEL.to_le_bytes(),
+            payload[8..12],
+            "the reference's clash code"
+        );
+        assert_eq!(1, conductor.publication_failures());
+
+        // The same stream under a session nobody is using is a new publication.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 44, 1001, "aeron:ipc?session-id=5001"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(5001i32.to_le_bytes(), payload[16..20]);
+        assert_eq!(44i64.to_le_bytes(), payload[8..16], "its own publication");
+        assert_eq!(2, conductor.publications().publications().len());
+    }
+
+    #[test]
+    fn a_channel_this_driver_cannot_serve_is_refused_with_a_code_and_an_answer() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        // A channel that is not a channel: the reference raises
+        // `-AERON_ERROR_CODE_INVALID_CHANNEL`, which reaches the client as the
+        // positive code.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 9, 1001, "aeron:tcp?endpoint=localhost:1"),
+        );
+        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+
+        assert_eq!(9i64.to_le_bytes(), payload[0..8], "the failing command");
+        assert_eq!(
+            ERROR_CODE_INVALID_CHANNEL.to_le_bytes(),
+            payload[8..12],
+            "the reference's code for a channel it cannot read"
+        );
+        assert_eq!(1, conductor.publication_failures());
+
+        // A UDP channel is a channel this build does not serve yet: it is
+        // refused rather than left waiting, and with the code the protocol has
+        // for exactly that.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=localhost:40123"),
+        );
+        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+
+        assert_eq!(10i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(ERROR_CODE_NOT_SUPPORTED.to_le_bytes(), payload[8..12]);
+        assert_eq!(2, conductor.publication_failures());
+
+        // A URI the client could not have written but a hostile one could: the
+        // payload is short of the channel it claims.
+        send(&conductor, ADD_PUBLICATION_TYPE_ID, &[0u8; 16]);
+        conductor.do_work();
+        assert_eq!(
+            1,
+            conductor.malformed_commands(),
+            "and it is counted as malformed rather than as a failed publication"
+        );
+        assert_eq!(0, conductor.publications().publications().len());
     }
 }
