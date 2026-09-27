@@ -168,6 +168,30 @@ impl<'a, Access> CountersReader<'a, Access> {
             .load_i64_acquire(offset + layout::COUNTER_VALUE_OFFSET)
     }
 
+    /// The raw key of one counter, at its full width.
+    ///
+    /// The key has no length field: the reference hands every reader
+    /// `sizeof(record->key)` bytes and lets the counter's type decide how many
+    /// of them mean anything (`aeron_counters_manager.c:309`, and the layout
+    /// structs at `aeron_counters_manager.h:37-70` for what each type means).
+    /// The client's own heartbeat lookup compares the first eight bytes — the
+    /// registration id — to its client id (`aeron_client_conductor.c:1208-1232`).
+    ///
+    /// A fixed-width array rather than a slice because there is nothing to
+    /// trim: a caller that wants eight bytes takes eight, and nothing allocates
+    /// on the way.
+    pub fn key(&self, counter_id: i32) -> Option<[u8; layout::COUNTER_KEY_LENGTH]> {
+        if counter_id < 0 || counter_id > self.max_counter_id {
+            return None;
+        }
+
+        let offset = counter_id as usize * layout::COUNTER_METADATA_LENGTH;
+        let mut out = [0u8; layout::COUNTER_KEY_LENGTH];
+        self.metadata
+            .copy_out(offset + layout::COUNTER_KEY_OFFSET, &mut out)?;
+        Some(out)
+    }
+
     /// Read one metadata record into a descriptor.
     ///
     /// `label_length` is read with an acquire *after* the state was observed

@@ -15,6 +15,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod clients;
 pub mod conductor;
 pub mod config;
 pub mod dir;
@@ -27,3 +28,4 @@ pub mod sender;
 /// place the allow appears. ADR-0002 zone 4.
 #[allow(unsafe_code)]
 pub mod sys;
+pub mod system_counters;

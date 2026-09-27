@@ -218,6 +218,15 @@ pub const COUNTER_STATE_OFFSET: usize = 0;
 /// `type_id` within a metadata record (`int32`).
 pub const COUNTER_TYPE_ID_OFFSET: usize = 4;
 
+/// `free_for_reuse_deadline_ms` within a metadata record (`int64`, volatile) —
+/// `aeron-client/src/main/c/aeronc.h:861`.
+///
+/// Two values are meaningful and the rest are timestamps: [`COUNTER_NOT_FREE_TO_REUSE`]
+/// for an allocated record, and `now_ms + timeout` for a reclaimed one. Only a
+/// *reclaimed* record ever has a deadline in the past, and only the allocator
+/// reads this field.
+pub const COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET: usize = 8;
+
 /// `key` within a metadata record; always read at its full length, never
 /// trimmed (`aeron-client/src/main/c/concurrent/aeron_counters_manager.c:310`).
 pub const COUNTER_KEY_OFFSET: usize = 16;
@@ -241,6 +250,28 @@ pub const COUNTER_STATE_ALLOCATED: i32 = 1;
 /// Record state meaning "returned to the pool"; its `key` is zeroed
 /// non-atomically, so the key of a reclaimed record must not be read.
 pub const COUNTER_STATE_RECLAIMED: i32 = -1;
+
+/// The `free_for_reuse_deadline_ms` of a live counter: "not on the free list,
+/// and not headed there" (`aeron-client/src/main/c/aeronc.h:893`,
+/// `AERON_COUNTER_NOT_FREE_TO_REUSE`).
+pub const COUNTER_NOT_FREE_TO_REUSE: i64 = i64::MAX;
+
+/// What a value record's `registration_id` is reset to when its slot is
+/// recycled (`aeron-client/src/main/c/aeronc.h:890`,
+/// `AERON_COUNTER_REGISTRATION_ID_DEFAULT`).
+pub const COUNTER_REGISTRATION_ID_DEFAULT: i64 = 0;
+
+/// The reset value of `owner_id` on recycle (`aeron-client/src/main/c/aeronc.h:894`).
+pub const COUNTER_OWNER_ID_DEFAULT: i64 = 0;
+
+/// The reset value of `reference_id` on recycle (`aeron-client/src/main/c/aeronc.h:895`).
+pub const COUNTER_REFERENCE_ID_DEFAULT: i64 = 0;
+
+/// "No counter", as a counter id (`aeron-client/src/main/c/aeronc.h:896`,
+/// `AERON_NULL_COUNTER_ID`). Distinct from [`NULL_VALUE`], which is a *value*
+/// sentinel and also `-1` — the two coincide numerically and mean different
+/// things, so the names are kept apart here as they are in the reference.
+pub const NULL_COUNTER_ID: i32 = -1;
 
 const _: () = assert!(COUNTER_KEY_OFFSET + COUNTER_KEY_LENGTH == COUNTER_LABEL_LENGTH_OFFSET);
 const _: () = assert!(COUNTER_LABEL_OFFSET + COUNTER_LABEL_LENGTH_MAX == COUNTER_METADATA_LENGTH);

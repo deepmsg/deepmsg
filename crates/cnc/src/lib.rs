@@ -10,13 +10,16 @@
 //! - **creating** — [`CncFile::create`]: the file, its regions, and the
 //!   release store that publishes them. Only a driver does this; the client
 //!   half of the life of a CnC file is mapping one that is already there;
+//! - **writing** — [`CounterManager`] allocates and reclaims counters, and
+//!   [`ToClientsTransmitter`] publishes driver→client events. Both are the
+//!   driver's half of two contracts whose reader half is also here, which is
+//!   why they live in this crate rather than in the driver;
 //! - version negotiation, in [`deepmsg_core::version`]: refuse on major
 //!   mismatch, refuse a file whose minor is older than ours, retry while the
 //!   version is still zero.
 //!
-//! Not here yet: counter *allocation* and the to-clients broadcast *writer*.
-//! Both belong to the driver, and both arrive with the driver code that needs
-//! them rather than ahead of it.
+//! Not here yet: the distinct error log's *writer*, which arrives with the
+//! driver code that records errors (P1-3).
 //!
 //! # Unsafe
 //!
@@ -30,6 +33,7 @@
 
 pub mod broadcast;
 pub mod command;
+pub mod counter_manager;
 pub mod counters;
 pub mod create;
 pub mod error;
@@ -39,8 +43,15 @@ pub mod layout;
 pub mod metadata;
 pub mod ring;
 
-pub use broadcast::{Received, ToClientsReceiver};
-pub use command::{MAX_TOKEN_LENGTH, TERMINATE_DRIVER_TYPE_ID, TerminateDriver};
+pub use broadcast::{Received, ToClientsReceiver, ToClientsTransmitter, TransmitError};
+pub use command::{
+    AddCounter, CLIENT_TIMEOUT_LENGTH, CORRELATED_COMMAND_LENGTH, COUNTER_UPDATE_LENGTH,
+    Correlated, MAX_TOKEN_LENGTH, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, RemoveCounter, TERMINATE_DRIVER_TYPE_ID, TerminateDriver,
+    decode_add_counter, decode_correlated, decode_remove_counter, encode_client_timeout,
+    encode_counter_update,
+};
+pub use counter_manager::{CounterManager, CounterRegions};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use create::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncIdentity, CncLayout};
 pub use error::{CncError, Region};

@@ -183,6 +183,16 @@ published after the body and is the completeness signal. `latest_counter` lags
 `latest_counter` (`aeron_broadcast_receiver.c:47-52`); starting at
 `tail_counter` would replay the whole ring.
 
+**The transmitter is not the Java one.** The C writes a record's header once,
+*before* the payload — `length` then `msg_type_id`, both plain stores — and
+publishes with a single release store of `tail_counter`
+(`concurrent/aeron_broadcast_transmitter.c:96-102`). There is no second
+length-and-type-id write after the body and no per-record commit marker: a
+reader that waits for one, as the Java reader does, waits forever. The only
+ordering that is made explicit is the *tail intent*, which is raised with a
+release and then a full fence (`:45-49`) **before** the record is touched,
+because it is what a lapped reader measures itself against.
+
 **Record header**, both rings: `{ int32 length; int32 msg_type_id }`, 8 bytes.
 The struct is `#pragma pack(4)`, so its *alignment* is 4; record *starts* are
 8-aligned via `AERON_RB_ALIGNMENT` (`aeron-client/src/main/c/concurrent/aeron_rb.h:52`). `msg_type_id == -1` marks
@@ -263,6 +273,56 @@ Enumeration mirrors `aeron-client/src/main/c/concurrent/aeron_counters_manager.c
 stride 512 from index 0, report only `ALLOCATED`, **stop at the first `UNUSED`**
 (counters are allocated densely from zero), and step over `RECLAIMED` without
 reading its key, which reclamation zeroes non-atomically.
+
+### Writing one
+
+`deepmsg_cnc::CounterManager` is the write half, and the order it writes in is
+the contract a reader depends on (`aeron_counters_manager.c:87-124`): `type_id`,
+the reuse deadline, the key, the label, `label_length`, and then `state` with a
+**release**. That release — and nothing else — is what makes a half-filled
+record invisible. The value record is not touched by an allocation at all;
+`registration_id`, `owner_id` and `reference_id` are written afterwards by
+whoever owns the counter.
+
+Two properties of the write side have no counterpart on the read side and are
+easy to mistake for bugs:
+
+- **The free list is in the driver's heap, not in the file.** A driver that
+  restarts re-derives ids from a high-water mark and knows nothing of what was
+  freed. The durable half of reclamation is `state = RECLAIMED` plus
+  `free_for_reuse_deadline_ms`; nothing in the file marks a slot as "waiting".
+- **Neither the key nor the label is cleared to its full width.** Only the bytes
+  the length covers are written, so a recycled slot can show the previous
+  tenant's text past the current label. A reader bounds itself by
+  `label_length`; a writer must not "tidy" the tail.
+
+`free` is the exception that proves the rule: it zeroes the *key*
+(`:262-263`), because a reader is told never to look at a reclaimed record's
+key, and leaves `type_id`, `label` and `label_length` exactly as they were.
+
+### The system counters
+
+A driver allocates forty-six of them at conductor init
+(`aeron-driver/src/main/c/aeron_system_counters.c:24-71`), all with type id `0`,
+a four-byte little-endian **index** as the key, the index as their
+`registration_id` and `NULL_VALUE` as their owner. The reference fails init if
+the manager hands back any id other than the table index (`:99-107`), so they
+must be the first thing a fresh file carries.
+
+Their labels are interop-visible text, and two of them name a build:
+`Errors: version=… commit=…` (id 15) and `Aeron software: …` (id 34). The
+reference writes its own version text and git sha; **deepmsg writes the Aeron
+version whose contracts it implements and its own identity**
+(`deepmsg-<crate version>`). The divergence is deliberate — a file should not
+claim to have been written by a build that does not exist — and it is why a
+golden comparison of the two catalogues masks those two labels.
+
+The reference also appends runtime context to eight labels
+(`aeron_driver_conductor.c:848-951`): the resolver's name, the driver's
+threading mode and the duty-cycle thresholds. deepmsg appends to three of them;
+the sender, receiver and name-resolver counters keep their base labels, because
+those agents are not built yet and a suffix naming the duty cycle of something
+that never runs describes nothing.
 
 `max_counter_id = CV / 128 - 1` (`aeron_counters_manager.h:170`).
 

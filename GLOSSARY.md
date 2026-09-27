@@ -54,6 +54,9 @@ follow ADR-0005; tiers say where each name lives:
 | spy | T1 | The `aeron-spy:` URI scheme: subscribe locally to a network publication without joining its remote/multicast group. Archive LOCAL recording rides on this mechanism. |
 | MDC / MDS | code | Multi-destination-cast: client-managed destination control on a live publication (send) or subscription (receive); the manual `control-mode=` URI parameters are the frozen part. |
 | counters | T2 | Typed, labeled slots in the CnC file. Type ids are byte-level contract; label text is interop-visible. Cross-process references pass the 4-byte registration id — counters never leave the host. |
+| client heartbeat | code | The counter (type `11`) a driver allocates per client, labelled `client-heartbeat: id=<clientId>`, which the *client* writes on its own duty cycle. There is no registration command and no client record region: this counter is the registration, and it is what the driver reaps a client by. |
+| client liveness timeout | code | `aeron.client.liveness.timeout`, ten seconds by default: how long a client's heartbeat may go unwritten before the driver destroys everything that client owned and announces `ON_CLIENT_TIMEOUT` — unless the client closed itself first, which is announced as a departure without a timeout. |
+| counter reuse deadline | code | `aeron.counters.free.to.reuse.timeout`, one second by default: how long a freed counter stays out of reuse, so a client holding a stale id cannot read a fresh counter as the old one. The durable half of reclamation is this plus `state = RECLAIMED`; the free list itself lives in the driver's heap. |
 
 ## Archive
 

@@ -35,6 +35,35 @@ Rules:
 - Changing anything in this table without extending the interop suite first
   is a review-blocking offence.
 
+## Counters
+
+Two of the forty-six system counter labels name the build that wrote the file:
+`Errors: version=… commit=…` (id 15) and `Aeron software: …` (id 34)
+(`aeron-driver/src/main/c/aeron_system_counters.c:41,60`). The reference writes
+`AERON_VERSION_TXT` and its git sha. deepmsg writes `version=1.53.2` — the
+version whose contracts it implements, and the same version its value field
+packs as `79106` — and `commit=deepmsg-<crate version>`.
+
+That is a recorded divergence rather than a copy, and it is deliberate: a git
+sha is a fact about a build, the reference's own label changes from build to
+build, and writing theirs would put a claim in the file that is not true. A
+tool that *parses* the field (none in the reference does; `AeronStat` prints
+it) would take `deepmsg-0.1.0` for a commit, which is the one honest thing it
+could say.
+
+The other labels the reference suffixes at runtime — the driver's threading
+mode, the resolver's name, the duty-cycle thresholds
+(`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
+reference's own text changes with its settings. deepmsg appends `INVOKER` to
+the conductor's two counters, matching the reference's word for a driver whose
+agents are invoked by one thread, and leaves the sender, receiver and
+name-resolver counters unsuffixed because those agents do not exist yet.
+
+The consequence for testing: a golden comparison of the two catalogues
+compares each label up to its first colon, and
+`crates/driver/tests/system_counters.rs` asserts the masked halves separately
+so that being *absent* cannot pass for being right.
+
 ## Configuration names
 
 The driver reads the reference's settings under both spellings: the property
@@ -51,3 +80,7 @@ existing configuration therefore works unchanged, which is the point.
 The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
+
+`aeron.counters.free.to.reuse.timeout` follows the same rule and is one more
+name whose environment variable is not the property name in capitals
+(`AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT`, `aeronmd.h:525`).

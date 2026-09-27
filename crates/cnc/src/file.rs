@@ -16,6 +16,7 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 use deepmsg_core::version::{self, CncVersionCompatibility};
 
+use crate::counter_manager::CounterRegions;
 use crate::counters::CountersReader;
 use crate::create::CncCreateError;
 use crate::error::CncError;
@@ -346,6 +347,38 @@ impl CncFile {
     pub fn to_clients_region(&self) -> Option<AtomicBuffer<'_, ReadOnly>> {
         self.mapping
             .region(self.layout.to_clients.start, self.layout.to_clients.len())
+    }
+
+    /// A **writable** window over the to-clients broadcast region.
+    ///
+    /// The driver's half of the same ring [`CncFile::to_clients_region`] hands
+    /// to a client, and writable for the same reason: the file was opened that
+    /// way, not because a different name was called. `None` on a read-only
+    /// file.
+    pub fn to_clients_region_writable(&self) -> Option<AtomicBuffer<'_, ReadWrite>> {
+        self.mapping
+            .region_mut(self.layout.to_clients.start, self.layout.to_clients.len())
+    }
+
+    /// The two counter regions as a writer's pair.
+    ///
+    /// [`CncFile::counters_writable`] gives the same bytes as a reader, which
+    /// is what a client's heartbeat needs; this gives them as the pair a
+    /// [`CounterRegions`] is built from, which is what allocating and freeing
+    /// needs. Both exist rather than one, because the two callers differ in
+    /// what they should be able to do: a client may write a value and must not
+    /// allocate, a driver does both.
+    pub fn counter_regions(&self) -> Option<CounterRegions<'_>> {
+        let metadata = self.mapping.region_mut(
+            self.layout.counters_metadata.start,
+            self.layout.counters_metadata.len(),
+        )?;
+        let values = self.mapping.region_mut(
+            self.layout.counters_values.start,
+            self.layout.counters_values.len(),
+        )?;
+
+        CounterRegions::new(metadata, values)
     }
 
     /// A **writable** view over the counters, for a client's own heartbeat.

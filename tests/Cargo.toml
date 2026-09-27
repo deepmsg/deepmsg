@@ -76,5 +76,13 @@ name = "c_driver_pubsub"
 path = "interop/c_driver_pubsub.rs"
 required-features = ["interop"]
 
+# The other direction: the reference's own counter viewer reading a file
+# *this* build wrote. Needs the reference build for `AeronStat`, not for a
+# driver.
+[[test]]
+name = "aeron_stat_counters"
+path = "interop/aeron_stat_counters.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true
