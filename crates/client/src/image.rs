@@ -241,66 +241,72 @@ impl Image {
         let term_length = geometry.term_length as usize;
         let mut fragments = 0;
 
-        while fragments < fragment_limit {
-            let term_begin = self.position.term_begin(geometry.bits_to_shift);
-            let term_end = Position::from_raw(term_begin.raw() + geometry.term_length as i64);
+        // **One term per call.** The partition index is fixed here, at the
+        // entry, and the scan below stops at that term's end; the advance into
+        // the next term happens on the *next* call, where the position already
+        // names it (`aeron_image.c:266-273` does the same, and the Java client
+        // with it). A poll that crossed terms would deliver more fragments than
+        // the reference's for the same state, which is visible to any caller
+        // that throttles by counting them — `docs/compat.md` has the row, and
+        // the test is `a_poll_reads_one_term_at_a_time`.
+        let term_begin = self.position.term_begin(geometry.bits_to_shift);
+        let term_end = Position::from_raw(term_begin.raw() + geometry.term_length as i64);
 
-            let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
-                break;
-            };
-            let offset = (self.position.raw() - term_begin.raw()) as usize;
+        let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
+            return fragments;
+        };
+        let offset = (self.position.raw() - term_begin.raw()) as usize;
 
-            let mut scanner = Scanner::at(&term, term_length, offset);
-            let mut next = self.position;
+        let mut scanner = Scanner::at(&term, term_length, offset);
+        let mut next = self.position;
 
-            loop {
-                match scanner.advance() {
-                    Step::Data {
-                        offset,
-                        frame_length,
-                    } => {
-                        handler(&Fragment {
-                            frame: Frame::new(&term, offset),
-                            position: next.raw(),
-                        });
-                        fragments += 1;
+        loop {
+            match scanner.advance() {
+                Step::Data {
+                    offset,
+                    frame_length,
+                } => {
+                    handler(&Fragment {
+                        frame: Frame::new(&term, offset),
+                        position: next.raw(),
+                    });
+                    fragments += 1;
 
-                        let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
-                        next = Position::from_raw(next.raw() + i64::from(aligned));
+                    let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+                    next = Position::from_raw(next.raw() + i64::from(aligned));
 
-                        if fragments >= fragment_limit {
-                            break;
-                        }
-                    }
-                    // A padding frame means the producer ran out of term, so
-                    // the rest of this term is consumed whatever it contains.
-                    Step::Padding { .. } => {
-                        next = term_end;
+                    if fragments >= fragment_limit {
                         break;
                     }
-                    // The scan reached the term's end because the previous
-                    // frame ended exactly on the boundary, with no padding
-                    // frame to mark it. Not an error, and not "no data": the
-                    // term is simply done.
-                    Step::End => {
-                        next = term_end;
-                        break;
-                    }
-                    // A claimed-but-unpublished frame, or a length no writer
-                    // could have produced. Both stop the scan where they are:
-                    // the position does not move, and the caller comes back.
-                    Step::NotReady { .. } | Step::Malformed { .. } => break,
                 }
+                // A padding frame means the producer ran out of term, so
+                // the rest of this term is consumed whatever it contains.
+                Step::Padding { .. } => {
+                    next = term_end;
+                    break;
+                }
+                // The scan reached the term's end because the previous
+                // frame ended exactly on the boundary, with no padding
+                // frame to mark it. Not an error, and not "no data": the
+                // term is simply done.
+                Step::End => {
+                    next = term_end;
+                    break;
+                }
+                // A claimed-but-unpublished frame, or a length no writer
+                // could have produced. Both stop the scan where they are:
+                // the position does not move, and the caller comes back.
+                Step::NotReady { .. } | Step::Malformed { .. } => break,
             }
-
-            if next.raw() <= self.position.raw() {
-                // No progress. Either the term is not ready or it is empty;
-                // either way looping again would spin.
-                break;
-            }
-
-            self.position = next;
         }
+
+        if next.raw() <= self.position.raw() {
+            // No progress. Either the term is not ready or it is empty;
+            // either way the caller comes back.
+            return fragments;
+        }
+
+        self.position = next;
 
         fragments
     }

@@ -3212,4 +3212,392 @@ mod tests {
         );
         assert_eq!(0, assembler.abandoned());
     }
+
+    /// A conductor driven on its own thread.
+    ///
+    /// The client's API *waits* for replies, and a reply needs the conductor to
+    /// run: in one thread the two deadlock. This is the smallest thing that
+    /// makes the pair behave like the two processes they would be, and it is
+    /// what the lifeline tests need — they are about a client noticing that its
+    /// driver is not there.
+    struct DrivenDriver {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl DrivenDriver {
+        fn start(cnc: CncFile, config: DriverConfig) -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&stop);
+
+            let thread = std::thread::spawn(move || {
+                let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) && conductor.is_running() {
+                    conductor.do_work();
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+
+                // A clean stop, so the ring carries the sentinel a client
+                // reads as "the driver meant to go" rather than letting its
+                // heartbeat go stale.
+                let _ = conductor.close();
+            });
+
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// Stop it the way a `kill -9` would: no close, so no sentinel and no
+        /// fresh heartbeat — the file keeps whatever it last held.
+        fn kill(mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for DrivenDriver {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A client connected to a directory, with the driver beneath it running on
+    /// its own thread.
+    fn connected(
+        temp: &TempDir,
+        config: &DriverConfig,
+    ) -> (DrivenDriver, deepmsg_client::client::Client) {
+        let cnc = create(&temp.0);
+        let driver = DrivenDriver::start(cnc, config.clone());
+        let client = deepmsg_client::client::Client::connect(&temp.0).expect("the client connects");
+
+        (driver, client)
+    }
+
+    #[test]
+    fn a_client_notices_a_driver_that_stopped_on_purpose() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (driver, mut client) = connected(&temp, &config);
+
+        // A command, so this driver knows the client and has given it a
+        // heartbeat counter to keep alive.
+        client
+            .add_subscription("aeron:ipc", 1001, std::time::Duration::from_secs(5))
+            .expect("subscribed");
+        assert!(client.poll());
+        assert_eq!(None, client.error());
+
+        let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
+            .expect("the file, from the test's side");
+
+        // A clean stop writes the sentinel (`aeron_driver_conductor.c:3493`):
+        // a client that reads it knows the driver left on purpose rather than
+        // being killed, and those are different errors.
+        drop(driver);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let ring = cnc.to_driver_ring().expect("the ring");
+        assert_eq!(
+            Some(deepmsg_cnc::layout::NULL_VALUE),
+            ring.consumer_heartbeat(),
+            "the driver wrote the sentinel as it went"
+        );
+
+        client.poll();
+        assert_eq!(
+            Some(deepmsg_client::client::ClientError::DriverShutdown),
+            client.error(),
+            "and the client reads it as one"
+        );
+        assert!(client.is_terminated());
+    }
+
+    #[test]
+    fn a_client_notices_a_driver_that_was_killed() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (driver, mut client) = connected(&temp, &config);
+
+        client
+            .add_subscription("aeron:ipc", 1001, std::time::Duration::from_secs(5))
+            .expect("subscribed");
+        assert!(client.poll());
+
+        // Killed: no sentinel, and nothing refreshing the heartbeat any more.
+        // The test writes one that is already older than the client's timeout,
+        // because waiting ten seconds for the real thing is not a unit test.
+        driver.kill();
+
+        let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
+            .expect("the file, from the test's side");
+        let region = cnc.to_driver_region().expect("the ring");
+        let consumer =
+            deepmsg_cnc::ToDriverRingConsumer::new(&region.as_read_only()).expect("a command ring");
+        let stale = clock::epoch_millis() - (deepmsg_client::client::DRIVER_TIMEOUT_MS + 1_000);
+        consumer
+            .write_consumer_heartbeat(&region, stale)
+            .expect("in range");
+
+        client.poll();
+        assert_eq!(
+            Some(deepmsg_client::client::ClientError::DriverTimeout {
+                age_ms: deepmsg_client::client::DRIVER_TIMEOUT_MS + 1_000,
+                timeout_ms: deepmsg_client::client::DRIVER_TIMEOUT_MS,
+            }),
+            client.error(),
+            "a heartbeat past the timeout is a driver that is gone, not one that is slow"
+        );
+    }
+
+    #[test]
+    fn a_client_whose_heartbeat_counter_is_reclaimed_gives_up() {
+        let temp = TempDir::new();
+        // A liveness window of ten milliseconds and a tier of one: the driver
+        // reaps this client as soon as it stops saying it is alive, which also
+        // takes its heartbeat counter away — the exact state that made the
+        // cached id dangerous.
+        let config = DriverConfig {
+            aeron_dir: temp.0.clone(),
+            ipc_term_buffer_length: 64 * 1024,
+            client_liveness_timeout_ns: 100_000_000,
+            timer_interval_ns: 10_000_000,
+            ..DriverConfig::default()
+        };
+        let (_driver, mut client) = connected(&temp, &config);
+
+        client
+            .add_subscription("aeron:ipc", 1001, std::time::Duration::from_secs(5))
+            .expect("subscribed");
+        assert!(client.poll(), "the heartbeat counter is found and written");
+
+        // Stop saying anything, and let the driver decide. Long enough that
+        // the window has certainly passed and a tier has certainly run.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        client.poll();
+        assert_eq!(
+            Some(deepmsg_client::client::ClientError::HeartbeatCounterClosed),
+            client.error(),
+            "the counter this client was writing is somebody else's now, or nobody's"
+        );
+    }
+
+    #[test]
+    fn a_client_that_falls_a_ring_behind_counts_the_lap() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        // One poll, so the client's cursor is planted where the ring begins.
+        client.poll();
+        assert_eq!(0, client.laps());
+
+        // Now write more than a ring's worth of events through the driver's own
+        // transmitter, with nobody reading them. The writer wraps rather than
+        // refusing, so the events the client has not read yet are overwritten —
+        // which is what a lap is, and what the reference calls a system error.
+        let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
+            .expect("the file, from the test's side");
+        let region = cnc.to_clients_region_writable().expect("the event ring");
+        let mut transmitter = deepmsg_cnc::ToClientsTransmitter::new(&region).expect("a ring");
+
+        let payload = vec![0x5Au8; 512];
+        let record = layout::align_up(
+            payload.len() + layout::RECORD_HEADER_LENGTH,
+            layout::RECORD_ALIGNMENT,
+        );
+        let writes = config.layout.to_clients_length / record + 2;
+
+        for _ in 0..writes {
+            transmitter
+                .transmit(&region, ON_ERROR_TYPE_ID, &payload)
+                .expect("the ring has room for a wrap");
+        }
+
+        client.poll();
+
+        assert_eq!(
+            1,
+            client.laps(),
+            "the client resynchronised past the overwritten span"
+        );
+        // The lap was caught *before* a read, so no message was lost mid-read
+        // — which is what `discarded` counts, and why it is zero here while the
+        // lap count is not.
+        assert_eq!(0, client.discarded());
+
+        // A command that timed out afterwards says so, rather than leaving the
+        // caller to wonder whether the driver ignored it.
+        let error = deepmsg_client::client::CommandError::TimedOut {
+            correlation_id: 7,
+            laps: client.laps(),
+            discarded: client.discarded(),
+        };
+        assert!(
+            error.to_string().contains("resynchronised past the ring"),
+            "a timeout carries the reason it might have happened: {error}"
+        );
+    }
+
+    #[test]
+    fn a_poll_reads_one_term_at_a_time() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let path = String::from_utf8(ready[36..].to_vec()).expect("a path");
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four"));
+        let limit_counter_id = i32::from_le_bytes(ready[24..28].try_into().expect("four"));
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let image_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        let deepmsg_cnc::command::Response::AvailableImage {
+            subscriber_position_id,
+            ..
+        } = deepmsg_cnc::command::decode_response(ON_AVAILABLE_IMAGE_TYPE_ID, &image_ready)
+        else {
+            panic!("an image");
+        };
+
+        let producer = deepmsg_client::publication::Publication::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            limit_counter_id,
+            -1,
+        )
+        .expect("the log the driver named");
+
+        let mut image = deepmsg_client::image::Image::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            subscriber_position_id,
+            0,
+        )
+        .expect("the same log, read-only");
+
+        // Fill the first term. Each message is small enough for the window a
+        // single reader opens, and the reader reports the position it has read
+        // — which is what lets the publisher get past one window at all
+        // (`aeron_ipc_publication.c:296-313` computes the limit from it).
+        let small = vec![b'a'; 1024];
+        let mut written = 0;
+
+        loop {
+            conductor.do_work();
+            let limit = counter_value(&conductor, limit_counter_id).expect("the limit");
+
+            match producer.offer(limit, &small) {
+                deepmsg_core::logbuffer::append::Appended::Ok { .. } => written += small.len(),
+                // The reader has to catch up for the window to reopen — but
+                // only as far as it has to: reporting the position it has read
+                // is what lets the publisher carry on, and holding it back to
+                // the point where the offer is refused leaves unread frames at
+                // the end of the term, which is what this test is about.
+                deepmsg_core::logbuffer::append::Appended::BackPressured => {
+                    image.poll(64, |_| {});
+                    set_counter(&conductor, subscriber_position_id, image.position());
+                    continue;
+                }
+                // The message did not fit the term's remainder: a padding frame
+                // covers it and the log is now in its next term.
+                deepmsg_core::logbuffer::append::Appended::EndOfLog => {
+                    conductor.do_work();
+                    let limit = counter_value(&conductor, limit_counter_id).expect("the limit");
+
+                    assert!(
+                        matches!(
+                            producer.offer(limit, &small),
+                            deepmsg_core::logbuffer::append::Appended::Ok { .. }
+                        ),
+                        "the term has rotated and the next message lands in the new one"
+                    );
+                    written += small.len();
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        assert!(
+            written > 32 * 1024,
+            "more than one window's worth had to be written to fill the term: {written}"
+        );
+
+        // One poll with a fragment limit far above what two terms hold
+        // together. What it delivers must all lie in **one term**: the
+        // reference fixes the partition at the poll's entry and stops the scan
+        // at that term's end (`aeron_image.c:266-273`), and a caller that
+        // throttles by counting fragments is entitled to the same numbers.
+        let mut positions = Vec::new();
+        let read = image.poll(100_000, |fragment| positions.push(fragment.position()));
+
+        assert_eq!(read, positions.len());
+        assert!(read > 0, "there is unread data in this term");
+
+        let term_length = 64 * 1024;
+        let term = positions[0] / term_length;
+        assert!(
+            positions
+                .iter()
+                .all(|position| position / term_length == term),
+            "a poll delivered fragments from more than one term: {positions:?}"
+        );
+
+        // And the message that rotated into the next term is still there for
+        // the next poll — a poll that stopped at the term's end did not lose
+        // it.
+        let mut next_term = 0;
+        image.poll(100_000, |_| next_term += 1);
+        assert!(
+            next_term > 0,
+            "the message in the next term is read by the next poll"
+        );
+    }
 }

@@ -40,6 +40,7 @@ use deepmsg_cnc::command::{
     decode_response,
 };
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
+use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
 use crate::fragment_assembler::Message;
@@ -119,7 +120,16 @@ pub enum CommandError {
         /// The id the request used, and the subscription's registration id if
         /// the driver did create it.
         correlation_id: i64,
+        /// How many times this client has resynchronised past a lap of the
+        /// to-clients ring, which is one place a reply can be lost.
+        laps: u64,
+        /// And how many messages those laps cost.
+        discarded: u64,
     },
+    /// The client stopped being able to work — see [`ClientError`]. Every
+    /// command still waiting failed with it, because there is nothing left to
+    /// wait for.
+    Terminated(ClientError),
     /// The driver refused the command.
     Driver {
         /// The reference's error code.
@@ -146,11 +156,33 @@ impl std::fmt::Display for CommandError {
         match self {
             Self::Claim(error) => write!(f, "the command ring refused the command: {error:?}"),
             Self::Encoding => f.write_str("the command does not fit its own encoding"),
-            Self::TimedOut { correlation_id } => write!(
-                f,
-                "no reply for correlation id {correlation_id}; the driver may still have \
-                 created the resource"
-            ),
+            Self::TimedOut {
+                correlation_id,
+                laps,
+                discarded,
+            } => {
+                write!(
+                    f,
+                    "no reply for correlation id {correlation_id}; the driver may still have \
+                     created the resource"
+                )?;
+
+                // A lap of the to-clients ring is a *plausible* reason a reply
+                // never arrived, and it is reported as one rather than left as
+                // a mystery: the reference turns a lap into a client-level
+                // error instead, and this build records the difference
+                // (`docs/compat.md`).
+                if *laps > 0 {
+                    write!(
+                        f,
+                        " (this client has resynchronised past the ring {laps} time(s), \
+                         losing {discarded} message(s) with them, which may be where the \
+                         reply went)"
+                    )?;
+                }
+
+                Ok(())
+            }
             Self::Driver { code, message } => write!(f, "the driver refused it: {code} {message}"),
             Self::LogBuffer { path, source } => {
                 write!(
@@ -159,11 +191,62 @@ impl std::fmt::Display for CommandError {
                     path.display()
                 )
             }
+            Self::Terminated(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for CommandError {}
+
+/// Why a client stopped being able to work.
+///
+/// The reference reports these through an error handler and then force-closes
+/// everything the client holds (`aeron_client_conductor_check_liveness`,
+/// `aeron-client/src/main/c/aeron_client_conductor.c:1305-1394`). A `Client`
+/// that has one of these has no driver behind it any more, and every call that
+/// would wait for one says so instead of waiting for a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientError {
+    /// The driver stopped on purpose: it wrote the null sentinel into the ring
+    /// as it shut down (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`).
+    DriverShutdown,
+    /// The driver has not refreshed the ring's heartbeat for longer than the
+    /// driver timeout, so it is gone rather than slow — killed, or a machine
+    /// that lost power. The reference's `MediaDriver keepalive` error.
+    DriverTimeout {
+        /// How old the heartbeat was, in milliseconds.
+        age_ms: i64,
+        /// The timeout it was measured against.
+        timeout_ms: i64,
+    },
+    /// The heartbeat counter this client writes is no longer its own: the
+    /// driver went away and another one took the directory, or this client was
+    /// reaped. Writing into it would keep somebody else alive.
+    HeartbeatCounterClosed,
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DriverShutdown => f.write_str("the media driver has been shut down"),
+            Self::DriverTimeout { age_ms, timeout_ms } => write!(
+                f,
+                "the media driver's heartbeat is {age_ms}ms old, past the {timeout_ms}ms timeout"
+            ),
+            Self::HeartbeatCounterClosed => {
+                f.write_str("the heartbeat counter was closed by somebody else")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+/// How stale the driver's heartbeat may be before this client treats it as
+/// gone: `AERON_DRIVER_TIMEOUT_MS_DEFAULT (10 * 1000)`
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:217`), which is what the
+/// reference's client context uses too (`aeron.driver.timeout`).
+pub const DRIVER_TIMEOUT_MS: i64 = 10 * 1000;
 
 /// What a completed command handed back.
 #[derive(Debug)]
@@ -206,6 +289,10 @@ pub struct Client {
     unknown_responses: u64,
     /// Images that arrived for a subscription this client did not have yet.
     orphan_images: u64,
+    /// Set once when this client discovers the driver is gone, and never
+    /// cleared: everything it would do afterwards is work for a driver that is
+    /// not there.
+    terminated: Option<ClientError>,
 }
 
 impl Client {
@@ -268,6 +355,7 @@ impl Client {
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
+            terminated: None,
         })
     }
 
@@ -293,6 +381,35 @@ impl Client {
     /// or that has since dropped it — has nowhere to put it.
     pub const fn orphan_images(&self) -> u64 {
         self.orphan_images
+    }
+
+    /// Why this client stopped being able to work, if it has.
+    ///
+    /// Once this is set, every command that waits for a reply fails with it
+    /// rather than waiting out its deadline, and nothing is written to the
+    /// driver any more — the reference's client does the same, and calls it
+    /// being terminating (`aeron_client_conductor.c:1305-1336`).
+    pub const fn error(&self) -> Option<ClientError> {
+        self.terminated
+    }
+
+    /// Whether this client has given up on its driver.
+    pub const fn is_terminated(&self) -> bool {
+        self.terminated.is_some()
+    }
+
+    /// How many times this client has resynchronised past a lap of the
+    /// to-clients ring.
+    ///
+    /// A lap means the driver wrote more than a ring's worth of events while
+    /// this client was not reading, and whatever was in the overwritten span is
+    /// gone — possibly this client's own reply. The reference treats it as a
+    /// system error and force-closes the client
+    /// (`aeron_client_conductor.c:2728-2734`); this build resynchronises and
+    /// counts, and the count is here so that a caller can assert it and find it
+    /// in a timeout's message (`docs/compat.md` records the divergence).
+    pub const fn laps(&self) -> u64 {
+        self.receiver.lapped()
     }
 
     /// Messages discarded because the driver overwrote them mid-read.
@@ -330,7 +447,7 @@ impl Client {
     /// Returns whether anything happened, matching the reference's `work_count`
     /// so a caller can drive an idle strategy from it.
     pub fn poll(&mut self) -> bool {
-        let keepalive = self.keepalive();
+        let keepalive = self.check_liveness();
 
         let mut worked = false;
         if let Some(region) = self.cnc.to_clients_region() {
@@ -637,6 +754,14 @@ impl Client {
         loop {
             self.poll();
 
+            // Ahead of the lookup below, and before the deadline: when the
+            // client has given up, the commands it was waiting on are gone
+            // *because* of that, and reporting them as timed out would bury the
+            // reason.
+            if let Some(error) = self.terminated {
+                return Err(CommandError::Terminated(error));
+            }
+
             let Some(index) = self
                 .pending
                 .iter()
@@ -644,7 +769,11 @@ impl Client {
             else {
                 // Vanished, which only `expire_pending` does, and it records
                 // the reason.
-                return Err(CommandError::TimedOut { correlation_id });
+                return Err(CommandError::TimedOut {
+                    correlation_id,
+                    laps: self.receiver.lapped(),
+                    discarded: self.receiver.discarded(),
+                });
             };
 
             if let Some(outcome) = self.pending[index].outcome.take() {
@@ -654,7 +783,11 @@ impl Client {
 
             if Instant::now() >= self.pending[index].deadline {
                 self.pending.swap_remove(index);
-                return Err(CommandError::TimedOut { correlation_id });
+                return Err(CommandError::TimedOut {
+                    correlation_id,
+                    laps: self.receiver.lapped(),
+                    discarded: self.receiver.discarded(),
+                });
             }
 
             std::thread::sleep(wait);
@@ -663,24 +796,87 @@ impl Client {
     }
 
     /// Refresh this client's heartbeat counter, if the driver has made one yet.
-    fn keepalive(&mut self) -> bool {
+    fn check_liveness(&mut self) -> bool {
+        if self.terminated.is_some() {
+            return false;
+        }
+
+        let now = now_ms();
+        let heartbeat = self
+            .cnc
+            .to_driver_ring()
+            .and_then(|ring| ring.consumer_heartbeat());
+
+        // The reference's two failure branches, in its order, and the order is
+        // what makes them distinguishable: a driver that *stopped* leaves the
+        // null sentinel behind (`aeron_driver_conductor.c:3493` writes it), and
+        // a driver that was killed leaves its last heartbeat — so the first
+        // test is exact and the second is a timeout
+        // (`aeron_client_conductor.c:1308-1334`).
+        match heartbeat {
+            Some(NULL_VALUE) => {
+                self.terminate(ClientError::DriverShutdown);
+                return false;
+            }
+            Some(last) => {
+                let age_ms = now.saturating_sub(last);
+
+                if age_ms > DRIVER_TIMEOUT_MS {
+                    self.terminate(ClientError::DriverTimeout {
+                        age_ms,
+                        timeout_ms: DRIVER_TIMEOUT_MS,
+                    });
+                    return false;
+                }
+            }
+            None => return false,
+        }
+
         let Some(counters) = self.cnc.counters_writable() else {
             return false;
         };
 
-        if self.heartbeat_counter.is_none() {
+        let Some(counter_id) = self.heartbeat_counter else {
             // Not there yet is normal: the driver allocates it while handling
             // the first command, so the first poll may run before it exists.
             // Treating that as an error would make a healthy client look broken.
             self.heartbeat_counter =
                 counters.find_by_type_and_registration(CLIENT_HEARTBEAT_TYPE_ID, self.client_id);
-        }
 
-        let Some(counter_id) = self.heartbeat_counter else {
             return false;
         };
 
-        counters.set_value(counter_id, now_ms()).is_some()
+        // Re-verified every cycle rather than remembered, because a counter id
+        // outlives the client that owned it: the driver reclaims ids and hands
+        // them out again, so the id this client cached can be *somebody else's*
+        // counter by now — after the driver went away and another took the
+        // directory, or after this client was reaped. Writing `now` into it
+        // would keep a stranger alive and keep this client looking healthy
+        // while it is not (`aeron_client_conductor.c:1338-1390`).
+        let still_ours = counters.get(counter_id).is_some_and(|counter| {
+            counter.type_id == CLIENT_HEARTBEAT_TYPE_ID && counter.registration_id == self.client_id
+        });
+
+        if !still_ours {
+            self.terminate(ClientError::HeartbeatCounterClosed);
+            return false;
+        }
+
+        counters.set_value(counter_id, now).is_some()
+    }
+
+    /// Give up: nothing this client holds can be used any more.
+    ///
+    /// The reference force-closes every resource it holds, which unmaps every
+    /// image it had mapped (`aeron_client_conductor_force_close_resources`,
+    /// `:1290-1303`). Dropping them here does the same, and a caller that
+    /// reaches for one afterwards finds nothing rather than a mapping of a log
+    /// buffer whose driver is gone.
+    fn terminate(&mut self, error: ClientError) {
+        self.terminated = Some(error);
+        self.subscriptions.clear();
+        self.publications.clear();
+        self.pending.clear();
     }
 
     /// Take one decoded response and act on it.
@@ -839,12 +1035,22 @@ impl Client {
     }
 
     /// Drop pending commands whose deadline has passed, recording why.
+    ///
+    /// A command that times out here might not have been ignored: it might have
+    /// been *lost*, and one of the ways a reply is lost is a lap of the
+    /// to-clients ring (`crate::Client::laps`). The counts travel with the
+    /// error so that a caller who reports a timeout can say which it was.
     fn expire_pending(&mut self) {
         let now = Instant::now();
+        let laps = self.receiver.lapped();
+        let discarded = self.receiver.discarded();
+
         for pending in &mut self.pending {
             if pending.outcome.is_none() && now >= pending.deadline {
                 pending.outcome = Some(Err(CommandError::TimedOut {
                     correlation_id: pending.correlation_id,
+                    laps,
+                    discarded,
                 }));
             }
         }

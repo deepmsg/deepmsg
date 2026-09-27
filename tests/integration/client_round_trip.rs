@@ -73,7 +73,12 @@ fn error_payload(correlation_id: i64, code: i32, message: &str) -> Vec<u8> {
 
 #[test]
 fn matches_a_ready_response_by_correlation_id() {
-    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION);
+    // A **live** driver's file: every test here drives a client, and a client
+    // reads the ring's heartbeat before it does anything else — a file without
+    // one is a driver that never started, and it says so rather than waiting
+    // out a deadline.
+    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION)
+        .with_heartbeat(deepmsg_core::clock::epoch_millis());
     let expected = subscription_correlation_id(&cnc.cnc_path());
     publish(
         &cnc.cnc_path(),
@@ -93,7 +98,12 @@ fn matches_a_ready_response_by_correlation_id() {
 fn a_response_for_someone_else_is_ignored_not_mistaken() {
     // Every client reads the whole broadcast ring, so a reply addressed to a
     // different request is the normal case rather than an edge one.
-    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION);
+    // A **live** driver's file: every test here drives a client, and a client
+    // reads the ring's heartbeat before it does anything else — a file without
+    // one is a driver that never started, and it says so rather than waiting
+    // out a deadline.
+    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION)
+        .with_heartbeat(deepmsg_core::clock::epoch_millis());
     let ours = subscription_correlation_id(&cnc.cnc_path());
     publish(
         &cnc.cnc_path(),
@@ -107,14 +117,19 @@ fn a_response_for_someone_else_is_ignored_not_mistaken() {
         .expect_err("a reply for another request must not complete ours");
 
     assert!(
-        matches!(error, CommandError::TimedOut { correlation_id } if correlation_id == ours),
+        matches!(error, CommandError::TimedOut { correlation_id, .. } if correlation_id == ours),
         "got {error:?}"
     );
 }
 
 #[test]
 fn surfaces_a_driver_error_against_the_command_that_caused_it() {
-    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION);
+    // A **live** driver's file: every test here drives a client, and a client
+    // reads the ring's heartbeat before it does anything else — a file without
+    // one is a driver that never started, and it says so rather than waiting
+    // out a deadline.
+    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION)
+        .with_heartbeat(deepmsg_core::clock::epoch_millis());
     let expected = subscription_correlation_id(&cnc.cnc_path());
     publish(
         &cnc.cnc_path(),
@@ -138,7 +153,12 @@ fn surfaces_a_driver_error_against_the_command_that_caused_it() {
 
 #[test]
 fn a_command_with_no_reply_expires_rather_than_hanging() {
-    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION);
+    // A **live** driver's file: every test here drives a client, and a client
+    // reads the ring's heartbeat before it does anything else — a file without
+    // one is a driver that never started, and it says so rather than waiting
+    // out a deadline.
+    let cnc = SyntheticCnc::new(deepmsg_core::version::CNC_VERSION)
+        .with_heartbeat(deepmsg_core::clock::epoch_millis());
     let expected = subscription_correlation_id(&cnc.cnc_path());
 
     let mut client = Client::connect(cnc.path()).expect("connect");
@@ -148,7 +168,7 @@ fn a_command_with_no_reply_expires_rather_than_hanging() {
         .expect_err("nothing will answer");
 
     assert!(
-        matches!(error, CommandError::TimedOut { correlation_id } if correlation_id == expected),
+        matches!(error, CommandError::TimedOut { correlation_id, .. } if correlation_id == expected),
         "got {error:?}"
     );
     assert!(
