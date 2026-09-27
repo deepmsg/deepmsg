@@ -476,8 +476,9 @@ impl Client {
     ///
     /// Returns `None` if there is no such publication. Otherwise the typed
     /// outcome — see [`deepmsg_core::logbuffer::append::Appended`], whose
-    /// `EndOfLog` means the log rotated and the caller should retry, not that
-    /// anything failed.
+    /// `EndOfLog` and `MidRotation` both mean "retry", not that anything
+    /// failed: one is a rotation that happened, the other a rotation happening
+    /// right now.
     ///
     /// The window limit is read from the counter the driver maintains, here and
     /// per call, because that counter is the only thing standing between a

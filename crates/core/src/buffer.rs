@@ -465,6 +465,22 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         Some(())
     }
 
+    /// Compare and exchange a 4-byte field, returning whether it took.
+    ///
+    /// The reference has this as well as the 8-byte form
+    /// (`aeron_cas_int32`, `aeron-client/src/main/c/concurrent/aeron_atomic64_gcc_x86_64.h:23-33`),
+    /// and the log's `active_term_count` is exactly four bytes wide
+    /// (`aeron_logbuffer_descriptor.h:186-191`). Reaching for the 8-byte form
+    /// there would compare and write the four bytes of structure padding after
+    /// it — which happens to be zero today and is promised by nothing.
+    pub fn compare_exchange_i32(&self, offset: usize, expected: i32, new: i32) -> Option<bool> {
+        Some(
+            self.slot_i32(offset)?
+                .compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+        )
+    }
+
     /// Write zeroes over `len` bytes starting at `offset`.
     ///
     /// The MPSC consumer's obligation rather than an optimisation: the

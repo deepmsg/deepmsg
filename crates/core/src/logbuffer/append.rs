@@ -61,6 +61,13 @@ pub enum Appended {
     /// (`aeron-client/src/main/c/aeron_publication.h:76-95`). A caller that
     /// conflates them reports "slow subscriber" for "no subscriber".
     NotConnected,
+    /// The producer caught the log mid-rotation: the term count names one
+    /// partition while that partition's tail still carries the previous term's
+    /// id, so there is no coherent position to write at. Like
+    /// [`Appended::EndOfLog`] this means "try again" — the reference returns
+    /// its `AERON_PUBLICATION_ADMIN_ACTION` for exactly this state
+    /// (`aeron_publication.c:491-494`).
+    MidRotation,
     /// The payload is larger than one frame, so the reference would split it
     /// across several. **This port does not fragment yet**, and refuses rather
     /// than writing one oversized frame — which would be a layout the reference
@@ -91,6 +98,15 @@ pub struct Appender<'a> {
     max_payload_length: usize,
     /// `min(term_length / 8, 16 MiB)`: the largest message of any shape.
     max_message_length: usize,
+    /// A test-only seam: bytes this appender "lends" to another producer
+    /// between its entry read and its claim.
+    ///
+    /// The race the claim's value source exists for lives in that window, and
+    /// nothing outside [`Appender::append`] can be in it. A test sets this and
+    /// gets a deterministic reproduction instead of a thread race; no other
+    /// build has the field.
+    #[cfg(test)]
+    produce_race: Option<(i64, bool)>,
 }
 
 impl<'a> Appender<'a> {
@@ -132,6 +148,8 @@ impl<'a> Appender<'a> {
             max_payload_length: max_payload_length as usize,
             #[allow(clippy::cast_sign_loss)]
             max_message_length: position::max_message_length(term_length) as usize,
+            #[cfg(test)]
+            produce_race: None,
         })
     }
 
@@ -163,7 +181,10 @@ impl<'a> Appender<'a> {
 
     /// How many terms have been written since the log began.
     pub fn active_term_count(&self) -> Option<i32> {
-        self.metadata.load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET)
+        // Acquire, as `aeron_logbuffer_active_term_count` reads it
+        // (`aeron_logbuffer_descriptor.h:179-184`).
+        self.metadata
+            .load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET)
     }
 
     /// The tail of the term the producer is currently in.
@@ -197,8 +218,8 @@ impl<'a> Appender<'a> {
     ///
     /// # Errors
     ///
-    /// See [`Appended`]. `EndOfLog` is not a failure — the caller retries and
-    /// lands in the rotated term.
+    /// See [`Appended`]. Two of its outcomes mean "try again" rather than
+    /// "no": [`Appended::EndOfLog`] and [`Appended::MidRotation`].
     pub fn append(
         &self,
         session_id: i32,
@@ -206,35 +227,32 @@ impl<'a> Appender<'a> {
         position_limit: i64,
         payload: &[u8],
     ) -> Appended {
-        // The reference's order, and it matters. The message cap is checked
-        // before anything is read (`aeron_publication.c:515-524`); then the
-        // limit; and only *then*, once the window is known to be exhausted, is
-        // the reason classified. Checking either size bound after the claim
-        // would leave a claimed span abandoned without a padding frame.
-        if payload.len() > self.max_message_length {
-            return Appended::MessageTooLarge;
-        }
-
-        let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+        // Entry, in the reference's order (`aeron_publication.c:483-494`): the
+        // limit, then the term count, then the tail that count names, and only
+        // then a position. The pair is checked against itself because another
+        // producer may be rotating right now — the count advanced while the
+        // tail still carries the old term id — and every position computed
+        // from a pair like that is nonsense. The reference returns
+        // `ADMIN_ACTION` and the caller retries.
+        let Some(term_count) = self.active_term_count() else {
             return Appended::Malformed;
         };
-        let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
-
-        let Some(tail) = self.current_tail() else {
+        let Some(tail) = self.tail_at(position::index_by_term_count(term_count)) else {
             return Appended::Malformed;
         };
         let term_id = tail.term_id();
-        let term_offset = tail.term_offset(self.term_length);
 
-        // The frame this append will produce starts where the tail points, and
-        // the tail is what it will be advanced to.
+        if term_count != position::term_count(term_id, self.initial_term_id) {
+            return Appended::MidRotation;
+        }
+
+        let term_offset = tail.term_offset(self.term_length);
         let position = Position::new(
             term_id,
             term_offset,
             self.bits_to_shift,
             self.initial_term_id,
         );
-        let end_position = Position::from_raw(position.raw() + aligned_length as i64);
 
         // At or past the limit means the offer does not happen at all — nothing
         // is written and the tail does not move (`aeron_publication.h:76-95`).
@@ -242,7 +260,14 @@ impl<'a> Appender<'a> {
         // stream outranks a closed window, and whether anyone is listening
         // decides between the other two.
         if position.raw() >= position_limit {
-            if end_position.raw() >= position::max_possible_position(self.term_length) {
+            let frame_length = payload.len().saturating_add(DATA_HEADER_LENGTH);
+            let aligned_length = frame_length
+                .saturating_add(descriptor::FRAME_ALIGNMENT as usize - 1)
+                & !(descriptor::FRAME_ALIGNMENT as usize - 1);
+
+            if position.raw().saturating_add(aligned_length as i64)
+                >= position::max_possible_position(self.term_length)
+            {
                 return Appended::MaxPositionExceeded;
             }
 
@@ -253,35 +278,80 @@ impl<'a> Appender<'a> {
             };
         }
 
-        // The window is open, so this is the first point at which the payload's
-        // *shape* can matter. Refused rather than written oversized.
+        // Inside the window, and only now, the payload's *shape* matters
+        // (`aeron_publication.c:499-524`): the size bounds are checked here
+        // rather than before the window, so a payload too large for this
+        // publication still reports back-pressure while nobody can take it.
+        if payload.len() > self.max_message_length {
+            return Appended::MessageTooLarge;
+        }
+
+        let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+            return Appended::Malformed;
+        };
+        let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+
         if payload.len() > self.max_payload_length {
             return Appended::NeedsFragmentation;
         }
 
-        // Claim. The offset this returns is where *this* producer writes; the
-        // alignment applies to the tail so the next one starts on a boundary.
-        let Some(claimed) = self.claim(aligned_length as i64) else {
-            return Appended::Malformed;
-        };
-        let claimed_offset = claimed.term_offset(self.term_length);
+        // The seam, if a test set one: another producer takes these bytes
+        // before this one claims anything.
+        #[cfg(test)]
+        if let Some((stolen, rotates)) = self.produce_race {
+            let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
+                + position::index_by_term_count(term_count) * descriptor::TERM_TAIL_COUNTER_STRIDE;
+            self.metadata.fetch_add_i64(offset, stolen);
 
-        // The span may run past the term even though the frame started inside
-        // it. That is the normal way a term ends.
-        if claimed_offset + aligned_length > self.term_length {
-            return self.handle_end_of_log(term_offset, term_id, position);
+            if rotates {
+                // The competing producer finishes its own offer: it takes the
+                // rest of the term and rotates.
+                self.rotate(term_count, term_id);
+            }
         }
 
-        let Some(end_position) = self.write_frame(
-            session_id,
-            stream_id,
-            claimed_offset,
-            term_id,
-            frame_length,
-            payload,
+        // The claim is the **only** source of where this frame lands: the tail
+        // it returns carries both the term id and the offset, and using the
+        // entry read instead is how a concurrent producer's padding ends up on
+        // top of a frame somebody already published
+        // (`aeron_publication.c:182-186`).
+        let Some(claimed) = self.claim(
+            position::index_by_term_count(term_count),
+            aligned_length as i64,
         ) else {
             return Appended::Malformed;
         };
+        let claimed_offset = claimed.term_offset(self.term_length);
+        let claimed_term_id = claimed.term_id();
+        let resulting_offset = claimed_offset.saturating_add(aligned_length);
+
+        // Where this append would end, computed from the claimed values alone.
+        let end_position = Position::new(
+            claimed_term_id,
+            resulting_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        // The span may run past the term even though the frame started inside
+        // it. That is the normal way a term ends.
+        if resulting_offset > self.term_length {
+            return self.handle_end_of_log(claimed_offset, claimed_term_id, end_position);
+        }
+
+        if self
+            .write_frame(
+                session_id,
+                stream_id,
+                claimed_offset,
+                claimed_term_id,
+                frame_length,
+                payload,
+            )
+            .is_none()
+        {
+            return Appended::Malformed;
+        }
 
         Appended::Ok {
             position: end_position,
@@ -299,7 +369,7 @@ impl<'a> Appender<'a> {
         term_id: i32,
         frame_length: i32,
         payload: &[u8],
-    ) -> Option<Position> {
+    ) -> Option<()> {
         let frame = Frame::new(&self.term, term_offset as usize);
 
         frame.begin(
@@ -314,24 +384,20 @@ impl<'a> Appender<'a> {
         frame.write_payload(payload)?;
         frame.publish(frame_length)?;
 
-        Some(Position::new(
-            term_id,
-            term_offset + position::align_up(frame_length, descriptor::FRAME_ALIGNMENT),
-            self.bits_to_shift,
-            self.initial_term_id,
-        ))
+        Some(())
     }
 
-    /// Claim `length` bytes of the current term's tail.
+    /// Claim `length` bytes of one partition's tail.
     ///
     /// A fetch-and-add, not a compare-and-exchange: every producer gets a
     /// distinct span and nobody retries. The reference does the same
-    /// (`aeron_publication.c:109-114`).
-    fn claim(&self, length: i64) -> Option<RawTail> {
-        let term_count = self.active_term_count()?;
-        let index = position::index_by_term_count(term_count);
-        let offset =
-            descriptor::TERM_TAIL_COUNTERS_OFFSET + index * descriptor::TERM_TAIL_COUNTER_STRIDE;
+    /// (`aeron_publication.c:109-114`), against the counter the entry read
+    /// picked — re-reading `active_term_count` here would be a second read that
+    /// can disagree with the first, which is the whole reason the guard at the
+    /// top of [`Appender::append`] exists.
+    fn claim(&self, partition: usize, length: i64) -> Option<RawTail> {
+        let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
+            + partition * descriptor::TERM_TAIL_COUNTER_STRIDE;
 
         self.metadata
             .fetch_add_i64(offset, length)
@@ -378,15 +444,16 @@ impl<'a> Appender<'a> {
             return Appended::MaxPositionExceeded;
         }
 
-        let Some(term_count) = self.active_term_count() else {
-            return Appended::Malformed;
-        };
+        // The count comes from the **claimed** term id, not from a read taken
+        // before the claim. And the rotation is attempted, not required:
+        // another producer may have done it already, and the reference ignores
+        // the answer entirely (`aeron_publication.c:144-171`) — the caller
+        // retries either way, and treating a lost race as a metadata error is
+        // how a normal competition gets reported as a corrupt log.
+        let term_count = position::term_count(term_id, self.initial_term_id);
+        self.rotate(term_count, term_id);
 
-        if self.rotate(term_count, term_id) {
-            Appended::EndOfLog
-        } else {
-            Appended::Malformed
-        }
+        Appended::EndOfLog
     }
 
     /// Rotate the log to the next term.
@@ -408,34 +475,43 @@ impl<'a> Appender<'a> {
         let next_term_id = current_term_id.wrapping_add(1);
         let next_term_count = current_term_count.wrapping_add(1);
         let next_index = position::index_by_term_count(next_term_count);
-        let expected_term_id = next_term_id - descriptor::PARTITION_COUNT as i32;
+        let expected_term_id = next_term_id.wrapping_sub(descriptor::PARTITION_COUNT as i32);
 
         let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
             + next_index * descriptor::TERM_TAIL_COUNTER_STRIDE;
 
-        let Some(raw) = self.metadata.load_i64_acquire(offset) else {
-            return false;
-        };
+        // The reset retries while it is still ours to perform. Losing the
+        // compare-exchange to another producer rotating the same term is not a
+        // failure — it means the reset is done — and the reference loops for
+        // exactly that reason (`aeron_logbuffer_descriptor.h:197-211`).
+        loop {
+            let Some(raw) = self.metadata.load_i64_acquire(offset) else {
+                return false;
+            };
 
-        if expected_term_id == RawTail::from_raw(raw).term_id() {
-            let reset = RawTail::new(next_term_id, 0).raw();
-            if !self
+            if expected_term_id != RawTail::from_raw(raw).term_id() {
+                break;
+            }
+
+            if self
                 .metadata
-                .compare_exchange_i64(offset, raw, reset)
+                .compare_exchange_i64(offset, raw, RawTail::new(next_term_id, 0).raw())
                 .unwrap_or(false)
             {
-                // Another producer rotated first. Whether that is this rotation
-                // is decided by the count below, so carry on rather than
-                // failing outright.
-                return false;
+                break;
             }
         }
 
+        // The count is the linearization point, and it is **four bytes wide**:
+        // the four bytes after it are structure padding that nothing promises
+        // to keep zero, and an 8-byte compare-exchange would take them into
+        // both the comparison and the write
+        // (`aeron_logbuffer_descriptor.h:186-191`).
         self.metadata
-            .compare_exchange_i64(
+            .compare_exchange_i32(
                 descriptor::ACTIVE_TERM_COUNT_OFFSET,
-                i64::from(current_term_count),
-                i64::from(next_term_count),
+                current_term_count,
+                next_term_count,
             )
             .unwrap_or(false)
     }
@@ -594,6 +670,169 @@ mod tests {
             let mut scanner = Scanner::new(&view, TERM_LENGTH as usize);
             scanner.advance()
         }
+    }
+
+    /// The frame a "concurrent producer" left behind at `offset`, written by
+    /// hand so a test can tell whether anything covered it later.
+    fn another_producers_frame(log: &mut Log, offset: i32) {
+        let view = AtomicBuffer::from_slice_mut(&mut log.term.0).expect("aligned");
+        let frame = frame::Frame::new(&view, offset as usize);
+        frame
+            .begin(
+                64,
+                FLAG_UNFRAGMENTED,
+                TYPE_DATA,
+                offset,
+                11,
+                22,
+                initial_term_id(),
+            )
+            .expect("fits");
+        frame.write_payload(&[0x5A; 32]).expect("fits");
+        frame.publish(64).expect("fits");
+    }
+
+    /// Run `initialise_tails` through an appender that is then dropped, so the
+    /// caller keeps `&mut log` for the rest of its setup.
+    fn initialised(log: &mut Log) {
+        let appender = log.appender();
+        appender
+            .initialise_tails(initial_term_id())
+            .then_some(())
+            .expect("tails initialised");
+    }
+
+    #[test]
+    fn padding_covers_the_span_this_producer_claimed_not_the_one_it_entered_at() {
+        // A1's gate. Another producer takes the tail *between this one's entry
+        // read and its claim* — the window the seam creates — and publishes a
+        // frame there. This producer's payload no longer fits, so it pads: from
+        // the offset it **claimed**, which leaves the other frame alone. A
+        // padding written from the entry offset would start 8128 bytes earlier
+        // and cover it.
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let entry_offset = TERM_LENGTH - 8192;
+        another_producers_frame(&mut log, entry_offset);
+        log.set_tail(initial_term_id(), entry_offset + 64, 0);
+
+        let mut appender = log.appender();
+        // The competing producer takes everything but the last 32 bytes.
+        appender.produce_race = Some((i64::from(TERM_LENGTH - 32 - (entry_offset + 64)), false));
+
+        let outcome = { appender.append(11, 22, i64::MAX, &[0xAB; 128]) };
+
+        assert_eq!(
+            Appended::EndOfLog,
+            outcome,
+            "the tail moved to the end of the term, so it is padded and rotated"
+        );
+
+        let (padding_length, type_id, _) = log.read_frame((TERM_LENGTH - 32) as usize);
+        assert_eq!(
+            TYPE_PAD, type_id,
+            "the padding starts where the claim landed"
+        );
+        assert_eq!(32, padding_length, "and covers exactly what was left");
+
+        let (length, type_id, payload) = log.read_frame(entry_offset as usize);
+        assert_eq!(64, length, "the other producer's frame is untouched");
+        assert_eq!(TYPE_DATA, type_id);
+        assert_eq!(vec![0x5A; 32], payload);
+    }
+
+    #[test]
+    fn a_rotation_another_producer_already_did_is_not_a_metadata_error() {
+        // A2's gate. Both producers reach the end of the term; the other one
+        // rotates first, so this one's tail compare-exchange finds the next
+        // partition already reset and its count compare-exchange finds the
+        // count already advanced. That is a race won by somebody else, not a
+        // corrupt log — the reference ignores the rotation's answer entirely
+        // (`aeron_publication.c:144-171`) and so does this now.
+        let mut log = Log::new();
+        initialised(&mut log);
+        log.set_tail(initial_term_id(), TERM_LENGTH - 128, 0);
+
+        let outcome = {
+            let mut appender = log.appender();
+            appender.produce_race = Some((128, true));
+            appender.append(11, 22, i64::MAX, &[0xAB; 128])
+        };
+
+        assert_eq!(
+            Appended::EndOfLog,
+            outcome,
+            "the caller retries; it is not told the log is broken"
+        );
+
+        let meta = AtomicBuffer::from_slice(&log.metadata.0).expect("aligned");
+        assert_eq!(
+            Some(1),
+            meta.load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET),
+            "and the rotation really happened — by the other producer"
+        );
+    }
+
+    #[test]
+    fn rotating_leaves_the_four_bytes_after_the_term_count_alone() {
+        // A3's gate. `active_term_count` is four bytes wide and the four bytes
+        // after it are structure padding that nothing promises to keep zero. An
+        // eight-byte compare-exchange fails to rotate at all when they are not
+        // — and would zero them if they were.
+        const SENTINEL: i32 = 0x0BAD_F00D_i32;
+
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        {
+            let meta = AtomicBuffer::from_slice_mut(&mut log.metadata.0).expect("aligned");
+            meta.store_i32_relaxed(descriptor::ACTIVE_TERM_COUNT_OFFSET + 4, SENTINEL)
+                .expect("in range");
+        }
+
+        {
+            let appender = log.appender();
+            assert!(
+                appender.rotate(0, initial_term_id()),
+                "the rotation took, whatever the padding holds"
+            );
+            assert_eq!(Some(1), appender.active_term_count(), "the count moved");
+        }
+
+        let meta = AtomicBuffer::from_slice(&log.metadata.0).expect("aligned");
+        assert_eq!(
+            Some(SENTINEL),
+            meta.load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET + 4),
+            "and the bytes it must not touch are where they were"
+        );
+    }
+
+    #[test]
+    fn a_count_that_disagrees_with_its_tail_is_a_retry_not_a_write() {
+        // B1's gate. The count names partition 1 while partition 1's tail still
+        // carries term 0 — the instant between another producer's tail reset
+        // and its count store. Every position computed from that pair is
+        // nonsense, so the offer does not happen and nothing is written.
+        let mut log = Log::new();
+        initialised(&mut log);
+        log.set_tail(initial_term_id(), 0, 1);
+
+        let outcome = {
+            let appender = log.appender();
+            appender.append(11, 22, i64::MAX, b"hello")
+        };
+
+        assert_eq!(
+            Appended::MidRotation,
+            outcome,
+            "the caller retries once the rotation has settled"
+        );
+        assert_eq!(
+            (0, 0, Vec::new()),
+            log.read_frame(0),
+            "and nothing was written"
+        );
     }
 
     #[test]
