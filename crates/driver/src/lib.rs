@@ -21,12 +21,14 @@ pub mod config;
 pub mod dir;
 pub mod flowcontrol;
 pub mod idle;
+pub mod ipc_publication;
 pub mod loss;
 pub mod media;
 pub mod native_resource_agent;
 pub mod position;
 pub mod receiver;
 pub mod sender;
+pub mod subscribable;
 /// The process's signal seam: the one `unsafe` in this crate, and the only
 /// place the allow appears. ADR-0002 zone 4.
 #[allow(unsafe_code)]

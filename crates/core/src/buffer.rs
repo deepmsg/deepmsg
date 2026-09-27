@@ -465,6 +465,39 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         Some(())
     }
 
+    /// Write an `int64` at a **4-byte-aligned** offset, as two 32-bit stores.
+    ///
+    /// The reference's log-buffer metadata block is `#pragma pack(4)`
+    /// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:42-88`),
+    /// so its last field, `untethered_linger_timeout_ns`, lands at offset 500 —
+    /// four-aligned and not eight. The reference writes it plainly; a Rust
+    /// atomic needs eight, which is why this exists and why it is a pair of
+    /// stores rather than one.
+    ///
+    /// **For a field written before anything can read it** — initialising a
+    /// block, not updating a live one. A reader that arrives mid-write can see
+    /// the halves disagree, and there is no ordering that fixes that.
+    pub fn store_i64_relaxed_unaligned(&self, offset: usize, value: i64) -> Option<()> {
+        #[allow(clippy::cast_possible_truncation)] // the two halves of one i64
+        let low = value as i32;
+        let high = (value >> 32) as i32;
+
+        self.store_i32_relaxed(offset, low)?;
+        self.store_i32_relaxed(offset + 4, high)
+    }
+
+    /// Read an `int64` at a **4-byte-aligned** offset, as two 32-bit loads.
+    ///
+    /// The reader's half of [`AtomicBuffer::store_i64_relaxed_unaligned`], for
+    /// the one field of the log buffer's metadata block that is four-aligned
+    /// (`aeron_logbuffer_descriptor.h:78-88` hands it offset 500).
+    pub fn load_i64_unaligned(&self, offset: usize) -> Option<i64> {
+        let low = i64::from(self.load_i32(offset)? as u32);
+        let high = i64::from(self.load_i32(offset + 4)? as u32);
+
+        Some((high << 32) | low)
+    }
+
     /// Compare and exchange a 4-byte field, returning whether it took.
     ///
     /// The reference has this as well as the 8-byte form

@@ -205,7 +205,11 @@ pub fn initialise(
         UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_OFFSET,
         init.untethered_window_limit_timeout_ns,
     )?;
-    block.store_i64_relaxed(
+    // The one field of this block that is four-aligned rather than eight: it
+    // follows `type` and two bytes of padding, which puts it at 500
+    // (`aeron_logbuffer_descriptor.h:78-88`). The reference writes it with a
+    // plain assignment, and nothing can be reading the block yet.
+    block.store_i64_relaxed_unaligned(
         UNTETHERED_LINGER_TIMEOUT_NS_OFFSET,
         init.untethered_linger_timeout_ns,
     )?;
