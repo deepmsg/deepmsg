@@ -273,10 +273,30 @@ impl CncFile {
     /// The last retryable error once `timeout` elapses, or the first
     /// non-retryable one immediately.
     pub fn open(aeron_dir: &Path, timeout: Duration) -> Result<Self, CncOpenError> {
+        Self::open_with(aeron_dir, timeout, Self::try_open)
+    }
+
+    /// The same wait, for a file the caller intends to write.
+    ///
+    /// A client needs this rather than [`CncFile::open`]: it takes its client
+    /// id from the command ring and writes its own heartbeat counter, so a
+    /// read-only mapping would do it no good. The wait is the same one, and it
+    /// is the reference's — a client that arrives while a driver is creating
+    /// its file retries until the file, and then the version, are there
+    /// (`aeron_client_connect_to_driver`, `aeronc.c:70-125`).
+    pub fn open_writable(aeron_dir: &Path, timeout: Duration) -> Result<Self, CncOpenError> {
+        Self::open_with(aeron_dir, timeout, Self::try_open_writable)
+    }
+
+    fn open_with(
+        aeron_dir: &Path,
+        timeout: Duration,
+        open: impl Fn(&Path) -> Result<Self, CncOpenError>,
+    ) -> Result<Self, CncOpenError> {
         let deadline = Instant::now() + timeout;
 
         loop {
-            match Self::try_open(aeron_dir) {
+            match open(aeron_dir) {
                 Ok(file) => return Ok(file),
                 Err(error) => {
                     if !error.is_retryable() || Instant::now() >= deadline {

@@ -26,10 +26,19 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use deepmsg_cnc::{CncFile, CncOpenError};
+use deepmsg_core::clock;
+use deepmsg_core::version::CncVersionCompatibility;
 
 use crate::config::DriverConfig;
+
+/// How long to wait between looks while another driver creates its CnC file.
+///
+/// The reference sleeps a millisecond in the same loop (`aeron_micro_sleep(1000)`,
+/// `aeron-driver/src/main/c/aeron_driver_context.c:1610`).
+pub const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Subdirectory for IPC publication log buffers
 /// (`aeron-client/src/main/c/util/aeron_fileutil.h:101`).
@@ -50,6 +59,14 @@ pub enum DirError {
         heartbeat_ms: i64,
         /// The window it was judged against.
         timeout_ms: i64,
+    },
+    /// A driver owns the directory and publishes a CnC version this build may
+    /// not read, so its heartbeat cannot be checked and its liveness cannot be
+    /// judged. Refusing is the conservative answer — see
+    /// [`check_for_a_live_driver`].
+    BusyIncompatible {
+        /// The directory that is in use.
+        path: PathBuf,
     },
     /// The directory could not be inspected, removed, or created.
     Io {
@@ -73,6 +90,12 @@ impl std::fmt::Display for DirError {
                  within the {timeout_ms} ms window",
                 path.display()
             ),
+            Self::BusyIncompatible { path } => write!(
+                f,
+                "a media driver holds {} and its CnC version is not one this build may open; \
+                 refusing to take the directory over",
+                path.display()
+            ),
             Self::Io { path, source } => {
                 write!(f, "{}: {source}", path.display())
             }
@@ -84,7 +107,7 @@ impl std::error::Error for DirError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Busy { .. } => None,
+            Self::Busy { .. } | Self::BusyIncompatible { .. } => None,
         }
     }
 }
@@ -143,49 +166,90 @@ pub fn remove(config: &DriverConfig) -> Result<(), DirError> {
 
 /// Refuse the directory if a driver in it looks alive.
 ///
-/// Every other outcome — a directory with no CnC file, a file whose version
-/// this build cannot read, a heartbeat that went stale or was set to
-/// [`deepmsg_cnc::layout::NULL_VALUE`] on the way out — is a dead driver, and
-/// the caller deletes it.
+/// The question the reference asks is one question, but it is asked in two
+/// steps, and this used to ask only the second. A CnC file whose version field
+/// is still **zero** is a driver that is creating its file right now: the file
+/// is written first and the version is published when the conductor is ready,
+/// and for a 46 MB file that window is tens to hundreds of milliseconds wide.
+/// Deciding on the first look therefore means a driver starting beside a live
+/// one deletes its directory and then serves the file the other one is still
+/// writing — so the reference spins until the version appears or its timeout
+/// expires (`aeron_is_driver_active_with_cnc`'s `while (0 == cnc_version)`,
+/// `aeron-driver/src/main/c/aeron_driver_context.c:1603-1612`).
+///
+/// The second step is a heartbeat check, and it is only meaningful for a file
+/// this build can read. That is why an *incompatible* file is not
+/// automatically a dead one: the reference judges liveness by **major** version
+/// alone, and this build also applies the Java minor rule — so an older-minor
+/// driver with a fresh heartbeat would be refused by the reference and deleted
+/// by a naive port. Refusing is the conservative answer, and the review that
+/// found this put the principle plainly: when liveness cannot be judged, err
+/// towards a live driver, never towards a deleted one.
+///
+/// Every other outcome — no CnC file, a file that was created and never
+/// published, a different major version, a corrupt block, a heartbeat that went
+/// stale or was set to [`deepmsg_cnc::layout::NULL_VALUE`] on the way out — is
+/// a dead driver, and the caller deletes it.
 fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), DirError> {
     let dir = config.aeron_dir.as_path();
+    // The window is measured against the real clock, while the heartbeat
+    // comparison uses the caller's `now_ms` — passing that in is what lets a
+    // test age a heartbeat without waiting for one, and it is not a clock the
+    // wait itself can be built on.
+    let deadline_ms = clock::epoch_millis().saturating_add(config.driver_timeout_ms);
 
-    match CncFile::try_open(dir) {
-        Ok(cnc) => {
-            let heartbeat_ms = cnc
-                .consumer_heartbeat_ms()
-                .unwrap_or(deepmsg_cnc::layout::NULL_VALUE);
+    loop {
+        match CncFile::try_open(dir) {
+            Ok(cnc) => {
+                let heartbeat_ms = cnc
+                    .consumer_heartbeat_ms()
+                    .unwrap_or(deepmsg_cnc::layout::NULL_VALUE);
 
-            if cnc.driver_is_active(now_ms, config.driver_timeout_ms) {
-                return Err(DirError::Busy {
+                if cnc.driver_is_active(now_ms, config.driver_timeout_ms) {
+                    return Err(DirError::Busy {
+                        path: dir.to_owned(),
+                        heartbeat_ms,
+                        timeout_ms: config.driver_timeout_ms,
+                    });
+                }
+
+                return Ok(());
+            }
+            // Creating, not dead. Look again until the window closes.
+            Err(CncOpenError::NotReady) if clock::epoch_millis() < deadline_ms => {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            // Same major, older minor: this build cannot read the file, which
+            // is not the same thing as the file being unowned.
+            Err(CncOpenError::Incompatible(CncVersionCompatibility::InsufficientMinor)) => {
+                return Err(DirError::BusyIncompatible {
                     path: dir.to_owned(),
-                    heartbeat_ms,
-                    timeout_ms: config.driver_timeout_ms,
                 });
             }
-
-            Ok(())
+            // Nothing to read: an empty directory, or one whose CnC file was
+            // never created. Both mean nobody is home.
+            Err(CncOpenError::Io(error)) if io::ErrorKind::NotFound == error.kind() => {
+                return Ok(());
+            }
+            // A file that exists and is not a CnC file this build can use:
+            // too short to hold a region, created and never published, a
+            // version from a different implementation, or metadata that does
+            // not describe a layout.
+            Err(
+                CncOpenError::TooShort { .. }
+                | CncOpenError::NotReady
+                | CncOpenError::Incompatible(_)
+                | CncOpenError::Malformed(_),
+            ) => return Ok(()),
+            // The file is there and could not be read, which is not a
+            // statement about who owns the directory.
+            Err(CncOpenError::Io(source)) => {
+                return Err(DirError::Io {
+                    path: dir.to_owned(),
+                    source,
+                });
+            }
         }
-        // Nothing to read: an empty directory, or one whose CnC file was never
-        // created. Both mean nobody is home.
-        Err(CncOpenError::Io(error)) if io::ErrorKind::NotFound == error.kind() => Ok(()),
-        // A file that exists and is not a CnC file this build can use: too
-        // short to hold a region, version still zero, a version from another
-        // implementation, or metadata that does not describe a layout. The
-        // reference reaches the same conclusion by reading the version first
-        // and finding it unusable (`aeron_driver_context.c:1620-1624`).
-        Err(
-            CncOpenError::TooShort { .. }
-            | CncOpenError::NotReady
-            | CncOpenError::Incompatible(_)
-            | CncOpenError::Malformed(_),
-        ) => Ok(()),
-        // The file is there and could not be read, which is not a statement
-        // about who owns the directory.
-        Err(CncOpenError::Io(source)) => Err(DirError::Io {
-            path: dir.to_owned(),
-            source,
-        }),
     }
 }
 
@@ -209,6 +273,7 @@ mod tests {
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
     use deepmsg_cnc::layout;
     use deepmsg_cnc::{CncIdentity, CncLayout, ToDriverRingConsumer};
+    use std::io::{Seek as _, Write as _};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A directory of our own in the system temp directory, removed on drop.
@@ -283,6 +348,103 @@ mod tests {
         // The version last, as a driver publishes it: a file with a heartbeat
         // and no version is not one this driver would read as a live peer.
         cnc.publish().expect("publish");
+    }
+
+    /// The identity a test's driver starts with, fixed so that a file's
+    /// metadata is reproducible.
+    fn identity() -> CncIdentity {
+        CncIdentity {
+            liveness_timeout_ns: 10_000_000_000,
+            start_timestamp_ms: NOW_MS,
+            pid: 4242,
+        }
+    }
+
+    /// A driver that is creating its file right now: the CnC file exists, its
+    /// heartbeat is written, and its version is not published yet.
+    fn cnc_pending_publication(dir: &Path) -> CncFile {
+        let cnc = CncFile::create(dir, &layout(), &identity()).expect("create the CnC file");
+
+        let region = cnc.to_driver_region().expect("created read-write");
+        let consumer =
+            ToDriverRingConsumer::new(&region.as_read_only()).expect("a valid to-driver ring");
+        consumer
+            .write_consumer_heartbeat(&region, NOW_MS)
+            .expect("write the heartbeat");
+
+        cnc
+    }
+
+    #[test]
+    fn a_driver_that_is_still_publishing_is_not_a_dead_one() {
+        // The window the review found: a driver that has created its 46 MB file
+        // and written its first heartbeat, but has not published the version
+        // yet. Deciding on the first look deletes the directory of a driver
+        // that is mid-start, so the question has to wait for the version.
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        let cnc = cnc_pending_publication(temp.path());
+
+        // Published from another thread, as the conductor does once it is
+        // ready — after the peer has already looked once.
+        // The version is stored through the file system rather than through a
+        // `CncFile`: opening one is exactly what the version gate refuses
+        // while the version is zero, and that gate is what this test is about.
+        // The bytes are the same ones `publish` writes.
+        let dir = temp.path().to_owned();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(deepmsg_cnc::CNC_FILE_NAME))
+                .expect("the CnC file");
+            file.seek(std::io::SeekFrom::Start(0)).expect("seek");
+            file.write_all(&deepmsg_core::version::CNC_VERSION.to_le_bytes())
+                .expect("write the version");
+            file.sync_all().expect("sync");
+        });
+        let _creating = cnc;
+
+        let config = config(temp.path());
+        let error = prepare(&config, NOW_MS).expect_err("a driver that is still starting");
+        publisher.join().expect("the publishing thread");
+
+        assert!(
+            matches!(error, DirError::Busy { .. }),
+            "the file's driver may be starting, so it may not be deleted: {error:?}"
+        );
+        assert!(
+            temp.path().join("cnc.dat").is_file(),
+            "and it is still there"
+        );
+    }
+
+    #[test]
+    fn a_file_that_never_gets_a_version_is_a_dead_directory() {
+        // The other end of the same window: nobody published, so after the
+        // window the directory is a dead one — which is the reference's
+        // conclusion too ("CnC file is created but not initialised",
+        // `aeron_driver_context.c:1605-1609`), reached after the same wait.
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        let _cnc = cnc_pending_publication(temp.path());
+
+        let config = DriverConfig {
+            driver_timeout_ms: 40,
+            ..config(temp.path())
+        };
+        let started = std::time::Instant::now();
+        prepare(&config, NOW_MS).expect("prepare");
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "it waits the window out before concluding nobody is coming"
+        );
+        assert!(
+            temp.path().join(PUBLICATIONS_DIR).is_dir(),
+            "and then takes the directory over"
+        );
     }
 
     #[test]

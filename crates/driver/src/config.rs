@@ -254,6 +254,20 @@ impl DriverConfig {
             });
         }
 
+        // The liveness window is written into the CnC metadata and every
+        // compatible client derives its keepalive contract from it, so a value
+        // that is zero, negative, or no longer than the tier that checks it is
+        // a promise the driver cannot keep. The reference refuses both
+        // (`aeron_driver_context.c:1526-1533`).
+        if config.client_liveness_timeout_ns <= 0
+            || config.client_liveness_timeout_ns <= config.timer_interval_ns
+        {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::CLIENT_LIVENESS_TIMEOUT.property,
+                value: config.client_liveness_timeout_ns.to_string(),
+            });
+        }
+
         Ok(config)
     }
 }
@@ -490,6 +504,13 @@ fn lookup(
         .or_else(|| env(&our_env))
         .or_else(|| property(properties, &theirs))
         .or_else(|| env(setting.env))
+        // An empty value is an unset value, which is how the reference reads
+        // its own properties (`aeron_properties_util.c:151-179`). Without
+        // this, `-Ddeepmsg.dir=` would pass the mandatory-directory check as
+        // the empty path: the driver would skip the directory discipline
+        // entirely and write `cnc.dat`, `publications/` and `images/` into
+        // whatever directory it was started from.
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn property(properties: &[(String, String)], name: &str) -> Option<String> {
@@ -626,6 +647,81 @@ mod tests {
         assert!(!config.dirs_delete_on_shutdown);
         assert!(!config.warn_if_dirs_exist);
         assert!(config.aeron_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn an_empty_value_is_an_unset_value() {
+        // The reference reads an empty `-D` value as "not set"
+        // (`aeron_properties_util.c:151-179`). Here that has to mean the
+        // mandatory-directory check fails, because the empty path would skip
+        // the directory discipline and write the CnC file into the working
+        // directory instead.
+        for empty in ["", "   ", "\t"] {
+            assert!(
+                matches!(
+                    resolve(&[("deepmsg.dir", empty)]),
+                    Err(ConfigError::MissingAeronDir { .. })
+                ),
+                "{empty:?} must not be a directory"
+            );
+        }
+
+        assert!(
+            matches!(
+                resolve_with_env(&[("aeron.dir", "/tmp/aeron")], &[("DEEPMSG_DIR", "")]),
+                Err(ConfigError::MissingAeronDir { .. })
+            ),
+            "our empty environment value must not shadow the reference's flag"
+        );
+
+        // And an empty value for any other setting is "unset", not a parse
+        // error: a deployment's configuration file may carry a blank line for
+        // something it does not configure.
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("deepmsg.timer.interval", ""),
+        ])
+        .expect("resolve");
+        assert_eq!(1_000_000_000, config.timer_interval_ns, "the default");
+    }
+
+    #[test]
+    fn the_liveness_window_must_outlast_the_tier_that_checks_it() {
+        // Zero or negative first: the metadata field is a contract with every
+        // client, and zero is a promise of immediate reaping.
+        for bad in ["0", "-1ns"] {
+            assert!(
+                matches!(
+                    resolve(&[
+                        ("deepmsg.dir", "/tmp/deepmsg"),
+                        ("deepmsg.client.liveness.timeout", bad),
+                    ]),
+                    Err(ConfigError::OutOfRange { .. })
+                ),
+                "{bad} must be refused"
+            );
+        }
+
+        // And a window the timeout tier cannot honour: the reference refuses
+        // `client_liveness_timeout_ns <= timer_interval_ns`
+        // (`aeron_driver_context.c:1526-1533`).
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.timer.interval", "1s"),
+                ("deepmsg.client.liveness.timeout", "1s"),
+            ]),
+            Err(ConfigError::OutOfRange { .. })
+        ));
+        assert!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.timer.interval", "1s"),
+                ("deepmsg.client.liveness.timeout", "1001ms"),
+            ])
+            .is_ok(),
+            "one millisecond more is enough"
+        );
     }
 
     #[test]

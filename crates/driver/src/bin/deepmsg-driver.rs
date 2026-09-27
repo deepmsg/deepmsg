@@ -16,10 +16,11 @@
 //! cannot be swapped: creating a file over a live driver's is not something a
 //! later check can undo.
 
+use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use deepmsg_cnc::{CncFile, CncIdentity};
+use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
 use deepmsg_core::clock;
 use deepmsg_driver::conductor::Conductor;
 use deepmsg_driver::config::DriverConfig;
@@ -58,6 +59,22 @@ fn main() -> ExitCode {
     // conductor has a heartbeat to show, and the conductor is what publishes.
     let cnc = match CncFile::create(&config.aeron_dir, &config.layout, &identity) {
         Ok(cnc) => cnc,
+        // Another driver won the `O_EXCL` race — it created its file between
+        // `prepare` looking at the directory and this call. Deleting the
+        // directory here would unlink the winner's `cnc.dat` and its
+        // `publications/` and `images/` trees and leave it running as a driver
+        // nobody can reach: the failure the directory discipline exists to
+        // prevent, reached through the other door. The directory is not ours,
+        // so it is not ours to remove.
+        Err(CncCreateError::Io(source)) if io::ErrorKind::AlreadyExists == source.kind() => {
+            eprintln!(
+                "deepmsg-driver: another driver is creating {}: EBUSY",
+                config.aeron_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        // Everything past this point happens in a directory this process
+        // created, so removing it on the way out is removing our own work.
         Err(error) => {
             eprintln!("deepmsg-driver: {error}");
             let _ = dir::remove(&config);

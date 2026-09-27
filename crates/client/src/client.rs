@@ -58,6 +58,14 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// (`aeron-client/src/main/c/aeron_context.c:35`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`Client::connect`] waits for a driver that is starting.
+///
+/// The same ten seconds as [`DEFAULT_TIMEOUT`], and the same constant in the
+/// reference: the client's `driver_timeout_ms` is what bounds its wait for the
+/// file, the version and the heartbeat at connect
+/// (`aeron-client/src/main/c/aeron_context.c:35`, used at `aeronc.c:74`).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default fragment budget for one poll, matching
 /// `AERON_IMAGE_FRAGMENT_LIMIT_DEFAULT`.
 pub const FRAGMENT_LIMIT: usize = 10;
@@ -202,7 +210,31 @@ impl Client {
     /// [`ConnectError`] if the CnC file cannot be opened read-write or either
     /// ring is unusable.
     pub fn connect(aeron_dir: &Path) -> Result<Self, ConnectError> {
-        let cnc = CncFile::try_open_writable(aeron_dir).map_err(ConnectError::Cnc)?;
+        Self::connect_with_timeout(aeron_dir, CONNECT_TIMEOUT)
+    }
+
+    /// Connect, waiting at most `timeout` for a driver that is starting.
+    ///
+    /// The window is a setting in the reference — `driver_timeout_ms`,
+    /// `AERON_DRIVER_TIMEOUT`, ten seconds by default — and this is the same
+    /// knob.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::connect`], including the timeout expiring.
+    pub fn connect_with_timeout(aeron_dir: &Path, timeout: Duration) -> Result<Self, ConnectError> {
+        // A client that arrives while the driver is starting has to wait for
+        // it, not fail: the CnC file is created first and published a moment
+        // later, and for a 46 MB file that moment is not small. The reference
+        // waits out exactly this window, in four steps — file, mapping,
+        // version, heartbeat — for up to `driver_timeout_ms`
+        // (`aeron_client_connect_to_driver`, `aeronc.c:70-125`).
+        //
+        // What this does *not* wait for is a heartbeat: a driver that published
+        // a version and then stopped is one this client connects to and then
+        // notices, which is P0's behaviour and the client conductor's job
+        // (`crates/client/src/conductor.rs`), not the connect path's.
+        let cnc = CncFile::open_writable(aeron_dir, timeout).map_err(ConnectError::Cnc)?;
 
         // The client id comes from the ring's shared counter, exactly as the
         // reference's does. Two consecutive values are not needed here — that

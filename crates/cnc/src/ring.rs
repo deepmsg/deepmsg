@@ -516,6 +516,16 @@ impl ToDriverRingConsumer {
         self.load_head(region)
     }
 
+    /// How far the producers have published, in the same index space.
+    ///
+    /// Not the consumer's own field, but a consumer needs it to tell "nothing
+    /// to read" from "something to read that cannot be read" — the difference
+    /// [`ToDriverRingConsumer::unblock`] exists for
+    /// (`aeron_mpsc_rb_producer_position`, `concurrent/aeron_mpsc_rb.c:186-190`).
+    pub fn producer_position<A>(&self, region: &AtomicBuffer<'_, A>) -> Option<i64> {
+        region.load_i64_acquire(self.trailer + layout::MPSC_TAIL_POSITION_OFFSET)
+    }
+
     /// Read at most `limit` records, handing each to `handler`.
     ///
     /// Returns how many messages were delivered, matching the reference's
@@ -617,6 +627,156 @@ impl ToDriverRingConsumer {
         }
 
         messages_read
+    }
+
+    /// Break a stall at the head of the ring, if there is one.
+    ///
+    /// A producer that dies between claiming a record and committing it leaves
+    /// a record whose length is negative — the in-flight marker — and the read
+    /// loop stops at it forever: it publishes no new head position, so the ring
+    /// never advances, and the driver goes deaf while still looking alive (its
+    /// heartbeat keeps being refreshed by the very loop that cannot read).
+    /// Nothing about that is self-healing, which is why the reference has
+    /// `aeron_mpsc_rb_unblock` and calls it from its own duty cycle
+    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:373-431`,
+    /// called at `aeron_driver_conductor.c:3253`).
+    ///
+    /// Two shapes, and the first is the one that happens:
+    ///
+    /// - **A negative length** is a claim that was never committed. The bytes
+    ///   are a record header and nothing else can be assumed about them, so the
+    ///   fix is to make the record a *padding* record of the same size: the
+    ///   reader already steps over padding, and the space is reclaimed in one
+    ///   store with nothing to scan.
+    /// - **A zero length** is space that was never claimed at all, which should
+    ///   not be reachable while the tail is ahead — but a producer that died
+    ///   between publishing its tail and writing the record leaves exactly
+    ///   this. The fix is to find the next record that *was* written and pad
+    ///   the gap up to it, after confirming the gap is still all zeroes: the
+    ///   producer may have claimed that space between the scan and the write.
+    ///
+    /// Returns whether anything was broken — the caller counts those, as the
+    /// reference counts them in system counter 20.
+    pub fn unblock(&self, region: &AtomicBuffer<ReadWrite>) -> bool {
+        let (Some(head), Some(tail)) = (
+            region.load_i64_acquire(self.trailer + layout::MPSC_HEAD_POSITION_OFFSET),
+            region.load_i64_acquire(self.trailer + layout::MPSC_TAIL_POSITION_OFFSET),
+        ) else {
+            return false;
+        };
+
+        // Nothing is in flight: the ring is simply empty.
+        if head == tail {
+            return false;
+        }
+
+        #[allow(clippy::cast_possible_truncation)] // masked to the capacity
+        let consumer_index = (head as usize) & self.mask;
+        #[allow(clippy::cast_possible_truncation)] // masked to the capacity
+        let producer_index = (tail as usize) & self.mask;
+
+        let Some(length) = region.load_i32_acquire(consumer_index + layout::RECORD_LENGTH_OFFSET)
+        else {
+            return false;
+        };
+
+        if length < 0 {
+            // The in-flight marker, made into a padding record of the same
+            // length: `msg_type_id` first, then the length, released.
+            if region
+                .store_i32_relaxed(
+                    consumer_index + layout::RECORD_MSG_TYPE_ID_OFFSET,
+                    layout::PADDING_MSG_TYPE_ID,
+                )
+                .is_none()
+            {
+                return false;
+            }
+
+            return region
+                .store_i32_release(consumer_index + layout::RECORD_LENGTH_OFFSET, -length)
+                .is_some();
+        }
+
+        if 0 != length {
+            return false;
+        }
+
+        // A gap where nothing was written. The reference scans to the producer
+        // index when the producer is ahead of the consumer, and to the end of
+        // the ring when it is behind — a producer that wrapped while the
+        // consumer stalled.
+        let limit = if producer_index > consumer_index {
+            producer_index
+        } else {
+            self.capacity
+        };
+
+        let mut index = consumer_index + layout::RECORD_ALIGNMENT;
+        while index < limit {
+            match region.load_i32_acquire(index + layout::RECORD_LENGTH_OFFSET) {
+                Some(0) => index += layout::RECORD_ALIGNMENT,
+                Some(_) => {
+                    // Something was written after the gap — but between the
+                    // scan above and the store below, the producer may have
+                    // claimed the gap. Zeroes all the way back to the consumer
+                    // index is what says it did not.
+                    if !Self::still_zeroed(region, index, consumer_index) {
+                        return false;
+                    }
+
+                    if region
+                        .store_i32_relaxed(
+                            consumer_index + layout::RECORD_MSG_TYPE_ID_OFFSET,
+                            layout::PADDING_MSG_TYPE_ID,
+                        )
+                        .is_none()
+                    {
+                        return false;
+                    }
+
+                    #[allow(clippy::cast_possible_truncation)] // bounded by the capacity
+                    let gap = (index - consumer_index) as i32;
+                    return region
+                        .store_i32_release(consumer_index + layout::RECORD_LENGTH_OFFSET, gap)
+                        .is_some();
+                }
+                None => return false,
+            }
+        }
+
+        false
+    }
+
+    /// Whether every record header from `from` back to `limit` reads zero.
+    ///
+    /// The counterpart of the reference's `scan_back_to_confirm_still_zeroed`
+    /// (`concurrent/aeron_mpsc_rb.c:425-445`), and the reason the gap case is
+    /// safe to write at all: the producer may have claimed the gap between the
+    /// scan and the store, and this is what says it did not.
+    ///
+    /// The walk stops at `limit` rather than decrementing past it. The
+    /// reference decrements a `size_t` and would wrap to the far end of memory
+    /// on the next comparison when `limit` is zero — a read that is only
+    /// survivable because the address is never dereferenced in a build that
+    /// survives it. This walks the same records, in the same order, and stops.
+    /// `from > limit` is the caller's invariant.
+    fn still_zeroed(region: &AtomicBuffer<ReadWrite>, from: usize, limit: usize) -> bool {
+        debug_assert!(
+            from > limit,
+            "the caller scans forward before it scans back"
+        );
+
+        let mut index = from;
+        while index > limit {
+            index -= layout::RECORD_ALIGNMENT;
+            match region.load_i32_acquire(index + layout::RECORD_LENGTH_OFFSET) {
+                Some(0) => {}
+                _ => return false,
+            }
+        }
+
+        true
     }
 
     /// Publish the consumer's liveness, in epoch milliseconds.
@@ -1035,6 +1195,105 @@ mod tests {
         let mut out = vec![0u8; len];
         window.copy_out(0, &mut out).expect("in range");
         out
+    }
+
+    /// Build the bytes of a record header at `index`, and move the tail past
+    /// it — the state a producer leaves whether it committed or died.
+    fn stage_record(region: &mut Region<REGION>, index: usize, length: i32, type_id: i32) {
+        let window = AtomicBuffer::from_slice_mut(&mut region.0).expect("aligned region");
+        window
+            .store_i32_release(index + layout::RECORD_LENGTH_OFFSET, length)
+            .expect("in range");
+        window
+            .store_i32_relaxed(index + layout::RECORD_MSG_TYPE_ID_OFFSET, type_id)
+            .expect("in range");
+        window
+            .store_i64_release(
+                CAPACITY + layout::MPSC_TAIL_POSITION_OFFSET,
+                (index + layout::align_up(length.unsigned_abs() as usize, layout::RECORD_ALIGNMENT))
+                    as i64,
+            )
+            .expect("in range");
+    }
+
+    #[test]
+    fn unblocking_turns_a_claim_that_was_never_committed_into_padding() {
+        // What a producer killed between claim and commit leaves behind: the
+        // negative in-flight length, a tail already past it, and no consumer
+        // that can ever move. Without this the driver stops reading commands
+        // while its heartbeat keeps telling clients it is fine.
+        let mut region = region();
+        stage_record(&mut region, 0, -24, 7);
+
+        let window = AtomicBuffer::from_slice_mut(&mut region.0).expect("aligned region");
+        let mut consumer = ToDriverRingConsumer::new(&window.as_read_only()).expect("consumer");
+
+        // Before: the read loop stalls on it.
+        assert_eq!(0, consumer.read(&window, 10, |_, _| {}));
+        assert_eq!(Some(0), consumer.consume_position(&window));
+
+        assert!(consumer.unblock(&window), "the dead claim is broken");
+        assert_eq!(
+            (Some(24), Some(layout::PADDING_MSG_TYPE_ID),),
+            (
+                window.load_i32_acquire(layout::RECORD_LENGTH_OFFSET),
+                window.load_i32_acquire(layout::RECORD_MSG_TYPE_ID_OFFSET),
+            ),
+            "the same length, now positive and named as padding"
+        );
+
+        // And the ring moves: the record is stepped over, nothing is delivered,
+        // and nothing is counted as malformed.
+        assert_eq!(0, consumer.read(&window, 10, |_, _| {}));
+        assert_eq!(Some(24), consumer.consume_position(&window));
+        assert_eq!(0, consumer.malformed());
+    }
+
+    #[test]
+    fn unblocking_pads_a_gap_where_nothing_was_written() {
+        // A producer that died after publishing its tail but before writing the
+        // header of the record it claimed: zeros at the head, a real record
+        // further on.
+        let mut region = region();
+        stage_record(&mut region, 16, 16, 7);
+
+        let window = AtomicBuffer::from_slice_mut(&mut region.0).expect("aligned region");
+        let mut consumer = ToDriverRingConsumer::new(&window.as_read_only()).expect("consumer");
+
+        assert_eq!(
+            0,
+            consumer.read(&window, 10, |_, _| {}),
+            "stalled at the gap"
+        );
+        assert!(consumer.unblock(&window));
+
+        // The gap became one padding record covering bytes 0..16, so the real
+        // record is what the next read delivers.
+        let mut seen = Vec::new();
+        assert_eq!(
+            1,
+            consumer.read(&window, 10, |type_id, payload| {
+                seen.push((type_id, payload.to_vec()));
+            })
+        );
+        assert_eq!(vec![(7, vec![0u8; 8])], seen, "the record after the gap");
+        assert_eq!(Some(32), consumer.consume_position(&window));
+    }
+
+    #[test]
+    fn unblocking_does_nothing_to_a_ring_that_is_not_stalled() {
+        let mut region = region();
+        publish(&mut region, &[(7, b"hello")]);
+
+        let window = AtomicBuffer::from_slice_mut(&mut region.0).expect("aligned region");
+        let mut consumer = ToDriverRingConsumer::new(&window.as_read_only()).expect("consumer");
+
+        // A committed record at the head is not a stall.
+        assert!(!consumer.unblock(&window));
+
+        // Nor is an empty ring.
+        assert_eq!(1, consumer.read(&window, 10, |_, _| {}));
+        assert!(!consumer.unblock(&window), "head == tail");
     }
 
     #[test]
