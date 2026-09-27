@@ -32,7 +32,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use deepmsg_core::logbuffer::logfile::LogFile;
@@ -143,11 +143,8 @@ impl NativeResourceAgent {
     pub fn poll(&self) -> Vec<Completion> {
         let mut done = Vec::new();
 
-        loop {
-            match self.completions.try_recv() {
-                Ok(completion) => done.push(completion),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(completion) = self.completions.try_recv() {
+            done.push(completion);
         }
 
         done
