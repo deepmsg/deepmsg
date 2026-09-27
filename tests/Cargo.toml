@@ -104,5 +104,12 @@ name = "own_driver_reference_client"
 path = "interop/own_driver_reference_client.rs"
 required-features = ["interop"]
 
+# Our client's fragmentation, read frame by frame by the reference's own
+# subscriber. Needs the reference build for the driver *and* for the sample.
+[[test]]
+name = "our_client_reference_frames"
+path = "interop/our_client_reference_frames.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

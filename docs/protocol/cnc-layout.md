@@ -303,6 +303,46 @@ easy to mistake for bugs:
 (`:262-263`), because a reader is told never to look at a reclaimed record's
 key, and leaves `type_id`, `label` and `label_length` exactly as they were.
 
+### The position counters
+
+Three counters are neither system counters nor a client's own: they are where
+a driver and its clients keep a stream's positions, and they are the *only*
+counters the IPC data plane needs.
+
+| Type id | Name | Label | Source |
+|---|---|---|---|
+| 1 | `pub-lmt` | `pub-lmt: <registration> <session> <stream> <channel>` | `aeron-client/src/main/c/aeron_counters.h:71-72` |
+| 4 | `sub-pos` | `sub-pos: <registration> <session> <stream> <channel> @<joining position>` | `:80-81` |
+| 12 | `pub-pos` | `pub-pos (concurrent\|exclusive): <registration> <session> <stream> <channel>` | `:100-102` |
+
+All three carry the same **112-byte key**
+(`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:37-47`):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `registration_id` |
+| 8 | 4 | `session_id` |
+| 12 | 4 | `stream_id` |
+| 16 | 4 | `channel_length` |
+| 20 | 92 | channel |
+
+Every field is written, including the channel's tail past the 92nd byte — the
+reference builds the key as a designated initialiser
+(`aeron-driver/src/main/c/aeron_position.c:41-42`), so what it does not name is
+zero rather than whatever was on the stack. The label is the other way round:
+it carries the channel **whole**, up to 380 bytes (`:35-39`), and its length
+field is the label's own. A 200-byte URI therefore produces a label that shows
+all of it and a key that shows the first 92 and says so — copying one length
+into the other is a bug neither key nor label alone would reveal.
+
+Which side writes which is the whole of the backpressure contract: the producer
+writes `pub-pos` through the log's tail (and the driver writes it again from the
+same place every duty cycle), the driver is the only writer of `pub-lmt`, and a
+subscriber writes `sub-pos` — whereupon the driver recomputes `pub-lmt` from the
+smallest of them (`aeron-driver/src/main/c/aeron_ipc_publication.c:278-328`).
+A reader that reads without reporting eventually stops the producer, which is
+the property `tests/interop/c_driver_pubsub.rs` asserts from the other side.
+
 ### The system counters
 
 A driver allocates forty-six of them at conductor init

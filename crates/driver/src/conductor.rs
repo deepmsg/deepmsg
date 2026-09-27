@@ -3600,4 +3600,144 @@ mod tests {
             "the message in the next term is read by the next poll"
         );
     }
+
+    #[test]
+    fn a_publication_stops_at_its_window_and_goes_again_when_the_reader_reads() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let path = String::from_utf8(ready[36..].to_vec()).expect("a path");
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four"));
+        let limit_counter_id = i32::from_le_bytes(ready[24..28].try_into().expect("four"));
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let image_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        let deepmsg_cnc::command::Response::AvailableImage {
+            subscriber_position_id,
+            ..
+        } = deepmsg_cnc::command::decode_response(ON_AVAILABLE_IMAGE_TYPE_ID, &image_ready)
+        else {
+            panic!("an image");
+        };
+
+        let producer = deepmsg_client::publication::Publication::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            limit_counter_id,
+            -1,
+        )
+        .expect("the log the driver named");
+        let mut image = deepmsg_client::image::Image::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            subscriber_position_id,
+            0,
+        )
+        .expect("the same log, read-only");
+
+        // The window is half a term (32 KiB) and each message is 4 KiB, so the
+        // eighth cannot be written until the reader reports something: this is
+        // the whole of backpressure, and it is what stops a producer from
+        // outrunning a reader on a log buffer that only has three terms.
+        let message = vec![b'x'; 4 * 1024];
+        let mut offered = 0;
+
+        loop {
+            conductor.do_work();
+            let limit = counter_value(&conductor, limit_counter_id).expect("the limit");
+
+            match producer.offer(limit, &message) {
+                deepmsg_core::logbuffer::append::Appended::Ok { .. } => offered += 1,
+                deepmsg_core::logbuffer::append::Appended::BackPressured => break,
+                other => panic!("{other:?}"),
+            }
+
+            assert!(
+                offered < 32,
+                "the window has to close before a whole term is written"
+            );
+        }
+
+        assert_eq!(
+            8, offered,
+            "half a term of 64 KiB holds exactly eight of these"
+        );
+
+        // The limit stopped where the reader's position plus one window is, and
+        // it does not move while the reader does not.
+        let stopped_at = counter_value(&conductor, limit_counter_id).expect("the limit");
+        assert_eq!(32 * 1024, stopped_at);
+
+        for _ in 0..4 {
+            conductor.do_work();
+        }
+        assert_eq!(
+            Some(stopped_at),
+            counter_value(&conductor, limit_counter_id),
+            "a limit that moves with nobody reading is a window that is not one"
+        );
+        assert!(matches!(
+            producer.offer(stopped_at, &message),
+            deepmsg_core::logbuffer::append::Appended::BackPressured
+        ));
+
+        // The reader catches up and reports, which is the only thing that can
+        // open the window again.
+        let mut read = 0;
+        image.poll(64, |_| read += 1);
+        assert_eq!(
+            24, read,
+            "eight messages of 4 KiB, and each of those is three frames"
+        );
+        set_counter(&conductor, subscriber_position_id, image.position());
+
+        conductor.do_work();
+        let reopened = counter_value(&conductor, limit_counter_id).expect("the limit");
+        assert!(
+            reopened > stopped_at,
+            "the window follows the reader: {reopened} against {stopped_at}"
+        );
+
+        assert!(matches!(
+            producer.offer(reopened, &message),
+            deepmsg_core::logbuffer::append::Appended::Ok { .. }
+        ));
+    }
 }
