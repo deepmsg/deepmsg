@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use deepmsg_cnc::{CncFile, CncOpenError};
-use deepmsg_core::clock;
 use deepmsg_core::version::CncVersionCompatibility;
 
 use crate::config::DriverConfig;
@@ -236,11 +235,18 @@ pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<PreparedDir, DirErr
 /// a dead driver, and the caller deletes it.
 fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), DirError> {
     let dir = config.aeron_dir.as_path();
-    // The window is measured against the real clock, while the heartbeat
-    // comparison uses the caller's `now_ms` — passing that in is what lets a
-    // test age a heartbeat without waiting for one, and it is not a clock the
-    // wait itself can be built on.
-    let deadline_ms = clock::epoch_millis().saturating_add(config.driver_timeout_ms);
+
+    // The wait is a *duration*, so it is measured with a monotonic clock — not
+    // with the epoch clock the judgement below uses. The reference measures it
+    // against `aeron_epoch_clock()` (`aeron_driver_context.c:1605`), which a
+    // clock step turns into a different window: a fresh VM correcting its time
+    // can step it forward by seconds and make a driver give up on a peer that
+    // is still creating its file, or backward and make the wait longer than
+    // configured. A duration has no such failure mode, and the judgement —
+    // "is this heartbeat inside the driver timeout?" — stays on the epoch
+    // clock, because that is the clock the heartbeat is written from.
+    let started = std::time::Instant::now();
+    let window = Duration::from_millis(u64::try_from(config.driver_timeout_ms).unwrap_or(u64::MAX));
 
     loop {
         match CncFile::try_open(dir) {
@@ -265,7 +271,7 @@ fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), Dir
                 return Ok(());
             }
             // Creating, not dead. Look again until the window closes.
-            Err(CncOpenError::NotReady) if clock::epoch_millis() < deadline_ms => {
+            Err(CncOpenError::NotReady) if started.elapsed() < window => {
                 std::thread::sleep(POLL_INTERVAL);
             }
             // Same major, older minor: this build cannot read the file, which
@@ -488,7 +494,8 @@ mod tests {
 
         assert!(
             started.elapsed() >= Duration::from_millis(40),
-            "it waits the window out before concluding nobody is coming"
+            "it waits the window out before concluding nobody is coming: {:?}",
+            started.elapsed()
         );
         assert!(
             temp.path().join(PUBLICATIONS_DIR).is_dir(),

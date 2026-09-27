@@ -76,7 +76,11 @@ rather than the way the reference's code happens to:
   waits for the version to appear before it judges anything, up to
   `aeron.driver.timeout` (`aeron_is_driver_active_with_cnc`, `aeron_driver_context.c:1603-1612`),
   because a driver creating a 46 MB file looks exactly like a dead one. So does
-  deepmsg. Past the window, a file that never got a version is taken over.
+  deepmsg. Past the window, a file that never got a version is taken over. The
+  *wait* is measured with a monotonic clock rather than the reference's epoch
+  clock: a duration measured against a clock a VM can step is a different
+  duration after the step, and the failure mode of the short side is a live
+  driver's directory.
 - **A file this build may not *read* is not a file nobody owns.** The reference
   judges liveness by major version alone; deepmsg also applies the Java client's
   minor rule when reading a file. Where the two meet — a same-major, older-minor
