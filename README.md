@@ -16,8 +16,17 @@ P1-0: `deepmsg-driver` is a media driver. It creates the CnC file — byte for
 byte what a real driver writes, compared against a capture from one in
 `tests/integration/cnc_create.rs` — runs the conductor's duty cycle, answers a
 client with the client P0 proved, and stops cleanly on command, on a signal, or
-by reclaiming a dead driver's directory. Counter allocation, the to-clients
-broadcast and the UDP data plane are the slices after it.
+by reclaiming a dead driver's directory.
+
+P1-1: the driver publishes what a driver publishes. It allocates the
+forty-six system counters in the reference's own order and shape — compared
+record for record against a capture of a real driver's, and read back by the
+reference's own `AeronStat` (`crates/driver/tests/system_counters.rs`,
+`tests/interop/aeron_stat_counters.rs`). It knows its clients: a client exists
+from its first resource command, its liveness is a counter the client writes
+itself, and one that goes quiet is reaped and announced on the to-clients ring,
+which this build now writes. The remaining resource commands and the UDP data
+plane are the slices after it.
 
 Premium features (Cluster Standby and friends) are explicitly out of scope for
 now; the seams they need (cluster schemas, reserved counter ids, the
