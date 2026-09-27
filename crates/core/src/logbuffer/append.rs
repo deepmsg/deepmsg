@@ -28,8 +28,8 @@ use crate::buffer::{AtomicBuffer, ReadWrite};
 
 use super::descriptor;
 use super::frame::{
-    DATA_HEADER_LENGTH, FLAG_UNFRAGMENTED, Frame, SESSION_ID_FIELD_OFFSET, STREAM_ID_FIELD_OFFSET,
-    TYPE_DATA, TYPE_PAD,
+    DATA_HEADER_LENGTH, FLAG_BEGIN, FLAG_END, FLAG_UNFRAGMENTED, Frame, SESSION_ID_FIELD_OFFSET,
+    STREAM_ID_FIELD_OFFSET, TYPE_DATA, TYPE_PAD,
 };
 use super::position::{self, Position, RawTail};
 
@@ -68,11 +68,9 @@ pub enum Appended {
     /// its `AERON_PUBLICATION_ADMIN_ACTION` for exactly this state
     /// (`aeron_publication.c:491-494`).
     MidRotation,
-    /// The payload is larger than one frame, so the reference would split it
-    /// across several. **This port does not fragment yet**, and refuses rather
-    /// than writing one oversized frame — which would be a layout the reference
-    /// never produces, and invisible to any test that only reads back its own
-    /// writes.
+    /// Reserved for a port that refuses to fragment. Nothing returns it now: a
+    /// payload larger than one frame is split across several, as the reference
+    /// does (`aeron_publication.c:251-317`).
     NeedsFragmentation,
     /// The payload is beyond `max_message_length`, which the reference refuses
     /// too (`aeron_publication.c:515-524`).
@@ -286,21 +284,77 @@ impl<'a> Appender<'a> {
             return Appended::MessageTooLarge;
         }
 
+        let partition = position::index_by_term_count(term_count);
+
+        if payload.len() > self.max_payload_length {
+            // Fragmented: the reservation is the whole message, computed with
+            // the reference's own formula so the frames below land exactly
+            // where it says (`aeron_logbuffer_descriptor.h:326-334`).
+            let framed_length =
+                descriptor::compute_fragmented_length(payload.len(), self.max_payload_length);
+
+            return self.claim_and_place(
+                session_id,
+                stream_id,
+                partition,
+                term_count,
+                term_id,
+                payload,
+                framed_length as i64,
+                true,
+            );
+        }
+
         let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
             return Appended::Malformed;
         };
         let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
 
-        if payload.len() > self.max_payload_length {
-            return Appended::NeedsFragmentation;
-        }
+        self.claim_and_place(
+            session_id,
+            stream_id,
+            partition,
+            term_count,
+            term_id,
+            payload,
+            i64::from(aligned_length),
+            false,
+        )
+    }
+
+    /// Claim the space, and write the frame or frames into it.
+    ///
+    /// The reference splits the same way: `offer` reads the world and decides,
+    /// and `append_unfragmented_message` / `append_fragmented_message` each
+    /// start with the fetch-and-add and then place what they were given
+    /// (`aeron_publication.c:210-317`).
+    ///
+    /// `framed_length` is what to reserve — one aligned frame, or a whole
+    /// fragmented message — and one fetch-and-add reserves all of it, which is
+    /// what makes a fragmented message all-or-nothing within its term.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_and_place(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        partition: usize,
+        term_count: i32,
+        term_id: i32,
+        payload: &[u8],
+        framed_length: i64,
+        fragmented: bool,
+    ) -> Appended {
+        // The entry's count and term id are read only by the test seam below;
+        // a real build takes everything from the claim.
+        #[cfg(not(test))]
+        let _ = (term_count, term_id);
 
         // The seam, if a test set one: another producer takes these bytes
         // before this one claims anything.
         #[cfg(test)]
         if let Some((stolen, rotates)) = self.produce_race {
             let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
-                + position::index_by_term_count(term_count) * descriptor::TERM_TAIL_COUNTER_STRIDE;
+                + partition * descriptor::TERM_TAIL_COUNTER_STRIDE;
             self.metadata.fetch_add_i64(offset, stolen);
 
             if rotates {
@@ -310,20 +364,19 @@ impl<'a> Appender<'a> {
             }
         }
 
-        // The claim is the **only** source of where this frame lands: the tail
-        // it returns carries both the term id and the offset, and using the
-        // entry read instead is how a concurrent producer's padding ends up on
-        // top of a frame somebody already published
+        // The claim is the **only** source of where this message lands: the
+        // tail it returns carries both the term id and the offset, and using
+        // the entry read instead is how a concurrent producer's padding ends
+        // up on top of a frame somebody already published
         // (`aeron_publication.c:182-186`).
-        let Some(claimed) = self.claim(
-            position::index_by_term_count(term_count),
-            aligned_length as i64,
-        ) else {
+        let Some(claimed) = self.claim(partition, framed_length) else {
             return Appended::Malformed;
         };
         let claimed_offset = claimed.term_offset(self.term_length);
         let claimed_term_id = claimed.term_id();
-        let resulting_offset = claimed_offset.saturating_add(aligned_length);
+
+        #[allow(clippy::cast_possible_truncation)] // bounded by the term length
+        let resulting_offset = claimed_offset.saturating_add(framed_length as i32);
 
         // Where this append would end, computed from the claimed values alone.
         let end_position = Position::new(
@@ -333,14 +386,27 @@ impl<'a> Appender<'a> {
             self.initial_term_id,
         );
 
-        // The span may run past the term even though the frame started inside
-        // it. That is the normal way a term ends.
+        // The span may run past the term even though it started inside it. That
+        // is the normal way a term ends — and for a fragmented message it is
+        // also the rule that no message straddles two terms.
         if resulting_offset > self.term_length {
             return self.handle_end_of_log(claimed_offset, claimed_term_id, end_position);
         }
 
-        if self
-            .write_frame(
+        let written = if fragmented {
+            self.write_fragmented(
+                session_id,
+                stream_id,
+                claimed_offset,
+                claimed_term_id,
+                payload,
+            )
+        } else {
+            let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+                return Appended::Malformed;
+            };
+
+            self.write_frame(
                 session_id,
                 stream_id,
                 claimed_offset,
@@ -348,8 +414,9 @@ impl<'a> Appender<'a> {
                 frame_length,
                 payload,
             )
-            .is_none()
-        {
+        };
+
+        if written.is_none() {
             return Appended::Malformed;
         }
 
@@ -357,6 +424,58 @@ impl<'a> Appender<'a> {
             position: end_position,
             term_offset: claimed_offset,
         }
+    }
+
+    /// Write a message as several frames, each committed as it is written.
+    ///
+    /// The layout is the reference's (`aeron_publication.c:265-317`): every
+    /// frame carries `min(remaining, max_payload_length)` bytes, the first is
+    /// flagged `BEGIN`, the last `END`, and the cursor advances by the frame's
+    /// **aligned** length while the length it records stays unaligned. The
+    /// reservation covered the whole message, so the frames fill the span that
+    /// was claimed exactly.
+    fn write_fragmented(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        term_offset: i32,
+        term_id: i32,
+        payload: &[u8],
+    ) -> Option<()> {
+        let mut flags = FLAG_BEGIN;
+        let mut offset = term_offset;
+        let mut written = 0;
+
+        while written < payload.len() {
+            let remaining = payload.len() - written;
+            let bytes = remaining.min(self.max_payload_length);
+            let frame_length = i32::try_from(bytes + DATA_HEADER_LENGTH).ok()?;
+
+            // The END flag goes on the frame that ends the message, before it
+            // is written (`aeron_publication.c:287-290`).
+            if remaining <= self.max_payload_length {
+                flags |= FLAG_END;
+            }
+
+            let frame = Frame::new(&self.term, offset as usize);
+            frame.begin(
+                frame_length,
+                flags,
+                TYPE_DATA,
+                offset,
+                session_id,
+                stream_id,
+                term_id,
+            )?;
+            frame.write_payload(&payload[written..written + bytes])?;
+            frame.publish(frame_length)?;
+
+            flags = 0;
+            offset += position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+            written += bytes;
+        }
+
+        Some(())
     }
 
     /// Write the frame and publish it.
@@ -662,6 +781,22 @@ mod tests {
             }
 
             (length, type_id, payload)
+        }
+
+        /// The flags byte of the frame at `offset`.
+        fn frame_flags(&self, offset: usize) -> Option<u8> {
+            let view = AtomicBuffer::from_slice(&self.term.0).expect("aligned");
+            frame::Frame::new(&view, offset).flags()
+        }
+
+        /// How far the current term's tail has advanced.
+        fn tail_offset(&self) -> Option<i32> {
+            let view = AtomicBuffer::from_slice(&self.metadata.0).expect("aligned");
+            let index = position::index_by_term_count(0);
+            let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
+                + index * descriptor::TERM_TAIL_COUNTER_STRIDE;
+
+            Some(RawTail::from_raw(view.load_i64_acquire(offset)?).term_offset(TERM_LENGTH))
         }
 
         /// What a scanner sees first.
@@ -987,16 +1122,13 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_the_reference_would_fragment_is_refused_not_written_oversized() {
-        // The most dangerous possible bug in this module: one frame of 2000
-        // bytes where the reference writes two. Every test that reads back its
-        // own writes agrees with the wrong layout, and only a real subscriber
-        // or a captured buffer would notice.
+    fn a_payload_of_exactly_one_frame_is_one_whole_frame() {
+        // The boundary the fragmentation split sits on: at `max_payload_length`
+        // the reference writes one frame flagged BEGIN|END, and one byte more
+        // becomes two.
         let mut log = Log::new();
         log.set_connected(true);
 
-        // Scoped: an appender borrows the log mutably, so the reader below
-        // cannot run while one is alive.
         let max_payload = {
             let appender = log.appender();
             appender
@@ -1011,29 +1143,159 @@ mod tests {
                 "one MTU less a data header"
             );
 
-            let too_big = vec![0u8; max_payload + 1];
-            let outcome = appender.append(11, 22, i64::MAX, &too_big);
-            assert!(
-                matches!(outcome, Appended::NeedsFragmentation),
-                "got {outcome:?}"
-            );
+            let outcome = appender.append(11, 22, i64::MAX, &vec![0x11; max_payload]);
+            assert!(matches!(outcome, Appended::Ok { .. }), "got {outcome:?}");
 
             max_payload
         };
 
+        let (length, type_id, payload) = log.read_frame(0);
         assert_eq!(
-            Step::NotReady { offset: 0 },
-            log.first_step(),
-            "nothing may be written for a payload this shape cannot carry"
+            max_payload as i32 + DATA_HEADER_LENGTH as i32,
+            length,
+            "one frame, its own length"
+        );
+        assert_eq!(TYPE_DATA, type_id);
+        assert_eq!(max_payload, payload.len());
+    }
+
+    #[test]
+    fn a_payload_one_byte_past_one_frame_becomes_two() {
+        // The layout the reference produces: payload per frame, BEGIN on the
+        // first, END on the last, the cursor advanced by each frame's aligned
+        // length while the length recorded stays unaligned.
+        let mut log = Log::new();
+        log.set_connected(true);
+
+        let max_payload = {
+            let appender = log.appender();
+            appender
+                .initialise_tails(initial_term_id())
+                .then_some(())
+                .expect("tails initialised");
+
+            let max_payload = appender.max_payload_length();
+            let outcome = appender.append(11, 22, i64::MAX, &vec![0x22; max_payload + 1]);
+            assert!(matches!(outcome, Appended::Ok { .. }), "got {outcome:?}");
+
+            max_payload
+        };
+
+        // First frame: the whole MTU of payload, BEGIN only.
+        let (first_length, first_type, first_payload) = log.read_frame(0);
+        assert_eq!((max_payload + DATA_HEADER_LENGTH) as i32, first_length);
+        assert_eq!(TYPE_DATA, first_type);
+        assert_eq!(max_payload, first_payload.len());
+        assert_eq!(
+            Some(FLAG_BEGIN),
+            log.frame_flags(0),
+            "the first frame begins a message and does not end one"
         );
 
-        // Exactly at the bound it still fits one frame.
-        {
+        // Second frame: one byte, END only, at the first frame's aligned end.
+        let second = position::align_up(first_length, descriptor::FRAME_ALIGNMENT) as usize;
+        let (second_length, _, second_payload) = log.read_frame(second);
+        assert_eq!(DATA_HEADER_LENGTH as i32 + 1, second_length);
+        assert_eq!(vec![0x22], second_payload);
+        assert_eq!(
+            Some(FLAG_END),
+            log.frame_flags(second),
+            "and the last frame ends it"
+        );
+
+        assert_eq!(
+            Some(descriptor::compute_fragmented_length(max_payload + 1, max_payload) as i32),
+            log.tail_offset(),
+            "the term advanced by exactly what the reservation said"
+        );
+    }
+
+    #[test]
+    fn a_multi_frame_message_lands_where_the_reservation_said() {
+        // Three frames, so the middle one is the continuation case: no flags at
+        // all. A producer that only got the two-frame case right would still
+        // write a layout no reader could follow.
+        let mut log = Log::new();
+        log.set_connected(true);
+
+        let (max_payload, payload_length) = {
             let appender = log.appender();
-            let exact = vec![0u8; max_payload];
-            let outcome = appender.append(11, 22, i64::MAX, &exact);
+            appender
+                .initialise_tails(initial_term_id())
+                .then_some(())
+                .expect("tails initialised");
+
+            let max_payload = appender.max_payload_length();
+            let payload_length = max_payload * 2 + 17;
+            let payload = vec![0x33; payload_length];
+            let outcome = appender.append(11, 22, i64::MAX, &payload);
             assert!(matches!(outcome, Appended::Ok { .. }), "got {outcome:?}");
-        }
+
+            (max_payload, payload_length)
+        };
+
+        assert_eq!(Some(FLAG_BEGIN), log.frame_flags(0), "first: begins");
+
+        let second = position::align_up(
+            (max_payload + DATA_HEADER_LENGTH) as i32,
+            descriptor::FRAME_ALIGNMENT,
+        ) as usize;
+        assert_eq!(
+            Some(0),
+            log.frame_flags(second),
+            "middle: continuation, no flags"
+        );
+
+        let third = second
+            + position::align_up(
+                (max_payload + DATA_HEADER_LENGTH) as i32,
+                descriptor::FRAME_ALIGNMENT,
+            ) as usize;
+        assert_eq!(Some(FLAG_END), log.frame_flags(third), "last: ends");
+
+        let (third_length, _, third_payload) = log.read_frame(third);
+        assert_eq!(17, third_payload.len(), "and carries the remainder");
+        assert_eq!(DATA_HEADER_LENGTH as i32 + 17, third_length);
+
+        assert_eq!(
+            Some(descriptor::compute_fragmented_length(payload_length, max_payload) as i32),
+            log.tail_offset()
+        );
+    }
+
+    #[test]
+    fn a_fragmented_message_that_does_not_fit_the_term_is_not_split_across_it() {
+        // The all-or-nothing rule: the reservation is the whole message, so a
+        // message whose frames would straddle a term boundary is not written at
+        // all — the term is padded and the caller retries in the next one
+        // (`aeron_publication.c:251-262`).
+        let mut log = Log::new();
+        log.set_connected(true);
+        initialised(&mut log);
+
+        // Room for one frame and a bit, which is not room for a two-frame
+        // message.
+        let max_payload = {
+            let appender = log.appender();
+            appender.max_payload_length()
+        };
+        log.set_tail(
+            initial_term_id(),
+            TERM_LENGTH - (max_payload as i32 + 64),
+            0,
+        );
+
+        let outcome = {
+            let appender = log.appender();
+            appender.append(11, 22, i64::MAX, &vec![0x44; max_payload + 1])
+        };
+
+        assert_eq!(Appended::EndOfLog, outcome);
+
+        let (padding_length, type_id, _) =
+            log.read_frame((TERM_LENGTH - (max_payload as i32 + 64)) as usize);
+        assert_eq!(TYPE_PAD, type_id);
+        assert_eq!(max_payload as i32 + 64, padding_length);
     }
 
     #[test]

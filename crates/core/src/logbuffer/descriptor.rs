@@ -59,6 +59,264 @@ pub const FRAME_ALIGNMENT: i32 = 32;
 /// The cap on a single message, independent of the term length.
 pub const MAX_MESSAGE_LENGTH: i32 = 16 * 1024 * 1024;
 
+/// The fields a driver writes into a fresh log's metadata block.
+///
+/// `aeron_logbuffer_metadata_init` takes these as thirty-odd positional
+/// arguments (`aeron_logbuffer_descriptor.h:240-317`); naming them is what
+/// makes a call site where two adjacent `i32`s are swapped *impossible* rather
+/// than merely unlikely — and the two socket-buffer triples are exactly that
+/// shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogMetadataInit {
+    /// `end_of_stream_position`: `INT64_MAX` until the stream ends.
+    pub end_of_stream_position: i64,
+    /// `is_connected`: zero until a subscriber joins.
+    pub is_connected: i32,
+    /// `active_transport_count`: network only; zero for IPC.
+    pub active_transport_count: i32,
+    /// `correlation_id`: the publication's registration id, which is also what
+    /// names its log file.
+    pub correlation_id: i64,
+    /// `initial_term_id`.
+    pub initial_term_id: i32,
+    /// `mtu_length`: what decides `max_payload_length`, so it is a *byte
+    /// contract* for every producer that writes here.
+    pub mtu_length: i32,
+    /// `term_length`.
+    pub term_length: i32,
+    /// `page_size` the file was created with.
+    pub page_size: i32,
+    /// `publication_window_length`: half the term unless configured otherwise,
+    /// and the slack the publisher limit is computed from.
+    pub publication_window_length: i32,
+    /// `receiver_window_length`: network only.
+    pub receiver_window_length: i32,
+    /// `socket_sndbuf_length`: network only, zero before a channel exists.
+    pub socket_sndbuf_length: i32,
+    /// `os_default_socket_sndbuf_length` (a system value the context carries).
+    pub os_default_socket_sndbuf_length: i32,
+    /// `os_max_socket_sndbuf_length`.
+    pub os_max_socket_sndbuf_length: i32,
+    /// `socket_rcvbuf_length`: network only.
+    pub socket_rcvbuf_length: i32,
+    /// `os_default_socket_rcvbuf_length`.
+    pub os_default_socket_rcvbuf_length: i32,
+    /// `os_max_socket_rcvbuf_length`.
+    pub os_max_socket_rcvbuf_length: i32,
+    /// `max_resend`: network only.
+    pub max_resend: i32,
+    /// `session_id`.
+    pub session_id: i32,
+    /// `stream_id`.
+    pub stream_id: i32,
+    /// `entity_tag`.
+    pub entity_tag: i64,
+    /// `response_correlation_id`.
+    pub response_correlation_id: i64,
+    /// `linger_timeout_ns`.
+    pub linger_timeout_ns: i64,
+    /// `untethered_window_limit_timeout_ns`.
+    pub untethered_window_limit_timeout_ns: i64,
+    /// `untethered_linger_timeout_ns`.
+    pub untethered_linger_timeout_ns: i64,
+    /// `untethered_resting_timeout_ns`.
+    pub untethered_resting_timeout_ns: i64,
+    /// `group`: the inferred group id; zero when unset.
+    pub group: u8,
+    /// `is_response`.
+    pub is_response: bool,
+    /// `rejoin`.
+    pub rejoin: bool,
+    /// `reliable`.
+    pub reliable: bool,
+    /// `sparse`.
+    pub sparse: bool,
+    /// `signal_eos`.
+    pub signal_eos: bool,
+    /// `spies_simulate_connection`.
+    pub spies_simulate_connection: bool,
+    /// `tether`.
+    pub tether: bool,
+    /// `type`: exclusive (1) or concurrent (0) publication
+    /// (`aeron_logbuffer_descriptor.h:34-36`).
+    pub is_exclusive: bool,
+}
+
+/// Write every field a driver initialises on a fresh log's metadata block.
+///
+/// Mirrors `aeron_logbuffer_metadata_init` (`aeron_logbuffer_descriptor.h:240-317`)
+/// field for field, in its order — including the two it deliberately does
+/// **not** touch: `term_tail_counters` and `active_term_count` belong to the
+/// code that creates the publication, not to the metadata template
+/// (`aeron_ipc_publication.c:75-103`).
+///
+/// # Errors
+///
+/// `None` if the block is shorter than the metadata struct.
+pub fn initialise(
+    block: &crate::buffer::AtomicBuffer<crate::buffer::ReadWrite>,
+    init: &LogMetadataInit,
+) -> Option<()> {
+    if block.len() < METADATA_STRUCT_LENGTH {
+        return None;
+    }
+
+    block.store_i64_relaxed(END_OF_STREAM_POSITION_OFFSET, init.end_of_stream_position)?;
+    block.store_i32_relaxed(IS_CONNECTED_OFFSET, init.is_connected)?;
+    block.store_i32_relaxed(ACTIVE_TRANSPORT_COUNT_OFFSET, init.active_transport_count)?;
+
+    block.store_i64_relaxed(CORRELATION_ID_OFFSET, init.correlation_id)?;
+    block.store_i32_relaxed(INITIAL_TERM_ID_OFFSET, init.initial_term_id)?;
+    block.store_i32_relaxed(MTU_LENGTH_OFFSET, init.mtu_length)?;
+    block.store_i32_relaxed(TERM_LENGTH_OFFSET, init.term_length)?;
+    block.store_i32_relaxed(PAGE_SIZE_OFFSET, init.page_size)?;
+
+    block.store_i32_relaxed(
+        PUBLICATION_WINDOW_LENGTH_OFFSET,
+        init.publication_window_length,
+    )?;
+    block.store_i32_relaxed(RECEIVER_WINDOW_LENGTH_OFFSET, init.receiver_window_length)?;
+    block.store_i32_relaxed(SOCKET_SNDBUF_LENGTH_OFFSET, init.socket_sndbuf_length)?;
+    block.store_i32_relaxed(
+        OS_DEFAULT_SOCKET_SNDBUF_LENGTH_OFFSET,
+        init.os_default_socket_sndbuf_length,
+    )?;
+    block.store_i32_relaxed(
+        OS_MAX_SOCKET_SNDBUF_LENGTH_OFFSET,
+        init.os_max_socket_sndbuf_length,
+    )?;
+    block.store_i32_relaxed(SOCKET_RCVBUF_LENGTH_OFFSET, init.socket_rcvbuf_length)?;
+    block.store_i32_relaxed(
+        OS_DEFAULT_SOCKET_RCVBUF_LENGTH_OFFSET,
+        init.os_default_socket_rcvbuf_length,
+    )?;
+    block.store_i32_relaxed(
+        OS_MAX_SOCKET_RCVBUF_LENGTH_OFFSET,
+        init.os_max_socket_rcvbuf_length,
+    )?;
+    block.store_i32_relaxed(MAX_RESEND_OFFSET, init.max_resend)?;
+
+    fill_default_header(block, init.session_id, init.stream_id, init.initial_term_id)?;
+
+    block.store_i64_relaxed(ENTITY_TAG_OFFSET, init.entity_tag)?;
+    block.store_i64_relaxed(RESPONSE_CORRELATION_ID_OFFSET, init.response_correlation_id)?;
+    block.store_i64_relaxed(LINGER_TIMEOUT_NS_OFFSET, init.linger_timeout_ns)?;
+    block.store_i64_relaxed(
+        UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_OFFSET,
+        init.untethered_window_limit_timeout_ns,
+    )?;
+    block.store_i64_relaxed(
+        UNTETHERED_LINGER_TIMEOUT_NS_OFFSET,
+        init.untethered_linger_timeout_ns,
+    )?;
+    block.store_i64_relaxed(
+        UNTETHERED_RESTING_TIMEOUT_NS_OFFSET,
+        init.untethered_resting_timeout_ns,
+    )?;
+    block.store_u8_relaxed(GROUP_OFFSET, init.group)?;
+    block.store_u8_relaxed(IS_RESPONSE_OFFSET, u8::from(init.is_response))?;
+    block.store_u8_relaxed(REJOIN_OFFSET, u8::from(init.rejoin))?;
+    block.store_u8_relaxed(RELIABLE_OFFSET, u8::from(init.reliable))?;
+    block.store_u8_relaxed(SPARSE_OFFSET, u8::from(init.sparse))?;
+    block.store_u8_relaxed(SIGNAL_EOS_OFFSET, u8::from(init.signal_eos))?;
+    block.store_u8_relaxed(
+        SPIES_SIMULATE_CONNECTION_OFFSET,
+        u8::from(init.spies_simulate_connection),
+    )?;
+    block.store_u8_relaxed(TETHER_OFFSET, u8::from(init.tether))?;
+    block.store_u8_relaxed(IS_PUBLICATION_REVOKED_OFFSET, 0)?;
+    block.store_u8_relaxed(TYPE_OFFSET, u8::from(init.is_exclusive))?;
+
+    Some(())
+}
+
+/// Write the template frame header a receiver copies for frames it has to
+/// invent — padding, heartbeats, gap fills (`aeron_logbuffer_descriptor.h:320-341`).
+///
+/// `frame_length` is written as **zero**, which is what the reference writes:
+/// the template is a header, not a record, and a reader that trusted a length
+/// here would step over something nobody wrote.
+///
+/// # Errors
+///
+/// `None` if the block cannot hold the template.
+pub fn fill_default_header(
+    block: &crate::buffer::AtomicBuffer<crate::buffer::ReadWrite>,
+    session_id: i32,
+    stream_id: i32,
+    initial_term_id: i32,
+) -> Option<()> {
+    #[allow(clippy::cast_possible_truncation)] // 32 bytes, a constant
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_LENGTH_OFFSET,
+        crate::logbuffer::frame::DATA_HEADER_LENGTH as i32,
+    )?;
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::FRAME_LENGTH_OFFSET,
+        0,
+    )?;
+    block.store_u8_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::VERSION_OFFSET,
+        crate::logbuffer::frame::VERSION as u8,
+    )?;
+    block.store_u8_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::FLAGS_OFFSET,
+        crate::logbuffer::frame::FLAG_UNFRAGMENTED,
+    )?;
+    block.store_i16_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::TYPE_OFFSET,
+        crate::logbuffer::frame::TYPE_DATA,
+    )?;
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::TERM_OFFSET_FIELD_OFFSET,
+        0,
+    )?;
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::SESSION_ID_FIELD_OFFSET,
+        session_id,
+    )?;
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::STREAM_ID_FIELD_OFFSET,
+        stream_id,
+    )?;
+    block.store_i32_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::TERM_ID_FIELD_OFFSET,
+        initial_term_id,
+    )?;
+    block.store_i64_relaxed(
+        DEFAULT_FRAME_HEADER_OFFSET + crate::logbuffer::frame::RESERVED_VALUE_OFFSET,
+        0,
+    )?;
+
+    Some(())
+}
+
+/// The term space one fragmented message occupies.
+///
+/// Mirrors `aeron_logbuffer_compute_fragmented_length`
+/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:326-334`):
+/// every full frame costs `max_payload_length + 32` — **not** rounded up, which
+/// is only equivalent because the driver forces the MTU to a multiple of the
+/// frame alignment — and the last, possibly short, frame costs its aligned
+/// length. The total is what a producer reserves with one fetch-and-add, so it
+/// has to be exact: reserving less would let two messages overlap.
+pub const fn compute_fragmented_length(length: usize, max_payload_length: usize) -> usize {
+    let full_frames = length / max_payload_length;
+    let remaining_payload = length % max_payload_length;
+    let last_frame_length = if remaining_payload > 0 {
+        let frame_length = remaining_payload + crate::logbuffer::frame::DATA_HEADER_LENGTH;
+        // `AERON_ALIGN(frame_length, AERON_LOGBUFFER_FRAME_ALIGNMENT)`, in
+        // `usize` because the caller's payload can be up to 16 MiB and the
+        // intermediate sum is not an `i32` in any useful sense.
+        (frame_length + FRAME_ALIGNMENT as usize - 1) & !(FRAME_ALIGNMENT as usize - 1)
+    } else {
+        0
+    };
+
+    full_frames * (max_payload_length + crate::logbuffer::frame::DATA_HEADER_LENGTH)
+        + last_frame_length
+}
+
 /// The default MTU, and the default for the IPC channel too.
 pub const MTU_LENGTH_DEFAULT: i32 = 1408;
 
