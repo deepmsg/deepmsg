@@ -496,6 +496,25 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     }
 }
 
+/// A full store fence, mirroring the reference's `aeron_release()`
+/// (`aeron-client/src/main/c/util/aeron_atomic.h`).
+///
+/// The one place it is needed is the broadcast transmitter's tail-intent
+/// publish: the intent is a *release* store, and a release orders the writes
+/// that came before it — but the guarantee the receiver reads it for is the
+/// other direction, that nothing written *after* it becomes visible first.
+/// Only a fence gives that, so
+/// `aeron_broadcast_transmitter.c:45-49` stores with a release and then calls
+/// `aeron_release()`, and this is that call.
+///
+/// On x86-64 it compiles to nothing: `mov` retires stores in order. It is here
+/// for the same reason the reference has it — so the argument is written in
+/// terms of a primitive that holds on every architecture, not in terms of the
+/// one this was developed on.
+pub fn store_fence() {
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
 impl<Access> std::fmt::Debug for AtomicBuffer<'_, Access> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicBuffer")
