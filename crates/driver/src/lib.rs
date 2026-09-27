@@ -27,3 +27,4 @@ pub mod sender;
 /// place the allow appears. ADR-0002 zone 4.
 #[allow(unsafe_code)]
 pub mod sys;
+pub mod system_counters;

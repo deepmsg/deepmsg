@@ -40,6 +40,26 @@ pub const CNC_VERSION: i32 = semantic_version_compose(
     CNC_SEMANTIC_VERSION.2,
 );
 
+/// The Aeron version this build implements the contracts of, as text.
+///
+/// It is the `version=` half of the two system counter labels that carry a
+/// build identity (`aeron-driver/src/main/c/aeron_system_counters.c:41,60`), and
+/// it matches the packed value those counters hold — `1.53.2` as `79106`. The
+/// reference writes its own `AERON_VERSION_TXT` there; this is the honest
+/// equivalent: the version we are compatible with, which is a claim about the
+/// contracts rather than about our source tree.
+pub const COMPAT_VERSION_TEXT: &str = "1.53.2";
+
+/// Who wrote a file, in one token: `deepmsg-<crate version>`.
+///
+/// The `commit=` half of the same two labels. The reference puts its git sha
+/// there, which is a build-time fact it generates a header for; deepmsg uses
+/// the package version instead — deterministic, reproducible, and free of a
+/// build script. A reader learns which build left the file behind, which is
+/// what the field is for; that it is not a sha is a documented divergence
+/// (`docs/compat.md`).
+pub const BUILD_IDENTITY: &str = concat!("deepmsg-", env!("CARGO_PKG_VERSION"));
+
 /// Whether a CnC file's version is one this build can use.
 ///
 /// Two rules, from two different references. Knowing which is which matters

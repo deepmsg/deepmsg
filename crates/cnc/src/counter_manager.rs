@@ -54,8 +54,9 @@
 //! `&[]` key means "do not touch the key field", which is what a `NULL`/0-length
 //! key means in C (`:112-115`), and is *not* the same as "write zeroes".
 
-use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 
+use crate::counters::CountersReader;
 use crate::layout;
 
 /// The two regions a counter lives in, borrowed for one call.
@@ -80,6 +81,16 @@ impl<'a> CounterRegions<'a> {
         }
 
         Some(Self { metadata, values })
+    }
+
+    /// A read-only view of the same two regions.
+    ///
+    /// The reader the client half of this crate uses, over a driver's own
+    /// windows — which is how a driver checks what it just wrote without a
+    /// second constructor for the pair, and how its tests assert against the
+    /// same decoding a client would do.
+    pub fn reader(&self) -> CountersReader<'_, ReadOnly> {
+        CountersReader::new(self.metadata.as_read_only(), self.values.as_read_only())
     }
 
     /// The highest id that can exist, `values_length / 128 - 1`
