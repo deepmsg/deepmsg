@@ -11,7 +11,7 @@
 //! **Nothing is initialised.** `aeron_counters_manager_init` (`:45-80`) writes
 //! no byte of either region: a record is "unused" because the file was created
 //! zero-filled (`aeron-driver.c:313` maps the CnC with `fill_with_zeroes`), and
-//! the state field's zero *is* `UNUSED`. [`CounterManager::new`] therefore does
+//! the state field's zero *is* `UNUSED`. [`CounterRegions::new`] therefore does
 //! the same, and a caller that hands it a non-zero region gets the reference's
 //! behaviour rather than a safer one.
 //!
@@ -32,6 +32,17 @@
 //! skipped even when it sits at the head. There is no `is_reusable` predicate
 //! in the C, and adding one would change which id a client is handed.
 //!
+//! # Two types, because a driver owns its own mapping
+//!
+//! The reference's manager holds pointers to both regions for its whole life
+//! (`aeron_counters_manager.h:72-88`), which in Rust would make the type that
+//! owns the CnC file borrow one of its own fields — a shape the language
+//! rejects. So the split is the one the ring consumers already use: the
+//! **process state** — the id allocator and the free list — lives in
+//! [`CounterManager`], and the regions arrive per call as [`CounterRegions`].
+//! A driver constructs the regions from its `CncFile` each time it touches a
+//! counter; a test constructs them once from two arrays.
+//!
 //! # What is deliberately different
 //!
 //! Time arrives as an argument (`now_ms`) rather than through a clock the
@@ -47,14 +58,44 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 
 use crate::layout;
 
-/// The manager's view of the two regions.
+/// The two regions a counter lives in, borrowed for one call.
+pub struct CounterRegions<'a> {
+    metadata: AtomicBuffer<'a, ReadWrite>,
+    values: AtomicBuffer<'a, ReadWrite>,
+}
+
+impl<'a> CounterRegions<'a> {
+    /// Pair the regions up.
+    ///
+    /// The lengths must satisfy the reference's rule — the metadata region is
+    /// at least four times the values region
+    /// (`concurrent/aeron_counters_manager.h:100-101`) — and a pair that does
+    /// not is refused here rather than producing nonsense offsets later.
+    pub fn new(
+        metadata: AtomicBuffer<'a, ReadWrite>,
+        values: AtomicBuffer<'a, ReadWrite>,
+    ) -> Option<Self> {
+        if metadata.len() < values.len().checked_mul(4)? {
+            return None;
+        }
+
+        Some(Self { metadata, values })
+    }
+
+    /// The highest id that can exist, `values_length / 128 - 1`
+    /// (`aeron_counters_manager.h:170`).
+    pub fn max_counter_id(&self) -> i32 {
+        #[allow(clippy::cast_possible_truncation)] // a region length, bounded by i32::MAX
+        let max = (self.values.len() / layout::COUNTER_VALUE_LENGTH) as i32 - 1;
+        max
+    }
+}
+
+/// The allocator: who owns the ids, and which of them are waiting to be reused.
 ///
-/// Holds no copy of the counters: the records live in the mapped regions, and
-/// the only per-process state is the id allocator and the free list, exactly as
-/// in `aeron_counters_manager_stct` (`concurrent/aeron_counters_manager.h:72-88`).
-pub struct CounterManager<'a> {
-    pub(crate) metadata: AtomicBuffer<'a, ReadWrite>,
-    pub(crate) values: AtomicBuffer<'a, ReadWrite>,
+/// Everything here is process-local. The records themselves are in the regions,
+/// and they outlive this type.
+pub struct CounterManager {
     max_counter_id: i32,
     /// The highest id ever handed out, or `-1` for none
     /// (`aeron_counters_manager.c:64`).
@@ -63,29 +104,22 @@ pub struct CounterManager<'a> {
     free_to_reuse_timeout_ms: i64,
 }
 
-impl<'a> CounterManager<'a> {
-    /// Pair the regions up.
+impl CounterManager {
+    /// Set up an allocator over a values region of `values_length` bytes.
     ///
-    /// The lengths must satisfy the reference's rule — the metadata region is
-    /// at least four times the values region
-    /// (`concurrent/aeron_counters_manager.h:100-101`) — and the id ceiling is
-    /// derived from the values region alone
-    /// (`aeron_counters_manager.h:170`, `values_length / 128 - 1`).
-    pub fn new(
-        metadata: AtomicBuffer<'a, ReadWrite>,
-        values: AtomicBuffer<'a, ReadWrite>,
-        free_to_reuse_timeout_ms: i64,
-    ) -> Option<Self> {
-        if metadata.len() < values.len().checked_mul(4)? {
+    /// The reference derives the same ceiling at manager init
+    /// (`aeron_counters_manager.c:66`) and allocates a two-entry free list
+    /// (`:78`); this one grows a `Vec` instead, which is the same list without
+    /// a reallocation policy to get wrong. `None` for an empty region: a
+    /// region with no room for one value record has no ids at all.
+    pub fn new(values_length: usize, free_to_reuse_timeout_ms: i64) -> Option<Self> {
+        #[allow(clippy::cast_possible_truncation)] // a region length, bounded by i32::MAX
+        let max_counter_id = (values_length / layout::COUNTER_VALUE_LENGTH) as i32 - 1;
+        if max_counter_id < 0 {
             return None;
         }
 
-        #[allow(clippy::cast_possible_truncation)] // a region length, bounded by i32::MAX
-        let max_counter_id = (values.len() / layout::COUNTER_VALUE_LENGTH) as i32 - 1;
-
         Some(Self {
-            metadata,
-            values,
             max_counter_id,
             id_high_water_mark: -1,
             free_list: Vec::new(),
@@ -93,15 +127,12 @@ impl<'a> CounterManager<'a> {
         })
     }
 
-    /// The highest id that can exist, `values_length / 128 - 1`.
+    /// The highest id that can exist.
     pub const fn max_counter_id(&self) -> i32 {
         self.max_counter_id
     }
 
     /// The highest id handed out so far.
-    ///
-    /// Not part of the reference's reader API — it is the writer's, and it is
-    /// exposed for reports and tests.
     pub const fn id_high_water_mark(&self) -> i32 {
         self.id_high_water_mark
     }
@@ -111,7 +142,7 @@ impl<'a> CounterManager<'a> {
         self.free_list.len()
     }
 
-    /// Allocate a counter and return its id, or `None` if the region is full.
+    /// Allocate a counter and return its id, or `None` if there is no room.
     ///
     /// The write order is the reference's (`aeron_counters_manager.c:87-124`):
     /// `type_id`, the reuse deadline, the key, the label, `label_length`, and
@@ -124,13 +155,21 @@ impl<'a> CounterManager<'a> {
     /// anything past what they cover is left as it was: the reference copies
     /// `min(sizeof(field), length)` bytes and nothing more (`:114`, `:117-119`),
     /// so a recycled slot can show a longer key than the one just written.
-    pub fn allocate(&mut self, type_id: i32, key: &[u8], label: &[u8], now_ms: i64) -> Option<i32> {
-        let counter_id = self.next_counter_id(now_ms)?;
+    pub fn allocate(
+        &mut self,
+        regions: &CounterRegions<'_>,
+        type_id: i32,
+        key: &[u8],
+        label: &[u8],
+        now_ms: i64,
+    ) -> Option<i32> {
+        let counter_id = self.next_counter_id(regions, now_ms)?;
         let offset = Self::metadata_offset(counter_id)?;
 
-        self.metadata
+        regions
+            .metadata
             .store_i32_relaxed(offset + layout::COUNTER_TYPE_ID_OFFSET, type_id)?;
-        self.metadata.store_i64_relaxed(
+        regions.metadata.store_i64_relaxed(
             offset + layout::COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET,
             layout::COUNTER_NOT_FREE_TO_REUSE,
         )?;
@@ -140,20 +179,23 @@ impl<'a> CounterManager<'a> {
         // request to write zeroes.
         if !key.is_empty() {
             let length = key.len().min(layout::COUNTER_KEY_LENGTH);
-            self.metadata
+            regions
+                .metadata
                 .copy_in(offset + layout::COUNTER_KEY_OFFSET, &key[..length])?;
         }
 
         let length = label.len().min(layout::COUNTER_LABEL_LENGTH_MAX);
-        self.metadata
+        regions
+            .metadata
             .copy_in(offset + layout::COUNTER_LABEL_OFFSET, &label[..length])?;
         #[allow(clippy::cast_possible_truncation)] // bounded by COUNTER_LABEL_LENGTH_MAX
-        self.metadata
+        regions
+            .metadata
             .store_i32_relaxed(offset + layout::COUNTER_LABEL_LENGTH_OFFSET, length as i32)?;
 
         // The publication: every field above is now visible to a reader that
         // acquire-loads this one.
-        self.metadata.store_i32_release(
+        regions.metadata.store_i32_release(
             offset + layout::COUNTER_STATE_OFFSET,
             layout::COUNTER_STATE_ALLOCATED,
         )?;
@@ -171,7 +213,7 @@ impl<'a> CounterManager<'a> {
     /// key for exactly that reason. What is **not** cleared is `type_id`,
     /// `label` and `label_length` (`:250-282` writes none of them): a scanner
     /// that ignores `state` still sees the last tenant's name.
-    pub fn free(&mut self, counter_id: i32, now_ms: i64) -> bool {
+    pub fn free(&mut self, regions: &CounterRegions<'_>, counter_id: i32, now_ms: i64) -> bool {
         if counter_id < 0 || counter_id > self.max_counter_id {
             return false;
         }
@@ -180,14 +222,14 @@ impl<'a> CounterManager<'a> {
         };
 
         // Plain, not acquire, as the reference's check is (`:250`).
-        let state = self
+        let state = regions
             .metadata
             .load_i32_relaxed(offset + layout::COUNTER_STATE_OFFSET);
         if state != Some(layout::COUNTER_STATE_ALLOCATED) {
             return false;
         }
 
-        if self
+        if regions
             .metadata
             .store_i32_release(
                 offset + layout::COUNTER_STATE_OFFSET,
@@ -197,7 +239,7 @@ impl<'a> CounterManager<'a> {
         {
             return false;
         }
-        if self
+        if regions
             .metadata
             .zero(
                 offset + layout::COUNTER_KEY_OFFSET,
@@ -207,7 +249,7 @@ impl<'a> CounterManager<'a> {
         {
             return false;
         }
-        if self
+        if regions
             .metadata
             .store_i64_relaxed(
                 offset + layout::COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET,
@@ -224,74 +266,113 @@ impl<'a> CounterManager<'a> {
 
     /// `registration_id`, which is how a reader finds this counter by owner
     /// (`aeron_counters_manager.c:141-148`).
-    pub fn set_registration_id(&self, counter_id: i32, value: i64) -> Option<()> {
+    pub fn set_registration_id(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        value: i64,
+    ) -> Option<()> {
         let offset = self.value_offset(counter_id)?;
-        self.values
+        regions
+            .values
             .store_i64_release(offset + layout::COUNTER_REGISTRATION_ID_OFFSET, value)
     }
 
     /// `owner_id`; a plain write, as `:150-157`.
-    pub fn set_owner_id(&self, counter_id: i32, value: i64) -> Option<()> {
+    pub fn set_owner_id(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        value: i64,
+    ) -> Option<()> {
         let offset = self.value_offset(counter_id)?;
-        self.values
+        regions
+            .values
             .store_i64_relaxed(offset + layout::COUNTER_OWNER_ID_OFFSET, value)
     }
 
     /// `reference_id`; a plain write, as `:159-166`.
-    pub fn set_reference_id(&self, counter_id: i32, value: i64) -> Option<()> {
+    pub fn set_reference_id(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        value: i64,
+    ) -> Option<()> {
         let offset = self.value_offset(counter_id)?;
-        self.values
+        regions
+            .values
             .store_i64_relaxed(offset + layout::COUNTER_REFERENCE_ID_OFFSET, value)
     }
 
     /// The counter's value, read with an acquire — the same load a driver makes
     /// when it decides whether a client is still alive.
-    pub fn value(&self, counter_id: i32) -> Option<i64> {
+    pub fn value(&self, regions: &CounterRegions<'_>, counter_id: i32) -> Option<i64> {
         let offset = self.value_offset(counter_id)?;
-        self.values
+        regions
+            .values
             .load_i64_acquire(offset + layout::COUNTER_VALUE_OFFSET)
     }
 
     /// Publish a counter's value.
-    pub fn set_value(&self, counter_id: i32, value: i64) -> Option<()> {
+    pub fn set_value(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        value: i64,
+    ) -> Option<()> {
         let offset = self.value_offset(counter_id)?;
-        self.values
+        regions
+            .values
             .store_i64_release(offset + layout::COUNTER_VALUE_OFFSET, value)
     }
 
     /// Replace a label, truncating at the field width
     /// (`aeron_counters_manager.c:168-178`).
-    pub fn update_label(&self, counter_id: i32, label: &[u8]) -> Option<()> {
+    pub fn update_label(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        label: &[u8],
+    ) -> Option<()> {
         let offset = Self::metadata_offset(counter_id)?;
         let length = label.len().min(layout::COUNTER_LABEL_LENGTH_MAX);
 
-        self.metadata
+        regions
+            .metadata
             .copy_in(offset + layout::COUNTER_LABEL_OFFSET, &label[..length])?;
         #[allow(clippy::cast_possible_truncation)] // bounded by COUNTER_LABEL_LENGTH_MAX
-        self.metadata
+        regions
+            .metadata
             .store_i32_release(offset + layout::COUNTER_LABEL_LENGTH_OFFSET, length as i32)
     }
 
     /// Append to a label, truncating silently at the field width
     /// (`aeron_counters_manager.c:180-195`) — how the driver adds its duty
     /// cycle and threshold to the system counter labels.
-    pub fn append_to_label(&self, counter_id: i32, label: &[u8]) -> Option<()> {
+    pub fn append_to_label(
+        &self,
+        regions: &CounterRegions<'_>,
+        counter_id: i32,
+        label: &[u8],
+    ) -> Option<()> {
         let offset = Self::metadata_offset(counter_id)?;
         let current = Self::to_offset(
-            self.metadata
+            regions
+                .metadata
                 .load_i32_acquire(offset + layout::COUNTER_LABEL_LENGTH_OFFSET)?,
         )?;
         let available = layout::COUNTER_LABEL_LENGTH_MAX.saturating_sub(current);
         let length = label.len().min(available);
 
-        self.metadata.copy_in(
+        regions.metadata.copy_in(
             offset + layout::COUNTER_LABEL_OFFSET + current,
             &label[..length],
         )?;
 
         let total = current.checked_add(length)?;
         #[allow(clippy::cast_possible_truncation)] // bounded by COUNTER_LABEL_LENGTH_MAX
-        self.metadata
+        regions
+            .metadata
             .store_i32_release(offset + layout::COUNTER_LABEL_LENGTH_OFFSET, total as i32)
     }
 
@@ -300,17 +381,17 @@ impl<'a> CounterManager<'a> {
     /// Mirrors `aeron_counters_manager.c:207-244`. The free list is scanned
     /// from the front and the **first** cool entry wins — a still-warm entry at
     /// the head does not stop the scan, so this is neither LIFO nor FIFO.
-    fn next_counter_id(&mut self, now_ms: i64) -> Option<i32> {
+    fn next_counter_id(&mut self, regions: &CounterRegions<'_>, now_ms: i64) -> Option<i32> {
         for index in 0..self.free_list.len() {
             let counter_id = self.free_list[index];
             let offset = Self::metadata_offset(counter_id)?;
-            let deadline = self
+            let deadline = regions
                 .metadata
                 .load_i64_acquire(offset + layout::COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET)?;
 
             if now_ms >= deadline {
                 self.free_list.remove(index);
-                self.reset_value(counter_id)?;
+                self.reset_value(regions, counter_id)?;
                 return Some(counter_id);
             }
         }
@@ -324,11 +405,11 @@ impl<'a> CounterManager<'a> {
     }
 
     /// Clear a recycled slot's value record (`aeron_counters_manager.c:228-235`).
-    fn reset_value(&self, counter_id: i32) -> Option<()> {
-        self.set_registration_id(counter_id, layout::COUNTER_REGISTRATION_ID_DEFAULT)?;
-        self.set_owner_id(counter_id, layout::COUNTER_OWNER_ID_DEFAULT)?;
-        self.set_reference_id(counter_id, layout::COUNTER_REFERENCE_ID_DEFAULT)?;
-        self.set_value(counter_id, 0)
+    fn reset_value(&self, regions: &CounterRegions<'_>, counter_id: i32) -> Option<()> {
+        self.set_registration_id(regions, counter_id, layout::COUNTER_REGISTRATION_ID_DEFAULT)?;
+        self.set_owner_id(regions, counter_id, layout::COUNTER_OWNER_ID_DEFAULT)?;
+        self.set_reference_id(regions, counter_id, layout::COUNTER_REFERENCE_ID_DEFAULT)?;
+        self.set_value(regions, counter_id, 0)
     }
 
     /// A counter id as a byte-offset multiplier, refusing negatives.
@@ -349,7 +430,7 @@ impl<'a> CounterManager<'a> {
     }
 }
 
-impl std::fmt::Debug for CounterManager<'_> {
+impl std::fmt::Debug for CounterManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CounterManager")
             .field("max_counter_id", &self.max_counter_id)
@@ -398,41 +479,43 @@ mod tests {
             }
         }
 
-        fn manager(&mut self, free_to_reuse_timeout_ms: i64) -> CounterManager<'_> {
-            CounterManager::new(
-                self.metadata.writable(),
-                self.values.writable(),
-                free_to_reuse_timeout_ms,
-            )
-            .expect("regions are four-to-one")
+        /// An allocator and one call's worth of regions over this fixture.
+        ///
+        /// The borrow is of the fixture, never of the manager — which is the
+        /// whole reason the two are separate types.
+        fn open(&mut self, free_to_reuse_timeout_ms: i64) -> (CounterManager, CounterRegions<'_>) {
+            let values_length = self.values.0.len();
+            let regions = CounterRegions::new(self.metadata.writable(), self.values.writable())
+                .expect("regions are four-to-one");
+            let manager = CounterManager::new(values_length, free_to_reuse_timeout_ms)
+                .expect("at least one counter");
+
+            (manager, regions)
         }
     }
 
-    // Reads go through the manager's own windows: it holds the only writable
-    // borrow of the regions, and the bytes it wrote are the same bytes.
-
-    fn state(manager: &CounterManager<'_>, counter_id: usize) -> i32 {
-        counter_offset(manager, counter_id, layout::COUNTER_STATE_OFFSET)
+    fn state(regions: &CounterRegions<'_>, counter_id: usize) -> i32 {
+        counter_field(regions, counter_id, layout::COUNTER_STATE_OFFSET)
     }
 
-    fn type_id(manager: &CounterManager<'_>, counter_id: usize) -> i32 {
-        counter_offset(manager, counter_id, layout::COUNTER_TYPE_ID_OFFSET)
+    fn type_id(regions: &CounterRegions<'_>, counter_id: usize) -> i32 {
+        counter_field(regions, counter_id, layout::COUNTER_TYPE_ID_OFFSET)
     }
 
-    fn free_deadline(manager: &CounterManager<'_>, counter_id: usize) -> i64 {
+    fn counter_field(regions: &CounterRegions<'_>, counter_id: usize, field: usize) -> i32 {
+        let offset = counter_id * layout::COUNTER_METADATA_LENGTH + field;
+        regions.metadata.load_i32_relaxed(offset).expect("in range")
+    }
+
+    fn free_deadline(regions: &CounterRegions<'_>, counter_id: usize) -> i64 {
         let offset = counter_id * layout::COUNTER_METADATA_LENGTH
             + layout::COUNTER_FREE_FOR_REUSE_DEADLINE_OFFSET;
-        manager.metadata.load_i64_relaxed(offset).expect("in range")
+        regions.metadata.load_i64_relaxed(offset).expect("in range")
     }
 
-    fn counter_offset(manager: &CounterManager<'_>, counter_id: usize, field: usize) -> i32 {
-        let offset = counter_id * layout::COUNTER_METADATA_LENGTH + field;
-        manager.metadata.load_i32_relaxed(offset).expect("in range")
-    }
-
-    fn label_length(manager: &CounterManager<'_>, counter_id: usize) -> usize {
-        usize::try_from(counter_offset(
-            manager,
+    fn label_length(regions: &CounterRegions<'_>, counter_id: usize) -> usize {
+        usize::try_from(counter_field(
+            regions,
             counter_id,
             layout::COUNTER_LABEL_LENGTH_OFFSET,
         ))
@@ -440,28 +523,28 @@ mod tests {
     }
 
     fn bytes_at(
-        manager: &CounterManager<'_>,
+        regions: &CounterRegions<'_>,
         counter_id: usize,
         field: usize,
         len: usize,
     ) -> Vec<u8> {
         let offset = counter_id * layout::COUNTER_METADATA_LENGTH + field;
         let mut out = vec![0u8; len];
-        manager
+        regions
             .metadata
             .copy_out(offset, &mut out)
             .expect("in range");
         out
     }
 
-    fn key(manager: &CounterManager<'_>, counter_id: usize, len: usize) -> Vec<u8> {
-        bytes_at(manager, counter_id, layout::COUNTER_KEY_OFFSET, len)
+    fn key(regions: &CounterRegions<'_>, counter_id: usize, len: usize) -> Vec<u8> {
+        bytes_at(regions, counter_id, layout::COUNTER_KEY_OFFSET, len)
     }
 
-    fn label(manager: &CounterManager<'_>, counter_id: usize) -> String {
-        let length = label_length(manager, counter_id);
+    fn label(regions: &CounterRegions<'_>, counter_id: usize) -> String {
+        let length = label_length(regions, counter_id);
         String::from_utf8(bytes_at(
-            manager,
+            regions,
             counter_id,
             layout::COUNTER_LABEL_OFFSET,
             length,
@@ -469,30 +552,33 @@ mod tests {
         .expect("labels are ascii in these tests")
     }
 
-    fn value_field(manager: &CounterManager<'_>, counter_id: usize, field: usize) -> i64 {
+    fn value_field(regions: &CounterRegions<'_>, counter_id: usize, field: usize) -> i64 {
         let offset = counter_id * layout::COUNTER_VALUE_LENGTH + field;
-        manager.values.load_i64_relaxed(offset).expect("in range")
+        regions.values.load_i64_relaxed(offset).expect("in range")
     }
 
     #[test]
     fn ids_are_handed_out_densely_from_zero() {
         let mut fixture = Fixture::new(3);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
-        assert_eq!(Some(0), manager.allocate(0, &[0, 0, 0, 0], b"first", 1));
-        assert_eq!(Some(1), manager.allocate(0, &[], b"second", 1));
-        assert_eq!(Some(2), manager.allocate(0, &[], b"third", 1));
+        assert_eq!(
+            Some(0),
+            manager.allocate(&regions, 0, &[0, 0, 0, 0], b"first", 1)
+        );
+        assert_eq!(Some(1), manager.allocate(&regions, 0, &[], b"second", 1));
+        assert_eq!(Some(2), manager.allocate(&regions, 0, &[], b"third", 1));
 
         assert_eq!(
             layout::COUNTER_STATE_ALLOCATED,
-            state(&manager, 0),
+            state(&regions, 0),
             "the first record was published"
         );
-        assert_eq!(layout::COUNTER_STATE_ALLOCATED, state(&manager, 1));
+        assert_eq!(layout::COUNTER_STATE_ALLOCATED, state(&regions, 1));
         assert_eq!(2, manager.id_high_water_mark());
         assert_eq!(
             layout::COUNTER_NOT_FREE_TO_REUSE,
-            free_deadline(&manager, 0),
+            free_deadline(&regions, 0),
             "a live counter is never headed for the free list"
         );
     }
@@ -500,162 +586,195 @@ mod tests {
     #[test]
     fn a_full_region_runs_out_of_ids() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
-        assert_eq!(Some(0), manager.allocate(0, &[], b"a", 0));
-        assert_eq!(Some(1), manager.allocate(0, &[], b"b", 0));
-        assert_eq!(None, manager.allocate(0, &[], b"c", 0), "no id 2 exists");
+        assert_eq!(Some(0), manager.allocate(&regions, 0, &[], b"a", 0));
+        assert_eq!(Some(1), manager.allocate(&regions, 0, &[], b"b", 0));
+        assert_eq!(
+            None,
+            manager.allocate(&regions, 0, &[], b"c", 0),
+            "no id 2 exists"
+        );
     }
 
     #[test]
     fn a_key_is_written_only_when_it_has_length() {
         let mut fixture = Fixture::new(2);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
         assert_eq!(
             Some(0),
-            manager.allocate(11, &7i64.to_le_bytes(), b"client-heartbeat: id=7", 0)
+            manager.allocate(
+                &regions,
+                11,
+                &7i64.to_le_bytes(),
+                b"client-heartbeat: id=7",
+                0
+            )
         );
-        assert_eq!(11, type_id(&manager, 0));
-        assert_eq!(vec![7, 0, 0, 0, 0, 0, 0, 0], key(&manager, 0, 8));
-        assert_eq!("client-heartbeat: id=7", label(&manager, 0));
+        assert_eq!(11, type_id(&regions, 0));
+        assert_eq!(vec![7, 0, 0, 0, 0, 0, 0, 0], key(&regions, 0, 8));
+        assert_eq!("client-heartbeat: id=7", label(&regions, 0));
 
         // An empty key leaves the field alone — which on a fresh region means
         // zeroes, but on a recycled slot means the previous tenant's bytes.
-        assert_eq!(Some(1), manager.allocate(0, &[], b"no key", 0));
-        assert_eq!(vec![0u8; 8], key(&manager, 1, 8));
+        assert_eq!(Some(1), manager.allocate(&regions, 0, &[], b"no key", 0));
+        assert_eq!(vec![0u8; 8], key(&regions, 1, 8));
     }
 
     #[test]
     fn a_key_and_label_longer_than_their_fields_are_truncated() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
         let long_key = vec![0xABu8; layout::COUNTER_KEY_LENGTH + 8];
         let long_label = vec![b'L'; layout::COUNTER_LABEL_LENGTH_MAX + 8];
-        assert_eq!(Some(0), manager.allocate(0, &long_key, &long_label, 0));
+        assert_eq!(
+            Some(0),
+            manager.allocate(&regions, 0, &long_key, &long_label, 0)
+        );
 
         assert_eq!(
             vec![0xABu8; layout::COUNTER_KEY_LENGTH],
-            key(&manager, 0, layout::COUNTER_KEY_LENGTH)
+            key(&regions, 0, layout::COUNTER_KEY_LENGTH)
         );
-        assert_eq!(layout::COUNTER_LABEL_LENGTH_MAX, label_length(&manager, 0));
+        assert_eq!(layout::COUNTER_LABEL_LENGTH_MAX, label_length(&regions, 0));
     }
 
     #[test]
     fn allocating_does_not_touch_the_value_record() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
-        assert_eq!(Some(0), manager.allocate(0, &[], b"a", 0));
+        assert_eq!(Some(0), manager.allocate(&regions, 0, &[], b"a", 0));
 
-        assert_eq!(0, value_field(&manager, 0, layout::COUNTER_VALUE_OFFSET));
+        assert_eq!(0, value_field(&regions, 0, layout::COUNTER_VALUE_OFFSET));
         assert_eq!(
             layout::COUNTER_REGISTRATION_ID_DEFAULT,
-            value_field(&manager, 0, layout::COUNTER_REGISTRATION_ID_OFFSET)
+            value_field(&regions, 0, layout::COUNTER_REGISTRATION_ID_OFFSET)
         );
         assert_eq!(
             layout::COUNTER_OWNER_ID_DEFAULT,
-            value_field(&manager, 0, layout::COUNTER_OWNER_ID_OFFSET)
+            value_field(&regions, 0, layout::COUNTER_OWNER_ID_OFFSET)
         );
-        assert_eq!(Some(0), manager.value(0), "and it reads as zero");
+        assert_eq!(Some(0), manager.value(&regions, 0), "and it reads as zero");
     }
 
     #[test]
     fn the_value_record_is_written_by_the_setters() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
-        let id = manager.allocate(11, &[], b"a", 0).expect("an id");
+        let (mut manager, regions) = fixture.open(0);
+        let id = manager.allocate(&regions, 11, &[], b"a", 0).expect("an id");
 
-        manager.set_registration_id(id, 42).expect("in range");
-        manager.set_owner_id(id, -1).expect("in range");
-        manager.set_reference_id(id, 7).expect("in range");
-        manager.set_value(id, 1234).expect("in range");
+        manager
+            .set_registration_id(&regions, id, 42)
+            .expect("in range");
+        manager.set_owner_id(&regions, id, -1).expect("in range");
+        manager.set_reference_id(&regions, id, 7).expect("in range");
+        manager.set_value(&regions, id, 1234).expect("in range");
 
         assert_eq!(
             42,
-            value_field(&manager, 0, layout::COUNTER_REGISTRATION_ID_OFFSET)
+            value_field(&regions, 0, layout::COUNTER_REGISTRATION_ID_OFFSET)
         );
         assert_eq!(
             -1,
-            value_field(&manager, 0, layout::COUNTER_OWNER_ID_OFFSET)
+            value_field(&regions, 0, layout::COUNTER_OWNER_ID_OFFSET)
         );
         assert_eq!(
             7,
-            value_field(&manager, 0, layout::COUNTER_REFERENCE_ID_OFFSET)
+            value_field(&regions, 0, layout::COUNTER_REFERENCE_ID_OFFSET)
         );
-        assert_eq!(Some(1234), manager.value(id));
+        assert_eq!(Some(1234), manager.value(&regions, id));
     }
 
     #[test]
     fn a_reclaimed_counter_stays_out_of_reuse_until_its_deadline() {
         let mut fixture = Fixture::new(2);
-        let mut manager = fixture.manager(1_000);
+        let (mut manager, regions) = fixture.open(1_000);
 
-        let first = manager.allocate(0, &[], b"first", 10).expect("an id");
+        let first = manager
+            .allocate(&regions, 0, &[], b"first", 10)
+            .expect("an id");
         assert_eq!(0, first);
-        assert!(manager.free(first, 10_000));
+        assert!(manager.free(&regions, first, 10_000));
 
         // Still warm: the next allocation is a *new* id, not this one.
-        assert_eq!(Some(1), manager.allocate(0, &[], b"second", 10_500));
-        assert_eq!(layout::COUNTER_STATE_RECLAIMED, state(&manager, 0));
+        assert_eq!(
+            Some(1),
+            manager.allocate(&regions, 0, &[], b"second", 10_500)
+        );
+        assert_eq!(layout::COUNTER_STATE_RECLAIMED, state(&regions, 0));
         assert_eq!(1, manager.free_list_len(), "still waiting");
 
         // Cooled: the id comes back, and its value record was reset on the way.
-        manager.set_value(1, 99).expect("in range");
-        assert!(manager.free(1, 12_000));
+        manager.set_value(&regions, 1, 99).expect("in range");
+        assert!(manager.free(&regions, 1, 12_000));
         assert_eq!(2, manager.free_list_len(), "both ids are waiting now");
-        let reused = manager.allocate(0, &[], b"third", 13_000).expect("an id");
+        let reused = manager
+            .allocate(&regions, 0, &[], b"third", 13_000)
+            .expect("an id");
         assert_eq!(0, reused, "the first cool entry wins, and it is the oldest");
         assert_eq!(
             1,
             manager.free_list_len(),
             "0 left the list, 1 is still on it"
         );
-        assert_eq!(Some(0), manager.value(reused), "reset to zero on reuse");
+        assert_eq!(
+            Some(0),
+            manager.value(&regions, reused),
+            "reset to zero on reuse"
+        );
     }
 
     #[test]
     fn a_warm_entry_at_the_head_does_not_stop_the_scan() {
         let mut fixture = Fixture::new(3);
-        let mut manager = fixture.manager(1_000);
+        let (mut manager, regions) = fixture.open(1_000);
 
         // Free 0 and 1 at different times, so 1 is cool before 0 is.
-        let zero = manager.allocate(0, &[], b"zero", 0).expect("an id");
-        let one = manager.allocate(0, &[], b"one", 0).expect("an id");
-        assert!(manager.free(zero, 10_000));
-        assert!(manager.free(one, 9_000));
+        let zero = manager
+            .allocate(&regions, 0, &[], b"zero", 0)
+            .expect("an id");
+        let one = manager
+            .allocate(&regions, 0, &[], b"one", 0)
+            .expect("an id");
+        assert!(manager.free(&regions, zero, 10_000));
+        assert!(manager.free(&regions, one, 9_000));
 
         // 0 is warm (deadline 11_000), 1 is cool (deadline 10_000): the scan
         // skips the head and takes 1.
-        assert_eq!(Some(1), manager.allocate(0, &[], b"reused", 10_500));
+        assert_eq!(
+            Some(1),
+            manager.allocate(&regions, 0, &[], b"reused", 10_500)
+        );
         assert_eq!(1, manager.free_list_len(), "0 is still on the list");
     }
 
     #[test]
     fn freeing_clears_the_key_but_leaves_the_label_and_type() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
         let id = manager
-            .allocate(11, &[1, 2, 3, 4], b"client-heartbeat: id=1", 0)
+            .allocate(&regions, 11, &[1, 2, 3, 4], b"client-heartbeat: id=1", 0)
             .expect("an id");
 
-        assert!(manager.free(id, 100));
+        assert!(manager.free(&regions, id, 100));
 
-        assert_eq!(layout::COUNTER_STATE_RECLAIMED, state(&manager, 0));
+        assert_eq!(layout::COUNTER_STATE_RECLAIMED, state(&regions, 0));
         assert_eq!(
             vec![0u8; layout::COUNTER_KEY_LENGTH],
-            key(&manager, 0, layout::COUNTER_KEY_LENGTH),
+            key(&regions, 0, layout::COUNTER_KEY_LENGTH),
             "the key is the one field reclamation clears"
         );
-        assert_eq!("client-heartbeat: id=1", label(&manager, 0));
-        assert_eq!(11, type_id(&manager, 0));
-        assert_eq!(100, free_deadline(&manager, 0), "now + the reuse timeout");
+        assert_eq!("client-heartbeat: id=1", label(&regions, 0));
+        assert_eq!(11, type_id(&regions, 0));
+        assert_eq!(100, free_deadline(&regions, 0), "now + the reuse timeout");
 
         // An id cannot be freed twice, nor one that never existed.
-        assert!(!manager.free(id, 100));
-        assert!(!manager.free(9, 100));
-        assert!(!manager.free(-1, 100));
+        assert!(!manager.free(&regions, id, 100));
+        assert!(!manager.free(&regions, 9, 100));
+        assert!(!manager.free(&regions, -1, 100));
     }
 
     #[test]
@@ -665,18 +784,20 @@ mod tests {
         // current length. A reader bounds itself by `label_length`, which is
         // why this is legal — and why it must not be "fixed".
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
         let long = b"a-very-long-label";
-        let id = manager.allocate(0, &[], long, 0).expect("an id");
-        assert!(manager.free(id, 0));
-        let id = manager.allocate(0, &[], b"short", 1).expect("reused");
+        let id = manager.allocate(&regions, 0, &[], long, 0).expect("an id");
+        assert!(manager.free(&regions, id, 0));
+        let id = manager
+            .allocate(&regions, 0, &[], b"short", 1)
+            .expect("reused");
 
-        assert_eq!("short", label(&manager, id as usize));
+        assert_eq!("short", label(&regions, id as usize));
         assert_eq!(
             &long[5..],
             &bytes_at(
-                &manager,
+                &regions,
                 id as usize,
                 layout::COUNTER_LABEL_OFFSET + 5,
                 long.len() - 5
@@ -688,22 +809,22 @@ mod tests {
     #[test]
     fn appending_to_a_label_stops_at_the_field_width() {
         let mut fixture = Fixture::new(2);
-        let mut manager = fixture.manager(0);
+        let (mut manager, regions) = fixture.open(0);
 
         let full = vec![b'x'; layout::COUNTER_LABEL_LENGTH_MAX];
-        let id = manager.allocate(0, &[], &full, 0).expect("an id");
+        let id = manager.allocate(&regions, 0, &[], &full, 0).expect("an id");
         manager
-            .append_to_label(id, b": DEDICATED")
+            .append_to_label(&regions, id, b": DEDICATED")
             .expect("in range");
         assert_eq!(
             layout::COUNTER_LABEL_LENGTH_MAX,
-            label_length(&manager, 0),
+            label_length(&regions, 0),
             "a full label has no room left"
         );
         assert_eq!(
             &full[..],
             &bytes_at(
-                &manager,
+                &regions,
                 0,
                 layout::COUNTER_LABEL_OFFSET,
                 layout::COUNTER_LABEL_LENGTH_MAX
@@ -712,24 +833,28 @@ mod tests {
 
         // With room, the append lands after the current text, not over it.
         let id = manager
-            .allocate(0, &[], b"Conductor max", 0)
+            .allocate(&regions, 0, &[], b"Conductor max", 0)
             .expect("an id");
         manager
-            .append_to_label(id, b": DEDICATED")
+            .append_to_label(&regions, id, b": DEDICATED")
             .expect("in range");
-        assert_eq!("Conductor max: DEDICATED", label(&manager, 1));
+        assert_eq!("Conductor max: DEDICATED", label(&regions, 1));
     }
 
     #[test]
     fn updating_a_label_replaces_it_wholesale() {
         let mut fixture = Fixture::new(1);
-        let mut manager = fixture.manager(0);
-        let id = manager.allocate(0, &[], b"before", 0).expect("an id");
+        let (mut manager, regions) = fixture.open(0);
+        let id = manager
+            .allocate(&regions, 0, &[], b"before", 0)
+            .expect("an id");
 
-        manager.update_label(id, b"after").expect("in range");
+        manager
+            .update_label(&regions, id, b"after")
+            .expect("in range");
 
-        assert_eq!("after", label(&manager, 0));
-        assert_eq!(5, label_length(&manager, 0));
+        assert_eq!("after", label(&regions, 0));
+        assert_eq!(5, label_length(&regions, 0));
     }
 
     #[test]
@@ -738,7 +863,7 @@ mod tests {
         let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH - 512);
 
         assert!(
-            CounterManager::new(metadata.writable(), values.writable(), 0).is_none(),
+            CounterRegions::new(metadata.writable(), values.writable()).is_none(),
             "the reference asserts metadata >= 4 * values (`aeron_counters_manager.h:100-101`)"
         );
     }
@@ -746,11 +871,28 @@ mod tests {
     #[test]
     fn ids_are_bounded_by_the_values_region() {
         let mut fixture = Fixture::new(1);
-        let manager = fixture.manager(0);
+        let (manager, regions) = fixture.open(0);
 
         assert_eq!(1, manager.max_counter_id());
-        assert_eq!(None, manager.set_value(2, 1));
-        assert_eq!(None, manager.set_value(-1, 1));
-        assert_eq!(Some(()), manager.set_value(1, 1), "the last id is in range");
+        assert_eq!(1, regions.max_counter_id(), "the same ceiling, twice");
+        assert_eq!(None, manager.set_value(&regions, 2, 1));
+        assert_eq!(None, manager.set_value(&regions, -1, 1));
+        assert_eq!(
+            Some(()),
+            manager.set_value(&regions, 1, 1),
+            "the last id is in range"
+        );
+    }
+
+    #[test]
+    fn an_empty_values_region_has_no_ids() {
+        assert!(CounterManager::new(0, 0).is_none());
+        assert!(CounterManager::new(layout::COUNTER_VALUE_LENGTH - 1, 0).is_none());
+        assert_eq!(
+            0,
+            CounterManager::new(layout::COUNTER_VALUE_LENGTH, 0)
+                .expect("one counter's worth")
+                .max_counter_id()
+        );
     }
 }

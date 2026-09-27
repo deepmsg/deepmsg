@@ -45,7 +45,7 @@ pub mod ring;
 
 pub use broadcast::{Received, ToClientsReceiver, ToClientsTransmitter, TransmitError};
 pub use command::{MAX_TOKEN_LENGTH, TERMINATE_DRIVER_TYPE_ID, TerminateDriver};
-pub use counter_manager::CounterManager;
+pub use counter_manager::{CounterManager, CounterRegions};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use create::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncIdentity, CncLayout};
 pub use error::{CncError, Region};
