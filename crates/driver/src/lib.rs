@@ -23,6 +23,7 @@ pub mod flowcontrol;
 pub mod idle;
 pub mod loss;
 pub mod media;
+pub mod native_resource_agent;
 pub mod receiver;
 pub mod sender;
 /// The process's signal seam: the one `unsafe` in this crate, and the only

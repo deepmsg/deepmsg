@@ -88,6 +88,16 @@ impl LogFile {
         self.file.len()
     }
 
+    /// Where the file is.
+    ///
+    /// A log buffer's name is part of its contract — it is what the driver
+    /// sends a subscriber in `ON_AVAILABLE_IMAGE` and what the reference derives
+    /// from the publication's registration id — so callers need to read it back
+    /// rather than remember it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The term buffer at `index`, or `None` past the third.
     pub fn term(&self, index: usize) -> Option<AtomicBuffer<'_, ReadWrite>> {
         if index >= descriptor::PARTITION_COUNT {
