@@ -16,6 +16,8 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 use deepmsg_core::version::{self, CncVersionCompatibility};
 
+use crate::ring::ToDriverRingConsumer;
+
 use crate::counter_manager::CounterRegions;
 use crate::counters::CountersReader;
 use crate::create::CncCreateError;
@@ -32,6 +34,20 @@ pub const CNC_FILE_NAME: &str = "cnc.dat";
 /// How long the reference waits between attempts while a driver starts up
 /// (`aeron-client/src/main/c/aeron_cnc.c:79`).
 pub const RETRY_INTERVAL: Duration = Duration::from_millis(16);
+
+/// What one read of the driver's heartbeat says.
+///
+/// Both fields come from the same load, which is the point of the type existing
+/// rather than two methods: a caller that reports the heartbeat and acts on the
+/// verdict must be reporting the heartbeat it judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Liveness {
+    /// The heartbeat, epoch milliseconds — [`layout::NULL_VALUE`] if the driver
+    /// stopped deliberately.
+    pub heartbeat_ms: i64,
+    /// Whether it is inside the driver timeout.
+    pub active: bool,
+}
 
 /// Why a CnC file could not be opened.
 #[derive(Debug)]
@@ -138,10 +154,21 @@ impl CncFile {
     /// [`CncCreateError::VersionNotPublished`] if the store does not read back
     /// as a version this build accepts.
     pub fn publish(&mut self) -> Result<(), CncCreateError> {
+        // The order is the contract: the driver writes its first heartbeat and
+        // *then* the version (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+        // A file published the other way round passes every client's version
+        // gate and then fails its liveness rule, so every client that reads it
+        // concludes the driver is already gone. The gap is closed here rather
+        // than left as a note in a doc comment for the next caller to miss.
+        match self.consumer_heartbeat_ms() {
+            Some(heartbeat) if 0 != heartbeat => {}
+            _ => return Err(CncCreateError::NoHeartbeat),
+        }
+
         let head = self
             .mapping
             .region_mut(0, layout::VERSION_AND_METADATA_LENGTH)
-            .ok_or(CncCreateError::FileLengthTooLarge {
+            .ok_or(CncCreateError::MetadataNotMapped {
                 length: self.mapping.len(),
             })?;
 
@@ -149,13 +176,13 @@ impl CncFile {
             layout::CNC_VERSION_OFFSET,
             deepmsg_core::version::CNC_VERSION,
         )
-        .ok_or(CncCreateError::FileLengthTooLarge {
+        .ok_or(CncCreateError::MetadataNotMapped {
             length: self.mapping.len(),
         })?;
         self.mapping.sync()?;
 
         let read_back = head.load_i32_acquire(layout::CNC_VERSION_OFFSET).ok_or(
-            CncCreateError::FileLengthTooLarge {
+            CncCreateError::MetadataNotMapped {
                 length: self.mapping.len(),
             },
         )?;
@@ -208,6 +235,20 @@ impl CncFile {
 
     fn try_open_with(aeron_dir: &Path, writable: bool) -> Result<Self, CncOpenError> {
         let path = aeron_dir.join(CNC_FILE_NAME);
+
+        // A file that exists and is empty is a driver that has created it and
+        // not written a byte yet — the *earliest* instant of the window every
+        // client waits through. The mapping layer refuses an empty file with
+        // `InvalidData`, which is not retryable, so the earliest state of all
+        // would be the one state a waiting client gives up on. It belongs with
+        // the other too-short files: a driver creates the file and fills it
+        // afterwards.
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if 0 == metadata.len() {
+                return Err(CncOpenError::TooShort { length: 0 });
+            }
+        }
+
         let mapping = if writable {
             MappedFile::open_readwrite(&path)
         } else {
@@ -273,10 +314,30 @@ impl CncFile {
     /// The last retryable error once `timeout` elapses, or the first
     /// non-retryable one immediately.
     pub fn open(aeron_dir: &Path, timeout: Duration) -> Result<Self, CncOpenError> {
+        Self::open_with(aeron_dir, timeout, Self::try_open)
+    }
+
+    /// The same wait, for a file the caller intends to write.
+    ///
+    /// A client needs this rather than [`CncFile::open`]: it takes its client
+    /// id from the command ring and writes its own heartbeat counter, so a
+    /// read-only mapping would do it no good. The wait is the same one, and it
+    /// is the reference's — a client that arrives while a driver is creating
+    /// its file retries until the file, and then the version, are there
+    /// (`aeron_client_connect_to_driver`, `aeronc.c:70-125`).
+    pub fn open_writable(aeron_dir: &Path, timeout: Duration) -> Result<Self, CncOpenError> {
+        Self::open_with(aeron_dir, timeout, Self::try_open_writable)
+    }
+
+    fn open_with(
+        aeron_dir: &Path,
+        timeout: Duration,
+        open: impl Fn(&Path) -> Result<Self, CncOpenError>,
+    ) -> Result<Self, CncOpenError> {
         let deadline = Instant::now() + timeout;
 
         loop {
-            match Self::try_open(aeron_dir) {
+            match open(aeron_dir) {
                 Ok(file) => return Ok(file),
                 Err(error) => {
                     if !error.is_retryable() || Instant::now() >= deadline {
@@ -430,6 +491,20 @@ impl CncFile {
             .region_mut(self.layout.to_driver.start, self.layout.to_driver.len())
     }
 
+    /// Publish the driver's liveness: the field every client reads to decide
+    /// whether a driver is there at all.
+    ///
+    /// The other half of [`CncFile::publish`], which refuses to run without it.
+    /// A driver calls this from its timeout tier; a test calls it once before
+    /// publishing, because a file that claims to be ready while its heartbeat
+    /// says nobody is home is a file no client can use.
+    pub fn write_consumer_heartbeat(&self, now_ms: i64) -> Option<()> {
+        let region = self.to_driver_region()?;
+        let consumer = ToDriverRingConsumer::new(&region.as_read_only())?;
+
+        consumer.write_consumer_heartbeat(&region, now_ms)
+    }
+
     /// The to-driver ring's consumer heartbeat, epoch milliseconds.
     ///
     /// This is the field the reference reads to decide liveness — there is no
@@ -446,19 +521,36 @@ impl CncFile {
             .load_i64_acquire(layout::MPSC_CONSUMER_HEARTBEAT_OFFSET)
     }
 
-    /// Whether the driver looks alive as of `now_ms`.
+    /// The heartbeat and the verdict on it, from **one** read of the field.
     ///
-    /// The reference's rule (`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`)
-    /// is that the heartbeat's age must not exceed the timeout. A heartbeat of
+    /// One read and not two, because both answers come from the same value: a
+    /// caller that reads the heartbeat for a message and then asks
+    /// [`CncFile::driver_is_active`] can print a heartbeat that is not the one
+    /// the answer was made from.
+    ///
+    /// The rule is the reference's
+    /// (`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`): the
+    /// heartbeat's age must not exceed the timeout. A heartbeat of
     /// [`layout::NULL_VALUE`] means the driver stopped deliberately — it wrote
     /// that value on the way out
     /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`) — which is
     /// reported as not active rather than as an impossibly old age.
+    ///
+    /// `None` if the region cannot be read.
+    pub fn driver_liveness(&self, now_ms: i64, driver_timeout_ms: i64) -> Option<Liveness> {
+        let heartbeat_ms = self.consumer_heartbeat_ms()?;
+
+        Some(Liveness {
+            heartbeat_ms,
+            active: layout::NULL_VALUE != heartbeat_ms
+                && now_ms.saturating_sub(heartbeat_ms) <= driver_timeout_ms,
+        })
+    }
+
+    /// Whether the driver looks alive as of `now_ms`.
     pub fn driver_is_active(&self, now_ms: i64, driver_timeout_ms: i64) -> bool {
-        match self.consumer_heartbeat_ms() {
-            None | Some(layout::NULL_VALUE) => false,
-            Some(heartbeat) => now_ms.saturating_sub(heartbeat) <= driver_timeout_ms,
-        }
+        self.driver_liveness(now_ms, driver_timeout_ms)
+            .is_some_and(|liveness| liveness.active)
     }
 }
 
@@ -695,6 +787,38 @@ mod tests {
             error,
             CncOpenError::Incompatible(CncVersionCompatibility::InsufficientMinor)
         ));
+    }
+
+    #[test]
+    fn an_empty_file_is_a_file_that_is_still_being_written() {
+        // The earliest instant of the create window: the file is there and has
+        // no bytes in it. The mapping layer refuses an empty file outright, so
+        // without this classification the *first* state of the window would be
+        // the one state a waiting client treats as permanent.
+        let dir = std::env::temp_dir().join(format!("deepmsg-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(CNC_FILE_NAME), b"").expect("an empty file");
+
+        let error = CncFile::try_open(&dir).expect_err("empty is not readable");
+        assert!(
+            matches!(error, CncOpenError::TooShort { length: 0 }),
+            "classified with the other too-short files: {error}"
+        );
+        assert!(error.is_retryable(), "and it is worth waiting for");
+
+        // And waiting is enough: the driver fills it in a moment later.
+        let cnc = TempCnc::new(deepmsg_core::version::CNC_VERSION);
+        let written =
+            std::fs::read(cnc.path().join(CNC_FILE_NAME)).expect("read the synthetic file");
+        std::fs::write(dir.join(CNC_FILE_NAME), &written).expect("fill it in");
+
+        assert!(
+            CncFile::try_open(&dir).is_ok(),
+            "the same path, one write later"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod conductor;
 pub mod config;
 pub mod dir;
 pub mod flowcontrol;
+pub mod idle;
 pub mod loss;
 pub mod media;
 pub mod receiver;

@@ -274,6 +274,11 @@ pub struct Conductor {
     timeout_check_deadline_ns: i64,
     /// When the previous pass started, for the cycle-time counters.
     last_cycle_ns: i64,
+    /// The command ring's consumer position as of the last pass that saw it
+    /// move, and when that was — the two halves of the stall detector
+    /// (`aeron_driver_conductor.c:3246-3266`).
+    last_command_consumer_position: i64,
+    time_of_last_position_change_ns: i64,
     now_ms: i64,
     running: bool,
     /// Broadcast failures not yet added to system counter 15.
@@ -337,12 +342,23 @@ impl Conductor {
                 .map_err(ConductorError::SystemCounters)?;
         }
 
-        // A producer's view, taken for one call and dropped: the id the driver
-        // burns at startup belongs to the same counter a client takes its
-        // client id from.
-        if let Some(ring) = cnc.to_driver_ring() {
-            let _ = ring.next_correlation_id();
-        }
+        // The id the driver burns at startup belongs to the same counter a
+        // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
+        // which is why the first client sees id 1 rather than 0. The ring was
+        // proved readable twenty lines above, so a `None` here means the file
+        // changed underneath this process — and starting anyway would hand that
+        // first client id 0, a byte-level divergence with no other symptom.
+        let ring = cnc.to_driver_ring().ok_or(ConductorError::NoCommandRing)?;
+        ring.next_correlation_id()
+            .ok_or(ConductorError::NoCommandRing)?;
+
+        // Where the command ring stands now, so that the stall detector starts
+        // from a position rather than from zero: the reference seeds the same
+        // field the same way (`aeron_driver_conductor.c:829`).
+        let last_command_consumer_position = cnc
+            .to_driver_region()
+            .and_then(|region| commands.consume_position(&region))
+            .unwrap_or(0);
 
         let mut conductor = Self {
             cnc,
@@ -354,12 +370,14 @@ impl Conductor {
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
             clock,
-            clock_update_deadline_ns: now_ns + CLOCK_UPDATE_INTERVAL_NS,
+            clock_update_deadline_ns: now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS),
             // Seeded to now, so the first pass runs the timeout tier: the
             // reference does the same (`aeron_driver_conductor.c:824`), and it
             // means the heartbeat is set before anything can read the version.
             timeout_check_deadline_ns: now_ns,
             last_cycle_ns: now_ns,
+            last_command_consumer_position,
+            time_of_last_position_change_ns: now_ns,
             now_ms,
             running: true,
             pending_broadcast_failures: 0,
@@ -387,14 +405,15 @@ impl Conductor {
 
         if now_ns > self.clock_update_deadline_ns {
             self.now_ms = self.clock.update(now_ns);
-            self.clock_update_deadline_ns = now_ns + CLOCK_UPDATE_INTERVAL_NS;
+            self.clock_update_deadline_ns = now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS);
         }
 
         if now_ns > self.timeout_check_deadline_ns {
             self.write_heartbeat();
-            self.timeout_check_deadline_ns = now_ns + self.timer_interval_ns;
             work_count += 1;
             work_count += self.check_clients();
+            work_count += usize::from(self.check_for_blocked_commands(now_ns));
+            self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
 
         let work = work_count + self.process_commands();
@@ -635,6 +654,62 @@ impl Conductor {
                 }
             }
         })
+    }
+
+    /// Break a stall in the command ring, and count it when it breaks one.
+    ///
+    /// A producer that dies between claiming a record and committing it leaves
+    /// a record that can never be read, and the consumer that stops at it never
+    /// publishes a new head position — so the ring never moves again and the
+    /// driver goes deaf while its heartbeat keeps telling every client it is
+    /// fine. That is the whole failure mode, and time is the only thing that
+    /// distinguishes it from a command being written right now.
+    ///
+    /// The reference asks the question on its timeout tier
+    /// (`aeron_driver_conductor_on_check_for_blocked_driver_commands`,
+    /// `:3246-3266`): if the consumer position has not moved while the
+    /// producer's is ahead of it, and that has been true for a whole client
+    /// liveness window, try to break it and count the break in system counter
+    /// 20.
+    fn check_for_blocked_commands(&mut self, now_ns: i64) -> bool {
+        let Some(region) = self.cnc.to_driver_region() else {
+            return false;
+        };
+        let (Some(consumer_position), Some(producer_position)) = (
+            self.commands.consume_position(&region),
+            self.commands.producer_position(&region),
+        ) else {
+            return false;
+        };
+
+        if consumer_position != self.last_command_consumer_position
+            || producer_position <= consumer_position
+        {
+            self.time_of_last_position_change_ns = now_ns;
+            self.last_command_consumer_position = consumer_position;
+            return false;
+        }
+
+        let stalled_since_ns = self
+            .time_of_last_position_change_ns
+            .saturating_add(self.liveness_timeout_ns);
+        if now_ns <= stalled_since_ns {
+            return false;
+        }
+
+        if !self.commands.unblock(&region) {
+            return false;
+        }
+
+        if let Some(regions) = self.cnc.counter_regions() {
+            system_counters::increment(
+                &self.counters,
+                &regions,
+                system_counters::id::UNBLOCKED_COMMANDS,
+            );
+        }
+
+        true
     }
 
     /// The client pool's turn: reap whoever has gone quiet, announcing each
@@ -1384,6 +1459,75 @@ mod tests {
         assert_eq!(1, conductor.malformed_commands());
         assert_eq!(0, conductor.clients().len(), "no client was registered");
         assert_eq!(45, conductor.counters().id_high_water_mark());
+    }
+
+    #[test]
+    fn a_ring_stalled_by_a_dead_producer_is_unblocked() {
+        // What a client killed between claiming a command and committing it
+        // leaves: a record whose length is the negative in-flight marker and a
+        // tail already past it. Nothing can read it, so nothing can move the
+        // consumer position, so the driver never sees another command — while
+        // its heartbeat keeps telling every client it is alive.
+        // A ten-second liveness window, because the window is what the test is
+        // about: a stall is only a stall once it has outlasted it.
+        let (temp, mut conductor) = running_with(10_000_000_000, 1_000_000);
+
+        let claim_length = 24i64;
+        let stalled = CncFile::try_open_writable(&temp.0).expect("the file is published");
+        {
+            let region = stalled.to_driver_region().expect("writable");
+            region
+                .store_i32_release(layout::RECORD_LENGTH_OFFSET, -(claim_length as i32))
+                .expect("in range");
+            region
+                .store_i32_relaxed(layout::RECORD_MSG_TYPE_ID_OFFSET, 0x09)
+                .expect("in range");
+
+            let trailer = region.len() - layout::MPSC_RB_TRAILER_LENGTH;
+            region
+                .store_i64_release(trailer + layout::MPSC_TAIL_POSITION_OFFSET, claim_length)
+                .expect("in range");
+        }
+
+        // A command the driver cannot read is not work, and the tier does
+        // nothing until the stall has lasted a whole liveness window.
+        conductor.timeout_check_deadline_ns = 0;
+        conductor.do_work();
+        assert_eq!(
+            Some(0),
+            conductor
+                .cnc
+                .to_driver_region()
+                .and_then(|region| conductor.commands.consume_position(&region)),
+            "the read stalls where it was"
+        );
+
+        // Age the stall past the window and run the tier again.
+        conductor.time_of_last_position_change_ns -= 10_000_000_001;
+
+        conductor.timeout_check_deadline_ns = 0;
+        conductor.do_work();
+
+        assert_eq!(
+            Some(claim_length),
+            conductor
+                .cnc
+                .to_driver_region()
+                .and_then(|region| conductor.commands.consume_position(&region)),
+            "the dead claim is stepped over and the ring moves again"
+        );
+        assert_eq!(
+            Some(1),
+            conductor.cnc.counter_regions().and_then(|regions| conductor
+                .counters()
+                .value(&regions, system_counters::id::UNBLOCKED_COMMANDS)),
+            "and system counter 20 counts it"
+        );
+
+        // A live client's command still arrives normally afterwards.
+        send(&conductor, 0x7F, b"after");
+        conductor.do_work();
+        assert_eq!(1, conductor.unknown_commands());
     }
 
     #[test]

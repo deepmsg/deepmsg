@@ -14,9 +14,11 @@
 //! AERON_DIR=/tmp/aeron
 //! ```
 //!
-//! A `-D` argument beats the environment, and a deepmsg name beats the
-//! reference's, which is the precedence a one-off override wants: the more
-//! specific spelling wins. Unknown properties are ignored rather than
+//! Within one dialect a `-D` argument beats the environment, and across the two
+//! the **whole deepmsg chain beats the whole reference chain** — so
+//! `DEEPMSG_DIR` beats `-Daeron.dir`. That is the precedence the lookup table
+//! implements and the one a one-off override wants: the deployment sets the
+//! reference's names, and a deepmsg name is how somebody overrides them. Unknown properties are ignored rather than
 //! rejected, because a reference deployment's configuration file will carry
 //! settings this driver has no use for yet, and refusing to start over one of
 //! them would make the alias worse than useless.
@@ -50,6 +52,14 @@ pub const TIMER_INTERVAL_NS_DEFAULT: i64 = 1_000_000_000;
 /// directory as abandoned: `AERON_DRIVER_TIMEOUT_MS_DEFAULT (10 * 1000)`
 /// (`aeron-driver/src/main/c/aeron_driver_context.c:217`).
 pub const DRIVER_TIMEOUT_MS_DEFAULT: i64 = 10 * 1000;
+
+/// The largest tier period this driver accepts: one hour.
+///
+/// Not the reference's limit — it has none — but ours, and for a reason the
+/// reference gets away with because it clamps everywhere and this does not: a
+/// deadline is `now + period`, and a period near `i64::MAX` makes that sum
+/// wrap. One hour is a cadence no deployment asks for deliberately.
+pub const MAX_TIMER_INTERVAL_NS: i64 = 60 * 60 * 1_000_000_000;
 
 /// How long a reclaimed counter stays out of reuse: one second, the reference's
 /// `AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_NS_DEFAULT`
@@ -240,7 +250,13 @@ impl DriverConfig {
         // a bad value is reported before the directory is touched.
         config.layout.validate().map_err(ConfigError::Layout)?;
 
-        if config.timer_interval_ns <= 0 {
+        // A tier period is a cadence, and everything above an hour is a typo
+        // rather than a configuration. It also keeps every deadline this
+        // driver computes provably inside an `i64`: the reference parses its
+        // own interval up to `INT64_MAX` and then adds it to a nanosecond
+        // clock, which is where a value like 8e18 turns into a wrapped
+        // deadline and a driver that busy-spins a core while looking healthy.
+        if config.timer_interval_ns <= 0 || config.timer_interval_ns > MAX_TIMER_INTERVAL_NS {
             return Err(ConfigError::OutOfRange {
                 name: Setting::TIMER_INTERVAL.property,
                 value: config.timer_interval_ns.to_string(),
@@ -251,6 +267,20 @@ impl DriverConfig {
             return Err(ConfigError::OutOfRange {
                 name: Setting::DRIVER_TIMEOUT.property,
                 value: config.driver_timeout_ms.to_string(),
+            });
+        }
+
+        // The liveness window is written into the CnC metadata and every
+        // compatible client derives its keepalive contract from it, so a value
+        // that is zero, negative, or no longer than the tier that checks it is
+        // a promise the driver cannot keep. The reference refuses both
+        // (`aeron_driver_context.c:1526-1533`).
+        if config.client_liveness_timeout_ns <= 0
+            || config.client_liveness_timeout_ns <= config.timer_interval_ns
+        {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::CLIENT_LIVENESS_TIMEOUT.property,
+                value: config.client_liveness_timeout_ns.to_string(),
             });
         }
 
@@ -490,6 +520,13 @@ fn lookup(
         .or_else(|| env(&our_env))
         .or_else(|| property(properties, &theirs))
         .or_else(|| env(setting.env))
+        // An empty value is an unset value, which is how the reference reads
+        // its own properties (`aeron_properties_util.c:151-179`). Without
+        // this, `-Ddeepmsg.dir=` would pass the mandatory-directory check as
+        // the empty path: the driver would skip the directory discipline
+        // entirely and write `cnc.dat`, `publications/` and `images/` into
+        // whatever directory it was started from.
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn property(properties: &[(String, String)], name: &str) -> Option<String> {
@@ -626,6 +663,81 @@ mod tests {
         assert!(!config.dirs_delete_on_shutdown);
         assert!(!config.warn_if_dirs_exist);
         assert!(config.aeron_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn an_empty_value_is_an_unset_value() {
+        // The reference reads an empty `-D` value as "not set"
+        // (`aeron_properties_util.c:151-179`). Here that has to mean the
+        // mandatory-directory check fails, because the empty path would skip
+        // the directory discipline and write the CnC file into the working
+        // directory instead.
+        for empty in ["", "   ", "\t"] {
+            assert!(
+                matches!(
+                    resolve(&[("deepmsg.dir", empty)]),
+                    Err(ConfigError::MissingAeronDir { .. })
+                ),
+                "{empty:?} must not be a directory"
+            );
+        }
+
+        assert!(
+            matches!(
+                resolve_with_env(&[("aeron.dir", "/tmp/aeron")], &[("DEEPMSG_DIR", "")]),
+                Err(ConfigError::MissingAeronDir { .. })
+            ),
+            "our empty environment value must not shadow the reference's flag"
+        );
+
+        // And an empty value for any other setting is "unset", not a parse
+        // error: a deployment's configuration file may carry a blank line for
+        // something it does not configure.
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("deepmsg.timer.interval", ""),
+        ])
+        .expect("resolve");
+        assert_eq!(1_000_000_000, config.timer_interval_ns, "the default");
+    }
+
+    #[test]
+    fn the_liveness_window_must_outlast_the_tier_that_checks_it() {
+        // Zero or negative first: the metadata field is a contract with every
+        // client, and zero is a promise of immediate reaping.
+        for bad in ["0", "-1ns"] {
+            assert!(
+                matches!(
+                    resolve(&[
+                        ("deepmsg.dir", "/tmp/deepmsg"),
+                        ("deepmsg.client.liveness.timeout", bad),
+                    ]),
+                    Err(ConfigError::OutOfRange { .. })
+                ),
+                "{bad} must be refused"
+            );
+        }
+
+        // And a window the timeout tier cannot honour: the reference refuses
+        // `client_liveness_timeout_ns <= timer_interval_ns`
+        // (`aeron_driver_context.c:1526-1533`).
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.timer.interval", "1s"),
+                ("deepmsg.client.liveness.timeout", "1s"),
+            ]),
+            Err(ConfigError::OutOfRange { .. })
+        ));
+        assert!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.timer.interval", "1s"),
+                ("deepmsg.client.liveness.timeout", "1001ms"),
+            ])
+            .is_ok(),
+            "one millisecond more is enough"
+        );
     }
 
     #[test]

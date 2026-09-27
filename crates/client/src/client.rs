@@ -53,10 +53,23 @@ use crate::subscription::Subscription;
 /// core.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The wait between the first polls of [`Client::wait`], doubling up to
+/// [`POLL_INTERVAL`]: short enough that a fast reply is not paid for with a
+/// frame of latency, and the same 16 ms ceiling as before for one that is slow.
+const MIN_POLL_INTERVAL: Duration = Duration::from_micros(50);
+
 /// Default deadline for a command's reply, matching
 /// `AERON_CONTEXT_DRIVER_TIMEOUT_MS_DEFAULT`
 /// (`aeron-client/src/main/c/aeron_context.c:35`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`Client::connect`] waits for a driver that is starting.
+///
+/// The same ten seconds as [`DEFAULT_TIMEOUT`], and the same constant in the
+/// reference: the client's `driver_timeout_ms` is what bounds its wait for the
+/// file, the version and the heartbeat at connect
+/// (`aeron-client/src/main/c/aeron_context.c:35`, used at `aeronc.c:74`).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default fragment budget for one poll, matching
 /// `AERON_IMAGE_FRAGMENT_LIMIT_DEFAULT`.
@@ -202,7 +215,31 @@ impl Client {
     /// [`ConnectError`] if the CnC file cannot be opened read-write or either
     /// ring is unusable.
     pub fn connect(aeron_dir: &Path) -> Result<Self, ConnectError> {
-        let cnc = CncFile::try_open_writable(aeron_dir).map_err(ConnectError::Cnc)?;
+        Self::connect_with_timeout(aeron_dir, CONNECT_TIMEOUT)
+    }
+
+    /// Connect, waiting at most `timeout` for a driver that is starting.
+    ///
+    /// The window is a setting in the reference — `driver_timeout_ms`,
+    /// `AERON_DRIVER_TIMEOUT`, ten seconds by default — and this is the same
+    /// knob.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::connect`], including the timeout expiring.
+    pub fn connect_with_timeout(aeron_dir: &Path, timeout: Duration) -> Result<Self, ConnectError> {
+        // A client that arrives while the driver is starting has to wait for
+        // it, not fail: the CnC file is created first and published a moment
+        // later, and for a 46 MB file that moment is not small. The reference
+        // waits out exactly this window, in four steps — file, mapping,
+        // version, heartbeat — for up to `driver_timeout_ms`
+        // (`aeron_client_connect_to_driver`, `aeronc.c:70-125`).
+        //
+        // What this does *not* wait for is a heartbeat: a driver that published
+        // a version and then stopped is one this client connects to and then
+        // notices, which is P0's behaviour and the client conductor's job
+        // (`crates/client/src/conductor.rs`), not the connect path's.
+        let cnc = CncFile::open_writable(aeron_dir, timeout).map_err(ConnectError::Cnc)?;
 
         // The client id comes from the ring's shared counter, exactly as the
         // reference's does. Two consecutive values are not needed here — that
@@ -580,6 +617,13 @@ impl Client {
     /// (`aeron_test_base.h:116-131`) and what the C++ wrapper's blocking
     /// `addSubscription` is.
     fn wait(&mut self, correlation_id: i64) -> Result<Ready, CommandError> {
+        // The first wait is short and doubles to [`POLL_INTERVAL`]. A driver
+        // answers in well under a millisecond — its command tier runs every
+        // pass — so a fixed frame-length sleep after every poll made each
+        // command cost the caller a frame of its latency budget. A reply that
+        // is genuinely late still backs off to the same cadence as before.
+        let mut wait = MIN_POLL_INTERVAL;
+
         loop {
             self.poll();
 
@@ -603,7 +647,8 @@ impl Client {
                 return Err(CommandError::TimedOut { correlation_id });
             }
 
-            std::thread::sleep(POLL_INTERVAL);
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(POLL_INTERVAL);
         }
     }
 

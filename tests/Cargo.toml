@@ -50,6 +50,18 @@ path = "integration/cnc_terminate.rs"
 name = "client_round_trip"
 path = "integration/client_round_trip.rs"
 
+# The wait a client owes a driver that is still creating its file — the window
+# that made a client started alongside a driver fail deterministically.
+[[test]]
+name = "connect_window"
+path = "integration/connect_window.rs"
+
+# What the directory discipline does with a CnC file whose version this build
+# may not read: refuse it, never delete it.
+[[test]]
+name = "dir_liveness"
+path = "integration/dir_liveness.rs"
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"

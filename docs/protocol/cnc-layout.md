@@ -110,7 +110,10 @@ with a release (`aeron-driver.c:972`), then the whole file is flushed (`:973`).
 deepmsg splits that into `CncFile::create` and `CncFile::publish`, because
 there is work that belongs between them: the driver writes its first heartbeat
 one line before the version (`:971`), and a client that passes the version
-gate must not then find a heartbeat of zero.
+gate must not then find a heartbeat of zero. `publish` **enforces** that order
+rather than documenting it: a file whose to-driver heartbeat is still zero is
+refused, because the alternative is a file that every client reads as a driver
+that has already gone.
 
 Two rules bind a writer that a reader never has to know, because they are
 about the *ring* rather than the region. The to-driver capacity — the region

@@ -240,7 +240,7 @@ impl CncLayout {
         ] {
             let capacity = length.saturating_sub(trailer);
 
-            if !capacity.is_power_of_two() || capacity < minimum || capacity >= i32::MAX as usize {
+            if !layout::ring_capacity_is_valid(capacity, minimum) {
                 return Err(CncCreateError::RingCapacityInvalid {
                     region,
                     length,
@@ -252,7 +252,36 @@ impl CncLayout {
         // Every length is at most INT32_MAX and there are five of them, so this
         // cannot overflow a usize on any platform this runs on; the check is
         // for the *metadata field*, which is an int32.
-        self.file_length()?;
+        let file_length = self.file_length()?;
+
+        // The reader's own layout rule, applied to the lengths this build is
+        // about to write. Without it a value like `counters.values.buffer.length
+        // = 1048579` passes every range check above and then fails *after* the
+        // 46 MB file has been written and mapped, as "the CnC file could not be
+        // read" about a file this process just wrote. `RegionLayout::compute`
+        // is the authority for the rule (`metadata.rs:214-227`); calling it here
+        // rather than restating it is what keeps the two from drifting.
+        let intended = CncMetadata {
+            cnc_version: deepmsg_core::version::CNC_VERSION,
+            to_driver_buffer_length: as_i32(self.to_driver_length),
+            to_clients_buffer_length: as_i32(self.to_clients_length),
+            counter_metadata_buffer_length: as_i32(self.counters_metadata_length()),
+            counter_values_buffer_length: as_i32(self.counters_values_length),
+            error_log_buffer_length: as_i32(self.error_log_length),
+            client_liveness_timeout_ns: 0,
+            start_timestamp_ms: 0,
+            pid: 0,
+            file_page_size: as_i32(self.page_size),
+        };
+
+        RegionLayout::compute(&intended, file_length).map_err(|error| match error {
+            CncError::RegionUnaligned { region, offset } => CncCreateError::BaseUnaligned {
+                name: length_setting_before(region),
+                region,
+                offset,
+            },
+            other => CncCreateError::NotReadable(other),
+        })?;
 
         Ok(())
     }
@@ -273,6 +302,23 @@ pub struct CncIdentity {
     pub pid: i64,
 }
 
+/// The setting whose length decides where a region's base lands.
+///
+/// See [`CncCreateError::BaseUnaligned`]: each base is the sum of what is in
+/// front of it, so the setting to look at is the length of the region directly
+/// before — except for the counters metadata, whose length is four times the
+/// values length and so is decided by the values setting.
+const fn length_setting_before(region: Region) -> &'static str {
+    match region {
+        // Bases of 0 and 128 are always aligned; these arms are here because
+        // the match has to be total.
+        Region::Metadata | Region::ToDriver => "to.conductor.buffer.length",
+        Region::ToClients => "to.conductor.buffer.length",
+        Region::CountersMetadata => "to.clients.buffer.length",
+        Region::CountersValues | Region::ErrorLog => "counters.values.buffer.length",
+    }
+}
+
 /// Why a CnC file could not be created.
 #[derive(Debug)]
 pub enum CncCreateError {
@@ -286,6 +332,21 @@ pub enum CncCreateError {
         min: usize,
         /// The largest accepted value.
         max: usize,
+    },
+    /// A region's base does not land on the 8-byte grid a reader requires, so
+    /// the file this build would write is one it could not read back
+    /// (`RegionLayout::compute`, `metadata.rs:214-227`).
+    ///
+    /// `name` is the setting whose length decides where that base lands: a base
+    /// is the sum of everything before it, and the last term is the length of
+    /// the region in front of it.
+    BaseUnaligned {
+        /// The setting to look at, by the name a caller set it by.
+        name: &'static str,
+        /// The region whose base is off the grid.
+        region: Region,
+        /// Where the base landed.
+        offset: usize,
     },
     /// The page size is not a power of two, so the total cannot be aligned to
     /// it (`aeron-driver/src/main/c/aeron_driver.c:475-482`).
@@ -316,6 +377,21 @@ pub enum CncCreateError {
     /// read, which the round-trip inside [`CncFile::create`] exists to make
     /// impossible to ship.
     NotReadable(CncError),
+    /// The version was about to be published before the driver had written a
+    /// heartbeat, which would produce a file every client reads as a dead
+    /// driver (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+    NoHeartbeat,
+    /// The metadata block is not inside the mapping.
+    ///
+    /// Every constructor of this type produces a file longer than its own
+    /// metadata region, so this is not a caller error — but the mapping is
+    /// shared, and something else truncating the file between the two is not
+    /// impossible. It used to be reported as [`CncCreateError::FileLengthTooLarge`],
+    /// which sent whoever read the message looking at a setting.
+    MetadataNotMapped {
+        /// The mapping's length as it was when the write was attempted.
+        length: usize,
+    },
     /// The version read back is not one this build accepts.
     ///
     /// The publish store is the last thing `create` does, so reaching this
@@ -347,6 +423,24 @@ impl std::fmt::Display for CncCreateError {
                 f,
                 "{region} region is {length} bytes, a capacity of {capacity} that is not one the ring can use"
             ),
+            Self::MetadataNotMapped { length } => write!(
+                f,
+                "the mapping is {length} bytes and does not contain the metadata block it \
+                 should have been created with"
+            ),
+            Self::NoHeartbeat => f.write_str(
+                "the version cannot be published before the driver's first heartbeat: \
+                 every client would read the file as a dead driver",
+            ),
+            Self::BaseUnaligned {
+                name,
+                region,
+                offset,
+            } => write!(
+                f,
+                "{name} puts the {region:?} region at {offset}, which is not on the 8-byte grid \
+                 a reader requires"
+            ),
             Self::FileLengthTooLarge { length } => {
                 write!(f, "CnC file length {length} does not fit in an int32")
             }
@@ -370,6 +464,9 @@ impl std::error::Error for CncCreateError {
             Self::LengthOutOfRange { .. }
             | Self::InvalidPageSize { .. }
             | Self::RingCapacityInvalid { .. }
+            | Self::BaseUnaligned { .. }
+            | Self::NoHeartbeat
+            | Self::MetadataNotMapped { .. }
             | Self::FileLengthTooLarge { .. }
             | Self::VersionNotPublished { .. } => None,
         }
@@ -436,7 +533,7 @@ impl CncFile {
 
         let head = mapping
             .region_mut(0, layout::VERSION_AND_METADATA_LENGTH)
-            .ok_or(CncCreateError::FileLengthTooLarge {
+            .ok_or(CncCreateError::MetadataNotMapped {
                 length: file_length,
             })?;
 
@@ -444,7 +541,7 @@ impl CncFile {
         // zero until `publish`, which is what keeps this block unreadable
         // while it is still being filled (`aeron_driver.c:250-269`).
         head.copy_in(0, &block)
-            .ok_or(CncCreateError::FileLengthTooLarge {
+            .ok_or(CncCreateError::MetadataNotMapped {
                 length: file_length,
             })?;
 
@@ -458,7 +555,7 @@ impl CncFile {
         mapping
             .region(0, layout::VERSION_AND_METADATA_LENGTH)
             .and_then(|head| head.copy_out(0, &mut reread))
-            .ok_or(CncCreateError::FileLengthTooLarge {
+            .ok_or(CncCreateError::MetadataNotMapped {
                 length: file_length,
             })?;
 
@@ -518,10 +615,14 @@ mod tests {
     fn identity() -> CncIdentity {
         CncIdentity {
             liveness_timeout_ns: CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT,
-            start_timestamp_ms: 1_700_000_000_000,
+            start_timestamp_ms: TIMESTAMP_MS,
             pid: 4242,
         }
     }
+
+    /// The clock these tests pretend it is, one constant so that a heartbeat
+    /// and a start timestamp cannot drift apart.
+    const TIMESTAMP_MS: i64 = 1_700_000_000_000;
 
     #[test]
     fn the_defaults_produce_the_length_a_reference_driver_writes() {
@@ -536,6 +637,46 @@ mod tests {
         assert_eq!(8_388_608, layout.counters_values_length);
         assert_eq!(4_194_304, layout.error_log_length);
         assert_eq!(48_235_520, layout.unaligned_length());
+    }
+
+    #[test]
+    fn a_length_that_puts_a_region_off_the_grid_is_refused_before_the_directory() {
+        // Three bytes past the minimum: every range check passes, and the
+        // counters metadata region four times that length puts the counters
+        // *values* base four bytes off the grid. Without this check the driver
+        // writes 46 MB and then fails to read its own file back, minutes after
+        // the setting was parsed.
+        let layout = CncLayout {
+            counters_values_length: COUNTERS_VALUES_BUFFER_LENGTH_MIN + 3,
+            ..CncLayout::default()
+        };
+
+        let error = layout
+            .validate()
+            .expect_err("an odd counters length moves every base after it");
+
+        match error {
+            CncCreateError::BaseUnaligned { name, region, .. } => {
+                assert_eq!("counters.values.buffer.length", name);
+                assert_eq!(Region::CountersValues, region);
+            }
+            other => panic!("expected the setting to be named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_length_that_puts_the_to_clients_region_off_the_grid_is_refused() {
+        // The other end of the same rule: the to-clients base is 128 plus the
+        // to-driver length, so a to-driver length off the grid moves it. The
+        // ring check refuses this length first (a capacity that is not a power
+        // of two), which is why the message names *that* rule — the point of
+        // the test is that the refusal happens at all, and at validation.
+        let layout = CncLayout {
+            to_driver_length: CncLayout::default().to_driver_length + 4,
+            ..CncLayout::default()
+        };
+
+        assert!(layout.validate().is_err(), "refused, and before any file");
     }
 
     #[test]
@@ -733,6 +874,12 @@ mod tests {
             Err(CncOpenError::NotReady)
         ));
 
+        // The driver's first heartbeat, one line before it publishes — the
+        // order `publish` now insists on.
+        created
+            .write_consumer_heartbeat(TIMESTAMP_MS)
+            .expect("the ring is writable");
+
         created.publish().expect("publish");
 
         assert_eq!(deepmsg_core::version::CNC_VERSION, created.cnc_version());
@@ -790,10 +937,11 @@ mod tests {
     #[test]
     fn a_second_driver_cannot_create_over_the_first() {
         let dir = TempDir::new();
-        CncFile::create(&dir.0, &small(), &identity())
-            .expect("first")
-            .publish()
-            .expect("publish");
+        let mut first = CncFile::create(&dir.0, &small(), &identity()).expect("first");
+        first
+            .write_consumer_heartbeat(TIMESTAMP_MS)
+            .expect("the ring is writable");
+        first.publish().expect("publish");
 
         let error = CncFile::create(&dir.0, &small(), &identity()).expect_err("must not clobber");
 
@@ -808,6 +956,9 @@ mod tests {
     fn publishing_twice_is_just_the_same_store_twice() {
         let dir = TempDir::new();
         let mut created = CncFile::create(&dir.0, &small(), &identity()).expect("create");
+        created
+            .write_consumer_heartbeat(TIMESTAMP_MS)
+            .expect("the ring is writable");
 
         created.publish().expect("first");
         created.publish().expect("second");

@@ -180,6 +180,23 @@ const _: () = assert!(BROADCAST_LATEST_COUNTER_OFFSET + 8 <= BROADCAST_TRAILER_L
 /// "alignment 8" about the struct would contradict the header.
 pub const RECORD_HEADER_LENGTH: usize = 8;
 
+/// Whether a capacity can be a ring's index space.
+///
+/// One rule, in one place, because three callers need it and a divergence
+/// between them is a file that a writer accepts and a reader refuses: the
+/// capacity of an **MPSC ring** must be a power of two, at least
+/// [`MPSC_MIN_CAPACITY`], and below `INT32_MAX`
+/// (`aeron-client/src/main/c/concurrent/aeron_rb.h:79-82`); the capacity of a
+/// **broadcast ring** must be a power of two and non-zero, which is this with
+/// `minimum` of 1 (`concurrent/aeron_broadcast_descriptor.h:43`).
+///
+/// The upper bound is not decoration: the record indices are masked from a
+/// `uint32_t` counter, so a capacity that needs more than 31 bits cannot be
+/// masked correctly.
+pub const fn ring_capacity_is_valid(capacity: usize, minimum: usize) -> bool {
+    capacity.is_power_of_two() && capacity >= minimum && capacity < i32::MAX as usize
+}
+
 /// `msg_type_id` value marking a padding record written to fill a ring wrap.
 pub const PADDING_MSG_TYPE_ID: i32 = -1;
 

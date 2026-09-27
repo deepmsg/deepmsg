@@ -64,6 +64,37 @@ compares each label up to its first colon, and
 `crates/driver/tests/system_counters.rs` asserts the masked halves separately
 so that being *absent* cannot pass for being right.
 
+## Driver liveness and the directory
+
+Two drivers cannot share an aeron directory, and the question "is somebody else
+living here?" is the to-driver ring's consumer heartbeat — there is no lock file
+anywhere (`aeron-driver/src/main/c/aeron_driver.c:136-235`). Two rules around it
+are worth recording, because deepmsg answers them the way the *contract* does
+rather than the way the reference's code happens to:
+
+- **A file whose version is still zero is not a dead driver.** The reference
+  waits for the version to appear before it judges anything, up to
+  `aeron.driver.timeout` (`aeron_is_driver_active_with_cnc`, `aeron_driver_context.c:1603-1612`),
+  because a driver creating a 46 MB file looks exactly like a dead one. So does
+  deepmsg. Past the window, a file that never got a version is taken over. The
+  *wait* is measured with a monotonic clock rather than the reference's epoch
+  clock: a duration measured against a clock a VM can step is a different
+  duration after the step, and the failure mode of the short side is a live
+  driver's directory.
+- **A file this build may not *read* is not a file nobody owns.** The reference
+  judges liveness by major version alone; deepmsg also applies the Java client's
+  minor rule when reading a file. Where the two meet — a same-major, older-minor
+  file — deepmsg refuses the directory (`BusyIncompatible`) instead of deleting
+  it. The reference would find a fresh heartbeat there and refuse it too; the
+  difference is only in which test it took to get there, and the cost of the
+  wrong answer is a live driver's directory.
+
+A CnC file is also *published* differently: `CncFile::publish` refuses to store
+the version until the to-driver ring has a heartbeat, because the reference
+writes the heartbeat first for a reason — a file that passes a client's version
+gate and then fails its liveness rule is a file every client reads as a driver
+that is already gone (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+
 ## Configuration names
 
 The driver reads the reference's settings under both spellings: the property
@@ -84,3 +115,11 @@ it cannot parse, and this refuses.
 `aeron.counters.free.to.reuse.timeout` follows the same rule and is one more
 name whose environment variable is not the property name in capitals
 (`AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT`, `aeronmd.h:525`).
+
+One setting has a bound the reference does not: `aeron.timer.interval` is
+capped at one hour. The reference parses up to `INT64_MAX` and then adds the
+period to a nanosecond clock (`aeron_driver_conductor.c:3379`), which a period
+near `INT64_MAX` turns into a wrapped deadline — a driver that looks healthy and
+spins a core. deepmsg computes its deadlines with saturating arithmetic *and*
+refuses the value, because a tier period above an hour is a typo rather than a
+configuration.

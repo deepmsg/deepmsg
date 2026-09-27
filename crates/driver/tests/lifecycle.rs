@@ -185,9 +185,22 @@ fn the_default_policy_refuses_a_termination_and_keeps_running() {
     let outcome = request_driver_termination(&dir.0, b"let me in").expect("sending succeeds");
     assert_eq!(TerminationOutcome::Committed, outcome);
 
-    // A short wait first, so that a driver which *did* stop has time to say so
-    // rather than being caught mid-flight.
-    std::thread::sleep(Duration::from_millis(250));
+    // Waiting for evidence rather than for a fixed number of milliseconds: the
+    // driver refreshes its heartbeat on every timeout tier, so a *new* value is
+    // positive proof that it is still running after the denial — and if it had
+    // stopped, the refresh would never come and the wait would say so. The
+    // sleep this replaces proved the same thing by hoping.
+    let before = cnc
+        .consumer_heartbeat_ms()
+        .expect("the ring trailer is readable");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while cnc.consumer_heartbeat_ms() == Some(before) {
+        assert!(
+            Instant::now() < deadline,
+            "the driver stopped refreshing its heartbeat after a denied termination"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     assert!(driver.is_running(), "the default validator is deny");
     assert!(
@@ -246,6 +259,39 @@ fn a_signal_stops_the_driver_and_reports_the_signal() {
     assert!(
         !dir.0.exists(),
         "and it still went through the shutdown path"
+    );
+}
+
+#[test]
+fn a_signal_during_startup_still_takes_the_clean_path() {
+    // The signal handler is installed *before* the directory work, so the
+    // window in which a SIGTERM kills the process outright is the few
+    // microseconds between `exec` and the install — not the whole of a 46 MB
+    // create or a `remove_dir_all` of a stale tree. The stale tree here is what
+    // makes that window observable: `dir.delete.on.start` gives the driver real
+    // work to do before its loop, and the signal arrives while it is doing it.
+    let dir = TempDir::new();
+    std::fs::create_dir_all(&dir.0).expect("mkdir");
+    for n in 0..1_000 {
+        std::fs::write(dir.0.join(format!("stale-{n}")), b"").expect("a stale file");
+    }
+
+    let mut driver = Driver::start(&dir.0, &["-Ddeepmsg.dir.delete.on.start=true"]);
+
+    // Straight away, with no wait for a CnC file: this is a signal during
+    // startup, which is the whole point.
+    let signal = Command::new("kill")
+        .arg("-TERM")
+        .arg(driver.child.id().to_string())
+        .status()
+        .expect("kill runs");
+    assert!(signal.success());
+
+    assert_eq!(
+        Some(15),
+        driver.wait_for_exit(),
+        "the handler ran, so the exit code is the signal — a process killed by \
+         the default disposition reports no code at all"
     );
 }
 
