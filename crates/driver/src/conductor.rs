@@ -37,19 +37,22 @@
 //!
 //! Commands whose resources are not implemented yet — publications,
 //! subscriptions, images — are counted and named rather than answered. The
-//! reference would reply `ON_ERROR` on the to-clients ring, and now that there
-//! *is* a ring here, that reply is P1-2's to add along with the resources
-//! themselves; until then a client that sent one of them reaches its own
-//! deadline and reports a timeout, which is the same shape as the reference's
-//! own timeout leak (`docs/protocol/cnc-layout.md`, "A leak in the reference").
-//! A malformed command — one whose payload is shorter than its own lengths
-//! claim — is counted separately, because it is a bug or a hostile client
-//! rather than a feature this build has not reached.
+//! reference replies `ON_ERROR` on the to-clients ring, and until that reply
+//! exists for them a client that sent one reaches its own deadline and reports
+//! a timeout, which is the same shape as the reference's own timeout leak
+//! (`docs/protocol/cnc-layout.md`, "A leak in the reference"). The commands
+//! this build *does* implement answer with the same replies the reference uses:
+//! `ON_COUNTER_READY` when a counter is allocated, `ON_OPERATION_SUCCEEDED` when
+//! a removal is done, and `ON_ERROR` with the reference's error code when one
+//! fails. A malformed command — one whose payload is shorter than its own
+//! lengths claim — is counted separately, because it is a bug or a hostile
+//! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
-    decode_add_counter, decode_correlated, decode_remove_counter, encode_client_timeout,
-    encode_counter_update,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ON_CLIENT_TIMEOUT_TYPE_ID,
+    ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, decode_add_counter, decode_correlated, decode_remove_counter,
+    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
 };
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
@@ -58,9 +61,9 @@ use deepmsg_cnc::{
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::clock::{self, CachedClock};
 
-use crate::clients::{ClientEvents, Clients, CounterLink, CounterTimeouts};
+use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
-use crate::system_counters::{self, SystemCounterError};
+use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
 /// (`aeron-driver/src/main/c/aeron_driver_context.h:53`).
@@ -257,6 +260,16 @@ impl ClientEvents for Transmit<'_> {
         let payload = encode_client_timeout(client_id);
         self.send(ON_CLIENT_TIMEOUT_TYPE_ID, &payload);
     }
+
+    fn operation_succeeded(&mut self, correlation_id: i64) {
+        let payload = encode_operation_succeeded(correlation_id);
+        self.send(ON_OPERATION_SUCCEEDED_TYPE_ID, &payload);
+    }
+
+    fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]) {
+        let payload = encode_error(correlation_id, error_code, message);
+        self.send(ON_ERROR_TYPE_ID, &payload);
+    }
 }
 
 /// The driver's control plane.
@@ -265,6 +278,9 @@ pub struct Conductor {
     commands: ToDriverRingConsumer,
     transmitter: ToClientsTransmitter,
     counters: CounterManager,
+    /// What this driver allocated for itself, so its shutdown gives back
+    /// exactly that (`aeron_system_counters_close`, `:3487`).
+    system_counters: SystemCounters,
     clients: Clients,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
@@ -332,15 +348,15 @@ impl Conductor {
         )
         .ok_or(ConductorError::NoCounterRegions)?;
 
-        {
+        let owned_counters = {
             let regions = cnc
                 .counter_regions()
                 .ok_or(ConductorError::NoCounterRegions)?;
             #[allow(clippy::cast_possible_wrap)] // a file length, far below i64::MAX
             let bytes_mapped = cnc.file_length() as i64;
             system_counters::allocate_all(&mut counters, &regions, now_ms, bytes_mapped)
-                .map_err(ConductorError::SystemCounters)?;
-        }
+                .map_err(ConductorError::SystemCounters)?
+        };
 
         // The id the driver burns at startup belongs to the same counter a
         // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
@@ -365,6 +381,7 @@ impl Conductor {
             commands,
             transmitter,
             counters,
+            system_counters: owned_counters,
             clients: Clients::new(),
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
@@ -499,12 +516,26 @@ impl Conductor {
         // A client's counters are deliberately not freed, matching the
         // reference: it frees the client's link *arrays* on the way out and
         // leaves the counters themselves allocated.
-        if let Some(regions) = self.cnc.counter_regions() {
-            for counter_id in 0..system_counters::COUNT as i32 {
-                self.counters.free(&regions, counter_id, self.now_ms);
-            }
-        }
+        let Some(regions) = self.cnc.counter_regions() else {
+            // A file this build created and validated does not lose its counter
+            // regions; if it has, the shutdown is not the place to find out
+            // quietly.
+            self.running = false;
+            return Err(std::io::Error::other(
+                "the counter regions are unreachable at shutdown",
+            ));
+        };
 
+        let released = self
+            .system_counters
+            .release_all(&mut self.counters, &regions, self.now_ms);
+        debug_assert_eq!(
+            system_counters::COUNT,
+            released,
+            "the driver releases exactly the counters it allocated"
+        );
+
+        self.running = false;
         self.write_heartbeat_value(layout::NULL_VALUE);
         self.cnc.sync()
     }
@@ -594,30 +625,62 @@ impl Conductor {
                             &mut transmit,
                         ) else {
                             *counter_failures += 1;
+                            // The reference appends "Failed to add client" and
+                            // returns -1, which the dispatcher turns into
+                            // `ON_ERROR` (`:3226`, `:6171-6178`).
+                            transmit.error(
+                                registration_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                b"failed to add client",
+                            );
                             return;
                         };
 
-                        match counters.allocate(
-                            &counter_regions,
-                            command.type_id,
-                            command.key,
-                            command.label,
-                            now_ms,
-                        ) {
+                        let allocated = counters
+                            .allocate(
+                                &counter_regions,
+                                command.type_id,
+                                command.key,
+                                command.label,
+                                now_ms,
+                            )
+                            .and_then(|counter_id| {
+                                // Both writes, and the link only if they
+                                // happened: a counter announced with a
+                                // registration of zero is one nobody can ever
+                                // find or remove again.
+                                counters
+                                    .set_registration_id(
+                                        &counter_regions,
+                                        counter_id,
+                                        registration_id,
+                                    )
+                                    .and_then(|()| {
+                                        counters.set_owner_id(
+                                            &counter_regions,
+                                            counter_id,
+                                            client_id,
+                                        )
+                                    })
+                                    .map(|()| counter_id)
+                            });
+
+                        match allocated {
                             Some(counter_id) => {
-                                counters.set_registration_id(
-                                    &counter_regions,
-                                    counter_id,
-                                    registration_id,
-                                );
-                                counters.set_owner_id(&counter_regions, counter_id, client_id);
                                 record.counter_links.push(CounterLink {
                                     registration_id,
                                     counter_id,
                                 });
                                 transmit.counter_ready(registration_id, counter_id);
                             }
-                            None => *counter_failures += 1,
+                            None => {
+                                *counter_failures += 1;
+                                transmit.error(
+                                    registration_id,
+                                    ERROR_CODE_GENERIC_ERROR,
+                                    b"failed to allocate counter",
+                                );
+                            }
                         }
                     }
                     None => *malformed += 1,
@@ -636,10 +699,22 @@ impl Conductor {
 
                         match link {
                             Some(link) => {
+                                // Acknowledge, then announce, then free — the
+                                // reference's order, and the reason its
+                                // `removeCounter` unblocks while the counter is
+                                // still being returned (`:6221-6235`).
+                                transmit.operation_succeeded(command.correlated.correlation_id);
                                 transmit.counter_unavailable(link.registration_id, link.counter_id);
                                 counters.free(&counter_regions, link.counter_id, now_ms);
                             }
-                            None => *unknown_counters += 1,
+                            None => {
+                                *unknown_counters += 1;
+                                transmit.error(
+                                    command.correlated.correlation_id,
+                                    ERROR_CODE_UNKNOWN_COUNTER,
+                                    b"unknown counter",
+                                );
+                            }
                         }
                     }
                     None => *malformed += 1,
@@ -712,8 +787,13 @@ impl Conductor {
         true
     }
 
-    /// The client pool's turn: reap whoever has gone quiet, announcing each
-    /// departure as the reference does.
+    /// The client pool's turn: announce whoever has gone quiet, and then
+    /// reclaim them.
+    ///
+    /// Two phases, in the reference's order (`aeron_driver_conductor.c:1038-1056`
+    /// then `:1692-1712`): the announcements of *every* expired client precede
+    /// the reclamation of any of them, which is visible on the ring whenever
+    /// two clients expire in the same tick.
     fn check_clients(&mut self) -> usize {
         let Some(counter_regions) = self.cnc.counter_regions() else {
             return 0;
@@ -722,7 +802,12 @@ impl Conductor {
             return 0;
         };
 
-        let CounterTimeouts { reaped, timed_out } = {
+        // Phase one reads the counters — each client's heartbeat, and system
+        // counter 24 — so it borrows them immutably; phase two frees, so it
+        // borrows them mutably. The two cannot be alive at once, and they
+        // should not be: that is what keeps every announcement ahead of every
+        // free.
+        {
             let mut transmit = Transmit {
                 transmitter: &mut self.transmitter,
                 region: &event_region,
@@ -730,44 +815,46 @@ impl Conductor {
             };
             self.clients.on_time_event(
                 self.now_ms,
-                &mut self.counters,
-                &counter_regions,
-                &mut transmit,
-            )
-        };
-
-        // One per client that went quiet, never for one that said goodbye
-        // (`aeron_driver_conductor.c:1048`).
-        for _ in 0..timed_out {
-            system_counters::increment(
                 &self.counters,
                 &counter_regions,
-                system_counters::id::CLIENT_TIMEOUTS,
+                &mut transmit,
             );
         }
 
-        reaped
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+        };
+        self.clients.reap_expired(
+            self.now_ms,
+            &mut self.counters,
+            &counter_regions,
+            &mut transmit,
+        )
     }
 
-    /// Move this pass's broadcast failures into system counter 15.
+    /// Account for this pass's broadcast failures.
+    ///
+    /// They are counted here and **not** in system counter 15: the reference's
+    /// `client_transmit` appends to its error log and touches no counter
+    /// (`aeron_driver_conductor.c:2233-2241`), and counter 15 is how a
+    /// deployment alerts on the driver's own errors — a transport that could
+    /// not publish a twelve-byte event would quietly raise every threshold on
+    /// it. The first one is said out loud, because a ring that refuses events
+    /// is worth noticing; the rest are counted, because one per pass forever is
+    /// not worth reading.
     fn flush_broadcast_failures(&mut self) {
         if 0 == self.pending_broadcast_failures {
             return;
         }
 
-        let Some(counter_regions) = self.cnc.counter_regions() else {
-            return;
-        };
         let pending = std::mem::take(&mut self.pending_broadcast_failures);
 
-        self.broadcast_failures += pending;
-        for _ in 0..pending {
-            system_counters::increment(
-                &self.counters,
-                &counter_regions,
-                system_counters::id::ERRORS,
-            );
+        if 0 == self.broadcast_failures {
+            eprintln!("deepmsg-driver: the to-clients ring refused a broadcast");
         }
+        self.broadcast_failures += pending;
     }
 
     /// Measure the pass that just ended, and count it if it ran long
@@ -1156,6 +1243,10 @@ mod tests {
         let scan = counters.for_each(|_| {});
         assert_eq!(0, scan.allocated, "a stopped driver publishes none");
         assert_eq!(46, scan.reclaimed, "and leaves forty-six reclaimed slots");
+        assert!(
+            !conductor.is_running(),
+            "and a closed conductor is not a running one"
+        );
     }
 
     #[test]
@@ -1414,11 +1505,18 @@ mod tests {
         conductor.do_work();
 
         assert_eq!(
-            vec![(
-                deepmsg_cnc::command::ON_UNAVAILABLE_COUNTER_TYPE_ID,
-                encode_counter_update(99, 47).to_vec()
-            )],
-            drain(&cnc, &mut receiver)
+            vec![
+                (
+                    deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+                    encode_operation_succeeded(5).to_vec()
+                ),
+                (
+                    deepmsg_cnc::command::ON_UNAVAILABLE_COUNTER_TYPE_ID,
+                    encode_counter_update(99, 47).to_vec()
+                ),
+            ],
+            drain(&cnc, &mut receiver),
+            "the command unblocks first, then the counter goes away — the reference's order"
         );
         assert_eq!(
             1,
@@ -1434,12 +1532,25 @@ mod tests {
                 .is_empty()
         );
 
-        // A second removal finds nothing, and so does one from a stranger.
+        // A second removal finds nothing, and so does one from a stranger —
+        // and each is *answered*, so the client that asked is not left waiting
+        // for a deadline (`aeron_driver_conductor.c:6244-6252`).
         send(&conductor, 0x0A, &remove_counter_payload(7, 6, 99));
         conductor.do_work();
         send(&conductor, 0x0A, &remove_counter_payload(8, 7, 99));
         conductor.do_work();
         assert_eq!(2, conductor.unknown_counters());
+
+        let errors = drain(&cnc, &mut receiver);
+        assert_eq!(2, errors.len());
+        for (type_id, payload) in errors {
+            assert_eq!(deepmsg_cnc::command::ON_ERROR_TYPE_ID, type_id);
+            assert_eq!(
+                deepmsg_cnc::command::ERROR_CODE_UNKNOWN_COUNTER,
+                i32::from_le_bytes(payload[8..12].try_into().expect("four bytes")),
+                "the code the reference uses for this failure"
+            );
+        }
     }
 
     #[test]

@@ -117,15 +117,6 @@ impl std::error::Error for TransmitError {}
 /// system — clients never transmit on it.
 pub struct ToClientsTransmitter {
     capacity: usize,
-    /// Where the next record starts, in the ring's unbounded counter space.
-    ///
-    /// The reference re-reads `tail_counter` for every message
-    /// (`aeron_broadcast_transmitter.c:71`), which a broadcast ring with many
-    /// writers needs. A media driver is the only writer on this ring, so this
-    /// is the same number with one less load — and it is re-read from the
-    /// descriptor at construction, so a driver handed a ring that already
-    /// carried traffic continues where that traffic left off.
-    next_record: i64,
 }
 
 impl ToClientsTransmitter {
@@ -134,6 +125,14 @@ impl ToClientsTransmitter {
     /// The capacity rule is the reader's (`aeron_broadcast_descriptor.h:43`):
     /// a power of two, and non-zero, because a record's offset is the counter
     /// masked with `capacity - 1`.
+    ///
+    /// **One writer per ring.** Every `transmit` reads `tail_counter` and
+    /// writes back past it, as the reference does
+    /// (`aeron_broadcast_transmitter.c:71`), which is what lets a second
+    /// transmitter on the same file continue where the first stopped — and
+    /// what makes two of them *at once* overwrite each other's records. The
+    /// ring has no way to enforce it; the driver owns its CnC file, and
+    /// anything else that maps it writable is breaking that.
     pub fn new(region: &AtomicBuffer<ReadWrite>) -> Option<Self> {
         let capacity = region.len().checked_sub(layout::BROADCAST_TRAILER_LENGTH)?;
 
@@ -141,13 +140,7 @@ impl ToClientsTransmitter {
             return None;
         }
 
-        let next_record =
-            region.load_i64_acquire(capacity + layout::BROADCAST_TAIL_COUNTER_OFFSET)?;
-
-        Some(Self {
-            capacity,
-            next_record,
-        })
+        Some(Self { capacity })
     }
 
     /// The capacity of the record area.
@@ -195,22 +188,31 @@ impl ToClientsTransmitter {
             });
         }
 
+        // Read plainly, as the C does: this is the writer's own last position,
+        // and the publication of *this* record is the release store below.
+        let current_tail = region
+            .load_i64_relaxed(self.trailer(layout::BROADCAST_TAIL_COUNTER_OFFSET))
+            .ok_or(TransmitError::OutOfRange)?;
+
         let aligned = layout::align_up(
             payload.len() + layout::RECORD_HEADER_LENGTH,
             layout::RECORD_ALIGNMENT,
         );
-        let new_tail = self.next_record + aligned as i64;
-        let to_end_of_buffer = self.capacity - self.index_of(self.next_record);
-        let mut tail = self.next_record;
-        let mut offset = self.index_of(self.next_record);
+        let new_tail = current_tail + aligned as i64;
+        let to_end_of_buffer = self.capacity - self.index_of(current_tail);
+        let mut tail = current_tail;
+        let mut offset = self.index_of(current_tail);
 
         if to_end_of_buffer < aligned {
             self.signal_tail_intent(region, new_tail + to_end_of_buffer as i64)?;
 
-            // The padding's own length is its distance to the end of the ring,
-            // which is not a multiple of the alignment in general — a reader
-            // steps over it without aligning, and the record after it starts
-            // at offset 0.
+            // The padding's own length is its distance to the end of the ring:
+            // `capacity - offset`, where the capacity is a power of two and
+            // every record starts on an 8-byte boundary — so it is always a
+            // multiple of the alignment, and a reader that aligns it is doing
+            // an identity. Both are kept: the reader's `align_up` is an
+            // invariant guard, not dead code, and the record after the padding
+            // starts at offset 0.
             self.store_i32(
                 region,
                 offset + layout::RECORD_MSG_TYPE_ID_OFFSET,
@@ -252,7 +254,6 @@ impl ToClientsTransmitter {
             tail + aligned as i64,
         )?;
 
-        self.next_record = tail + aligned as i64;
         Ok(())
     }
 
@@ -315,7 +316,6 @@ impl std::fmt::Debug for ToClientsTransmitter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToClientsTransmitter")
             .field("capacity", &self.capacity)
-            .field("next_record", &self.next_record)
             .finish()
     }
 }
@@ -678,9 +678,10 @@ mod tests {
             self.buffer.as_read_only()
         }
 
-        /// Where the next record starts, in the ring's counter space.
+        /// Where the next record starts, in the ring's counter space — read
+        /// from the ring, because that is where the transmitter keeps it.
         fn next(&self) -> i64 {
-            self.transmitter.next_record
+            self.counter(layout::BROADCAST_TAIL_COUNTER_OFFSET)
         }
 
         fn trailer(&self, field: usize) -> usize {
@@ -745,6 +746,12 @@ mod tests {
         /// reader.
         fn overtake(&self, past: i64) {
             self.store_i64(layout::BROADCAST_TAIL_INTENT_COUNTER_OFFSET, past);
+        }
+
+        /// Move the published tail, standing in for another writer — or for
+        /// this one after a restart.
+        fn set_tail(&self, past: i64) {
+            self.store_i64(layout::BROADCAST_TAIL_COUNTER_OFFSET, past);
         }
     }
 
@@ -920,6 +927,39 @@ mod tests {
             assert_eq!(
                 (aligned + second) as i64,
                 writer.counter(layout::BROADCAST_TAIL_COUNTER_OFFSET)
+            );
+        });
+    }
+
+    #[test]
+    fn a_publish_continues_from_the_tail_it_finds() {
+        // The transmitter reads `tail_counter` for every message, as the C does
+        // (`aeron_broadcast_transmitter.c:71`) — it does not carry its own idea
+        // of where it was. A version that cached the position would overwrite
+        // whatever another writer had published in between, and the loss would
+        // be invisible: the record would look well-formed and the ring's
+        // counters would keep moving.
+        let mut fixture = Fixture::new();
+
+        fixture.with(|writer, _receiver| {
+            writer.publish(0x0F07, b"first");
+
+            // Someone else moved the tail on — a second transmitter, or this
+            // one after a restart.
+            const AHEAD: i64 = 512;
+            writer.set_tail(AHEAD);
+
+            writer.publish(0x0F08, b"second");
+
+            assert_eq!(
+                (8 + 6, 0x0F08),
+                writer.record_header(AHEAD as usize),
+                "the record landed where the tail said, not where this writer left off"
+            );
+            assert_eq!(
+                AHEAD + 16,
+                writer.next(),
+                "and the tail moved on from there: 14 bytes of record, aligned to 16"
             );
         });
     }

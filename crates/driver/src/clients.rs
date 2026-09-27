@@ -18,21 +18,29 @@
 //! the protocol, but this driver's only use for it is refreshing a client it
 //! already knows, and the reference C client never sends it at all.
 //!
-//! # Reaping is two announcements and three frees, in that order
+//! # A pass is two phases, and the split is visible on the wire
 //!
-//! `aeron_client_on_time_event` (`:1038-1056`) fires first: it announces
-//! `ON_CLIENT_TIMEOUT` — unless the client closed itself — and
-//! `ON_UNAVAILABLE_COUNTER` for the heartbeat counter. Only then does
-//! `aeron_client_delete` (`:1218-1295`) run, freeing the client's counters one
-//! by one (each announced) and last the heartbeat counter. A client that is
-//! already gone must not be announced as timed out: `CLIENT_CLOSE` sets the
-//! heartbeat to zero so the next tick reaps it, and `closed_by_command` is what
-//! tells the two apart (`:5269-5280`, `:6321-6331`).
+//! `aeron_client_on_time_event` (`:1038-1056`) runs over **every** client
+//! first: it counts the timeout in system counter 24, announces
+//! `ON_CLIENT_TIMEOUT` — unless the client closed itself — and announces
+//! `ON_UNAVAILABLE_COUNTER` for the heartbeat counter. Only then does the
+//! reclamation pass call `aeron_client_delete` (`:1218-1295`) for each client
+//! that reached end of life, freeing its counters one by one (each announced)
+//! and the heartbeat last. So [`Clients::on_time_event`] marks and announces,
+//! and [`Clients::reap_expired`] frees — and when two clients expire in the
+//! same tick, both of their timeouts precede both of their reclamations, which
+//! is the order a C driver emits and an interleaved loop does not.
+//!
+//! A client that is already gone must not be announced as timed out:
+//! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
+//! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
 
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-/// Where a client-lifecycle event goes.
+use crate::system_counters;
+
+/// Where a driver→client event goes.
 ///
 /// Implemented by the conductor, which encodes and broadcasts it; implemented
 /// by tests as a recording sink. The events are named after the protocol's
@@ -48,26 +56,21 @@ pub trait ClientEvents {
     /// id must let it go.
     fn counter_unavailable(&mut self, registration_id: i64, counter_id: i32);
 
-    /// `ON_CLIENT_TIMEOUT`: the client stopped being heard from. The conductor
-    /// counts it in system counter 24 as well
-    /// (`aeron_driver_conductor.c:1048`), which is why this event is *not*
+    /// `ON_CLIENT_TIMEOUT`: the client stopped being heard from. System counter
+    /// 24 is incremented by the pool before this is raised
+    /// (`aeron_driver_conductor.c:1047-1049`), which is also why it is *not*
     /// raised for a client that closed itself.
     fn client_timed_out(&mut self, client_id: i64);
-}
 
-/// What one pass of the client pool did.
-///
-/// Two numbers rather than one because two different things are counted: every
-/// expired client is reaped, and only the ones that did not close themselves
-/// are *announced* as timed out and counted in system counter 24
-/// (`aeron_driver_conductor.c:1038-1056`). Collapsing them would make a client
-/// that shut down cleanly look like one that died.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CounterTimeouts {
-    /// Clients whose records were freed.
-    pub reaped: usize,
-    /// Clients reaped for silence, as opposed to a `CLIENT_CLOSE`.
-    pub timed_out: usize,
+    /// `ON_OPERATION_SUCCEEDED`: the command with this correlation id is done.
+    ///
+    /// The completion signal for a command that has no reply of its own. A real
+    /// client blocks on it: without it, a removal that *worked* leaves that
+    /// client waiting for a deadline and then reporting a timeout.
+    fn operation_succeeded(&mut self, correlation_id: i64);
+
+    /// `ON_ERROR`: the command with this correlation id failed.
+    fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]);
 }
 
 /// One counter a client owns, by the id the client knows it as.
@@ -234,47 +237,96 @@ impl Clients {
             .is_some()
     }
 
-    /// One pass of the reference's `aeron_client_on_time_event`
-    /// (`:1038-1056`), followed by the reaping of anything that just expired.
+    /// Phase one of a pass: **mark the expired clients and announce them**.
+    ///
+    /// The reference splits a pass in two, and the split is visible on the wire
+    /// when more than one client expires in the same tick. `aeron_client_on_time_event`
+    /// (`aeron_driver_conductor.c:1038-1056`) runs over every client first —
+    /// counting the timeout in system counter 24, then broadcasting
+    /// `ON_CLIENT_TIMEOUT` and the heartbeat's `ON_UNAVAILABLE_COUNTER` — and
+    /// only then does the pool's reclamation pass call `aeron_client_delete`
+    /// for each client that reached end of life (`:1692-1712`). Interleaving
+    /// the two per client produces an order a C driver never emits: A's
+    /// counters going unavailable *before* B's timeout.
+    ///
+    /// Counter 24 is incremented here, before the announcement, and only for a
+    /// client that did not close itself — the reference's order (`:1047-1049`),
+    /// and why a tool that drains the ring and reads the counter together never
+    /// sees the event arrive first.
+    ///
+    /// Nothing is freed here, and nothing is removed: that is
+    /// [`Clients::reap_expired`], and keeping the two apart is what makes the
+    /// order above possible.
     pub fn on_time_event(
+        &mut self,
+        now_ms: i64,
+        manager: &CounterManager,
+        regions: &CounterRegions<'_>,
+        events: &mut impl ClientEvents,
+    ) {
+        for index in (0..self.records.len()).rev() {
+            let record = &mut self.records[index];
+            if record.reached_end_of_life {
+                continue;
+            }
+
+            let Some(held) = manager.value(regions, record.heartbeat_counter_id) else {
+                continue;
+            };
+
+            // Wrap, not saturate. The reference compares
+            // `now > timestamp + timeout` with C's wrapping arithmetic
+            // (`aeron_driver_conductor.c:1042`), so a heartbeat near `i64::MAX`
+            // wraps negative and the client expires at once. Saturating instead
+            // would make that heartbeat *never* expire: a client — or anything
+            // that can write a counter — could pin a record and its counter for
+            // the driver's whole life.
+            if now_ms <= held.wrapping_add(record.liveness_timeout_ms) {
+                continue;
+            }
+
+            record.reached_end_of_life = true;
+
+            if !record.closed_by_command {
+                system_counters::increment(manager, regions, system_counters::id::CLIENT_TIMEOUTS);
+                events.client_timed_out(record.client_id);
+            }
+            events.counter_unavailable(record.client_id, record.heartbeat_counter_id);
+        }
+    }
+
+    /// Phase two: free everything a marked client owned, announcing each
+    /// counter as it goes (`aeron_client_delete`, `:1218-1295`).
+    ///
+    /// The order is the reference's: the client's own counters first, each
+    /// announced before it is freed, then the heartbeat — whose announcement
+    /// went out with the timeout in phase one, which is why this does not
+    /// repeat it.
+    ///
+    /// Returns how many clients were reaped.
+    pub fn reap_expired(
         &mut self,
         now_ms: i64,
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
-    ) -> CounterTimeouts {
-        let mut outcome = CounterTimeouts::default();
+    ) -> usize {
+        let mut reaped = 0;
         let mut index = self.records.len();
 
         while index > 0 {
             index -= 1;
 
-            {
-                let record = &mut self.records[index];
-                if !record.reached_end_of_life {
-                    let timestamp = manager.value(regions, record.heartbeat_counter_id);
-                    if timestamp.is_some_and(|held| {
-                        now_ms > held.saturating_add(record.liveness_timeout_ms)
-                    }) {
-                        record.reached_end_of_life = true;
-
-                        if !record.closed_by_command {
-                            events.client_timed_out(record.client_id);
-                            outcome.timed_out += 1;
-                        }
-                        events.counter_unavailable(record.client_id, record.heartbeat_counter_id);
-                    }
-                }
+            if !self.records[index].reached_end_of_life {
+                continue;
             }
 
-            if self.records[index].reached_end_of_life {
-                self.reap(index, now_ms, manager, regions, events);
-                self.records.swap_remove(index);
-                outcome.reaped += 1;
-            }
+            self.reap(index, now_ms, manager, regions, events);
+            self.records.swap_remove(index);
+            reaped += 1;
         }
 
-        outcome
+        reaped
     }
 
     /// Free everything one client owned, announcing each counter as it goes
@@ -350,6 +402,14 @@ mod tests {
 
         fn client_timed_out(&mut self, client_id: i64) {
             self.0.push(format!("timeout:{client_id}"));
+        }
+
+        fn operation_succeeded(&mut self, correlation_id: i64) {
+            self.0.push(format!("succeeded:{correlation_id}"));
+        }
+
+        fn error(&mut self, correlation_id: i64, error_code: i32, _message: &[u8]) {
+            self.0.push(format!("error:{correlation_id}:{error_code}"));
         }
     }
 
@@ -511,19 +571,16 @@ mod tests {
         events.0.clear();
 
         // Not yet: the timeout is ten seconds and the value is one second old.
-        assert_eq!(
-            CounterTimeouts::default(),
-            clients.on_time_event(NOW + 11_000, &mut manager, &regions, &mut events)
-        );
+        clients.on_time_event(NOW + 11_000, &manager, &regions, &mut events);
         assert!(events.0.is_empty());
+        assert_eq!(1, clients.len(), "and nothing was reclaimed either");
 
-        // One millisecond past the deadline.
+        // One millisecond past the deadline: phase one announces…
+        clients.on_time_event(NOW + 11_001, &manager, &regions, &mut events);
+        assert_eq!(1, clients.len(), "…and phase two is what reclaims");
         assert_eq!(
-            CounterTimeouts {
-                reaped: 1,
-                timed_out: 1,
-            },
-            clients.on_time_event(NOW + 11_001, &mut manager, &regions, &mut events)
+            1,
+            clients.reap_expired(NOW + 11_001, &mut manager, &regions, &mut events)
         );
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0"],
@@ -553,12 +610,10 @@ mod tests {
         clients.on_close(7, &manager, &regions);
         events.0.clear();
 
+        clients.on_time_event(NOW + 1, &manager, &regions, &mut events);
         assert_eq!(
-            CounterTimeouts {
-                reaped: 1,
-                timed_out: 0,
-            },
-            clients.on_time_event(NOW + 1, &mut manager, &regions, &mut events),
+            1,
+            clients.reap_expired(NOW + 1, &mut manager, &regions, &mut events),
             "a zeroed heartbeat expires on the next tick, without a timeout"
         );
         assert_eq!(
@@ -595,7 +650,8 @@ mod tests {
             });
         events.0.clear();
 
-        clients.on_time_event(NOW + 20_000, &mut manager, &regions, &mut events);
+        clients.on_time_event(NOW + 20_000, &manager, &regions, &mut events);
+        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
 
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0", "unavailable:42:1"],
@@ -606,6 +662,142 @@ mod tests {
             2,
             regions.reader().for_each(|_| {}).reclaimed,
             "both are freed"
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_at_the_top_of_the_range_expires_instead_of_never() {
+        // The comparison wraps, as the reference's does
+        // (`aeron_driver_conductor.c:1042`): `i64::MAX + anything` is negative,
+        // so the client is expired on the spot. Saturating instead would make
+        // it *never* expire — a counter anyone can write, pinning a client
+        // record and its counters for the driver's whole life.
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+        let mut clients = Clients::new();
+        let mut events = Events::default();
+
+        clients
+            .get_or_add(7, NOW, TIMEOUT_NS, &mut manager, &regions, &mut events)
+            .expect("registered");
+        manager.set_value(&regions, 0, i64::MAX).expect("in range");
+        events.0.clear();
+
+        clients.on_time_event(NOW, &manager, &regions, &mut events);
+        assert_eq!(
+            vec!["timeout:7", "unavailable:7:0"],
+            events.0,
+            "a heartbeat that cannot be inside the window is outside it"
+        );
+        assert_eq!(
+            1,
+            clients.reap_expired(NOW, &mut manager, &regions, &mut events)
+        );
+        assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn every_announcement_precedes_every_reclamation() {
+        // Two clients expiring in the same tick, which is when the reference's
+        // two-phase pass is visible on the ring: both timeouts, then both
+        // reclamations. An interleaved loop emits A's counters going away
+        // before B's timeout, which no C driver ever does
+        // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+        let mut clients = Clients::new();
+        let mut events = Events::default();
+
+        for client_id in [7, 9] {
+            clients
+                .get_or_add(
+                    client_id,
+                    NOW,
+                    TIMEOUT_NS,
+                    &mut manager,
+                    &regions,
+                    &mut events,
+                )
+                .expect("registered");
+        }
+        events.0.clear();
+
+        // Both are silent, so both expire in the same tick.
+        clients.on_time_event(NOW + 20_000, &manager, &regions, &mut events);
+        assert_eq!(
+            vec![
+                "timeout:9",
+                "unavailable:9:1",
+                "timeout:7",
+                "unavailable:7:0"
+            ],
+            events.0,
+            "phase one: every announcement, in one pass — newest client first, \
+             because the reference's pool walks its array backwards to remove by swap"
+        );
+        assert_eq!(2, clients.len(), "and nothing reclaimed yet");
+
+        events.0.clear();
+        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
+        assert!(
+            events
+                .0
+                .iter()
+                .all(|event| event.starts_with("unavailable:")),
+            "phase two only reclaims: {:?}",
+            events.0
+        );
+        assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn the_timeout_is_counted_before_it_is_announced() {
+        // System counter 24 is incremented before the broadcast
+        // (`aeron_driver_conductor.c:1047-1049`), so a reader that drains the
+        // ring and reads the counter in the same breath never sees the event
+        // arrive first. The sink here reads the counter at the moment the
+        // event is raised, which is the only place the order is observable.
+        struct Counting<'a> {
+            manager: &'a CounterManager,
+            regions: &'a CounterRegions<'a>,
+            seen: Vec<i64>,
+        }
+
+        impl ClientEvents for Counting<'_> {
+            fn counter_ready(&mut self, _registration_id: i64, _counter_id: i32) {}
+            fn counter_unavailable(&mut self, _registration_id: i64, _counter_id: i32) {}
+            fn operation_succeeded(&mut self, _correlation_id: i64) {}
+            fn error(&mut self, _correlation_id: i64, _error_code: i32, _message: &[u8]) {}
+
+            fn client_timed_out(&mut self, _client_id: i64) {
+                self.seen.push(
+                    self.manager
+                        .value(self.regions, crate::system_counters::id::CLIENT_TIMEOUTS)
+                        .unwrap_or(-1),
+                );
+            }
+        }
+
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+        let mut clients = Clients::new();
+        let mut ready = Events::default();
+
+        clients
+            .get_or_add(7, NOW, TIMEOUT_NS, &mut manager, &regions, &mut ready)
+            .expect("registered");
+
+        let mut counting = Counting {
+            manager: &manager,
+            regions: &regions,
+            seen: Vec::new(),
+        };
+        clients.on_time_event(NOW + 20_000, &manager, &regions, &mut counting);
+
+        assert_eq!(
+            vec![1],
+            counting.seen,
+            "the counter already reads 1 when the event is raised"
         );
     }
 
