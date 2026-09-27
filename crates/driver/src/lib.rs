@@ -25,6 +25,7 @@ pub mod flowcontrol;
 pub mod idle;
 pub mod ipc_publication;
 pub mod ipc_publications;
+pub mod ipc_subscriptions;
 pub mod loss;
 pub mod media;
 pub mod native_resource_agent;

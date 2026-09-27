@@ -48,6 +48,7 @@ use crate::clients::{ClientEvents, ClientRecord, Clients, PublicationLink};
 use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
+use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::native_resource_agent::{Completion, NativeResourceAgent};
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError};
@@ -291,6 +292,20 @@ impl IpcPublications {
         &self.publications
     }
 
+    /// The same, for a subscription attaching a reader to one of them: the
+    /// subscription's `sub-pos` counter and the publication's reader set are
+    /// two halves of one link (`crate::ipc_subscriptions`).
+    pub fn publications_mut(&mut self) -> &mut [IpcPublication] {
+        &mut self.publications
+    }
+
+    /// The publication a subscription reads, by the id its images name.
+    pub fn find(&self, registration_id: i64) -> Option<&IpcPublication> {
+        self.publications
+            .iter()
+            .find(|publication| publication.registration_id == registration_id)
+    }
+
     /// How many publications are being built.
     pub fn pending(&self) -> usize {
         self.pending.len()
@@ -319,6 +334,7 @@ impl IpcPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
@@ -358,6 +374,7 @@ impl IpcPublications {
                     .map_err(AddError::Share)?;
 
                 self.link(index, registration_id, is_exclusive, client, events);
+                link_subscriptions(self, index, subscriptions, counters, regions, now, events);
 
                 return Ok(());
             }
@@ -401,6 +418,26 @@ impl IpcPublications {
         Ok(())
     }
 
+    /// Write `pub-pos` and recompute `pub-lmt` for every publication
+    /// (`aeron_ipc_publication_update_pub_pos_and_lmt`,
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:278-328`), and return
+    /// how many of them did work.
+    pub fn update_limits(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> usize {
+        let mut worked = 0;
+
+        for publication in &mut self.publications {
+            if publication.update_pub_pos_and_lmt(counters, regions) {
+                worked += 1;
+            }
+        }
+
+        worked
+    }
+
     /// Take everything the agent finished since the last call and create the
     /// publications whose log buffers have landed.
     ///
@@ -415,6 +452,7 @@ impl IpcPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> usize {
@@ -444,6 +482,7 @@ impl IpcPublications {
                         counters,
                         regions,
                         clients,
+                        subscriptions,
                         now,
                         events,
                     );
@@ -512,6 +551,7 @@ impl IpcPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         now: Now,
         events: &mut impl ClientEvents,
     ) {
@@ -645,6 +685,16 @@ impl IpcPublications {
             client,
             events,
         );
+
+        link_subscriptions(
+            self,
+            self.publications.len() - 1,
+            subscriptions,
+            counters,
+            regions,
+            now,
+            events,
+        );
     }
 
     /// Tell a client that its publication could not be created, and remove the
@@ -742,6 +792,28 @@ impl IpcPublications {
                 && publication.session_id == session_id
         })
     }
+}
+
+/// Give a publication to the subscriptions that were waiting for it.
+///
+/// Split out of the two places that need it — a publication created now, and a
+/// request linked to one that already existed — because the borrow is awkward
+/// in both: the publication is inside `self` and the subscriptions are beside
+/// it, so the call needs the manager's own field split off by hand.
+fn link_subscriptions(
+    publications: &mut IpcPublications,
+    index: usize,
+    subscriptions: &mut IpcSubscriptions,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    now: Now,
+    events: &mut impl ClientEvents,
+) {
+    let Some(publication) = publications.publications_mut().get_mut(index) else {
+        return;
+    };
+
+    subscriptions.link_publication(publication, counters, regions, now, events);
 }
 
 /// Put both position counters on the position a resumed stream resumes from

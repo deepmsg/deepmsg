@@ -65,6 +65,14 @@ pub mod key {
     pub const UNTETHERED_LINGER_TIMEOUT: &str = "untethered-linger-timeout";
     /// `untethered-resting-timeout`.
     pub const UNTETHERED_RESTING_TIMEOUT: &str = "untethered-resting-timeout";
+    /// `reliable`: whether the channel is reliable. No effect on IPC.
+    pub const RELIABLE: &str = "reliable";
+    /// `tether`: whether the subscription keeps its position whatever it costs.
+    pub const TETHER: &str = "tether";
+    /// `rejoin`: whether this is a re-join of a stream.
+    pub const REJOIN: &str = "rejoin";
+    /// `control-mode`: `response` makes a channel a response channel.
+    pub const CONTROL_MODE: &str = "control-mode";
 }
 
 /// `AERON_URI_PROTOTYPE_VALUE_CORRELATION_ID`
@@ -145,6 +153,132 @@ pub struct PublicationParams {
     /// position was given, otherwise random — which is what makes two
     /// publications of the same name from two drivers different streams.
     pub initial_term_id: i32,
+}
+
+/// What a channel URI says about the subscription it names.
+///
+/// Mirrors `aeron_driver_uri_subscription_params`
+/// (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:443-530`). Most of these
+/// flags matter to the network transport rather than to IPC — a shared-memory
+/// image is neither reliable nor unreliable, and it never re-joins — but the
+/// link records them and the tether flag decides which of them a reader is
+/// allowed to be put aside for being slow.
+///
+/// # The defaults that are not configuration yet
+///
+/// Four defaults come from the reference's *context* and are constants here:
+/// [`RELIABLE_STREAM_DEFAULT`], [`TETHER_SUBSCRIPTIONS_DEFAULT`],
+/// [`REJOIN_STREAM_DEFAULT`] and the initial window length. The URI can
+/// override every one of them per subscription, which is the part that
+/// affects what the driver does; turning them into settings of this driver
+/// belongs with the transport that reads them (P1-4), not with the flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubscriptionParams {
+    /// The session to read, or `None` for "whatever publishes this stream".
+    pub session_id: Option<i32>,
+    /// Whether the subscription asked to keep its position whatever it costs.
+    /// A tethered reader is never put to rest for reading slowly — and
+    /// **true** is the default (`AERON_TETHER_SUBSCRIPTIONS_DEFAULT`).
+    pub is_tether: bool,
+    /// Whether this is a re-join of a stream the subscription left.
+    pub is_rejoin: bool,
+    /// Whether the channel is reliable. No effect on IPC.
+    pub is_reliable: bool,
+    /// Whether the log buffer is sparse. No effect on IPC: the *publication*
+    /// decides that, and it is already created by the time anyone subscribes.
+    pub is_sparse: bool,
+    /// Whether this subscription exists to carry the answers to a request.
+    pub is_response: bool,
+    /// How long the reader may stall the publisher limit before it stops
+    /// counting, and the two timeouts either side of it.
+    pub untethered_window_limit_timeout_ns: i64,
+    /// See [`Self::untethered_window_limit_timeout_ns`].
+    pub untethered_linger_timeout_ns: i64,
+    /// See [`Self::untethered_window_limit_timeout_ns`].
+    pub untethered_resting_timeout_ns: i64,
+}
+
+/// `AERON_RELIABLE_STREAM_DEFAULT` (`aeron-driver/src/main/c/aeron_driver_context.c:213`).
+pub const RELIABLE_STREAM_DEFAULT: bool = true;
+
+/// `AERON_TETHER_SUBSCRIPTIONS_DEFAULT` (`aeron_driver_context.c:214`).
+pub const TETHER_SUBSCRIPTIONS_DEFAULT: bool = true;
+
+/// `AERON_REJOIN_STREAM_DEFAULT` (`aeron_driver_context.c:228`).
+pub const REJOIN_STREAM_DEFAULT: bool = true;
+
+/// The `control-mode` value that makes a channel a response channel
+/// (`AERON_UDP_CHANNEL_CONTROL_MODE_RESPONSE_VALUE`,
+/// `aeron-client/src/main/c/uri/aeron_uri.h:50`).
+pub const CONTROL_MODE_RESPONSE: &str = "response";
+
+impl SubscriptionParams {
+    /// Read a channel URI into the parameters a subscription is created from.
+    ///
+    /// # Errors
+    ///
+    /// [`PublicationParamsError`] for a parameter the reference refuses.
+    pub fn resolve(
+        uri: &ChannelUri<'_>,
+        config: &DriverConfig,
+    ) -> Result<Self, PublicationParamsError> {
+        let mut params = Self {
+            session_id: None,
+            is_tether: TETHER_SUBSCRIPTIONS_DEFAULT,
+            is_rejoin: REJOIN_STREAM_DEFAULT,
+            is_reliable: RELIABLE_STREAM_DEFAULT,
+            is_sparse: config.term_buffer_sparse_file,
+            is_response: is_response_channel(uri),
+            untethered_window_limit_timeout_ns: config.untethered_window_limit_timeout_ns,
+            untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
+            untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
+        };
+
+        if let Some(reliable) = uri.bool(key::RELIABLE)? {
+            params.is_reliable = reliable;
+        }
+        if let Some(sparse) = uri.bool(key::SPARSE)? {
+            params.is_sparse = sparse;
+        }
+        if let Some(tether) = uri.bool(key::TETHER)? {
+            params.is_tether = tether;
+        }
+        if let Some(rejoin) = uri.bool(key::REJOIN)? {
+            params.is_rejoin = rejoin;
+        }
+
+        // The subscribe side takes a plain number: there is no `tag:` form
+        // here, because a subscription is not choosing a publication to
+        // continue (`aeron_driver_uri.c:159-168`).
+        params.session_id = uri.i32(key::SESSION_ID)?;
+
+        if let Some(window_limit) = uri.duration_ns(key::UNTETHERED_WINDOW_LIMIT_TIMEOUT)? {
+            params.untethered_window_limit_timeout_ns = window_limit;
+        }
+        if let Some(linger) = uri.duration_ns(key::UNTETHERED_LINGER_TIMEOUT)? {
+            if linger > 0 {
+                params.untethered_linger_timeout_ns = linger;
+            } else if params.untethered_linger_timeout_ns == -1 {
+                params.untethered_linger_timeout_ns = params.untethered_window_limit_timeout_ns;
+            }
+        } else if params.untethered_linger_timeout_ns == -1 {
+            params.untethered_linger_timeout_ns = params.untethered_window_limit_timeout_ns;
+        }
+        if let Some(resting) = uri.duration_ns(key::UNTETHERED_RESTING_TIMEOUT)? {
+            params.untethered_resting_timeout_ns = resting;
+        }
+
+        Ok(params)
+    }
+}
+
+/// Whether a channel is a response channel: `control-mode=response`.
+///
+/// Read from the URI's own `control-mode` field rather than from the parameter
+/// list, because an IPC channel parses that one key specially
+/// (`aeron-client/src/main/c/uri/aeron_uri.c:196-199`).
+fn is_response_channel(uri: &ChannelUri<'_>) -> bool {
+    uri.value(key::CONTROL_MODE) == Some(CONTROL_MODE_RESPONSE)
 }
 
 /// Why a URI could not be turned into publication parameters.

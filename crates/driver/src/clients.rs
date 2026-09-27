@@ -35,7 +35,7 @@
 //! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
 //! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
 
-use deepmsg_cnc::command::PublicationBuffersReady;
+use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -72,6 +72,15 @@ pub trait ClientEvents {
 
     /// `ON_ERROR`: the command with this correlation id failed.
     fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]);
+
+    /// `ON_SUBSCRIPTION_READY`: the subscription exists. It is sent *before*
+    /// any image, because a client that heard about an image first would have
+    /// an image for a subscription it has not been told about.
+    fn subscription_ready(&mut self, registration_id: i64, channel_status_indicator_id: i32);
+
+    /// `ON_AVAILABLE_IMAGE`: a publication this subscription matches exists,
+    /// and its log buffer can be mapped from [`ImageBuffersReady::log_file`].
+    fn available_image(&mut self, ready: &ImageBuffersReady<'_>);
 
     /// `ON_PUBLICATION_READY` or `ON_EXCLUSIVE_PUBLICATION_READY`: the log
     /// buffer exists and the client may map it.
@@ -444,6 +453,19 @@ mod tests {
                 ready.correlation_id, ready.registration_id
             ));
         }
+
+        fn subscription_ready(&mut self, registration_id: i64, channel_status_indicator_id: i32) {
+            self.0.push(format!(
+                "subscription:{registration_id}:{channel_status_indicator_id}"
+            ));
+        }
+
+        fn available_image(&mut self, ready: &ImageBuffersReady<'_>) {
+            self.0.push(format!(
+                "image:{}:{}",
+                ready.correlation_id, ready.subscriber_registration_id
+            ));
+        }
     }
 
     struct Fixture {
@@ -807,6 +829,8 @@ mod tests {
                 _is_exclusive: bool,
             ) {
             }
+            fn subscription_ready(&mut self, _registration_id: i64, _status: i32) {}
+            fn available_image(&mut self, _ready: &ImageBuffersReady<'_>) {}
 
             fn client_timed_out(&mut self, _client_id: i64) {
                 self.seen.push(

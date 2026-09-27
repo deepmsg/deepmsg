@@ -326,6 +326,24 @@ impl<'c> AddPublication<'c> {
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:52`).
 pub const ON_SUBSCRIPTION_READY_TYPE_ID: i32 = 0x0F07;
 
+/// The payload of `ON_SUBSCRIPTION_READY`: the request's correlation id and a
+/// channel status counter id (`aeron_subscription_ready_t`,
+/// `aeron_control_protocol.h:106-111`, twelve bytes under the header's
+/// `#pragma pack(4)`).
+///
+/// `channel_status_indicator_id` is [`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`]
+/// for an IPC subscription, which is the only kind this build serves.
+pub fn encode_subscription_ready(
+    correlation_id: i64,
+    channel_status_indicator_id: i32,
+) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..12].copy_from_slice(&channel_status_indicator_id.to_le_bytes());
+
+    out
+}
+
 /// `AERON_RESPONSE_ON_ERROR` (`aeron_control_protocol.h:46`).
 pub const ON_ERROR_TYPE_ID: i32 = 0x0F01;
 
@@ -779,6 +797,48 @@ pub fn decode_add_publication(payload: &[u8]) -> Option<AddPublicationCommand<'_
     })
 }
 
+/// `ADD_SUBSCRIPTION` as it arrives: the receiving side of
+/// [`AddSubscription`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddSubscriptionCommand<'a> {
+    /// Who is asking. Registered on first sight, like a publication's client.
+    pub client_id: i64,
+    /// Becomes the subscription's registration id, and is what every image's
+    /// `subscriber_registration_id` quotes.
+    pub correlation_id: i64,
+    /// The field the driver never reads (`aeron_driver_conductor.c:4757-4760`
+    /// stores nothing from it).
+    pub registration_correlation_id: i64,
+    /// The stream to read.
+    pub stream_id: i32,
+    /// The channel URI as raw bytes, **not** NUL-terminated.
+    pub channel: &'a [u8],
+}
+
+/// Decode `ADD_SUBSCRIPTION`.
+///
+/// Eight bytes longer than [`decode_add_publication`]: the extra
+/// `registration_correlation_id` sits between the correlated head and the
+/// stream id (`aeron_control_protocol.h:91-98`).
+pub fn decode_add_subscription(payload: &[u8]) -> Option<AddSubscriptionCommand<'_>> {
+    let correlated = decode_correlated(payload)?;
+    let registration_correlation_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
+    let stream_id = le_i32(payload, CORRELATED_COMMAND_LENGTH + 8)?;
+    let channel_length = usize::try_from(le_i32(payload, CORRELATED_COMMAND_LENGTH + 12)?).ok()?;
+    let channel = payload.get(
+        ADD_SUBSCRIPTION_HEADER_LENGTH
+            ..ADD_SUBSCRIPTION_HEADER_LENGTH.checked_add(channel_length)?,
+    )?;
+
+    Some(AddSubscriptionCommand {
+        client_id: correlated.client_id,
+        correlation_id: correlated.correlation_id,
+        registration_correlation_id,
+        stream_id,
+        channel,
+    })
+}
+
 /// Decode a response payload.
 ///
 /// A payload too short for its own type is reported as [`Response::Other`]
@@ -910,6 +970,83 @@ fn decode_publication_ready(type_id: i32, payload: &[u8]) -> Response<'_> {
         position_limit_counter_id,
         channel_status_indicator_id,
         log_file: &payload[start..end],
+    }
+}
+
+/// The fixed head of `ON_AVAILABLE_IMAGE`
+/// (`aeron_image_buffers_ready_t`, `aeron_control_protocol.h:113-119`), and
+/// the two strings that follow it.
+///
+/// # The tail is not what it looks like
+///
+/// The head is 28 bytes under the header's `#pragma pack(4)`. After it comes a
+/// length-prefixed log file path, then **padding to a four-byte boundary**,
+/// then a length-prefixed source identity — and the identity is the one string
+/// that is *not* padded, because nothing follows it
+/// (`on_available_image`, `aeron_driver_conductor.c:2550-2569`).
+///
+/// [`ImageBuffersReady::encode`] and `decode_available_image` are the two
+/// halves of this and are tested against each other; a decoder that read the
+/// identity where the padding ends would read four bytes of the path's tail as
+/// a length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageBuffersReady<'a> {
+    /// The **publication's** registration id: the log file is named after it,
+    /// and this is what an image reports as its own correlation id.
+    pub correlation_id: i64,
+    /// The session the publication runs under.
+    pub session_id: i32,
+    /// The stream being read.
+    pub stream_id: i32,
+    /// The **subscription's** registration id — the client's own correlation
+    /// id for the `ADD_SUBSCRIPTION`, which is how a client with several
+    /// subscriptions on one stream tells the images apart.
+    pub subscriber_registration_id: i64,
+    /// The `sub-pos` counter this subscription reads through, one per
+    /// (subscription, publication) pair.
+    pub subscriber_position_id: i32,
+    /// The log buffer's path: raw bytes, **not** NUL-terminated, padded to a
+    /// four-byte boundary before the identity that follows.
+    pub log_file: &'a [u8],
+    /// Where the stream comes from. For an IPC channel this is the constant
+    /// `"aeron:ipc"` and not the channel the client wrote
+    /// (`aeron_driver_conductor.c:3612-3613` passes `AERON_IPC_CHANNEL`).
+    pub source_identity: &'a [u8],
+}
+
+impl ImageBuffersReady<'_> {
+    /// The payload, including the padding the decoder has to skip.
+    pub fn encode(&self) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation)] // lengths this build forms
+        let mut out = vec![
+            0u8;
+            IMAGE_BUFFERS_READY_LENGTH
+                + 4
+                + align_up_four(self.log_file.len())
+                + 4
+                + self.source_identity.len()
+        ];
+
+        out[0..8].copy_from_slice(&self.correlation_id.to_le_bytes());
+        out[8..12].copy_from_slice(&self.session_id.to_le_bytes());
+        out[12..16].copy_from_slice(&self.stream_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.subscriber_registration_id.to_le_bytes());
+        out[24..28].copy_from_slice(&self.subscriber_position_id.to_le_bytes());
+
+        let path_length = IMAGE_BUFFERS_READY_LENGTH;
+        out[path_length..path_length + 4]
+            .copy_from_slice(&(self.log_file.len() as i32).to_le_bytes());
+        out[path_length + 4..path_length + 4 + self.log_file.len()].copy_from_slice(self.log_file);
+
+        // The padding bytes between the path and the identity are zero here;
+        // the reference's buffer is a stack array it does not clear, so those
+        // four bytes are whatever was on its stack. Nothing reads them.
+        let identity_length = path_length + 4 + align_up_four(self.log_file.len());
+        out[identity_length..identity_length + 4]
+            .copy_from_slice(&(self.source_identity.len() as i32).to_le_bytes());
+        out[identity_length + 4..].copy_from_slice(self.source_identity);
+
+        out
     }
 }
 
@@ -1218,6 +1355,97 @@ mod response_tests {
         assert_eq!(1001i32.to_le_bytes(), out[24..28]);
         assert_eq!(9i32.to_le_bytes(), out[28..32]);
         assert_eq!(b"aeron:ipc", &out[32..], "no NUL, exactly the length");
+    }
+
+    #[test]
+    fn a_subscription_command_is_what_the_client_encoder_writes() {
+        let request = AddSubscription {
+            client_id: 7,
+            correlation_id: 9,
+            registration_correlation_id: -1,
+            stream_id: 1001,
+            channel: "aeron:ipc?session-id=5",
+        };
+        let mut out = vec![0u8; request.encoded_length()];
+        assert!(request.encode_into(&mut out));
+
+        assert_eq!(32 + 22, out.len());
+        assert_eq!(
+            Some(AddSubscriptionCommand {
+                client_id: 7,
+                correlation_id: 9,
+                registration_correlation_id: -1,
+                stream_id: 1001,
+                channel: b"aeron:ipc?session-id=5",
+            }),
+            decode_add_subscription(&out)
+        );
+
+        // A channel length that runs past the payload is refused, as it is for
+        // a publication.
+        let mut short = vec![0u8; ADD_SUBSCRIPTION_HEADER_LENGTH];
+        short[28..32].copy_from_slice(&4096i32.to_le_bytes());
+        assert!(decode_add_subscription(&short).is_none());
+    }
+
+    #[test]
+    fn the_subscription_ready_is_the_correlated_head_and_a_status_counter() {
+        let ready = encode_subscription_ready(9, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED);
+
+        assert_eq!(12, ready.len(), "packed(4)");
+        assert_eq!(
+            Response::SubscriptionReady {
+                correlation_id: 9,
+                channel_status_indicator_id: CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
+            },
+            decode_response(ON_SUBSCRIPTION_READY_TYPE_ID, &ready)
+        );
+    }
+
+    #[test]
+    fn the_available_image_pads_its_path_and_not_its_identity() {
+        // The path's length is chosen so that the padding is *not* zero: a
+        // decoder that skipped the alignment, or one that applied it to the
+        // identity as well, reads a different string here.
+        for path in [
+            "/tmp/aeron/publications/42.logbuffer",
+            "/tmp/aeron/publications/7.logbuffer",
+            "/p",
+        ] {
+            let ready = ImageBuffersReady {
+                correlation_id: 42,
+                session_id: 100,
+                stream_id: 1001,
+                subscriber_registration_id: 9,
+                subscriber_position_id: 3,
+                log_file: path.as_bytes(),
+                source_identity: b"aeron:ipc",
+            }
+            .encode();
+
+            assert_eq!(
+                28 + 4 + align_up_four(path.len()) + 4 + 9,
+                ready.len(),
+                "{path}"
+            );
+
+            // And it decodes back to what was encoded, through the client's own
+            // decoder — the two halves of one message, checked against each
+            // other rather than against a transcription of the layout.
+            assert_eq!(
+                Response::AvailableImage {
+                    publication_registration_id: 42,
+                    session_id: 100,
+                    stream_id: 1001,
+                    subscriber_registration_id: 9,
+                    subscriber_position_id: 3,
+                    log_file: path.as_bytes(),
+                    source_identity: b"aeron:ipc",
+                },
+                decode_response(ON_AVAILABLE_IMAGE_TYPE_ID, &ready),
+                "{path}"
+            );
+        }
     }
 
     #[test]

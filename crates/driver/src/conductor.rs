@@ -49,12 +49,14 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ON_CLIENT_TIMEOUT_TYPE_ID,
-    ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
-    ON_UNAVAILABLE_COUNTER_TYPE_ID, decode_add_counter, decode_correlated, decode_remove_counter,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ImageBuffersReady,
+    ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, PublicationBuffersReady, decode_add_counter,
+    decode_add_publication, decode_add_subscription, decode_correlated, decode_remove_counter,
     encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
+    encode_subscription_ready,
 };
-use deepmsg_cnc::command::{PublicationBuffersReady, decode_add_publication};
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, ToClientsTransmitter, ToDriverRingConsumer,
@@ -65,6 +67,7 @@ use deepmsg_core::clock::{self, CachedClock};
 use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
+use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -282,6 +285,16 @@ impl ClientEvents for Transmit<'_> {
         let payload = ready.encode();
         self.send(PublicationBuffersReady::type_id(is_exclusive), &payload);
     }
+
+    fn subscription_ready(&mut self, registration_id: i64, channel_status_indicator_id: i32) {
+        let payload = encode_subscription_ready(registration_id, channel_status_indicator_id);
+        self.send(ON_SUBSCRIPTION_READY_TYPE_ID, &payload);
+    }
+
+    fn available_image(&mut self, ready: &ImageBuffersReady<'_>) {
+        let payload = ready.encode();
+        self.send(ON_AVAILABLE_IMAGE_TYPE_ID, &payload);
+    }
 }
 
 /// The driver's control plane.
@@ -300,6 +313,8 @@ pub struct Conductor {
     /// The publications this driver owns, and the thread that maps their log
     /// buffers.
     publications: IpcPublications,
+    /// The subscriptions reading them.
+    subscriptions: IpcSubscriptions,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -321,6 +336,8 @@ pub struct Conductor {
     counter_failures: u64,
     /// `ADD_PUBLICATION`s this driver could not serve.
     publication_failures: u64,
+    /// `ADD_SUBSCRIPTION`s this driver could not serve.
+    subscription_failures: u64,
     malformed: u64,
     unknown_counters: u64,
     unhandled: u64,
@@ -414,6 +431,7 @@ impl Conductor {
             system_counters: owned_counters,
             clients: Clients::new(),
             publications,
+            subscriptions: IpcSubscriptions::new(),
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -432,6 +450,7 @@ impl Conductor {
             broadcast_failures: 0,
             counter_failures: 0,
             publication_failures: 0,
+            subscription_failures: 0,
             malformed: 0,
             unknown_counters: 0,
             unhandled: 0,
@@ -465,9 +484,30 @@ impl Conductor {
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
 
-        let work = work_count + self.process_commands(now_ns) + self.poll_publications();
+        let work = work_count
+            + self.process_commands(now_ns)
+            + self.poll_publications()
+            + self.update_publication_limits();
         self.flush_broadcast_failures();
         work
+    }
+
+    /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
+    /// readers, and clean what they have finished with
+    /// (`aeron_driver_conductor.c:3401-3404`, at the end of the reference's own
+    /// duty cycle).
+    ///
+    /// This is what makes an IPC publication *run*: nothing else writes
+    /// `pub-pos`, so without it a producer's position counter never moves and
+    /// its limit stays where the create left it — zero — which reports
+    /// back-pressure for ever.
+    fn update_publication_limits(&mut self) -> usize {
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        self.publications
+            .update_limits(&mut self.counters, &counter_regions)
     }
 
     /// Take the native resource agent's completions: this is where a
@@ -507,6 +547,7 @@ impl Conductor {
             &mut self.counters,
             &counter_regions,
             &mut self.clients,
+            &mut self.subscriptions,
             now,
             &mut transmit,
         )
@@ -533,9 +574,19 @@ impl Conductor {
         &self.publications
     }
 
+    /// The subscriptions reading this driver's publications.
+    pub const fn subscriptions(&self) -> &IpcSubscriptions {
+        &self.subscriptions
+    }
+
     /// `ADD_PUBLICATION`s this driver could not serve.
     pub const fn publication_failures(&self) -> u64 {
         self.publication_failures
+    }
+
+    /// `ADD_SUBSCRIPTION`s this driver could not serve.
+    pub const fn subscription_failures(&self) -> u64 {
+        self.subscription_failures
     }
 
     /// Commands that are in the protocol and not implemented here yet.
@@ -616,6 +667,9 @@ impl Conductor {
         // publication counters behind.
         self.publications
             .close(&mut self.counters, &regions, self.now_ms);
+        // The subscriptions own no counters: a reader's `sub-pos` is in the
+        // publication's set, and the line above has already given it back.
+        self.subscriptions.close();
 
         let released = self
             .system_counters
@@ -645,6 +699,8 @@ impl Conductor {
         let config = &self.config;
         let publications = &mut self.publications;
         let publication_failures = &mut self.publication_failures;
+        let subscriptions = &mut self.subscriptions;
+        let subscription_failures = &mut self.subscription_failures;
         let now_ms = self.now_ms;
         let liveness_timeout_ns = self.liveness_timeout_ns;
         let pending_failures = &mut self.pending_broadcast_failures;
@@ -719,6 +775,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 clients,
+                                subscriptions,
                                 now,
                                 &mut transmit,
                             ) {
@@ -738,6 +795,37 @@ impl Conductor {
                         None => *malformed += 1,
                     }
                 }
+                // A subscription: parse the URI, register the client, answer
+                // it, and then give it every publication it already matches
+                // (`aeron_driver_conductor.c:4741-4824`).
+                Command::AddSubscription => match decode_add_subscription(payload) {
+                    Some(request) => {
+                        let now = Now {
+                            ms: now_ms,
+                            ns: now_ns,
+                            client_liveness_timeout_ns: liveness_timeout_ns,
+                        };
+
+                        if let Err(error) = subscriptions.add_subscription(
+                            &request,
+                            config,
+                            counters,
+                            &counter_regions,
+                            clients,
+                            publications,
+                            now,
+                            &mut transmit,
+                        ) {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlation_id,
+                                error.error_code(),
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    }
+                    None => *malformed += 1,
+                },
                 Command::ClientClose => match decode_correlated(payload) {
                     Some(correlated) => {
                         clients.on_close(correlated.client_id, counters, &counter_regions);
@@ -1057,9 +1145,9 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 mod tests {
     use super::*;
     use deepmsg_cnc::command::{
-        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ERROR_CODE_INVALID_CHANNEL,
-        ERROR_CODE_NOT_SUPPORTED, ON_ERROR_TYPE_ID, ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
-        ON_PUBLICATION_READY_TYPE_ID,
+        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
+        ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ON_ERROR_TYPE_ID,
+        ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, ON_PUBLICATION_READY_TYPE_ID,
     };
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
     use deepmsg_core::logbuffer::{descriptor, frame};
@@ -1278,29 +1366,56 @@ mod tests {
     /// lands a pass or two after the command: draining once would be asserting
     /// on the speed of a file system, and a deadline is what makes the
     /// assertion about the driver instead.
+    ///
+    /// Anything else that arrives is **kept** in `pending` rather than thrown
+    /// away. A subscription's answer and its image are two events that arrive
+    /// together, and a helper that dropped the second while waiting for the
+    /// first would send its caller looking for an event it had already read.
     fn await_event(
         conductor: &mut Conductor,
         cnc: &CncFile,
         receiver: &mut ToClientsReceiver,
+        pending: &mut Vec<(i32, Vec<u8>)>,
         type_id: i32,
     ) -> Vec<u8> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
         loop {
-            for (received_id, payload) in drain(cnc, receiver) {
-                if received_id == type_id {
-                    return payload;
-                }
+            if let Some(index) = pending.iter().position(|(id, _)| *id == type_id) {
+                return pending.swap_remove(index).1;
             }
+
+            pending.extend(drain(cnc, receiver));
 
             assert!(
                 std::time::Instant::now() < deadline,
-                "no event with type {type_id} arrived"
+                "no event with type {type_id} arrived (pending: {:?})",
+                pending.iter().map(|(id, _)| *id).collect::<Vec<_>>()
             );
 
             conductor.do_work();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// `ADD_SUBSCRIPTION`'s wire form, from the client-side encoder.
+    fn add_subscription_payload(
+        client_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        channel: &str,
+    ) -> Vec<u8> {
+        let command = deepmsg_cnc::command::AddSubscription {
+            client_id,
+            correlation_id,
+            registration_correlation_id: -1,
+            stream_id,
+            channel,
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        out
     }
 
     /// `REMOVE_COUNTER`'s wire form: the correlated head and the **counter's**
@@ -1390,9 +1505,12 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic.
-        send(&conductor, 0x04, b"first");
-        send(&conductor, 0x04, b"second");
+        // pass read without any byte arithmetic. `0x07` is ADD_DESTINATION:
+        // still unimplemented (the network transport is P1-4), which is what a
+        // test wants from a stand-in — a command whose handling cannot start
+        // happening.
+        send(&conductor, 0x07, b"first");
+        send(&conductor, 0x07, b"second");
 
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
@@ -1419,12 +1537,12 @@ mod tests {
     fn an_unimplemented_command_is_counted_and_named() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x04, b"aeron:ipc|1"); // ADD_SUBSCRIPTION
+        send(&conductor, 0x07, b"aeron:ipc|1"); // ADD_DESTINATION
         conductor.do_work();
 
         assert_eq!(1, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddSubscription), conductor.last_unhandled());
+        assert_eq!(Some(Command::AddDestination), conductor.last_unhandled());
         assert!(conductor.is_running(), "and nothing else happened");
     }
 
@@ -1492,7 +1610,7 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x04, b"channel");
+        send(&conductor, 0x07, b"channel");
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands());
 
@@ -1896,6 +2014,7 @@ mod tests {
         let cnc = create(&temp.0);
         let mut conductor = Conductor::new(cnc, &config).expect("conductor");
         let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
 
         let registration_id = 42;
         send(
@@ -1908,6 +2027,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_PUBLICATION_READY_TYPE_ID,
         );
 
@@ -2015,6 +2135,7 @@ mod tests {
         let cnc = create(&temp.0);
         let mut conductor = Conductor::new(cnc, &config).expect("conductor");
         let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
 
         send(
             &conductor,
@@ -2025,6 +2146,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_PUBLICATION_READY_TYPE_ID,
         );
 
@@ -2040,6 +2162,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_PUBLICATION_READY_TYPE_ID,
         );
 
@@ -2072,6 +2195,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
         );
 
@@ -2088,6 +2212,7 @@ mod tests {
         let cnc = create(&temp.0);
         let mut conductor = Conductor::new(cnc, &config).expect("conductor");
         let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
 
         // An exclusive publication holds session 5000 on stream 1001. It is
         // not shareable, so the session id it holds cannot be handed out again
@@ -2102,6 +2227,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID,
         );
         assert_eq!(
@@ -2115,7 +2241,13 @@ mod tests {
             ADD_PUBLICATION_TYPE_ID,
             &add_publication_payload(7, 43, 1001, "aeron:ipc?session-id=5000"),
         );
-        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
 
         assert_eq!(43i64.to_le_bytes(), payload[0..8]);
         assert_eq!(
@@ -2135,6 +2267,7 @@ mod tests {
             &mut conductor,
             &cnc,
             &mut receiver,
+            &mut pending,
             ON_PUBLICATION_READY_TYPE_ID,
         );
 
@@ -2150,6 +2283,7 @@ mod tests {
         let cnc = create(&temp.0);
         let mut conductor = Conductor::new(cnc, &config).expect("conductor");
         let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
 
         // A channel that is not a channel: the reference raises
         // `-AERON_ERROR_CODE_INVALID_CHANNEL`, which reaches the client as the
@@ -2159,7 +2293,13 @@ mod tests {
             ADD_PUBLICATION_TYPE_ID,
             &add_publication_payload(7, 9, 1001, "aeron:tcp?endpoint=localhost:1"),
         );
-        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
 
         assert_eq!(9i64.to_le_bytes(), payload[0..8], "the failing command");
         assert_eq!(
@@ -2177,7 +2317,13 @@ mod tests {
             ADD_PUBLICATION_TYPE_ID,
             &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=localhost:40123"),
         );
-        let payload = await_event(&mut conductor, &cnc, &mut receiver, ON_ERROR_TYPE_ID);
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
 
         assert_eq!(10i64.to_le_bytes(), payload[0..8]);
         assert_eq!(ERROR_CODE_NOT_SUPPORTED.to_le_bytes(), payload[8..12]);
@@ -2193,5 +2339,249 @@ mod tests {
             "and it is counted as malformed rather than as a failed publication"
         );
         assert_eq!(0, conductor.publications().publications().len());
+    }
+    #[test]
+    fn a_subscription_gets_an_image_and_the_producer_gets_a_window() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A publication, created by the client's own encoder and answered with
+        // the bytes the client decodes.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let path = String::from_utf8(ready[36..].to_vec()).expect("a path");
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four"));
+        let limit_counter_id = i32::from_le_bytes(ready[24..28].try_into().expect("four"));
+
+        // The producer's end of the log, mapped the way a client maps it.
+        let producer = deepmsg_client::publication::Publication::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            limit_counter_id,
+            -1,
+        )
+        .expect("the log the driver named");
+
+        // With no reader there is no window at all, which is what a producer
+        // with nobody listening should find.
+        assert_eq!(
+            Some(false),
+            producer.is_connected(),
+            "the driver has not connected anything yet"
+        );
+        assert_eq!(
+            0,
+            conductor
+                .counters()
+                .value(&counter_regions(&conductor), limit_counter_id)
+                .expect("the limit")
+        );
+
+        // A subscription on the same stream.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        let subscription_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        assert_eq!(9i64.to_le_bytes(), subscription_ready[0..8]);
+        assert_eq!(
+            (-1i32).to_le_bytes(),
+            subscription_ready[8..12],
+            "an IPC subscription has no status counter"
+        );
+
+        // And its image, which names the *publication* first and the
+        // subscription second.
+        let image_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        let deepmsg_cnc::command::Response::AvailableImage {
+            publication_registration_id,
+            session_id: image_session_id,
+            stream_id,
+            subscriber_registration_id,
+            subscriber_position_id,
+            log_file,
+            source_identity,
+        } = deepmsg_cnc::command::decode_response(ON_AVAILABLE_IMAGE_TYPE_ID, &image_ready)
+        else {
+            panic!("an image");
+        };
+
+        assert_eq!(42, publication_registration_id, "the publication");
+        assert_eq!(session_id, image_session_id);
+        assert_eq!(1001, stream_id);
+        assert_eq!(9, subscriber_registration_id, "the subscription");
+        assert_eq!(path.as_bytes(), log_file);
+        assert_eq!(b"aeron:ipc", source_identity, "the constant, not the URI");
+
+        // The pass that follows is what gives the producer its window: the
+        // limit becomes the join position plus one term window, and the log's
+        // `is_connected` byte is already one.
+        conductor.do_work();
+        let regions = counter_regions(&conductor);
+        let join_position = conductor
+            .counters()
+            .value(&regions, subscriber_position_id)
+            .expect("the reader's position");
+        assert_eq!(
+            0, join_position,
+            "a reader joining a publication nobody has written to joins at the start"
+        );
+        let limit = conductor
+            .counters()
+            .value(&regions, limit_counter_id)
+            .expect("the limit");
+        assert_eq!(
+            32 * 1024,
+            limit,
+            "half a term of 64 KiB, from the reader's position"
+        );
+        assert_eq!(Some(true), producer.is_connected());
+
+        // The producer writes, the driver reads the tail on its next pass, and
+        // a reader sees the frame.
+        let payload = b"hello driver";
+        let deepmsg_core::logbuffer::append::Appended::Ok { .. } = producer.offer(limit, payload)
+        else {
+            panic!("the window allows one small frame");
+        };
+        conductor.do_work();
+        assert_eq!(
+            Some(64),
+            producer_position(&conductor, 42),
+            "32 bytes of header and 11 of payload, on a 32-byte frame grid"
+        );
+
+        // And the reader's end, mapped from the same reply.
+        let mut image = deepmsg_client::image::Image::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            subscriber_position_id,
+            join_position,
+        )
+        .expect("the same log, read-only");
+
+        let mut seen = Vec::new();
+        image.poll(10, |fragment| {
+            let mut out = vec![0u8; fragment.payload_length()];
+            fragment.copy_payload(&mut out);
+            seen.push(out);
+        });
+
+        assert_eq!(vec![payload.to_vec()], seen);
+    }
+
+    /// The producer's position, as the driver's `pub-pos` counter holds it.
+    fn producer_position(conductor: &Conductor, registration_id: i64) -> Option<i64> {
+        let regions = counter_regions(conductor);
+        let reader = regions.reader();
+        let counter = reader.find_by_type_id(crate::position::type_id::PUBLISHER_POSITION)?;
+
+        assert_eq!(registration_id, counter.registration_id);
+
+        conductor.counters().value(&regions, counter.counter_id)
+    }
+
+    #[test]
+    fn a_subscription_that_arrives_first_is_told_when_the_publication_appears() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // Subscribing to a stream nobody publishes is legal, and the client is
+        // answered as soon as the subscription exists.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "no image without a publication"
+        );
+
+        // The publication arrives, and its reply is followed by the image the
+        // subscription was waiting for.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let image_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+
+        assert_eq!(42i64.to_le_bytes(), image_ready[0..8], "the publication");
+        assert_eq!(9i64.to_le_bytes(), image_ready[16..24], "the subscription");
+
+        // And once more, from the other side: a second publication on another
+        // stream is nobody's, so it produces no image.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 2002, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "another stream is another stream"
+        );
     }
 }

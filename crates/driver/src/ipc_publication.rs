@@ -533,6 +533,23 @@ impl IpcPublication {
         self.subscribers.set_state(counter_id, state, now_ns)
     }
 
+    /// Where a subscriber joining right now should start reading
+    /// (`aeron_ipc_publication_join_position`, `aeron_ipc_publication.h:176-197`).
+    ///
+    /// The earliest position any current reader still needs, or the
+    /// publication's own consumer position when there is none. Not the
+    /// producer's position: a reader that joined at the tail could not be
+    /// served a stream whose earliest unread byte is a term behind, and the
+    /// limit holds the producer back to the oldest reader anyway — so joining
+    /// at the oldest reader is joining where the stream actually is.
+    pub fn join_position(&self, manager: &CounterManager, regions: &CounterRegions<'_>) -> i64 {
+        self.subscribers
+            .min_active_position(manager, regions)
+            .map_or(self.consumer_position, |position| {
+                position.min(self.consumer_position)
+            })
+    }
+
     /// Write `pub-pos` and recompute `pub-lmt`
     /// (`aeron_ipc_publication.c:278-328`).
     ///
