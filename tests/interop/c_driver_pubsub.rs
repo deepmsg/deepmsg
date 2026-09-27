@@ -25,7 +25,7 @@
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT, FRAGMENT_LIMIT};
-use deepmsg_client::image::Fragment;
+use deepmsg_client::fragment_assembler::Message;
 use deepmsg_cnc::CncFile;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::driver::{self, READY_TIMEOUT, ReferenceDriver};
@@ -99,22 +99,19 @@ fn offer_within(
     }
 }
 
-/// Collect every fragment a subscription delivers within `within`.
+/// Collect every message a subscription delivers within `within`.
+///
+/// Messages, not fragments: a subscription's default delivery reassembles the
+/// frames a message arrived in, and this test is about the bytes surviving the
+/// trip rather than about how many frames they took.
 fn drain(client: &mut Client, subscription_id: i64, within: Duration) -> Vec<Vec<u8>> {
     let deadline = Instant::now() + within;
     let mut collected = Vec::new();
 
     while Instant::now() < deadline {
-        client.poll_subscription(
-            subscription_id,
-            FRAGMENT_LIMIT,
-            |fragment: &Fragment<'_>| {
-                let mut payload = vec![0u8; fragment.payload_length()];
-                if fragment.copy_payload(&mut payload).is_some() {
-                    collected.push(payload);
-                }
-            },
-        );
+        client.poll_subscription(subscription_id, FRAGMENT_LIMIT, |message: Message<'_>| {
+            collected.push(message.payload.to_vec());
+        });
 
         if !collected.is_empty() {
             break;

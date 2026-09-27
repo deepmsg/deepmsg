@@ -44,6 +44,9 @@ use std::path::PathBuf;
 
 use deepmsg_cnc::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncLayout};
 
+use crate::publication_params;
+use crate::sys::{self, SocketBufferLengths};
+
 /// Timer interval default: one second (`aeron-driver/src/main/c/aeron_driver_context.h:194`,
 /// assigned from `AERON_TIMER_INTERVAL_NS_DEFAULT` at `aeron_driver_context.c:470`).
 pub const TIMER_INTERVAL_NS_DEFAULT: i64 = 1_000_000_000;
@@ -69,6 +72,72 @@ pub const MAX_TIMER_INTERVAL_NS: i64 = 60 * 60 * 1_000_000_000;
 /// reclaimed slot is readable again: the slot is unusable the moment its state
 /// turns `RECLAIMED`, and this only says how long it must stay that way.
 pub const COUNTER_FREE_TO_REUSE_NS_DEFAULT: i64 = 1_000_000_000;
+
+/// The length of one term of an IPC publication's log buffer: 64 MiB
+/// (`aeron.ipc.term.buffer.length`, `aeron-driver/src/main/c/aeron_driver_context.c:180`).
+///
+/// Sixty-four *mega*, not kilo: a log buffer is three terms and a metadata
+/// page, so one IPC publication of the default size is a 192 MiB file. It is
+/// the term length a URI's `term-length` replaces, and the one
+/// `AERON_IPC_TERM_BUFFER_LENGTH` overrides for a deployment that wants
+/// smaller — which is what a test that creates publications wants.
+pub const IPC_TERM_BUFFER_LENGTH_DEFAULT: i32 = 64 * 1024 * 1024;
+
+/// The largest frame an IPC publication writes: 1408 bytes
+/// (`aeron.ipc.mtu.length`, `aeron_driver_context.c:187`).
+///
+/// Thirty-two bytes larger than the UDP default's payload because the IPC
+/// fixed header is what it is, and it is written into the log buffer's
+/// metadata where a subscriber reads its own MTU from.
+pub const IPC_MTU_LENGTH_DEFAULT: i32 = 1408;
+
+/// How far ahead of its slowest reader an IPC producer may run: zero, which
+/// means half a term (`aeron.ipc.publication.term.window.length`,
+/// `aeron_driver_context.h:216`).
+pub const IPC_PUBLICATION_WINDOW_LENGTH_DEFAULT: i32 = 0;
+
+/// How long a drained publication lingers before it is closed: five seconds
+/// (`aeron.publication.linger.timeout`, `aeron_driver_context.h:189`).
+pub const PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT: i64 = 5_000_000_000;
+
+/// How long a subscription may fail to keep up before the publication stops
+/// counting it towards the limit: five seconds
+/// (`aeron.untethered.window.limit.timeout`, `aeron_driver_context.h:196`).
+pub const UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_DEFAULT: i64 = 5_000_000_000;
+
+/// The same for the lingering half of the tether cycle: unset, which means
+/// "the window limit timeout" (`aeron.untethered.linger.timeout`,
+/// `aeron_driver_context.h:197`).
+///
+/// `-1` is the reference's `AERON_NULL_VALUE`, and it is a value rather than an
+/// `Option` because it is a byte in every log buffer's metadata: the fallback
+/// happens while the publication is created, not here.
+pub const UNTETHERED_LINGER_TIMEOUT_NS_DEFAULT: i64 = -1;
+
+/// And the resting half: ten seconds (`aeron.untethered.resting.timeout`,
+/// `aeron_driver_context.h:198`).
+pub const UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT: i64 = 10_000_000_000;
+
+/// The bottom of the session id range the driver keeps for itself: `-1`
+/// (`aeron.publication.reserved.session.id.low`, `aeron_driver_context.c:229`).
+pub const PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT: i32 = -1;
+
+/// And the top: `1000` (`:230`).
+///
+/// The range exists so that a session id a *client* invents cannot collide
+/// with one the driver hands out, and so that `session-id=-1` — which a client
+/// that does not care about sessions sends — is never a real session.
+pub const PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT: i32 = 1000;
+
+/// Whether a log buffer is left sparse: **true**
+/// (`aeron.term.buffer.sparse.file`, `aeron_driver_context.c:181`).
+///
+/// True means the file system fills the file with zeros as it is read, and the
+/// driver does not touch the pages it allocated. It is a byte in the log
+/// buffer's metadata as well as a behaviour, so a driver that wrote `false`
+/// would differ from the reference in the file *and* in what a reader of the
+/// file is told about it.
+pub const TERM_BUFFER_SPARSE_FILE_DEFAULT: bool = true;
 
 /// What the driver does with a `TERMINATE_DRIVER` command.
 ///
@@ -139,6 +208,46 @@ pub struct DriverConfig {
     /// stale id cannot read a fresh counter as if it were the old one
     /// (`aeron.counters.free.to.reuse.timeout`, one second by default).
     pub counter_free_to_reuse_ns: i64,
+    /// The length of one term of an IPC publication's log buffer
+    /// (`aeron.ipc.term.buffer.length`, see
+    /// [`IPC_TERM_BUFFER_LENGTH_DEFAULT`]).
+    pub ipc_term_buffer_length: i32,
+    /// The largest frame an IPC publication writes
+    /// (`aeron.ipc.mtu.length`, see [`IPC_MTU_LENGTH_DEFAULT`]).
+    pub ipc_mtu_length: i32,
+    /// How far ahead of its slowest reader an IPC producer may run
+    /// (`aeron.ipc.publication.term.window.length`; zero means half a term,
+    /// see [`IPC_PUBLICATION_WINDOW_LENGTH_DEFAULT`]).
+    pub ipc_publication_window_length: i32,
+    /// How long a drained publication lingers
+    /// (`aeron.publication.linger.timeout`).
+    pub publication_linger_timeout_ns: i64,
+    /// How long a subscription may fail to keep up before the publication
+    /// stops counting it (`aeron.untethered.window.limit.timeout`).
+    pub untethered_window_limit_timeout_ns: i64,
+    /// The same for the lingering half of the tether cycle; `-1` means "the
+    /// window limit timeout" (`aeron.untethered.linger.timeout`).
+    pub untethered_linger_timeout_ns: i64,
+    /// And for the resting half (`aeron.untethered.resting.timeout`).
+    pub untethered_resting_timeout_ns: i64,
+    /// Whether a log buffer is left sparse
+    /// (`aeron.term.buffer.sparse.file`, true by default).
+    pub term_buffer_sparse_file: bool,
+    /// The session ids the driver keeps for itself, low end
+    /// (`aeron.publication.reserved.session.id.low`).
+    pub publication_reserved_session_id_low: i32,
+    /// ...and the high end (`aeron.publication.reserved.session.id.high`).
+    pub publication_reserved_session_id_high: i32,
+    /// What a fresh socket reports as its receive and send buffer sizes.
+    ///
+    /// These are four of the fields every log buffer's metadata carries
+    /// (`aeron-driver/src/main/c/aeron_ipc_publication.c:117-124`), so they are
+    /// **not** zeroes and they are not this driver's to choose: the reference
+    /// probes the kernel at start-up
+    /// (`aeron-client/src/main/c/util/aeron_netutil.c:883-919`) and writes
+    /// what it is told. A probe that fails leaves zeroes, which is what a
+    /// process that cannot make a socket would have written anyway.
+    pub socket_buffers: SocketBufferLengths,
 }
 
 impl Default for DriverConfig {
@@ -156,6 +265,20 @@ impl Default for DriverConfig {
             timer_interval_ns: TIMER_INTERVAL_NS_DEFAULT,
             driver_timeout_ms: DRIVER_TIMEOUT_MS_DEFAULT,
             counter_free_to_reuse_ns: COUNTER_FREE_TO_REUSE_NS_DEFAULT,
+            ipc_term_buffer_length: IPC_TERM_BUFFER_LENGTH_DEFAULT,
+            ipc_mtu_length: IPC_MTU_LENGTH_DEFAULT,
+            ipc_publication_window_length: IPC_PUBLICATION_WINDOW_LENGTH_DEFAULT,
+            publication_linger_timeout_ns: PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT,
+            untethered_window_limit_timeout_ns: UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_DEFAULT,
+            untethered_linger_timeout_ns: UNTETHERED_LINGER_TIMEOUT_NS_DEFAULT,
+            untethered_resting_timeout_ns: UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT,
+            term_buffer_sparse_file: TERM_BUFFER_SPARSE_FILE_DEFAULT,
+            publication_reserved_session_id_low: PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
+            publication_reserved_session_id_high: PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT,
+            socket_buffers: SocketBufferLengths {
+                rcvbuf: 0,
+                sndbuf: 0,
+            },
         }
     }
 }
@@ -243,6 +366,80 @@ impl DriverConfig {
             config.counter_free_to_reuse_ns =
                 parse_duration_ns(&Setting::COUNTER_FREE_TO_REUSE_TIMEOUT, &value)?;
         }
+
+        // The publication settings: what a channel URI's parameters override,
+        // and therefore the values a log buffer's metadata is written from
+        // when a URI says nothing.
+        if let Some(value) = get(&Setting::IPC_TERM_BUFFER_LENGTH) {
+            let length = parse_size64(&Setting::IPC_TERM_BUFFER_LENGTH, &value)?;
+            config.ipc_term_buffer_length =
+                publication_params::check_term_length(u64::try_from(length).unwrap_or(u64::MAX))
+                    .map_err(|_| ConfigError::OutOfRange {
+                        name: Setting::IPC_TERM_BUFFER_LENGTH.property,
+                        value,
+                    })?;
+        }
+        if let Some(value) = get(&Setting::IPC_MTU_LENGTH) {
+            let mtu = parse_size64(&Setting::IPC_MTU_LENGTH, &value)?;
+            config.ipc_mtu_length = publication_params::check_mtu(
+                u64::try_from(mtu).unwrap_or(u64::MAX),
+            )
+            .map_err(|_| ConfigError::OutOfRange {
+                name: Setting::IPC_MTU_LENGTH.property,
+                value,
+            })?;
+        }
+        if let Some(value) = get(&Setting::IPC_PUBLICATION_WINDOW_LENGTH) {
+            let window = parse_size64(&Setting::IPC_PUBLICATION_WINDOW_LENGTH, &value)?;
+            config.ipc_publication_window_length =
+                i32::try_from(window).map_err(|_| ConfigError::OutOfRange {
+                    name: Setting::IPC_PUBLICATION_WINDOW_LENGTH.property,
+                    value,
+                })?;
+        }
+        if let Some(value) = get(&Setting::PUBLICATION_LINGER_TIMEOUT) {
+            config.publication_linger_timeout_ns =
+                parse_duration_ns(&Setting::PUBLICATION_LINGER_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::UNTETHERED_WINDOW_LIMIT_TIMEOUT) {
+            config.untethered_window_limit_timeout_ns =
+                parse_duration_ns(&Setting::UNTETHERED_WINDOW_LIMIT_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::UNTETHERED_LINGER_TIMEOUT) {
+            config.untethered_linger_timeout_ns =
+                parse_duration_ns(&Setting::UNTETHERED_LINGER_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::UNTETHERED_RESTING_TIMEOUT) {
+            config.untethered_resting_timeout_ns =
+                parse_duration_ns(&Setting::UNTETHERED_RESTING_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::TERM_BUFFER_SPARSE_FILE) {
+            config.term_buffer_sparse_file = parse_bool(&Setting::TERM_BUFFER_SPARSE_FILE, &value)?;
+        }
+        if let Some(value) = get(&Setting::PUBLICATION_RESERVED_SESSION_ID_LOW) {
+            let id = parse_count(&Setting::PUBLICATION_RESERVED_SESSION_ID_LOW, &value)?;
+            config.publication_reserved_session_id_low =
+                i32::try_from(id).map_err(|_| ConfigError::OutOfRange {
+                    name: Setting::PUBLICATION_RESERVED_SESSION_ID_LOW.property,
+                    value,
+                })?;
+        }
+        if let Some(value) = get(&Setting::PUBLICATION_RESERVED_SESSION_ID_HIGH) {
+            let id = parse_count(&Setting::PUBLICATION_RESERVED_SESSION_ID_HIGH, &value)?;
+            config.publication_reserved_session_id_high =
+                i32::try_from(id).map_err(|_| ConfigError::OutOfRange {
+                    name: Setting::PUBLICATION_RESERVED_SESSION_ID_HIGH.property,
+                    value,
+                })?;
+        }
+
+        // The one setting that is not read from anywhere: the kernel is asked.
+        // It is here rather than in the conductor because it belongs with the
+        // values a log buffer is written from, and it is asked once.
+        config.socket_buffers = sys::default_socket_buffers().unwrap_or(SocketBufferLengths {
+            rcvbuf: 0,
+            sndbuf: 0,
+        });
 
         // The lengths come from six independent settings, so the range checks
         // have to run after all of them are in place. This is the same
@@ -344,6 +541,56 @@ impl Setting {
         env: "AERON_ERROR_BUFFER_LENGTH",
     };
     /// `aeron.client.liveness.timeout` (`:129`).
+    /// `aeron.ipc.term.buffer.length` (`aeronmd.h:145`).
+    const IPC_TERM_BUFFER_LENGTH: Self = Self {
+        property: "ipc.term.buffer.length",
+        env: "AERON_IPC_TERM_BUFFER_LENGTH",
+    };
+    /// `aeron.ipc.mtu.length` (`aeronmd.h:201`).
+    const IPC_MTU_LENGTH: Self = Self {
+        property: "ipc.mtu.length",
+        env: "AERON_IPC_MTU_LENGTH",
+    };
+    /// `aeron.ipc.publication.term.window.length` (`aeronmd.h:209`).
+    const IPC_PUBLICATION_WINDOW_LENGTH: Self = Self {
+        property: "ipc.publication.term.window.length",
+        env: "AERON_IPC_PUBLICATION_TERM_WINDOW_LENGTH",
+    };
+    /// `aeron.publication.reserved.session.id.low` (`aeronmd.h:760`).
+    const PUBLICATION_RESERVED_SESSION_ID_LOW: Self = Self {
+        property: "publication.reserved.session.id.low",
+        env: "AERON_PUBLICATION_RESERVED_SESSION_ID_LOW",
+    };
+    /// `aeron.publication.reserved.session.id.high` (`aeronmd.h:765`).
+    const PUBLICATION_RESERVED_SESSION_ID_HIGH: Self = Self {
+        property: "publication.reserved.session.id.high",
+        env: "AERON_PUBLICATION_RESERVED_SESSION_ID_HIGH",
+    };
+    /// `aeron.publication.linger.timeout` (`aeronmd.h:225`).
+    const PUBLICATION_LINGER_TIMEOUT: Self = Self {
+        property: "publication.linger.timeout",
+        env: "AERON_PUBLICATION_LINGER_TIMEOUT",
+    };
+    /// `aeron.term.buffer.sparse.file` (`aeronmd.h:153`).
+    const TERM_BUFFER_SPARSE_FILE: Self = Self {
+        property: "term.buffer.sparse.file",
+        env: "AERON_TERM_BUFFER_SPARSE_FILE",
+    };
+    /// `aeron.untethered.window.limit.timeout` (`aeronmd.h:611`).
+    const UNTETHERED_WINDOW_LIMIT_TIMEOUT: Self = Self {
+        property: "untethered.window.limit.timeout",
+        env: "AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT",
+    };
+    /// `aeron.untethered.linger.timeout` (`aeronmd.h:620`).
+    const UNTETHERED_LINGER_TIMEOUT: Self = Self {
+        property: "untethered.linger.timeout",
+        env: "AERON_UNTETHERED_LINGER_TIMEOUT",
+    };
+    /// `aeron.untethered.resting.timeout` (`aeronmd.h:629`).
+    const UNTETHERED_RESTING_TIMEOUT: Self = Self {
+        property: "untethered.resting.timeout",
+        env: "AERON_UNTETHERED_RESTING_TIMEOUT",
+    };
     const CLIENT_LIVENESS_TIMEOUT: Self = Self {
         property: "client.liveness.timeout",
         env: "AERON_CLIENT_LIVENESS_TIMEOUT",

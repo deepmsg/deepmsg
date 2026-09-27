@@ -50,6 +50,17 @@ pub struct Fragment<'a> {
 }
 
 impl<'a> Fragment<'a> {
+    /// A fragment over one frame.
+    ///
+    /// The scanner inside [`Image::poll`] is what builds these in production;
+    /// this exists for the tests of the pieces that consume fragments and need
+    /// frames of their own — the assembler's tests write them into a term the
+    /// test owns.
+    #[cfg(test)]
+    pub(crate) const fn new(frame: Frame<'a, ReadOnly>, position: i64) -> Self {
+        Self { frame, position }
+    }
+
     /// Where this fragment begins in the stream.
     pub const fn position(&self) -> i64 {
         self.position
@@ -68,6 +79,49 @@ impl<'a> Fragment<'a> {
     /// Whether this fragment is a whole message.
     pub fn is_unfragmented(&self) -> bool {
         self.frame.is_unfragmented()
+    }
+
+    /// The session whose publication wrote it. This is the key the fragment
+    /// assembler reassembles by: one stream can be carried by two publications
+    /// at once, and their fragments must not be assembled together.
+    pub fn session_id(&self) -> Option<i32> {
+        self.frame.session_id()
+    }
+
+    /// The stream it belongs to.
+    pub fn stream_id(&self) -> Option<i32> {
+        self.frame.stream_id()
+    }
+
+    /// Where it begins in its term.
+    pub fn term_offset(&self) -> Option<i32> {
+        self.frame.term_offset()
+    }
+
+    /// The length of the frame itself, header included.
+    pub fn frame_length(&self) -> Option<i32> {
+        self.frame.frame_length()
+    }
+
+    /// Where the **next** fragment of this message would begin
+    /// (`aeron_header_next_term_offset`,
+    /// `aeron-client/src/main/c/aeron_subscription.c:587-593`).
+    ///
+    /// That is the continuity test the assembler makes: a fragment whose term
+    /// offset is not this is a fragment whose predecessor is missing, and the
+    /// message it was part of can never be completed.
+    pub fn next_term_offset(&self) -> Option<i32> {
+        let term_offset = self.term_offset()?;
+        let length = self.frame_length()?;
+
+        // Checked, because this is arithmetic on a field another process
+        // wrote: a frame whose length does not add up is not a fragment this
+        // build can place, and saying so is better than wrapping into a
+        // plausible offset.
+        let end = term_offset.checked_add(length)?;
+
+        end.checked_add(descriptor::FRAME_ALIGNMENT - 1)
+            .map(|value| value & !(descriptor::FRAME_ALIGNMENT - 1))
     }
 
     /// Copy the payload out, which is what a handler almost always does.
@@ -187,66 +241,72 @@ impl Image {
         let term_length = geometry.term_length as usize;
         let mut fragments = 0;
 
-        while fragments < fragment_limit {
-            let term_begin = self.position.term_begin(geometry.bits_to_shift);
-            let term_end = Position::from_raw(term_begin.raw() + geometry.term_length as i64);
+        // **One term per call.** The partition index is fixed here, at the
+        // entry, and the scan below stops at that term's end; the advance into
+        // the next term happens on the *next* call, where the position already
+        // names it (`aeron_image.c:266-273` does the same, and the Java client
+        // with it). A poll that crossed terms would deliver more fragments than
+        // the reference's for the same state, which is visible to any caller
+        // that throttles by counting them — `docs/compat.md` has the row, and
+        // the test is `a_poll_reads_one_term_at_a_time`.
+        let term_begin = self.position.term_begin(geometry.bits_to_shift);
+        let term_end = Position::from_raw(term_begin.raw() + geometry.term_length as i64);
 
-            let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
-                break;
-            };
-            let offset = (self.position.raw() - term_begin.raw()) as usize;
+        let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
+            return fragments;
+        };
+        let offset = (self.position.raw() - term_begin.raw()) as usize;
 
-            let mut scanner = Scanner::at(&term, term_length, offset);
-            let mut next = self.position;
+        let mut scanner = Scanner::at(&term, term_length, offset);
+        let mut next = self.position;
 
-            loop {
-                match scanner.advance() {
-                    Step::Data {
-                        offset,
-                        frame_length,
-                    } => {
-                        handler(&Fragment {
-                            frame: Frame::new(&term, offset),
-                            position: next.raw(),
-                        });
-                        fragments += 1;
+        loop {
+            match scanner.advance() {
+                Step::Data {
+                    offset,
+                    frame_length,
+                } => {
+                    handler(&Fragment {
+                        frame: Frame::new(&term, offset),
+                        position: next.raw(),
+                    });
+                    fragments += 1;
 
-                        let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
-                        next = Position::from_raw(next.raw() + i64::from(aligned));
+                    let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+                    next = Position::from_raw(next.raw() + i64::from(aligned));
 
-                        if fragments >= fragment_limit {
-                            break;
-                        }
-                    }
-                    // A padding frame means the producer ran out of term, so
-                    // the rest of this term is consumed whatever it contains.
-                    Step::Padding { .. } => {
-                        next = term_end;
+                    if fragments >= fragment_limit {
                         break;
                     }
-                    // The scan reached the term's end because the previous
-                    // frame ended exactly on the boundary, with no padding
-                    // frame to mark it. Not an error, and not "no data": the
-                    // term is simply done.
-                    Step::End => {
-                        next = term_end;
-                        break;
-                    }
-                    // A claimed-but-unpublished frame, or a length no writer
-                    // could have produced. Both stop the scan where they are:
-                    // the position does not move, and the caller comes back.
-                    Step::NotReady { .. } | Step::Malformed { .. } => break,
                 }
+                // A padding frame means the producer ran out of term, so
+                // the rest of this term is consumed whatever it contains.
+                Step::Padding { .. } => {
+                    next = term_end;
+                    break;
+                }
+                // The scan reached the term's end because the previous
+                // frame ended exactly on the boundary, with no padding
+                // frame to mark it. Not an error, and not "no data": the
+                // term is simply done.
+                Step::End => {
+                    next = term_end;
+                    break;
+                }
+                // A claimed-but-unpublished frame, or a length no writer
+                // could have produced. Both stop the scan where they are:
+                // the position does not move, and the caller comes back.
+                Step::NotReady { .. } | Step::Malformed { .. } => break,
             }
-
-            if next.raw() <= self.position.raw() {
-                // No progress. Either the term is not ready or it is empty;
-                // either way looping again would spin.
-                break;
-            }
-
-            self.position = next;
         }
+
+        if next.raw() <= self.position.raw() {
+            // No progress. Either the term is not ready or it is empty;
+            // either way the caller comes back.
+            return fragments;
+        }
+
+        self.position = next;
 
         fragments
     }

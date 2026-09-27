@@ -219,6 +219,87 @@ pub fn locate_verified() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Environment variable naming **our own** driver binary.
+pub const OWN_DRIVER_ENV: &str = "DEEPMSG_DRIVER";
+
+/// Where our own driver is expected to be: this workspace's own build output.
+///
+/// One level up from this crate's directory, which is where the reference's
+/// `../../aeron/...` defaults land two levels up — the reference is a *sibling*
+/// of this repo, and our binary is inside it.
+pub const DEFAULT_OWN_DRIVER: &str = "../target/debug/deepmsg-driver";
+
+/// Find our own media driver.
+///
+/// Unlike the reference it is not version-checked — it is built from this
+/// checkout, so "the wrong driver" is not a state a test can be in — but it is
+/// still looked for rather than assumed, so a workspace that has not built it
+/// skips the tests that need it instead of failing them.
+pub fn locate_own() -> Option<PathBuf> {
+    locate_tool(OWN_DRIVER_ENV, DEFAULT_OWN_DRIVER)
+}
+
+/// A running *deepmsg* media driver, in its own aeron directory.
+///
+/// The same shape as [`ReferenceDriver`] — a driver in a directory of its own,
+/// configured by `-D` properties, stopped by a signal — and built on the same
+/// code, so the two cannot drift apart in how a test starts a driver. What it
+/// is for is the other direction of this suite: every other interop test runs
+/// *our* client against the *reference* driver, and the ones that use this run
+/// the reference client against ours. That is the only arrangement in which a
+/// bug in our driver's own byte contracts can be falsified rather than
+/// restated.
+pub struct OwnDriver(ReferenceDriver);
+
+impl OwnDriver {
+    /// Start our driver for `test_name`, or skip when it is not built.
+    pub fn start(test_name: &str) -> Option<Self> {
+        Self::start_with(test_name, &[])
+    }
+
+    /// Start our driver with additional `-D` properties.
+    ///
+    /// `-Dname=value` is this driver's own configuration syntax
+    /// (`crates/driver/src/config.rs`), which it shares with `aeronmd` on
+    /// purpose: a property list written for one is a property list for the
+    /// other, so a test can configure both drivers the same way.
+    pub fn start_with(test_name: &str, extra_properties: &[&str]) -> Option<Self> {
+        let binary = locate_own()?;
+
+        ReferenceDriver::start_with(&binary, test_name, extra_properties)
+            .ok()
+            .map(Self)
+    }
+
+    /// The aeron directory this driver owns.
+    pub fn aeron_dir(&self) -> &Path {
+        self.0.aeron_dir()
+    }
+
+    /// Wait for the CnC file to be published and readable.
+    pub fn await_cnc(&mut self, timeout: Duration) -> Result<CncFile, DriverError> {
+        self.0.await_cnc(timeout)
+    }
+
+    /// Stop the driver and wait for it.
+    pub fn stop(&mut self) -> Result<ExitStatus, DriverError> {
+        self.0.stop()
+    }
+
+    /// The last lines the driver wrote to its log.
+    pub fn log_tail(&self, lines: usize) -> String {
+        self.0.log_tail(lines)
+    }
+}
+
+/// Announce that a test could not run because our own driver is not built.
+pub fn announce_own_skip() {
+    eprintln!(
+        "SKIPPED: not verified -- no deepmsg driver binary found. \
+         Build it (`cargo build -p deepmsg-driver`) or set {OWN_DRIVER_ENV}."
+    );
+}
+
 /// A running reference driver in its own aeron directory.
 pub struct ReferenceDriver {
     child: Child,

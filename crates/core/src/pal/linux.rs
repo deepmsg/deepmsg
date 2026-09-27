@@ -113,6 +113,19 @@ pub struct MappedFile {
     writable: bool,
 }
 
+// SAFETY: a mapping is process-wide memory, not thread-local state — every
+// thread of this process may address it, and the kernel does not care which one
+// faults on it. What the type tracks is `addr`, `len` and `writable`, all plain
+// values, so moving one between threads moves a description of memory that was
+// always reachable from both. Aliasing is not this impl's business: it is
+// enforced by `AtomicBuffer`'s borrows and by the reference's own single-writer
+// rules, which do not change with the thread.
+//
+// The reason this exists at all is the native resource agent: it creates a log
+// buffer on a thread of its own and hands the mapping to the conductor, which
+// is exactly the transfer this makes legal.
+unsafe impl Send for MappedFile {}
+
 impl MappedFile {
     /// Open `path` and map it read-only, shared with every other process.
     ///

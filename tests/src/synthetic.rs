@@ -118,6 +118,7 @@ impl SyntheticCnc {
         );
         write_i64(&mut bytes, layout::PID_OFFSET, 4242);
         write_i32(&mut bytes, layout::FILE_PAGE_SIZE_OFFSET, 4096);
+
         // Published last, as a driver does.
         write_i32(&mut bytes, layout::CNC_VERSION_OFFSET, version);
 
@@ -137,6 +138,24 @@ impl SyntheticCnc {
 
     /// Rewrite bytes on disk, for the hostile cases a real driver never
     /// produces.
+    /// Give this file a **live** driver's ring heartbeat.
+    ///
+    /// A file with no heartbeat is not a quiet driver: it is one that never
+    /// started, and every reader that asks first asks that question — the
+    /// client reads it before it does anything else and gives up when it is
+    /// missing (`aeron-client/src/main/c/aeron_client_conductor.c:1311-1334`),
+    /// and the directory liveness rule calls the file dead
+    /// (`aeron-driver/src/main/c/aeron_driver.c:136-235`). So it is a choice
+    /// each test makes, not a default: `client_round_trip` wants a running
+    /// driver's file, and `dir_liveness` wants a dead one's.
+    pub fn with_heartbeat(self, now_ms: i64) -> Self {
+        let offset = layout::VERSION_AND_METADATA_LENGTH
+            + COMMAND_CAPACITY
+            + layout::MPSC_CONSUMER_HEARTBEAT_OFFSET;
+
+        self.patch(offset, &now_ms.to_le_bytes())
+    }
+
     pub fn patch(self, offset: usize, bytes: &[u8]) -> Self {
         let path = self.cnc_path();
         let mut file = std::fs::OpenOptions::new()

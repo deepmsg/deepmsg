@@ -112,8 +112,10 @@ impl Publication {
     ///
     /// # Errors
     ///
-    /// See [`Appended`]. `EndOfLog` is not a failure: the log rotated and the
-    /// caller retries into the new term.
+    /// See [`Appended`]. Two outcomes are "try again" rather than "no":
+    /// `EndOfLog` (the log rotated and the caller retries into the new term)
+    /// and `MidRotation` (another producer is rotating right now, so the caller
+    /// retries once it has settled).
     pub fn offer(&self, position_limit: i64, payload: &[u8]) -> Appended {
         let Some(appender) = self.appender() else {
             return Appended::Malformed;

@@ -157,6 +157,27 @@ impl<'a, Access> CountersReader<'a, Access> {
         found
     }
 
+    /// One counter's record, by id.
+    ///
+    /// `None` when the id is out of range or its slot is not a live counter —
+    /// which is what makes this the reader for "is the counter I cached still
+    /// *mine*": the reference asks the same question of the record at the id
+    /// (`aeron_counter_heartbeat_timestamp_is_active`,
+    /// `aeron-client/src/main/c/aeron_client_conductor.c:1338-1360`, which
+    /// checks the type, the registration and the state of the slot the client
+    /// remembers).
+    pub fn get(&self, counter_id: i32) -> Option<CounterDescriptor> {
+        let mut found = None;
+
+        self.for_each(|counter| {
+            if counter.counter_id == counter_id {
+                found = Some(counter.clone());
+            }
+        });
+
+        found
+    }
+
     /// The current value of one counter, by id.
     pub fn value(&self, counter_id: i32) -> Option<i64> {
         if counter_id < 0 || counter_id > self.max_counter_id {

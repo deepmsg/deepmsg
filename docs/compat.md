@@ -95,6 +95,41 @@ writes the heartbeat first for a reason — a file that passes a client's versio
 gate and then fails its liveness rule is a file every client reads as a driver
 that is already gone (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
 
+## The client's view of the ring, and of a message
+
+Four places where this build answers a question the reference answers
+differently, all on the client's side. Each names the test that covers it.
+
+- **A lap is counted, not fatal.** When the driver writes more events than the
+  to-clients ring holds while a client is not reading, the events the client has
+  not read are overwritten. The reference treats that as a system error and
+  force-closes the client (`aeron-client/src/main/c/aeron_client_conductor.c:2728-2734`);
+  deepmsg resynchronises forward, counts (`Client::laps`, `Client::discarded`)
+  and passes the counts into a timeout's message, so a caller that sees a
+  timeout can tell "the driver ignored me" from "my reply was overwritten".
+  Covered by `crates/driver/src/conductor.rs::a_client_that_falls_a_ring_behind_counts_the_lap`
+  and, for the receiver's own semantics, `crates/cnc/src/broadcast.rs::a_lap_resyncs_forwards_and_is_counted`.
+- **One term per poll.** `Image::poll` fixes the partition at its entry and
+  stops at that term's end, advancing into the next term on the *next* call —
+  which is what `aeron_image_poll` does (`aeron-client/src/main/c/aeron_image.c:266-273`)
+  and what a caller that throttles by counting fragments per poll depends on.
+  Covered by `crates/driver/src/conductor.rs::a_poll_reads_one_term_at_a_time`.
+- **An abandoned message is counted.** The fragment assembler drops a message
+  whose fragments do not line up, as the reference does, and keeps a count of
+  them (`FragmentAssembler::abandoned`) where the reference counts nothing
+  (`aeron-client/src/main/c/aeron_fragment_assembler.c:170-181`). ADR-0003: a
+  skipped input is a counted one. Covered by the assembler's own tests in
+  `crates/client/src/fragment_assembler.rs`.
+- **A delivered message is copied.** `Message::payload` points into the
+  assembler's buffer, so every message is copied once; the reference hands out
+  a pointer into the term for a message that arrived in one frame
+  (`aeron_fragment_assembler.c:158-161`). A `&[u8]` over a term is a reference
+  into memory a producer may be writing — in one process, in every test that
+  publishes and subscribes at once — and `deepmsg-core`'s buffer API hands out
+  no such slice for that reason. The copy is into a reused buffer, so a
+  session's messages allocate nothing after the first. Covered by the same
+  tests.
+
 ## Configuration names
 
 The driver reads the reference's settings under both spellings: the property

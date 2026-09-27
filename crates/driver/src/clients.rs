@@ -35,9 +35,12 @@
 //! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
 //! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
 
+use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::ipc_publications::IpcPublications;
+use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::system_counters;
 
 /// Where a driver→client event goes.
@@ -71,6 +74,36 @@ pub trait ClientEvents {
 
     /// `ON_ERROR`: the command with this correlation id failed.
     fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]);
+
+    /// `ON_SUBSCRIPTION_READY`: the subscription exists. It is sent *before*
+    /// any image, because a client that heard about an image first would have
+    /// an image for a subscription it has not been told about.
+    fn subscription_ready(&mut self, registration_id: i64, channel_status_indicator_id: i32);
+
+    /// `ON_AVAILABLE_IMAGE`: a publication this subscription matches exists,
+    /// and its log buffer can be mapped from [`ImageBuffersReady::log_file`].
+    fn available_image(&mut self, ready: &ImageBuffersReady<'_>);
+
+    /// `ON_UNAVAILABLE_IMAGE`: an image this subscription was reading is gone,
+    /// and the client must unmap it. The channel is the **subscription's** —
+    /// the one the client subscribed with — except where a publication is
+    /// revoked, which sends the constant `aeron:ipc` instead
+    /// (`aeron_driver_conductor.c:510-517` against `:5975-5982`).
+    fn unavailable_image(
+        &mut self,
+        correlation_id: i64,
+        subscription_registration_id: i64,
+        stream_id: i32,
+        channel: &[u8],
+    );
+
+    /// `ON_PUBLICATION_READY` or `ON_EXCLUSIVE_PUBLICATION_READY`: the log
+    /// buffer exists and the client may map it.
+    ///
+    /// Which of the two type ids is sent says whether the log buffer may be
+    /// shared with another producer, so it is part of the message rather than
+    /// something the client can work out for itself.
+    fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool);
 }
 
 /// One counter a client owns, by the id the client knows it as.
@@ -98,6 +131,22 @@ pub struct ClientRecord {
     pub liveness_timeout_ms: i64,
     /// Counters this client allocated, in allocation order.
     pub counter_links: Vec<CounterLink>,
+    /// Publications this client holds, in the order it asked for them.
+    pub publication_links: Vec<PublicationLink>,
+}
+
+/// One client's hold on a publication (`aeron_publication_link_t`,
+/// `aeron-driver/src/main/c/aeron_driver_common.h:212-217`).
+///
+/// Two ids, and they are not interchangeable: the first is what the client
+/// called this `ADD_PUBLICATION`, the second is the publication itself. A
+/// removal is matched by the first and acted on the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationLink {
+    /// The client's correlation id for the `ADD_PUBLICATION` that made it.
+    pub registration_id: i64,
+    /// The publication's own registration id — the log file's name.
+    pub publication_registration_id: i64,
 }
 
 /// The clients this driver knows about.
@@ -189,6 +238,7 @@ impl Clients {
             heartbeat_counter_id,
             liveness_timeout_ms: liveness_timeout_ms(liveness_timeout_ns),
             counter_links: Vec::new(),
+            publication_links: Vec::new(),
         });
 
         events.counter_ready(client_id, heartbeat_counter_id);
@@ -303,13 +353,21 @@ impl Clients {
     /// went out with the timeout in phase one, which is why this does not
     /// repeat it.
     ///
+    /// What the client held elsewhere goes with it: its publications are let
+    /// go of, and its subscriptions are detached from the publications they
+    /// read. Since the client is not there to hear it, none of that is
+    /// announced.
+    ///
     /// Returns how many clients were reaped.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn reap_expired(
         &mut self,
         now_ms: i64,
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
+        publications: &mut IpcPublications,
+        subscriptions: &mut IpcSubscriptions,
     ) -> usize {
         let mut reaped = 0;
         let mut index = self.records.len();
@@ -321,7 +379,15 @@ impl Clients {
                 continue;
             }
 
-            self.reap(index, now_ms, manager, regions, events);
+            self.reap(
+                index,
+                now_ms,
+                manager,
+                regions,
+                events,
+                publications,
+                subscriptions,
+            );
             self.records.swap_remove(index);
             reaped += 1;
         }
@@ -336,6 +402,7 @@ impl Clients {
     /// announced before it is freed, then the heartbeat — whose announcement
     /// already went out with the timeout, which is why this one does not repeat
     /// it.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
     fn reap(
         &mut self,
         index: usize,
@@ -343,13 +410,23 @@ impl Clients {
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
+        publications: &mut IpcPublications,
+        subscriptions: &mut IpcSubscriptions,
     ) {
         let record = &mut self.records[index];
+
+        // The publications first, in the reference's order (`:1220-1241`): a
+        // client that dies takes its links with it, and a publication whose last
+        // link that was starts draining.
+        publications.release_links(&record.publication_links, manager, regions);
+        record.publication_links.clear();
 
         for link in std::mem::take(&mut record.counter_links) {
             events.counter_unavailable(link.registration_id, link.counter_id);
             manager.free(regions, link.counter_id, now_ms);
         }
+
+        subscriptions.remove_for_client(record.client_id, manager, regions, publications, now_ms);
 
         manager.free(regions, record.heartbeat_counter_id, now_ms);
         record.client_id = -1;
@@ -386,6 +463,15 @@ mod tests {
         }
     }
 
+    /// The publication and subscription managers a teardown needs, with no
+    /// publications in them: what these tests are about is the client pool.
+    fn managers() -> (IpcPublications, IpcSubscriptions) {
+        (
+            IpcPublications::start(-1, 1000).expect("an agent thread"),
+            IpcSubscriptions::new(),
+        )
+    }
+
     /// A recording sink: the events, in the order they were raised.
     #[derive(Debug, Default)]
     struct Events(Vec<String>);
@@ -410,6 +496,38 @@ mod tests {
 
         fn error(&mut self, correlation_id: i64, error_code: i32, _message: &[u8]) {
             self.0.push(format!("error:{correlation_id}:{error_code}"));
+        }
+
+        fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
+            self.0.push(format!(
+                "publication:{}:{}:exclusive={is_exclusive}",
+                ready.correlation_id, ready.registration_id
+            ));
+        }
+
+        fn subscription_ready(&mut self, registration_id: i64, channel_status_indicator_id: i32) {
+            self.0.push(format!(
+                "subscription:{registration_id}:{channel_status_indicator_id}"
+            ));
+        }
+
+        fn available_image(&mut self, ready: &ImageBuffersReady<'_>) {
+            self.0.push(format!(
+                "image:{}:{}",
+                ready.correlation_id, ready.subscriber_registration_id
+            ));
+        }
+
+        fn unavailable_image(
+            &mut self,
+            correlation_id: i64,
+            subscription_registration_id: i64,
+            _stream_id: i32,
+            _channel: &[u8],
+        ) {
+            self.0.push(format!(
+                "unavailable:{correlation_id}:{subscription_registration_id}"
+            ));
         }
     }
 
@@ -556,6 +674,7 @@ mod tests {
     fn a_silent_client_is_reaped_and_announced_in_the_references_order() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -580,7 +699,14 @@ mod tests {
         assert_eq!(1, clients.len(), "…and phase two is what reclaims");
         assert_eq!(
             1,
-            clients.reap_expired(NOW + 11_001, &mut manager, &regions, &mut events)
+            clients.reap_expired(
+                NOW + 11_001,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            )
         );
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0"],
@@ -602,6 +728,7 @@ mod tests {
     fn a_client_that_closed_itself_is_reaped_without_a_timeout_announcement() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -613,7 +740,14 @@ mod tests {
         clients.on_time_event(NOW + 1, &manager, &regions, &mut events);
         assert_eq!(
             1,
-            clients.reap_expired(NOW + 1, &mut manager, &regions, &mut events),
+            clients.reap_expired(
+                NOW + 1,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            ),
             "a zeroed heartbeat expires on the next tick, without a timeout"
         );
         assert_eq!(
@@ -627,6 +761,7 @@ mod tests {
     fn a_clients_counters_go_before_its_heartbeat() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -651,7 +786,14 @@ mod tests {
         events.0.clear();
 
         clients.on_time_event(NOW + 20_000, &manager, &regions, &mut events);
-        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
+        clients.reap_expired(
+            NOW + 20_000,
+            &mut manager,
+            &regions,
+            &mut events,
+            &mut publications,
+            &mut subscriptions,
+        );
 
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0", "unavailable:42:1"],
@@ -674,6 +816,7 @@ mod tests {
         // record and its counters for the driver's whole life.
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -691,7 +834,14 @@ mod tests {
         );
         assert_eq!(
             1,
-            clients.reap_expired(NOW, &mut manager, &regions, &mut events)
+            clients.reap_expired(
+                NOW,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            )
         );
         assert!(clients.is_empty());
     }
@@ -705,6 +855,7 @@ mod tests {
         // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -738,7 +889,14 @@ mod tests {
         assert_eq!(2, clients.len(), "and nothing reclaimed yet");
 
         events.0.clear();
-        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
+        clients.reap_expired(
+            NOW + 20_000,
+            &mut manager,
+            &regions,
+            &mut events,
+            &mut publications,
+            &mut subscriptions,
+        );
         assert!(
             events
                 .0
@@ -768,6 +926,22 @@ mod tests {
             fn counter_unavailable(&mut self, _registration_id: i64, _counter_id: i32) {}
             fn operation_succeeded(&mut self, _correlation_id: i64) {}
             fn error(&mut self, _correlation_id: i64, _error_code: i32, _message: &[u8]) {}
+            fn publication_ready(
+                &mut self,
+                _ready: &PublicationBuffersReady<'_>,
+                _is_exclusive: bool,
+            ) {
+            }
+            fn subscription_ready(&mut self, _registration_id: i64, _status: i32) {}
+            fn available_image(&mut self, _ready: &ImageBuffersReady<'_>) {}
+            fn unavailable_image(
+                &mut self,
+                _correlation_id: i64,
+                _subscription_registration_id: i64,
+                _stream_id: i32,
+                _channel: &[u8],
+            ) {
+            }
 
             fn client_timed_out(&mut self, _client_id: i64) {
                 self.seen.push(

@@ -17,6 +17,7 @@
 //!   frame, and rotation.
 //! - [`scan`]       — walking frames as a reader: skipping padding, and
 //!   stopping at a frame that is not yet ready.
+//! - [`logfile`]    — creating and removing the file those three terms live in.
 //! - [`repair`]     — the rebuilder, the gap scanner, the gap filler, and the
 //!   unblocker.
 //!
@@ -39,6 +40,7 @@
 pub mod append;
 pub mod descriptor;
 pub mod frame;
+pub mod logfile;
 pub mod position;
 pub mod repair;
 pub mod scan;
