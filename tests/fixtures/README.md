@@ -31,3 +31,40 @@ The contents of the regions are covered by the synthetic buffers in
 Signal the pid you spawned, never `pkill aeronmd`: a developer may have their
 own driver running, and killing it would take their work with it. The harness
 in `tests/src/driver.rs` exists partly so that no test has to remember this.
+
+## `counters-metadata.bin`
+
+The first **46 counter metadata records** — 46 × 512 = 23,552 bytes — of the
+same captured `cnc.dat`: the counters a default-configured `aeronmd` 1.53.2
+allocates before it publishes anything.
+
+Captured from the same run as `cnc-header.bin` (2026-09-27), from the start of
+the counters metadata region, which `docs/protocol/cnc-layout.md` places at
+128 + to_driver + to_clients = 2,098,176 for the default layout.
+
+The records are the contract `AeronStat` reads: state, type id, a four-byte
+little-endian index as the key, the label, and — in the values region — the
+index as the registration id and `-1` as the owner. What a *golden test* may
+compare directly is everything except three things that are runtime or build
+identity rather than contract:
+
+- the counter values (byte counts, cycle times, the pid of the run),
+- the two labels that name a build (`Errors: …`, `Aeron software: …`), and
+- the labels' runtime suffixes: the threading mode, the resolver name and the
+  duty-cycle thresholds, which a driver appends from its own configuration.
+
+`crates/driver/tests/system_counters.rs` compares up to the first `:` of each
+label for exactly that reason, and says so where it does it.
+
+### Regenerating
+
+Same as `cnc-header.bin`, with one extra step before the kill:
+
+    python3 -c "
+    import sys
+    data = open(sys.argv[1], 'rb').read()[2098176:2098176 + 46 * 512]
+    open('tests/fixtures/counters-metadata.bin', 'wb').write(data)
+    " "$AERON_DIR/cnc.dat"
+
+If a future reference build changes a label, the diff will be in this file —
+which is the point of committing it whole rather than as a list of strings.
