@@ -11,6 +11,8 @@
 
 use deepmsg_cnc::command::CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED;
 
+use crate::fragment_assembler::FragmentAssembler;
+use crate::image::Fragment;
 use crate::image::Image;
 
 /// A subscription and the images attached to it.
@@ -25,6 +27,15 @@ pub struct Subscription {
     channel: String,
     stream_id: i32,
     images: Vec<Image>,
+    /// What the fragments of this subscription's images are reassembled into
+    /// when it is polled for whole messages.
+    ///
+    /// One per subscription, which is the arrangement the reference's own
+    /// samples use (`aeron-samples/src/main/c/basic_subscriber.c` creates one
+    /// assembler per subscription): a message is reassembled per **session**,
+    /// and a second subscription reading a different stream has no business
+    /// sharing the buffer its messages are copied into.
+    pub(crate) assembler: FragmentAssembler,
 }
 
 impl Subscription {
@@ -41,7 +52,68 @@ impl Subscription {
             channel,
             stream_id,
             images: Vec::new(),
+            assembler: FragmentAssembler::new(),
         }
+    }
+
+    /// The assembler this subscription's messages are reassembled in, and how
+    /// many messages it abandoned on the way.
+    pub const fn assembler(&self) -> &FragmentAssembler {
+        &self.assembler
+    }
+
+    /// Poll every image, delivering whole messages, and hand back the counter
+    /// positions the caller has to publish.
+    ///
+    /// The positions are returned rather than written because the counters live
+    /// in the CnC file and this type does not own it: writing them here would
+    /// need the file borrowed while the subscription is borrowed mutably, which
+    /// is exactly the aliasing the borrow checker exists to refuse. The caller
+    /// — [`crate::Client::poll_subscription`] — writes them after the poll.
+    pub(crate) fn poll_messages<F>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut F,
+    ) -> (usize, Vec<(i32, i64)>)
+    where
+        F: FnMut(crate::fragment_assembler::Message<'_>),
+    {
+        let mut messages = 0;
+        let mut fragments = 0;
+        let mut counter_writes = Vec::new();
+
+        // The images and the assembler are borrowed apart here because both are
+        // needed at once: the images are what is read, the assembler is where
+        // their fragments go.
+        let Self {
+            images, assembler, ..
+        } = self;
+
+        for image in images.iter_mut() {
+            let remaining = fragment_limit.saturating_sub(fragments);
+            if 0 == remaining {
+                break;
+            }
+
+            // The assembler counts what it delivers, so this needs no second
+            // closure to count for it — and a closure inside a closure is where
+            // the borrow checker's higher-ranked inference gives up.
+            let before = assembler.delivered();
+
+            // The parameter's type is spelled out because an unannotated
+            // closure gets one lifetime inferred from its first use, and the
+            // poll hands it fragments of *every* lifetime it reads — the
+            // compiler's "implementation of `FnMut` is not general enough".
+            fragments += image.poll(remaining, &mut |fragment: &Fragment<'_>| {
+                assembler.push(fragment, handler);
+            });
+
+            messages += usize::try_from(assembler.delivered() - before).unwrap_or(0);
+
+            counter_writes.push((image.subscriber_position_id(), image.position()));
+        }
+
+        (messages, counter_writes)
     }
 
     /// The subscription's registration id.

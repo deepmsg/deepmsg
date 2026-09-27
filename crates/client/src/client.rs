@@ -42,6 +42,7 @@ use deepmsg_cnc::command::{
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
+use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::publication::Publication;
 use crate::subscription::Subscription;
@@ -545,10 +546,23 @@ impl Client {
     }
 
     /// Read up to `fragment_limit` fragments from every image of a
-    /// subscription.
+    /// subscription, and deliver **whole messages**.
     ///
-    /// Convenience for the common case; [`Client::poll_image`] is the same
-    /// thing for one image.
+    /// This is the subscription's default delivery, and the reference's: a
+    /// client that polls a subscription reads messages, and the frames they
+    /// arrived in are an implementation detail of the transport
+    /// (`aeron_subscription_poll` with a fragment assembler, which is what
+    /// every reference sample does). The fragments are reassembled per session
+    /// by the subscription's own assembler, so a message split across two
+    /// polls — or across two images — is still delivered once, whole.
+    ///
+    /// [`Client::poll_image`] is the fragment-level view, for a caller that
+    /// wants the frames themselves. Mixing the two on one subscription is legal
+    /// but worth thinking about: the fragments the raw poll takes are fragments
+    /// the assembler never sees, and a message missing a piece is a message
+    /// abandoned.
+    ///
+    /// Returns how many messages were delivered.
     pub fn poll_subscription<F>(
         &mut self,
         subscription_id: i64,
@@ -556,10 +570,8 @@ impl Client {
         mut handler: F,
     ) -> usize
     where
-        F: FnMut(&Fragment<'_>),
+        F: FnMut(Message<'_>),
     {
-        let mut total = 0;
-
         let Some(subscription) = self
             .subscriptions
             .iter_mut()
@@ -568,23 +580,20 @@ impl Client {
             return 0;
         };
 
-        for image in subscription.images_mut() {
-            let remaining = fragment_limit.saturating_sub(total);
-            if 0 == remaining {
-                break;
-            }
+        let (messages, counter_writes) = subscription.poll_messages(fragment_limit, &mut handler);
 
-            total += image.poll(remaining, &mut handler);
-
-            // Published before moving to the next image rather than after all
-            // of them: each image's position is its own, and holding it back
-            // would delay the publisher's window for no benefit.
-            if let Some(counters) = self.cnc.counters_writable() {
-                counters.set_value(image.subscriber_position_id(), image.position());
+        // Published after the poll rather than during it: the counters live in
+        // the CnC file, which the images do not borrow, and the reference
+        // publishes a reader's position for the driver to compute the
+        // publisher's window from — an image that is read but not reported
+        // eventually blocks the publisher (`aeron_ipc_publication.c:296-313`).
+        if let Some(counters) = self.cnc.counters_writable() {
+            for (counter_id, position) in counter_writes {
+                counters.set_value(counter_id, position);
             }
         }
 
-        total
+        messages
     }
 
     /// Send a command and register it as pending with a deadline.

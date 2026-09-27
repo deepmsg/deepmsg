@@ -50,6 +50,17 @@ pub struct Fragment<'a> {
 }
 
 impl<'a> Fragment<'a> {
+    /// A fragment over one frame.
+    ///
+    /// The scanner inside [`Image::poll`] is what builds these in production;
+    /// this exists for the tests of the pieces that consume fragments and need
+    /// frames of their own — the assembler's tests write them into a term the
+    /// test owns.
+    #[cfg(test)]
+    pub(crate) const fn new(frame: Frame<'a, ReadOnly>, position: i64) -> Self {
+        Self { frame, position }
+    }
+
     /// Where this fragment begins in the stream.
     pub const fn position(&self) -> i64 {
         self.position
@@ -68,6 +79,49 @@ impl<'a> Fragment<'a> {
     /// Whether this fragment is a whole message.
     pub fn is_unfragmented(&self) -> bool {
         self.frame.is_unfragmented()
+    }
+
+    /// The session whose publication wrote it. This is the key the fragment
+    /// assembler reassembles by: one stream can be carried by two publications
+    /// at once, and their fragments must not be assembled together.
+    pub fn session_id(&self) -> Option<i32> {
+        self.frame.session_id()
+    }
+
+    /// The stream it belongs to.
+    pub fn stream_id(&self) -> Option<i32> {
+        self.frame.stream_id()
+    }
+
+    /// Where it begins in its term.
+    pub fn term_offset(&self) -> Option<i32> {
+        self.frame.term_offset()
+    }
+
+    /// The length of the frame itself, header included.
+    pub fn frame_length(&self) -> Option<i32> {
+        self.frame.frame_length()
+    }
+
+    /// Where the **next** fragment of this message would begin
+    /// (`aeron_header_next_term_offset`,
+    /// `aeron-client/src/main/c/aeron_subscription.c:587-593`).
+    ///
+    /// That is the continuity test the assembler makes: a fragment whose term
+    /// offset is not this is a fragment whose predecessor is missing, and the
+    /// message it was part of can never be completed.
+    pub fn next_term_offset(&self) -> Option<i32> {
+        let term_offset = self.term_offset()?;
+        let length = self.frame_length()?;
+
+        // Checked, because this is arithmetic on a field another process
+        // wrote: a frame whose length does not add up is not a fragment this
+        // build can place, and saying so is better than wrapping into a
+        // plausible offset.
+        let end = term_offset.checked_add(length)?;
+
+        end.checked_add(descriptor::FRAME_ALIGNMENT - 1)
+            .map(|value| value & !(descriptor::FRAME_ALIGNMENT - 1))
     }
 
     /// Copy the payload out, which is what a handler almost always does.

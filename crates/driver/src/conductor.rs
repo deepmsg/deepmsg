@@ -3087,4 +3087,129 @@ mod tests {
             conductor.publications().publications()[0].end_of_stream_position()
         );
     }
+
+    #[test]
+    fn a_fragmented_message_from_our_client_arrives_whole() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A publication and a reader for it, the way every client does it.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let path = String::from_utf8(ready[36..].to_vec()).expect("a path");
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four"));
+        let limit_counter_id = i32::from_le_bytes(ready[24..28].try_into().expect("four"));
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let image_ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        let deepmsg_cnc::command::Response::AvailableImage {
+            subscriber_position_id,
+            ..
+        } = deepmsg_cnc::command::decode_response(ON_AVAILABLE_IMAGE_TYPE_ID, &image_ready)
+        else {
+            panic!("an image");
+        };
+
+        let producer = deepmsg_client::publication::Publication::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            limit_counter_id,
+            -1,
+        )
+        .expect("the log the driver named");
+
+        // The window has to be open before a payload this size can be offered.
+        conductor.do_work();
+        let limit = counter_value(&conductor, limit_counter_id).expect("the limit");
+
+        // Three frames' worth: one frame holds 1376 bytes of payload on this
+        // channel, so the client splits this into three and the driver carries
+        // frames it knows nothing about the shape of.
+        let payload: Vec<u8> = (0..1376 * 2 + 10)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let deepmsg_core::logbuffer::append::Appended::Ok { .. } = producer.offer(limit, &payload)
+        else {
+            panic!("the window allows this");
+        };
+
+        conductor.do_work();
+        let regions = counter_regions(&conductor);
+        let join_position = conductor
+            .counters()
+            .value(&regions, subscriber_position_id)
+            .expect("the reader's position");
+        assert_eq!(0, join_position);
+
+        // Read the frames back through the reader's mapping, and reassemble.
+        let mut image = deepmsg_client::image::Image::open(
+            std::path::Path::new(&path),
+            42,
+            session_id,
+            1001,
+            subscriber_position_id,
+            join_position,
+        )
+        .expect("the same log, read-only");
+
+        let mut assembler = deepmsg_client::fragment_assembler::FragmentAssembler::new();
+        let mut delivered: Vec<(i32, i32, Vec<u8>)> = Vec::new();
+        let mut frames = 0;
+
+        // The fragment's type is spelled out because an unannotated closure
+        // gets one lifetime inferred from its first use, and this one is handed
+        // fragments of every lifetime the image reads.
+        frames += image.poll(64, &mut |fragment: &deepmsg_client::image::Fragment<'_>| {
+            let mut handler = |message: deepmsg_client::fragment_assembler::Message<'_>| {
+                delivered.push((
+                    message.header.session_id,
+                    message.header.stream_id,
+                    message.payload.to_vec(),
+                ));
+            };
+
+            assembler.push(fragment, &mut handler);
+        });
+
+        assert_eq!(3, frames, "the appender split it into three frames");
+        assert_eq!(
+            vec![(session_id, 1001, payload)],
+            delivered,
+            "and the reader gets one message, not three fragments"
+        );
+        assert_eq!(0, assembler.abandoned());
+    }
 }
