@@ -51,6 +51,15 @@ pub const TIMER_INTERVAL_NS_DEFAULT: i64 = 1_000_000_000;
 /// (`aeron-driver/src/main/c/aeron_driver_context.c:217`).
 pub const DRIVER_TIMEOUT_MS_DEFAULT: i64 = 10 * 1000;
 
+/// How long a reclaimed counter stays out of reuse: one second, the reference's
+/// `AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_NS_DEFAULT`
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:211`).
+///
+/// It is a *floor* on how soon an id can come back, not a delay before a
+/// reclaimed slot is readable again: the slot is unusable the moment its state
+/// turns `RECLAIMED`, and this only says how long it must stay that way.
+pub const COUNTER_FREE_TO_REUSE_NS_DEFAULT: i64 = 1_000_000_000;
+
 /// What the driver does with a `TERMINATE_DRIVER` command.
 ///
 /// The reference has no compiled-in answer: it loads one of two functions by
@@ -116,6 +125,10 @@ pub struct DriverConfig {
     /// directory over. The liveness window this driver checks *other* drivers
     /// against; it is not what it asks of its clients.
     pub driver_timeout_ms: i64,
+    /// How long a reclaimed counter stays out of reuse, so a client holding a
+    /// stale id cannot read a fresh counter as if it were the old one
+    /// (`aeron.counters.free.to.reuse.timeout`, one second by default).
+    pub counter_free_to_reuse_ns: i64,
 }
 
 impl Default for DriverConfig {
@@ -132,6 +145,7 @@ impl Default for DriverConfig {
             client_liveness_timeout_ns: CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT,
             timer_interval_ns: TIMER_INTERVAL_NS_DEFAULT,
             driver_timeout_ms: DRIVER_TIMEOUT_MS_DEFAULT,
+            counter_free_to_reuse_ns: COUNTER_FREE_TO_REUSE_NS_DEFAULT,
         }
     }
 }
@@ -214,6 +228,10 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::DRIVER_TIMEOUT) {
             config.driver_timeout_ms = parse_count(&Setting::DRIVER_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::COUNTER_FREE_TO_REUSE_TIMEOUT) {
+            config.counter_free_to_reuse_ns =
+                parse_duration_ns(&Setting::COUNTER_FREE_TO_REUSE_TIMEOUT, &value)?;
         }
 
         // The lengths come from six independent settings, so the range checks
@@ -319,6 +337,12 @@ impl Setting {
     const DRIVER_TIMEOUT: Self = Self {
         property: "driver.timeout",
         env: "AERON_DRIVER_TIMEOUT",
+    };
+    /// `aeron.counters.free.to.reuse.timeout` (`:525`). Zero is legal and means
+    /// a reclaimed counter is immediately reusable.
+    const COUNTER_FREE_TO_REUSE_TIMEOUT: Self = Self {
+        property: "counters.free.to.reuse.timeout",
+        env: "AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT",
     };
 }
 
@@ -596,6 +620,7 @@ mod tests {
         assert_eq!(CncLayout::default(), config.layout);
         assert_eq!(10_000_000_000, config.client_liveness_timeout_ns);
         assert_eq!(1_000_000_000, config.timer_interval_ns);
+        assert_eq!(1_000_000_000, config.counter_free_to_reuse_ns);
         assert_eq!(TerminationPolicy::Deny, config.termination);
         assert!(!config.dirs_delete_on_start);
         assert!(!config.dirs_delete_on_shutdown);
@@ -609,6 +634,34 @@ mod tests {
 
         assert!(matches!(error, ConfigError::MissingAeronDir { .. }));
         assert!(error.to_string().contains("-Ddeepmsg.dir"));
+    }
+
+    #[test]
+    fn the_counter_reuse_timeout_answers_to_the_references_names() {
+        // The reference's environment name is not the property name in
+        // capitals, which is why the table carries both (`aeronmd.h:525`).
+        let by_property = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.counters.free.to.reuse.timeout", "5s"),
+        ])
+        .expect("resolve");
+        assert_eq!(5_000_000_000, by_property.counter_free_to_reuse_ns);
+
+        let by_env = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/deepmsg")],
+            &[("AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT", "250ms")],
+        )
+        .expect("resolve");
+        assert_eq!(250_000_000, by_env.counter_free_to_reuse_ns);
+
+        // Zero is legal and means "reusable at once"; the reference accepts it
+        // (`aeron_driver_context.c:883-890` parses from a floor of zero).
+        let zero = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("deepmsg.counters.free.to.reuse.timeout", "0ns"),
+        ])
+        .expect("resolve");
+        assert_eq!(0, zero.counter_free_to_reuse_ns);
     }
 
     #[test]
