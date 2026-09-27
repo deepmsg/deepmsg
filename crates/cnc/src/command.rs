@@ -237,6 +237,10 @@ pub const ADD_PUBLICATION_TYPE_ID: i32 = 0x01;
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:28`).
 pub const REMOVE_PUBLICATION_TYPE_ID: i32 = 0x02;
 
+/// `AERON_COMMAND_REMOVE_SUBSCRIPTION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:31`).
+pub const REMOVE_SUBSCRIPTION_TYPE_ID: i32 = 0x05;
+
 /// `AERON_COMMAND_ADD_EXCLUSIVE_PUBLICATION`
 /// (`aeron_control_protocol.h:29`).
 ///
@@ -378,6 +382,12 @@ pub const ERROR_CODE_UNKNOWN_COUNTER: i32 = 5;
 /// What the reference reports for a channel URI it cannot parse, and for a
 /// session id clash on a stream.
 pub const ERROR_CODE_INVALID_CHANNEL: i32 = 1;
+
+/// `AERON_ERROR_CODE_UNKNOWN_SUBSCRIPTION` (`aeron_client_error.h:14`).
+pub const ERROR_CODE_UNKNOWN_SUBSCRIPTION: i32 = 2;
+
+/// `AERON_ERROR_CODE_UNKNOWN_PUBLICATION` (`aeron_client_error.h:16`).
+pub const ERROR_CODE_UNKNOWN_PUBLICATION: i32 = 3;
 
 /// `AERON_ERROR_CODE_NOT_SUPPORTED` (`aeron_client_error.h:20`).
 pub const ERROR_CODE_NOT_SUPPORTED: i32 = 8;
@@ -839,6 +849,71 @@ pub fn decode_add_subscription(payload: &[u8]) -> Option<AddSubscriptionCommand<
     })
 }
 
+/// `REMOVE_PUBLICATION` as it arrives, with its flags word
+/// (`aeron_remove_publication_command_t`, `aeron_control_protocol.h:70-76`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemovePublication {
+    /// Who is asking. Unlike a subscription removal, this one is checked
+    /// against the client's own link list
+    /// (`aeron_driver_conductor.c:4707-4709`).
+    pub correlated: Correlated,
+    /// The client's correlation id for the `ADD_PUBLICATION` that made it.
+    pub registration_id: i64,
+    /// [`REMOVE_PUBLICATION_FLAG_REVOKE`], or zero.
+    pub flags: i64,
+}
+
+/// `AERON_COMMAND_REMOVE_PUBLICATION_FLAG_REVOKE`
+/// (`aeron_control_protocol.h:60`): revoke the publication instead of just
+/// letting go of it, so its readers are told the stream is done.
+pub const REMOVE_PUBLICATION_FLAG_REVOKE: i64 = 0x1;
+
+/// Decode `REMOVE_PUBLICATION`.
+///
+/// # The 24-byte form
+///
+/// The command grew a `flags` word, and the reference accepts the older shape
+/// — a payload that ends where the flags would begin — by treating the flags as
+/// zero (`aeron_driver_conductor.c:2920-2948`). A decoder that insisted on 32
+/// bytes would refuse a removal from a client built before the flags existed,
+/// and that client's publication would never go away.
+pub fn decode_remove_publication(payload: &[u8]) -> Option<RemovePublication> {
+    let correlated = decode_correlated(payload)?;
+    let registration_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
+
+    let flags = if payload.len() < REMOVE_PUBLICATION_HEADER_LENGTH {
+        0
+    } else {
+        le_i64(payload, CORRELATED_COMMAND_LENGTH + 8)?
+    };
+
+    Some(RemovePublication {
+        correlated,
+        registration_id,
+        flags,
+    })
+}
+
+/// `REMOVE_SUBSCRIPTION` as it arrives: the correlated head and the
+/// subscription's registration id (`aeron_remove_subscription_command_t`,
+/// `aeron_control_protocol.h:146-151`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoveSubscription {
+    /// Who is asking. The reference does **not** check it: a subscription is
+    /// found by its registration id alone (`aeron_driver_conductor.c:5203`).
+    pub correlated: Correlated,
+    /// The client's correlation id for the `ADD_SUBSCRIPTION`.
+    pub registration_id: i64,
+}
+
+/// Decode `REMOVE_SUBSCRIPTION`.
+pub fn decode_remove_subscription(payload: &[u8]) -> Option<RemoveSubscription> {
+    Some(RemoveSubscription {
+        correlated: decode_correlated(payload)?,
+        registration_id: le_i64(payload, CORRELATED_COMMAND_LENGTH)?,
+    })
+}
+
 /// Decode a response payload.
 ///
 /// A payload too short for its own type is reported as [`Response::Other`]
@@ -1048,6 +1123,32 @@ impl ImageBuffersReady<'_> {
 
         out
     }
+}
+
+/// The payload of `ON_UNAVAILABLE_IMAGE`
+/// (`aeron_image_message_t`, `aeron_control_protocol.h:153-159`): which image
+/// went away, and which of the client's subscriptions was reading it.
+///
+/// The channel that follows the fixed head is the **subscription's**, not the
+/// publication's — it is the channel the client subscribed with, echoed back —
+/// and it is not aligned and not NUL-terminated
+/// (`on_unavailable_image`, `aeron_driver_conductor.c:2550-2569`).
+pub fn encode_unavailable_image(
+    correlation_id: i64,
+    subscription_registration_id: i64,
+    stream_id: i32,
+    channel: &[u8],
+) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)] // a channel from a command, far below i32::MAX
+    let mut out = vec![0u8; IMAGE_MESSAGE_LENGTH + channel.len()];
+
+    out[0..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..16].copy_from_slice(&subscription_registration_id.to_le_bytes());
+    out[16..20].copy_from_slice(&stream_id.to_le_bytes());
+    out[20..24].copy_from_slice(&(channel.len() as i32).to_le_bytes());
+    out[IMAGE_MESSAGE_LENGTH..].copy_from_slice(channel);
+
+    out
 }
 
 /// Decode `ON_AVAILABLE_IMAGE`, whose variable tail is two length-prefixed
@@ -1355,6 +1456,68 @@ mod response_tests {
         assert_eq!(1001i32.to_le_bytes(), out[24..28]);
         assert_eq!(9i32.to_le_bytes(), out[28..32]);
         assert_eq!(b"aeron:ipc", &out[32..], "no NUL, exactly the length");
+    }
+
+    #[test]
+    fn a_removal_is_read_with_and_without_its_flags_word() {
+        // The current shape: 32 bytes.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7i64.to_le_bytes());
+        payload.extend_from_slice(&9i64.to_le_bytes());
+        payload.extend_from_slice(&42i64.to_le_bytes());
+        payload.extend_from_slice(&REMOVE_PUBLICATION_FLAG_REVOKE.to_le_bytes());
+
+        assert_eq!(
+            Some(RemovePublication {
+                correlated: Correlated {
+                    client_id: 7,
+                    correlation_id: 9,
+                },
+                registration_id: 42,
+                flags: REMOVE_PUBLICATION_FLAG_REVOKE,
+            }),
+            decode_remove_publication(&payload)
+        );
+
+        // And the older one, which ends where the flags would have begun: a
+        // client built before the word existed still gets its publication
+        // removed, with no revocation.
+        assert_eq!(
+            Some(RemovePublication {
+                correlated: Correlated {
+                    client_id: 7,
+                    correlation_id: 9,
+                },
+                registration_id: 42,
+                flags: 0,
+            }),
+            decode_remove_publication(&payload[..24])
+        );
+
+        assert!(decode_remove_publication(&payload[..20]).is_none());
+
+        assert_eq!(
+            Some(RemoveSubscription {
+                correlated: Correlated {
+                    client_id: 7,
+                    correlation_id: 9,
+                },
+                registration_id: 42,
+            }),
+            decode_remove_subscription(&payload[..24])
+        );
+    }
+
+    #[test]
+    fn the_unavailable_image_carries_the_subscriptions_channel_unaligned() {
+        let channel = b"aeron:ipc?session-id=5";
+        let message = encode_unavailable_image(42, 9, 1001, channel);
+
+        assert_eq!(24 + channel.len(), message.len(), "no padding, no NUL");
+        assert_eq!(42i64.to_le_bytes(), message[0..8], "the publication");
+        assert_eq!(9i64.to_le_bytes(), message[8..16], "the subscription");
+        assert_eq!((channel.len() as i32).to_le_bytes(), message[20..24]);
+        assert_eq!(channel, &message[24..]);
     }
 
     #[test]

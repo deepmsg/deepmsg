@@ -49,13 +49,15 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ImageBuffersReady,
-    ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
-    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
-    ON_UNAVAILABLE_COUNTER_TYPE_ID, PublicationBuffersReady, decode_add_counter,
-    decode_add_publication, decode_add_subscription, decode_correlated, decode_remove_counter,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
+    ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
+    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
+    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
+    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
+    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
+    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
     encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
-    encode_subscription_ready,
+    encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
@@ -295,6 +297,22 @@ impl ClientEvents for Transmit<'_> {
         let payload = ready.encode();
         self.send(ON_AVAILABLE_IMAGE_TYPE_ID, &payload);
     }
+
+    fn unavailable_image(
+        &mut self,
+        correlation_id: i64,
+        subscription_registration_id: i64,
+        stream_id: i32,
+        channel: &[u8],
+    ) {
+        let payload = encode_unavailable_image(
+            correlation_id,
+            subscription_registration_id,
+            stream_id,
+            channel,
+        );
+        self.send(ON_UNAVAILABLE_IMAGE_TYPE_ID, &payload);
+    }
 }
 
 /// The driver's control plane.
@@ -480,6 +498,7 @@ impl Conductor {
             self.write_heartbeat();
             work_count += 1;
             work_count += self.check_clients();
+            work_count += self.check_publications(now_ns);
             work_count += usize::from(self.check_for_blocked_commands(now_ns));
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
@@ -795,6 +814,83 @@ impl Conductor {
                         None => *malformed += 1,
                     }
                 }
+                // A publication's client letting go of it. The revocation
+                // flag is set on the publication's own byte and acted on at
+                // the next timeout tier (`aeron_driver_conductor.c:4705-4735`).
+                Command::RemovePublication => match decode_remove_publication(payload) {
+                    Some(request) => {
+                        let link =
+                            clients
+                                .find_mut(request.correlated.client_id)
+                                .and_then(|record| {
+                                    let index =
+                                        record.publication_links.iter().position(|link| {
+                                            link.registration_id == request.registration_id
+                                        })?;
+                                    Some(record.publication_links.swap_remove(index))
+                                });
+
+                        match link {
+                            Some(link) => {
+                                if request.flags & REMOVE_PUBLICATION_FLAG_REVOKE != 0 {
+                                    if let Some(publication) = publications
+                                        .publications_mut()
+                                        .iter_mut()
+                                        .find(|publication| {
+                                            publication.registration_id
+                                                == link.publication_registration_id
+                                        })
+                                    {
+                                        publication.set_revoked();
+                                    }
+                                }
+
+                                publications.release_links(&[link], counters, &counter_regions);
+                                transmit.operation_succeeded(request.correlated.correlation_id);
+                            }
+                            None => {
+                                *publication_failures += 1;
+                                transmit.error(
+                                    request.correlated.correlation_id,
+                                    ERROR_CODE_UNKNOWN_PUBLICATION,
+                                    b"unknown publication",
+                                );
+                            }
+                        }
+                    }
+                    None => *malformed += 1,
+                },
+                // A subscription going away: every image it held is announced
+                // as gone, its positions are detached and its counters come
+                // back (`aeron_driver_conductor.c:5199-5267`).
+                Command::RemoveSubscription => match decode_remove_subscription(payload) {
+                    Some(request) => {
+                        if subscriptions.has(request.registration_id) {
+                            // The acknowledgement first: the reference answers
+                            // before it announces the images it is taking away,
+                            // so a client that is waiting on the removal is not
+                            // handed an image event first.
+                            transmit.operation_succeeded(request.correlated.correlation_id);
+
+                            subscriptions.remove(
+                                request.registration_id,
+                                counters,
+                                &counter_regions,
+                                publications,
+                                &mut transmit,
+                                now_ms,
+                            );
+                        } else {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlated.correlation_id,
+                                ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                                b"unknown subscription",
+                            );
+                        }
+                    }
+                    None => *malformed += 1,
+                },
                 // A subscription: parse the URI, register the client, answer
                 // it, and then give it every publication it already matches
                 // (`aeron_driver_conductor.c:4741-4824`).
@@ -1011,6 +1107,34 @@ impl Conductor {
         true
     }
 
+    /// The publications' turn: advance the ones on their way out, revoke the
+    /// ones whose clients asked, and remove the ones that are done
+    /// (`aeron_driver_conductor_on_check_managed_resources`, `:1691-1712`,
+    /// which the reference runs on the same tier).
+    fn check_publications(&mut self, now_ns: i64) -> usize {
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+        };
+
+        self.publications.on_time_event(
+            &mut self.counters,
+            &counter_regions,
+            &mut self.subscriptions,
+            &mut transmit,
+            now_ns,
+            self.now_ms,
+        )
+    }
+
     /// The client pool's turn: announce whoever has gone quiet, and then
     /// reclaim them.
     ///
@@ -1055,6 +1179,8 @@ impl Conductor {
             &mut self.counters,
             &counter_regions,
             &mut transmit,
+            &mut self.publications,
+            &mut self.subscriptions,
         )
     }
 
@@ -1393,6 +1519,78 @@ mod tests {
                 pending.iter().map(|(id, _)| *id).collect::<Vec<_>>()
             );
 
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `REMOVE_PUBLICATION`'s wire form, in either shape.
+    ///
+    /// Written here rather than in the `cnc` crate because the client's own
+    /// removal API does not exist yet — the client's life cycle is the next
+    /// commit — and a protocol encoder with no client to use it would be a
+    /// promise rather than a contract.
+    fn remove_publication_payload(
+        client_id: i64,
+        correlation_id: i64,
+        registration_id: i64,
+        flags: i64,
+        with_flags: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&client_id.to_le_bytes());
+        out.extend_from_slice(&correlation_id.to_le_bytes());
+        out.extend_from_slice(&registration_id.to_le_bytes());
+        if with_flags {
+            out.extend_from_slice(&flags.to_le_bytes());
+        }
+
+        out
+    }
+
+    /// `REMOVE_SUBSCRIPTION`'s wire form: the correlated head and the
+    /// subscription's registration id.
+    fn remove_subscription_payload(
+        client_id: i64,
+        correlation_id: i64,
+        registration_id: i64,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&client_id.to_le_bytes());
+        out.extend_from_slice(&correlation_id.to_le_bytes());
+        out.extend_from_slice(&registration_id.to_le_bytes());
+
+        out
+    }
+
+    /// A counter's value, with the regions taken and given back **inside** the
+    /// call: they borrow the CnC file, so a test that held them across a pass
+    /// could not drive the conductor at all.
+    fn counter_value(conductor: &Conductor, counter_id: i32) -> Option<i64> {
+        let regions = counter_regions(conductor);
+        conductor.counters().value(&regions, counter_id)
+    }
+
+    /// Write a counter, for the same reason.
+    fn set_counter(conductor: &Conductor, counter_id: i32, value: i64) {
+        let regions = counter_regions(conductor);
+        conductor.counters().set_value(&regions, counter_id, value);
+    }
+
+    /// Wait for the agent thread to remove a file.
+    ///
+    /// The conductor asks and the agent does it, so a test that asserted on the
+    /// next line would be racing a thread it owns. The deadline is what keeps a
+    /// removal that never happens from hanging the suite.
+    fn await_removed(conductor: &mut Conductor, path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} was never removed",
+                path.display()
+            );
             conductor.do_work();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -2582,6 +2780,298 @@ mod tests {
         assert!(
             drain(&cnc, &mut receiver).is_empty(),
             "another stream is another stream"
+        );
+    }
+    /// A conductor with one publication (client 7, correlation 42) and one
+    /// subscription (client 7, correlation 9) on stream 1001, both served.
+    #[allow(clippy::type_complexity)] // the whole fixture, returned whole
+    fn publishing_and_subscribed() -> (
+        TempDir,
+        Conductor,
+        CncFile,
+        ToClientsReceiver,
+        Vec<(i32, Vec<u8>)>,
+    ) {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+
+        (temp, conductor, cnc, receiver, pending)
+    }
+
+    #[test]
+    fn removing_a_publication_ends_its_stream_and_then_removes_it() {
+        let (temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        // One pass for the limit, so there is a window to take back.
+        conductor.do_work();
+        let limit_counter_id = conductor.publications().publications()[0].pub_lmt_counter_id;
+        let pos_counter_id = conductor.publications().publications()[0].pub_pos_counter_id;
+        let subscriber_position_id =
+            conductor.subscriptions().links()[0].subscribables[0].counter_id;
+        assert_eq!(Some(32 * 1024), counter_value(&conductor, limit_counter_id));
+
+        // The client lets go.
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(7, 50, 42, 0, true),
+        );
+        conductor.do_work();
+
+        let (type_id, payload) = drain(&cnc, &mut receiver)
+            .into_iter()
+            .next()
+            .expect("an answer");
+        assert_eq!(
+            deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+            type_id
+        );
+        assert_eq!(50i64.to_le_bytes(), payload[0..8]);
+
+        // The link is gone, and the publication is on its way out: its limit
+        // has been pulled back to where the producer got to and its log says
+        // the stream ended there.
+        assert!(
+            conductor
+                .clients()
+                .find(7)
+                .expect("the client")
+                .publication_links
+                .is_empty()
+        );
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, limit_counter_id),
+            "the limit is the producer's position, which is zero"
+        );
+        assert_eq!(
+            Some(0),
+            conductor.publications().publications()[0].end_of_stream_position(),
+            "and the log says so"
+        );
+
+        // The reader catches up — there was nothing to read, so it already has
+        // — and the publication drains, lingers and goes. Two tiers: one to
+        // drain, one to be done.
+        set_counter(&conductor, subscriber_position_id, 0);
+        for _ in 0..2 {
+            conductor.timeout_check_deadline_ns = 0;
+            conductor.do_work();
+        }
+
+        assert!(conductor.publications().publications().is_empty());
+
+        // The log buffer goes with it, on the agent thread.
+        await_removed(
+            &mut conductor,
+            &temp.0.join("publications").join("42.logbuffer"),
+        );
+
+        // And the counters: the two the publication owned and the reader's.
+        let observer = cnc.counters().expect("the counter regions");
+        assert!(
+            observer
+                .find_by_type_id(crate::position::type_id::PUBLISHER_POSITION)
+                .is_none(),
+            "pub-pos is reclaimed"
+        );
+        assert!(
+            observer
+                .find_by_type_id(crate::position::type_id::SUBSCRIPTION_POSITION)
+                .is_none(),
+            "and the reader's position"
+        );
+        // `pub-pos`'s *value* is still readable — the values region is indexed
+        // by counter id and a reclaimed slot keeps what it held until something
+        // else takes the id (`CounterManager::value` is the reference's address
+        // arithmetic). What says it is gone is the state, and the region reader
+        // is what skips a reclaimed counter.
+        assert!(
+            counter_value(&conductor, pos_counter_id).is_some(),
+            "a reclaimed counter's slot is still there"
+        );
+    }
+
+    #[test]
+    fn removing_a_subscription_detaches_its_reader_and_frees_its_counter() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID,
+            &remove_subscription_payload(7, 51, 9),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert_eq!(2, events.len(), "the acknowledgement, then the image");
+        assert_eq!(
+            deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+            events[0].0
+        );
+        assert_eq!(51i64.to_le_bytes(), events[0].1[0..8]);
+        assert_eq!(
+            deepmsg_cnc::command::ON_UNAVAILABLE_IMAGE_TYPE_ID,
+            events[1].0,
+            "the client has to know its image is gone"
+        );
+        assert_eq!(42i64.to_le_bytes(), events[1].1[0..8], "the publication");
+        assert_eq!(9i64.to_le_bytes(), events[1].1[8..16], "the subscription");
+        assert_eq!(
+            b"aeron:ipc",
+            &events[1].1[24..],
+            "the channel it subscribed with"
+        );
+
+        assert!(conductor.subscriptions().links().is_empty());
+        assert_eq!(
+            0,
+            conductor.publications().publications()[0].subscribers.len(),
+            "the publication has no readers again"
+        );
+        assert!(
+            conductor.publications().publications()[0]
+                .is_drained(conductor.counters(), &counter_regions(&conductor))
+        );
+        assert!(
+            cnc.counters()
+                .expect("the counter regions")
+                .find_by_type_id(crate::position::type_id::SUBSCRIPTION_POSITION)
+                .is_none(),
+            "and the reader's counter is reclaimed"
+        );
+    }
+
+    #[test]
+    fn an_unknown_removal_is_answered_with_the_references_code() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        // A publication this client does not hold, and a subscription nobody
+        // made.
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(7, 60, 99, 0, true),
+        );
+        conductor.do_work();
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID,
+            &remove_subscription_payload(7, 61, 99),
+        );
+        conductor.do_work();
+
+        let errors = drain(&cnc, &mut receiver);
+        assert_eq!(2, errors.len());
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_UNKNOWN_PUBLICATION,
+            i32::from_le_bytes(errors[0].1[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+            i32::from_le_bytes(errors[1].1[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(1, conductor.publication_failures());
+        assert_eq!(1, conductor.subscription_failures());
+
+        // The older 24-byte removal — a client built before the flags word —
+        // still finds its link and is still answered.
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(7, 62, 42, 0, false),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert_eq!(1, events.len());
+        assert_eq!(
+            deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+            events[0].0,
+            "no flags means no revocation, not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_revoked_publication_tells_its_readers_and_is_counted() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(
+                7,
+                52,
+                42,
+                deepmsg_cnc::command::REMOVE_PUBLICATION_FLAG_REVOKE,
+                true,
+            ),
+        );
+        conductor.do_work();
+        drain(&cnc, &mut receiver);
+
+        assert!(conductor.publications().publications()[0].is_revoked());
+
+        // The revocation is acted on at the next timeout tier: the stream is
+        // cut off where the producer got to, and the reader is told.
+        conductor.timeout_check_deadline_ns = 0;
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert_eq!(
+            deepmsg_cnc::command::ON_UNAVAILABLE_IMAGE_TYPE_ID,
+            events[0].0
+        );
+        assert_eq!(42i64.to_le_bytes(), events[0].1[0..8]);
+        assert_eq!(
+            b"aeron:ipc",
+            &events[0].1[24..],
+            "a revoke names the constant channel, not the subscription's"
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::PUBLICATIONS_REVOKED),
+            "and the driver counts it"
+        );
+        assert_eq!(
+            Some(0),
+            conductor.publications().publications()[0].end_of_stream_position()
         );
     }
 }

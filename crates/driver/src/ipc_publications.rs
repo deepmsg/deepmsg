@@ -48,7 +48,7 @@ use crate::clients::{ClientEvents, ClientRecord, Clients, PublicationLink};
 use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
-use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::ipc_subscriptions::{IPC_CHANNEL, IpcSubscriptions};
 use crate::native_resource_agent::{Completion, NativeResourceAgent};
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError};
@@ -502,6 +502,121 @@ impl IpcPublications {
                 }
                 Completion::Freed { .. } => {}
             }
+        }
+
+        work
+    }
+
+    /// Let go of the publications a client held, as its death or its
+    /// `REMOVE_PUBLICATION` requires (`aeron_client_delete`, `:1218-1226`, and
+    /// `aeron_driver_conductor_on_remove_publication`, `:4705-4735`).
+    ///
+    /// Every link is released, and a publication whose last link that was
+    /// starts draining: its limit is pulled back, its log says where the stream
+    /// ended, and its readers will find it drained on the next timeout tier.
+    /// Nothing is closed here — a draining publication is still readable, which
+    /// is the whole point of the state.
+    pub fn release_links(
+        &mut self,
+        links: &[crate::clients::PublicationLink],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+    ) {
+        for link in links {
+            let Some(publication) = self.publications.iter_mut().find(|publication| {
+                publication.registration_id == link.publication_registration_id
+            }) else {
+                continue;
+            };
+
+            publication.release(counters, regions);
+        }
+    }
+
+    /// The timeout tier's turn for every publication
+    /// (`aeron_driver_conductor_on_check_managed_resources`, `:1691-1712`):
+    /// advance the ones on their way out, and remove the ones that are done.
+    ///
+    /// Removing means: tell the subscriptions to forget it, give its readers'
+    /// positions and its own two counters back, hand the log buffer to the
+    /// agent, and drop it from the list — the reference's
+    /// `aeron_ipc_publication_entry_delete` (`:1428-1446`) followed by
+    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:588-604`).
+    ///
+    /// Returns the work done, for the cycle counter.
+    pub fn on_time_event(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        subscriptions: &mut IpcSubscriptions,
+        events: &mut impl ClientEvents,
+        now_ns: i64,
+        now_ms: i64,
+    ) -> usize {
+        let mut work = 0;
+
+        for index in 0..self.publications.len() {
+            // The revoke is the active state's only duty here: a publication
+            // whose client asked for `REMOVE_PUBLICATION` with the revoke flag
+            // cuts its stream off at the next timeout tier, and tells its
+            // readers (`aeron_ipc_publication.c:492-520`).
+            if self.publications[index].state() == State::Active
+                && self.publications[index].is_revoked()
+            {
+                let publication = &mut self.publications[index];
+                let registration_id = publication.registration_id;
+                let stream_id = publication.stream_id;
+
+                work += usize::from(publication.revoke(counters, regions));
+
+                for link in subscriptions.readers_of(registration_id) {
+                    events.unavailable_image(
+                        registration_id,
+                        link.registration_id,
+                        stream_id,
+                        IPC_CHANNEL,
+                    );
+                }
+
+                crate::system_counters::increment(
+                    counters,
+                    regions,
+                    crate::system_counters::id::PUBLICATIONS_REVOKED,
+                );
+
+                continue;
+            }
+
+            // The reference's switch is exclusive: a publication revoked in
+            // this pass has *become* lingering, and its lingering case runs on
+            // the next turn — which is what makes a revoked publication
+            // readable for one more tier than a removed one.
+            work += usize::from(self.publications[index].on_time_event(counters, regions, now_ns));
+        }
+
+        // And the ones that have reached the end of their life go.
+        let mut index = self.publications.len();
+        while index > 0 {
+            index -= 1;
+
+            if !self.publications[index].has_reached_end_of_life() {
+                continue;
+            }
+
+            // The readers were told when the publication started draining —
+            // this is only forgetting, which is what the reference's
+            // `unlink_subscribable` does on its way past.
+            let publication = self.publications.swap_remove(index);
+            subscriptions.forget_publication(publication.registration_id);
+
+            for reader in publication.subscribers.positions() {
+                counters.free(regions, reader.counter_id, now_ms);
+            }
+            counters.free(regions, publication.pub_lmt_counter_id, now_ms);
+            counters.free(regions, publication.pub_pos_counter_id, now_ms);
+
+            let _ = self.agent.free_log_buffer(*publication.into_log());
+            work += 1;
         }
 
         work

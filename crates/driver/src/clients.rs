@@ -39,6 +39,8 @@ use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::ipc_publications::IpcPublications;
+use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::system_counters;
 
 /// Where a driver→client event goes.
@@ -81,6 +83,19 @@ pub trait ClientEvents {
     /// `ON_AVAILABLE_IMAGE`: a publication this subscription matches exists,
     /// and its log buffer can be mapped from [`ImageBuffersReady::log_file`].
     fn available_image(&mut self, ready: &ImageBuffersReady<'_>);
+
+    /// `ON_UNAVAILABLE_IMAGE`: an image this subscription was reading is gone,
+    /// and the client must unmap it. The channel is the **subscription's** —
+    /// the one the client subscribed with — except where a publication is
+    /// revoked, which sends the constant `aeron:ipc` instead
+    /// (`aeron_driver_conductor.c:510-517` against `:5975-5982`).
+    fn unavailable_image(
+        &mut self,
+        correlation_id: i64,
+        subscription_registration_id: i64,
+        stream_id: i32,
+        channel: &[u8],
+    );
 
     /// `ON_PUBLICATION_READY` or `ON_EXCLUSIVE_PUBLICATION_READY`: the log
     /// buffer exists and the client may map it.
@@ -338,13 +353,21 @@ impl Clients {
     /// went out with the timeout in phase one, which is why this does not
     /// repeat it.
     ///
+    /// What the client held elsewhere goes with it: its publications are let
+    /// go of, and its subscriptions are detached from the publications they
+    /// read. Since the client is not there to hear it, none of that is
+    /// announced.
+    ///
     /// Returns how many clients were reaped.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn reap_expired(
         &mut self,
         now_ms: i64,
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
+        publications: &mut IpcPublications,
+        subscriptions: &mut IpcSubscriptions,
     ) -> usize {
         let mut reaped = 0;
         let mut index = self.records.len();
@@ -356,7 +379,15 @@ impl Clients {
                 continue;
             }
 
-            self.reap(index, now_ms, manager, regions, events);
+            self.reap(
+                index,
+                now_ms,
+                manager,
+                regions,
+                events,
+                publications,
+                subscriptions,
+            );
             self.records.swap_remove(index);
             reaped += 1;
         }
@@ -371,6 +402,7 @@ impl Clients {
     /// announced before it is freed, then the heartbeat — whose announcement
     /// already went out with the timeout, which is why this one does not repeat
     /// it.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
     fn reap(
         &mut self,
         index: usize,
@@ -378,13 +410,23 @@ impl Clients {
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
+        publications: &mut IpcPublications,
+        subscriptions: &mut IpcSubscriptions,
     ) {
         let record = &mut self.records[index];
+
+        // The publications first, in the reference's order (`:1220-1241`): a
+        // client that dies takes its links with it, and a publication whose last
+        // link that was starts draining.
+        publications.release_links(&record.publication_links, manager, regions);
+        record.publication_links.clear();
 
         for link in std::mem::take(&mut record.counter_links) {
             events.counter_unavailable(link.registration_id, link.counter_id);
             manager.free(regions, link.counter_id, now_ms);
         }
+
+        subscriptions.remove_for_client(record.client_id, manager, regions, publications, now_ms);
 
         manager.free(regions, record.heartbeat_counter_id, now_ms);
         record.client_id = -1;
@@ -419,6 +461,15 @@ mod tests {
         fn writable(&mut self) -> AtomicBuffer<'_, ReadWrite> {
             AtomicBuffer::from_slice_mut(&mut self.0).expect("aligned region")
         }
+    }
+
+    /// The publication and subscription managers a teardown needs, with no
+    /// publications in them: what these tests are about is the client pool.
+    fn managers() -> (IpcPublications, IpcSubscriptions) {
+        (
+            IpcPublications::start(-1, 1000).expect("an agent thread"),
+            IpcSubscriptions::new(),
+        )
     }
 
     /// A recording sink: the events, in the order they were raised.
@@ -464,6 +515,18 @@ mod tests {
             self.0.push(format!(
                 "image:{}:{}",
                 ready.correlation_id, ready.subscriber_registration_id
+            ));
+        }
+
+        fn unavailable_image(
+            &mut self,
+            correlation_id: i64,
+            subscription_registration_id: i64,
+            _stream_id: i32,
+            _channel: &[u8],
+        ) {
+            self.0.push(format!(
+                "unavailable:{correlation_id}:{subscription_registration_id}"
             ));
         }
     }
@@ -611,6 +674,7 @@ mod tests {
     fn a_silent_client_is_reaped_and_announced_in_the_references_order() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -635,7 +699,14 @@ mod tests {
         assert_eq!(1, clients.len(), "…and phase two is what reclaims");
         assert_eq!(
             1,
-            clients.reap_expired(NOW + 11_001, &mut manager, &regions, &mut events)
+            clients.reap_expired(
+                NOW + 11_001,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            )
         );
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0"],
@@ -657,6 +728,7 @@ mod tests {
     fn a_client_that_closed_itself_is_reaped_without_a_timeout_announcement() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -668,7 +740,14 @@ mod tests {
         clients.on_time_event(NOW + 1, &manager, &regions, &mut events);
         assert_eq!(
             1,
-            clients.reap_expired(NOW + 1, &mut manager, &regions, &mut events),
+            clients.reap_expired(
+                NOW + 1,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            ),
             "a zeroed heartbeat expires on the next tick, without a timeout"
         );
         assert_eq!(
@@ -682,6 +761,7 @@ mod tests {
     fn a_clients_counters_go_before_its_heartbeat() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -706,7 +786,14 @@ mod tests {
         events.0.clear();
 
         clients.on_time_event(NOW + 20_000, &manager, &regions, &mut events);
-        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
+        clients.reap_expired(
+            NOW + 20_000,
+            &mut manager,
+            &regions,
+            &mut events,
+            &mut publications,
+            &mut subscriptions,
+        );
 
         assert_eq!(
             vec!["timeout:7", "unavailable:7:0", "unavailable:42:1"],
@@ -729,6 +816,7 @@ mod tests {
         // record and its counters for the driver's whole life.
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -746,7 +834,14 @@ mod tests {
         );
         assert_eq!(
             1,
-            clients.reap_expired(NOW, &mut manager, &regions, &mut events)
+            clients.reap_expired(
+                NOW,
+                &mut manager,
+                &regions,
+                &mut events,
+                &mut publications,
+                &mut subscriptions
+            )
         );
         assert!(clients.is_empty());
     }
@@ -760,6 +855,7 @@ mod tests {
         // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
+        let (mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -793,7 +889,14 @@ mod tests {
         assert_eq!(2, clients.len(), "and nothing reclaimed yet");
 
         events.0.clear();
-        clients.reap_expired(NOW + 20_000, &mut manager, &regions, &mut events);
+        clients.reap_expired(
+            NOW + 20_000,
+            &mut manager,
+            &regions,
+            &mut events,
+            &mut publications,
+            &mut subscriptions,
+        );
         assert!(
             events
                 .0
@@ -831,6 +934,14 @@ mod tests {
             }
             fn subscription_ready(&mut self, _registration_id: i64, _status: i32) {}
             fn available_image(&mut self, _ready: &ImageBuffersReady<'_>) {}
+            fn unavailable_image(
+                &mut self,
+                _correlation_id: i64,
+                _subscription_registration_id: i64,
+                _stream_id: i32,
+                _channel: &[u8],
+            ) {
+            }
 
             fn client_timed_out(&mut self, _client_id: i64) {
                 self.seen.push(

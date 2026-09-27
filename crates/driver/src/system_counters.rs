@@ -52,6 +52,11 @@ pub mod id {
     pub const ERRORS: i32 = 15;
     /// `AERON_SYSTEM_COUNTER_ID_UNBLOCKED_COMMANDS`.
     pub const UNBLOCKED_COMMANDS: i32 = 20;
+    /// `AERON_SYSTEM_COUNTER_ID_PUBLICATIONS_REVOKED` — incremented when a
+    /// `REMOVE_PUBLICATION` carrying the revoke flag cuts a stream off
+    /// (`aeron_counters.h:61`, incremented at
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:520`).
+    pub const PUBLICATIONS_REVOKED: i32 = 40;
     /// `AERON_SYSTEM_COUNTER_ID_CLIENT_TIMEOUTS` — incremented once per client
     /// reaped for silence, never for one that closed itself.
     pub const CLIENT_TIMEOUTS: i32 = 24;

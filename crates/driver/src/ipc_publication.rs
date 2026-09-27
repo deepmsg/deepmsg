@@ -112,6 +112,8 @@ pub struct IpcPublication {
     clean_position: i64,
     /// How many clients hold a link to this publication.
     refcount: i32,
+    /// When the state last changed (`managed_resource.time_of_last_state_change_ns`).
+    time_of_last_state_change_ns: i64,
     state: State,
     has_reached_end_of_life: bool,
 }
@@ -378,6 +380,7 @@ impl IpcPublication {
             consumer_position: clean_position,
             clean_position,
             refcount: 0,
+            time_of_last_state_change_ns: 0,
             state: State::Active,
             has_reached_end_of_life: false,
         })
@@ -446,6 +449,165 @@ impl IpcPublication {
     /// knows the publication.
     pub fn path_bytes(&self) -> &[u8] {
         self.log.path().as_os_str().as_encoded_bytes()
+    }
+
+    /// Where the stream ends, as the log records it. `i64::MAX` until it ends.
+    ///
+    /// This is what a subscriber's image reads to learn the stream is over —
+    /// the driver does not send it a message for that, which is why a
+    /// publication going away quietly still ends cleanly for its readers
+    /// (`aeron_ipc_publication_handle_managed_resource_event`, the DECREF at
+    /// zero).
+    pub fn end_of_stream_position(&self) -> Option<i64> {
+        self.log
+            .metadata()?
+            .load_i64_acquire(descriptor::END_OF_STREAM_POSITION_OFFSET)
+    }
+
+    /// Write it.
+    pub fn set_end_of_stream(&self, position: i64) -> bool {
+        self.log
+            .metadata()
+            .and_then(|metadata| {
+                metadata.store_i64_release(descriptor::END_OF_STREAM_POSITION_OFFSET, position)
+            })
+            .is_some()
+    }
+
+    /// Whether the publication was revoked: the byte `REMOVE_PUBLICATION`'s
+    /// revoke flag sets (`aeron_ipc_publication_handle_managed_resource_event`,
+    /// the REVOKE case).
+    /// The load is a plain one, and the store below a relaxed one, because the
+    /// only reader of this byte is the conductor that writes it: a client reads
+    /// `end_of_stream_position` and `is_connected`, never this. The reference's
+    /// `AERON_GET_ACQUIRE`/`AERON_SET_RELEASE` are for the same reason a
+    /// volatile read and write — the field is shared memory.
+    pub fn is_revoked(&self) -> bool {
+        self.log
+            .metadata()
+            .and_then(|metadata| metadata.load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET))
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// Set the revoked byte.
+    pub fn set_revoked(&self) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
+        }
+    }
+
+    /// One link fewer, and what the last one does
+    /// (`aeron_ipc_publication_handle_managed_resource_event`).
+    ///
+    /// Three things, in the reference's order, and each is the last chance to
+    /// do it:
+    ///
+    /// 1. the limit is pulled back to where the producer actually got to, so a
+    ///    client still holding the counter is not told it may write past the
+    ///    end of a stream;
+    /// 2. the log's end-of-stream position is written **there**, which is how
+    ///    every reader learns the stream is over;
+    /// 3. and unless it was revoked — which cuts the stream off the same way
+    ///    but with a message to the readers — the publication starts draining.
+    ///
+    /// Returns whether that was the last link.
+    pub fn release(&mut self, counters: &mut CounterManager, regions: &CounterRegions<'_>) -> bool {
+        if !self.decref() {
+            return false;
+        }
+
+        let producer_position = self.publisher_position().unwrap_or(0);
+
+        if counters
+            .value(regions, self.pub_lmt_counter_id)
+            .is_some_and(|limit| limit > producer_position)
+        {
+            counters.set_value(regions, self.pub_lmt_counter_id, producer_position);
+        }
+
+        self.set_end_of_stream(producer_position);
+
+        if !self.is_revoked() {
+            self.state = State::Draining;
+        }
+
+        true
+    }
+
+    /// Cut the stream off where the producer got to
+    /// (`aeron_ipc_publication_on_time_event`'s revoked branch).
+    ///
+    /// The readers are told by the caller — one `ON_UNAVAILABLE_IMAGE` each —
+    /// because that is a conductor's job, not a publication's.
+    ///
+    /// Returns whether it was still active: a publication that has already been
+    /// revoked, or is already draining, is left alone.
+    pub fn revoke(&mut self, counters: &mut CounterManager, regions: &CounterRegions<'_>) -> bool {
+        if self.state != State::Active {
+            return false;
+        }
+
+        let revoked_position = self.publisher_position().unwrap_or(0);
+
+        counters.set_value(regions, self.pub_lmt_counter_id, revoked_position);
+        self.set_end_of_stream(revoked_position);
+
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_i32_release(descriptor::IS_CONNECTED_OFFSET, 0);
+        }
+
+        self.state = State::Linger;
+
+        true
+    }
+
+    /// The timeout tier's turn for this publication
+    /// (`aeron_ipc_publication_on_time_event`, `:481-585`).
+    ///
+    /// Only the two states a publication can be in on its way out are handled
+    /// here; the active state's other duties — the untethered subscription
+    /// sweep, the blocked-publisher unblocker and the cool-down that follows one
+    /// — are not this commit's.
+    ///
+    /// Returns whether anything happened.
+    pub fn on_time_event(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> bool {
+        match self.state {
+            State::Active => false,
+            State::Draining => {
+                let producer_position = self.publisher_position().unwrap_or(0);
+                counters.set_value(regions, self.pub_pos_counter_id, producer_position);
+
+                if !self.is_drained(counters, regions) {
+                    return false;
+                }
+
+                self.state = State::Linger;
+                self.time_of_last_state_change_ns = now_ns;
+
+                true
+            }
+            State::Linger => {
+                // The reference's whole rule for this state: a publication with
+                // nobody holding it is done. The linger timeout in the metadata
+                // is for readers, not for this.
+                if self.refcount <= 0 {
+                    self.has_reached_end_of_life = true;
+                }
+
+                true
+            }
+        }
+    }
+
+    /// When the state last changed, for a report.
+    pub const fn time_of_last_state_change_ns(&self) -> i64 {
+        self.time_of_last_state_change_ns
     }
 
     /// One more client holds a link to this publication

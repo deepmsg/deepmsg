@@ -333,6 +333,112 @@ impl IpcSubscriptions {
         }
     }
 
+    /// The subscriptions reading a publication, for the caller that has to tell
+    /// them it is going away (`aeron_driver_conductor_unlink_ipc_subscriptions`,
+    /// `:6453-6475`, which sends one message per reader).
+    pub fn readers_of(&self, publication_registration_id: i64) -> Vec<&SubscriptionLink> {
+        self.links
+            .iter()
+            .filter(|link| link.reads(publication_registration_id))
+            .collect()
+    }
+
+    /// Forget a publication that no longer exists: drop the entries that point
+    /// at it, without freeing anything — its own close owns the counters
+    /// (`aeron_driver_conductor_unlink_subscribable`, `:3662-3677`).
+    pub fn forget_publication(&mut self, publication_registration_id: i64) {
+        for link in &mut self.links {
+            link.subscribables
+                .retain(|entry| entry.publication_registration_id != publication_registration_id);
+        }
+    }
+
+    /// Whether a subscription with this registration id exists, which is what
+    /// decides between an acknowledgement and an error before the removal
+    /// itself happens (`aeron_driver_conductor.c:5203-5266`).
+    pub fn has(&self, registration_id: i64) -> bool {
+        self.links
+            .iter()
+            .any(|link| link.registration_id == registration_id)
+    }
+
+    /// Remove a subscription (`aeron_driver_conductor_on_remove_subscription`,
+    /// `:5199-5267`).
+    ///
+    /// Every reader position is detached from its publication and its counter
+    /// given back, the client is told each image is gone, and the link is
+    /// dropped. Returns whether one was found — the reference's
+    /// `is_any_subscription_found`, which decides between an acknowledgement and
+    /// an error.
+    ///
+    /// The match is on the registration id **alone**: the reference does not
+    /// check the client id here, so a client that knows a subscription's
+    /// registration id can remove it even though it does not own it. That is
+    /// reproduced rather than tightened — a driver that refused would be one
+    /// where a legitimate removal failed.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn remove(
+        &mut self,
+        registration_id: i64,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        publications: &mut IpcPublications,
+        events: &mut impl ClientEvents,
+        now_ms: i64,
+    ) -> bool {
+        let Some(index) = self
+            .links
+            .iter()
+            .position(|link| link.registration_id == registration_id)
+        else {
+            return false;
+        };
+
+        let link = self.links.swap_remove(index);
+
+        for entry in &link.subscribables {
+            events.unavailable_image(
+                entry.publication_registration_id,
+                link.registration_id,
+                link.stream_id,
+                &link.channel,
+            );
+        }
+
+        unlink_all(link, counters, regions, publications, now_ms);
+
+        true
+    }
+
+    /// Give up every subscription a client owned, without telling it anything:
+    /// it is gone, and a message to a client that is not there is a message
+    /// nobody reads (`aeron_client_delete`, `:1234-1250`).
+    pub fn remove_for_client(
+        &mut self,
+        client_id: i64,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        publications: &mut IpcPublications,
+        now_ms: i64,
+    ) -> usize {
+        let mut removed = 0;
+        let mut index = self.links.len();
+
+        while index > 0 {
+            index -= 1;
+
+            if self.links[index].client_id != client_id {
+                continue;
+            }
+
+            let link = self.links.swap_remove(index);
+            unlink_all(link, counters, regions, publications, now_ms);
+            removed += 1;
+        }
+
+        removed
+    }
+
     /// Give up every subscription.
     ///
     /// No counters are freed here: a reader's `sub-pos` belongs to the
@@ -342,6 +448,32 @@ impl IpcSubscriptions {
     /// the ordering here is the reference's — publications first.
     pub fn close(&mut self) {
         self.links.clear();
+    }
+}
+
+/// Detach every reader a link holds and give its counter back
+/// (`aeron_driver_conductor_unlink_all_subscribable`, `:3679-3693`).
+///
+/// The position leaves the publication's set first — which is what the removal
+/// hook counts, and what closes the log's `is_connected` byte when it was the
+/// last reader — and the counter goes back after.
+fn unlink_all(
+    link: SubscriptionLink,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    publications: &mut IpcPublications,
+    now_ms: i64,
+) {
+    for entry in &link.subscribables {
+        if let Some(publication) = publications
+            .publications_mut()
+            .iter_mut()
+            .find(|publication| publication.registration_id == entry.publication_registration_id)
+        {
+            publication.remove_subscriber(entry.counter_id);
+        }
+
+        counters.free(regions, entry.counter_id, now_ms);
     }
 }
 
