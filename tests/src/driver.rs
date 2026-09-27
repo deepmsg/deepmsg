@@ -148,6 +148,56 @@ fn search_path() -> Option<PathBuf> {
         .filter(|candidate| candidate.is_file())
 }
 
+/// Environment variable naming the reference `AeronStat` to run.
+pub const AERONSTAT_ENV: &str = "DEEPMSG_REF_AERONSTAT";
+
+/// Where `AeronStat` is expected to be when the variable is unset.
+///
+/// Beside the `aeronmd` this file already looks for: both come out of the same
+/// reference build (`cppbuild/Release/binaries/`).
+pub const DEFAULT_AERONSTAT: &str = "../../aeron/cppbuild/Release/binaries/AeronStat";
+
+/// Find a reference *tool* — `AeronStat` today — in the same places the driver
+/// is looked for.
+///
+/// A tool is not version-checked the way the driver is: it prints what it
+/// finds, and what it prints is what the test compares, so a mismatched tool
+/// fails loudly on its own. Returns `None` when the reference checkout is
+/// absent, which is a skip rather than a failure for the same reason
+/// [`locate`] is.
+pub fn locate_tool(env: &str, default: &str) -> Option<PathBuf> {
+    if let Some(overridden) = std::env::var_os(env) {
+        let path = PathBuf::from(overridden);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join(default);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+
+    let name = Path::new(default).file_name()?;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Find the reference `AeronStat`, or `None` when there is no reference build.
+pub fn locate_aeron_stat() -> Option<PathBuf> {
+    locate_tool(AERONSTAT_ENV, DEFAULT_AERONSTAT)
+}
+
+/// Announce that a tool-based test could not run, and why.
+pub fn announce_tool_skip(tool: &str) {
+    eprintln!(
+        "SKIPPED: {tool} not verified -- no reference {tool} found. \
+         Set the tool's DEEPMSG_REF_* variable, or check out the reference next \
+         to this repo (see docs/reference.md)."
+    );
+}
+
 /// Find the driver and prove it is the version the contracts were read from.
 ///
 /// Running `-v` first turns "the wrong driver is on PATH" from a mysterious

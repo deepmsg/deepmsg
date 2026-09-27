@@ -470,6 +470,22 @@ impl Conductor {
     ///
     /// The error from flushing the mapping, if any.
     pub fn close(&mut self) -> std::io::Result<()> {
+        // The counters the driver owns go first (`aeron_system_counters_close`,
+        // called at `aeron_driver_conductor.c:3487`), and the heartbeat is
+        // nulled after (`:3493`). It is why a driver that stopped on purpose
+        // leaves forty-six *reclaimed* slots behind, and why a capture of a
+        // stopped driver is a different file from one of a running driver —
+        // the golden fixture is the running one.
+        //
+        // A client's counters are deliberately not freed, matching the
+        // reference: it frees the client's link *arrays* on the way out and
+        // leaves the counters themselves allocated.
+        if let Some(regions) = self.cnc.counter_regions() {
+            for counter_id in 0..system_counters::COUNT as i32 {
+                self.counters.free(&regions, counter_id, self.now_ms);
+            }
+        }
+
         self.write_heartbeat_value(layout::NULL_VALUE);
         self.cnc.sync()
     }
@@ -1052,6 +1068,19 @@ mod tests {
 
         assert_eq!(0, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
+    }
+
+    #[test]
+    fn closing_reclaims_the_counters_the_driver_owns() {
+        let (temp, mut conductor) = running_with(10_000_000_000, 1_000_000_000);
+
+        conductor.close().expect("close");
+
+        let reader = CncFile::try_open(&temp.0).expect("the file is published");
+        let counters = reader.counters().expect("the counter regions");
+        let scan = counters.for_each(|_| {});
+        assert_eq!(0, scan.allocated, "a stopped driver publishes none");
+        assert_eq!(46, scan.reclaimed, "and leaves forty-six reclaimed slots");
     }
 
     #[test]
