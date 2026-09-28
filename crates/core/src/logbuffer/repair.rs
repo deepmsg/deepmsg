@@ -196,6 +196,54 @@ fn reset_as_padding(
     frame.publish(length)
 }
 
+/// Copy a whole received *packet* into a hole in a term.
+///
+/// The reference's `aeron_term_rebuilder_insert`
+/// (`concurrent/aeron_term_rebuilder.h:24-40`) takes the packet as it came off
+/// the wire — not a frame from another term — and writes it whole: one
+/// datagram may carry several frames, and they are contiguous from
+/// `dest_offset` because the receiver validated exactly that before calling
+/// (`aeron_publication_image_validate_packet`,
+/// `aeron-driver/src/main/c/aeron_publication_image.c:645-735`).
+///
+/// The order is the reference's and it is the publish protocol itself: the
+/// payload and the header's last three words go first, plainly, and the first
+/// word — length, version, flags, type — goes last with a release, because
+/// that word is what tells a reader the frame is there.
+///
+/// Returns `None` when the destination already holds a frame (a duplicate, or
+/// a hole filled by an earlier retransmission) or the packet is too short to
+/// be one.
+pub fn insert_packet(
+    dest: &AtomicBuffer<'_, ReadWrite>,
+    dest_offset: usize,
+    packet: &[u8],
+) -> Option<()> {
+    if packet.len() < DATA_HEADER_LENGTH {
+        return None;
+    }
+
+    let dest_frame = Frame::new(dest, dest_offset);
+    if dest_frame.frame_length()? != 0 {
+        return None;
+    }
+
+    dest.copy_in(
+        dest_offset + DATA_HEADER_LENGTH,
+        &packet[DATA_HEADER_LENGTH..],
+    )?;
+
+    for word in [24usize, 16, 8] {
+        let value = i64::from_le_bytes(packet[word..word + 8].try_into().ok()?);
+        dest.store_i64_relaxed(dest_offset + word, value)?;
+    }
+
+    let header = i64::from_le_bytes(packet[..8].try_into().ok()?);
+    dest.store_i64_release(dest_offset, header)?;
+
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +448,73 @@ mod tests {
             scanner.advance(),
             super::super::scan::Step::Padding { .. }
         ));
+    }
+
+    #[test]
+    fn a_packet_is_inserted_payload_first_and_published_last() {
+        let mut source = term();
+        let mut destination = term();
+
+        {
+            let source_buffer = AtomicBuffer::from_slice_mut(&mut source.0).expect("aligned");
+            let frame = Frame::new(&source_buffer, 0);
+            let length = 13 + DATA_HEADER_LENGTH as i32;
+            frame
+                .begin(length, FLAG_BEGIN | FLAG_END, TYPE_DATA, 0, 7, 8, 9)
+                .expect("in range");
+            frame.write_payload(b"retransmitted").expect("in range");
+            frame.publish(length).expect("in range");
+        }
+
+        let packet = source.0[..96].to_vec();
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut destination.0).expect("aligned");
+            insert_packet(&writer, 32, &packet).expect("a hole");
+        }
+
+        let view = AtomicBuffer::from_slice(&destination.0).expect("aligned");
+        let frame = Frame::new(&view, 32);
+
+        assert_eq!(Some(64), frame.aligned_length(), "45 bytes aligned to 64");
+        let mut payload = [0u8; 13];
+        frame.copy_payload(&mut payload).expect("in range");
+        assert_eq!(b"retransmitted", &payload);
+    }
+
+    #[test]
+    fn a_frame_that_is_already_there_is_not_overwritten() {
+        let mut source = term();
+        let mut destination = term();
+
+        {
+            let source_buffer = AtomicBuffer::from_slice_mut(&mut source.0).expect("aligned");
+            let frame = Frame::new(&source_buffer, 0);
+            let length = 3 + DATA_HEADER_LENGTH as i32;
+            frame
+                .begin(length, FLAG_BEGIN | FLAG_END, TYPE_DATA, 0, 7, 8, 9)
+                .expect("in range");
+            frame.write_payload(b"one").expect("in range");
+            frame.publish(length).expect("in range");
+        }
+
+        {
+            let dest_buffer = AtomicBuffer::from_slice_mut(&mut destination.0).expect("aligned");
+            let frame = Frame::new(&dest_buffer, 0);
+            let length = 12 + DATA_HEADER_LENGTH as i32;
+            frame
+                .begin(length, FLAG_BEGIN | FLAG_END, TYPE_DATA, 0, 7, 8, 9)
+                .expect("in range");
+            frame.write_payload(b"already here").expect("in range");
+            frame.publish(length).expect("in range");
+        }
+
+        let packet = source.0[..96].to_vec();
+        let writer = AtomicBuffer::from_slice_mut(&mut destination.0).expect("aligned");
+
+        assert!(
+            insert_packet(&writer, 0, &packet).is_none(),
+            "a duplicate is refused rather than written twice"
+        );
     }
 }

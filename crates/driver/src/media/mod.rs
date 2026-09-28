@@ -35,7 +35,9 @@
 use std::io;
 use std::net::SocketAddr;
 
+pub mod dispatcher;
 pub mod loss_transport;
+pub mod receive_endpoint;
 pub mod send_endpoint;
 pub mod udp_transport;
 
