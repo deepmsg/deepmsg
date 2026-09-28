@@ -49,7 +49,8 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND, ERROR_CODE_STORAGE_SPACE,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND,
+    ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE, ERROR_CODE_STORAGE_SPACE,
     ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
     ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
     ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
@@ -247,6 +248,10 @@ struct Transmit<'a> {
     transmitter: &'a mut ToClientsTransmitter,
     region: &'a AtomicBuffer<'a, ReadWrite>,
     failures: &'a mut u64,
+    /// Errors this pass noticed but cannot record while it runs: recording
+    /// takes the file's error-log window, and the pass is already holding the
+    /// file's other windows. The conductor drains this once the pass is over.
+    faults: &'a mut Vec<(i32, String)>,
 }
 
 impl Transmit<'_> {
@@ -258,6 +263,17 @@ impl Transmit<'_> {
         {
             *self.failures += 1;
         }
+    }
+
+    /// Leave an error for the conductor to record after the pass.
+    ///
+    /// The code is the one the log is written under — for an `ON_ERROR` that
+    /// is the **protocol** code the client is told, not the negated code a
+    /// recording site set, because the reference's `log_explicit_error` is
+    /// handed the former (`aeron_driver_conductor.c:2369` takes `code`, not
+    /// `errcode`).
+    fn record_fault(&mut self, error_code: i32, description: String) {
+        self.faults.push((error_code, description));
     }
 }
 
@@ -282,9 +298,26 @@ impl ClientEvents for Transmit<'_> {
         self.send(ON_OPERATION_SUCCEEDED_TYPE_ID, &payload);
     }
 
+    /// Answer with an `ON_ERROR` — and record it, because the reference does
+    /// not do the one without the other.
+    ///
+    /// `aeron_driver_conductor_on_error` transmits the response and then falls
+    /// through to its own `log_error:` label, which records the error and
+    /// raises the errors counter for every code but one
+    /// (`aeron_driver_conductor.c:2366-2370`). So an `ON_ERROR` a client sees
+    /// is always an entry in the distinct error log and a bump of counter 15
+    /// — the two halves are one act, and this is where this build keeps them
+    /// together.
+    ///
+    /// The words are diagnostic rather than contract (`docs/compat.md`, "The
+    /// words that ride an `ON_ERROR`"), so the entry carries what the client
+    /// was told. The reference carries its per-thread composition there
+    /// instead, which is the same divergence, recorded in the same place.
     fn error(&mut self, correlation_id: i64, error_code: i32, message: &[u8]) {
         let payload = encode_error(correlation_id, error_code, message);
         self.send(ON_ERROR_TYPE_ID, &payload);
+
+        self.record_fault(error_code, String::from_utf8_lossy(message).into_owned());
     }
 
     fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
@@ -334,10 +367,10 @@ fn malformed_command(
     type_id: i32,
     payload_len: usize,
     malformed: &mut u64,
-    faults: &mut Vec<(i32, String)>,
+    faults: &mut Transmit<'_>,
 ) {
     *malformed += 1;
-    faults.push((
+    faults.record_fault(
         -ERROR_CODE_MALFORMED_COMMAND,
         compose_description(
             -ERROR_CODE_MALFORMED_COMMAND,
@@ -346,7 +379,7 @@ fn malformed_command(
             3232,
             &format!("command={type_id} too short: length={payload_len}"),
         ),
-    ));
+    );
 }
 
 /// The driver's control plane.
@@ -398,9 +431,10 @@ pub struct Conductor {
     unhandled: u64,
     unknown: u64,
     last_unhandled: Option<Command>,
-    /// Errors the command adapter noticed but could not record yet: the pass
-    /// holds the CnC file's windows while it runs, so these wait for it, the
-    /// way broadcast failures do.
+    /// Errors this pass noticed but could not record yet — the command
+    /// adapter's own faults, and every error it answered a client with. The
+    /// pass holds the CnC file's other windows while it runs, so these wait
+    /// for it, the way broadcast failures do.
     pending_log_errors: Vec<(i32, String)>,
 }
 
@@ -555,6 +589,12 @@ impl Conductor {
             + self.process_commands(now_ns)
             + self.poll_publications()
             + self.update_publication_limits();
+        // What the pass noticed and could not record while it held the file:
+        // the errors behind the `ON_ERROR`s it sent, the command adapter's own
+        // faults, the storage warnings, and the broadcasts the ring refused.
+        // The reference records each of these inside the pass; nothing outside
+        // the pass can tell the difference, and a window cannot be held twice.
+        self.record_pending_faults();
         self.record_storage_warnings();
         self.flush_broadcast_failures();
         work
@@ -608,6 +648,7 @@ impl Conductor {
             transmitter: &mut self.transmitter,
             region: &event_region,
             failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
         };
 
         self.publications.poll(
@@ -793,9 +834,10 @@ impl Conductor {
             transmitter,
             region: &event_region,
             failures: pending_failures,
+            faults,
         };
 
-        let work = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -816,7 +858,7 @@ impl Conductor {
                             &counter_regions,
                         );
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 // Nothing is freed here: the heartbeat is zeroed so the next
                 // timeout tier collects the client, which is also what stops
@@ -861,7 +903,7 @@ impl Conductor {
                                 );
                             }
                         }
-                        None => malformed_command(type_id, payload.len(), malformed, faults),
+                        None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                     }
                 }
                 // A publication's client letting go of it. The revocation
@@ -916,7 +958,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 // A subscription going away: its positions are detached and
                 // its counters come back (`aeron_driver_conductor.c:5199-5267`)
@@ -955,7 +997,7 @@ impl Conductor {
                             );
                         }
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 // A subscription: parse the URI, register the client, answer
                 // it, and then give it every publication it already matches
@@ -986,13 +1028,13 @@ impl Conductor {
                             );
                         }
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 Command::ClientClose => match decode_correlated(payload) {
                     Some(correlated) => {
                         clients.on_close(correlated.client_id, counters, &counter_regions);
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 Command::AddCounter => match decode_add_counter(payload) {
                     Some(command) => {
@@ -1069,7 +1111,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 Command::RemoveCounter => match decode_remove_counter(payload) {
                     Some(command) => {
@@ -1103,12 +1145,12 @@ impl Conductor {
                             }
                         }
                     }
-                    None => malformed_command(type_id, payload.len(), malformed, faults),
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 command => {
                     if let Command::Unknown(unknown_type_id) = command {
                         *unknown += 1;
-                        faults.push((
+                        transmit.record_fault(
                             -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
                             compose_description(
                                 -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
@@ -1117,25 +1159,14 @@ impl Conductor {
                                 3219,
                                 &format!("command={unknown_type_id} unknown"),
                             ),
-                        ));
+                        );
                     } else {
                         *unhandled += 1;
                     }
                     *last_unhandled = Some(command);
                 }
             }
-        });
-
-        // The faults the adapter collected are recorded after the read: the
-        // closure borrows the conductor's fields piecemeal and cannot call a
-        // method on the whole of it, and the order within a pass is not
-        // observable from outside the pass.
-        let faults = std::mem::take(&mut self.pending_log_errors);
-        for (error_code, description) in faults {
-            self.log_error(error_code, &description);
-        }
-
-        work
+        })
     }
 
     /// Break a stall in the command ring, and count it when it breaks one.
@@ -1210,6 +1241,7 @@ impl Conductor {
             transmitter: &mut self.transmitter,
             region: &event_region,
             failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
         };
 
         self.publications.on_time_event(
@@ -1247,6 +1279,7 @@ impl Conductor {
                 transmitter: &mut self.transmitter,
                 region: &event_region,
                 failures: &mut self.pending_broadcast_failures,
+                faults: &mut self.pending_log_errors,
             };
             self.clients.on_time_event(
                 self.now_ms,
@@ -1260,6 +1293,7 @@ impl Conductor {
             transmitter: &mut self.transmitter,
             region: &event_region,
             failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
         };
         self.clients.reap_expired(
             self.now_ms,
@@ -1282,8 +1316,9 @@ impl Conductor {
     ///
     /// The code recorded is zero, which is what the reference records too:
     /// `AERON_APPEND_ERR` appends text without setting a code
-    /// (`util/aeron_error.c:499-501`), and the last thing a recorded error did
-    /// was clear the state (`:389-397`).
+    /// (`util/aeron_error.c:380-388`, whose Windows twin's comment says the
+    /// same at `:498-501`), and the last thing a recorded error did was clear
+    /// the state (`:389-397`).
     ///
     /// This reverses the P1-1 review's D4, which read `:2233-2241` as "touches
     /// no counter" and removed the increment — the counter it leaves alone is
@@ -1307,20 +1342,53 @@ impl Conductor {
     /// (`aeron_driver_conductor_log_explicit_error`,
     /// `aeron_driver_conductor.c:1203-1215`).
     fn log_error(&mut self, error_code: i32, description: &str) {
-        if let Some(region) = self.cnc.error_log_writable() {
-            if let Err(deepmsg_cnc::error_log::RecordError::Unrecordable { description }) = self
-                .error_log
-                .record(&region, self.now_ms, error_code, description)
-            {
-                // The reference prints a formatted date here; stderr is a
-                // diagnostic and not a contract, and the epoch time says the
-                // same thing (`aeron_distinct_error_log.c:185-191`).
-                eprintln!("{} - unrecordable error {}", self.now_ms, description);
-            }
-        }
+        self.record_entry(error_code, description);
 
         if let Some(regions) = self.cnc.counter_regions() {
             system_counters::increment(&self.counters, &regions, system_counters::id::ERRORS);
+        }
+    }
+
+    /// Record what the pass left behind: every error it answered a client
+    /// with, and the command adapter's own faults.
+    ///
+    /// An `ON_ERROR` is recorded under the **protocol** code the client was
+    /// told, not the negated one a recording site set: the reference hands
+    /// `log_explicit_error` the `code` it composed, not the `errcode`
+    /// (`aeron_driver_conductor.c:2369`). One code the reference refuses to
+    /// record is skipped — the transient "resource temporarily unavailable"
+    /// is answered but kept out of the log, and so raises no counter either
+    /// (`:2367`).
+    fn record_pending_faults(&mut self) {
+        for (error_code, description) in std::mem::take(&mut self.pending_log_errors) {
+            if ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE == error_code {
+                continue;
+            }
+
+            self.log_error(error_code, &description);
+        }
+    }
+
+    /// Write one entry, and say so on stderr when the region cannot hold it.
+    ///
+    /// The reference complains from **inside** its recorder
+    /// (`aeron_distinct_error_log.c:183-191`), so every path that records
+    /// reports a failure to record the same way — including the ones whose
+    /// callers ignore the return value, such as the storage warning
+    /// (`aeron_driver_context.c:1374`).
+    fn record_entry(&mut self, error_code: i32, description: &str) {
+        let Some(region) = self.cnc.error_log_writable() else {
+            return;
+        };
+
+        if let Err(deepmsg_cnc::error_log::RecordError::Unrecordable { description }) = self
+            .error_log
+            .record(&region, self.now_ms, error_code, description)
+        {
+            // The reference prints a formatted date here; stderr is a
+            // diagnostic and not a contract, and the epoch time says the same
+            // thing (`aeron_distinct_error_log.c:183-191`).
+            eprintln!("{} - unrecordable error {}", self.now_ms, description);
         }
     }
 
@@ -1366,17 +1434,11 @@ impl Conductor {
     /// [`Conductor::log_error`]; this is for the paths the reference
     /// recorded without deciding anything had failed.
     fn record_distinct(&mut self, error_code: i32, description: &str) {
-        let Some(region) = self.cnc.error_log_writable() else {
-            return;
-        };
-
-        // An entry that does not fit is ignored: the reference does not look
-        // at the return value on this path (`aeron_driver_context.c:1374`),
-        // and the counter a recorded error would raise is not raised here at
-        // all.
-        let _ = self
-            .error_log
-            .record(&region, self.now_ms, error_code, description);
+        // What an entry that does not fit costs is the *return value*: this
+        // path's caller does not look at it (`aeron_driver_context.c:1374`)
+        // and no counter moves for a recorded error either. The complaint on
+        // stderr still happens, because it is the recorder that makes it.
+        self.record_entry(error_code, description);
     }
 
     /// Measure the pass that just ended, and count it if it ran long
@@ -3396,6 +3458,31 @@ mod tests {
         assert_eq!(1, conductor.publication_failures());
         assert_eq!(1, conductor.subscription_failures());
 
+        // Answering with an `ON_ERROR` is also recording it: the reference's
+        // `on_error` falls through to its own `log_error:` label, so the two
+        // halves are one act (`aeron_driver_conductor.c:2366-2370`). Two
+        // answers, two entries, two bumps of the errors counter — and the
+        // entry holds the same words the client was handed, because the
+        // reference hands `log_explicit_error` the message it just sent.
+        let mut recorded = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(2, log.read(i64::MIN, &mut recorded).entries);
+        assert_eq!(
+            "unknown publication client_id=7 registration_id=99",
+            recorded[0].text
+        );
+        assert_eq!(
+            "unknown subscription client_id=7 registration_id=99",
+            recorded[1].text
+        );
+        assert_eq!(1, recorded[0].observation_count, "one sighting each");
+        assert_eq!(1, recorded[1].observation_count);
+        assert_eq!(
+            Some(2),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "one bump per answer, not one per pass"
+        );
+
         // The older 24-byte removal — a client built before the flags word —
         // still finds its link and is still answered.
         send(
@@ -3411,6 +3498,36 @@ mod tests {
             deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
             events[0].0,
             "no flags means no revocation, not a refusal"
+        );
+        assert_eq!(
+            Some(2),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "and an answer that is not an error raises nothing"
+        );
+    }
+
+    #[test]
+    fn the_one_error_the_reference_keeps_out_of_the_log_is_answered_but_not_recorded() {
+        // `aeron_driver_conductor_on_error` skips its own `log_error:` label
+        // for `RESOURCE_TEMPORARILY_UNAVAILABLE` — a transient condition is
+        // answered but not recorded, and so raises no counter either
+        // (`aeron_driver_conductor.c:2367-2370`). No command this build
+        // serves reaches that code yet, so the decision is exercised where it
+        // is made.
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+
+        conductor.pending_log_errors.push((
+            ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
+            "the to-clients ring is busy".to_string(),
+        ));
+        conductor.do_work();
+
+        let mut recorded = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(0, log.read(i64::MIN, &mut recorded).entries);
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, system_counters::id::ERRORS)
         );
     }
 

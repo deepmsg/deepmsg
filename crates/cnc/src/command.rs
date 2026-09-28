@@ -417,6 +417,14 @@ pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
 /// keeps whatever that left (`aeron_driver_conductor.c:3218-3221`).
 pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
 
+/// `AERON_ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE` (`aeron_client_error.h:20`).
+///
+/// The one code the driver answers a client with and then **keeps out of the
+/// distinct error log**: `aeron_driver_conductor_on_error` skips its own
+/// `log_explicit_error` for it, so no entry appears and the errors counter
+/// stays where it was (`aeron_driver_conductor.c:2367-2370`).
+pub const ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE: i32 = 10;
+
 /// `AERON_ERROR_CODE_MALFORMED_COMMAND` (`aeron_client_error.h:17`).
 ///
 /// What the reference's command adapter reports for a command whose payload
