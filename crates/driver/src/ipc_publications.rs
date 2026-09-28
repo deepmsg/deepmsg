@@ -37,19 +37,20 @@ use std::path::PathBuf;
 
 use deepmsg_cnc::command::{
     AddPublicationCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
-    ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, PublicationBuffersReady,
+    ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_STORAGE_SPACE,
+    PublicationBuffersReady,
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position;
 
-use crate::channel_uri::{ChannelUri, Transport};
+use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, ClientRecord, Clients, PublicationLink};
 use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
 use crate::ipc_subscriptions::{IPC_CHANNEL, IpcSubscriptions};
-use crate::native_resource_agent::{Completion, NativeResourceAgent};
+use crate::native_resource_agent::{Completion, NativeResourceAgent, StorageChecks};
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError};
 use crate::sys;
@@ -124,20 +125,30 @@ impl AddError {
     /// becomes its own negation, anything else becomes the generic code). The
     /// two codes that matter are therefore:
     ///
-    /// * [`ERROR_CODE_INVALID_CHANNEL`] for a channel the driver cannot read
-    ///   and for a session id clash — the two places the reference raises
-    ///   `-AERON_ERROR_CODE_INVALID_CHANNEL`.
-    /// * [`ERROR_CODE_GENERIC_ERROR`] for everything a parameter check
-    ///   refuses, because those raise a plain `EINVAL` upstream.
+    /// * [`ERROR_CODE_INVALID_CHANNEL`] for a channel whose URI the driver
+    ///   cannot read — the scheme, the transport, the length, the *shape* of a
+    ///   parameter — and for a session id clash: the places the reference
+    ///   raises `-AERON_ERROR_CODE_INVALID_CHANNEL` (`aeron_uri.c:269-273`,
+    ///   `:311-314`, `:48`, `:84`).
+    /// * [`ERROR_CODE_GENERIC_ERROR`] for a parameter *value* the reference's
+    ///   readers reject, because those return a bare `-1` or raise `EINVAL`,
+    ///   which the conductor's composition turns into the generic code
+    ///   (`aeron_driver_conductor.c:2326-2341`) — and for every other
+    ///   parameter check that refuses.
     ///
     /// The unsupported transport has no reference answer — the reference serves
     /// UDP channels — so it reports the code the protocol has for exactly this
     /// ([`ERROR_CODE_NOT_SUPPORTED`]).
     pub const fn error_code(&self) -> i32 {
         match self {
-            Self::Params(PublicationParamsError::Uri(_)) | Self::SessionClash { .. } => {
-                ERROR_CODE_INVALID_CHANNEL
-            }
+            Self::Params(PublicationParamsError::Uri(
+                UriError::InvalidScheme
+                | UriError::TooLong { .. }
+                | UriError::NotUtf8
+                | UriError::MissingKey { .. }
+                | UriError::MissingValue { .. },
+            ))
+            | Self::SessionClash { .. } => ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => ERROR_CODE_NOT_SUPPORTED,
             Self::Params(_) | Self::NoClientRecord | Self::Share(_) | Self::AgentStopped => {
                 ERROR_CODE_GENERIC_ERROR
@@ -273,17 +284,22 @@ pub struct IpcPublications {
 }
 
 impl IpcPublications {
-    /// Start the manager, and the thread that will create log buffers.
+    /// Start the manager, and the thread that will create log buffers —
+    /// asking `storage`'s filesystem first, when the checks are on.
     ///
     /// # Errors
     ///
     /// [`io::Error`] if the agent thread cannot be spawned.
-    pub fn start(reserved_session_id_low: i32, reserved_session_id_high: i32) -> io::Result<Self> {
+    pub fn start(
+        reserved_session_id_low: i32,
+        reserved_session_id_high: i32,
+        storage: StorageChecks,
+    ) -> io::Result<Self> {
         Ok(Self {
             publications: Vec::new(),
             pending: Vec::new(),
             session_ids: SessionIds::start(reserved_session_id_low, reserved_session_id_high),
-            agent: NativeResourceAgent::start()?,
+            agent: NativeResourceAgent::start(storage)?,
         })
     }
 
@@ -396,7 +412,12 @@ impl IpcPublications {
         let path = publication_path(&config.aeron_dir, registration_id);
 
         self.agent
-            .map_log_buffer(&path, params.term_length, config.layout.page_size)
+            .map_log_buffer(
+                &path,
+                params.term_length,
+                config.layout.page_size,
+                params.is_sparse,
+            )
             .map_err(|_| AddError::AgentStopped)?;
 
         self.pending.push(PendingPublication {
@@ -496,7 +517,7 @@ impl IpcPublications {
 
                     events.error(
                         pending.identity.registration_id,
-                        ERROR_CODE_GENERIC_ERROR,
+                        storage_space_or_generic(&error),
                         format!("could not create the log buffer: {error}").as_bytes(),
                     );
                 }
@@ -541,7 +562,7 @@ impl IpcPublications {
     /// positions and its own two counters back, hand the log buffer to the
     /// agent, and drop it from the list — the reference's
     /// `aeron_ipc_publication_entry_delete` (`:1428-1446`) followed by
-    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:588-604`).
+    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:196-214`).
     ///
     /// Returns the work done, for the cycle counter.
     pub fn on_time_event(
@@ -935,6 +956,22 @@ impl IpcPublications {
 /// request linked to one that already existed — because the borrow is awkward
 /// in both: the publication is inside `self` and the subscriptions are beside
 /// it, so the call needs the manager's own field split off by hand.
+/// The error code the reference composes for a log buffer that could not be
+/// made (`aeron_driver_conductor.c:2326-2341`): an `ENOSPC` — the kernel's or
+/// the pre-creation storage check's — becomes `STORAGE_SPACE`, and everything
+/// else the generic code.
+///
+/// The reference's third branch, a *negative* errno standing in for a
+/// protocol code, cannot arrive here: an `io::Error` from the file layer
+/// carries the kernel's positive errnos or no errno at all.
+fn storage_space_or_generic(error: &io::Error) -> i32 {
+    if error.raw_os_error() == Some(libc::ENOSPC) {
+        ERROR_CODE_STORAGE_SPACE
+    } else {
+        ERROR_CODE_GENERIC_ERROR
+    }
+}
+
 fn link_subscriptions(
     publications: &mut IpcPublications,
     index: usize,
@@ -1010,6 +1047,25 @@ pub fn publication_path(aeron_dir: &std::path::Path, registration_id: i64) -> Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_out_of_space_log_buffer_keeps_its_own_error_code() {
+        // The reference's composition (`aeron_driver_conductor.c:2326-2341`):
+        // an `ENOSPC` — the kernel's or the pre-creation check's — arrives as
+        // `STORAGE_SPACE`, and everything else as the generic code.
+        assert_eq!(
+            ERROR_CODE_STORAGE_SPACE,
+            storage_space_or_generic(&io::Error::from_raw_os_error(libc::ENOSPC))
+        );
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            storage_space_or_generic(&io::Error::from_raw_os_error(libc::EACCES))
+        );
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            storage_space_or_generic(&io::Error::other("the agent has stopped"))
+        );
+    }
 
     #[test]
     fn the_path_is_the_registration_id_under_the_publications_directory() {

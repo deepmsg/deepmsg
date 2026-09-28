@@ -22,6 +22,10 @@
 //!   to ask the same question.
 //! * **Randomness**, for the session id a driver's allocation starts from
 //!   (`aeron-client/src/main/c/util/aeron_bitutil.c:61-90`).
+//! * **Free space.** Before a log buffer is created, the filesystem it will
+//!   land on is asked whether it has room — the reference's
+//!   `aeron_usable_fs_space`, a `statvfs` asking `f_frsize * f_bavail`
+//!   (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`).
 //!
 //! # Why this is `unsafe`, and why it is small
 //!
@@ -158,6 +162,40 @@ pub fn default_socket_buffers() -> io::Result<SocketBufferLengths> {
     }
 
     Ok(SocketBufferLengths { rcvbuf, sndbuf })
+}
+
+/// The bytes free to an unprivileged process on the filesystem holding
+/// `path` — or zero, when the filesystem cannot be asked.
+///
+/// This is the reference's `aeron_usable_fs_space`
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`): `statvfs`'s
+/// `f_frsize * f_bavail`, with a failure reading as zero. A caller comparing
+/// the answer against a log buffer's length treats that as "no space",
+/// which is the safe side to fail on.
+pub fn usable_fs_space(path: &std::path::Path) -> u64 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+
+    // SAFETY: `statvfs` is only specified for a zeroed-out struct when the
+    // call fails, so this starts from zeroes rather than from whatever the
+    // stack held.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `path` is a live NUL-terminated string for the duration of the
+    // call, and `vfs` is a plain-out struct the call may write through —
+    // which is exactly what the two pointers promise `statvfs(3)`.
+    if 0 != unsafe { libc::statvfs(path.as_ptr(), &mut vfs) } {
+        return 0;
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // f_frsize is a page-ish size
+    let frsize = vfs.f_frsize as u64;
+
+    frsize * vfs.f_bavail
 }
 
 /// A random `i32` to start the session id allocation from.

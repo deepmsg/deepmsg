@@ -51,29 +51,37 @@ impl LogFile {
     ///
     /// The file is created exclusively — a log buffer that already exists
     /// belongs to a publication, and two publications must not share one by
-    /// accident — and its whole length is allocated and touched, so a producer
-    /// never pays a page fault on the hot path (`:1288-1293` does the same for
-    /// a non-sparse log).
+    /// accident. `sparse` picks how the length is made real: a sparse file
+    /// declares its length and leaves the pages to the filesystem, which is
+    /// the reference's default (`term.buffer.sparse.file`); a dense one
+    /// allocates and touches its whole length up front, so a producer never
+    /// pays a page fault on the hot path. The reference's `aeron_raw_log_map`
+    /// makes the same choice from its `use_sparse_files` parameter
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1269-1292`).
     ///
     /// # Errors
     ///
     /// [`io::Error`] if the term length is not one the layout allows, or if the
     /// file cannot be created, allocated or mapped. A file this call created
     /// and then abandoned is removed before returning.
-    pub fn create(path: &Path, term_length: i32, page_size: usize) -> io::Result<Self> {
-        if position::bits_to_shift(term_length).is_none() || page_size < descriptor::PAGE_MIN_SIZE {
+    pub fn create(
+        path: &Path,
+        term_length: i32,
+        page_size: usize,
+        sparse: bool,
+    ) -> io::Result<Self> {
+        let Some(length) = Self::log_length(term_length, page_size) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the term length or page size is not one a log buffer may have",
             ));
-        }
+        };
 
-        let unaligned = (term_length as usize)
-            .saturating_mul(descriptor::PARTITION_COUNT)
-            .saturating_add(descriptor::METADATA_LENGTH);
-        let length = unaligned.saturating_add(page_size - 1) & !(page_size - 1);
-
-        let file = MappedFile::create(path, length)?;
+        let file = if sparse {
+            MappedFile::create_sparse(path, length)?
+        } else {
+            MappedFile::create(path, length)?
+        };
 
         Ok(Self {
             file,
@@ -81,6 +89,37 @@ impl LogFile {
             term_length,
             metadata_offset: length - descriptor::METADATA_LENGTH,
         })
+    }
+
+    /// The page-aligned length a log buffer of `term_length` and `page_size`
+    /// occupies, or `None` for a pair the layout does not allow.
+    ///
+    /// The same arithmetic [`LogFile::create`] makes a file of, factored out
+    /// for the caller that must know the length *before* it decides to create:
+    /// the reference's storage check compares this against the usable space
+    /// first (`aeron_driver_context.c:1354-1375`, asking
+    /// `aeron_logbuffer_compute_log_length` for the same number).
+    ///
+    /// The reference's own compute is a bare alignment
+    /// (`aeron_logbuffer_descriptor.h:107-110`) and trusts its caller for the
+    /// page size, because the driver validates it once at start-up — a range
+    /// and a power of two (`aeron_driver.c:468-485`). This is the single
+    /// validation point on this side, so the power-of-two test lives here: a
+    /// non-power-of-two page size would not merely be unusual, the mask below
+    /// would round to an arbitrary length.
+    pub fn log_length(term_length: i32, page_size: usize) -> Option<usize> {
+        if position::bits_to_shift(term_length).is_none()
+            || page_size < descriptor::PAGE_MIN_SIZE
+            || !page_size.is_power_of_two()
+        {
+            return None;
+        }
+
+        let unaligned = (term_length as usize)
+            .saturating_mul(descriptor::PARTITION_COUNT)
+            .saturating_add(descriptor::METADATA_LENGTH);
+
+        Some(unaligned.saturating_add(page_size - 1) & !(page_size - 1))
     }
 
     /// The file's length, as created.
@@ -250,10 +289,29 @@ mod tests {
 
     fn created() -> (TempDir, LogFile) {
         let dir = TempDir::new();
-        let log = LogFile::create(&dir.path().join("test.logbuffer"), TERM_LENGTH, PAGE_SIZE)
-            .expect("a log buffer");
+        let log = LogFile::create(
+            &dir.path().join("test.logbuffer"),
+            TERM_LENGTH,
+            PAGE_SIZE,
+            false,
+        )
+        .expect("a log buffer");
 
         (dir, log)
+    }
+
+    #[test]
+    fn a_page_size_that_is_not_a_power_of_two_is_refused() {
+        // The mask the length is rounded with only means anything for a power
+        // of two, and the reference's driver validates the same thing at
+        // start-up (`aeron_driver.c:468-485`). Refused here means the file is
+        // never made.
+        let dir = TempDir::new();
+        let odd = dir.path().join("odd.logbuffer");
+
+        assert!(LogFile::log_length(TERM_LENGTH, PAGE_SIZE + 2).is_none());
+        assert!(LogFile::create(&odd, TERM_LENGTH, PAGE_SIZE + 2, false).is_err());
+        assert!(!odd.exists());
     }
 
     #[test]
@@ -360,8 +418,8 @@ mod tests {
         // accident: the second one must fail and be given a different file.
         let dir = TempDir::new();
         let path = dir.path().join("taken.logbuffer");
-        let first = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE).expect("the first");
-        let second = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE);
+        let first = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE, false).expect("the first");
+        let second = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE, false);
 
         assert!(second.is_err(), "the file already exists");
         drop(first);
@@ -371,7 +429,7 @@ mod tests {
     fn removing_unmaps_and_deletes() {
         let dir = TempDir::new();
         let path = dir.path().join("gone.logbuffer");
-        let log = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE).expect("a log buffer");
+        let log = LogFile::create(&path, TERM_LENGTH, PAGE_SIZE, false).expect("a log buffer");
 
         log.remove().expect("removed");
 

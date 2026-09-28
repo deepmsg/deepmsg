@@ -33,7 +33,7 @@ use deepmsg_cnc::command::{
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::channel_uri::{ChannelUri, Transport};
+use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
 use crate::config::DriverConfig;
 use crate::ipc_publications::{AddError, IpcPublications};
@@ -143,12 +143,18 @@ pub enum AddSubscriptionError {
 
 impl AddSubscriptionError {
     /// The `ON_ERROR` code this failure is reported under, by the same rule as
-    /// [`AddError::error_code`].
+    /// [`AddError::error_code`]: a URI the driver cannot *read* is an invalid
+    /// channel, a parameter *value* the reference's readers would reject is
+    /// generic.
     pub const fn error_code(&self) -> i32 {
         match self {
-            Self::Params(PublicationParamsError::Uri(_)) => {
-                deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL
-            }
+            Self::Params(PublicationParamsError::Uri(
+                UriError::InvalidScheme
+                | UriError::TooLong { .. }
+                | UriError::NotUtf8
+                | UriError::MissingKey { .. }
+                | UriError::MissingValue { .. },
+            )) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
             Self::Params(_) | Self::NoClientRecord | Self::Link => ERROR_CODE_GENERIC_ERROR,
         }
@@ -366,24 +372,24 @@ impl IpcSubscriptions {
     /// `:5199-5267`).
     ///
     /// Every reader position is detached from its publication and its counter
-    /// given back, the client is told each image is gone, and the link is
-    /// dropped. Returns whether one was found — the reference's
-    /// `is_any_subscription_found`, which decides between an acknowledgement and
-    /// an error.
+    /// given back, and the link is dropped — with **no image message**: the
+    /// reference's removal path only unlinks, in C and in Java alike, so the
+    /// images a subscription held go unannounced and the acknowledgement is
+    /// the whole of what the client hears. Returns whether one was found —
+    /// the reference's `is_any_subscription_found`, which decides between an
+    /// acknowledgement and an error.
     ///
     /// The match is on the registration id **alone**: the reference does not
     /// check the client id here, so a client that knows a subscription's
     /// registration id can remove it even though it does not own it. That is
     /// reproduced rather than tightened — a driver that refused would be one
     /// where a legitimate removal failed.
-    #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn remove(
         &mut self,
         registration_id: i64,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
-        events: &mut impl ClientEvents,
         now_ms: i64,
     ) -> bool {
         let Some(index) = self
@@ -395,15 +401,6 @@ impl IpcSubscriptions {
         };
 
         let link = self.links.swap_remove(index);
-
-        for entry in &link.subscribables {
-            events.unavailable_image(
-                entry.publication_registration_id,
-                link.registration_id,
-                link.stream_id,
-                &link.channel,
-            );
-        }
 
         unlink_all(link, counters, regions, publications, now_ms);
 
@@ -443,7 +440,7 @@ impl IpcSubscriptions {
     ///
     /// No counters are freed here: a reader's `sub-pos` belongs to the
     /// *publication's* set, and the publication's close is what frees it
-    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:588-604`).
+    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:196-214`).
     /// Freeing them in both places would hand the same counter back twice, and
     /// the ordering here is the reference's — publications first.
     pub fn close(&mut self) {
@@ -591,7 +588,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a temp directory");
         let path = dir.join("publication.logbuffer");
 
-        let log = deepmsg_core::logbuffer::logfile::LogFile::create(&path, 64 * 1024, 4096)
+        let log = deepmsg_core::logbuffer::logfile::LogFile::create(&path, 64 * 1024, 4096, false)
             .expect("a log buffer");
         let params = crate::publication_params::PublicationParams {
             term_length: 64 * 1024,

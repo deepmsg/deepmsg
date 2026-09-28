@@ -463,11 +463,16 @@ mod tests {
         }
     }
 
+    use crate::native_resource_agent::StorageChecks;
+
+    use std::path::PathBuf;
+
     /// The publication and subscription managers a teardown needs, with no
     /// publications in them: what these tests are about is the client pool.
     fn managers() -> (IpcPublications, IpcSubscriptions) {
         (
-            IpcPublications::start(-1, 1000).expect("an agent thread"),
+            IpcPublications::start(-1, 1000, StorageChecks::new(false, PathBuf::new()))
+                .expect("an agent thread"),
             IpcSubscriptions::new(),
         )
     }

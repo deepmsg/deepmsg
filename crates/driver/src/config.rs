@@ -139,6 +139,16 @@ pub const PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT: i32 = 1000;
 /// file is told about it.
 pub const TERM_BUFFER_SPARSE_FILE_DEFAULT: bool = true;
 
+/// Whether creating a log buffer is preceded by a space check: **true**
+/// (`perform.storage.checks`, `aeron_driver_context.c:182`, set at `:457`).
+pub const PERFORM_STORAGE_CHECKS_DEFAULT: bool = true;
+
+/// The free space below which the reference records a low-space warning:
+/// ten term buffer lengths, at the reference's default term length of
+/// 16 MiB (`low.file.store.warning.threshold`,
+/// `aeron_driver_context.c:179` and `:183`).
+pub const LOW_FILE_STORE_WARNING_THRESHOLD_DEFAULT: u64 = 10 * 16 * 1024 * 1024;
+
 /// What the driver does with a `TERMINATE_DRIVER` command.
 ///
 /// The reference has no compiled-in answer: it loads one of two functions by
@@ -233,6 +243,17 @@ pub struct DriverConfig {
     /// Whether a log buffer is left sparse
     /// (`aeron.term.buffer.sparse.file`, true by default).
     pub term_buffer_sparse_file: bool,
+    /// Whether a log buffer is refused before it is created when the
+    /// filesystem it will land on cannot hold it
+    /// (`perform.storage.checks`, true by default).
+    pub perform_storage_checks: bool,
+    /// The usable space below which a low-space warning would be recorded
+    /// (`low.file.store.warning.threshold`, ten default term lengths).
+    ///
+    /// The warning itself waits for the driver's error log, so until that
+    /// arrives this names a level nothing yet acts on — the refusals the
+    /// check above makes do not need it.
+    pub low_file_store_warning_threshold: u64,
     /// The session ids the driver keeps for itself, low end
     /// (`aeron.publication.reserved.session.id.low`).
     pub publication_reserved_session_id_low: i32,
@@ -273,6 +294,8 @@ impl Default for DriverConfig {
             untethered_linger_timeout_ns: UNTETHERED_LINGER_TIMEOUT_NS_DEFAULT,
             untethered_resting_timeout_ns: UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT,
             term_buffer_sparse_file: TERM_BUFFER_SPARSE_FILE_DEFAULT,
+            perform_storage_checks: PERFORM_STORAGE_CHECKS_DEFAULT,
+            low_file_store_warning_threshold: LOW_FILE_STORE_WARNING_THRESHOLD_DEFAULT,
             publication_reserved_session_id_low: PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
             publication_reserved_session_id_high: PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT,
             socket_buffers: SocketBufferLengths {
@@ -416,6 +439,19 @@ impl DriverConfig {
         if let Some(value) = get(&Setting::TERM_BUFFER_SPARSE_FILE) {
             config.term_buffer_sparse_file = parse_bool(&Setting::TERM_BUFFER_SPARSE_FILE, &value)?;
         }
+        if let Some(value) = get(&Setting::PERFORM_STORAGE_CHECKS) {
+            config.perform_storage_checks = parse_bool(&Setting::PERFORM_STORAGE_CHECKS, &value)?;
+        }
+        if let Some(value) = get(&Setting::LOW_FILE_STORE_WARNING_THRESHOLD) {
+            config.low_file_store_warning_threshold = u64::try_from(parse_size64(
+                &Setting::LOW_FILE_STORE_WARNING_THRESHOLD,
+                &value,
+            )?)
+            .map_err(|_| ConfigError::OutOfRange {
+                name: Setting::LOW_FILE_STORE_WARNING_THRESHOLD.property,
+                value,
+            })?;
+        }
         if let Some(value) = get(&Setting::PUBLICATION_RESERVED_SESSION_ID_LOW) {
             let id = parse_count(&Setting::PUBLICATION_RESERVED_SESSION_ID_LOW, &value)?;
             config.publication_reserved_session_id_low =
@@ -540,7 +576,6 @@ impl Setting {
         property: "error.buffer.length",
         env: "AERON_ERROR_BUFFER_LENGTH",
     };
-    /// `aeron.client.liveness.timeout` (`:129`).
     /// `aeron.ipc.term.buffer.length` (`aeronmd.h:145`).
     const IPC_TERM_BUFFER_LENGTH: Self = Self {
         property: "ipc.term.buffer.length",
@@ -575,6 +610,16 @@ impl Setting {
     const TERM_BUFFER_SPARSE_FILE: Self = Self {
         property: "term.buffer.sparse.file",
         env: "AERON_TERM_BUFFER_SPARSE_FILE",
+    };
+    /// `aeron.perform.storage.checks` (`aeronmd.h:163-164`).
+    const PERFORM_STORAGE_CHECKS: Self = Self {
+        property: "perform.storage.checks",
+        env: "AERON_PERFORM_STORAGE_CHECKS",
+    };
+    /// `aeron.low.file.store.warning.threshold` (`aeronmd.h:171-172`).
+    const LOW_FILE_STORE_WARNING_THRESHOLD: Self = Self {
+        property: "low.file.store.warning.threshold",
+        env: "AERON_LOW_FILE_STORE_WARNING_THRESHOLD",
     };
     /// `aeron.untethered.window.limit.timeout` (`aeronmd.h:611`).
     const UNTETHERED_WINDOW_LIMIT_TIMEOUT: Self = Self {
@@ -993,6 +1038,29 @@ mod tests {
 
         assert!(matches!(error, ConfigError::MissingAeronDir { .. }));
         assert!(error.to_string().contains("-Ddeepmsg.dir"));
+    }
+
+    #[test]
+    fn the_storage_check_answers_to_the_references_names() {
+        // On by default, and the warning level ten of the reference's default
+        // term lengths (`aeron_driver_context.c:179-183`, `:457`, `:492`).
+        let config = DriverConfig::default();
+        assert!(config.perform_storage_checks);
+        assert_eq!(160 * 1024 * 1024, config.low_file_store_warning_threshold);
+
+        let off = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.perform.storage.checks", "false"),
+        ])
+        .expect("resolve");
+        assert!(!off.perform_storage_checks);
+
+        let level = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.low.file.store.warning.threshold", "1g"),
+        ])
+        .expect("resolve");
+        assert_eq!(1024 * 1024 * 1024, level.low_file_store_warning_threshold);
     }
 
     #[test]

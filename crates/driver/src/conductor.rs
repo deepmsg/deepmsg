@@ -70,6 +70,7 @@ use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::native_resource_agent::StorageChecks;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -437,6 +438,7 @@ impl Conductor {
         let publications = IpcPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
+            StorageChecks::new(config.perform_storage_checks, config.aeron_dir.clone()),
         )
         .map_err(ConductorError::Agent)?;
 
@@ -850,42 +852,58 @@ impl Conductor {
                             }
                             None => {
                                 *publication_failures += 1;
+                                // The reference's text names both ids
+                                // (`aeron_driver_conductor.c:4734`), so a
+                                // client — or an operator reading its logs —
+                                // is told *whose* publication nobody had.
+                                let unknown = format!(
+                                    "unknown publication client_id={} registration_id={}",
+                                    request.correlated.client_id, request.registration_id,
+                                );
                                 transmit.error(
                                     request.correlated.correlation_id,
                                     ERROR_CODE_UNKNOWN_PUBLICATION,
-                                    b"unknown publication",
+                                    unknown.as_bytes(),
                                 );
                             }
                         }
                     }
                     None => *malformed += 1,
                 },
-                // A subscription going away: every image it held is announced
-                // as gone, its positions are detached and its counters come
-                // back (`aeron_driver_conductor.c:5199-5267`).
+                // A subscription going away: its positions are detached and
+                // its counters come back (`aeron_driver_conductor.c:5199-5267`)
+                // — silently, which is the reference's answer in C and in
+                // Java alike: neither announces the images a removal takes
+                // away, so the acknowledgement is the whole event stream.
                 Command::RemoveSubscription => match decode_remove_subscription(payload) {
                     Some(request) => {
                         if subscriptions.has(request.registration_id) {
-                            // The acknowledgement first: the reference answers
-                            // before it announces the images it is taking away,
-                            // so a client that is waiting on the removal is not
-                            // handed an image event first.
-                            transmit.operation_succeeded(request.correlated.correlation_id);
-
+                            // The detachment first, the acknowledgement after
+                            // it: the reference unlinks every subscribable and
+                            // only then answers, so a client that reads its
+                            // events in order knows the removal has happened
+                            // once the answer arrives.
                             subscriptions.remove(
                                 request.registration_id,
                                 counters,
                                 &counter_regions,
                                 publications,
-                                &mut transmit,
                                 now_ms,
                             );
+
+                            transmit.operation_succeeded(request.correlated.correlation_id);
                         } else {
                             *subscription_failures += 1;
+                            // The same two ids as the publication's text
+                            // (`aeron_driver_conductor.c:5258`).
+                            let unknown = format!(
+                                "unknown subscription client_id={} registration_id={}",
+                                request.correlated.client_id, request.registration_id,
+                            );
                             transmit.error(
                                 request.correlated.correlation_id,
                                 ERROR_CODE_UNKNOWN_SUBSCRIPTION,
-                                b"unknown subscription",
+                                unknown.as_bytes(),
                             );
                         }
                     }
@@ -2538,6 +2556,45 @@ mod tests {
         );
         assert_eq!(0, conductor.publications().publications().len());
     }
+
+    #[test]
+    fn a_parameter_value_the_reference_cannot_parse_is_generic() {
+        // The URI's *structure* reads — the scheme, the transport, the shape
+        // of the parameter — so the reference gets as far as parsing the
+        // value, where its reader returns a bare `-1` and the conductor's
+        // error composition turns that into the generic code
+        // (`aeron_driver_conductor.c:2326-2341`). A driver that answered the
+        // invalid-channel code here would move the goalposts for a client
+        // that branches on the two codes differently.
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 9, 1001, "aeron:ipc?term-length=abc"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(9i64.to_le_bytes(), payload[0..8], "the failing command");
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR.to_le_bytes(),
+            payload[8..12],
+            "the code the reference's composition gives a value it cannot parse"
+        );
+        assert_eq!(1, conductor.publication_failures());
+    }
+
     #[test]
     fn a_subscription_gets_an_image_and_the_producer_gets_a_window() {
         let temp = TempDir::new();
@@ -2952,25 +3009,17 @@ mod tests {
         );
         conductor.do_work();
 
+        // The removal is silent in the reference, in C and in Java alike:
+        // no image is announced as gone, and the acknowledgement — which the
+        // reference sends only after the unlinking — is the whole event
+        // stream (`aeron_driver_conductor.c:5199-5267`).
         let events = drain(&cnc, &mut receiver);
-        assert_eq!(2, events.len(), "the acknowledgement, then the image");
+        assert_eq!(1, events.len(), "the acknowledgement, and nothing else");
         assert_eq!(
             deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
             events[0].0
         );
         assert_eq!(51i64.to_le_bytes(), events[0].1[0..8]);
-        assert_eq!(
-            deepmsg_cnc::command::ON_UNAVAILABLE_IMAGE_TYPE_ID,
-            events[1].0,
-            "the client has to know its image is gone"
-        );
-        assert_eq!(42i64.to_le_bytes(), events[1].1[0..8], "the publication");
-        assert_eq!(9i64.to_le_bytes(), events[1].1[8..16], "the subscription");
-        assert_eq!(
-            b"aeron:ipc",
-            &events[1].1[24..],
-            "the channel it subscribed with"
-        );
 
         assert!(conductor.subscriptions().links().is_empty());
         assert_eq!(
@@ -3017,8 +3066,18 @@ mod tests {
             i32::from_le_bytes(errors[0].1[8..12].try_into().expect("four bytes"))
         );
         assert_eq!(
+            &b"unknown publication client_id=7 registration_id=99"[..],
+            &errors[0].1[16..],
+            "the reference's text names both ids (aeron_driver_conductor.c:4734)"
+        );
+        assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
             i32::from_le_bytes(errors[1].1[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            &b"unknown subscription client_id=7 registration_id=99"[..],
+            &errors[1].1[16..],
+            "and the subscription's text does the same (:5258)"
         );
         assert_eq!(1, conductor.publication_failures());
         assert_eq!(1, conductor.subscription_failures());

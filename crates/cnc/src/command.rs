@@ -400,6 +400,14 @@ pub const ERROR_CODE_NOT_SUPPORTED: i32 = 8;
 /// and leaves the code as it found it.
 pub const ERROR_CODE_GENERIC_ERROR: i32 = 11;
 
+/// `AERON_ERROR_CODE_STORAGE_SPACE` (`aeron_client_error.h:22`).
+///
+/// The code the reference composes for a log buffer the filesystem could not
+/// hold — whether the kernel refused with `ENOSPC` or the driver's own
+/// pre-creation check decided there was no room
+/// (`aeron_driver_conductor.c:2326-2341`).
+pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
+
 /// Encode `ON_OPERATION_SUCCEEDED`.
 pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
     correlation_id.to_le_bytes()
