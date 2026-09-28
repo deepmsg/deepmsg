@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use deepmsg_cnc::command::{
     AddPublicationCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
     ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_STORAGE_SPACE,
-    PublicationBuffersReady,
+    ImageBuffersReady, PublicationBuffersReady,
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::logfile::LogFile;
@@ -55,6 +55,7 @@ use crate::native_resource_agent::{
 };
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError};
+use crate::subscribable::UntetheredEvent;
 use crate::sys;
 
 /// The moment a command is served at, and how long a client this driver has
@@ -492,6 +493,77 @@ impl IpcPublications {
         worked
     }
 
+    /// What the untethered machine's three outcomes become for a client
+    /// (`aeron_ipc_publication.c:396-402`, `:435-448`, `:421-425`).
+    ///
+    /// The same three messages a *network* reader gets from its image, and the
+    /// same shapes: an unavailable image naming the subscription, an available
+    /// one carrying the publication's own log file, and a counter going back
+    /// to the manager. The channel is the **constant** `aeron:ipc`, not the
+    /// one the client subscribed with — the reference sends the constant here
+    /// as it does when a publication drains, because the reader is holding a
+    /// mapping of a log buffer rather than a description of a channel.
+    fn on_untethered(
+        &mut self,
+        index: usize,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        events: &mut impl ClientEvents,
+        now_ns: i64,
+        now_ms: i64,
+    ) -> usize {
+        let publication = &mut self.publications[index];
+        let registration_id = publication.registration_id;
+        let stream_id = publication.stream_id;
+        let session_id = publication.session_id;
+
+        let moved = publication.check_untethered_subscriptions(counters, regions, now_ns);
+        let mut work = 0;
+
+        for event in &moved {
+            work += 1;
+
+            match *event {
+                UntetheredEvent::Unavailable {
+                    subscription_registration_id,
+                    ..
+                } => {
+                    events.unavailable_image(
+                        registration_id,
+                        subscription_registration_id,
+                        stream_id,
+                        IPC_CHANNEL,
+                    );
+                }
+                UntetheredEvent::Available {
+                    subscription_registration_id,
+                    counter_id,
+                    ..
+                } => {
+                    // The same message `link_subscribable` sends a reader that
+                    // has just arrived, down to the source identity
+                    // (`ipc_subscriptions.rs:950-958`): a woken reader cannot
+                    // tell the difference, which is the point of waking it this
+                    // way rather than inventing a second message.
+                    events.available_image(&ImageBuffersReady {
+                        correlation_id: registration_id,
+                        session_id,
+                        stream_id,
+                        subscriber_registration_id: subscription_registration_id,
+                        subscriber_position_id: counter_id,
+                        log_file: publication.path_bytes(),
+                        source_identity: IPC_CHANNEL,
+                    });
+                }
+                UntetheredEvent::Closed { counter_id } => {
+                    counters.free(regions, counter_id, now_ms);
+                }
+            }
+        }
+
+        work
+    }
+
     /// Take everything the agent finished since the last call and create the
     /// publications whose log buffers have landed.
     ///
@@ -653,6 +725,21 @@ impl IpcPublications {
             // the next turn — which is what makes a revoked publication
             // readable for one more tier than a removed one.
             let before = self.publications[index].state();
+
+            // A reader that has stopped reading is put aside, woken or closed
+            // (`aeron_ipc_publication.c:530-534`): the actives' first duty, and
+            // one the revoke above skips — a publication on its way out is
+            // already telling its readers so.
+            if before == State::Active {
+                work += self.on_untethered(index, counters, regions, events, now_ns, now_ms);
+
+                // The reference's next line, on the same tier
+                // (`aeron_ipc_publication.c:533-534`): a reader the machine
+                // just took out of the working count is one the producer can
+                // no longer see reading.
+                self.publications[index].update_connected_status();
+            }
+
             work += usize::from(self.publications[index].on_time_event(counters, regions, now_ns));
 
             // The moment a publication finishes draining, its readers are told
