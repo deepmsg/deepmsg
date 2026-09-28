@@ -30,6 +30,7 @@ pub mod loss;
 pub mod media;
 pub mod native_resource_agent;
 pub mod network_publication;
+pub mod network_publications;
 pub mod position;
 pub mod protocol;
 pub mod publication_params;

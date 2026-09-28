@@ -67,14 +67,20 @@ use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
     ToDriverRingConsumer,
 };
+use std::sync::Arc;
+
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::clock::{self, CachedClock};
 
+use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::native_resource_agent::StorageChecks;
+use crate::network_publications::NetworkPublications;
+use crate::send_endpoints::SendChannelEndpoints;
+use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -189,6 +195,8 @@ impl Command {
 /// Why a conductor could not take over a CnC file.
 #[derive(Debug)]
 pub enum ConductorError {
+    /// The sender thread could not be started.
+    Sender(std::io::Error),
     /// The ready version could not be stored.
     Publish(CncCreateError),
     /// The to-driver region is not a ring this build can consume. Validation
@@ -221,6 +229,7 @@ impl std::fmt::Display for ConductorError {
                 write!(f, "the system counters were not published: {error}")
             }
             Self::Agent(error) => write!(f, "the native resource agent did not start: {error}"),
+            Self::Sender(error) => write!(f, "the sender thread did not start: {error}"),
         }
     }
 }
@@ -230,7 +239,7 @@ impl std::error::Error for ConductorError {
         match self {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
-            Self::Agent(error) => Some(error),
+            Self::Agent(error) | Self::Sender(error) => Some(error),
             Self::NoCommandRing | Self::NoEventRing | Self::NoCounterRegions => None,
         }
     }
@@ -387,7 +396,10 @@ pub struct Conductor {
     /// The settings every publication's parameters default to, kept because
     /// they are read on the command path and not only at start-up.
     config: DriverConfig,
-    cnc: CncFile,
+    /// The shared-memory file, behind an `Arc` because the data plane's agents
+    /// each derive their own counter views over the same pages (P1-4). Every
+    /// use below is a shared borrow, which is what makes that possible.
+    cnc: Arc<CncFile>,
     commands: ToDriverRingConsumer,
     transmitter: ToClientsTransmitter,
     counters: CounterManager,
@@ -403,6 +415,14 @@ pub struct Conductor {
     publications: IpcPublications,
     /// The subscriptions reading them.
     subscriptions: IpcSubscriptions,
+    /// The send endpoints a network publication shares, one per canonical
+    /// channel (`aeron_driver_conductor.c:1961-2030`).
+    send_endpoints: SendChannelEndpoints,
+    /// The publications that send over UDP, and the thread that maps their log
+    /// buffers.
+    network_publications: NetworkPublications,
+    /// The sender thread, whose proxy is how anything reaches it.
+    sender: Sender,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -520,7 +540,53 @@ impl Conductor {
         )
         .map_err(ConductorError::Agent)?;
 
-        let mut conductor = Self {
+        // The network side: the sender thread first, because the publications
+        // manager hands it what it creates, then the manager itself (which is
+        // another agent thread — the one that maps *network* log buffers).
+        // The heartbeat and the ready version, *before* the file is shared:
+        // `publish` updates the in-memory metadata as well as the mapping, and
+        // after the `Arc` below there is no longer a mutable reference to it.
+        // The order is the contract (`aeron-driver/src/main/c/aeron_driver.c:971-972`)
+        // and it is enforced inside `publish`, which refuses a file whose
+        // heartbeat is still zero.
+        {
+            let region = cnc
+                .to_driver_region()
+                .ok_or(ConductorError::NoCommandRing)?;
+            let written = commands.write_consumer_heartbeat(&region, now_ms);
+            debug_assert!(written.is_some(), "the region was validated above");
+        }
+
+        let mut cnc = cnc;
+        cnc.publish().map_err(ConductorError::Publish)?;
+
+        // The file moves into the `Arc` here, which is what lets the agents
+        // below share it; everything above this line borrowed it directly.
+        let cnc = Arc::new(cnc);
+
+        let sender = Sender::start(
+            Arc::clone(&cnc),
+            // The counters region's length is what fixes a counter id's meaning
+            // on both sides of the handover.
+            cnc.layout().counters_values.len(),
+            free_to_reuse_ms(config.counter_free_to_reuse_ns),
+            usize::try_from(config.mtu_length).unwrap_or(1408),
+            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+        )
+        .map_err(ConductorError::Sender)?;
+
+        let network_publications = NetworkPublications::start(
+            config.publication_reserved_session_id_low,
+            config.publication_reserved_session_id_high,
+            StorageChecks::new(
+                config.perform_storage_checks,
+                config.low_file_store_warning_threshold,
+                config.aeron_dir.clone(),
+            ),
+        )
+        .map_err(ConductorError::Agent)?;
+
+        let conductor = Self {
             config: config.clone(),
             cnc,
             commands,
@@ -531,6 +597,9 @@ impl Conductor {
             clients: Clients::new(),
             publications,
             subscriptions: IpcSubscriptions::new(),
+            send_endpoints: SendChannelEndpoints::new(),
+            network_publications,
+            sender,
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -557,9 +626,6 @@ impl Conductor {
             last_unhandled: None,
             pending_log_errors: Vec::new(),
         };
-
-        conductor.write_heartbeat();
-        conductor.cnc.publish().map_err(ConductorError::Publish)?;
 
         Ok(conductor)
     }
@@ -627,8 +693,10 @@ impl Conductor {
     /// sequence), and for the same reason: the create has to happen on the
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
-        if self.publications.pending() == 0 {
-            return 0;
+        let mut work = self.poll_sender_events();
+
+        if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
+            return work;
         }
 
         let Some(counter_regions) = self.cnc.counter_regions() else {
@@ -651,7 +719,7 @@ impl Conductor {
             faults: &mut self.pending_log_errors,
         };
 
-        self.publications.poll(
+        work += self.publications.poll(
             &self.config,
             &mut self.counters,
             &counter_regions,
@@ -659,7 +727,57 @@ impl Conductor {
             &mut self.subscriptions,
             now,
             &mut transmit,
-        )
+        );
+
+        // The network side's own pending list, whose create also hands the
+        // publication to the sender.
+        work += self.network_publications.poll(
+            &self.config,
+            &mut self.counters,
+            &counter_regions,
+            &mut self.clients,
+            self.sender.proxy(),
+            now,
+            &mut transmit,
+        );
+
+        work
+    }
+
+    /// What the sender thread has to say: an endpoint it closed, a publication
+    /// it let go, and the faults it could not record itself (it has no error
+    /// log of its own — the distinct log is the conductor's).
+    ///
+    /// The reference's arrangement is the same one seen from the other side:
+    /// its sender calls `aeron_driver_sender_log_error` for exactly these, and
+    /// that records into the shared log on the sender's own thread. This build
+    /// keeps every writer of that log on one thread, which is why the fault
+    /// travels here first.
+    fn poll_sender_events(&mut self) -> usize {
+        let events = self.sender.proxy().poll();
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match event {
+                crate::sender::SenderEvent::Fault {
+                    error_code,
+                    description,
+                } => {
+                    self.pending_log_errors.push((error_code, description));
+                }
+                crate::sender::SenderEvent::EndpointRemoved { .. }
+                | crate::sender::SenderEvent::PublicationRemoved { .. } => {
+                    // The conductor's own bookkeeping for a removal arrives
+                    // with the removal path (P1-4's last slice): an endpoint
+                    // outlives its publications only until the reference
+                    // count reaches zero, and that is the conductor's count.
+                }
+            }
+        }
+
+        work
     }
 
     /// Whether the driver should keep running.
@@ -776,6 +894,12 @@ impl Conductor {
         // publication counters behind.
         self.publications
             .close(&mut self.counters, &regions, self.now_ms);
+        // The network side: the thread first — it owns the sockets and the log
+        // buffers, and a log buffer unmapped while a sender is reading it is
+        // the one failure mode this ordering exists to prevent — then the
+        // publications' own bookkeeping.
+        let _ = self.sender.close();
+        let _ = self.network_publications.close();
         // The subscriptions own no counters: a reader's `sub-pos` is in the
         // publication's set, and the line above has already given it back.
         self.subscriptions.close();
@@ -813,6 +937,9 @@ impl Conductor {
         let termination = self.termination;
         let config = &self.config;
         let publications = &mut self.publications;
+        let network_publications = &mut self.network_publications;
+        let send_endpoints = &mut self.send_endpoints;
+        let sender = &self.sender;
         let publication_failures = &mut self.publication_failures;
         let subscriptions = &mut self.subscriptions;
         let subscription_failures = &mut self.subscription_failures;
@@ -885,17 +1012,41 @@ impl Conductor {
                                 client_liveness_timeout_ns: liveness_timeout_ns,
                             };
 
-                            if let Err(error) = publications.add_publication(
-                                &request,
-                                is_exclusive,
-                                config,
-                                counters,
-                                &counter_regions,
-                                clients,
-                                subscriptions,
-                                now,
-                                &mut transmit,
-                            ) {
+                            // Which collection serves this depends on what
+                            // the URI names, and *only* on that: the reference
+                            // parses the channel and then follows one of two
+                            // paths (`aeron_driver_conductor.c:4113-4135`), and
+                            // a channel this build does not serve is refused by
+                            // the collection that would have had it.
+                            let result = match ChannelUri::parse(request.channel) {
+                                Ok(uri) if uri.transport() == Transport::Udp => {
+                                    network_publications.add_publication(
+                                        &request,
+                                        is_exclusive,
+                                        config,
+                                        counters,
+                                        &counter_regions,
+                                        clients,
+                                        send_endpoints,
+                                        sender.proxy(),
+                                        now,
+                                        &mut transmit,
+                                    )
+                                }
+                                _ => publications.add_publication(
+                                    &request,
+                                    is_exclusive,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    subscriptions,
+                                    now,
+                                    &mut transmit,
+                                ),
+                            };
+
+                            if let Err(error) = result {
                                 // The error code is the reference's, derived
                                 // from what failed rather than from where: a
                                 // channel it cannot parse is a different
@@ -2967,13 +3118,14 @@ mod tests {
         );
         assert_eq!(1, conductor.publication_failures());
 
-        // A UDP channel is a channel this build does not serve yet: it is
-        // refused rather than left waiting, and with the code the protocol has
-        // for exactly that.
+        // A channel the reference serves and this build does not — a multicast
+        // group — is refused rather than left waiting, and with the code the
+        // protocol has for exactly that. (A unicast UDP channel used to be this
+        // test's example; P1-4 made it a channel this driver *does* serve.)
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=localhost:40123"),
+            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=224.0.1.1:40123"),
         );
         let payload = await_event(
             &mut conductor,

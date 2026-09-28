@@ -83,6 +83,51 @@ pub const COUNTER_FREE_TO_REUSE_NS_DEFAULT: i64 = 1_000_000_000;
 /// smaller — which is what a test that creates publications wants.
 pub const IPC_TERM_BUFFER_LENGTH_DEFAULT: i32 = 64 * 1024 * 1024;
 
+/// `AERON_TERM_BUFFER_LENGTH_DEFAULT`
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:179`).
+pub const TERM_BUFFER_LENGTH_DEFAULT: i32 = 16 * 1024 * 1024;
+
+/// `AERON_MTU_LENGTH_DEFAULT` (`aeron_driver_context.c:186`).
+pub const MTU_LENGTH_DEFAULT: i32 = 1408;
+
+/// `aeron.publication.term.window.length`'s default: zero, which means half a
+/// term (`aeron_driver_context.c:189`).
+pub const PUBLICATION_WINDOW_LENGTH_DEFAULT: i32 = 0;
+
+/// `AERON_SOCKET_SO_RCVBUF_DEFAULT` (`aeron_driver_context.c:191`).
+pub const SOCKET_SO_RCVBUF_DEFAULT: i32 = 128 * 1024;
+
+/// `AERON_SOCKET_SO_SNDBUF_DEFAULT` (`aeron_driver_context.c:192`): zero, and
+/// for a *send* buffer that is not a mistake — the kernel's default is what
+/// the socket gets unless a channel asks for more.
+pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
+
+/// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:205`).
+pub const RCV_INITIAL_WINDOW_LENGTH_DEFAULT: i32 = 128 * 1024;
+
+/// `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT`
+/// (`aeron_driver_context.c:242`), which is clamped to
+/// [`crate::media::udp_transport`]'s sixteen by the context setter
+/// (`:3378-3384`).
+pub const NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT: usize = 4;
+
+/// `AERON_SEND_TO_STATUS_POLL_RATIO_DEFAULT` (`aeron_driver_context.c:199`).
+pub const SEND_TO_STATUS_POLL_RATIO_DEFAULT: u8 = 6;
+
+/// `AERON_PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT`
+/// (`aeron_driver_context.c:208`).
+pub const PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT: i64 = 5_000_000_000;
+
+/// `AERON_RETRANSMIT_UNICAST_DELAY_NS_DEFAULT` (`aeron_driver_context.c:218`).
+pub const RETRANSMIT_UNICAST_DELAY_NS_DEFAULT: i64 = 0;
+
+/// `AERON_RETRANSMIT_UNICAST_LINGER_NS_DEFAULT`
+/// (`aeron_driver_context.c:219`).
+pub const RETRANSMIT_UNICAST_LINGER_NS_DEFAULT: i64 = 10_000_000;
+
+/// `AERON_RETRANSMIT_HANDLER_MAX_RESEND` (`aeron_driver_context.c:499`).
+pub const MAX_RESEND_DEFAULT: i32 = 16;
+
 /// The largest frame an IPC publication writes: 1408 bytes
 /// (`aeron.ipc.mtu.length`, `aeron_driver_context.c:187`).
 ///
@@ -269,6 +314,51 @@ pub struct DriverConfig {
     /// what it is told. A probe that fails leaves zeroes, which is what a
     /// process that cannot make a socket would have written anyway.
     pub socket_buffers: SocketBufferLengths,
+    /// The length of one term of a *network* publication's log buffer
+    /// (`aeron.term.buffer.length`, [`TERM_BUFFER_LENGTH_DEFAULT`]).
+    ///
+    /// Sixteen megabytes, a quarter of the IPC default: a network term is
+    /// bounded by what a receiver can hold and by how long a term takes to
+    /// fill at the link's rate, neither of which shared memory is.
+    pub term_buffer_length: i32,
+    /// The largest frame a network publication writes (`aeron.mtu.length`,
+    /// [`MTU_LENGTH_DEFAULT`]). It is the datagram size, so it is also what a
+    /// batch of frames is cut into.
+    pub mtu_length: i32,
+    /// How far ahead of its slowest reader a network producer may run
+    /// (`aeron.publication.term.window.length`; zero means half a term).
+    pub publication_window_length: i32,
+    /// `SO_RCVBUF` for a channel that named none (`aeron.socket.so.rcvbuf`,
+    /// [`SOCKET_SO_RCVBUF_DEFAULT`]).
+    pub socket_so_rcvbuf: i32,
+    /// `SO_SNDBUF`, likewise (`aeron.socket.so.sndbuf`; zero leaves the
+    /// kernel's default, which is a socket *sending* into a local buffer).
+    pub socket_so_sndbuf: i32,
+    /// The window a subscription offers a publication when the channel named
+    /// none (`aeron.receiver.window.length`,
+    /// [`RCV_INITIAL_WINDOW_LENGTH_DEFAULT`]).
+    pub receiver_window_length: i32,
+    /// How many datagrams one send batch may carry
+    /// (`aeron.network.publication.max.messages.per.send`, default four, one
+    /// to sixteen).
+    pub network_publication_max_messages_per_send: usize,
+    /// How many sender passes go by between two polls of the control sockets
+    /// (`aeron.send.to.sm.poll.ratio`, [`SEND_TO_STATUS_POLL_RATIO_DEFAULT`]).
+    pub send_to_sm_poll_ratio: u8,
+    /// How long a publication waits for a status message before it decides its
+    /// receivers are gone (`aeron.publication.connection.timeout`, five
+    /// seconds).
+    pub publication_connection_timeout_ns: i64,
+    /// How long a NAK's answer waits before it is sent
+    /// (`aeron.retransmit.unicast.delay`; zero answers at once, which is the
+    /// default).
+    pub retransmit_unicast_delay_ns: i64,
+    /// How long a served NAK lingers before its slot may be reused
+    /// (`aeron.retransmit.unicast.linger`, ten milliseconds).
+    pub retransmit_unicast_linger_ns: i64,
+    /// How many times a term may be retransmitted before the publication gives
+    /// up on it (`aeron.max.resend`, sixteen).
+    pub max_resend: i32,
 }
 
 impl Default for DriverConfig {
@@ -302,6 +392,19 @@ impl Default for DriverConfig {
                 rcvbuf: 0,
                 sndbuf: 0,
             },
+            term_buffer_length: TERM_BUFFER_LENGTH_DEFAULT,
+            mtu_length: MTU_LENGTH_DEFAULT,
+            publication_window_length: PUBLICATION_WINDOW_LENGTH_DEFAULT,
+            socket_so_rcvbuf: SOCKET_SO_RCVBUF_DEFAULT,
+            socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
+            receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
+            network_publication_max_messages_per_send:
+                NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT,
+            send_to_sm_poll_ratio: SEND_TO_STATUS_POLL_RATIO_DEFAULT,
+            publication_connection_timeout_ns: PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
+            retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
+            retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
+            max_resend: MAX_RESEND_DEFAULT,
         }
     }
 }
