@@ -40,7 +40,7 @@ use deepmsg_core::logbuffer::position::{Position, RawTail};
 
 use crate::flowcontrol::receiver_window_length;
 use crate::loss_detector::{Gap, LossDetector};
-use crate::protocol::{DataFrame, FrameHeader, HEADER_LENGTH, header_flags};
+use crate::protocol::{DataFrame, FrameHeader, header_flags};
 use crate::publication_params::SubscriptionParams;
 use crate::subscribable::{Subscribable, TetherState, TetherablePosition};
 use crate::system_counters::{self, System};
@@ -392,8 +392,10 @@ impl PublicationImage {
     ///
     /// * a **heartbeat** — a zero-length DATA frame — which carries liveness
     ///   and the end-of-stream flag and nothing else;
-    /// * a packet older than what is already there, which is the cooling tail
-    ///   of a retransmission;
+    /// * a packet behind the last status message this image sent, which is the
+    ///   cooling tail of a retransmission — counted as an under-run, and the
+    ///   one case among these that is still allowed to keep the connection
+    ///   alive;
     /// * a packet already in the term, which `insert_packet`'s
     ///   "write only into an empty slot" rule refuses.
     #[allow(clippy::too_many_arguments)] // the packet, its place, and the counters
@@ -417,9 +419,7 @@ impl PublicationImage {
         }
 
         let term_length = self.term_length.unsigned_abs() as i32;
-        let Some(payload_length) =
-            validate_packet(term_length, term_offset, packet, self.mtu_length)
-        else {
+        let Some(payload_length) = validate_packet(term_length, term_offset, packet) else {
             system.increment(system_counters::id::INVALID_PACKETS);
             return 0;
         };
@@ -446,6 +446,7 @@ impl PublicationImage {
 
             if packet_position >= window_bottom {
                 self.track_connection(source, now_ns);
+                self.time_of_last_packet_ns = now_ns;
                 self.on_heartbeat(packet, packet_position, counters, regions, system);
             } else {
                 system.increment(system_counters::id::FLOW_CONTROL_UNDER_RUNS);
@@ -454,10 +455,19 @@ impl PublicationImage {
             return 0;
         }
 
-        if packet_position >= self.last_sm_position - i64::from(self.max_receiver_window_length) {
-            // Inside what the last status message asked for: a packet behind
-            // the window bottom is one the receiver can no longer ask for, and
-            // writing it would be writing history over a reused term.
+        if self.is_flow_control_under_run(packet_position, system) {
+            // Behind the last status message: not written, because the term it
+            // belongs to may already have been reused and writing it would put
+            // a past term's frames back among the current one's. A sender
+            // inside the window we advertised may be retransmitting something
+            // we do still want, so that much of the band keeps the connection
+            // alive (`:841-844`).
+            if proposed_position
+                >= self.last_sm_position - i64::from(self.max_receiver_window_length)
+            {
+                self.track_connection(source, now_ns);
+            }
+        } else {
             self.track_connection(source, now_ns);
             self.time_of_last_packet_ns = now_ns;
 
@@ -476,14 +486,38 @@ impl PublicationImage {
                 self.counters.rcv_hwm,
                 proposed_position,
             );
-        } else {
-            system.increment(system_counters::id::FLOW_CONTROL_UNDER_RUNS);
         }
 
         packet.len()
     }
 
-    /// What an end-of-stream heartbeat does (`:790-830`).
+    /// Whether a packet is behind the last status message this image sent, and
+    /// the counter that says so.
+    ///
+    /// `aeron_publication_image_is_flow_control_under_run`
+    /// (`aeron_publication_image.h:252-262`) counts *every* packet that falls
+    /// behind — not only the ones outside the window we advertised — so the
+    /// increment lives in the predicate and both of its callers get it.
+    fn is_flow_control_under_run(&self, packet_position: i64, system: &System<'_>) -> bool {
+        let under_run = packet_position < self.last_sm_position;
+
+        if under_run {
+            system.increment(system_counters::id::FLOW_CONTROL_UNDER_RUNS);
+        }
+
+        under_run
+    }
+
+    /// What an end-of-stream heartbeat does (`:778-827`, the `is_heartbeat`
+    /// arm).
+    ///
+    /// A heartbeat proposes the position it arrived at and nothing more: the
+    /// payload length `validate_packet` returned for it was zero, so the
+    /// reference's `proposed_position = packet_position + payload_length`
+    /// (`:772`) is the packet's own position, and that is what is proposed at
+    /// `:821`. Adding a header's worth on top would advertise a high-water mark
+    /// for bytes no sender is going to send, which the loss detector reads as a
+    /// gap and reports forever.
     fn on_heartbeat(
         &mut self,
         packet: &[u8],
@@ -498,12 +532,8 @@ impl PublicationImage {
             return;
         };
 
-        let proposed_position = packet_position + i64::from(HEADER_LENGTH as i32);
-        let _ = counters.set_value(
-            regions,
-            self.counters.rcv_hwm,
-            self.hwm_position(counters, regions).max(proposed_position),
-        );
+        let _ =
+            system_counters::propose_max(counters, regions, self.counters.rcv_hwm, packet_position);
 
         if header.flags & header_flags::EOS == 0 || self.is_end_of_stream {
             return;
@@ -936,24 +966,29 @@ impl crate::subscribable::SubscribableHooks for NoHooks {
     fn position_removed(&mut self, _position: &TetherablePosition, _working_before: usize) {}
 }
 
-/// `aeron_publication_image_validate_packet` (`:645-735`), minus the
+/// `aeron_publication_image_validate_packet` (`:645-738`), minus the
 /// timestamping an ATS channel would add.
 ///
-/// Returns the packet's payload bytes: zero for a heartbeat, the packet's
-/// length when every frame in it is contiguous and complete, and `None` when
-/// the packet is not one an image may take.
-fn validate_packet(
-    term_length: i32,
-    term_offset: i32,
-    packet: &[u8],
-    mtu_length: i32,
-) -> Option<i32> {
-    if term_offset < 0 || term_offset >= term_length {
+/// Returns how far into the term the packet's frames reach: zero for a
+/// heartbeat, the end of the last frame it carried when every frame in it is
+/// contiguous and complete, and `None` when the packet is not one an image may
+/// take.
+///
+/// The return is an offset rather than the packet's length because of the PAD
+/// that fills out the end of a term: the last datagram of a term carries a
+/// final DATA frame and the PAD behind it, and what the caller advances its
+/// high-water mark by is where the frames end, not how many bytes arrived
+/// (`:732-737`).
+fn validate_packet(term_length: i32, term_offset: i32, packet: &[u8]) -> Option<i32> {
+    if term_offset < 0
+        || term_offset >= term_length
+        || term_offset % crate::protocol::FRAME_ALIGNMENT as i32 != 0
+    {
         return None;
     }
 
     // A heartbeat is a whole data header with a frame length of zero.
-    if is_heartbeat(packet, mtu_length) {
+    if is_heartbeat(packet) {
         return Some(0);
     }
 
@@ -961,7 +996,9 @@ fn validate_packet(
     let mut next_offset = i64::from(term_offset);
     let mut last_type = -1i16;
 
-    while offset + HEADER_LENGTH <= packet.len() {
+    // The guard is a whole data header, not just a frame header (`:730`): a
+    // frame that cannot hold one is a trailing fragment, not a frame.
+    while offset + DataFrame::LENGTH <= packet.len() {
         let frame = FrameHeader::read(&packet[offset..])?;
 
         if frame.frame_length <= 0 {
@@ -970,15 +1007,18 @@ fn validate_packet(
 
         last_type = frame.frame_type;
 
-        // Only DATA and PAD belong in a term.
+        // Only DATA and PAD belong in a term (`0 == (frame_type & 0xFFFE)`,
+        // `:685-688`). A PAD is a data header with a zero payload, so the term
+        // offset below reads out of the same place in either type — which is
+        // why it is not taken through the type-gated [`DataFrame::read`].
         if frame.frame_type != crate::protocol::frame_type::DATA
             && frame.frame_type != crate::protocol::frame_type::PAD
         {
             break;
         }
 
-        let header = DataFrame::read(&packet[offset..])?;
-        if i64::from(header.term_offset) != next_offset {
+        let frame_term_offset = DataFrame::term_offset_of(&packet[offset..])?;
+        if i64::from(frame_term_offset) != next_offset {
             break;
         }
 
@@ -993,10 +1033,6 @@ fn validate_packet(
         }
 
         offset += usize::try_from(aligned).unwrap_or(usize::MAX);
-
-        if offset > packet.len().saturating_sub(HEADER_LENGTH) {
-            break;
-        }
     }
 
     if offset != packet.len()
@@ -1005,20 +1041,23 @@ fn validate_packet(
         return None;
     }
 
-    i32::try_from(packet.len()).ok()
+    i32::try_from(offset).ok()
 }
 
 /// Whether a packet is a heartbeat: a data header whose frame length says the
-/// frame carries nothing (`aeron_publication_image_is_heartbeat`, `:600-610`).
-fn is_heartbeat(packet: &[u8], mtu_length: i32) -> bool {
+/// frame carries nothing (`aeron_publication_image_is_heartbeat`,
+/// `aeron_publication_image.h:237-240`).
+///
+/// The length is exact, not a minimum — `AERON_DATA_HEADER_LENGTH == length`
+/// (`:239`). A longer packet whose first frame length is zero is a packet with
+/// trailing bytes, which the caller refuses as invalid rather than reading as
+/// a heartbeat.
+fn is_heartbeat(packet: &[u8]) -> bool {
     let Some(header) = FrameHeader::read(packet) else {
         return false;
     };
 
-    let expected = i32::try_from(DataFrame::LENGTH).unwrap_or(32);
-    let _ = mtu_length;
-
-    packet.len() >= expected as usize && header.frame_length == 0
+    packet.len() == DataFrame::LENGTH && header.frame_length == 0
 }
 
 /// The raw tails an image's log holds, for a caller that wants to see them.
@@ -1200,6 +1239,84 @@ mod tests {
         assert!(header.write(&mut bytes).is_some());
 
         bytes
+    }
+
+    /// One frame as it sits in a datagram: a frame header, then the data
+    /// header's `term_offset` at `(aeron_udp_protocol.h:59)`.
+    ///
+    /// `frame_length` is the whole frame, header included. The datagram grows
+    /// by the **aligned** length, because the validator advances its read
+    /// offset by `AERON_ALIGN(frame_length)` — the frames inside a term are
+    /// aligned, so a datagram carries the padding between them
+    /// (`aeron_publication_image.c:695`, `:728`).
+    fn push_frame(bytes: &mut Vec<u8>, frame_type: i16, frame_length: i32, term_offset: i32) {
+        let start = bytes.len();
+        bytes.resize(start + 32, 0);
+
+        let header = FrameHeader {
+            frame_length,
+            version: crate::protocol::VERSION,
+            flags: crate::protocol::header_flags::BEGIN | crate::protocol::header_flags::END,
+            frame_type,
+        };
+        assert!(header.write(&mut bytes[start..]).is_some());
+        bytes[start + 8..start + 12].copy_from_slice(&term_offset.to_le_bytes());
+
+        let aligned = deepmsg_core::logbuffer::position::align_up(frame_length, 32);
+        bytes.resize(start + usize::try_from(aligned).expect("small"), 0);
+    }
+
+    /// The last datagram of a term is a DATA frame and the PAD that fills the
+    /// term out, in one packet — and the PAD is not a reason to refuse it
+    /// (`aeron_publication_image.c:685-688`).
+    #[test]
+    fn a_data_frame_followed_by_a_pad_is_valid() {
+        let mut bytes = Vec::new();
+        push_frame(&mut bytes, crate::protocol::frame_type::DATA, 1032, 64416);
+        push_frame(&mut bytes, crate::protocol::frame_type::PAD, 64, 65472);
+
+        assert_eq!(bytes.len(), 1120);
+
+        // The PAD reaches the end of the term, so what the packet's frames
+        // reach is the term boundary — not the 1120 bytes that arrived, and
+        // certainly not the 1032 of the DATA frame on its own.
+        assert_eq!(validate_packet(65536, 64416, &bytes), Some(1120));
+
+        // A sender may leave the PAD's fill off the end of the datagram: the
+        // frames before it are complete, and the reference accepts a trailing
+        // PAD whether or not its fill arrived (`:732-737`).
+        assert_eq!(validate_packet(65536, 64416, &bytes[..1088]), Some(1120));
+    }
+
+    /// A PAD with nothing in front of it is a packet of its own.
+    #[test]
+    fn a_pad_alone_is_valid() {
+        let mut bytes = Vec::new();
+        push_frame(&mut bytes, crate::protocol::frame_type::PAD, 64, 65472);
+
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(validate_packet(65536, 65472, &bytes), Some(64));
+    }
+
+    /// A term offset that is not on a frame boundary is refused before any
+    /// frame is read (`aeron_publication_image.c:655`).
+    #[test]
+    fn an_unaligned_term_offset_is_refused() {
+        let mut bytes = Vec::new();
+        push_frame(&mut bytes, crate::protocol::frame_type::DATA, 64, 8);
+
+        assert_eq!(validate_packet(65536, 8, &bytes), None);
+    }
+
+    /// A heartbeat is **exactly** one data header with a zero frame length
+    /// (`aeron_publication_image.h:239`). A longer packet whose first frame
+    /// length is zero is a packet with trailing bytes, and refused — reading it
+    /// as a heartbeat would take liveness, and an end of stream, from a packet
+    /// nothing vouches for.
+    #[test]
+    fn a_zero_length_frame_is_a_heartbeat_only_at_the_header_length() {
+        assert_eq!(validate_packet(65536, 0, &[0u8; 32]), Some(0));
+        assert_eq!(validate_packet(65536, 0, &[0u8; 64]), None);
     }
 
     /// A reader's position counter, added to the image — and its **id**
@@ -1563,6 +1680,66 @@ mod tests {
                 .find_by_counter(counter_id)
                 .is_none(),
             "and its counter is no longer one the set points at"
+        );
+    }
+
+    /// A heartbeat proposes the position it arrived at, and nothing on top.
+    ///
+    /// A frame header's worth added to it would be a high-water mark for eight
+    /// bytes no sender is going to send, which the loss detector reads as a gap
+    /// — so an idle stream NAKs forever for a packet that does not exist
+    /// (`aeron_publication_image.c:772`, `:821`).
+    #[test]
+    fn a_heartbeat_proposes_its_own_position() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+        let system = System::new(&fixture.counters, &regions);
+
+        let term_offset = 640;
+        let frame = crate::protocol::DataFrame {
+            term_offset,
+            session_id: SESSION_ID,
+            stream_id: STREAM_ID,
+            term_id: INITIAL_TERM_ID,
+            reserved_value: 0,
+        };
+        let mut bytes = [0u8; 32];
+        assert!(
+            frame
+                .write_with_flags(
+                    &mut bytes,
+                    crate::protocol::header_flags::BEGIN | crate::protocol::header_flags::END
+                )
+                .is_some()
+        );
+        let header = FrameHeader {
+            frame_length: 0,
+            version: crate::protocol::VERSION,
+            flags: crate::protocol::header_flags::BEGIN | crate::protocol::header_flags::END,
+            frame_type: crate::protocol::frame_type::DATA,
+        };
+        assert!(header.write(&mut bytes).is_some());
+
+        assert_eq!(
+            0,
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                term_offset,
+                &bytes,
+                "127.0.0.1:5555".parse().expect("an address"),
+                &system,
+                &fixture.counters,
+                &regions,
+                1_000
+            ),
+            "a heartbeat carries no bytes to insert"
+        );
+
+        assert_eq!(
+            i64::from(term_offset),
+            fixture.image.hwm_position(&fixture.counters, &regions),
+            "the heartbeat's own position, with nothing added on top of it"
         );
     }
 
