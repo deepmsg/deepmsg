@@ -408,6 +408,23 @@ pub const ERROR_CODE_GENERIC_ERROR: i32 = 11;
 /// (`aeron_driver_conductor.c:2326-2341`).
 pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
 
+/// `AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` (`aeron_client_error.h:16`).
+///
+/// What the reference's command adapter reports for a type id the protocol
+/// does not define — not sent as an `ON_ERROR`, but recorded in the distinct
+/// error log, **negated**, because the adapter passes
+/// `-AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` to `AERON_SET_ERR` and the log
+/// keeps whatever that left (`aeron_driver_conductor.c:3218-3221`).
+pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
+
+/// `AERON_ERROR_CODE_MALFORMED_COMMAND` (`aeron_client_error.h:17`).
+///
+/// What the reference's command adapter reports for a command whose payload
+/// is shorter than its own header — recorded negated in the distinct error
+/// log, for the same reason as
+/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3231-3235`).
+pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
+
 /// Encode `ON_OPERATION_SUCCEEDED`.
 pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
     correlation_id.to_le_bytes()
@@ -559,6 +576,23 @@ pub enum Response<'a> {
         /// The counter's id, for `CountersReader`.
         counter_id: i32,
     },
+    /// A counter was removed — or taken with the client that owned it, which
+    /// the driver announces the same way. The payload is the same twelve bytes
+    /// [`Response::CounterReady`] carries.
+    CounterUnavailable {
+        /// The registration id the counter was allocated under — the client
+        /// id, when the driver allocated the counter itself.
+        correlation_id: i64,
+        /// The id the slot had, which is back in the pool now.
+        counter_id: i32,
+    },
+    /// A command whose work is done, when the done thing has no handle to
+    /// hand back: the driver's acknowledgement of a removal
+    /// (`aeron_operation_succeeded_t`, eight bytes under the header).
+    OperationSucceeded {
+        /// Echoes the `correlation_id` of the request.
+        correlation_id: i64,
+    },
     /// The driver gave up on a client and destroyed everything it owned.
     ClientTimeout {
         /// Which client.
@@ -699,6 +733,9 @@ pub fn decode_correlated(payload: &[u8]) -> Option<Correlated> {
     })
 }
 
+/// `AERON_COMMAND_ADD_COUNTER` (`aeron_control_protocol.h:35`).
+pub const ADD_COUNTER_TYPE_ID: i32 = 0x09;
+
 /// `ADD_COUNTER` (`0x09`), decoded.
 ///
 /// The wire form is `aeron_counter_command_t` — a correlated head and an
@@ -715,6 +752,47 @@ pub struct AddCounter<'a> {
     pub key: &'a [u8],
     /// The label: free-form text, **not** NUL-terminated.
     pub label: &'a [u8],
+}
+
+impl AddCounter<'_> {
+    /// How many bytes this command occupies in a record payload: the lengths
+    /// it declares are the same ones [`decode_add_counter`] reads back, so the
+    /// key is padded to four and the label is not.
+    pub const fn encoded_length(&self) -> usize {
+        ADD_COUNTER_KEY_OFFSET + layout::align_up(self.key.len(), 4) + 4 + self.label.len()
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`AddCounter::encoded_length`] bytes — the writing half of the shape
+    /// the reference's own conductor writes
+    /// (`aeron_client_conductor.c:2035-2052`).
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        let Ok(key_length) = i32::try_from(self.key.len()) else {
+            return false;
+        };
+        let Ok(label_length) = i32::try_from(self.label.len()) else {
+            return false;
+        };
+
+        let key_end = ADD_COUNTER_KEY_OFFSET + self.key.len();
+        out[0..8].copy_from_slice(&self.correlated.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlated.correlation_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.type_id.to_le_bytes());
+        out[20..24].copy_from_slice(&key_length.to_le_bytes());
+        // The padding is zero on the wire, and the decoder skips it by the
+        // aligned length rather than reading it.
+        out[ADD_COUNTER_KEY_OFFSET..key_end].copy_from_slice(self.key);
+        let label_length_offset = ADD_COUNTER_KEY_OFFSET + layout::align_up(self.key.len(), 4);
+        out[label_length_offset..label_length_offset + 4]
+            .copy_from_slice(&label_length.to_le_bytes());
+        out[label_length_offset + 4..].copy_from_slice(self.label);
+
+        true
+    }
 }
 
 /// Where `ADD_COUNTER`'s key begins: the correlated head, the `int32` type id
@@ -749,6 +827,9 @@ pub fn decode_add_counter(payload: &[u8]) -> Option<AddCounter<'_>> {
     })
 }
 
+/// `AERON_COMMAND_REMOVE_COUNTER` (`aeron_control_protocol.h:36`).
+pub const REMOVE_COUNTER_TYPE_ID: i32 = 0x0A;
+
 /// `REMOVE_COUNTER` (`0x0A`), decoded.
 ///
 /// It names the counter by the **client's registration id**, not by its
@@ -761,6 +842,27 @@ pub struct RemoveCounter {
     pub correlated: Correlated,
     /// The registration id the counter was allocated under.
     pub registration_id: i64,
+}
+
+impl RemoveCounter {
+    /// How many bytes this command occupies in a record payload.
+    pub const fn encoded_length(&self) -> usize {
+        CORRELATED_COMMAND_LENGTH + 8
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`RemoveCounter::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        out[0..8].copy_from_slice(&self.correlated.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlated.correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.registration_id.to_le_bytes());
+
+        true
+    }
 }
 
 /// Decode `REMOVE_COUNTER`.
@@ -944,6 +1046,17 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
                 counter_id,
             },
             _ => Response::Other { type_id },
+        },
+        ON_UNAVAILABLE_COUNTER_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(counter_id)) => Response::CounterUnavailable {
+                correlation_id,
+                counter_id,
+            },
+            _ => Response::Other { type_id },
+        },
+        ON_OPERATION_SUCCEEDED_TYPE_ID => match le_i64(payload, 0) {
+            Some(correlation_id) => Response::OperationSucceeded { correlation_id },
+            None => Response::Other { type_id },
         },
         ON_PUBLICATION_READY_TYPE_ID | ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID => {
             decode_publication_ready(type_id, payload)
@@ -1334,6 +1447,7 @@ mod response_tests {
         for (type_id, bytes) in [
             (ON_SUBSCRIPTION_READY_TYPE_ID, vec![0u8; 8]),
             (ON_COUNTER_READY_TYPE_ID, vec![0u8; 4]),
+            (ON_UNAVAILABLE_COUNTER_TYPE_ID, vec![0u8; 4]),
             (ON_CLIENT_TIMEOUT_TYPE_ID, vec![0u8; 7]),
             (ON_ERROR_TYPE_ID, vec![0u8; 12]),
         ] {
@@ -1406,6 +1520,68 @@ mod response_tests {
     }
 
     #[test]
+    fn an_add_counter_encodes_the_shape_the_decoder_reads() {
+        // A key that is not a multiple of four, so the padding is exercised:
+        // the reference writes the key, pads to four, then the label's length
+        // (`aeron_client_conductor.c:2035-2052`), and the decoder steps by the
+        // aligned length.
+        let command = AddCounter {
+            correlated: Correlated {
+                client_id: 7,
+                correlation_id: 42,
+            },
+            type_id: 100,
+            key: b"key",
+            label: b"a counter",
+        };
+
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        // The head (correlated, type, key length), the key padded to four,
+        // the label's length, the label.
+        assert_eq!(24 + 4 + 4 + 9, out.len());
+        assert_eq!(7i64.to_le_bytes(), out[0..8]);
+        assert_eq!(42i64.to_le_bytes(), out[8..16]);
+        assert_eq!(100i32.to_le_bytes(), out[16..20]);
+        assert_eq!(3i32.to_le_bytes(), out[20..24]);
+        assert_eq!(b"key\0", &out[24..28], "the key, padded to four");
+        assert_eq!(9i32.to_le_bytes(), out[28..32]);
+        assert_eq!(b"a counter", &out[32..], "no NUL, exactly the length");
+
+        assert_eq!(
+            Some(command),
+            decode_add_counter(&out),
+            "what the client writes is what the driver reads"
+        );
+
+        // And a buffer of the wrong size is refused rather than trusted.
+        assert!(!command.encode_into(&mut vec![0u8; out.len() + 1]));
+    }
+
+    #[test]
+    fn a_remove_counter_encodes_the_shape_the_decoder_reads() {
+        let command = RemoveCounter {
+            correlated: Correlated {
+                client_id: 7,
+                correlation_id: 9,
+            },
+            registration_id: 42,
+        };
+
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(24, out.len());
+        assert_eq!(7i64.to_le_bytes(), out[0..8]);
+        assert_eq!(9i64.to_le_bytes(), out[8..16]);
+        assert_eq!(42i64.to_le_bytes(), out[16..24]);
+
+        assert_eq!(Some(command), decode_remove_counter(&out));
+        assert!(!command.encode_into(&mut [0u8; 23]));
+    }
+
+    #[test]
     fn the_encoders_round_trip_through_the_decoder() {
         let ready = encode_counter_update(7, 42);
         assert_eq!(12, ready.len(), "packed(4), so twelve and not sixteen");
@@ -1417,15 +1593,22 @@ mod response_tests {
             decode_response(ON_COUNTER_READY_TYPE_ID, &ready)
         );
 
-        // The removal type carries the same twelve bytes. This build's decoder
-        // does not model it yet — the client's counter lifecycle is P1-3 — so
-        // it arrives as `Other`, which is the right answer for a response a
-        // client has nothing to do with.
+        // The removal type carries the same twelve bytes the ready type does,
+        // and decodes to its own variant: an event for the counter watchers,
+        // never a reply to a command — nothing waits on one.
         assert_eq!(
-            Response::Other {
-                type_id: ON_UNAVAILABLE_COUNTER_TYPE_ID,
+            Response::CounterUnavailable {
+                correlation_id: 7,
+                counter_id: 42,
             },
             decode_response(ON_UNAVAILABLE_COUNTER_TYPE_ID, &ready)
+        );
+
+        let succeeded = encode_operation_succeeded(9);
+        assert_eq!(8, succeeded.len());
+        assert_eq!(
+            Response::OperationSucceeded { correlation_id: 9 },
+            decode_response(ON_OPERATION_SUCCEEDED_TYPE_ID, &succeeded)
         );
 
         let timeout = encode_client_timeout(9);

@@ -54,7 +54,7 @@ enum Request {
 
 /// The space check that stands in front of every log buffer this agent
 /// creates — the reference's `aeron_driver_context_run_storage_checks`
-/// (`aeron_driver_context.c:1354-1375`), which its own agent runs at the
+/// (`aeron_driver_context.c:1354-1377`), which its own agent runs at the
 /// head of its map command (`aeron_driver_native_resource_agent.c:432`).
 ///
 /// A filesystem that cannot hold the log about to be made answers before
@@ -65,34 +65,83 @@ pub struct StorageChecks {
     /// the reference's "always plenty" probe (`aeron_usable_fs_space_disabled`,
     /// `aeron_fileutil.c:1203`).
     enabled: bool,
+    /// The level at which the check stops refusing and starts warning
+    /// (`low.file.store.warning.threshold`, `aeron_driver_context.h:207`).
+    warning_threshold: u64,
     /// The filesystem asked: the driver's run directory, which is where a
     /// log buffer lands.
     dir: PathBuf,
 }
 
+/// A filesystem that could hold the log about to be made, but only just
+/// (`aeron_driver_context.c:1368-1377`).
+///
+/// The reference records this straight into the distinct error log on its
+/// agent thread and carries on — the create proceeds. Here the
+/// de-duplication table lives on the conductor, so the warning travels a
+/// channel of its own beside the completions and is recorded by the
+/// conductor's next duty cycle: same entry, same log, and no counter it did
+/// not raise in the reference either.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StorageWarning {
+    /// The configured `low.file.store.warning.threshold` as it stood.
+    pub threshold: u64,
+    /// What the filesystem said it had left.
+    pub usable: u64,
+    /// The directory the check asked about, which is the directory the log
+    /// buffer lands in.
+    pub dir: PathBuf,
+}
+
+/// What the space check said: [`io::Error`] refuses, [`StorageWarning`]
+/// records, and the create proceeds with either, none, or both absent.
+type Assessment = (Option<io::Error>, Option<StorageWarning>);
+
 impl StorageChecks {
-    /// Checks as `enabled` says, asking about `dir`.
-    pub const fn new(enabled: bool, dir: PathBuf) -> Self {
-        Self { enabled, dir }
+    /// Checks as `enabled` says, warning from `warning_threshold`, asking
+    /// about `dir`.
+    pub const fn new(enabled: bool, warning_threshold: u64, dir: PathBuf) -> Self {
+        Self {
+            enabled,
+            warning_threshold,
+            dir,
+        }
     }
 
-    /// The error that refuses a log buffer of `term_length` + `page_size`,
-    /// or `None` when there is room — or when the check is off, or when the
-    /// pair is one no log buffer may have (which the create itself will
-    /// report, with the right error for it).
-    fn refuse(&self, term_length: i32, page_size: usize) -> Option<io::Error> {
+    /// The refusal and the warning for a log buffer of `term_length` +
+    /// `page_size`, in the reference's order: a filesystem that cannot hold
+    /// the log refuses and is never asked about the threshold, one that can
+    /// hold it but sits at or below the threshold warns, and a check that is
+    /// off — or a pair no log buffer may have, which the create itself will
+    /// report with the right error for it — says neither.
+    fn assess(&self, term_length: i32, page_size: usize) -> Assessment {
         if !self.enabled {
-            return None;
+            return (None, None);
         }
 
-        let length = LogFile::log_length(term_length, page_size)?;
+        let Some(length) = LogFile::log_length(term_length, page_size) else {
+            return (None, None);
+        };
         let usable = crate::sys::usable_fs_space(&self.dir);
 
         // `ENOSPC`, because that is the errno the reference's own composition
         // turns into `STORAGE_SPACE` — its pre-check raises the negative
         // protocol code and its kernel raises the errno, and both arrive at
         // the client as the same code (`aeron_driver_conductor.c:2326-2341`).
-        (usable < length as u64).then(|| io::Error::from_raw_os_error(libc::ENOSPC))
+        if usable < length as u64 {
+            return (Some(io::Error::from_raw_os_error(libc::ENOSPC)), None);
+        }
+
+        // The second half (`:1368-1377`): at or below the threshold the
+        // reference records a warning and **returns zero**, which is why the
+        // warning is not a refusal and the create that follows still happens.
+        let warning = (usable <= self.warning_threshold).then_some(StorageWarning {
+            threshold: self.warning_threshold,
+            usable,
+            dir: self.dir.clone(),
+        });
+
+        (None, warning)
     }
 }
 
@@ -126,6 +175,7 @@ pub enum Completion {
 pub struct NativeResourceAgent {
     requests: Sender<Request>,
     completions: Receiver<Completion>,
+    warnings: Receiver<StorageWarning>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -139,14 +189,16 @@ impl NativeResourceAgent {
     pub fn start(checks: StorageChecks) -> io::Result<Self> {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
+        let (warning_tx, warning_rx) = mpsc::channel::<StorageWarning>();
 
         let thread = std::thread::Builder::new()
             .name("deepmsg-native-resource-agent".to_string())
-            .spawn(move || Self::run(&request_rx, &completion_tx, &checks))?;
+            .spawn(move || Self::run(&request_rx, &completion_tx, &warning_tx, &checks))?;
 
         Ok(Self {
             requests: request_tx,
             completions: completion_rx,
+            warnings: warning_rx,
             thread: Some(thread),
         })
     }
@@ -201,6 +253,21 @@ impl NativeResourceAgent {
         done
     }
 
+    /// Every storage warning raised since the last call — filesystems that
+    /// could hold their log buffer but only just
+    /// (`aeron_driver_context.c:1368-1377`). These do not fail anything: the
+    /// create they accompanied went ahead, and the warning is for the
+    /// driver's error log.
+    pub fn poll_warnings(&self) -> Vec<StorageWarning> {
+        let mut raised = Vec::new();
+
+        while let Ok(warning) = self.warnings.try_recv() {
+            raised.push(warning);
+        }
+
+        raised
+    }
+
     /// Stop the thread and wait for it.
     ///
     /// The agent finishes what is queued before it stops, so a log buffer asked
@@ -222,7 +289,12 @@ impl NativeResourceAgent {
     }
 
     /// The agent's own loop.
-    fn run(requests: &Receiver<Request>, completions: &Sender<Completion>, checks: &StorageChecks) {
+    fn run(
+        requests: &Receiver<Request>,
+        completions: &Sender<Completion>,
+        warnings: &Sender<StorageWarning>,
+        checks: &StorageChecks,
+    ) {
         while let Ok(request) = requests.recv() {
             match request {
                 Request::MapLogBuffer {
@@ -233,16 +305,28 @@ impl NativeResourceAgent {
                 } => {
                     // The space question first, the file second: a refusal
                     // here never touches the filesystem, which is the point
-                    // of asking before allocating (`aeron_driver_context.c:1354-1375`).
-                    let completion = match checks.refuse(term_length, page_size) {
+                    // of asking before allocating (`aeron_driver_context.c:1354-1377`).
+                    let (refusal, warning) = checks.assess(term_length, page_size);
+                    let completion = match refusal {
                         Some(error) => Completion::MapFailed { path, error },
-                        None => match LogFile::create(&path, term_length, page_size, is_sparse) {
-                            Ok(log) => Completion::Mapped {
-                                path,
-                                log: Box::new(log),
-                            },
-                            Err(error) => Completion::MapFailed { path, error },
-                        },
+                        None => {
+                            // A warning is not a refusal: the reference
+                            // records it before it maps and carries on
+                            // (`:1374` inside the check, the create after the
+                            // `return 0`). Dropped rather than fatal if the
+                            // conductor is gone — the completion below is
+                            // what says the loop is over, and it says it.
+                            if let Some(warning) = warning {
+                                let _ = warnings.send(warning);
+                            }
+                            match LogFile::create(&path, term_length, page_size, is_sparse) {
+                                Ok(log) => Completion::Mapped {
+                                    path,
+                                    log: Box::new(log),
+                                },
+                                Err(error) => Completion::MapFailed { path, error },
+                            }
+                        }
                     };
 
                     if completions.send(completion).is_err() {
@@ -319,7 +403,7 @@ mod tests {
     fn a_mapped_log_buffer_comes_back_to_the_caller() {
         let dir = TempDir::new();
         let path = dir.0.join("mapped.logbuffer");
-        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("the agent starts");
 
         agent
@@ -348,7 +432,7 @@ mod tests {
         // pages are the filesystem's to hand out on first write.
         let dir = TempDir::new();
         let path = dir.0.join("sparse.logbuffer");
-        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("the agent starts");
 
         agent
@@ -389,9 +473,12 @@ mod tests {
         // composition turns into `STORAGE_SPACE`
         // (`aeron_driver_conductor.c:2326-2341`).
         let dir = TempDir::new();
-        let agent =
-            NativeResourceAgent::start(StorageChecks::new(true, dir.0.join("no-such-directory")))
-                .expect("the agent starts");
+        let agent = NativeResourceAgent::start(StorageChecks::new(
+            true,
+            0,
+            dir.0.join("no-such-directory"),
+        ))
+        .expect("the agent starts");
 
         agent
             .map_log_buffer(&dir.0.join("refused.logbuffer"), TERM_LENGTH, 4096, false)
@@ -407,6 +494,48 @@ mod tests {
             !dir.0.join("refused.logbuffer").exists(),
             "the refusal never touched the filesystem"
         );
+        // A filesystem with nothing left is below any threshold too, and the
+        // refusal is what answers: the reference returns before the warning's
+        // question is ever asked (`aeron_driver_context.c:1360-1366`).
+        assert!(agent.poll_warnings().is_empty());
+
+        agent.stop();
+    }
+
+    #[test]
+    fn a_nearly_full_filesystem_warns_and_the_log_buffer_still_lands() {
+        // The reference's second half (`aeron_driver_context.c:1368-1377`):
+        // at or below the threshold it records a warning in the distinct
+        // error log and returns zero, so the create it was asked about
+        // happens anyway. A threshold no filesystem can exceed stands in for
+        // a nearly-full one.
+        let dir = TempDir::new();
+        let path = dir.0.join("warned.logbuffer");
+        let agent = NativeResourceAgent::start(StorageChecks::new(true, u64::MAX, dir.0.clone()))
+            .expect("the agent starts");
+
+        agent
+            .map_log_buffer(&path, TERM_LENGTH, 4096, true)
+            .expect("queued");
+
+        match await_completion(&agent, std::time::Duration::from_secs(5)) {
+            Completion::Mapped { .. } => {}
+            other => panic!("the warning did not stop the create: {other:?}"),
+        }
+
+        let warnings = agent.poll_warnings();
+        assert_eq!(1, warnings.len(), "one warning per log buffer asked about");
+        assert_eq!(u64::MAX, warnings[0].threshold);
+        assert!(warnings[0].usable > 0, "a real filesystem answered");
+        assert_eq!(dir.0, warnings[0].dir);
+
+        // A second ask warns again: the reference records per check, and it
+        // is the conductor's log that counts the sightings.
+        agent
+            .map_log_buffer(&dir.0.join("again.logbuffer"), TERM_LENGTH, 4096, true)
+            .expect("queued");
+        let _ = await_completion(&agent, std::time::Duration::from_secs(5));
+        assert_eq!(1, agent.poll_warnings().len());
 
         agent.stop();
     }
@@ -417,7 +546,7 @@ mod tests {
         let path = dir.0.join("taken.logbuffer");
         std::fs::write(&path, b"not a log buffer").expect("the file exists");
 
-        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("the agent starts");
         agent
             .map_log_buffer(&path, TERM_LENGTH, 4096, false)
@@ -437,7 +566,7 @@ mod tests {
     fn freeing_removes_the_file_on_the_agent_thread() {
         let dir = TempDir::new();
         let path = dir.0.join("freed.logbuffer");
-        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("the agent starts");
 
         agent
@@ -466,7 +595,7 @@ mod tests {
         // nobody can name: the agent finishes what it was given.
         let dir = TempDir::new();
         let path = dir.0.join("late.logbuffer");
-        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("the agent starts");
 
         agent

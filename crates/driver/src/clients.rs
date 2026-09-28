@@ -471,7 +471,7 @@ mod tests {
     /// publications in them: what these tests are about is the client pool.
     fn managers() -> (IpcPublications, IpcSubscriptions) {
         (
-            IpcPublications::start(-1, 1000, StorageChecks::new(false, PathBuf::new()))
+            IpcPublications::start(-1, 1000, StorageChecks::new(false, 0, PathBuf::new()))
                 .expect("an agent thread"),
             IpcSubscriptions::new(),
         )

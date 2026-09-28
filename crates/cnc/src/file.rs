@@ -22,7 +22,7 @@ use crate::counter_manager::CounterRegions;
 use crate::counters::CountersReader;
 use crate::create::CncCreateError;
 use crate::error::CncError;
-use crate::error_log::ErrorLogReader;
+use crate::error_log::{ErrorLogReader, ErrorLogRegion};
 use crate::layout;
 use crate::metadata::{CncMetadata, RegionLayout};
 use crate::ring::ToDriverRing;
@@ -397,6 +397,19 @@ impl CncFile {
             .region(self.layout.error_log.start, self.layout.error_log.len())?;
 
         Some(ErrorLogReader::new(buffer))
+    }
+
+    /// The error-log region as the writer's window.
+    ///
+    /// The driver's half of the log [`CncFile::error_log`] hands to a reader,
+    /// and writable for the same reason the other writable windows are: the
+    /// file was opened that way, and `None` on a read-only one.
+    pub fn error_log_writable(&self) -> Option<ErrorLogRegion<'_>> {
+        let buffer = self
+            .mapping
+            .region_mut(self.layout.error_log.start, self.layout.error_log.len())?;
+
+        Some(ErrorLogRegion::new(buffer))
     }
 
     /// A read-only window over the to-clients broadcast region.
@@ -872,6 +885,36 @@ mod tests {
         assert!(!errors.has_entries());
         let mut out = Vec::new();
         assert_eq!(0, errors.read(i64::MIN, &mut out).entries);
+    }
+
+    #[test]
+    fn an_error_written_through_the_region_is_found_where_it_lands() {
+        // The round trip a driver actually performs: record through the
+        // writable window, then read the same bytes the way a tool would —
+        // through a *read-only* open, so the test cannot pass by accident of
+        // sharing a mapping with the writer.
+        let temp = TempCnc::new(deepmsg_core::version::CNC_VERSION);
+        let mut log = crate::error_log::DistinctErrorLog::new();
+
+        {
+            let cnc = CncFile::try_open_writable(temp.path()).expect("open writable");
+            let region = cnc.error_log_writable().expect("error log writable");
+            log.record(&region, 1_000, 11, "an unhappy driver")
+                .expect("fits");
+            log.record(&region, 2_000, 11, "an unhappy driver")
+                .expect("fits");
+        }
+
+        let cnc = CncFile::try_open(temp.path()).expect("open read-only");
+        let errors = cnc.error_log().expect("error log reachable");
+        assert!(errors.has_entries());
+
+        let mut out = Vec::new();
+        assert_eq!(1, errors.read(i64::MIN, &mut out).entries);
+        assert_eq!(2, out[0].observation_count);
+        assert_eq!(1_000, out[0].first_observation_timestamp_ms);
+        assert_eq!(2_000, out[0].last_observation_timestamp_ms);
+        assert_eq!("an unhappy driver", out[0].text);
     }
 
     #[test]

@@ -49,7 +49,8 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND, ERROR_CODE_STORAGE_SPACE,
+    ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
     ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
     ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
     ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
@@ -59,9 +60,11 @@ use deepmsg_cnc::command::{
     encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
     encode_subscription_ready, encode_unavailable_image,
 };
+use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
-    CncCreateError, CncFile, CounterManager, ToClientsTransmitter, ToDriverRingConsumer,
+    CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
+    ToDriverRingConsumer,
 };
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::clock::{self, CachedClock};
@@ -316,6 +319,36 @@ impl ClientEvents for Transmit<'_> {
     }
 }
 
+/// Count a command whose payload is shorter than its own header, and describe
+/// it for the error log in the reference adapter's words
+/// (`aeron_driver_conductor.c:3231-3235`).
+///
+/// The code is recorded negated because the reference's `AERON_SET_ERR` is
+/// given `-AERON_ERROR_CODE_MALFORMED_COMMAND` there and the log keeps
+/// whatever that left — a detail of the in-process table, since the code never
+/// reaches the region. The description carries the reference's composition —
+/// the code's own line, then the recording site at the `AERON_SET_ERR`'s own
+/// line — because that text is what `ErrorStat` prints and what dedup keys
+/// on.
+fn malformed_command(
+    type_id: i32,
+    payload_len: usize,
+    malformed: &mut u64,
+    faults: &mut Vec<(i32, String)>,
+) {
+    *malformed += 1;
+    faults.push((
+        -ERROR_CODE_MALFORMED_COMMAND,
+        compose_description(
+            -ERROR_CODE_MALFORMED_COMMAND,
+            "aeron_driver_conductor_on_command",
+            "aeron_driver_conductor.c",
+            3232,
+            &format!("command={type_id} too short: length={payload_len}"),
+        ),
+    ));
+}
+
 /// The driver's control plane.
 pub struct Conductor {
     /// The settings every publication's parameters default to, kept because
@@ -328,6 +361,9 @@ pub struct Conductor {
     /// What this driver allocated for itself, so its shutdown gives back
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
+    /// The process's half of the distinct error log; the region it writes
+    /// comes from the CnC file per call, like the counters.
+    error_log: DistinctErrorLog,
     clients: Clients,
     /// The publications this driver owns, and the thread that maps their log
     /// buffers.
@@ -362,6 +398,10 @@ pub struct Conductor {
     unhandled: u64,
     unknown: u64,
     last_unhandled: Option<Command>,
+    /// Errors the command adapter noticed but could not record yet: the pass
+    /// holds the CnC file's windows while it runs, so these wait for it, the
+    /// way broadcast failures do.
+    pending_log_errors: Vec<(i32, String)>,
 }
 
 impl Conductor {
@@ -438,7 +478,11 @@ impl Conductor {
         let publications = IpcPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
-            StorageChecks::new(config.perform_storage_checks, config.aeron_dir.clone()),
+            StorageChecks::new(
+                config.perform_storage_checks,
+                config.low_file_store_warning_threshold,
+                config.aeron_dir.clone(),
+            ),
         )
         .map_err(ConductorError::Agent)?;
 
@@ -449,6 +493,7 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
+            error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
             publications,
             subscriptions: IpcSubscriptions::new(),
@@ -476,6 +521,7 @@ impl Conductor {
             unhandled: 0,
             unknown: 0,
             last_unhandled: None,
+            pending_log_errors: Vec::new(),
         };
 
         conductor.write_heartbeat();
@@ -509,6 +555,7 @@ impl Conductor {
             + self.process_commands(now_ns)
             + self.poll_publications()
             + self.update_publication_limits();
+        self.record_storage_warnings();
         self.flush_broadcast_failures();
         work
     }
@@ -731,6 +778,7 @@ impl Conductor {
         let unhandled = &mut self.unhandled;
         let unknown = &mut self.unknown;
         let last_unhandled = &mut self.last_unhandled;
+        let faults = &mut self.pending_log_errors;
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -747,7 +795,7 @@ impl Conductor {
             failures: pending_failures,
         };
 
-        commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        let work = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -768,7 +816,7 @@ impl Conductor {
                             &counter_regions,
                         );
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // Nothing is freed here: the heartbeat is zeroed so the next
                 // timeout tier collects the client, which is also what stops
@@ -813,7 +861,7 @@ impl Conductor {
                                 );
                             }
                         }
-                        None => *malformed += 1,
+                        None => malformed_command(type_id, payload.len(), malformed, faults),
                     }
                 }
                 // A publication's client letting go of it. The revocation
@@ -868,7 +916,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // A subscription going away: its positions are detached and
                 // its counters come back (`aeron_driver_conductor.c:5199-5267`)
@@ -907,7 +955,7 @@ impl Conductor {
                             );
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // A subscription: parse the URI, register the client, answer
                 // it, and then give it every publication it already matches
@@ -938,13 +986,13 @@ impl Conductor {
                             );
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::ClientClose => match decode_correlated(payload) {
                     Some(correlated) => {
                         clients.on_close(correlated.client_id, counters, &counter_regions);
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::AddCounter => match decode_add_counter(payload) {
                     Some(command) => {
@@ -1021,7 +1069,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::RemoveCounter => match decode_remove_counter(payload) {
                     Some(command) => {
@@ -1055,18 +1103,39 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 command => {
-                    if matches!(command, Command::Unknown(_)) {
+                    if let Command::Unknown(unknown_type_id) = command {
                         *unknown += 1;
+                        faults.push((
+                            -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+                            compose_description(
+                                -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+                                "aeron_driver_conductor_on_command",
+                                "aeron_driver_conductor.c",
+                                3219,
+                                &format!("command={unknown_type_id} unknown"),
+                            ),
+                        ));
                     } else {
                         *unhandled += 1;
                     }
                     *last_unhandled = Some(command);
                 }
             }
-        })
+        });
+
+        // The faults the adapter collected are recorded after the read: the
+        // closure borrows the conductor's fields piecemeal and cannot call a
+        // method on the whole of it, and the order within a pass is not
+        // observable from outside the pass.
+        let faults = std::mem::take(&mut self.pending_log_errors);
+        for (error_code, description) in faults {
+            self.log_error(error_code, &description);
+        }
+
+        work
     }
 
     /// Break a stall in the command ring, and count it when it breaks one.
@@ -1204,25 +1273,110 @@ impl Conductor {
 
     /// Account for this pass's broadcast failures.
     ///
-    /// They are counted here and **not** in system counter 15: the reference's
-    /// `client_transmit` appends to its error log and touches no counter
-    /// (`aeron_driver_conductor.c:2233-2241`), and counter 15 is how a
-    /// deployment alerts on the driver's own errors — a transport that could
-    /// not publish a twelve-byte event would quietly raise every threshold on
-    /// it. The first one is said out loud, because a ring that refuses events
-    /// is worth noticing; the rest are counted, because one per pass forever is
-    /// not worth reading.
+    /// Each one is an error the reference records: `client_transmit` appends
+    /// "failed to transmit message" and logs it, and logging is what bumps the
+    /// errors system counter (`aeron_driver_conductor.c:2233-2241` feeding
+    /// `:1203-1215`). They are counted during the pass and recorded after it,
+    /// because the pass holds the event region mutably; the order within a
+    /// pass is not observable from outside it.
+    ///
+    /// The code recorded is zero, which is what the reference records too:
+    /// `AERON_APPEND_ERR` appends text without setting a code
+    /// (`util/aeron_error.c:499-501`), and the last thing a recorded error did
+    /// was clear the state (`:389-397`).
+    ///
+    /// This reverses the P1-1 review's D4, which read `:2233-2241` as "touches
+    /// no counter" and removed the increment — the counter it leaves alone is
+    /// a *different* one from the errors counter its own `log_error` raises.
     fn flush_broadcast_failures(&mut self) {
         if 0 == self.pending_broadcast_failures {
             return;
         }
 
         let pending = std::mem::take(&mut self.pending_broadcast_failures);
-
-        if 0 == self.broadcast_failures {
-            eprintln!("deepmsg-driver: the to-clients ring refused a broadcast");
-        }
         self.broadcast_failures += pending;
+
+        for _ in 0..pending {
+            self.log_error(0, "failed to transmit message");
+        }
+    }
+
+    /// Record a driver-side error: one entry in the distinct error log and one
+    /// bump of the errors system counter — the bump **always**, even for an
+    /// entry the log could not hold
+    /// (`aeron_driver_conductor_log_explicit_error`,
+    /// `aeron_driver_conductor.c:1203-1215`).
+    fn log_error(&mut self, error_code: i32, description: &str) {
+        if let Some(region) = self.cnc.error_log_writable() {
+            if let Err(deepmsg_cnc::error_log::RecordError::Unrecordable { description }) = self
+                .error_log
+                .record(&region, self.now_ms, error_code, description)
+            {
+                // The reference prints a formatted date here; stderr is a
+                // diagnostic and not a contract, and the epoch time says the
+                // same thing (`aeron_distinct_error_log.c:185-191`).
+                eprintln!("{} - unrecordable error {}", self.now_ms, description);
+            }
+        }
+
+        if let Some(regions) = self.cnc.counter_regions() {
+            system_counters::increment(&self.counters, &regions, system_counters::id::ERRORS);
+        }
+    }
+
+    /// Take the agent's storage warnings and record them
+    /// (`aeron_driver_context_run_storage_checks`'s second half,
+    /// `aeron_driver_context.c:1368-1377`).
+    ///
+    /// The warning is the reference's own words, and the two numbers are
+    /// printed the way its `PRId64` prints the `uint64_t` values it passes —
+    /// as signed, which no real threshold or filesystem can tell apart.
+    /// The description carries the reference's composition — the code's own
+    /// line, then the recording site — which is what `ErrorStat` prints.
+    fn record_storage_warnings(&mut self) {
+        for warning in self.publications.poll_storage_warnings() {
+            #[allow(clippy::cast_possible_wrap)] // printed as the reference prints it
+            let message = format!(
+                "WARNING: space is running low: threshold={} usable={} in {}",
+                warning.threshold as i64,
+                warning.usable as i64,
+                warning.dir.display()
+            );
+            // Negated, because the reference's `AERON_SET_ERR` was given
+            // `-AERON_ERROR_CODE_STORAGE_SPACE` and the log keeps what that
+            // left (`:1370-1372`).
+            let description = compose_description(
+                -ERROR_CODE_STORAGE_SPACE,
+                "aeron_driver_context_run_storage_checks",
+                "aeron_driver_context.c",
+                1370,
+                &message,
+            );
+            self.record_distinct(-ERROR_CODE_STORAGE_SPACE, &description);
+        }
+    }
+
+    /// Write one entry in the distinct error log, and nothing else.
+    ///
+    /// This is the reference's direct
+    /// `aeron_distinct_error_log_record(context->error_log, …)` — the calls
+    /// that do **not** go through `log_explicit_error`
+    /// (`aeron_driver_conductor.c:1203-1215`), and so raise no errors
+    /// counter. A caller that failed as well as warned uses
+    /// [`Conductor::log_error`]; this is for the paths the reference
+    /// recorded without deciding anything had failed.
+    fn record_distinct(&mut self, error_code: i32, description: &str) {
+        let Some(region) = self.cnc.error_log_writable() else {
+            return;
+        };
+
+        // An entry that does not fit is ignored: the reference does not look
+        // at the return value on this path (`aeron_driver_context.c:1374`),
+        // and the counter a recorded error would raise is not raised here at
+        // all.
+        let _ = self
+            .error_log
+            .record(&region, self.now_ms, error_code, description);
     }
 
     /// Measure the pass that just ended, and count it if it ran long
@@ -1299,6 +1453,7 @@ mod tests {
     use crate::config::{
         PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT, PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
     };
+    use deepmsg_client::counter::CounterEvent;
     use deepmsg_cnc::layout::NULL_VALUE;
     use deepmsg_cnc::{CncIdentity, CncLayout, TerminateDriver};
     use deepmsg_cnc::{Received, ToClientsReceiver};
@@ -1763,6 +1918,33 @@ mod tests {
     }
 
     #[test]
+    fn a_static_counter_request_is_recognised_and_not_served() {
+        // ADD_STATIC_COUNTER is the one unimplemented command whose absence is
+        // a recorded divergence rather than an unbuilt transport feature: the
+        // reference's driver allocates the counter
+        // (`aeron_driver_conductor.c:3153-3166`, the handler at `:6255`) and
+        // answers `ON_STATIC_COUNTER`, which its client pairs with the ready
+        // handler (`aeron_client_conductor.c:1147`). deepmsg recognises the
+        // command — it is in the protocol's table — but serves nothing, so a
+        // client that asks for one waits for a reply that never comes
+        // (docs/compat.md, "The counter a client asks for").
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+
+        send(&conductor, 0x0F, &[0u8; 16]);
+        conductor.do_work();
+
+        assert_eq!(1, conductor.unhandled_commands());
+        assert_eq!(0, conductor.unknown_commands());
+        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
+
+        // Counted, not recorded: the protocol defines this command, so it is
+        // no error to receive one — merely a thing this driver cannot do.
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(0, log.read(i64::MIN, &mut errors).entries);
+    }
+
+    #[test]
     fn a_type_id_the_protocol_does_not_define_is_counted_separately() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
@@ -1772,6 +1954,24 @@ mod tests {
         assert_eq!(0, conductor.unhandled_commands());
         assert_eq!(1, conductor.unknown_commands());
         assert_eq!(Some(Command::Unknown(0x7F)), conductor.last_unhandled());
+
+        // And the fault reaches the distinct error log in the adapter's
+        // words — the composition the reference's `AERON_SET_ERR` builds —
+        // with the errors counter bumped to match
+        // (`aeron_driver_conductor.c:3218-3221`).
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!(
+            "(-6) unknown command type id\n\
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             command=127 unknown\n",
+            errors[0].text
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, system_counters::id::ERRORS)
+        );
     }
 
     #[test]
@@ -2125,6 +2325,120 @@ mod tests {
         assert_eq!(1, conductor.malformed_commands());
         assert_eq!(0, conductor.clients().len(), "no client was registered");
         assert_eq!(45, conductor.counters().id_high_water_mark());
+
+        // And the fault reaches the distinct error log in the reference
+        // adapter's words — composed, as its `AERON_SET_ERR` composes — with
+        // the errors counter bumped to match (`aeron_driver_conductor.c:3231-3235`).
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!(
+            format!(
+                "(-7) malformed command\n\
+                 [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3232] \
+                 command=9 too short: length={}\n",
+                payload.len()
+            ),
+            errors[0].text
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, system_counters::id::ERRORS)
+        );
+    }
+
+    #[test]
+    fn a_broadcast_failure_is_recorded_and_counted() {
+        // The reversal of the P1-1 review's D4: the reference's
+        // `client_transmit` failure is logged like any driver error, and
+        // logging is what bumps the errors counter — one bump per refused
+        // message, with the distinct log collapsing them into one entry
+        // (`aeron_driver_conductor.c:2233-2241` feeding `:1203-1215`).
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+        conductor.pending_broadcast_failures = 3;
+
+        conductor.flush_broadcast_failures();
+
+        assert_eq!(3, conductor.broadcast_failures());
+        assert_eq!(
+            Some(3),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "one bump per refused message"
+        );
+
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!("failed to transmit message", errors[0].text);
+        assert_eq!(3, errors[0].observation_count);
+    }
+
+    #[test]
+    fn a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands() {
+        // The storage check's second half (`aeron_driver_context.c:1368-1377`):
+        // a filesystem that can hold the log buffer but sits at or below the
+        // threshold gets a warning in the distinct error log — written
+        // directly, not through `log_explicit_error`, so the errors counter
+        // stays where it was — and the create goes ahead. A threshold of
+        // `i64::MAX` stands in for a nearly-full filesystem, and prints as
+        // the reference's `PRId64` prints it: signed.
+        let temp = TempDir::new();
+        let config = DriverConfig {
+            aeron_dir: temp.0.clone(),
+            ipc_term_buffer_length: 64 * 1024,
+            low_file_store_warning_threshold: i64::MAX as u64,
+            ..DriverConfig::default()
+        };
+        crate::dir::prepare(&config, clock::epoch_millis()).expect("the directory is prepared");
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(
+            1,
+            conductor.publications().publications().len(),
+            "the warning never stopped the create"
+        );
+
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!(1, errors[0].observation_count);
+        assert!(
+            errors[0].text.starts_with(
+                "(-12) insufficient storage space\n\
+                 [aeron_driver_context_run_storage_checks, aeron_driver_context.c:1370] \
+                 WARNING: space is running low: threshold=9223372036854775807 usable="
+            ),
+            "the reference's composition and words, with the threshold it was given: {}",
+            errors[0].text
+        );
+        assert!(
+            errors[0]
+                .text
+                .ends_with(&format!(" in {}\n", temp.0.display())),
+            "and the directory it asked about: {}",
+            errors[0].text
+        );
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "a warning is not a counted error"
+        );
     }
 
     #[test]
@@ -3416,6 +3730,212 @@ mod tests {
             }),
             client.error(),
             "a heartbeat past the timeout is a driver that is gone, not one that is slow"
+        );
+    }
+
+    #[test]
+    fn a_client_can_add_hold_and_remove_a_counter() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        // Add: the command, the driver's reply, and the handle the reply
+        // named — whose registration id is the correlation id the request
+        // used, the same binding the reference's `on_counter_ready` makes
+        // (`aeron_client_conductor.c:850-895`).
+        let counter = client
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of ours",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        assert_eq!(1, client.counters().len());
+        assert_eq!(
+            Some(&counter),
+            client.counter(counter.registration_id()),
+            "the client holds what it asked for"
+        );
+
+        // The file agrees — the same find an `AeronStat` does — and the label
+        // and key arrived whole.
+        let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
+            .expect("the file, from the test's side");
+        let counters = cnc.counters().expect("the counter regions");
+        assert_eq!(
+            Some(counter.counter_id()),
+            counters.find_by_type_and_registration(100, counter.registration_id())
+        );
+        let descriptor = counter.descriptor(&counters).expect("allocated");
+        assert_eq!("a counter of ours", descriptor.label);
+        assert_eq!(0, descriptor.value, "a counter starts at zero");
+
+        // The value is this client's to write, and the write is the whole of
+        // the counter's life as far as the driver is concerned.
+        {
+            let writable = cnc.counters_writable().expect("writable regions");
+            assert!(counter.set_value(&writable, 41));
+        }
+        assert_eq!(Some(41), counter.value(&counters));
+
+        // Remove: the acknowledgement unblocks the call, and the counter goes
+        // back to the pool.
+        client
+            .remove_counter(&counter, std::time::Duration::from_secs(5))
+            .expect("removed");
+
+        assert!(client.counters().is_empty());
+        assert!(
+            counters
+                .find_by_type_and_registration(100, counter.registration_id())
+                .is_none(),
+            "the slot is reclaimed"
+        );
+    }
+
+    #[test]
+    fn counter_announcements_arrive_as_events_for_the_watchers() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        let counter = client
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of ours",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        // Two announcements crossed the broadcast while the add was waiting:
+        // this client's heartbeat — keyed by the client id — and the counter
+        // it asked for. Both are events for the watchers; only the second was
+        // also the reply the add was waiting on.
+        let events = client.counter_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CounterEvent::Ready { correlation_id, .. } if *correlation_id == client.client_id()
+            )),
+            "the heartbeat's announcement is an event, keyed by the client id"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CounterEvent::Ready { correlation_id, counter_id }
+                    if *correlation_id == counter.registration_id()
+                        && *counter_id == counter.counter_id()
+            )),
+            "and so is the counter the add asked for"
+        );
+
+        client
+            .remove_counter(&counter, std::time::Duration::from_secs(5))
+            .expect("removed");
+
+        // The acknowledgement is what unblocks the call; the announcement
+        // follows it on the broadcast and only a later poll reads it
+        // (`:6221-6235` — the reference's order too).
+        let mut unavailable = false;
+        for _ in 0..200 {
+            client.poll();
+            if client.counter_events().iter().any(|event| {
+                matches!(
+                    event,
+                    CounterEvent::Unavailable { correlation_id, .. }
+                        if *correlation_id == counter.registration_id()
+                )
+            }) {
+                unavailable = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(unavailable, "the removal is an event for the watchers too");
+    }
+
+    #[test]
+    fn another_clients_counters_arrive_as_events_too() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut watcher) = connected(&temp, &config);
+
+        // A second client on the same directory. The broadcast is one ring
+        // every client reads in full, so the watcher sees the other client's
+        // heartbeat and counter appear, though nothing of the watcher's was
+        // waiting for either.
+        let mut other =
+            deepmsg_client::client::Client::connect(&temp.0).expect("the other client connects");
+        let counter = other
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of theirs",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        let mut saw_heartbeat = false;
+        let mut saw_counter = false;
+        for _ in 0..200 {
+            watcher.poll();
+            for event in watcher.counter_events() {
+                match event {
+                    CounterEvent::Ready { correlation_id, .. }
+                        if correlation_id == other.client_id() =>
+                    {
+                        saw_heartbeat = true;
+                    }
+                    CounterEvent::Ready { correlation_id, .. }
+                        if correlation_id == counter.registration_id() =>
+                    {
+                        saw_counter = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if saw_heartbeat && saw_counter {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            saw_heartbeat,
+            "the other client's heartbeat is an event here"
+        );
+        assert!(saw_counter, "and so is its counter");
+    }
+
+    #[test]
+    fn a_client_reads_the_counters_through_its_own_mapping() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        client
+            .add_subscription("aeron:ipc", 1001, std::time::Duration::from_secs(5))
+            .expect("subscribed");
+
+        // The reader is over the client's own mapping of the file — the same
+        // one another process would map — and finds the heartbeat the driver
+        // allocated for it, holding a value this client's polls have been
+        // writing. This is the `aeron_counters_reader(client)` an
+        // `AeronStat`-shaped tool would walk (`aeron_client.c:276-286`).
+        let reader = client.counters_reader().expect("the counter regions");
+        let heartbeat = reader
+            .find_by_type_and_registration(
+                deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID,
+                client.client_id(),
+            )
+            .expect("the heartbeat is in the file");
+        assert!(
+            reader.value(heartbeat).unwrap_or(0) > 0,
+            "a living client has been writing its heartbeat"
         );
     }
 

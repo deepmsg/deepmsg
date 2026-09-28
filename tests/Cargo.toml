@@ -111,5 +111,13 @@ name = "our_client_reference_frames"
 path = "interop/our_client_reference_frames.rs"
 required-features = ["interop"]
 
+# The counter and error-log surfaces against the reference: our client's
+# ADD_COUNTER/REMOVE_COUNTER on their driver, and both drivers' error entries
+# read out by their ErrorStat and by our reader.
+[[test]]
+name = "counters_and_error_log"
+path = "interop/counters_and_error_log.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

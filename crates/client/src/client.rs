@@ -36,13 +36,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deepmsg_cnc::command::{
-    ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddPublication, AddSubscription, Response,
+    ADD_COUNTER_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter,
+    AddPublication, AddSubscription, Correlated, REMOVE_COUNTER_TYPE_ID, RemoveCounter, Response,
     decode_response,
 };
-use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
+use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
+use crate::counter::{Counter, CounterEvent};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::publication::Publication;
@@ -262,6 +264,11 @@ enum Ready {
         channel_status_indicator_id: i32,
         log_file: PathBuf,
     },
+    /// A counter exists, and its slot in the values region is the handle.
+    Counter { counter_id: i32 },
+    /// The command's work is done, and there is nothing to hand back — a
+    /// removal's acknowledgement.
+    OperationSucceeded,
 }
 
 /// A pending command, waiting for the response that completes it.
@@ -283,6 +290,12 @@ pub struct Client {
     pending: Vec<Pending>,
     subscriptions: Vec<Subscription>,
     publications: Vec<Publication>,
+    /// The counters this client asked for. The driver reclaims them with the
+    /// client when it goes, so this list is the client's whole counter life.
+    counters: Vec<Counter>,
+    /// Counter announcements read off the broadcast and not yet drained:
+    /// every counter that appeared or went away, whoever owns it.
+    counter_events: Vec<CounterEvent>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
@@ -352,6 +365,8 @@ impl Client {
             pending: Vec::new(),
             subscriptions: Vec::new(),
             publications: Vec::new(),
+            counters: Vec::new(),
+            counter_events: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
@@ -439,6 +454,43 @@ impl Client {
         self.publications
             .iter()
             .find(|publication| publication.registration_id() == registration_id)
+    }
+
+    /// The counters this client holds.
+    pub fn counters(&self) -> &[Counter] {
+        &self.counters
+    }
+
+    /// A counter by registration id.
+    pub fn counter(&self, registration_id: i64) -> Option<&Counter> {
+        self.counters
+            .iter()
+            .find(|counter| counter.registration_id() == registration_id)
+    }
+
+    /// The counters reader over this client's own mapping of the CnC file.
+    ///
+    /// The same reader the reference hands its applications, for the whole
+    /// life of the client (`aeron_counters_reader`,
+    /// `aeron-client/src/main/c/aeron_client.c:276-286`) — every counter in
+    /// the file, not only this client's, because the values region is one
+    /// shared namespace every process on the host reads the same way.
+    ///
+    /// `None` when the file describes no counter regions, which a driver that
+    /// is running does not produce.
+    pub fn counters_reader(&self) -> Option<CountersReader<'_>> {
+        self.cnc.counters()
+    }
+
+    /// Counter announcements since the last drain, and take them.
+    ///
+    /// Every counter that appeared or went away on the broadcast, whoever
+    /// owns it — see [`CounterEvent`] for what the reference does with these
+    /// and how this shape differs. Draining is the delivery: an announcement
+    /// left in the queue is one nobody has been told about yet, so a caller
+    /// that wants the watchers kept current drains every duty cycle.
+    pub fn counter_events(&mut self) -> Vec<CounterEvent> {
+        std::mem::take(&mut self.counter_events)
     }
 
     /// Run one duty cycle: refresh the heartbeat, then take at most one
@@ -588,6 +640,106 @@ impl Client {
         self.publications.push(publication);
 
         Ok(registration_id)
+    }
+
+    /// Add a counter and wait for the driver to allocate it.
+    ///
+    /// The type id is the contract a reader keys on — it says how to read the
+    /// key — and the key and label are free-form. The value starts at zero
+    /// and is this client's to write through the CnC file; nothing about it
+    /// ever reaches the driver (`aeron_async_add_counter`,
+    /// `aeron-client/src/main/c/aeronc.c:534-561`, and the waiting is this
+    /// crate's shape rather than the reference's poll triple).
+    ///
+    /// Returns the handle, which names the slot in the values region; the
+    /// client keeps it too, and reclaims it with this client when the driver
+    /// reaps the client.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it, or no reply arrived within `timeout`.
+    pub fn add_counter(
+        &mut self,
+        type_id: i32,
+        key: &[u8],
+        label: &str,
+        timeout: Duration,
+    ) -> Result<Counter, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = AddCounter {
+            correlated: Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            type_id,
+            key,
+            label: label.as_bytes(),
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(ADD_COUNTER_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let Ready::Counter { counter_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        // One command, one registration: the id the driver allocated under is
+        // the correlation id this request used, which is what `ON_COUNTER_READY`
+        // echoed (`aeron_client_conductor.c:850-895`).
+        let counter = Counter::new(correlation_id, correlation_id, counter_id);
+        self.counters.push(counter);
+
+        Ok(counter)
+    }
+
+    /// Remove a counter and wait for the driver to acknowledge.
+    ///
+    /// The acknowledgement is the whole reply — `ON_UNAVAILABLE_COUNTER`
+    /// follows it on the broadcast as an event for whoever was watching, and
+    /// is not part of this command's answer
+    /// (`aeron_driver_conductor.c:6221-6235`).
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it — a counter another client owns, or one already gone — or no reply
+    /// arrived within `timeout`.
+    pub fn remove_counter(
+        &mut self,
+        counter: &Counter,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = RemoveCounter {
+            correlated: Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            registration_id: counter.registration_id(),
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(REMOVE_COUNTER_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.counters
+            .retain(|held| held.registration_id() != counter.registration_id());
+
+        Ok(())
     }
 
     /// Offer a payload on a publication.
@@ -839,7 +991,12 @@ impl Client {
         let Some(counter_id) = self.heartbeat_counter else {
             // Not there yet is normal: the driver allocates it while handling
             // the first command, so the first poll may run before it exists.
-            // Treating that as an error would make a healthy client look broken.
+            // Treating that as an error would make a healthy client look
+            // broken. The announcement usually adopts it first (in `handle`);
+            // this scan is what saves a client that never saw the
+            // announcement — a lap, or polls that stopped — and is also the
+            // reference's only mechanism, run every liveness check until it
+            // hits (`aeron_client_conductor.c:1338-1341`).
             self.heartbeat_counter =
                 counters.find_by_type_and_registration(CLIENT_HEARTBEAT_TYPE_ID, self.client_id);
 
@@ -876,6 +1033,7 @@ impl Client {
         self.terminated = Some(error);
         self.subscriptions.clear();
         self.publications.clear();
+        self.counters.clear();
         self.pending.clear();
     }
 
@@ -958,10 +1116,63 @@ impl Client {
                     }),
                 );
             }
-            // A fresh client's *first* response is its own heartbeat counter,
-            // with the client id in the correlation field — not a reply to
-            // anything. Also how a later `ADD_COUNTER` would arrive.
-            Response::CounterReady { .. } => {}
+            // The driver's reply to an `ADD_COUNTER` this client sent, matched
+            // by the echoed correlation id — the same match the reference's
+            // `on_counter_ready` makes against its awaiting resources before
+            // it fires the watchers' handlers unconditionally, for every
+            // client's counters (`aeron_client_conductor.c:850-895`). The
+            // messages that match nothing pending are broadcasts — another
+            // client's counter, or this client's own heartbeat — and are not
+            // a reply to any command, so they are neither completed nor
+            // counted as unknown.
+            Response::CounterReady {
+                correlation_id,
+                counter_id,
+            } => {
+                self.counter_events.push(CounterEvent::Ready {
+                    correlation_id,
+                    counter_id,
+                });
+
+                // The heartbeat's correlation is the client id, and no command
+                // can ever carry that id again: client ids and correlation ids
+                // come from the one ring counter, and this client's id was
+                // drawn at connect, so the value is spent and will not be
+                // handed out as a correlation. The reference instead finds its
+                // heartbeat by scanning the file on the liveness path
+                // (`aeron_client_conductor.c:1338-1341`); adopting it here
+                // saves that scan in the normal case, and the scan remains
+                // below for a client that never saw the announcement.
+                if self.heartbeat_counter.is_none() && correlation_id == self.client_id {
+                    self.heartbeat_counter = Some(counter_id);
+                }
+
+                if self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.correlation_id == correlation_id)
+                {
+                    self.complete(correlation_id, Ok(Ready::Counter { counter_id }));
+                }
+            }
+            // A counter went away. The reference's handler for this fires the
+            // unavailable callbacks and does nothing else — no lookup, no
+            // close (`aeron_client_conductor.c:898-906`) — because a handle
+            // is only a name and a reclaimed slot already answers every
+            // question about itself with "gone". So does this: the event is
+            // the whole of the client's side.
+            Response::CounterUnavailable {
+                correlation_id,
+                counter_id,
+            } => {
+                self.counter_events.push(CounterEvent::Unavailable {
+                    correlation_id,
+                    counter_id,
+                });
+            }
+            Response::OperationSucceeded { correlation_id } => {
+                self.complete(correlation_id, Ok(Ready::OperationSucceeded));
+            }
             // Someone else's client was reaped. Every client sees it.
             Response::ClientTimeout { .. } => {}
             // Not modelled, or too short to trust. Counted, never fatal —
@@ -1092,6 +1303,8 @@ impl std::fmt::Debug for Client {
             .field("pending", &self.pending.len())
             .field("subscriptions", &self.subscriptions.len())
             .field("publications", &self.publications.len())
+            .field("counters", &self.counters.len())
+            .field("counter_events", &self.counter_events.len())
             .field("unknown_responses", &self.unknown_responses)
             .finish()
     }
