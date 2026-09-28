@@ -631,6 +631,12 @@ impl NetworkPublications {
 
 /// The counters a network publication's client reads
 /// (`aeron_driver_conductor.c:4508-4531`).
+///
+/// Each one carries the **stream-position key** the reference's own allocators
+/// build (`aeron_position.c:23-62`): the registration id, the session, the
+/// stream and the channel. The key is not decoration — a tool that finds a
+/// counter by name reads the key to learn *which* stream it measures, and a
+/// counter allocated with an empty key is one no tool can attribute.
 #[allow(clippy::too_many_arguments)]
 fn allocate_counters(
     counters: &mut CounterManager,
@@ -643,34 +649,72 @@ fn allocate_counters(
     is_exclusive: bool,
     now_ms: i64,
 ) -> Result<PublicationCounters, AddError> {
-    let allocate = |counters: &mut CounterManager, key: &str| {
-        counters.allocate(
+    let allocate = |counters: &mut CounterManager, name: &str, type_id: i32, suffix: &str| {
+        counter_position::allocate_stream_counter(
+            counters,
             regions,
-            counter_type_id(key),
-            &[],
-            format!("{key}: {registration_id} {session_id} {stream_id}").as_bytes(),
+            name,
+            type_id,
+            client_id,
+            registration_id,
+            session_id,
+            stream_id,
+            channel,
+            suffix,
             now_ms,
         )
     };
 
-    let _ = (client_id, channel, is_exclusive);
+    // `pub-pos` carries the exclusive/concurrent distinction in its *name*,
+    // which is how `AeronStat` tells a single-producer publication from a
+    // shared one (`aeron_counters.h:100-102`).
+    let pub_pos_name = if is_exclusive {
+        "pub-pos (exclusive)"
+    } else {
+        "pub-pos (concurrent)"
+    };
 
-    let Some(pub_pos) = allocate(counters, "pub-pos") else {
+    let Some(pub_pos) = allocate(
+        counters,
+        pub_pos_name,
+        counter_position::type_id::PUBLISHER_POSITION,
+        "",
+    ) else {
         return Err(AddError::NoCounterRecord);
     };
-    let Some(pub_lmt) = allocate(counters, "pub-lmt") else {
+
+    let Some(pub_lmt) = allocate(
+        counters,
+        "pub-lmt",
+        counter_position::type_id::PUBLISHER_LIMIT,
+        "",
+    ) else {
         return Err(AddError::NoCounterRecord);
     };
-    let Some(snd_pos) = allocate(counters, "snd-pos") else {
+
+    let Some(snd_pos) = allocate(
+        counters,
+        "snd-pos",
+        counter_position::type_id::SENDER_POSITION,
+        "",
+    ) else {
         return Err(AddError::NoCounterRecord);
     };
-    let Some(snd_lmt) = allocate(counters, "snd-lmt") else {
+
+    let Some(snd_lmt) = allocate(
+        counters,
+        "snd-lmt",
+        counter_position::type_id::SENDER_LIMIT,
+        "",
+    ) else {
         return Err(AddError::NoCounterRecord);
     };
-    let Some(snd_bpe) = allocate(counters, "snd-bpe") else {
+
+    let Some(snd_bpe) = allocate(counters, "snd-bpe", SENDER_BPE_TYPE_ID, "") else {
         return Err(AddError::NoCounterRecord);
     };
-    let Some(snd_naks_received) = allocate(counters, "snd-naks-received") else {
+    let Some(snd_naks_received) = allocate(counters, "snd-naks-received", SENDER_NAKS_TYPE_ID, "")
+    else {
         return Err(AddError::NoCounterRecord);
     };
 
@@ -684,22 +728,12 @@ fn allocate_counters(
     })
 }
 
-/// The counter type id a publication's counter carries
-/// (`aeron-client/src/main/c/aeron_counters.h`).
-///
-/// These are the reference's own ids, and a reader that finds one uses them to
-/// interpret the key — which is why the labels above are the reference's too.
-fn counter_type_id(key: &str) -> i32 {
-    match key {
-        "pub-pos" => counter_position::type_id::PUBLISHER_POSITION,
-        "pub-lmt" => counter_position::type_id::PUBLISHER_LIMIT,
-        "snd-pos" => 2,
-        "snd-lmt" => 9,
-        "snd-bpe" => 17,
-        "snd-naks-received" => 21,
-        _ => 0,
-    }
-}
+/// `AERON_COUNTER_SENDER_BPE_TYPE_ID` (`aeron-client/src/main/c/aeron_counters.h:104-105`):
+/// how many times the sender was held back by a receiver's window.
+const SENDER_BPE_TYPE_ID: i32 = 13;
+
+/// `AERON_COUNTER_SENDER_NAKS_RECEIVED_TYPE_ID` (`:120-121`).
+const SENDER_NAKS_TYPE_ID: i32 = 19;
 
 /// Whether an existing publication may be shared with these parameters
 /// (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1105-1178`).
