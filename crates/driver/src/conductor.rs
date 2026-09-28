@@ -49,19 +49,21 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
-    ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
-    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
-    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
-    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
-    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
-    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
-    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
-    encode_subscription_ready, encode_unavailable_image,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+    ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+    ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID,
+    ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
+    ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID,
+    PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter,
+    decode_add_publication, decode_add_subscription, decode_correlated, decode_remove_counter,
+    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
+    encode_counter_update, encode_error, encode_operation_succeeded, encode_subscription_ready,
+    encode_unavailable_image,
 };
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
-    CncCreateError, CncFile, CounterManager, ToClientsTransmitter, ToDriverRingConsumer,
+    CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
+    ToDriverRingConsumer,
 };
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::clock::{self, CachedClock};
@@ -316,6 +318,27 @@ impl ClientEvents for Transmit<'_> {
     }
 }
 
+/// Count a command whose payload is shorter than its own header, and describe
+/// it for the error log in the reference adapter's words
+/// (`aeron_driver_conductor.c:3233-3237`).
+///
+/// The code is recorded negated because the reference's `AERON_SET_ERR` is
+/// given `-AERON_ERROR_CODE_MALFORMED_COMMAND` there and the log keeps
+/// whatever that left — a detail of the in-process table, since the code never
+/// reaches the region.
+fn malformed_command(
+    type_id: i32,
+    payload_len: usize,
+    malformed: &mut u64,
+    faults: &mut Vec<(i32, String)>,
+) {
+    *malformed += 1;
+    faults.push((
+        -ERROR_CODE_MALFORMED_COMMAND,
+        format!("command={type_id} too short: length={payload_len}"),
+    ));
+}
+
 /// The driver's control plane.
 pub struct Conductor {
     /// The settings every publication's parameters default to, kept because
@@ -328,6 +351,9 @@ pub struct Conductor {
     /// What this driver allocated for itself, so its shutdown gives back
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
+    /// The process's half of the distinct error log; the region it writes
+    /// comes from the CnC file per call, like the counters.
+    error_log: DistinctErrorLog,
     clients: Clients,
     /// The publications this driver owns, and the thread that maps their log
     /// buffers.
@@ -362,6 +388,10 @@ pub struct Conductor {
     unhandled: u64,
     unknown: u64,
     last_unhandled: Option<Command>,
+    /// Errors the command adapter noticed but could not record yet: the pass
+    /// holds the CnC file's windows while it runs, so these wait for it, the
+    /// way broadcast failures do.
+    pending_log_errors: Vec<(i32, String)>,
 }
 
 impl Conductor {
@@ -449,6 +479,7 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
+            error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
             publications,
             subscriptions: IpcSubscriptions::new(),
@@ -476,6 +507,7 @@ impl Conductor {
             unhandled: 0,
             unknown: 0,
             last_unhandled: None,
+            pending_log_errors: Vec::new(),
         };
 
         conductor.write_heartbeat();
@@ -731,6 +763,7 @@ impl Conductor {
         let unhandled = &mut self.unhandled;
         let unknown = &mut self.unknown;
         let last_unhandled = &mut self.last_unhandled;
+        let faults = &mut self.pending_log_errors;
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -747,7 +780,7 @@ impl Conductor {
             failures: pending_failures,
         };
 
-        commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        let work = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -768,7 +801,7 @@ impl Conductor {
                             &counter_regions,
                         );
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // Nothing is freed here: the heartbeat is zeroed so the next
                 // timeout tier collects the client, which is also what stops
@@ -813,7 +846,7 @@ impl Conductor {
                                 );
                             }
                         }
-                        None => *malformed += 1,
+                        None => malformed_command(type_id, payload.len(), malformed, faults),
                     }
                 }
                 // A publication's client letting go of it. The revocation
@@ -868,7 +901,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // A subscription going away: its positions are detached and
                 // its counters come back (`aeron_driver_conductor.c:5199-5267`)
@@ -907,7 +940,7 @@ impl Conductor {
                             );
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 // A subscription: parse the URI, register the client, answer
                 // it, and then give it every publication it already matches
@@ -938,13 +971,13 @@ impl Conductor {
                             );
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::ClientClose => match decode_correlated(payload) {
                     Some(correlated) => {
                         clients.on_close(correlated.client_id, counters, &counter_regions);
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::AddCounter => match decode_add_counter(payload) {
                     Some(command) => {
@@ -1021,7 +1054,7 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 Command::RemoveCounter => match decode_remove_counter(payload) {
                     Some(command) => {
@@ -1055,18 +1088,33 @@ impl Conductor {
                             }
                         }
                     }
-                    None => *malformed += 1,
+                    None => malformed_command(type_id, payload.len(), malformed, faults),
                 },
                 command => {
-                    if matches!(command, Command::Unknown(_)) {
+                    if let Command::Unknown(unknown_type_id) = command {
                         *unknown += 1;
+                        faults.push((
+                            -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+                            format!("command={unknown_type_id} unknown"),
+                        ));
                     } else {
                         *unhandled += 1;
                     }
                     *last_unhandled = Some(command);
                 }
             }
-        })
+        });
+
+        // The faults the adapter collected are recorded after the read: the
+        // closure borrows the conductor's fields piecemeal and cannot call a
+        // method on the whole of it, and the order within a pass is not
+        // observable from outside the pass.
+        let faults = std::mem::take(&mut self.pending_log_errors);
+        for (error_code, description) in faults {
+            self.log_error(error_code, &description);
+        }
+
+        work
     }
 
     /// Break a stall in the command ring, and count it when it breaks one.
@@ -1204,25 +1252,55 @@ impl Conductor {
 
     /// Account for this pass's broadcast failures.
     ///
-    /// They are counted here and **not** in system counter 15: the reference's
-    /// `client_transmit` appends to its error log and touches no counter
-    /// (`aeron_driver_conductor.c:2233-2241`), and counter 15 is how a
-    /// deployment alerts on the driver's own errors — a transport that could
-    /// not publish a twelve-byte event would quietly raise every threshold on
-    /// it. The first one is said out loud, because a ring that refuses events
-    /// is worth noticing; the rest are counted, because one per pass forever is
-    /// not worth reading.
+    /// Each one is an error the reference records: `client_transmit` appends
+    /// "failed to transmit message" and logs it, and logging is what bumps the
+    /// errors system counter (`aeron_driver_conductor.c:2233-2241` feeding
+    /// `:1203-1215`). They are counted during the pass and recorded after it,
+    /// because the pass holds the event region mutably; the order within a
+    /// pass is not observable from outside it.
+    ///
+    /// The code recorded is zero, which is what the reference records too:
+    /// `AERON_APPEND_ERR` appends text without setting a code
+    /// (`util/aeron_error.c:499-501`), and the last thing a recorded error did
+    /// was clear the state (`:389-397`).
+    ///
+    /// This reverses the P1-1 review's D4, which read `:2233-2241` as "touches
+    /// no counter" and removed the increment — the counter it leaves alone is
+    /// a *different* one from the errors counter its own `log_error` raises.
     fn flush_broadcast_failures(&mut self) {
         if 0 == self.pending_broadcast_failures {
             return;
         }
 
         let pending = std::mem::take(&mut self.pending_broadcast_failures);
-
-        if 0 == self.broadcast_failures {
-            eprintln!("deepmsg-driver: the to-clients ring refused a broadcast");
-        }
         self.broadcast_failures += pending;
+
+        for _ in 0..pending {
+            self.log_error(0, "failed to transmit message");
+        }
+    }
+
+    /// Record a driver-side error: one entry in the distinct error log and one
+    /// bump of the errors system counter — the bump **always**, even for an
+    /// entry the log could not hold
+    /// (`aeron_driver_conductor_log_explicit_error`,
+    /// `aeron_driver_conductor.c:1203-1215`).
+    fn log_error(&mut self, error_code: i32, description: &str) {
+        if let Some(region) = self.cnc.error_log_writable() {
+            if let Err(deepmsg_cnc::error_log::RecordError::Unrecordable { description }) = self
+                .error_log
+                .record(&region, self.now_ms, error_code, description)
+            {
+                // The reference prints a formatted date here; stderr is a
+                // diagnostic and not a contract, and the epoch time says the
+                // same thing (`aeron_distinct_error_log.c:185-191`).
+                eprintln!("{} - unrecordable error {}", self.now_ms, description);
+            }
+        }
+
+        if let Some(regions) = self.cnc.counter_regions() {
+            system_counters::increment(&self.counters, &regions, system_counters::id::ERRORS);
+        }
     }
 
     /// Measure the pass that just ended, and count it if it ran long
@@ -1772,6 +1850,18 @@ mod tests {
         assert_eq!(0, conductor.unhandled_commands());
         assert_eq!(1, conductor.unknown_commands());
         assert_eq!(Some(Command::Unknown(0x7F)), conductor.last_unhandled());
+
+        // And the fault reaches the distinct error log in the adapter's
+        // words, with the errors counter bumped to match
+        // (`aeron_driver_conductor.c:3218-3221`).
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!("command=127 unknown", errors[0].text);
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, system_counters::id::ERRORS)
+        );
     }
 
     #[test]
@@ -2125,6 +2215,47 @@ mod tests {
         assert_eq!(1, conductor.malformed_commands());
         assert_eq!(0, conductor.clients().len(), "no client was registered");
         assert_eq!(45, conductor.counters().id_high_water_mark());
+
+        // And the fault reaches the distinct error log in the reference
+        // adapter's words, with the errors counter bumped to match
+        // (`aeron_driver_conductor.c:3233-3237`).
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!(
+            format!("command=9 too short: length={}", payload.len()),
+            errors[0].text
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, system_counters::id::ERRORS)
+        );
+    }
+
+    #[test]
+    fn a_broadcast_failure_is_recorded_and_counted() {
+        // The reversal of the P1-1 review's D4: the reference's
+        // `client_transmit` failure is logged like any driver error, and
+        // logging is what bumps the errors counter — one bump per refused
+        // message, with the distinct log collapsing them into one entry
+        // (`aeron_driver_conductor.c:2233-2241` feeding `:1203-1215`).
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+        conductor.pending_broadcast_failures = 3;
+
+        conductor.flush_broadcast_failures();
+
+        assert_eq!(3, conductor.broadcast_failures());
+        assert_eq!(
+            Some(3),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "one bump per refused message"
+        );
+
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!("failed to transmit message", errors[0].text);
+        assert_eq!(3, errors[0].observation_count);
     }
 
     #[test]

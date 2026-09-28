@@ -408,6 +408,23 @@ pub const ERROR_CODE_GENERIC_ERROR: i32 = 11;
 /// (`aeron_driver_conductor.c:2326-2341`).
 pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
 
+/// `AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` (`aeron_client_error.h:16`).
+///
+/// What the reference's command adapter reports for a type id the protocol
+/// does not define — not sent as an `ON_ERROR`, but recorded in the distinct
+/// error log, **negated**, because the adapter passes
+/// `-AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` to `AERON_SET_ERR` and the log
+/// keeps whatever that left (`aeron_driver_conductor.c:3218-3221`).
+pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
+
+/// `AERON_ERROR_CODE_MALFORMED_COMMAND` (`aeron_client_error.h:17`).
+///
+/// What the reference's command adapter reports for a command whose payload
+/// is shorter than its own header — recorded negated in the distinct error
+/// log, for the same reason as
+/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3233-3237`).
+pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
+
 /// Encode `ON_OPERATION_SUCCEEDED`.
 pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
     correlation_id.to_le_bytes()

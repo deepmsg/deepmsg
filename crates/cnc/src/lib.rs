@@ -57,7 +57,9 @@ pub use counter_manager::{CounterManager, CounterRegions};
 pub use counters::{CounterDescriptor, CounterScan, CountersReader};
 pub use create::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncIdentity, CncLayout};
 pub use error::{CncError, Region};
-pub use error_log::{ErrorLogEntry, ErrorLogReader, ErrorLogScan};
+pub use error_log::{
+    DistinctErrorLog, ErrorLogEntry, ErrorLogReader, ErrorLogRegion, ErrorLogScan,
+};
 pub use file::{CNC_FILE_NAME, CncFile, CncOpenError, Liveness, RETRY_INTERVAL};
 pub use metadata::{CncMetadata, RegionLayout};
 pub use ring::{ClaimError, ToDriverRing, ToDriverRingConsumer};
