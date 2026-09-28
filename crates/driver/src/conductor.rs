@@ -789,6 +789,12 @@ impl Conductor {
             "the driver releases exactly the counters it allocated"
         );
 
+        // The distinct error log's *process* half needs no line here: the
+        // observation table and the next offset are this build's own memory,
+        // and dropping the conductor is what gives them back
+        // (`aeron_distinct_error_log_close`, `aeron_driver_conductor.c:3489`).
+        // The region is the file's, and the file is left as it stands — a
+        // stopped driver's log is what a tool reads afterwards.
         self.running = false;
         self.write_heartbeat_value(layout::NULL_VALUE);
         self.cnc.sync()

@@ -489,6 +489,12 @@ impl Client {
     /// and how this shape differs. Draining is the delivery: an announcement
     /// left in the queue is one nobody has been told about yet, so a caller
     /// that wants the watchers kept current drains every duty cycle.
+    ///
+    /// Nothing bounds the queue. A caller that never drains it keeps every
+    /// announcement it has been sent, so a client that polls without reading
+    /// grows by one entry per counter event on the host — which is a
+    /// consequence of the shape rather than of a bug, and the reason the
+    /// method is named for the drain it performs.
     pub fn counter_events(&mut self) -> Vec<CounterEvent> {
         std::mem::take(&mut self.counter_events)
     }

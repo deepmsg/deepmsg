@@ -413,7 +413,12 @@ impl DistinctErrorLog {
             .store_i32_relaxed(offset + layout::ERROR_LOG_OBSERVATION_COUNT_OFFSET, 0)
             .expect("capacity was checked before the write");
 
-        self.next_offset = layout::align_up(length, layout::ERROR_LOG_RECORD_ALIGNMENT);
+        // Aligned from the entry's *start*, the way the reference aligns it
+        // (`:138`). The two agree while every offset is already a multiple of
+        // the alignment — which is the invariant the region's own alignment
+        // and this same expression maintain — and this is the one that stays
+        // right if it ever stops holding.
+        self.next_offset = layout::align_up(offset + length, layout::ERROR_LOG_RECORD_ALIGNMENT);
         self.observations.push(Observation {
             error_code,
             offset,
