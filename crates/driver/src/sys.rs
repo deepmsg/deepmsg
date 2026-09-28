@@ -45,6 +45,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use deepmsg_core::clock;
 
+/// Datagram sockets and the batching syscalls the data plane moves messages
+/// through.
+pub mod socket;
+
 /// No signal has asked this process to stop.
 pub const NOT_STOPPED: i32 = -1;
 
