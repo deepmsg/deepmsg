@@ -50,7 +50,9 @@ use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
 use crate::ipc_subscriptions::{IPC_CHANNEL, IpcSubscriptions};
-use crate::native_resource_agent::{Completion, NativeResourceAgent, StorageChecks};
+use crate::native_resource_agent::{
+    Completion, NativeResourceAgent, StorageChecks, StorageWarning,
+};
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError};
 use crate::sys;
@@ -526,6 +528,13 @@ impl IpcPublications {
         }
 
         work
+    }
+
+    /// Every storage warning the agent raised since the last call. Not this
+    /// pool's to answer — a warning never stopped a create — so they pass
+    /// straight through to the conductor, which owns the log they go to.
+    pub fn poll_storage_warnings(&self) -> Vec<StorageWarning> {
+        self.agent.poll_warnings()
     }
 
     /// Let go of the publications a client held, as its death or its

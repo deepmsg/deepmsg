@@ -106,12 +106,20 @@ composes for an `ENOSPC`, whether the check's or the kernel's
 are pinned by `crates/driver/src/config.rs::the_storage_check_answers_to_the_references_names`,
 and the refusal by the native resource agent's own tests.
 
-The reference's check has a second half this build does not answer yet: at
-or below `low.file.store.warning.threshold` it records a warning in the
-driver's distinct error log, which this build has no counterpart of. The
-setting is read and its default — ten of the reference's default term
-lengths (`aeron_driver_context.c:179-183`) — is honoured by configuration
-alone; the warning arrives with the error log that would record it.
+The check's second half: a filesystem that can hold the log buffer but
+sits at or below `low.file.store.warning.threshold` is warned about in the
+driver's distinct error log, in the reference's own words and under its
+code (`-STORAGE_SPACE`, negated as its `AERON_SET_ERR` left it), and the
+create goes ahead — the reference records the warning directly rather than
+through its `log_explicit_error`, so the errors counter does not move
+(`aeron_driver_context.c:1368-1377`). The reference's agent thread writes
+the entry itself; deepmsg's agent hands the numbers to the conductor, which
+owns the de-duplication table, so the entry lands on the duty cycle after
+the check rather than during it. The setting's default — ten of the
+reference's default term lengths (`aeron_driver_context.c:179-183`) — is
+pinned by configuration's own tests, and the warning's shape by the
+conductor's
+`a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands`.
 
 ## The session id a new publication is given
 

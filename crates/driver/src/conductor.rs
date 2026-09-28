@@ -49,16 +49,16 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
-    ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION,
-    ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID,
-    ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
-    ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID,
-    PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter,
-    decode_add_publication, decode_add_subscription, decode_correlated, decode_remove_counter,
-    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
-    encode_counter_update, encode_error, encode_operation_succeeded, encode_subscription_ready,
-    encode_unavailable_image,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND, ERROR_CODE_STORAGE_SPACE,
+    ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
+    ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
+    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
+    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
+    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
+    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
+    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
+    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
+    encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
@@ -468,7 +468,11 @@ impl Conductor {
         let publications = IpcPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
-            StorageChecks::new(config.perform_storage_checks, config.aeron_dir.clone()),
+            StorageChecks::new(
+                config.perform_storage_checks,
+                config.low_file_store_warning_threshold,
+                config.aeron_dir.clone(),
+            ),
         )
         .map_err(ConductorError::Agent)?;
 
@@ -541,6 +545,7 @@ impl Conductor {
             + self.process_commands(now_ns)
             + self.poll_publications()
             + self.update_publication_limits();
+        self.record_storage_warnings();
         self.flush_broadcast_failures();
         work
     }
@@ -1301,6 +1306,52 @@ impl Conductor {
         if let Some(regions) = self.cnc.counter_regions() {
             system_counters::increment(&self.counters, &regions, system_counters::id::ERRORS);
         }
+    }
+
+    /// Take the agent's storage warnings and record them
+    /// (`aeron_driver_context_run_storage_checks`'s second half,
+    /// `aeron_driver_context.c:1368-1377`).
+    ///
+    /// The warning is the reference's own words, and the two numbers are
+    /// printed the way its `PRId64` prints the `uint64_t` values it passes —
+    /// as signed, which no real threshold or filesystem can tell apart.
+    fn record_storage_warnings(&mut self) {
+        for warning in self.publications.poll_storage_warnings() {
+            #[allow(clippy::cast_possible_wrap)] // printed as the reference prints it
+            let text = format!(
+                "WARNING: space is running low: threshold={} usable={} in {}",
+                warning.threshold as i64,
+                warning.usable as i64,
+                warning.dir.display()
+            );
+            // Negated, because the reference's `AERON_SET_ERR` was given
+            // `-AERON_ERROR_CODE_STORAGE_SPACE` and the log keeps what that
+            // left (`:1370-1372`).
+            self.record_distinct(-ERROR_CODE_STORAGE_SPACE, &text);
+        }
+    }
+
+    /// Write one entry in the distinct error log, and nothing else.
+    ///
+    /// This is the reference's direct
+    /// `aeron_distinct_error_log_record(context->error_log, …)` — the calls
+    /// that do **not** go through `log_explicit_error`
+    /// (`aeron_driver_conductor.c:1203-1215`), and so raise no errors
+    /// counter. A caller that failed as well as warned uses
+    /// [`Conductor::log_error`]; this is for the paths the reference
+    /// recorded without deciding anything had failed.
+    fn record_distinct(&mut self, error_code: i32, description: &str) {
+        let Some(region) = self.cnc.error_log_writable() else {
+            return;
+        };
+
+        // An entry that does not fit is ignored: the reference does not look
+        // at the return value on this path (`aeron_driver_context.c:1374`),
+        // and the counter a recorded error would raise is not raised here at
+        // all.
+        let _ = self
+            .error_log
+            .record(&region, self.now_ms, error_code, description);
     }
 
     /// Measure the pass that just ended, and count it if it ran long
@@ -2256,6 +2307,72 @@ mod tests {
         assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
         assert_eq!("failed to transmit message", errors[0].text);
         assert_eq!(3, errors[0].observation_count);
+    }
+
+    #[test]
+    fn a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands() {
+        // The storage check's second half (`aeron_driver_context.c:1368-1377`):
+        // a filesystem that can hold the log buffer but sits at or below the
+        // threshold gets a warning in the distinct error log — written
+        // directly, not through `log_explicit_error`, so the errors counter
+        // stays where it was — and the create goes ahead. A threshold of
+        // `i64::MAX` stands in for a nearly-full filesystem, and prints as
+        // the reference's `PRId64` prints it: signed.
+        let temp = TempDir::new();
+        let config = DriverConfig {
+            aeron_dir: temp.0.clone(),
+            ipc_term_buffer_length: 64 * 1024,
+            low_file_store_warning_threshold: i64::MAX as u64,
+            ..DriverConfig::default()
+        };
+        crate::dir::prepare(&config, clock::epoch_millis()).expect("the directory is prepared");
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(
+            1,
+            conductor.publications().publications().len(),
+            "the warning never stopped the create"
+        );
+
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
+        assert_eq!(1, errors[0].observation_count);
+        assert!(
+            errors[0].text.starts_with(
+                "WARNING: space is running low: threshold=9223372036854775807 usable="
+            ),
+            "the reference's words, with the threshold it was given: {}",
+            errors[0].text
+        );
+        assert!(
+            errors[0]
+                .text
+                .ends_with(&format!(" in {}", temp.0.display())),
+            "and the directory it asked about: {}",
+            errors[0].text
+        );
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, system_counters::id::ERRORS),
+            "a warning is not a counted error"
+        );
     }
 
     #[test]
