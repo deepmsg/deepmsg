@@ -15,7 +15,7 @@
 //!    reference tool's report of the same region verbatim.
 //!
 //! The timestamps are the one thing two runs can never share, and the format
-//! puts them on the summary line (`error_stat.c:56-71`), so the comparison
+//! puts them on the summary line (`error_stat.c:57-79`), so the comparison
 //! parses that line for the observation count and takes the text whole.
 
 use std::path::{Path, PathBuf};
@@ -115,7 +115,7 @@ fn error_stat(binary: &Path, dir: &Path) -> String {
 ///
 /// Each entry prints as `***`, a summary line `<n> observations from <date>
 /// to <date> for:`, the recorded description, and a blank line
-/// (`aeron_error_stat_on_observation`, `error_stat.c:56-71`) — the first
+/// (`aeron_error_stat_on_observation`, `error_stat.c:57-79`) — the first
 /// line of the description indented one space by the print, the rest
 /// verbatim. The two dates are when the entry was first and last seen — the
 /// one part of the output that is about the run rather than the log — so

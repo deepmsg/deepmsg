@@ -175,13 +175,39 @@ and the reference's region read by this build's reader matching the tool's
 report verbatim
 (`::our_reader_reads_the_reference_error_log_and_matches_error_stat`).
 
-One recorded text diverges: a broadcast transmit failure. The reference's
-entry is appended by `AERON_APPEND_ERR` with the OS's own words for the
-errno that failed (`aeron_driver_conductor.c:2233-2241`), which no test can
-reproduce deterministically; deepmsg records the bare `"failed to transmit
-message"` under code zero — the same code, because appending never sets one
-(`aeron-client/src/main/c/util/aeron_error.c:499-501`). Covered by
+One recorded text diverges: a broadcast transmit failure. The reference
+appends it with `AERON_APPEND_ERR` (`aeron_driver_conductor.c:2240`), which
+resets neither the code nor the thread's error buffer — so the entry is the
+tail of a chain that thread has accumulated, ended by the append's own site
+line, and reads `[aeron_driver_conductor_client_transmit,
+aeron_driver_conductor.c:2240] failed to transmit message\n` under code
+zero (`aeron-client/src/main/c/util/aeron_error.c:380-388`; appending never
+sets a code). deepmsg records the bare `"failed to transmit message"`: the
+same code, the same de-duplication, without the site line that only means
+something on the reference's own thread. Covered by
 `crates/driver/src/conductor.rs::a_broadcast_failure_is_recorded_and_counted`.
+
+What the reference's *agent thread* records on its own account is not here,
+and the four recordings are named so the absence is a decision rather than a
+gap. All of them are in
+`aeron-driver/src/main/c/aeron_driver_native_resource_agent.c`:
+
+- An agent command its switch does not know is
+  `record(EINVAL, "unknown command")` (`:176-177`). This build's agent takes
+  a typed enum, so the failure has no representation to report.
+- A name resolver that would not start (`:239-247`, both its branches)
+  arrives with UDP, which this build has not reached.
+- The other two are allocation failures — a deque that would not grow
+  (`:417-420`) and an error message it could not allocate (`:131-133`);
+  this build's agent hands work over an unbounded channel and allocates
+  through Rust, so neither has a moment to fail at.
+
+The failure from that thread that *does* reach the log — a filesystem with
+no room for the log buffer — reaches it as the answer the client gets,
+recorded with that answer like any other error. Covered by
+`crates/driver/src/conductor.rs::a_refused_log_buffer_is_answered_and_recorded`
+and, for the agent's side of it,
+`crates/driver/src/native_resource_agent.rs::a_refused_log_buffer_never_touches_the_filesystem`.
 
 ## The session id a new publication is given
 

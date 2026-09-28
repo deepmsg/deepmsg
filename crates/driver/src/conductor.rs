@@ -2504,6 +2504,66 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_log_buffer_is_answered_and_recorded() {
+        // The refusal half of the same check, end to end. A filesystem that
+        // cannot hold the log refuses it (`aeron_driver_context.c:1360-1366`),
+        // the agent reports the failure (`:432-436`), the publication's state
+        // machine turns it into ERROR (`aeron_driver_conductor.c:4064-4067`)
+        // and the conductor answers the client *and* records the error, in one
+        // act (`:3304-3315` → `on_error`'s own `log_error:` label, `:2366-2370`).
+        //
+        // A directory that is gone is a filesystem that reports nothing
+        // usable, which is how this build's `usable_fs_space` reads one — the
+        // same stand-in the agent's own refusal test uses.
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        std::fs::remove_dir_all(&temp.0).expect("the filesystem is gone");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, "aeron:ipc"),
+        );
+
+        // The map is the agent's, so the answer arrives on a later pass than
+        // the command did.
+        let mut pending = Vec::new();
+        let answer = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+        assert_eq!(
+            ERROR_CODE_STORAGE_SPACE,
+            i32::from_le_bytes(answer[8..12].try_into().expect("four bytes")),
+            "the refusal carries its own code, not the generic one"
+        );
+
+        // And the answer is an entry: same words, one sighting, one bump.
+        let mut recorded = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(1, log.read(i64::MIN, &mut recorded).entries);
+        assert!(
+            recorded[0]
+                .text
+                .starts_with("could not create the log buffer: "),
+            "the entry holds what the client was told: {}",
+            recorded[0].text
+        );
+        assert_eq!(1, recorded[0].observation_count);
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, system_counters::id::ERRORS)
+        );
+    }
+
+    #[test]
     fn a_ring_stalled_by_a_dead_producer_is_unblocked() {
         // What a client killed between claiming a command and committing it
         // leaves: a record whose length is the negative in-flight marker and a

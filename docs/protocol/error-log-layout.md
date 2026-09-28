@@ -38,9 +38,12 @@ composition `AERON_SET_ERR` left in the thread's error buffer (`aeron_err_set`,
   `:348`).
 
 The one driver-side recording that does **not** carry the composition is a
-broadcast transmit failure, whose reference text is appended by
-`AERON_APPEND_ERR` with the OS's own words for the errno — that divergence is
-recorded in `docs/compat.md`.
+broadcast transmit failure. The reference appends it with `AERON_APPEND_ERR`
+(`aeron_driver_conductor.c:2240`), which is the other half of
+`aeron_err_update_entry`: no code's own line, no reset of the code, just the
+site line and the message — so the entry reads
+`[aeron_driver_conductor_client_transmit, aeron_driver_conductor.c:2240]
+failed to transmit message`. That divergence is recorded in `docs/compat.md`.
 
 Rust: `deepmsg_cnc::error_log::compose_description`. The golden texts are
 pinned by its unit tests and by the interop suite's comparison of both
@@ -90,6 +93,6 @@ Rust: `DistinctErrorLog::record` and `RecordError::Unrecordable`.
 
 `ErrorStat` prints each entry as `***`, a summary line with the observation
 count and two dates, and then the description — its first line indented one
-space by the print, the rest verbatim (`aeron-samples/src/main/c/error_stat.c:56-71`).
+space by the print, the rest verbatim (`aeron-samples/src/main/c/error_stat.c:57-79`).
 The dates are the entry's first- and last-seen times, and are the only part
 of the output that is about the run rather than the log.
