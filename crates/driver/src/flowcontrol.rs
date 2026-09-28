@@ -1,10 +1,375 @@
 //! Sender-side flow-control strategies (M10).
 //!
-//! P1 scope, mirroring `aeron-driver/src/main/c/aeron_flow_control.c`:
+//! A publication asks its strategy one question — how far may the producer
+//! write? — and the strategy answers from what the receivers have told it. The
+//! reference keeps the sender limit (`snd-lmt`) as a *single* value the
+//! strategy returns (`aeron_network_publication_on_status_message`,
+//! `aeron-driver/src/main/c/aeron_network_publication.c:779-840`), which is why
+//! [the rule the stub recorded][`Strategy::on_sm`] holds here too: this is the
+//! only place `snd-lmt` moves.
 //!
-//! - `max` (unicast default), `min` (multicast, with the new-receiver
-//!   admission gate and setup-catchup window freeze), `tagged`,
-//! - the strategy's on-SM return value is the single write point of the
-//!   sender limit (`snd_lmt`),
-//! - both naming schemes supported: env long names and URI `fc=` short
-//!   names.
+//! # What P1-4 carries
+//!
+//! `max`, which is the unicast default: a status message says how far its
+//! receiver has read and how much room it has, and the sender limit becomes the
+//! far edge of that window — never less than it already was
+//! (`aeron_flow_control.c:108-127`). The `min` strategy's admission gate,
+//! `tagged`'s per-tag limits and the multicast variants arrive with multicast
+//! in P1-5, as does the sender-side retransmit window the same options parse
+//! (`rrwm:`), which is read but not yet used.
+//!
+//! # Names, and where they are read
+//!
+//! `fc=` names the strategy, and the reference resolves it through a symbol
+//! table (`aeron_flow_control_strategy_supplier_load`,
+//! `aeron_flow_control.c:74-79`) whose names are `max`, `min` and `tagged`
+//! (`aeron_flow_control.h:24-26`). Options follow the name after a comma, and
+//! are parsed by [`max_options`].
+
+/// What a strategy answers with, every time it is asked.
+///
+/// Not a `Result`: a strategy that cannot advance the limit answers with the
+/// limit it had, which is a state rather than a failure (ADR-0003).
+pub type SenderLimit = i64;
+
+/// The options `fc=max` accepts
+/// (`aeron_flow_control_parse_max_options`, `aeron_flow_control.c:196-266`).
+///
+/// One option so far — how many receiver windows a retransmission may cover —
+/// and it is parsed here so that a malformed option is refused at the channel
+/// rather than ignored until the day it matters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaxOptions {
+    /// `rrwm:` — the retransmit receiver window multiple.
+    pub rrwm: Option<usize>,
+}
+
+/// Why a flow-control specification was refused
+/// (`aeron_flow_control.c:243-262`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowControlError {
+    /// A strategy this build does not have.
+    UnknownStrategy(String),
+    /// An option the strategy does not recognise.
+    UnrecognisedOption(String),
+    /// `rrwm:` with something that is not a positive number.
+    InvalidOption(String),
+}
+
+impl std::fmt::Display for FlowControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownStrategy(name) => {
+                write!(f, "unknown flow control strategy: {name}")
+            }
+            Self::UnrecognisedOption(option) => write!(
+                f,
+                "Flow control options - unrecognised option, field: {option}"
+            ),
+            Self::InvalidOption(option) => write!(
+                f,
+                "Flow control options - invalid flow control retransmit receiver window \
+                 multiple, field: {option}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FlowControlError {}
+
+/// What a sender asks of its strategy
+/// (`aeron_flow_control_strategy_t`, `aeron_flow_control.h:46-100`).
+pub trait Strategy {
+    /// A status message arrived: it carries the receiver's consumption
+    /// position and its window, and the answer is the new sender limit.
+    ///
+    /// `consumption_position` is the receiver's position, already computed from
+    /// the frame's term id and offset against the publication's initial term id
+    /// — which is the caller's job in both implementations
+    /// (`aeron_logbuffer_compute_position`, `aeron_flow_control.c:120-124`).
+    fn on_sm(
+        &mut self,
+        consumption_position: i64,
+        receiver_window: i32,
+        snd_lmt: SenderLimit,
+    ) -> SenderLimit;
+
+    /// Nothing arrived this pass (`aeron_max_flow_control_strategy_on_idle`,
+    /// `:87-95`): the limit is unchanged, and asking is how a strategy gets to
+    /// change its mind.
+    fn on_idle(
+        &mut self,
+        now_ns: i64,
+        snd_lmt: SenderLimit,
+        snd_pos: i64,
+        is_end_of_stream: bool,
+    ) -> SenderLimit;
+
+    /// How long a retransmission may be
+    /// (`aeron_max_flow_control_strategy_max_retransmission_length`,
+    /// `:156-166`).
+    ///
+    /// The receiver's window times the multiple, or what is left of the term,
+    /// whichever is smaller — and never more than the NAK asked for.
+    fn max_retransmission_length(
+        &self,
+        term_offset: usize,
+        resend_length: usize,
+        term_buffer_length: usize,
+        initial_window_length: usize,
+    ) -> usize;
+}
+
+/// The `max` strategy: the sender may write to the far edge of every receiver's
+/// window, and never moves backwards.
+///
+/// One implementation serves both the unicast and the multicast flavour in the
+/// reference (`aeron_unicast_flow_control_strategy_state_t` and
+/// `aeron_max_flow_control_strategy_state_t` are the same struct with the same
+/// functions, `aeron_flow_control.c:30-40`); the multicast admission gate lives
+/// in the delivery layer, not here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MaxStrategy {
+    /// How many receiver windows a retransmission may cover
+    /// (`retransmit_receiver_window_multiple`).
+    pub retransmit_receiver_window_multiple: usize,
+}
+
+/// The default retransmit receiver window multiple
+/// (`AERON_UNICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE`,
+/// `aeron-driver/src/main/c/aeron_flow_control.h:31`, which the context starts
+/// from at `aeron_driver_context.c:505`).
+///
+/// Sixteen receiver windows: a retransmission may cover far more than the
+/// window itself, because the receiver asks for what it is missing and the
+/// answer is bounded by the term rather than by the window most of the time.
+pub const UNICAST_RRWM_DEFAULT: usize = 16;
+
+impl MaxStrategy {
+    /// The strategy the reference builds from a `fc=max` channel: the driver's
+    /// configured multiple unless the channel named one
+    /// (`aeron_unicast_flow_control_strategy_supplier`,
+    /// `aeron_flow_control.c:350-366`).
+    pub fn from_options(
+        configured_rrwm: usize,
+        options: Option<&str>,
+    ) -> Result<Self, FlowControlError> {
+        let parsed = max_options(options)?;
+
+        Ok(Self {
+            retransmit_receiver_window_multiple: parsed.rrwm.unwrap_or(configured_rrwm),
+        })
+    }
+}
+
+impl Strategy for MaxStrategy {
+    fn on_sm(
+        &mut self,
+        consumption_position: i64,
+        receiver_window: i32,
+        snd_lmt: SenderLimit,
+    ) -> SenderLimit {
+        // `:108-127`: the window edge, and the limit never goes backwards.
+        let window_edge = consumption_position.saturating_add(i64::from(receiver_window));
+
+        snd_lmt.max(window_edge)
+    }
+
+    fn on_idle(
+        &mut self,
+        _now_ns: i64,
+        snd_lmt: SenderLimit,
+        _snd_pos: i64,
+        _is_end_of_stream: bool,
+    ) -> SenderLimit {
+        // `:87-95`: there is nothing to learn from silence.
+        snd_lmt
+    }
+
+    fn max_retransmission_length(
+        &self,
+        term_offset: usize,
+        resend_length: usize,
+        term_buffer_length: usize,
+        initial_window_length: usize,
+    ) -> usize {
+        // `:134-146`: whichever is smaller — the rest of the term, or the
+        // receiver's window times the multiple — and never more than what the
+        // NAK asked for.
+        let length_to_end_of_term = term_buffer_length.saturating_sub(term_offset);
+        let receiver_window = receiver_window_length(initial_window_length, term_buffer_length);
+        let estimated = receiver_window.saturating_mul(self.retransmit_receiver_window_multiple);
+
+        resend_length.min(length_to_end_of_term.min(estimated))
+    }
+}
+
+/// The receiver window a given initial window length settles at
+/// (`aeron_receiver_window_length`,
+/// `aeron-client/src/main/c/util/aeron_netutil.c` — the driver's own helper,
+/// used by `aeron_flow_control_calculate_retransmission_length`, `:138-146`).
+///
+/// A window is at most half a term, because a receiver needs the other half to
+/// keep reading while the publisher writes.
+pub const fn receiver_window_length(
+    initial_window_length: usize,
+    term_buffer_length: usize,
+) -> usize {
+    let half_term = term_buffer_length / 2;
+
+    if initial_window_length > half_term {
+        half_term
+    } else {
+        initial_window_length
+    }
+}
+
+/// Parse the options that follow a strategy name
+/// (`aeron_flow_control_parse_max_options`, `:196-266`).
+///
+/// The shape is comma-separated fields, the first of which is the strategy name
+/// itself — `fc=max,rrwm:3` — and anything unrecognised is refused rather than
+/// skipped.
+///
+/// # Errors
+///
+/// [`FlowControlError::UnrecognisedOption`] for a field that is not one of the
+/// known ones, [`FlowControlError::InvalidOption`] for an `rrwm:` that is not a
+/// positive number.
+pub fn max_options(options: Option<&str>) -> Result<MaxOptions, FlowControlError> {
+    let Some(options) = options else {
+        return Ok(MaxOptions::default());
+    };
+
+    if options.is_empty() {
+        return Ok(MaxOptions::default());
+    }
+
+    let mut parsed = MaxOptions::default();
+
+    for field in options.split(',') {
+        if field == "max" {
+            continue;
+        }
+
+        if let Some(value) = field.strip_prefix("rrwm:") {
+            // `strtol` with an errno check: a positive number or nothing.
+            let number = value
+                .parse::<i64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| FlowControlError::InvalidOption(field.to_owned()))?;
+
+            #[allow(clippy::cast_sign_loss)] // checked positive
+            {
+                parsed.rrwm = Some(number as usize);
+            }
+
+            continue;
+        }
+
+        return Err(FlowControlError::UnrecognisedOption(field.to_owned()));
+    }
+
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sender_limit_is_the_far_edge_of_the_window_and_never_backs_up() {
+        let mut strategy = MaxStrategy::default();
+
+        assert_eq!(1_600, strategy.on_sm(1_000, 600, 0));
+        // A window that moved backwards does not move the limit with it.
+        assert_eq!(1_600, strategy.on_sm(900, 300, 1_600));
+        // And a window that moved forwards does.
+        assert_eq!(2_000, strategy.on_sm(1_500, 500, 1_600));
+    }
+
+    #[test]
+    fn an_idle_pass_leaves_the_limit_alone() {
+        let mut strategy = MaxStrategy::default();
+
+        assert_eq!(42, strategy.on_idle(1_000, 42, 10, false));
+    }
+
+    #[test]
+    fn a_retransmission_is_bounded_by_the_term_the_window_and_the_nak() {
+        // A term of 64 KiB, a window of 8 KiB, a multiple of two: a
+        // retransmission covers the window or the rest of the term, whichever
+        // is smaller.
+        let strategy = MaxStrategy {
+            retransmit_receiver_window_multiple: 2,
+        };
+
+        assert_eq!(
+            16 * 1024,
+            strategy.max_retransmission_length(0, 64 * 1024, 64 * 1024, 8 * 1024),
+            "two windows, which is less than the term"
+        );
+        assert_eq!(
+            4 * 1024,
+            strategy.max_retransmission_length(0, 4 * 1024, 64 * 1024, 8 * 1024),
+            "but never more than the NAK asked for"
+        );
+        assert_eq!(
+            1_024,
+            strategy.max_retransmission_length(63 * 1024, 64 * 1024, 64 * 1024, 8 * 1024),
+            "and never past the end of the term"
+        );
+    }
+
+    #[test]
+    fn a_window_is_at_most_half_a_term() {
+        assert_eq!(8 * 1024, receiver_window_length(8 * 1024, 64 * 1024));
+        assert_eq!(32 * 1024, receiver_window_length(64 * 1024, 64 * 1024));
+        assert_eq!(32 * 1024, receiver_window_length(1024 * 1024, 64 * 1024));
+    }
+
+    #[test]
+    fn the_options_are_the_ones_the_reference_parses() {
+        assert_eq!(Ok(MaxOptions::default()), max_options(Some("max")));
+        assert_eq!(
+            Ok(MaxOptions { rrwm: Some(3) }),
+            max_options(Some("max,rrwm:3"))
+        );
+        assert_eq!(
+            Ok(MaxOptions { rrwm: Some(3) }),
+            max_options(Some("rrwm:3"))
+        );
+        assert_eq!(Ok(MaxOptions::default()), max_options(None));
+
+        assert_eq!(
+            Err(FlowControlError::UnrecognisedOption("nonsense".to_owned())),
+            max_options(Some("max,nonsense"))
+        );
+        assert_eq!(
+            Err(FlowControlError::InvalidOption("rrwm:0".to_owned())),
+            max_options(Some("rrwm:0"))
+        );
+        assert_eq!(
+            Err(FlowControlError::InvalidOption("rrwm:x".to_owned())),
+            max_options(Some("rrwm:x"))
+        );
+    }
+
+    #[test]
+    fn the_configured_multiple_is_what_a_channel_that_names_none_gets() {
+        assert_eq!(16, UNICAST_RRWM_DEFAULT, "the context's own default");
+        assert_eq!(
+            UNICAST_RRWM_DEFAULT,
+            MaxStrategy::from_options(UNICAST_RRWM_DEFAULT, Some("max"))
+                .expect("a strategy")
+                .retransmit_receiver_window_multiple
+        );
+        assert_eq!(
+            7,
+            MaxStrategy::from_options(UNICAST_RRWM_DEFAULT, Some("max,rrwm:7"))
+                .expect("a strategy")
+                .retransmit_receiver_window_multiple
+        );
+    }
+}
