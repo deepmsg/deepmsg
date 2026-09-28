@@ -157,6 +157,11 @@ impl ReceiveChannelEndpoints {
             ReceiveEndpointError::Socket(error) => ReceiveEndpointErrorKind::Socket(error),
         })?;
 
+        // The same status the send side writes, for the same reason: a
+        // subscription's counter is how a client learns its socket is up
+        // (`aeron_driver_conductor.c:2160`).
+        endpoint.set_status(counters, regions, EndpointStatus::Active);
+
         let id = self.next_id;
         self.next_id += 1;
 

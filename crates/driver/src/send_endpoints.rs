@@ -325,6 +325,13 @@ impl SendChannelEndpoints {
             send_endpoint::SendEndpointError::Socket(error) => EndpointError::Socket(error),
         })?;
 
+        // The status the counter holds: `ACTIVE` once the socket is there,
+        // which is what a client reads to answer "is this channel's socket up
+        // yet" (`aeron_driver_conductor.c:2013`,
+        // `aeron_counter_set_release(endpoint->channel_status.value_addr,
+        // AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ACTIVE)`).
+        endpoint.set_status(counters, regions, EndpointStatus::Active);
+
         let id = self.next_id;
         self.next_id += 1;
 
@@ -781,20 +788,9 @@ mod tests {
         );
         assert_eq!(&key[4..4 + uri.len()], uri.as_bytes());
 
-        // The value starts at INITIALIZING and the caller raises it to ACTIVE.
-        assert_eq!(
-            Some(counter_position::channel_status::INITIALIZING),
-            counters.value(&regions, id)
-        );
-
-        let created = match outcome {
-            EndpointOutcome::Created { endpoint, .. } => endpoint,
-            EndpointOutcome::Shared { .. } => panic!("it was made just now"),
-        };
-
-        created
-            .set_status(&counters, &regions, EndpointStatus::Active)
-            .expect("in range");
+        // The endpoint is up the moment it is registered, which is what a
+        // client reads: the counter is `ACTIVE` and not `INITIALIZING`, because
+        // by the time anything can look it up the socket exists.
         assert_eq!(
             Some(counter_position::channel_status::ACTIVE),
             counters.value(&regions, id)

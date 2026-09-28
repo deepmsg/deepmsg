@@ -717,3 +717,96 @@ fn send_status(
         .send_batch(Some(to), &[&frame])
         .expect("a status message");
 }
+
+/// A3 and A8: the whole slice without the reference, and the two channel-status
+/// counters a client can read.
+///
+/// One driver, two clients: one publishes over UDP, one subscribes to the same
+/// channel, and the messages cross. A8 rides along in the same session — both
+/// sides' `snd-channel` and `rcv-channel` counters go `ACTIVE` when their
+/// sockets come up, which is what `channel_status_indicator_id` is for.
+#[test]
+fn two_of_our_clients_talk_over_udp_and_both_channels_report_active() {
+    let Some(mut own) = OwnDriver::start("udp-two-clients") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(3);
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+
+    // The subscriber first: it binds the port the publisher will send to.
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect the subscriber");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect the publisher");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // A8, first half: the subscription's `rcv-channel` counter is up.
+    let status_id = subscriber
+        .subscription(subscription_id)
+        .and_then(|subscription| subscription.channel_status_indicator_id())
+        .expect("a UDP subscription has a channel status counter");
+
+    assert_eq!(
+        Some(CHANNEL_STATUS_ACTIVE),
+        counter_value_of(&own_cnc, status_id),
+        "the receive endpoint's socket is up"
+    );
+
+    // A8, second half: so is the publication's.
+    let send_status_id = publisher
+        .publication(publication_id)
+        .expect("the publication")
+        .channel_status_indicator_id();
+
+    assert_eq!(
+        Some(CHANNEL_STATUS_ACTIVE),
+        counter_value_of(&own_cnc, send_status_id),
+        "the send endpoint's socket is up"
+    );
+
+    // A3: the message crosses.
+    let payload = b"from one of ours to the other";
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut received = Vec::new();
+
+    while Instant::now() < deadline && received.is_empty() {
+        publisher.poll();
+        subscriber.poll();
+
+        let _ = publisher.offer(publication_id, payload);
+
+        received = drain_messages(
+            &mut subscriber,
+            subscription_id,
+            Duration::from_millis(50),
+            1,
+        );
+    }
+
+    let _ = own.stop();
+
+    assert_eq!(
+        vec![payload.to_vec()],
+        received,
+        "the bytes crossed one driver and two sockets"
+    );
+}
+
+/// `AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ACTIVE`
+/// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:33`).
+const CHANNEL_STATUS_ACTIVE: i64 = 1;
+
+/// One counter's value out of a live CnC file.
+fn counter_value_of(cnc: &deepmsg_cnc::CncFile, counter_id: i32) -> Option<i64> {
+    cnc.counters()?.value(counter_id)
+}
