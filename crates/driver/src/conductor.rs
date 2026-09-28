@@ -4029,6 +4029,85 @@ mod tests {
         );
     }
 
+    /// A7: two concurrent publications on one channel and stream are one
+    /// publication — the same log buffer, the same counters, the same sender —
+    /// and an explicit parameter that disagrees is a refusal rather than a
+    /// second publication (`aeron_confirm_publication_match`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1105-1178`).
+    #[test]
+    fn two_udp_publications_on_one_stream_share_and_a_named_mtu_must_agree() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 41, 1001, &channel),
+        );
+        let first = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let first_registration_id =
+            i64::from_le_bytes(first[8..16].try_into().expect("eight bytes"));
+
+        // The same channel and stream again: the reply names the *first*
+        // publication, because that is the one the client will write through.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, &channel),
+        );
+        let second = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        assert_eq!(
+            first_registration_id.to_le_bytes(),
+            second[8..16],
+            "a shared publication is the one that already exists"
+        );
+        assert_eq!(
+            1,
+            conductor.network_publications().len(),
+            "one publication, one log buffer"
+        );
+
+        // A third that names an mtu the first did not: refused rather than
+        // shared, and with the generic code the reference's `EINVAL` composes
+        // to.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1001, &format!("{channel}|mtu=1024")),
+        );
+        let error = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+        assert_eq!(43i64.to_le_bytes(), error[0..8], "the failing command");
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR.to_le_bytes(),
+            error[8..12]
+        );
+        assert_eq!(1, conductor.network_publications().len());
+    }
+
     #[test]
     fn a_channel_this_driver_cannot_serve_is_refused_with_a_code_and_an_answer() {
         let temp = TempDir::new();

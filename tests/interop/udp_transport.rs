@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_driver::protocol::SetupFrame;
+use deepmsg_driver::protocol::{SetupFrame, StatusMessageFrame};
 use deepmsg_driver::sys::AddressFamily;
-use deepmsg_driver::sys::socket::DatagramSocket;
+use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 use deepmsg_tests::samples;
 
@@ -522,4 +522,198 @@ fn a_udp_session_stops_cleanly_when_the_driver_is_asked_to() {
         !dir.exists(),
         "and it took its directory with it, which is the last thing it does"
     );
+}
+
+/// A6: the far end's window is what stops the producer, and what starts it
+/// again.
+///
+/// The whole flow-control loop, with a plain socket playing the subscriber:
+/// one status message opens a *small* window, the producer fills it and is
+/// told to stop, and a second status message with more room is what lets it
+/// write again. Nothing else in the suite crosses that boundary — the IPC
+/// window tests are about *readers*, and this one is about a receiver's
+/// advertised window arriving over a socket.
+#[test]
+fn a_full_window_stops_the_producer_and_a_larger_one_starts_it_again() {
+    let Some(mut own) = OwnDriver::start("udp-flow-control") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let subscriber = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+    subscriber
+        .bind("127.0.0.1:0".parse().expect("an address"))
+        .expect("a bind");
+    subscriber.set_nonblocking().expect("non-blocking");
+    let bound = subscriber.local_address().expect("a bound address");
+
+    // A *small* publication window, so the test can fill the producer's
+    // allowance in a handful of messages. Without it the producer may run half
+    // a term ahead of what has been sent — which is the design, and 32 MiB of
+    // offering is not a test.
+    let channel = format!("aeron:udp?endpoint={bound}|pub-wnd=1408");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // The publisher's address, from its first SETUP.
+    let mut buffers = vec![vec![0u8; 2048]];
+    let mut datagrams = Datagrams::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut publisher_address = None;
+    let mut initial_term_id = 0;
+
+    while Instant::now() < deadline && publisher_address.is_none() {
+        publisher.poll();
+
+        let received = subscriber
+            .receive_batch(&mut buffers, &mut datagrams)
+            .unwrap_or(0);
+
+        for (slot, datagram) in datagrams.as_slice()[..received].iter().enumerate() {
+            if datagram.length == 0 {
+                continue;
+            }
+
+            publisher_address = Some(datagram.source.expect("a source"));
+
+            // The `SETUP` carries the term the stream started at, which is what
+            // a status message's consumption position is *relative to*: an SM
+            // that names term zero is naming a term that does not exist, and
+            // the window edge it computes is nonsense.
+            if let Some(setup) = SetupFrame::read(&buffers[slot][..datagram.length]) {
+                initial_term_id = setup.initial_term_id;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let publisher_address = publisher_address.expect("the publication says SETUP before it sends");
+    let session_id = session_of(&_own_cnc, publication_id);
+
+    // A window of one frame, and nothing read from it: the *sender* may put
+    // one frame on the wire, and the producer may fill its own window of
+    // `pub-wnd` bytes ahead of that.
+    let small_window = 32 + 100;
+    send_status(
+        &subscriber,
+        publisher_address,
+        session_id,
+        initial_term_id,
+        small_window,
+    );
+
+    let payload = [7u8; 100];
+
+    // Offer until the window stops it. The first offers are `NotConnected`
+    // until the status message has been read, so this waits for
+    // `BackPressured` rather than treating anything else as an answer.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut blocked = false;
+
+    while Instant::now() < deadline {
+        publisher.poll();
+
+        match publisher.offer(publication_id, &payload) {
+            Some(deepmsg_core::logbuffer::append::Appended::BackPressured) => {
+                blocked = true;
+                break;
+            }
+            Some(_) | None => {}
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    if !blocked {
+        let diagnostics = counters_of(&_own_cnc);
+        let _ = own.stop();
+
+        panic!(
+            "a producer may run one window ahead of what has been sent, and no further.\
+             \nthe counters:\n{diagnostics}"
+        );
+    }
+
+    // Now the receiver says it has room: the producer may write again.
+    send_status(
+        &subscriber,
+        publisher_address,
+        session_id,
+        initial_term_id,
+        1024 * 1024,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut unblocked = false;
+
+    while Instant::now() < deadline {
+        publisher.poll();
+
+        if matches!(
+            publisher.offer(publication_id, &payload),
+            Some(deepmsg_core::logbuffer::append::Appended::Ok { .. })
+        ) {
+            unblocked = true;
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = own.stop();
+
+    assert!(
+        unblocked,
+        "a larger window is what lets the producer write again"
+    );
+}
+
+/// The session id a publication runs under, read from its `pub-pos` counter's
+/// key — the only place a client can learn it before an image exists.
+fn session_of(cnc: &deepmsg_cnc::CncFile, _publication_id: i64) -> i32 {
+    let Some(counters) = cnc.counters() else {
+        return 0;
+    };
+
+    let mut session_id = 0;
+    counters.for_each(|descriptor| {
+        if descriptor.label.starts_with("pub-pos") && session_id == 0 {
+            let key = counters.key(descriptor.counter_id).unwrap_or([0u8; 112]);
+            session_id = i32::from_le_bytes(key[8..12].try_into().unwrap_or([0; 4]));
+        }
+    });
+
+    session_id
+}
+
+/// One status message, from the socket playing the subscriber.
+fn send_status(
+    subscriber: &DatagramSocket,
+    to: std::net::SocketAddr,
+    session_id: i32,
+    consumption_term_id: i32,
+    window: i32,
+) {
+    let sm = StatusMessageFrame {
+        session_id,
+        stream_id: STREAM_ID,
+        consumption_term_id,
+        consumption_term_offset: 0,
+        receiver_window: window,
+        receiver_id: 1,
+    };
+    let mut frame = [0u8; StatusMessageFrame::LENGTH];
+    assert!(sm.write_with_flags(&mut frame, 0).is_some());
+
+    subscriber
+        .send_batch(Some(to), &[&frame])
+        .expect("a status message");
 }

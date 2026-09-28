@@ -40,6 +40,7 @@ use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
 use crate::config::DriverConfig;
 use crate::flowcontrol::MaxStrategy;
+use crate::ipc_publication::ShareMismatch;
 use crate::ipc_publications::{AddError, Now, SessionIds};
 use crate::media::TransportParams;
 use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
@@ -254,8 +255,18 @@ impl NetworkPublications {
 
         // A publication that already exists on this endpoint and stream may be
         // shared (`:4287-4320`).
+        //
+        // The candidate is found by endpoint and stream **first**, and only
+        // then checked for agreement: a second publication on the same stream
+        // that names a different MTU is not a new publication, it is a
+        // *refusal* — the reference reaches `aeron_confirm_publication_match`
+        // with a candidate in hand and turns its disagreement into an error
+        // (`:4350-4360`), rather than starting a second log buffer on the same
+        // stream.
         if !is_exclusive {
-            if let Some(index) = self.find_shared(endpoint_id, request.stream_id, &params) {
+            if let Some(index) = self.find_shareable(endpoint_id, request.stream_id) {
+                publication_matches(&self.publications[index], &params).map_err(AddError::Share)?;
+
                 self.link(
                     index,
                     request,
@@ -545,19 +556,18 @@ impl NetworkPublications {
         events.publication_ready(&ready, pending.is_exclusive);
     }
 
-    /// The publication a second `ADD_PUBLICATION` may share
-    /// (`:4287-4320` and `confirm_publication_match`, `:1105-1178`).
-    fn find_shared(
-        &self,
-        endpoint_id: u64,
-        stream_id: i32,
-        params: &PublicationParams,
-    ) -> Option<usize> {
+    /// A publication a second `ADD_PUBLICATION` might share: same endpoint,
+    /// same stream, and not exclusive
+    /// (`find_shared_network_publication_by_endpoint`, `:1851-1875`).
+    ///
+    /// Whether the two actually *agree* is [`publication_matches`]'s question,
+    /// asked by the caller — the same split the reference has, and the reason a
+    /// mismatch is an error rather than a fall-through to a create.
+    fn find_shareable(&self, endpoint_id: u64, stream_id: i32) -> Option<usize> {
         self.publications.iter().position(|publication| {
             publication.endpoint_id == endpoint_id
                 && publication.stream_id == stream_id
                 && !publication.is_exclusive
-                && publication_matches(publication, params).is_ok()
         })
     }
 
@@ -758,26 +768,46 @@ const SENDER_NAKS_TYPE_ID: i32 = 19;
 
 /// Whether an existing publication may be shared with these parameters
 /// (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1105-1178`).
+///
+/// A parameter the URI did **not** name says nothing: a client that did not ask
+/// for an MTU is agreeing to whatever the publication that exists has, which is
+/// what the `_named` flags are for.
 fn publication_matches(
     publication: &NetworkPublicationRecord,
     params: &PublicationParams,
-) -> Result<(), ()> {
+) -> Result<(), ShareMismatch> {
+    use crate::ipc_publication::ShareMismatch;
+
     if let Some(session_id) = params.session_id {
         if session_id != publication.session_id {
-            return Err(());
+            return Err(ShareMismatch::SessionId {
+                existing: publication.session_id,
+                requested: session_id,
+            });
         }
     }
 
     if params.mtu_length_named && params.mtu_length != publication.params.mtu_length {
-        return Err(());
+        return Err(ShareMismatch::Mtu {
+            existing: publication.params.mtu_length,
+            requested: params.mtu_length,
+        });
     }
 
     if params.term_length_named && params.term_length != publication.params.term_length {
-        return Err(());
+        return Err(ShareMismatch::TermLength {
+            existing: publication.params.term_length,
+            requested: params.term_length,
+        });
     }
 
-    if params.starting_position.is_some() {
-        return Err(());
+    if let Some(position) = params.starting_position {
+        if position.initial_term_id != publication.params.initial_term_id {
+            return Err(ShareMismatch::InitialTermId {
+                existing: publication.params.initial_term_id,
+                requested: position.initial_term_id,
+            });
+        }
     }
 
     Ok(())
