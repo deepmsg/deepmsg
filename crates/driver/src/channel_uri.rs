@@ -48,8 +48,10 @@
 //!   because a channel whose parameter went missing is a channel that would
 //!   silently not have it.
 //! * `key=` at the end of the URI reaches the reference's callback with a
-//!   **null** value, which its number readers then pass to `strtoll`
-//!   (`:88-95`); here it is an error.
+//!   **null** value, which its readers treat as the parameter not being there
+//!   at all (`aeron_uri.c:357-361`): the channel is served, without the
+//!   parameter. Here it is an error, because a parameter whose value went
+//!   missing is not the same channel as one that never had the parameter.
 //! * A URI that is not valid UTF-8 is refused: the reference compares bytes,
 //!   and every parameter this driver acts on is an ASCII number, a boolean or
 //!   a comma-separated tag.

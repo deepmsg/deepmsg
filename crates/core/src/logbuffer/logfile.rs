@@ -99,8 +99,19 @@ impl LogFile {
     /// the reference's storage check compares this against the usable space
     /// first (`aeron_driver_context.c:1354-1375`, asking
     /// `aeron_logbuffer_compute_log_length` for the same number).
+    ///
+    /// The reference's own compute is a bare alignment
+    /// (`aeron_logbuffer_descriptor.h:107-110`) and trusts its caller for the
+    /// page size, because the driver validates it once at start-up — a range
+    /// and a power of two (`aeron_driver.c:468-485`). This is the single
+    /// validation point on this side, so the power-of-two test lives here: a
+    /// non-power-of-two page size would not merely be unusual, the mask below
+    /// would round to an arbitrary length.
     pub fn log_length(term_length: i32, page_size: usize) -> Option<usize> {
-        if position::bits_to_shift(term_length).is_none() || page_size < descriptor::PAGE_MIN_SIZE {
+        if position::bits_to_shift(term_length).is_none()
+            || page_size < descriptor::PAGE_MIN_SIZE
+            || !page_size.is_power_of_two()
+        {
             return None;
         }
 
@@ -287,6 +298,20 @@ mod tests {
         .expect("a log buffer");
 
         (dir, log)
+    }
+
+    #[test]
+    fn a_page_size_that_is_not_a_power_of_two_is_refused() {
+        // The mask the length is rounded with only means anything for a power
+        // of two, and the reference's driver validates the same thing at
+        // start-up (`aeron_driver.c:468-485`). Refused here means the file is
+        // never made.
+        let dir = TempDir::new();
+        let odd = dir.path().join("odd.logbuffer");
+
+        assert!(LogFile::log_length(TERM_LENGTH, PAGE_SIZE + 2).is_none());
+        assert!(LogFile::create(&odd, TERM_LENGTH, PAGE_SIZE + 2, false).is_err());
+        assert!(!odd.exists());
     }
 
     #[test]

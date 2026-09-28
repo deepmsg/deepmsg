@@ -852,10 +852,18 @@ impl Conductor {
                             }
                             None => {
                                 *publication_failures += 1;
+                                // The reference's text names both ids
+                                // (`aeron_driver_conductor.c:4734`), so a
+                                // client — or an operator reading its logs —
+                                // is told *whose* publication nobody had.
+                                let unknown = format!(
+                                    "unknown publication client_id={} registration_id={}",
+                                    request.correlated.client_id, request.registration_id,
+                                );
                                 transmit.error(
                                     request.correlated.correlation_id,
                                     ERROR_CODE_UNKNOWN_PUBLICATION,
-                                    b"unknown publication",
+                                    unknown.as_bytes(),
                                 );
                             }
                         }
@@ -886,10 +894,16 @@ impl Conductor {
                             transmit.operation_succeeded(request.correlated.correlation_id);
                         } else {
                             *subscription_failures += 1;
+                            // The same two ids as the publication's text
+                            // (`aeron_driver_conductor.c:5258`).
+                            let unknown = format!(
+                                "unknown subscription client_id={} registration_id={}",
+                                request.correlated.client_id, request.registration_id,
+                            );
                             transmit.error(
                                 request.correlated.correlation_id,
                                 ERROR_CODE_UNKNOWN_SUBSCRIPTION,
-                                b"unknown subscription",
+                                unknown.as_bytes(),
                             );
                         }
                     }
@@ -2542,6 +2556,45 @@ mod tests {
         );
         assert_eq!(0, conductor.publications().publications().len());
     }
+
+    #[test]
+    fn a_parameter_value_the_reference_cannot_parse_is_generic() {
+        // The URI's *structure* reads — the scheme, the transport, the shape
+        // of the parameter — so the reference gets as far as parsing the
+        // value, where its reader returns a bare `-1` and the conductor's
+        // error composition turns that into the generic code
+        // (`aeron_driver_conductor.c:2326-2341`). A driver that answered the
+        // invalid-channel code here would move the goalposts for a client
+        // that branches on the two codes differently.
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 9, 1001, "aeron:ipc?term-length=abc"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(9i64.to_le_bytes(), payload[0..8], "the failing command");
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR.to_le_bytes(),
+            payload[8..12],
+            "the code the reference's composition gives a value it cannot parse"
+        );
+        assert_eq!(1, conductor.publication_failures());
+    }
+
     #[test]
     fn a_subscription_gets_an_image_and_the_producer_gets_a_window() {
         let temp = TempDir::new();
@@ -3013,8 +3066,18 @@ mod tests {
             i32::from_le_bytes(errors[0].1[8..12].try_into().expect("four bytes"))
         );
         assert_eq!(
+            &b"unknown publication client_id=7 registration_id=99"[..],
+            &errors[0].1[16..],
+            "the reference's text names both ids (aeron_driver_conductor.c:4734)"
+        );
+        assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
             i32::from_le_bytes(errors[1].1[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            &b"unknown subscription client_id=7 registration_id=99"[..],
+            &errors[1].1[16..],
+            "and the subscription's text does the same (:5258)"
         );
         assert_eq!(1, conductor.publication_failures());
         assert_eq!(1, conductor.subscription_failures());

@@ -44,7 +44,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position;
 
-use crate::channel_uri::{ChannelUri, Transport};
+use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, ClientRecord, Clients, PublicationLink};
 use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
@@ -125,20 +125,30 @@ impl AddError {
     /// becomes its own negation, anything else becomes the generic code). The
     /// two codes that matter are therefore:
     ///
-    /// * [`ERROR_CODE_INVALID_CHANNEL`] for a channel the driver cannot read
-    ///   and for a session id clash — the two places the reference raises
-    ///   `-AERON_ERROR_CODE_INVALID_CHANNEL`.
-    /// * [`ERROR_CODE_GENERIC_ERROR`] for everything a parameter check
-    ///   refuses, because those raise a plain `EINVAL` upstream.
+    /// * [`ERROR_CODE_INVALID_CHANNEL`] for a channel whose URI the driver
+    ///   cannot read — the scheme, the transport, the length, the *shape* of a
+    ///   parameter — and for a session id clash: the places the reference
+    ///   raises `-AERON_ERROR_CODE_INVALID_CHANNEL` (`aeron_uri.c:269-273`,
+    ///   `:311-314`, `:48`, `:84`).
+    /// * [`ERROR_CODE_GENERIC_ERROR`] for a parameter *value* the reference's
+    ///   readers reject, because those return a bare `-1` or raise `EINVAL`,
+    ///   which the conductor's composition turns into the generic code
+    ///   (`aeron_driver_conductor.c:2326-2341`) — and for every other
+    ///   parameter check that refuses.
     ///
     /// The unsupported transport has no reference answer — the reference serves
     /// UDP channels — so it reports the code the protocol has for exactly this
     /// ([`ERROR_CODE_NOT_SUPPORTED`]).
     pub const fn error_code(&self) -> i32 {
         match self {
-            Self::Params(PublicationParamsError::Uri(_)) | Self::SessionClash { .. } => {
-                ERROR_CODE_INVALID_CHANNEL
-            }
+            Self::Params(PublicationParamsError::Uri(
+                UriError::InvalidScheme
+                | UriError::TooLong { .. }
+                | UriError::NotUtf8
+                | UriError::MissingKey { .. }
+                | UriError::MissingValue { .. },
+            ))
+            | Self::SessionClash { .. } => ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => ERROR_CODE_NOT_SUPPORTED,
             Self::Params(_) | Self::NoClientRecord | Self::Share(_) | Self::AgentStopped => {
                 ERROR_CODE_GENERIC_ERROR

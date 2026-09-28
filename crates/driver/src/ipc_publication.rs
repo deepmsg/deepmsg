@@ -762,12 +762,20 @@ impl IpcPublication {
         let consumer_position = self.consumer_position;
 
         if self.subscribers.has_working_positions() {
-            let (min, max) = (
-                self.subscribers.min_active_position(manager, regions),
-                self.subscribers.max_active_position(manager, regions),
-            );
+            let min_sub_pos = self.subscribers.min_active_position(manager, regions);
 
-            let (Some(min_sub_pos), Some(max_sub_pos)) = (min, max) else {
+            // The reference seeds the running maximum with the consumer
+            // position before it takes a single reading
+            // (`aeron_ipc_publication.c:292`): the position is monotonic, and
+            // a reader that comes back below it — a rejoining subscription
+            // still holding its join position — must not drag the limit
+            // arithmetic backwards with it.
+            let max_sub_pos = self
+                .subscribers
+                .max_active_position(manager, regions)
+                .map_or(consumer_position, |max| max.max(consumer_position));
+
+            let Some(min_sub_pos) = min_sub_pos else {
                 return false;
             };
 
@@ -1389,6 +1397,28 @@ mod tests {
             1,
             metadata_i32(&publication, descriptor::IS_CONNECTED_OFFSET),
             "and the log says somebody is connected"
+        );
+    }
+
+    #[test]
+    fn a_reader_below_the_consumer_position_cannot_drag_it_back() {
+        // The running maximum is seeded with the consumer position
+        // (`aeron_ipc_publication.c:292`), so a subscription that reports a
+        // position the publication has already passed — which is what a
+        // rejoining reader holds until it catches up — does not pull the
+        // consumer position, and everything derived from it, backwards.
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+        subscribe(&mut publication, &mut manager, &region_pair, 100, 64);
+        publication.consumer_position = 4096;
+
+        publication.update_pub_pos_and_lmt(&mut manager, &region_pair);
+
+        assert_eq!(
+            4096, publication.consumer_position,
+            "the consumer position is monotonic"
         );
     }
 

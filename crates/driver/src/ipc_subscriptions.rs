@@ -33,7 +33,7 @@ use deepmsg_cnc::command::{
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::channel_uri::{ChannelUri, Transport};
+use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
 use crate::config::DriverConfig;
 use crate::ipc_publications::{AddError, IpcPublications};
@@ -143,12 +143,18 @@ pub enum AddSubscriptionError {
 
 impl AddSubscriptionError {
     /// The `ON_ERROR` code this failure is reported under, by the same rule as
-    /// [`AddError::error_code`].
+    /// [`AddError::error_code`]: a URI the driver cannot *read* is an invalid
+    /// channel, a parameter *value* the reference's readers would reject is
+    /// generic.
     pub const fn error_code(&self) -> i32 {
         match self {
-            Self::Params(PublicationParamsError::Uri(_)) => {
-                deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL
-            }
+            Self::Params(PublicationParamsError::Uri(
+                UriError::InvalidScheme
+                | UriError::TooLong { .. }
+                | UriError::NotUtf8
+                | UriError::MissingKey { .. }
+                | UriError::MissingValue { .. },
+            )) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
             Self::Params(_) | Self::NoClientRecord | Self::Link => ERROR_CODE_GENERIC_ERROR,
         }

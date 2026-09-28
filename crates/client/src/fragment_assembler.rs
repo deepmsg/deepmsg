@@ -16,8 +16,15 @@
 //!
 //! The key is the **session id**, not the stream: two publications can carry
 //! one stream at the same time, and their fragments must never be assembled
-//! into one message (`:165-168`). A builder is kept per session and reused, so
-//! the second message on a session assembles into the same buffer as the first.
+//! into one message. That keying is the **Java** assembler's rule — one builder
+//! per session id, its `builderBySessionIdMap`
+//! (`aeron-client/src/main/java/io/aeron/FragmentAssembler.java:46`) — not the
+//! C file this module otherwise mirrors: the C assembler keeps a single
+//! builder, and one session's `BEGIN` resets another's run
+//! (`aeron-client/src/main/c/aeron_fragment_assembler.c:152-188`). The
+//! stronger rule is deliberate, and the difference is recorded in
+//! `docs/compat.md`. A builder is kept per session and reused, so the second
+//! message on a session assembles into the same buffer as the first.
 //!
 //! # Why the payload is copied
 //!

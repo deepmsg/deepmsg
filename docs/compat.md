@@ -113,6 +113,49 @@ setting is read and its default — ten of the reference's default term
 lengths (`aeron_driver_context.c:179-183`) — is honoured by configuration
 alone; the warning arrives with the error log that would record it.
 
+## The session id a new publication is given
+
+A session id no client names is speculated: the driver takes the first id from
+its cursor that no live publication on that stream holds. The reference scans a
+bit set one longer than its publication count — there is always a free bit, so
+the answer always exists (`aeron-driver/src/main/c/aeron_driver_conductor.c:3787-3789`,
+with the search itself at `:1089-1105`). deepmsg scans a fixed window of 1024
+(`SessionIds::MAX_SPECULATION`) instead of a per-driver-sized set, which finds
+the same id for every driver whose live publications on one stream number fewer
+than that, and answers the cursor's own id rather than failing when even that
+window is full. Covered by
+`crates/driver/src/ipc_publications.rs::a_speculated_session_is_the_first_one_the_stream_is_not_using`
+and `::a_speculation_always_answers_even_when_every_id_is_in_use`.
+
+## The channel URIs this driver refuses
+
+Three shapes the reference *serves*, this driver refuses, because in each one
+a parameter has silently gone missing rather than been absent: a trailing
+`?key` with no `=` and a URI that ends on `|` — both dropped by the reference's
+scanner, whose final flush only runs while it is inside a value
+(`aeron-client/src/main/c/uri/aeron_uri.c:96-102`) — and a trailing `key=`,
+whose null value the reference's readers treat as the parameter not being
+there at all (`:357-361`). Covered by
+`crates/driver/src/channel_uri.rs::the_destructive_shapes_are_refused_here`.
+
+The error *codes* follow the reference's split rather than the shapes: a URI
+the driver cannot read is `INVALID_CHANNEL`, which is what the reference
+raises for a bad scheme, a bad transport, an over-long URI and a malformed
+parameter (`aeron_uri.c:269-273`, `:311-314`, `:48`, `:84`); a parameter
+*value* its readers would reject is the generic code, because that is what
+the reference's bare `-1` and `EINVAL` returns compose to
+(`aeron-driver/src/main/c/aeron_driver_conductor.c:2326-2341`). Covered by
+`crates/driver/src/conductor.rs::a_parameter_value_the_reference_cannot_parse_is_generic`
+alongside `::a_channel_this_driver_cannot_serve_is_refused_with_a_code_and_an_answer`.
+
+The words that ride an `ON_ERROR` are diagnostic, not contract: the two
+"unknown publication/subscription" answers carry the reference's `client_id=`
+and `registration_id=` fields (`aeron_driver_conductor.c:4734`, `:5258`;
+asserted by `crates/driver/src/conductor.rs::an_unknown_removal_is_answered_with_the_references_code`),
+and the rest are single lines where the reference sends an accumulated chain
+of every `AERON_SET_ERR` and `AERON_APPEND_ERR` on the path (e.g. `:4757`) —
+less context, the same code and the same correlation.
+
 ## The client's view of the ring, and of a message
 
 Four places where this build answers a question the reference answers
@@ -138,6 +181,16 @@ differently, all on the client's side. Each names the test that covers it.
   (`aeron-client/src/main/c/aeron_fragment_assembler.c:170-181`). ADR-0003: a
   skipped input is a counted one. Covered by the assembler's own tests in
   `crates/client/src/fragment_assembler.rs`.
+- **A message is assembled by session.** The assembler keeps one builder per
+  session id, which is the Java client's rule
+  (`aeron-client/src/main/java/io/aeron/FragmentAssembler.java:46`) and not
+  the C file the rest of the module mirrors: the C assembler keeps a single
+  builder, so two publications interleaving fragmented messages on one stream
+  would reset each other's runs
+  (`aeron-client/src/main/c/aeron_fragment_assembler.c:152-188`). deepmsg
+  takes the stronger rule because a subscriber cannot tell the reference's
+  behaviour there from a stream that loses messages. Covered by
+  `crates/client/src/fragment_assembler.rs::two_sessions_are_assembled_apart`.
 - **A delivered message is copied.** `Message::payload` points into the
   assembler's buffer, so every message is copied once; the reference hands out
   a pointer into the term for a message that arrived in one frame

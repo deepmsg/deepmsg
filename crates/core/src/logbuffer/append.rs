@@ -68,10 +68,6 @@ pub enum Appended {
     /// its `AERON_PUBLICATION_ADMIN_ACTION` for exactly this state
     /// (`aeron_publication.c:491-494`).
     MidRotation,
-    /// Reserved for a port that refuses to fragment. Nothing returns it now: a
-    /// payload larger than one frame is split across several, as the reference
-    /// does (`aeron_publication.c:251-317`).
-    NeedsFragmentation,
     /// The payload is beyond `max_message_length`, which the reference refuses
     /// too (`aeron_publication.c:515-524`).
     MessageTooLarge,
@@ -1311,8 +1307,8 @@ mod tests {
 
         // Beyond `term_length / 8`, which for a 64 KiB term is 8 KiB — and
         // therefore also beyond what one frame holds. That both bounds are
-        // exceeded is the point: the message cap is checked first, so the
-        // answer is `MessageTooLarge` and not `NeedsFragmentation`
+        // exceeded is the point: the message cap is checked first, before any
+        // question of how the payload would be split
         // (`aeron_publication.c:515-524`, before the append).
         assert_eq!(8192, position::max_message_length(TERM_LENGTH));
         assert!(8192 > appender.max_payload_length());
