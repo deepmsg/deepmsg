@@ -3668,6 +3668,68 @@ mod tests {
     }
 
     #[test]
+    fn a_client_can_add_hold_and_remove_a_counter() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        // Add: the command, the driver's reply, and the handle the reply
+        // named — whose registration id is the correlation id the request
+        // used, the same binding the reference's `on_counter_ready` makes
+        // (`aeron_client_conductor.c:850-895`).
+        let counter = client
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of ours",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        assert_eq!(1, client.counters().len());
+        assert_eq!(
+            Some(&counter),
+            client.counter(counter.registration_id()),
+            "the client holds what it asked for"
+        );
+
+        // The file agrees — the same find an `AeronStat` does — and the label
+        // and key arrived whole.
+        let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
+            .expect("the file, from the test's side");
+        let counters = cnc.counters().expect("the counter regions");
+        assert_eq!(
+            Some(counter.counter_id()),
+            counters.find_by_type_and_registration(100, counter.registration_id())
+        );
+        let descriptor = counter.descriptor(&counters).expect("allocated");
+        assert_eq!("a counter of ours", descriptor.label);
+        assert_eq!(0, descriptor.value, "a counter starts at zero");
+
+        // The value is this client's to write, and the write is the whole of
+        // the counter's life as far as the driver is concerned.
+        {
+            let writable = cnc.counters_writable().expect("writable regions");
+            assert!(counter.set_value(&writable, 41));
+        }
+        assert_eq!(Some(41), counter.value(&counters));
+
+        // Remove: the acknowledgement unblocks the call, and the counter goes
+        // back to the pool.
+        client
+            .remove_counter(&counter, std::time::Duration::from_secs(5))
+            .expect("removed");
+
+        assert!(client.counters().is_empty());
+        assert!(
+            counters
+                .find_by_type_and_registration(100, counter.registration_id())
+                .is_none(),
+            "the slot is reclaimed"
+        );
+    }
+
+    #[test]
     fn a_client_whose_heartbeat_counter_is_reclaimed_gives_up() {
         let temp = TempDir::new();
         // A liveness window of ten milliseconds and a tier of one: the driver

@@ -36,13 +36,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deepmsg_cnc::command::{
-    ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddPublication, AddSubscription, Response,
+    ADD_COUNTER_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter,
+    AddPublication, AddSubscription, Correlated, REMOVE_COUNTER_TYPE_ID, RemoveCounter, Response,
     decode_response,
 };
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
+use crate::counter::Counter;
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::publication::Publication;
@@ -262,6 +264,11 @@ enum Ready {
         channel_status_indicator_id: i32,
         log_file: PathBuf,
     },
+    /// A counter exists, and its slot in the values region is the handle.
+    Counter { counter_id: i32 },
+    /// The command's work is done, and there is nothing to hand back — a
+    /// removal's acknowledgement.
+    OperationSucceeded,
 }
 
 /// A pending command, waiting for the response that completes it.
@@ -283,6 +290,9 @@ pub struct Client {
     pending: Vec<Pending>,
     subscriptions: Vec<Subscription>,
     publications: Vec<Publication>,
+    /// The counters this client asked for. The driver reclaims them with the
+    /// client when it goes, so this list is the client's whole counter life.
+    counters: Vec<Counter>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
@@ -352,6 +362,7 @@ impl Client {
             pending: Vec::new(),
             subscriptions: Vec::new(),
             publications: Vec::new(),
+            counters: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
@@ -439,6 +450,18 @@ impl Client {
         self.publications
             .iter()
             .find(|publication| publication.registration_id() == registration_id)
+    }
+
+    /// The counters this client holds.
+    pub fn counters(&self) -> &[Counter] {
+        &self.counters
+    }
+
+    /// A counter by registration id.
+    pub fn counter(&self, registration_id: i64) -> Option<&Counter> {
+        self.counters
+            .iter()
+            .find(|counter| counter.registration_id() == registration_id)
     }
 
     /// Run one duty cycle: refresh the heartbeat, then take at most one
@@ -588,6 +611,106 @@ impl Client {
         self.publications.push(publication);
 
         Ok(registration_id)
+    }
+
+    /// Add a counter and wait for the driver to allocate it.
+    ///
+    /// The type id is the contract a reader keys on — it says how to read the
+    /// key — and the key and label are free-form. The value starts at zero
+    /// and is this client's to write through the CnC file; nothing about it
+    /// ever reaches the driver (`aeron_async_add_counter`,
+    /// `aeron-client/src/main/c/aeronc.c:534-561`, and the waiting is this
+    /// crate's shape rather than the reference's poll triple).
+    ///
+    /// Returns the handle, which names the slot in the values region; the
+    /// client keeps it too, and reclaims it with this client when the driver
+    /// reaps the client.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it, or no reply arrived within `timeout`.
+    pub fn add_counter(
+        &mut self,
+        type_id: i32,
+        key: &[u8],
+        label: &str,
+        timeout: Duration,
+    ) -> Result<Counter, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = AddCounter {
+            correlated: Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            type_id,
+            key,
+            label: label.as_bytes(),
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(ADD_COUNTER_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let Ready::Counter { counter_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        // One command, one registration: the id the driver allocated under is
+        // the correlation id this request used, which is what `ON_COUNTER_READY`
+        // echoed (`aeron_client_conductor.c:850-895`).
+        let counter = Counter::new(correlation_id, correlation_id, counter_id);
+        self.counters.push(counter);
+
+        Ok(counter)
+    }
+
+    /// Remove a counter and wait for the driver to acknowledge.
+    ///
+    /// The acknowledgement is the whole reply — `ON_UNAVAILABLE_COUNTER`
+    /// follows it on the broadcast as an event for whoever was watching, and
+    /// is not part of this command's answer
+    /// (`aeron_driver_conductor.c:6221-6235`).
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it — a counter another client owns, or one already gone — or no reply
+    /// arrived within `timeout`.
+    pub fn remove_counter(
+        &mut self,
+        counter: &Counter,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = RemoveCounter {
+            correlated: Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            registration_id: counter.registration_id(),
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(REMOVE_COUNTER_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.counters
+            .retain(|held| held.registration_id() != counter.registration_id());
+
+        Ok(())
     }
 
     /// Offer a payload on a publication.
@@ -876,6 +999,7 @@ impl Client {
         self.terminated = Some(error);
         self.subscriptions.clear();
         self.publications.clear();
+        self.counters.clear();
         self.pending.clear();
     }
 
@@ -958,10 +1082,29 @@ impl Client {
                     }),
                 );
             }
-            // A fresh client's *first* response is its own heartbeat counter,
-            // with the client id in the correlation field — not a reply to
-            // anything. Also how a later `ADD_COUNTER` would arrive.
-            Response::CounterReady { .. } => {}
+            // The driver's reply to an `ADD_COUNTER` this client sent, matched
+            // by the echoed correlation id — the same match the reference's
+            // `on_counter_ready` makes against its awaiting resources
+            // (`aeron_client_conductor.c:850-895`). The messages that match
+            // nothing are broadcasts — another client's counter, or this
+            // client's own heartbeat, whose correlation is the client id —
+            // and are not a reply to any command, so they are neither
+            // completed nor counted as unknown.
+            Response::CounterReady {
+                correlation_id,
+                counter_id,
+            } => {
+                if self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.correlation_id == correlation_id)
+                {
+                    self.complete(correlation_id, Ok(Ready::Counter { counter_id }));
+                }
+            }
+            Response::OperationSucceeded { correlation_id } => {
+                self.complete(correlation_id, Ok(Ready::OperationSucceeded));
+            }
             // Someone else's client was reaped. Every client sees it.
             Response::ClientTimeout { .. } => {}
             // Not modelled, or too short to trust. Counted, never fatal —
@@ -1092,6 +1235,7 @@ impl std::fmt::Debug for Client {
             .field("pending", &self.pending.len())
             .field("subscriptions", &self.subscriptions.len())
             .field("publications", &self.publications.len())
+            .field("counters", &self.counters.len())
             .field("unknown_responses", &self.unknown_responses)
             .finish()
     }
