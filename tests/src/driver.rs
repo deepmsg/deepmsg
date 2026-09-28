@@ -189,6 +189,19 @@ pub fn locate_aeron_stat() -> Option<PathBuf> {
     locate_tool(AERONSTAT_ENV, DEFAULT_AERONSTAT)
 }
 
+/// Environment variable naming the reference `ErrorStat` to run.
+pub const ERRORSTAT_ENV: &str = "DEEPMSG_REF_ERRORSTAT";
+
+/// Where `ErrorStat` is expected to be when the variable is unset.
+///
+/// Beside the `AeronStat` and the `aeronmd`: one reference build.
+pub const DEFAULT_ERRORSTAT: &str = "../../aeron/cppbuild/Release/binaries/ErrorStat";
+
+/// Find the reference `ErrorStat`, or `None` when there is no reference build.
+pub fn locate_error_stat() -> Option<PathBuf> {
+    locate_tool(ERRORSTAT_ENV, DEFAULT_ERRORSTAT)
+}
+
 /// Announce that a tool-based test could not run, and why.
 pub fn announce_tool_skip(tool: &str) {
     eprintln!(

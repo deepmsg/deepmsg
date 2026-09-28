@@ -64,6 +64,47 @@ compares each label up to its first colon, and
 `crates/driver/tests/system_counters.rs` asserts the masked halves separately
 so that being *absent* cannot pass for being right.
 
+## The counter a client asks for
+
+The section above is the system catalogue the driver writes; this one is the
+surface a client gets when it asks for a counter of its own — the
+`ADD_COUNTER`/`REMOVE_COUNTER` round, whose messages (`ON_COUNTER_READY`,
+`ON_OPERATION_SUCCEEDED`, `ON_UNAVAILABLE_COUNTER`) this build serves as the
+reference does. Three divergences on the client's side of that surface, each
+naming the test that covers it.
+
+- **A blocking add.** The reference's C client registers a counter
+  asynchronously — `aeron_add_counter` returns before any reply, and the
+  counter surfaces through the available-counter callback the caller
+  registered (`aeron_client_conductor.c:850-895` pairs the reply to the
+  registration). deepmsg's `Client::add_counter` blocks until the reply
+  lands or a caller-supplied deadline passes, and `remove_counter` waits the
+  same way for its acknowledgement — the Java client's shape rather than the
+  C one. Covered by
+  `tests/interop/counters_and_error_log.rs::our_client_adds_and_removes_a_counter_on_the_reference_driver`,
+  which adds, reads, writes, lists through the reference's `AeronStat`, and
+  removes a counter on the reference's own driver.
+- **Events, not callbacks.** The reference fires registered handlers inside
+  its conductor's duty cycle — available handlers on every
+  `ON_COUNTER_READY`, unavailable ones on every `ON_UNAVAILABLE_COUNTER`
+  (`aeron_client_conductor.c:850-906`), whatever else the client was doing.
+  deepmsg queues `CounterEvent`s on the same response pass and hands them
+  over when the caller asks (`Client::counter_events`), so a handler can
+  never run re-entrant inside the client's own poll. Covered by
+  `crates/driver/src/conductor.rs::counter_announcements_arrive_as_events_for_the_watchers`
+  and `::another_clients_counters_arrive_as_events_too`, and by the interop
+  test above, whose events arrive from the reference's driver.
+- **No static counters.** `ADD_STATIC_COUNTER` (`0x0F`,
+  `aeron-client/src/main/c/command/aeron_control_protocol.h:41`) is in the
+  command table but has no handler: the reference's driver allocates the
+  counter (`aeron-driver/src/main/c/aeron_driver_conductor.c:3153-3166`) and
+  answers `ON_STATIC_COUNTER` (`0x0F0B`,
+  `aeron_control_protocol.h:56`), which its client pairs with the ready
+  handler (`aeron_client_conductor.c:1147`). deepmsg counts the command as
+  unhandled and stays silent, so a client asking for one waits until its
+  deadline. Covered by
+  `crates/driver/src/conductor.rs::a_static_counter_request_is_recognised_and_not_served`.
+
 ## Driver liveness and the directory
 
 Two drivers cannot share an aeron directory, and the question "is somebody else
@@ -120,6 +161,27 @@ reference's default term lengths (`aeron_driver_context.c:179-183`) — is
 pinned by configuration's own tests, and the warning's shape by the
 conductor's
 `a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands`.
+
+## The distinct error log
+
+An entry this driver records carries the reference's composition — the
+negated code with its description, then the recording site and the message —
+built by `deepmsg_cnc::error_log::compose_description` and laid out in
+`docs/protocol/error-log-layout.md`. It is verified against the reference as
+text, not structure: the same unknown command recorded by each driver, read
+out by the reference's own `ErrorStat`, with only the timestamps masked
+(`tests/interop/counters_and_error_log.rs::error_stat_reads_what_both_drivers_record_for_an_unknown_command`),
+and the reference's region read by this build's reader matching the tool's
+report verbatim
+(`::our_reader_reads_the_reference_error_log_and_matches_error_stat`).
+
+One recorded text diverges: a broadcast transmit failure. The reference's
+entry is appended by `AERON_APPEND_ERR` with the OS's own words for the
+errno that failed (`aeron_driver_conductor.c:2233-2241`), which no test can
+reproduce deterministically; deepmsg records the bare `"failed to transmit
+message"` under code zero — the same code, because appending never sets one
+(`aeron-client/src/main/c/util/aeron_error.c:499-501`). Covered by
+`crates/driver/src/conductor.rs::a_broadcast_failure_is_recorded_and_counted`.
 
 ## The session id a new publication is given
 

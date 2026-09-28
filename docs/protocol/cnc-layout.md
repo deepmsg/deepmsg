@@ -385,6 +385,10 @@ Scan from offset 0, acquire-read `length`, **stop at the first zero**, advance
 by `align_up(length, 8)`. An entry is appended once and thereafter only has its
 counter and timestamp bumped (`aeron_distinct_error_log.c:199-202`).
 
+The writer's half of the same region — what the text holds (a composition, not
+a bare message), how sightings de-duplicate, and the unrecordable boundary —
+is [`error-log-layout.md`](error-log-layout.md).
+
 ## Ordering
 
 The reference marks these fields `volatile` and wraps access in

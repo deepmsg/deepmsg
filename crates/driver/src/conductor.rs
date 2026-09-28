@@ -1918,6 +1918,33 @@ mod tests {
     }
 
     #[test]
+    fn a_static_counter_request_is_recognised_and_not_served() {
+        // ADD_STATIC_COUNTER is the one unimplemented command whose absence is
+        // a recorded divergence rather than an unbuilt transport feature: the
+        // reference's driver allocates the counter
+        // (`aeron_driver_conductor.c:3153-3166`, the handler at `:6255`) and
+        // answers `ON_STATIC_COUNTER`, which its client pairs with the ready
+        // handler (`aeron_client_conductor.c:1147`). deepmsg recognises the
+        // command — it is in the protocol's table — but serves nothing, so a
+        // client that asks for one waits for a reply that never comes
+        // (docs/compat.md, "The counter a client asks for").
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+
+        send(&conductor, 0x0F, &[0u8; 16]);
+        conductor.do_work();
+
+        assert_eq!(1, conductor.unhandled_commands());
+        assert_eq!(0, conductor.unknown_commands());
+        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
+
+        // Counted, not recorded: the protocol defines this command, so it is
+        // no error to receive one — merely a thing this driver cannot do.
+        let mut errors = Vec::new();
+        let log = conductor.cnc.error_log().expect("the error log");
+        assert_eq!(0, log.read(i64::MIN, &mut errors).entries);
+    }
+
+    #[test]
     fn a_type_id_the_protocol_does_not_define_is_counted_separately() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
