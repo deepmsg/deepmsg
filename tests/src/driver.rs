@@ -113,10 +113,7 @@ impl std::error::Error for DriverError {}
 /// green run that proved something — see `docs/reference.md`.
 pub fn locate() -> Option<PathBuf> {
     if let Some(overridden) = std::env::var_os(AERONMD_ENV) {
-        let path = PathBuf::from(overridden);
-        if path.is_file() {
-            return Some(path);
-        }
+        return Some(named(AERONMD_ENV, PathBuf::from(overridden)));
     }
 
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_AERONMD);
@@ -125,6 +122,23 @@ pub fn locate() -> Option<PathBuf> {
     }
 
     search_path().filter(|path| path.is_file())
+}
+
+/// A binary an environment variable named explicitly, which has to exist.
+///
+/// A `DEEPMSG_REF_*` that is set but names nothing is a mistake, not a machine
+/// without the reference: falling through to the sibling checkout would run
+/// these tests against a build nobody asked for, and a green run would then
+/// say nothing about either. The variable is therefore either unset — a
+/// search — or an answer.
+fn named(variable: &str, path: PathBuf) -> PathBuf {
+    assert!(
+        path.is_file(),
+        "{variable} is set to {}, which is not a file",
+        path.display()
+    );
+
+    path
 }
 
 /// Announce that a test could not run, and why.
@@ -167,10 +181,7 @@ pub const DEFAULT_AERONSTAT: &str = "../../aeron/cppbuild/Release/binaries/Aeron
 /// [`locate`] is.
 pub fn locate_tool(env: &str, default: &str) -> Option<PathBuf> {
     if let Some(overridden) = std::env::var_os(env) {
-        let path = PathBuf::from(overridden);
-        if path.is_file() {
-            return Some(path);
-        }
+        return Some(named(env, PathBuf::from(overridden)));
     }
 
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join(default);
