@@ -32,6 +32,7 @@ pub mod native_resource_agent;
 pub mod position;
 pub mod publication_params;
 pub mod receiver;
+pub mod send_endpoints;
 pub mod sender;
 pub mod subscribable;
 /// The kernel seam: the one `unsafe` in this crate, and the only place the

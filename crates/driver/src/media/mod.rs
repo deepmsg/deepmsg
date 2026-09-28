@@ -36,10 +36,12 @@ use std::io;
 use std::net::SocketAddr;
 
 pub mod loss_transport;
+pub mod send_endpoint;
 pub mod udp_transport;
 
 pub use crate::sys::socket::Datagrams;
 pub use loss_transport::LossTransport;
+pub use send_endpoint::SendChannelEndpoint;
 pub use udp_transport::UdpTransport;
 
 /// The knobs a transport is opened with

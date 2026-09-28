@@ -250,6 +250,103 @@ pub fn allocate_subscription_position(
     )
 }
 
+/// The names the channel-status counters carry
+/// (`aeron-client/src/main/c/aeron_counters.h:86-90`).
+pub const SEND_CHANNEL_STATUS_NAME: &str = "snd-channel";
+/// The receive endpoint's name.
+pub const RECEIVE_CHANNEL_STATUS_NAME: &str = "rcv-channel";
+
+/// The type ids the channel-status counters carry
+/// (`aeron-client/src/main/c/aeron_counters.h:86-90`).
+pub mod channel_type_id {
+    /// `AERON_COUNTER_SEND_CHANNEL_STATUS_TYPE_ID`, label `"snd-channel"`.
+    pub const SEND_CHANNEL_STATUS: i32 = 6;
+    /// `AERON_COUNTER_RECEIVE_CHANNEL_STATUS_TYPE_ID`, label `"rcv-channel"`.
+    pub const RECEIVE_CHANNEL_STATUS: i32 = 7;
+}
+
+/// What a channel-status counter holds
+/// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:30-34`).
+pub mod channel_status {
+    /// Just allocated, before the endpoint has its socket
+    /// (`AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_INITIALIZING`).
+    pub const INITIALIZING: i64 = 0;
+    /// Open and usable (`AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ACTIVE`).
+    pub const ACTIVE: i64 = 1;
+    /// Being torn down (`AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_CLOSING`).
+    pub const CLOSING: i64 = 2;
+    /// The endpoint failed (`AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ERRORED`).
+    pub const ERRORED: i64 = -1;
+}
+
+/// The key a channel-status counter carries
+/// (`aeron_channel_endpoint_status_key_layout_t`,
+/// `aeron-client/src/main/c/concurrent/aeron_counters_manager.h:44-49`):
+/// the channel's length and the channel.
+///
+/// The reference builds this with a `memcpy` into an uninitialized struct
+/// (`aeron_position.c:220-222`), so everything past the copied bytes is
+/// whatever was on its stack. Here it is zero — the same bytes for the same
+/// channel every time, which is the point of a key.
+pub struct ChannelStatusKey<'a> {
+    /// The channel, as the client sent it.
+    pub channel: &'a [u8],
+}
+
+impl ChannelStatusKey<'_> {
+    /// The key's width, and the one the counter manager is told about.
+    pub const LENGTH: usize = StreamPositionKey::LENGTH;
+
+    /// Where the channel field starts, after the length that describes it.
+    const CHANNEL_OFFSET: usize = 4;
+
+    /// How much of a channel the key can hold.
+    pub const CHANNEL_LENGTH_MAX: usize = Self::LENGTH - Self::CHANNEL_OFFSET;
+
+    /// The key as the bytes a reader would find.
+    pub fn encode(&self) -> [u8; ChannelStatusKey::LENGTH] {
+        let mut out = [0u8; Self::LENGTH];
+        let channel_length = self.channel.len().min(Self::CHANNEL_LENGTH_MAX);
+
+        #[allow(clippy::cast_possible_truncation)] // bounded by CHANNEL_LENGTH_MAX
+        out[..4].copy_from_slice(&(channel_length as i32).to_le_bytes());
+        out[Self::CHANNEL_OFFSET..Self::CHANNEL_OFFSET + channel_length]
+            .copy_from_slice(&self.channel[..channel_length]);
+
+        out
+    }
+}
+
+/// Allocate a channel-status counter for an endpoint
+/// (`aeron_channel_endpoint_status_allocate`, `aeron_position.c:204-229`).
+///
+/// Its **value** is the endpoint's state rather than a position, and its
+/// registration id is the endpoint's own — which is what a client reads to
+/// answer "is this channel's socket up yet".
+///
+/// # Errors
+///
+/// `None` when the counter manager has no room; nothing is left behind.
+pub fn allocate_channel_status_counter(
+    manager: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    name: &str,
+    type_id: i32,
+    registration_id: i64,
+    channel: &[u8],
+    now_ms: i64,
+) -> Option<i32> {
+    let mut label = format!("{name}: ").into_bytes();
+    label.extend_from_slice(channel);
+
+    let key = ChannelStatusKey { channel }.encode();
+    let counter_id = manager.allocate(regions, type_id, &key, &label, now_ms)?;
+
+    manager
+        .set_registration_id(regions, counter_id, registration_id)
+        .map(|()| counter_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
