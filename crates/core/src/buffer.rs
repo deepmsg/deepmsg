@@ -436,6 +436,15 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         Some(self.slot_i64(offset)?.fetch_add(value, Ordering::SeqCst))
     }
 
+    /// Add to a 4-byte field, returning the value it held **before**.
+    ///
+    /// Mirrors `AERON_GET_AND_ADD_INT32`, which is how the error log counts an
+    /// observation without caring what the count was
+    /// (`aeron-client/src/main/c/concurrent/aeron_distinct_error_log.c:200`).
+    pub fn fetch_add_i32(&self, offset: usize, value: i32) -> Option<i32> {
+        Some(self.slot_i32(offset)?.fetch_add(value, Ordering::SeqCst))
+    }
+
     /// Copy bytes into the window, or `None` if the range is out of bounds.
     ///
     /// The counterpart of [`AtomicBuffer::copy_out`] and the same reasoning in
