@@ -1028,6 +1028,7 @@ mod tests {
                 &dir.0.join("pub.logbuffer"),
                 TERM_LENGTH,
                 PAGE_SIZE as usize,
+                false,
             )
             .expect("a log buffer"),
         );
@@ -1276,6 +1277,7 @@ mod tests {
                 &dir.0.join("pub.logbuffer"),
                 TERM_LENGTH,
                 PAGE_SIZE as usize,
+                false,
             )
             .expect("a log buffer"),
         );

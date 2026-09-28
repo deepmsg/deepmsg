@@ -582,7 +582,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a temp directory");
         let path = dir.join("publication.logbuffer");
 
-        let log = deepmsg_core::logbuffer::logfile::LogFile::create(&path, 64 * 1024, 4096)
+        let log = deepmsg_core::logbuffer::logfile::LogFile::create(&path, 64 * 1024, 4096, false)
             .expect("a log buffer");
         let params = crate::publication_params::PublicationParams {
             term_length: 64 * 1024,

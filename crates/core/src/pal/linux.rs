@@ -153,7 +153,8 @@ impl MappedFile {
         Self::open_with(path, true)
     }
 
-    /// Create `path` at exactly `length` bytes and map it read-write, shared.
+    /// Create `path` at exactly `length` bytes and map it read-write, shared,
+    /// with the length **allocated**.
     ///
     /// Exclusive by construction: an existing file is an error rather than
     /// something to overwrite, which is what the reference asks the kernel for
@@ -178,6 +179,32 @@ impl MappedFile {
     /// abandoned is removed before returning, so no partial `cnc.dat` is left
     /// behind.
     pub fn create(path: &Path, length: usize) -> io::Result<Self> {
+        Self::create_inner(path, length, true)
+    }
+
+    /// The same, as a **sparse** file: the length is declared and nothing is
+    /// allocated — pages appear as the log is written into them and read as
+    /// zero until then.
+    ///
+    /// This is the reference's sparse log buffer: its `aeron_raw_log_map`
+    /// creates the file with the sparse flag and neither prefaults nor
+    /// touches when `use_sparse_files` is set
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1269-1292`), which is
+    /// the default a driver runs with (`term.buffer.sparse.file`). The bytes
+    /// are indistinguishable from a dense file's to a reader; the difference
+    /// is disk usage, and the pages of a sparse file's holes are the
+    /// filesystem's to hand out on first write.
+    ///
+    /// # Errors
+    ///
+    /// As [`MappedFile::create`], minus the allocation step.
+    pub fn create_sparse(path: &Path, length: usize) -> io::Result<Self> {
+        Self::create_inner(path, length, false)
+    }
+
+    /// Both constructors' shared body: open exclusively, make the length real
+    /// the way `allocated` says, map.
+    fn create_inner(path: &Path, length: usize, allocated: bool) -> io::Result<Self> {
         if 0 == length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -195,9 +222,13 @@ impl MappedFile {
         // then size. On Linux the first usually implies the second; the
         // reference separates them the same way (`aeron_fileutil.c:985` then
         // `:1015`), and a mapping taken over a short file would be a fault
-        // waiting for the first reader.
-        let prepared =
-            allocate(file.as_raw_fd(), length).and_then(|()| file.set_len(length as u64));
+        // waiting for the first reader. A sparse file skips the first half on
+        // purpose — its length is a declaration, not a reservation.
+        let prepared = if allocated {
+            allocate(file.as_raw_fd(), length).and_then(|()| file.set_len(length as u64))
+        } else {
+            file.set_len(length as u64)
+        };
         if let Err(error) = prepared {
             drop(file);
             let _ = std::fs::remove_file(path);

@@ -70,6 +70,7 @@ use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::native_resource_agent::StorageChecks;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -437,6 +438,7 @@ impl Conductor {
         let publications = IpcPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
+            StorageChecks::new(config.perform_storage_checks, config.aeron_dir.clone()),
         )
         .map_err(ConductorError::Agent)?;
 

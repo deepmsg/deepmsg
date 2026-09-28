@@ -1,9 +1,10 @@
 //! The thread that owns the file work the conductor must not block on.
 //!
-//! Creating a log buffer means allocating and touching its whole length — for
-//! an IPC publication at the default term length that is 192 MiB — and the
-//! conductor is the process's control plane: a conductor that spends tens of
-//! milliseconds inside `fallocate` is a conductor that has stopped draining
+//! Creating a log buffer means declaring its whole length — for an IPC
+//! publication at the default term length that is 192 MiB — and, when the
+//! channel asks for a dense one, allocating and touching every page of it.
+//! The conductor is the process's control plane: a conductor that spends tens
+//! of milliseconds inside `fallocate` is a conductor that has stopped draining
 //! commands, publishing positions and answering clients. The reference puts
 //! that work on a **native resource agent** thread and has the conductor poll
 //! for the result (`aeron-driver/src/main/c/aeron_driver_native_resource_agent.c:426-466`,
@@ -43,11 +44,56 @@ enum Request {
         path: PathBuf,
         term_length: i32,
         page_size: usize,
+        is_sparse: bool,
     },
     FreeLogBuffer {
         log: Box<LogFile>,
     },
     Stop,
+}
+
+/// The space check that stands in front of every log buffer this agent
+/// creates — the reference's `aeron_driver_context_run_storage_checks`
+/// (`aeron_driver_context.c:1354-1375`), which its own agent runs at the
+/// head of its map command (`aeron_driver_native_resource_agent.c:432`).
+///
+/// A filesystem that cannot hold the log about to be made answers before
+/// the file is touched, so the client hears `STORAGE_SPACE` from a check
+/// rather than `GENERIC` from a write that ran out of room halfway.
+pub struct StorageChecks {
+    /// Whether the check runs at all (`perform.storage.checks`). Off means
+    /// the reference's "always plenty" probe (`aeron_usable_fs_space_disabled`,
+    /// `aeron_fileutil.c:1203`).
+    enabled: bool,
+    /// The filesystem asked: the driver's run directory, which is where a
+    /// log buffer lands.
+    dir: PathBuf,
+}
+
+impl StorageChecks {
+    /// Checks as `enabled` says, asking about `dir`.
+    pub const fn new(enabled: bool, dir: PathBuf) -> Self {
+        Self { enabled, dir }
+    }
+
+    /// The error that refuses a log buffer of `term_length` + `page_size`,
+    /// or `None` when there is room — or when the check is off, or when the
+    /// pair is one no log buffer may have (which the create itself will
+    /// report, with the right error for it).
+    fn refuse(&self, term_length: i32, page_size: usize) -> Option<io::Error> {
+        if !self.enabled {
+            return None;
+        }
+
+        let length = LogFile::log_length(term_length, page_size)?;
+        let usable = crate::sys::usable_fs_space(&self.dir);
+
+        // `ENOSPC`, because that is the errno the reference's own composition
+        // turns into `STORAGE_SPACE` — its pre-check raises the negative
+        // protocol code and its kernel raises the errno, and both arrive at
+        // the client as the same code (`aeron_driver_conductor.c:2326-2341`).
+        (usable < length as u64).then(|| io::Error::from_raw_os_error(libc::ENOSPC))
+    }
 }
 
 /// What the agent finished.
@@ -84,18 +130,19 @@ pub struct NativeResourceAgent {
 }
 
 impl NativeResourceAgent {
-    /// Start the thread.
+    /// Start the thread, with the storage checks `checks` describes standing
+    /// in front of every log buffer it creates.
     ///
     /// # Errors
     ///
     /// [`io::Error`] if the thread cannot be spawned.
-    pub fn start() -> io::Result<Self> {
+    pub fn start(checks: StorageChecks) -> io::Result<Self> {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
 
         let thread = std::thread::Builder::new()
             .name("deepmsg-native-resource-agent".to_string())
-            .spawn(move || Self::run(&request_rx, &completion_tx))?;
+            .spawn(move || Self::run(&request_rx, &completion_tx, &checks))?;
 
         Ok(Self {
             requests: request_tx,
@@ -104,7 +151,9 @@ impl NativeResourceAgent {
         })
     }
 
-    /// Ask for a log buffer to be created and mapped.
+    /// Ask for a log buffer to be created and mapped, sparse or dense as
+    /// `is_sparse` says — the URI's `sparse=` resolved against the driver's
+    /// `term.buffer.sparse.file`.
     ///
     /// Returns as soon as the request is queued; the answer arrives from
     /// [`NativeResourceAgent::poll`].
@@ -117,12 +166,14 @@ impl NativeResourceAgent {
         path: &Path,
         term_length: i32,
         page_size: usize,
+        is_sparse: bool,
     ) -> io::Result<()> {
         self.requests
             .send(Request::MapLogBuffer {
                 path: path.to_owned(),
                 term_length,
                 page_size,
+                is_sparse,
             })
             .map_err(|_| io::Error::other("the native resource agent has stopped"))
     }
@@ -171,20 +222,27 @@ impl NativeResourceAgent {
     }
 
     /// The agent's own loop.
-    fn run(requests: &Receiver<Request>, completions: &Sender<Completion>) {
+    fn run(requests: &Receiver<Request>, completions: &Sender<Completion>, checks: &StorageChecks) {
         while let Ok(request) = requests.recv() {
             match request {
                 Request::MapLogBuffer {
                     path,
                     term_length,
                     page_size,
+                    is_sparse,
                 } => {
-                    let completion = match LogFile::create(&path, term_length, page_size) {
-                        Ok(log) => Completion::Mapped {
-                            path,
-                            log: Box::new(log),
+                    // The space question first, the file second: a refusal
+                    // here never touches the filesystem, which is the point
+                    // of asking before allocating (`aeron_driver_context.c:1354-1375`).
+                    let completion = match checks.refuse(term_length, page_size) {
+                        Some(error) => Completion::MapFailed { path, error },
+                        None => match LogFile::create(&path, term_length, page_size, is_sparse) {
+                            Ok(log) => Completion::Mapped {
+                                path,
+                                log: Box::new(log),
+                            },
+                            Err(error) => Completion::MapFailed { path, error },
                         },
-                        Err(error) => Completion::MapFailed { path, error },
                     };
 
                     if completions.send(completion).is_err() {
@@ -261,10 +319,11 @@ mod tests {
     fn a_mapped_log_buffer_comes_back_to_the_caller() {
         let dir = TempDir::new();
         let path = dir.0.join("mapped.logbuffer");
-        let agent = NativeResourceAgent::start().expect("the agent starts");
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+            .expect("the agent starts");
 
         agent
-            .map_log_buffer(&path, TERM_LENGTH, 4096)
+            .map_log_buffer(&path, TERM_LENGTH, 4096, false)
             .expect("queued");
 
         match await_completion(&agent, std::time::Duration::from_secs(5)) {
@@ -283,14 +342,85 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_log_buffer_leaves_its_pages_to_the_filesystem() {
+        // The reference's default shape: `term.buffer.sparse.file` true, so
+        // a log buffer declares its length and touches none of it, and the
+        // pages are the filesystem's to hand out on first write.
+        let dir = TempDir::new();
+        let path = dir.0.join("sparse.logbuffer");
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+            .expect("the agent starts");
+
+        agent
+            .map_log_buffer(&path, TERM_LENGTH, 4096, true)
+            .expect("queued");
+        match await_completion(&agent, std::time::Duration::from_secs(5)) {
+            Completion::Mapped { .. } => {}
+            other => panic!("expected a mapping, got {other:?}"),
+        }
+        agent.stop();
+
+        // A dense twin, for comparison: the same length, every block in use.
+        let dense = LogFile::create(&dir.0.join("dense.logbuffer"), TERM_LENGTH, 4096, false)
+            .expect("a dense log buffer");
+
+        use std::os::unix::fs::MetadataExt;
+        let sparse = std::fs::metadata(&path).expect("the sparse file");
+        let dense_meta = std::fs::metadata(dense.path()).expect("the dense file");
+
+        assert_eq!(
+            dense.length(),
+            usize::try_from(sparse.len()).expect("a length that fits"),
+            "the same length on the tin"
+        );
+        assert!(
+            sparse.blocks() < dense_meta.blocks(),
+            "sparse used {} blocks where dense used {}",
+            sparse.blocks(),
+            dense_meta.blocks()
+        );
+    }
+
+    #[test]
+    fn a_log_buffer_is_refused_when_the_filesystem_cannot_be_asked() {
+        // The reference's `aeron_usable_fs_space` answers zero when the
+        // filesystem cannot be asked (`aeron_fileutil.c:952-961`), and a
+        // check that cannot ask refuses — with the `ENOSPC` the error
+        // composition turns into `STORAGE_SPACE`
+        // (`aeron_driver_conductor.c:2326-2341`).
+        let dir = TempDir::new();
+        let agent =
+            NativeResourceAgent::start(StorageChecks::new(true, dir.0.join("no-such-directory")))
+                .expect("the agent starts");
+
+        agent
+            .map_log_buffer(&dir.0.join("refused.logbuffer"), TERM_LENGTH, 4096, false)
+            .expect("queued");
+
+        match await_completion(&agent, std::time::Duration::from_secs(5)) {
+            Completion::MapFailed { error, .. } => {
+                assert_eq!(Some(libc::ENOSPC), error.raw_os_error());
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            !dir.0.join("refused.logbuffer").exists(),
+            "the refusal never touched the filesystem"
+        );
+
+        agent.stop();
+    }
+
+    #[test]
     fn a_file_that_already_exists_comes_back_as_a_failure() {
         let dir = TempDir::new();
         let path = dir.0.join("taken.logbuffer");
         std::fs::write(&path, b"not a log buffer").expect("the file exists");
 
-        let agent = NativeResourceAgent::start().expect("the agent starts");
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+            .expect("the agent starts");
         agent
-            .map_log_buffer(&path, TERM_LENGTH, 4096)
+            .map_log_buffer(&path, TERM_LENGTH, 4096, false)
             .expect("queued");
 
         match await_completion(&agent, std::time::Duration::from_secs(5)) {
@@ -307,10 +437,11 @@ mod tests {
     fn freeing_removes_the_file_on_the_agent_thread() {
         let dir = TempDir::new();
         let path = dir.0.join("freed.logbuffer");
-        let agent = NativeResourceAgent::start().expect("the agent starts");
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+            .expect("the agent starts");
 
         agent
-            .map_log_buffer(&path, TERM_LENGTH, 4096)
+            .map_log_buffer(&path, TERM_LENGTH, 4096, false)
             .expect("queued");
         let Completion::Mapped { log, .. } =
             await_completion(&agent, std::time::Duration::from_secs(5))
@@ -335,10 +466,11 @@ mod tests {
         // nobody can name: the agent finishes what it was given.
         let dir = TempDir::new();
         let path = dir.0.join("late.logbuffer");
-        let agent = NativeResourceAgent::start().expect("the agent starts");
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, PathBuf::new()))
+            .expect("the agent starts");
 
         agent
-            .map_log_buffer(&path, TERM_LENGTH, 4096)
+            .map_log_buffer(&path, TERM_LENGTH, 4096, false)
             .expect("queued");
         agent.stop();
 

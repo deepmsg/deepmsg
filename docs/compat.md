@@ -95,6 +95,24 @@ writes the heartbeat first for a reason — a file that passes a client's versio
 gate and then fails its liveness rule is a file every client reads as a driver
 that is already gone (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
 
+## The space a log buffer needs
+
+Before a log buffer is created, the filesystem it will land on is asked
+whether it has room — the reference's check, on by default
+(`perform.storage.checks`, `aeron_driver_context.c:1354-1375`) — and a
+refusal reaches the client as `STORAGE_SPACE`, the code the reference
+composes for an `ENOSPC`, whether the check's or the kernel's
+(`aeron_driver_conductor.c:2326-2341`). The setting's names and defaults
+are pinned by `crates/driver/src/config.rs::the_storage_check_answers_to_the_references_names`,
+and the refusal by the native resource agent's own tests.
+
+The reference's check has a second half this build does not answer yet: at
+or below `low.file.store.warning.threshold` it records a warning in the
+driver's distinct error log, which this build has no counterpart of. The
+setting is read and its default — ten of the reference's default term
+lengths (`aeron_driver_context.c:179-183`) — is honoured by configuration
+alone; the warning arrives with the error log that would record it.
+
 ## The client's view of the ring, and of a message
 
 Four places where this build answers a question the reference answers
