@@ -71,6 +71,10 @@ struct PendingNetworkPublication {
     channel_status_counter_id: i32,
     /// The counters allocated for this publication.
     counters: PublicationCounters,
+    /// `so-sndbuf` the channel named, which the log buffer's metadata records.
+    channel_sndbuf: usize,
+    /// `so-rcvbuf`, likewise.
+    channel_rcvbuf: usize,
     /// The session it runs under — named, or speculated from the stream.
     session_id: i32,
     /// The log buffer's path, as the agent was given it.
@@ -331,6 +335,8 @@ impl NetworkPublications {
             endpoint_id,
             channel_status_counter_id,
             counters: publication_counters,
+            channel_sndbuf: endpoint_params.socket_sndbuf,
+            channel_rcvbuf: endpoint_params.socket_rcvbuf,
             session_id,
             path,
         });
@@ -473,6 +479,10 @@ impl NetworkPublications {
             config.network_publication_max_messages_per_send,
             flow_control,
             retransmit_handler,
+            config.layout.page_size,
+            config.socket_buffers,
+            pending.channel_sndbuf,
+            pending.channel_rcvbuf,
             now.ns,
         );
 

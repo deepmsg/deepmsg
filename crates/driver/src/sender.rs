@@ -772,6 +772,13 @@ mod tests {
                 4,
                 MaxStrategy::default(),
                 RetransmitHandler::new(1_000, 5_000_000, false, 1),
+                4096,
+                crate::sys::SocketBufferLengths {
+                    rcvbuf: 0,
+                    sndbuf: 0,
+                },
+                0,
+                0,
                 0,
             )
             .expect("a publication");

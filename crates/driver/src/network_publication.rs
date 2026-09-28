@@ -172,12 +172,16 @@ pub enum PublicationError {
     /// The term length is not a power of two in range, though the parameters
     /// were already checked in the reference's own order.
     BadTermLength,
+    /// The log buffer has no metadata block, so nothing could be written into
+    /// it — a mapping this build did not make.
+    NoMetadata,
 }
 
 impl std::fmt::Display for PublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadTermLength => f.write_str("term length is not a power of two in range"),
+            Self::NoMetadata => f.write_str("the log buffer has no metadata block"),
         }
     }
 }
@@ -209,6 +213,10 @@ impl NetworkPublication {
         max_messages_per_send: usize,
         flow_control: MaxStrategy,
         retransmit_handler: RetransmitHandler,
+        page_size: usize,
+        socket_buffers: crate::sys::SocketBufferLengths,
+        channel_sndbuf: usize,
+        channel_rcvbuf: usize,
         now_ns: i64,
     ) -> Result<Self, PublicationError> {
         let position_bits_to_shift =
@@ -218,6 +226,63 @@ impl NetworkPublication {
         // The three tails: the first term begins at offset zero, the two before
         // it hold the wraps a rotation looks for (`aeron_ipc_publication.c:75-103`).
         log.initialise_tails(params.initial_term_id, None);
+
+        // And then the metadata block, which is what a *client* reads when it
+        // maps the file `ON_PUBLICATION_READY` named
+        // (`aeron_logbuffer_metadata_init`, `aeron_network_publication.c:196-233`).
+        // A log buffer whose metadata was never written is one a client cannot
+        // map at all: its term length reads as zero.
+        {
+            let Some(metadata) = log.metadata() else {
+                return Err(PublicationError::NoMetadata);
+            };
+
+            let init = descriptor::LogMetadataInit {
+                end_of_stream_position: i64::MAX,
+                is_connected: 0,
+                active_transport_count: 0,
+                correlation_id: registration_id,
+                initial_term_id: params.initial_term_id,
+                mtu_length: params.mtu_length,
+                term_length: params.term_length,
+                page_size: i32_from(page_size),
+                publication_window_length: params.publication_window_length,
+                // A publication advertises no receive window: the counter that
+                // carries one belongs to an *image* (`:206` passes zero).
+                receiver_window_length: 0,
+                socket_sndbuf_length: i32_from(channel_sndbuf),
+                os_default_socket_sndbuf_length: socket_buffers.sndbuf,
+                os_max_socket_sndbuf_length: 0,
+                socket_rcvbuf_length: i32_from(channel_rcvbuf),
+                os_default_socket_rcvbuf_length: socket_buffers.rcvbuf,
+                os_max_socket_rcvbuf_length: 0,
+                max_resend: params.max_resend,
+                session_id,
+                stream_id,
+                entity_tag: params.entity_tag,
+                response_correlation_id: params.response_correlation_id,
+                linger_timeout_ns: params.linger_timeout_ns,
+                untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
+                untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
+                untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
+                // Group semantics, a response channel, a rejoin and a reliable
+                // stream are multicast or response-channel ideas: a unicast
+                // publication writes them false (`:226-229`).
+                group: 0u8,
+                is_response: false,
+                rejoin: false,
+                reliable: false,
+                sparse: params.is_sparse,
+                signal_eos: params.signal_eos,
+                spies_simulate_connection: params.spies_simulate_connection,
+                tether: false,
+                is_exclusive,
+            };
+
+            if descriptor::initialise(&metadata, &init).is_none() {
+                return Err(PublicationError::NoMetadata);
+            }
+        }
 
         Ok(Self {
             registration_id,
@@ -325,6 +390,16 @@ impl NetworkPublication {
         let position = Position::from_raw(snd_pos);
         let active_term_id = position.term_id(self.position_bits_to_shift, self.initial_term_id);
         let term_offset = position.term_offset(self.position_bits_to_shift);
+
+        // The producer's own two counters first: a publication that is sending
+        // nothing still has to publish how far its producer has written, and
+        // the limit that holds the producer back is computed in the same pass
+        // so the two never disagree for longer than one cycle. The reference
+        // does this from the *conductor*
+        // (`aeron_network_publication_update_pub_pos_and_lmt`, `:947-1010`);
+        // here it is the thread that owns the log buffer, which is the same
+        // duty done by the thread that can already read it.
+        self.update_pub_pos_and_lmt(counters, regions);
 
         if !self.has_initial_connection || self.is_setup_elicited {
             self.setup_message_check(
@@ -1010,6 +1085,11 @@ impl std::fmt::Debug for NetworkPublication {
     }
 }
 
+/// A length as the `i32` the log buffer's metadata stores.
+fn i32_from(length: usize) -> i32 {
+    i32::try_from(length).unwrap_or(i32::MAX)
+}
+
 /// The fault counters a retransmit handler bumps
 /// (`invalid_packets_counter`, `retransmit_overflow_counter`).
 struct PublicationFaults<'a> {
@@ -1180,6 +1260,13 @@ mod tests {
             4,
             MaxStrategy::default(),
             RetransmitHandler::new(0, 5_000_000, false, 1),
+            4096,
+            crate::sys::SocketBufferLengths {
+                rcvbuf: 0,
+                sndbuf: 0,
+            },
+            0,
+            0,
             0,
         )
         .expect("a publication");
@@ -1255,6 +1342,70 @@ mod tests {
             .enumerate()
             .map(|(index, datagram)| buffers[index][..datagram.length].to_vec())
             .collect()
+    }
+
+    #[test]
+    fn a_status_message_opens_the_producers_window() {
+        // The chain that matters most on the send side, and the one A1 stalled
+        // on: an SM arrives, the *sender* limit moves, and the producer's own
+        // limit follows it — because a network publication with no local reader
+        // is limited to what has been sent, plus a term's window.
+        let mut fixture = fixture();
+        let (counters, regions) = fixture.counters.open();
+        let system = System::new(&counters, &regions);
+
+        let frame = StatusMessageFrame {
+            session_id: 42,
+            stream_id: 1001,
+            consumption_term_id: 1_000,
+            consumption_term_offset: 0,
+            receiver_window: 8192,
+            receiver_id: 99,
+        };
+
+        fixture
+            .publication
+            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+
+        assert!(fixture.publication.has_subscribers(&counters, &regions));
+        assert_eq!(
+            Some(8192),
+            counters.value(&regions, fixture.publication.counters.snd_lmt)
+        );
+
+        fixture
+            .publication
+            .update_pub_pos_and_lmt(&counters, &regions);
+
+        let window = i64::from(fixture.publication.term_window_length);
+        assert!(window > 0, "a publication's window is half a term");
+        assert_eq!(
+            Some(window),
+            counters.value(&regions, fixture.publication.counters.pub_lmt),
+            "the producer may write a window ahead of what has been sent"
+        );
+    }
+
+    #[test]
+    fn the_log_buffer_is_left_describing_the_publication() {
+        // What a *client* reads when it maps the file the publication's
+        // `ON_PUBLICATION_READY` named: a log buffer whose metadata was never
+        // written reads a term length of zero, and a client cannot map it.
+        let fixture = fixture();
+        let metadata = fixture.publication.log.metadata().expect("metadata");
+
+        assert_eq!(
+            Some(fixture.publication.term_length),
+            metadata.load_i32_acquire(descriptor::TERM_LENGTH_OFFSET)
+        );
+        assert_eq!(
+            Some(fixture.publication.mtu_length),
+            metadata.load_i32_acquire(descriptor::MTU_LENGTH_OFFSET)
+        );
+        assert_eq!(
+            Some(4096),
+            metadata.load_i32_acquire(descriptor::PAGE_SIZE_OFFSET)
+        );
     }
 
     #[test]
