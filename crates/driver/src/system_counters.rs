@@ -68,6 +68,68 @@ pub mod id {
     pub const BYTES_CURRENTLY_MAPPED: i32 = 35;
     /// `AERON_SYSTEM_COUNTER_ID_CONTROL_PROTOCOL_VERSION`.
     pub const CONTROL_PROTOCOL_VERSION: i32 = 43;
+
+    // The data plane's own counters (`aeron_system_counters.h:25-45`, in id
+    // order). Their labels are in [`super::LABELS`]; these are the ids the
+    // sender, the receiver and the publications bump.
+    /// `AERON_SYSTEM_COUNTER_ID_BYTES_SENT`.
+    pub const BYTES_SENT: i32 = 0;
+    /// `AERON_SYSTEM_COUNTER_ID_BYTES_RECEIVED`.
+    pub const BYTES_RECEIVED: i32 = 1;
+    /// `AERON_SYSTEM_COUNTER_ID_SENDER_PROXY_FAILS`.
+    pub const SENDER_PROXY_FAILS: i32 = 3;
+    /// `AERON_SYSTEM_COUNTER_ID_RECEIVER_PROXY_FAILS`.
+    pub const RECEIVER_PROXY_FAILS: i32 = 2;
+    /// `AERON_SYSTEM_COUNTER_ID_NAK_MESSAGES_SENT`.
+    pub const NAK_MESSAGES_SENT: i32 = 5;
+    /// `AERON_SYSTEM_COUNTER_ID_NAK_MESSAGES_RECEIVED`.
+    pub const NAK_MESSAGES_RECEIVED: i32 = 6;
+    /// `AERON_SYSTEM_COUNTER_ID_STATUS_MESSAGES_SENT`.
+    pub const STATUS_MESSAGES_SENT: i32 = 7;
+    /// `AERON_SYSTEM_COUNTER_ID_STATUS_MESSAGES_RECEIVED`.
+    pub const STATUS_MESSAGES_RECEIVED: i32 = 8;
+    /// `AERON_SYSTEM_COUNTER_ID_HEARTBEATS_SENT`.
+    pub const HEARTBEATS_SENT: i32 = 9;
+    /// `AERON_SYSTEM_COUNTER_ID_HEARTBEATS_RECEIVED`.
+    pub const HEARTBEATS_RECEIVED: i32 = 10;
+    /// `AERON_SYSTEM_COUNTER_ID_RETRANSMITS_SENT`.
+    pub const RETRANSMITS_SENT: i32 = 11;
+    /// `AERON_SYSTEM_COUNTER_ID_FLOW_CONTROL_UNDER_RUNS`.
+    pub const FLOW_CONTROL_UNDER_RUNS: i32 = 12;
+    /// `AERON_SYSTEM_COUNTER_ID_FLOW_CONTROL_OVER_RUNS`.
+    pub const FLOW_CONTROL_OVER_RUNS: i32 = 13;
+    /// `AERON_SYSTEM_COUNTER_ID_INVALID_PACKETS`.
+    pub const INVALID_PACKETS: i32 = 14;
+    /// `AERON_SYSTEM_COUNTER_ID_SHORT_SENDS`.
+    pub const SHORT_SENDS: i32 = 16;
+    /// `AERON_SYSTEM_COUNTER_ID_SENDER_FLOW_CONTROL_LIMITS`.
+    pub const SENDER_FLOW_CONTROL_LIMITS: i32 = 18;
+    /// `AERON_SYSTEM_COUNTER_ID_UNBLOCKED_PUBLICATIONS`.
+    pub const UNBLOCKED_PUBLICATIONS: i32 = 19;
+    /// `AERON_SYSTEM_COUNTER_ID_LOSS_GAP_FILLS`.
+    pub const LOSS_GAP_FILLS: i32 = 23;
+    /// `AERON_SYSTEM_COUNTER_ID_SENDER_MAX_CYCLE_TIME`.
+    pub const SENDER_MAX_CYCLE_TIME: i32 = 28;
+    /// `AERON_SYSTEM_COUNTER_ID_SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED`.
+    pub const SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED: i32 = 29;
+    /// `AERON_SYSTEM_COUNTER_ID_RECEIVER_MAX_CYCLE_TIME`.
+    pub const RECEIVER_MAX_CYCLE_TIME: i32 = 30;
+    /// `AERON_SYSTEM_COUNTER_ID_RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED`.
+    pub const RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED: i32 = 31;
+    /// `AERON_SYSTEM_COUNTER_ID_RETRANSMITTED_BYTES`.
+    pub const RETRANSMITTED_BYTES: i32 = 36;
+    /// `AERON_SYSTEM_COUNTER_ID_RETRANSMIT_OVERFLOW`.
+    pub const RETRANSMIT_OVERFLOW: i32 = 37;
+    /// `AERON_SYSTEM_COUNTER_ID_ERROR_FRAMES_RECEIVED`.
+    pub const ERROR_FRAMES_RECEIVED: i32 = 38;
+    /// `AERON_SYSTEM_COUNTER_ID_ERROR_FRAMES_SENT`.
+    pub const ERROR_FRAMES_SENT: i32 = 39;
+    /// `AERON_SYSTEM_COUNTER_ID_PUBLICATION_IMAGES_REVOKED`.
+    pub const PUBLICATION_IMAGES_REVOKED: i32 = 41;
+    /// `AERON_SYSTEM_COUNTER_ID_IMAGES_REJECTED`.
+    pub const IMAGES_REJECTED: i32 = 42;
+    /// `AERON_SYSTEM_COUNTER_ID_STATUS_MESSAGES_REJECTED`.
+    pub const STATUS_MESSAGES_REJECTED: i32 = 44;
 }
 
 /// How many system counters the reference allocates
@@ -133,19 +195,42 @@ const LABELS: [&str; COUNT] = [
     "Failed offers to NativeResourceAgentProxy",
 ];
 
-/// The runtime suffixes this build appends, and to which counters.
+/// The name of this driver's threading mode, in the reference's vocabulary
+/// (`aeron_driver_threading_mode_to_string`,
+/// `aeron-driver/src/main/c/aeron_driver_context.c:53-61`).
 ///
-/// The reference's list is longer (`aeron_driver_conductor.c:848-951`) — see
-/// the module docs for why the sender, receiver and name-resolver counters are
-/// left alone here. `INVOKER` is this driver's threading mode in the
-/// reference's vocabulary (`aeron_driver.c:495-503`): one thread invokes every
-/// agent, which is what `deepmsg-driver` does today.
-const RUNTIME_SUFFIXES: [(i32, &str); 3] = [
+/// `DEDICATED` is the mode this driver runs in from P1-4 on: the conductor, the
+/// sender and the receiver are three threads
+/// (`aeron_driver_context.h:174`, whose default it is). The label says so
+/// because that is what the label is *for* — a reader of `AeronStat` uses it to
+/// know what it is looking at.
+pub const THREADING_MODE: &str = "DEDICATED";
+
+/// The runtime suffixes this build appends, and to which counters
+/// (`aeron_driver_conductor.c:848-951`).
+///
+/// Every counter the reference appends a threading mode to is here, because
+/// this driver now runs the agents those counters measure. The name-resolver
+/// pair (32 and 33) is the exception: resolution is synchronous in this build
+/// (P1-5 adds the agent), so there is no resolver to name a threshold for — a
+/// label describing a thread that does not exist would be worse than its
+/// absence, and `docs/compat.md` carries the divergence.
+const RUNTIME_SUFFIXES: [(i32, &str); 7] = [
     (25, ": driverName="),
-    (id::CONDUCTOR_MAX_CYCLE_TIME, ": INVOKER"),
+    (id::CONDUCTOR_MAX_CYCLE_TIME, ": DEDICATED"),
     (
         id::CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED,
-        ": threshold=100ms INVOKER",
+        ": threshold=100ms DEDICATED",
+    ),
+    (id::SENDER_MAX_CYCLE_TIME, ": DEDICATED"),
+    (
+        id::SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+        ": threshold=100ms DEDICATED",
+    ),
+    (id::RECEIVER_MAX_CYCLE_TIME, ": DEDICATED"),
+    (
+        id::RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+        ": threshold=100ms DEDICATED",
     ),
 ];
 
@@ -355,6 +440,44 @@ pub fn propose_max(
     }
 }
 
+/// The system counters a hot path bumps, with the manager and the regions
+/// paired so a call site is one line.
+///
+/// The counters are shared: every agent writes the same forty-six, and the
+/// value a reader sees is a plain atomic add. Nothing here takes `&mut`, which
+/// is what lets the conductor, the sender and the receiver hold one at once.
+#[derive(Clone, Copy)]
+pub struct System<'a> {
+    manager: &'a CounterManager,
+    regions: &'a CounterRegions<'a>,
+}
+
+impl<'a> System<'a> {
+    /// A view over the counters a driver allocated at startup.
+    pub const fn new(manager: &'a CounterManager, regions: &'a CounterRegions<'a>) -> Self {
+        Self { manager, regions }
+    }
+
+    /// Add one to a system counter, if the id is one.
+    pub fn increment(&self, counter_id: i32) {
+        let _ = increment(self.manager, self.regions, counter_id);
+    }
+
+    /// Add `value` to a system counter.
+    pub fn add(&self, counter_id: i32, value: i64) {
+        if let Some(current) = self.manager.value(self.regions, counter_id) {
+            let _ = self
+                .manager
+                .set_value(self.regions, counter_id, current + value);
+        }
+    }
+
+    /// A system counter's value, or zero for an id that is not one.
+    pub fn value(&self, counter_id: i32) -> i64 {
+        self.manager.value(self.regions, counter_id).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,24 +591,38 @@ mod tests {
         // The three this build appends to.
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
         assert_eq!(
-            "Conductor max cycle time doing its work in ns: INVOKER",
+            "Conductor max cycle time doing its work in ns: DEDICATED",
             label(&regions, 26)
         );
         assert_eq!(
-            "Conductor work cycle exceeded threshold count: threshold=100ms INVOKER",
+            "Conductor work cycle exceeded threshold count: threshold=100ms DEDICATED",
             label(&regions, 27)
         );
 
-        // And the ones it leaves alone, which the reference suffixes.
+        // The two agents P1-4 runs say which mode they run in, as the
+        // reference's do (`aeron_driver_conductor.c:867-888`).
         assert_eq!(
-            "Sender max cycle time doing its work in ns",
+            "Sender max cycle time doing its work in ns: DEDICATED",
             label(&regions, 28)
         );
         assert_eq!(
-            "Receiver max cycle time doing its work in ns",
+            "Receiver max cycle time doing its work in ns: DEDICATED",
             label(&regions, 30)
         );
+        assert_eq!(
+            "Sender work cycle exceeded threshold count: threshold=100ms DEDICATED",
+            label(&regions, 29)
+        );
+        assert_eq!(
+            "Receiver work cycle exceeded threshold count: threshold=100ms DEDICATED",
+            label(&regions, 31)
+        );
+
+        // The one pair this build leaves alone, because it has no resolver
+        // agent to name: resolution is synchronous here (P1-5 adds the agent),
+        // and a threshold label describes a thread that does not exist.
         assert_eq!("NameResolver exceeded threshold count", label(&regions, 33));
+        assert_eq!("NameResolver max time in ns", label(&regions, 32));
     }
 
     #[test]

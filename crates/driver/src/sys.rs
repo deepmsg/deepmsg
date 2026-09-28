@@ -26,6 +26,10 @@
 //!   land on is asked whether it has room — the reference's
 //!   `aeron_usable_fs_space`, a `statvfs` asking `f_frsize * f_bavail`
 //!   (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`).
+//! * **The interfaces this host has.** A channel's `interface=` parameter names
+//!   one, by address or by name, and the kernel is the only thing that knows
+//!   which addresses are local and what their indices are
+//!   (`aeron-client/src/main/c/util/aeron_netutil.c:634-787`).
 //!
 //! # Why this is `unsafe`, and why it is small
 //!
@@ -40,6 +44,10 @@ use std::io;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use deepmsg_core::clock;
+
+/// Datagram sockets and the batching syscalls the data plane moves messages
+/// through.
+pub mod socket;
 
 /// No signal has asked this process to stop.
 pub const NOT_STOPPED: i32 = -1;
@@ -223,6 +231,288 @@ pub fn random_i32() -> i32 {
     }
 }
 
+/// Which address family a channel is working in.
+///
+/// The reference carries `AF_INET`/`AF_INET6` through its lookups; the two
+/// cases are all this driver serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// `AF_INET`.
+    Inet,
+    /// `AF_INET6`.
+    Inet6,
+}
+
+impl AddressFamily {
+    /// The family an address is in.
+    pub fn of(address: std::net::IpAddr) -> Self {
+        match address {
+            std::net::IpAddr::V4(_) => Self::Inet,
+            std::net::IpAddr::V6(_) => Self::Inet6,
+        }
+    }
+}
+
+/// A local interface address and the kernel's index for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalInterface {
+    /// The address this interface holds in the family asked about.
+    pub address: std::net::IpAddr,
+    /// `if_nametoindex`, which multicast joins and `IP_MULTICAST_IF` take.
+    pub index: u32,
+}
+
+/// One entry of the kernel's interface list.
+struct InterfaceEntry {
+    name: String,
+    flags: u32,
+    address: Option<std::net::IpAddr>,
+    netmask: Option<std::net::IpAddr>,
+}
+
+/// The kernel's interface list, freed when it goes out of scope.
+struct Interfaces {
+    head: *mut libc::ifaddrs,
+}
+
+impl Interfaces {
+    fn open() -> io::Result<Self> {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+
+        // SAFETY: `getifaddrs` writes an owned list into the pointer it is
+        // given and returns zero on success; the list is released by
+        // `freeifaddrs` exactly once, in `Drop` below.
+        if 0 != unsafe { libc::getifaddrs(&mut head) } {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self { head })
+    }
+
+    /// Walk the list, newest entries first, as the kernel hands it over.
+    fn entries(&self) -> impl Iterator<Item = InterfaceEntry> + '_ {
+        let mut cursor = self.head;
+
+        std::iter::from_fn(move || {
+            if cursor.is_null() {
+                return None;
+            }
+
+            // SAFETY: `cursor` starts at the head of a list `getifaddrs`
+            // allocated and only ever advances along its `ifa_next` links,
+            // which are either valid entries or null — the terminator the
+            // loop above tests for.
+            let entry = unsafe { &*cursor };
+            cursor = entry.ifa_next;
+
+            Some(InterfaceEntry {
+                // SAFETY: `ifa_name` is a NUL-terminated string owned by the
+                // entry, which outlives this borrow.
+                name: unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned(),
+                flags: entry.ifa_flags,
+                address: sockaddr_to_ip(entry.ifa_addr),
+                netmask: sockaddr_to_ip(entry.ifa_netmask),
+            })
+        })
+    }
+}
+
+impl Drop for Interfaces {
+    fn drop(&mut self) {
+        // SAFETY: `head` is the list `getifaddrs` returned, released exactly
+        // once — this is the only `freeifaddrs` call on it.
+        unsafe { libc::freeifaddrs(self.head) };
+    }
+}
+
+/// Read the address out of a `sockaddr` the kernel wrote, for the two families
+/// this driver serves.
+fn sockaddr_to_ip(address: *const libc::sockaddr) -> Option<std::net::IpAddr> {
+    if address.is_null() {
+        return None;
+    }
+
+    // SAFETY: `sa_family` is the first field of every `sockaddr` variant, so
+    // reading it from the pointer the kernel wrote is valid whatever the
+    // family turns out to be; the two arms below then read the larger struct
+    // the family promises is there.
+    let family = unsafe { (*address).sa_family } as libc::c_int;
+    match family {
+        libc::AF_INET => {
+            // SAFETY: `AF_INET` means the kernel wrote a `sockaddr_in` at this
+            // address.
+            let ipv4 = unsafe { &*address.cast::<libc::sockaddr_in>() };
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                u32::from_be(ipv4.sin_addr.s_addr),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `AF_INET6` means the kernel wrote a `sockaddr_in6` at
+            // this address.
+            let ipv6 = unsafe { &*address.cast::<libc::sockaddr_in6>() };
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                ipv6.sin6_addr.s6_addr,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// The first address an interface named `name` holds in `family`, as
+/// `aeron_ip_lookup_by_name_and_family_func`
+/// (`aeron-client/src/main/c/util/aeron_netutil.c:533-568`) picks it: entries
+/// that are up, the name matching exactly, the first address in the family.
+///
+/// # Errors
+///
+/// The error from `getifaddrs`.
+pub fn interface_by_name(family: AddressFamily, name: &str) -> io::Result<Option<LocalInterface>> {
+    let interfaces = Interfaces::open()?;
+
+    for entry in interfaces.entries() {
+        if 0 == entry.flags & u32::try_from(libc::IFF_UP).unwrap_or(0) || entry.name != name {
+            continue;
+        }
+
+        let Some(address) = entry.address else {
+            continue;
+        };
+
+        if AddressFamily::of(address) == family {
+            return Ok(Some(LocalInterface {
+                address,
+                index: interface_index(name),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// The local interface whose address matches `address` under its netmask, as
+/// `aeron_ip_lookup_func`
+/// (`aeron-client/src/main/c/util/aeron_netutil.c:479-517`) chooses it: a
+/// loopback match wins, otherwise the multicast-capable interface with the
+/// longest prefix.
+///
+/// # Errors
+///
+/// The error from `getifaddrs`.
+pub fn interface_for_address(
+    family: AddressFamily,
+    address: std::net::IpAddr,
+    prefix_length: u8,
+) -> io::Result<Option<LocalInterface>> {
+    let interfaces = Interfaces::open()?;
+    let mut loopback = None;
+    let mut best: Option<(u8, LocalInterface)> = None;
+
+    for entry in interfaces.entries() {
+        if 0 == entry.flags & u32::try_from(libc::IFF_UP).unwrap_or(0) {
+            continue;
+        }
+
+        let Some(candidate) = entry.address else {
+            continue;
+        };
+
+        if AddressFamily::of(candidate) != family
+            || !address_matches(candidate, address, prefix_length)
+        {
+            continue;
+        }
+
+        let index = interface_index(&entry.name);
+
+        if entry.flags & u32::try_from(libc::IFF_LOOPBACK).unwrap_or(0) != 0 {
+            loopback.get_or_insert(LocalInterface {
+                address: candidate,
+                index,
+            });
+        } else if entry.flags & u32::try_from(libc::IFF_MULTICAST).unwrap_or(0) != 0 {
+            // The prefix length of this interface's own netmask decides which
+            // match wins — the longest is the most specific.
+            let interface_prefix = entry.netmask.map_or(0, netmask_prefix_length);
+
+            if best
+                .as_ref()
+                .is_none_or(|(prefix, _)| interface_prefix > *prefix)
+            {
+                best = Some((
+                    interface_prefix,
+                    LocalInterface {
+                        address: candidate,
+                        index,
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(loopback.or_else(|| best.map(|(_, interface)| interface)))
+}
+
+/// Whether `candidate` falls inside `address`'s net of `prefix_length` bits.
+///
+/// This is the reference's `aeron_ip_does_prefix_match`
+/// (`aeron-client/src/main/c/util/aeron_netutil.c:204-243`), which ANDs the two
+/// addresses and compares the leading bits.
+///
+/// The four-byte address is shifted up into the top of the 128-bit field the
+/// comparison happens in, so that a prefix counts from the same end of the
+/// address in both families — comparing a v4 address as a small integer would
+/// compare its *low* bits against a mask over the *high* ones, which matches
+/// everything.
+fn address_matches(
+    candidate: std::net::IpAddr,
+    address: std::net::IpAddr,
+    prefix_length: u8,
+) -> bool {
+    let (candidate, address) = match (candidate, address) {
+        (std::net::IpAddr::V4(candidate), std::net::IpAddr::V4(address)) => (
+            u128::from(u32::from(candidate)) << 96,
+            u128::from(u32::from(address)) << 96,
+        ),
+        (std::net::IpAddr::V6(candidate), std::net::IpAddr::V6(address)) => {
+            (u128::from(candidate), u128::from(address))
+        }
+        _ => return false,
+    };
+
+    let bits = u32::from(prefix_length).min(128);
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    };
+
+    candidate & mask == address & mask
+}
+
+/// How many leading bits a netmask has, as `aeron_ipv4_netmask_to_prefixlen`
+/// counts them (`aeron-client/src/main/c/util/aeron_netutil.c:355-358`, a
+/// population count).
+fn netmask_prefix_length(netmask: std::net::IpAddr) -> u8 {
+    match netmask {
+        std::net::IpAddr::V4(mask) => u8::try_from(u32::from(mask).count_ones()).unwrap_or(0),
+        std::net::IpAddr::V6(mask) => u8::try_from(u128::from(mask).count_ones()).unwrap_or(0),
+    }
+}
+
+/// `if_nametoindex(name)`, or zero when there is no such interface.
+#[allow(clippy::cast_possible_truncation)] // indices are small
+fn interface_index(name: &str) -> u32 {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return 0;
+    };
+
+    // SAFETY: `name` is a live NUL-terminated string for the call, which only
+    // reads it and searches the kernel's interface table.
+    unsafe { libc::if_nametoindex(name.as_ptr()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +547,50 @@ mod tests {
         assert!(
             first.rcvbuf >= 0 && first.sndbuf >= 0,
             "a negative size is not a buffer length"
+        );
+    }
+
+    #[test]
+    fn an_address_this_host_holds_finds_its_interface_and_one_it_does_not_finds_nothing() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Loopback is on every host this test can run on, and its index is
+        // never zero — that is what tells a real lookup from a fallback.
+        let loopback =
+            interface_for_address(AddressFamily::Inet, IpAddr::V4(Ipv4Addr::LOCALHOST), 32)
+                .expect("the kernel answers")
+                .expect("every host has a loopback");
+
+        assert_eq!(IpAddr::V4(Ipv4Addr::LOCALHOST), loopback.address);
+        assert_ne!(0, loopback.index, "a real interface index is never zero");
+
+        // A prefix match is a *prefix* match: a whole-address lookup of an
+        // address this host does not have finds nothing. Comparing the four
+        // bytes as a small integer would match everything here, because the
+        // mask covers the bits such a comparison never looks at.
+        assert_eq!(
+            None,
+            interface_for_address(
+                AddressFamily::Inet,
+                IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1)),
+                32
+            )
+            .expect("the kernel answers")
+        );
+    }
+
+    #[test]
+    fn a_named_interface_is_found_by_its_name() {
+        // `lo` is the one interface name POSIX promises.
+        let loopback = interface_by_name(AddressFamily::Inet, "lo")
+            .expect("the kernel answers")
+            .expect("every host has a loopback");
+
+        assert_ne!(0, loopback.index);
+        assert!(
+            interface_by_name(AddressFamily::Inet, "nosuchinterface")
+                .expect("the kernel answers")
+                .is_none()
         );
     }
 

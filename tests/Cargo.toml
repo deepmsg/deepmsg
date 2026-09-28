@@ -119,5 +119,20 @@ name = "counters_and_error_log"
 path = "interop/counters_and_error_log.rs"
 required-features = ["interop"]
 
+# P1-4's acceptance: our driver and our client publish over UDP, and the
+# reference's own subscriber — behind the reference's own driver — receives
+# them. Two drivers, one wire.
+[[test]]
+name = "udp_transport"
+path = "interop/udp_transport.rs"
+required-features = ["interop"]
+
+# A4: the reference's own `AeronStat` reading this driver's network counters,
+# on a live UDP session.
+[[test]]
+name = "udp_counters"
+path = "interop/udp_counters.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

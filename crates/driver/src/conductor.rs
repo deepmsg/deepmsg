@@ -67,14 +67,23 @@ use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
     ToDriverRingConsumer,
 };
+use std::sync::Arc;
+
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::clock::{self, CachedClock};
 
+use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::native_resource_agent::StorageChecks;
+use crate::network_publications::NetworkPublications;
+use crate::publication_images::PublicationImages;
+use crate::receive_endpoints::ReceiveChannelEndpoints;
+use crate::receiver::{Receiver, ReceiverEvent};
+use crate::send_endpoints::SendChannelEndpoints;
+use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 
 /// At most one command per duty cycle
@@ -189,6 +198,8 @@ impl Command {
 /// Why a conductor could not take over a CnC file.
 #[derive(Debug)]
 pub enum ConductorError {
+    /// The sender thread could not be started.
+    Sender(std::io::Error),
     /// The ready version could not be stored.
     Publish(CncCreateError),
     /// The to-driver region is not a ring this build can consume. Validation
@@ -221,6 +232,7 @@ impl std::fmt::Display for ConductorError {
                 write!(f, "the system counters were not published: {error}")
             }
             Self::Agent(error) => write!(f, "the native resource agent did not start: {error}"),
+            Self::Sender(error) => write!(f, "the sender thread did not start: {error}"),
         }
     }
 }
@@ -230,7 +242,7 @@ impl std::error::Error for ConductorError {
         match self {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
-            Self::Agent(error) => Some(error),
+            Self::Agent(error) | Self::Sender(error) => Some(error),
             Self::NoCommandRing | Self::NoEventRing | Self::NoCounterRegions => None,
         }
     }
@@ -387,7 +399,10 @@ pub struct Conductor {
     /// The settings every publication's parameters default to, kept because
     /// they are read on the command path and not only at start-up.
     config: DriverConfig,
-    cnc: CncFile,
+    /// The shared-memory file, behind an `Arc` because the data plane's agents
+    /// each derive their own counter views over the same pages (P1-4). Every
+    /// use below is a shared borrow, which is what makes that possible.
+    cnc: Arc<CncFile>,
     commands: ToDriverRingConsumer,
     transmitter: ToClientsTransmitter,
     counters: CounterManager,
@@ -403,6 +418,22 @@ pub struct Conductor {
     publications: IpcPublications,
     /// The subscriptions reading them.
     subscriptions: IpcSubscriptions,
+    /// The send endpoints a network publication shares, one per canonical
+    /// channel (`aeron_driver_conductor.c:1961-2030`).
+    send_endpoints: SendChannelEndpoints,
+    /// The publications that send over UDP, and the thread that maps their log
+    /// buffers.
+    network_publications: NetworkPublications,
+    /// The sender thread, whose proxy is how anything reaches it.
+    sender: Sender,
+    /// The receive endpoints a subscription listens on, one per canonical
+    /// channel (`aeron_driver_conductor.c:2046-2115`).
+    receive_endpoints: ReceiveChannelEndpoints,
+    /// The images built from datagrams, and the thread that maps their log
+    /// buffers.
+    images: PublicationImages,
+    /// The receiver thread.
+    receiver: Receiver,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -520,7 +551,74 @@ impl Conductor {
         )
         .map_err(ConductorError::Agent)?;
 
-        let mut conductor = Self {
+        // The network side: the sender thread first, because the publications
+        // manager hands it what it creates, then the manager itself (which is
+        // another agent thread — the one that maps *network* log buffers).
+        // The heartbeat and the ready version, *before* the file is shared:
+        // `publish` updates the in-memory metadata as well as the mapping, and
+        // after the `Arc` below there is no longer a mutable reference to it.
+        // The order is the contract (`aeron-driver/src/main/c/aeron_driver.c:971-972`)
+        // and it is enforced inside `publish`, which refuses a file whose
+        // heartbeat is still zero.
+        {
+            let region = cnc
+                .to_driver_region()
+                .ok_or(ConductorError::NoCommandRing)?;
+            let written = commands.write_consumer_heartbeat(&region, now_ms);
+            debug_assert!(written.is_some(), "the region was validated above");
+        }
+
+        let mut cnc = cnc;
+        cnc.publish().map_err(ConductorError::Publish)?;
+
+        // The file moves into the `Arc` here, which is what lets the agents
+        // below share it; everything above this line borrowed it directly.
+        let cnc = Arc::new(cnc);
+
+        let sender = Sender::start(
+            Arc::clone(&cnc),
+            // The counters region's length is what fixes a counter id's meaning
+            // on both sides of the handover.
+            cnc.layout().counters_values.len(),
+            free_to_reuse_ms(config.counter_free_to_reuse_ns),
+            usize::try_from(config.mtu_length).unwrap_or(1408),
+            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+        )
+        .map_err(ConductorError::Sender)?;
+
+        let network_publications = NetworkPublications::start(
+            config.publication_reserved_session_id_low,
+            config.publication_reserved_session_id_high,
+            StorageChecks::new(
+                config.perform_storage_checks,
+                config.low_file_store_warning_threshold,
+                config.aeron_dir.clone(),
+            ),
+        )
+        .map_err(ConductorError::Agent)?;
+
+        // The receive side: the receiver thread first (it owns the sockets and
+        // the images), then the images manager, which is the other agent thread
+        // — the one that maps an *image's* log buffer.
+        let receiver = Receiver::start(
+            Arc::clone(&cnc),
+            cnc.layout().counters_values.len(),
+            free_to_reuse_ms(config.counter_free_to_reuse_ns),
+            usize::try_from(config.mtu_length).unwrap_or(1408),
+            config.status_message_timeout_ns,
+            config.receiver_window_length,
+            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+        )
+        .map_err(ConductorError::Sender)?;
+
+        let images = PublicationImages::start(StorageChecks::new(
+            config.perform_storage_checks,
+            config.low_file_store_warning_threshold,
+            config.aeron_dir.clone(),
+        ))
+        .map_err(ConductorError::Agent)?;
+
+        let conductor = Self {
             config: config.clone(),
             cnc,
             commands,
@@ -531,6 +629,22 @@ impl Conductor {
             clients: Clients::new(),
             publications,
             subscriptions: IpcSubscriptions::new(),
+            send_endpoints: {
+                // The supplier (`aeron_driver_context.c:2979-2989`), set at
+                // start-up: every endpoint made from here on carries a loss
+                // generator of its own. Nothing is attached unless the driver
+                // was configured to inject loss.
+                let mut endpoints = SendChannelEndpoints::new();
+                if let Some(drop_every) = config.data_loss_drop_every {
+                    endpoints.attach_data_loss_generator(drop_every);
+                }
+                endpoints
+            },
+            network_publications,
+            sender,
+            receive_endpoints: ReceiveChannelEndpoints::new(),
+            images,
+            receiver,
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -557,9 +671,6 @@ impl Conductor {
             last_unhandled: None,
             pending_log_errors: Vec::new(),
         };
-
-        conductor.write_heartbeat();
-        conductor.cnc.publish().map_err(ConductorError::Publish)?;
 
         Ok(conductor)
     }
@@ -588,7 +699,8 @@ impl Conductor {
         let work = work_count
             + self.process_commands(now_ns)
             + self.poll_publications()
-            + self.update_publication_limits();
+            + self.update_publication_limits()
+            + self.poll_receiver(now_ns);
         // What the pass noticed and could not record while it held the file:
         // the errors behind the `ON_ERROR`s it sent, the command adapter's own
         // faults, the storage warnings, and the broadcasts the ring refused.
@@ -627,8 +739,10 @@ impl Conductor {
     /// sequence), and for the same reason: the create has to happen on the
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
-        if self.publications.pending() == 0 {
-            return 0;
+        let mut work = self.poll_sender_events();
+
+        if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
+            return work;
         }
 
         let Some(counter_regions) = self.cnc.counter_regions() else {
@@ -651,7 +765,7 @@ impl Conductor {
             faults: &mut self.pending_log_errors,
         };
 
-        self.publications.poll(
+        work += self.publications.poll(
             &self.config,
             &mut self.counters,
             &counter_regions,
@@ -659,12 +773,469 @@ impl Conductor {
             &mut self.subscriptions,
             now,
             &mut transmit,
-        )
+        );
+
+        // The network side's own pending list, whose create also hands the
+        // publication to the sender.
+        work += self.network_publications.poll(
+            &self.config,
+            &mut self.counters,
+            &counter_regions,
+            &mut self.clients,
+            self.sender.proxy(),
+            now,
+            &mut transmit,
+        );
+
+        work
+    }
+
+    /// What the receiver thread has to say, and what follows from it.
+    ///
+    /// Two of its events are *commands in disguise*: a `SETUP` that arrived for
+    /// a session nothing serves is a request to build an image — the reference
+    /// sends it the same way, over its conductor proxy — and an image that has
+    /// finished its life is a request to release it. The third is a fault, for
+    /// the error log this thread does not write itself.
+    ///
+    /// The create itself is like every other create here: it burns a
+    /// registration id, asks the agent for a log buffer off-thread, and the
+    /// image is built when the buffer lands (`poll_images`).
+    fn poll_receiver(&mut self, now_ns: i64) -> usize {
+        let events = self.receiver.proxy().poll();
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match event {
+                ReceiverEvent::CreateImage {
+                    endpoint_id,
+                    stream_id,
+                    session_id,
+                    initial_term_id,
+                    active_term_id,
+                    term_offset,
+                    term_length,
+                    mtu,
+                    control_address,
+                    source,
+                } => {
+                    let Some(ring) = self.cnc.to_driver_ring() else {
+                        continue;
+                    };
+                    let Some(registration_id) = ring.next_correlation_id() else {
+                        continue;
+                    };
+
+                    let Some(entry) = self.receive_endpoints.get(endpoint_id) else {
+                        continue;
+                    };
+                    let channel = entry.channel.original_uri.clone();
+
+                    let setup = crate::protocol::SetupFrame {
+                        term_offset,
+                        session_id,
+                        stream_id,
+                        initial_term_id,
+                        active_term_id,
+                        term_length,
+                        mtu,
+                        ttl: 0,
+                    };
+
+                    let now = Now {
+                        ms: self.now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: self.liveness_timeout_ns,
+                    };
+
+                    let Some(regions) = self.cnc.counter_regions() else {
+                        continue;
+                    };
+
+                    let result = self.images.begin_create(
+                        registration_id,
+                        endpoint_id,
+                        &channel,
+                        &setup,
+                        source,
+                        control_address,
+                        &self.config,
+                        &mut self.counters,
+                        &regions,
+                        now,
+                    );
+
+                    if let Err(error) = result {
+                        self.pending_log_errors
+                            .push((error.error_code(), error.to_string()));
+                    }
+                }
+                ReceiverEvent::ImageDone { registration_id } => {
+                    work += self.release_image(registration_id);
+                }
+                ReceiverEvent::Untethered {
+                    registration_id,
+                    events,
+                } => {
+                    work += self.on_untethered(registration_id, &events);
+                }
+                ReceiverEvent::Fault {
+                    error_code,
+                    description,
+                } => {
+                    self.pending_log_errors.push((error_code, description));
+                }
+            }
+        }
+
+        work + self.poll_images(now_ns)
+    }
+
+    /// The untethered state machine moved one or more readers of an image
+    /// (`aeron_publication_image_check_untethered_subscriptions`'s three
+    /// outcomes, `aeron-driver/src/main/c/aeron_publication_image.c:1199-1270`).
+    ///
+    /// Three client-visible events, and they are not symmetric. A reader put
+    /// aside is told its image is gone; a reader woken is told the image is
+    /// there again, at the join position — which is why the message it gets is
+    /// the same `ON_AVAILABLE_IMAGE` it got when it first linked. A reader that
+    /// was not rejoining is told *nothing*: its counter is freed and its
+    /// subscription keeps the images it has.
+    fn on_untethered(
+        &mut self,
+        registration_id: i64,
+        events: &[crate::publication_image::UntetheredEvent],
+    ) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match *event {
+                crate::publication_image::UntetheredEvent::Unavailable {
+                    subscription_registration_id,
+                    ..
+                } => {
+                    // The channel is the *subscription's*, which is what the
+                    // reference's image-transition path sends
+                    // (`aeron_driver_conductor.c:1657-1663`).
+                    let channel = self
+                        .subscriptions
+                        .links()
+                        .iter()
+                        .find(|link| link.registration_id == subscription_registration_id)
+                        .map(|link| link.channel.clone())
+                        .unwrap_or_else(|| image.channel.clone());
+
+                    transmit.unavailable_image(
+                        registration_id,
+                        subscription_registration_id,
+                        image.stream_id,
+                        &channel,
+                    );
+                }
+                crate::publication_image::UntetheredEvent::Available {
+                    subscription_registration_id,
+                    counter_id,
+                    ..
+                } => {
+                    transmit.available_image(&deepmsg_cnc::command::ImageBuffersReady {
+                        correlation_id: registration_id,
+                        session_id: image.session_id,
+                        stream_id: image.stream_id,
+                        subscriber_registration_id: subscription_registration_id,
+                        subscriber_position_id: counter_id,
+                        log_file: image.path.as_os_str().as_encoded_bytes(),
+                        source_identity: image.source_identity.as_bytes(),
+                    });
+                }
+                crate::publication_image::UntetheredEvent::Closed { counter_id } => {
+                    if let Some(region) = self.cnc.counter_regions() {
+                        let _ = self.counters.free(&region, counter_id, self.now_ms);
+                    }
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Let go of a network publication: stop sending it, give its counters
+    /// back, and count one less reader on its endpoint
+    /// (`aeron_network_publication_close`,
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-360`).
+    ///
+    /// The IPC path does the same for its own publications
+    /// ([`IpcPublications::release_links`]); this is the half that was missing,
+    /// and its absence was silent: a client could remove a UDP publication and
+    /// the sender would keep sending it.
+    fn release_network_publication(&mut self, registration_id: i64) -> bool {
+        let Some(record) = self.network_publications.remove(registration_id) else {
+            return false;
+        };
+
+        let _ = self.sender.proxy().remove_publication(registration_id);
+
+        if let Some(region) = self.cnc.counter_regions() {
+            for counter_id in [
+                record.counters.pub_pos,
+                record.counters.pub_lmt,
+                record.counters.snd_pos,
+                record.counters.snd_lmt,
+                record.counters.snd_bpe,
+                record.counters.snd_naks_received,
+            ] {
+                let _ = self.counters.free(&region, counter_id, self.now_ms);
+            }
+        }
+
+        self.send_endpoints.detach_publication(record.endpoint_id);
+
+        true
+    }
+
+    /// Whatever a client left behind: the network publications it was holding
+    /// when it stopped being a client this driver knows.
+    ///
+    /// Called after the client paths that *remove* a record — a close and a
+    /// timeout — rather than from inside them, because the release needs the
+    /// sender's proxy and the endpoint registry, and neither belongs in the
+    /// client pool.
+    fn release_orphaned_network_publications(&mut self) -> usize {
+        let orphans: Vec<i64> = self
+            .network_publications
+            .publications()
+            .iter()
+            .filter(|publication| !self.clients.knows(publication.client_id))
+            .map(|publication| publication.registration_id)
+            .collect();
+
+        let mut released = 0;
+
+        for registration_id in orphans {
+            released += usize::from(self.release_network_publication(registration_id));
+        }
+
+        released
+    }
+
+    /// An image has finished its life: unlink it, tell its readers, give its
+    /// counters and its log buffer back, and let the endpoint go if nothing
+    /// reads it any more (`aeron_driver_conductor_image_transition_to_linger`
+    /// and the delete that follows it, `aeron_driver_conductor.c:5680-5720`).
+    ///
+    /// This is the receiving side's answer to a publication's revoke: a
+    /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
+    /// message per **subscription** that was reading it, as the reference sends
+    /// them (`:5690-5700`) — and only then is the log buffer unmapped.
+    fn release_image(&mut self, registration_id: i64) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let _ = self.receiver.proxy().remove_image(registration_id);
+
+        // The readers, told — before anything is freed, because the message
+        // names the file they were reading.
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        for link in self.subscriptions.readers_of(registration_id) {
+            transmit.unavailable_image(
+                registration_id,
+                link.registration_id,
+                image.stream_id,
+                &image.channel,
+            );
+        }
+
+        // The transmit borrows the faults list and the ring; it goes out of
+        // scope here so the counter regions can be taken below.
+        let _ = &transmit;
+
+        self.subscriptions.forget_publication(registration_id);
+        self.receive_endpoints.detach_image(image.endpoint_id);
+
+        // The counters and the log buffer. The image is gone from the
+        // receiver, so nothing is reading either of them.
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, image.counters.rcv_hwm, self.now_ms);
+            let _ = self
+                .counters
+                .free(&region, image.counters.rcv_pos, self.now_ms);
+        }
+
+        // The image's log buffer goes back through the agent, because a delete
+        // unmaps and unlinks a file — the same rule every other log buffer
+        // follows (`crate::native_resource_agent`).
+        let _ = self.images.remove(registration_id);
+
+        1
+    }
+
+    /// Take the image agent's completions: this is where an image whose log
+    /// buffer was being created becomes one, where the subscriptions waiting
+    /// for that stream are given it, and where each of them is told.
+    fn poll_images(&mut self, now_ns: i64) -> usize {
+        if self.images.pending() == 0 {
+            return 0;
+        }
+
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let now = Now {
+            ms: self.now_ms,
+            ns: now_ns,
+            client_liveness_timeout_ns: self.liveness_timeout_ns,
+        };
+
+        let mut warnings = Vec::new();
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let created = self.images.poll(
+            &self.config,
+            &mut self.counters,
+            &counter_regions,
+            &mut self.receive_endpoints,
+            self.receiver.proxy(),
+            now,
+            &mut warnings,
+        );
+
+        for registration_id in &created {
+            // A link that fails is a subscription that will never read this
+            // image, and the client is waiting for exactly that message: it is
+            // recorded rather than dropped, because the alternative is a
+            // driver that looks healthy and delivers nothing.
+            let links = self.subscriptions.links().len();
+
+            if self
+                .subscriptions
+                .link_new_image(
+                    *registration_id,
+                    &mut self.images,
+                    &mut self.counters,
+                    &counter_regions,
+                    self.receiver.proxy(),
+                    now,
+                    &mut transmit,
+                )
+                .is_err()
+            {
+                transmit.record_fault(
+                    deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                    format!(
+                        "could not link a subscription to image {registration_id} ({links} links)"
+                    ),
+                );
+            }
+        }
+
+        for warning in warnings {
+            // The words are the reference's own shape for a low-space warning
+            // (`aeron_driver_context_run_storage_checks`), recorded where every
+            // other fault this pass noticed is.
+            transmit.record_fault(
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "usable fs space of {} bytes is below the {} byte threshold for {}",
+                    warning.usable,
+                    warning.threshold,
+                    warning.dir.display()
+                ),
+            );
+        }
+
+        created.len()
+    }
+
+    /// What the sender thread has to say: an endpoint it closed, a publication
+    /// it let go, and the faults it could not record itself (it has no error
+    /// log of its own — the distinct log is the conductor's).
+    ///
+    /// The reference's arrangement is the same one seen from the other side:
+    /// its sender calls `aeron_driver_sender_log_error` for exactly these, and
+    /// that records into the shared log on the sender's own thread. This build
+    /// keeps every writer of that log on one thread, which is why the fault
+    /// travels here first.
+    fn poll_sender_events(&mut self) -> usize {
+        let events = self.sender.proxy().poll();
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match event {
+                crate::sender::SenderEvent::Fault {
+                    error_code,
+                    description,
+                } => {
+                    self.pending_log_errors.push((error_code, description));
+                }
+                crate::sender::SenderEvent::EndpointRemoved { .. }
+                | crate::sender::SenderEvent::PublicationRemoved { .. } => {
+                    // The conductor's own bookkeeping for a removal arrives
+                    // with the removal path (P1-4's last slice): an endpoint
+                    // outlives its publications only until the reference
+                    // count reaches zero, and that is the conductor's count.
+                }
+            }
+        }
+
+        work
     }
 
     /// Whether the driver should keep running.
     pub const fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// The network publications this driver owns, for a caller that needs to
+    /// look — a test, or a tool that wants the sessions it chose.
+    pub fn network_publications(&self) -> &[crate::network_publications::NetworkPublicationRecord] {
+        self.network_publications.publications()
+    }
+
+    /// The images this driver is reading, for a caller that needs to look.
+    pub fn publication_images(&self) -> &[crate::publication_images::PublicationImageRecord] {
+        self.images.images()
     }
 
     /// The counters this driver publishes. Read-only: only the conductor
@@ -776,6 +1347,16 @@ impl Conductor {
         // publication counters behind.
         self.publications
             .close(&mut self.counters, &regions, self.now_ms);
+        // The network side: the thread first — it owns the sockets and the log
+        // buffers, and a log buffer unmapped while a sender is reading it is
+        // the one failure mode this ordering exists to prevent — then the
+        // publications' own bookkeeping.
+        let _ = self.sender.close();
+        let _ = self.network_publications.close();
+        // And the receive side, in the same order and for the same reason: the
+        // thread that owns the sockets and the log buffers goes first.
+        let _ = self.receiver.close();
+        self.images.close();
         // The subscriptions own no counters: a reader's `sub-pos` is in the
         // publication's set, and the line above has already given it back.
         self.subscriptions.close();
@@ -813,6 +1394,12 @@ impl Conductor {
         let termination = self.termination;
         let config = &self.config;
         let publications = &mut self.publications;
+        let network_publications = &mut self.network_publications;
+        let send_endpoints = &mut self.send_endpoints;
+        let sender = &self.sender;
+        let receive_endpoints = &mut self.receive_endpoints;
+        let images = &mut self.images;
+        let receiver = &self.receiver;
         let publication_failures = &mut self.publication_failures;
         let subscriptions = &mut self.subscriptions;
         let subscription_failures = &mut self.subscription_failures;
@@ -826,6 +1413,11 @@ impl Conductor {
         let unknown = &mut self.unknown;
         let last_unhandled = &mut self.last_unhandled;
         let faults = &mut self.pending_log_errors;
+        // A publication whose *client* link was released in this drain: the
+        // release itself needs the sender and the endpoint registry, which the
+        // drain's closure cannot reach, so the ids are collected here and the
+        // work happens below it.
+        let mut pending_publication_releases: Vec<i64> = Vec::new();
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -843,7 +1435,7 @@ impl Conductor {
             faults,
         };
 
-        commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        let drained = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -885,17 +1477,41 @@ impl Conductor {
                                 client_liveness_timeout_ns: liveness_timeout_ns,
                             };
 
-                            if let Err(error) = publications.add_publication(
-                                &request,
-                                is_exclusive,
-                                config,
-                                counters,
-                                &counter_regions,
-                                clients,
-                                subscriptions,
-                                now,
-                                &mut transmit,
-                            ) {
+                            // Which collection serves this depends on what
+                            // the URI names, and *only* on that: the reference
+                            // parses the channel and then follows one of two
+                            // paths (`aeron_driver_conductor.c:4113-4135`), and
+                            // a channel this build does not serve is refused by
+                            // the collection that would have had it.
+                            let result = match ChannelUri::parse(request.channel) {
+                                Ok(uri) if uri.transport() == Transport::Udp => {
+                                    network_publications.add_publication(
+                                        &request,
+                                        is_exclusive,
+                                        config,
+                                        counters,
+                                        &counter_regions,
+                                        clients,
+                                        send_endpoints,
+                                        sender.proxy(),
+                                        now,
+                                        &mut transmit,
+                                    )
+                                }
+                                _ => publications.add_publication(
+                                    &request,
+                                    is_exclusive,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    subscriptions,
+                                    now,
+                                    &mut transmit,
+                                ),
+                            };
+
+                            if let Err(error) = result {
                                 // The error code is the reference's, derived
                                 // from what failed rather than from where: a
                                 // channel it cannot parse is a different
@@ -944,6 +1560,7 @@ impl Conductor {
                                 }
 
                                 publications.release_links(&[link], counters, &counter_regions);
+                                pending_publication_releases.push(link.publication_registration_id);
                                 transmit.operation_succeeded(request.correlated.correlation_id);
                             }
                             None => {
@@ -1016,16 +1633,35 @@ impl Conductor {
                             client_liveness_timeout_ns: liveness_timeout_ns,
                         };
 
-                        if let Err(error) = subscriptions.add_subscription(
-                            &request,
-                            config,
-                            counters,
-                            &counter_regions,
-                            clients,
-                            publications,
-                            now,
-                            &mut transmit,
-                        ) {
+                        // As with publications: what the URI names decides
+                        // which half serves it, and nothing else.
+                        let subscription_result = match ChannelUri::parse(request.channel) {
+                            Ok(uri) if uri.transport() == Transport::Udp => subscriptions
+                                .add_network_subscription(
+                                    &request,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    receive_endpoints,
+                                    images,
+                                    receiver.proxy(),
+                                    now,
+                                    &mut transmit,
+                                ),
+                            _ => subscriptions.add_subscription(
+                                &request,
+                                config,
+                                counters,
+                                &counter_regions,
+                                clients,
+                                publications,
+                                now,
+                                &mut transmit,
+                            ),
+                        };
+
+                        if let Err(error) = subscription_result {
                             *subscription_failures += 1;
                             transmit.error(
                                 request.correlation_id,
@@ -1172,7 +1808,34 @@ impl Conductor {
                     *last_unhandled = Some(command);
                 }
             }
-        })
+        });
+
+        // A publication whose link was released: the network half stops
+        // sending it, gives its six counters back, and counts one less reader
+        // on its endpoint. The IPC half did its own release inside the drain.
+        let mut released = 0usize;
+
+        for registration_id in pending_publication_releases {
+            if let Some(record) = network_publications.remove(registration_id) {
+                let _ = sender.proxy().remove_publication(registration_id);
+
+                for counter_id in [
+                    record.counters.pub_pos,
+                    record.counters.pub_lmt,
+                    record.counters.snd_pos,
+                    record.counters.snd_lmt,
+                    record.counters.snd_bpe,
+                    record.counters.snd_naks_received,
+                ] {
+                    let _ = counters.free(&counter_regions, counter_id, now_ms);
+                }
+
+                send_endpoints.detach_publication(record.endpoint_id);
+                released += 1;
+            }
+        }
+
+        drained + released
     }
 
     /// Break a stall in the command ring, and count it when it breaks one.
@@ -1301,14 +1964,16 @@ impl Conductor {
             failures: &mut self.pending_broadcast_failures,
             faults: &mut self.pending_log_errors,
         };
-        self.clients.reap_expired(
+        let reaped = self.clients.reap_expired(
             self.now_ms,
             &mut self.counters,
             &counter_regions,
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
-        )
+        );
+
+        self.release_orphaned_network_publications() + reaped
     }
 
     /// Account for this pass's broadcast failures.
@@ -2934,6 +3599,525 @@ mod tests {
         assert_eq!(2, conductor.publications().publications().len());
     }
 
+    /// The receive path, driven by hand: a subscription binds a socket, a
+    /// `SETUP` arrives on it, an image is built from the setup, and the client
+    /// is told where the log buffer is.
+    ///
+    /// Every step here is one the reference's own publisher would take over the
+    /// wire; a plain socket takes them instead so that a failure can name the
+    /// step it failed at.
+    #[test]
+    fn a_udp_subscription_binds_a_socket_and_an_image_forms_on_a_setup() {
+        use crate::protocol::{DataFrame, FrameHeader, SetupFrame};
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::{DatagramSocket, Datagrams};
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A port nobody holds: the test's own socket will send to it, and the
+        // driver's receive endpoint will bind it.
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &channel),
+        );
+
+        // The reply carries the *endpoint's* channel status counter: a client
+        // that reads it learns whether the socket is up.
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
+
+        let status_counter_id = i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"));
+        assert!(status_counter_id >= 0, "the endpoint has a channel status");
+
+        // The `SETUP` a publisher sends when it finds a subscriber waiting.
+        let session_id = 99;
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        publisher.set_nonblocking().expect("non-blocking");
+
+        // The driver has to be given the pass to process the command before the
+        // socket exists.
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        // The image is built off the conductor's thread (a log buffer to map),
+        // so this waits for it rather than asserting after one pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut images = 0;
+
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            if conductor.publication_images().len() > images {
+                images = conductor.publication_images().len();
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            1, images,
+            "a setup with a subscriber waiting builds an image"
+        );
+
+        let image = conductor.publication_images()[0].clone();
+        assert_eq!(session_id, image.session_id);
+        assert_eq!(1001, image.stream_id);
+        assert_eq!(
+            1, image.refcount,
+            "the subscription that was waiting is linked to it"
+        );
+
+        // The reader is told where the image's log buffer is.
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        assert_eq!(image.registration_id.to_le_bytes(), payload[0..8]);
+        assert!(
+            payload.windows(9).any(|window| window == b"logbuffer"),
+            "the message names the file"
+        );
+
+        // And a DATA frame now reaches the image: the high-water mark is what
+        // says so.
+        let data = DataFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            term_id: 1_000,
+            reserved_value: 0,
+        };
+        let payload_bytes = b"the reference's bytes";
+        let mut data_frame = vec![0u8; 32 + payload_bytes.len()];
+
+        assert!(
+            data.write_with_flags(&mut data_frame, crate::protocol::header_flags::UNFRAGMENTED)
+                .is_some()
+        );
+        data_frame[32..].copy_from_slice(payload_bytes);
+
+        let _ = publisher.send_batch(
+            Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+            &[&data_frame],
+        );
+
+        let mut received_status = false;
+        let mut buffers = vec![vec![0u8; 2048]];
+        let mut datagrams = Datagrams::new();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            let received = publisher
+                .receive_batch(&mut buffers, &mut datagrams)
+                .unwrap_or(0);
+
+            for (slot, datagram) in datagrams.as_slice()[..received].iter().enumerate() {
+                let packet = &buffers[slot][..datagram.length];
+
+                if let Some(header) = FrameHeader::read(packet) {
+                    if header.frame_type == crate::protocol::frame_type::SM {
+                        received_status = true;
+                    }
+                }
+            }
+
+            if received_status {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            received_status,
+            "the subscriber answers with a status message: without one the \
+             publisher stops after one window"
+        );
+    }
+
+    /// An image that has finished its life is released, and every subscription
+    /// reading it is told (`ON_UNAVAILABLE_IMAGE`) — the receiving side of the
+    /// cleanup A9 asks about.
+    #[test]
+    fn an_image_that_is_done_is_released_and_its_readers_are_told() {
+        use crate::protocol::SetupFrame;
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &channel),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id: 99,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            if !conductor.publication_images().is_empty() {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let image = conductor.publication_images()[0].clone();
+        assert_eq!(1, image.refcount);
+
+        // The reader is told the log buffer is there before it is told it is
+        // gone: two messages, in that order.
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+
+        // The image has finished (the receiver said so) and the conductor
+        // releases it.
+        assert_eq!(1, conductor.release_image(image.registration_id));
+
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_UNAVAILABLE_IMAGE_TYPE_ID,
+        );
+        assert_eq!(image.registration_id.to_le_bytes(), payload[0..8]);
+        assert_eq!(11i64.to_le_bytes(), payload[8..16], "the reader is named");
+        assert_eq!(1001i32.to_le_bytes(), payload[16..20], "and the stream");
+
+        assert!(
+            conductor.publication_images().is_empty(),
+            "and the image is gone from the driver"
+        );
+    }
+
+    /// A12: the session id a network publication runs under.
+    ///
+    /// Two publications on one channel and different streams get *different*
+    /// sessions — the whole point of speculating rather than picking one — and
+    /// a URI that names a session gets exactly that one. Both are what the
+    /// reference does with the same `SessionIds` the IPC path uses
+    /// (`aeron_driver_conductor.c:4455-4478`).
+    #[test]
+    fn network_publications_speculate_a_session_each_and_honour_a_named_one() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        for (correlation_id, stream_id) in [(21i64, 1001i32), (22, 1002)] {
+            send(
+                &conductor,
+                ADD_PUBLICATION_TYPE_ID,
+                &add_publication_payload(7, correlation_id, stream_id, &channel),
+            );
+            let _ = await_event(
+                &mut conductor,
+                &cnc,
+                &mut receiver,
+                &mut pending,
+                ON_PUBLICATION_READY_TYPE_ID,
+            );
+        }
+
+        let sessions: Vec<i32> = conductor
+            .network_publications()
+            .iter()
+            .map(|publication| publication.session_id)
+            .collect();
+
+        assert_eq!(2, sessions.len());
+        assert_ne!(
+            sessions[0], sessions[1],
+            "two streams on one channel are two sessions"
+        );
+
+        // And one that names its session keeps it.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 23, 1003, &format!("{channel}|session-id=77")),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        let named = conductor
+            .network_publications()
+            .iter()
+            .find(|publication| publication.registration_id == 23)
+            .expect("the third publication");
+
+        assert_eq!(
+            77, named.session_id,
+            "a session the URI named is the one used"
+        );
+    }
+
+    /// A port nobody is listening on, for a test that only needs the shape of
+    /// a channel.
+    fn free_test_port() -> u16 {
+        let socket = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+
+        socket.local_address().expect("an address").port()
+    }
+
+    /// Removing a UDP publication stops the sender and gives its six counters
+    /// back — the half of the removal path that was missing, and whose absence
+    /// would have been silent: the client is answered, and the sender keeps
+    /// sending.
+    #[test]
+    fn removing_a_udp_publication_stops_the_sender_and_frees_its_counters() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 31, 1001, &channel),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(1, conductor.network_publications().len());
+
+        let counters_before = conductor.counters().free_list_len();
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(7, 32, 31, 0, false),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+        );
+        assert_eq!(32i64.to_le_bytes(), payload[0..8]);
+
+        assert!(
+            conductor.network_publications().is_empty(),
+            "the publication is gone from the driver"
+        );
+        assert_eq!(
+            counters_before + 6,
+            conductor.counters().free_list_len(),
+            "and its six counters came back"
+        );
+    }
+
+    /// A7: two concurrent publications on one channel and stream are one
+    /// publication — the same log buffer, the same counters, the same sender —
+    /// and an explicit parameter that disagrees is a refusal rather than a
+    /// second publication (`aeron_confirm_publication_match`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1105-1178`).
+    #[test]
+    fn two_udp_publications_on_one_stream_share_and_a_named_mtu_must_agree() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 41, 1001, &channel),
+        );
+        let first = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let first_registration_id =
+            i64::from_le_bytes(first[8..16].try_into().expect("eight bytes"));
+
+        // The same channel and stream again: the reply names the *first*
+        // publication, because that is the one the client will write through.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, &channel),
+        );
+        let second = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        assert_eq!(
+            first_registration_id.to_le_bytes(),
+            second[8..16],
+            "a shared publication is the one that already exists"
+        );
+        assert_eq!(
+            1,
+            conductor.network_publications().len(),
+            "one publication, one log buffer"
+        );
+
+        // A third that names an mtu the first did not: refused rather than
+        // shared, and with the generic code the reference's `EINVAL` composes
+        // to.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1001, &format!("{channel}|mtu=1024")),
+        );
+        let error = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+        assert_eq!(43i64.to_le_bytes(), error[0..8], "the failing command");
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR.to_le_bytes(),
+            error[8..12]
+        );
+        assert_eq!(1, conductor.network_publications().len());
+    }
+
     #[test]
     fn a_channel_this_driver_cannot_serve_is_refused_with_a_code_and_an_answer() {
         let temp = TempDir::new();
@@ -2967,13 +4151,14 @@ mod tests {
         );
         assert_eq!(1, conductor.publication_failures());
 
-        // A UDP channel is a channel this build does not serve yet: it is
-        // refused rather than left waiting, and with the code the protocol has
-        // for exactly that.
+        // A channel the reference serves and this build does not — a multicast
+        // group — is refused rather than left waiting, and with the code the
+        // protocol has for exactly that. (A unicast UDP channel used to be this
+        // test's example; P1-4 made it a channel this driver *does* serve.)
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=localhost:40123"),
+            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=224.0.1.1:40123"),
         );
         let payload = await_event(
             &mut conductor,

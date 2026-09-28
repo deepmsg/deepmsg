@@ -92,6 +92,26 @@ pub enum AddError {
     },
     /// An existing publication could be shared except for one parameter.
     Share(ShareMismatch),
+    /// A UDP channel this build refused, with the reference's own reason
+    /// ([`crate::udp_channel::UdpChannelError`]).
+    Channel(Box<crate::udp_channel::UdpChannelError>),
+    /// A channel a *publication* may not use — the checks the reference makes
+    /// on the endpoint and the control address before it creates anything
+    /// (`aeron_driver_conductor.c:569-608`). Its message is the reference's,
+    /// error code and all.
+    InvalidChannel(String),
+    /// A send endpoint could not be created or shared. Carried as its code and
+    /// its words because the underlying error is a syscall's, which is neither
+    /// cloneable nor comparable — and those two things are all a caller of
+    /// this enum uses.
+    Endpoint {
+        /// The `ON_ERROR` code the reference answers with.
+        error_code: i32,
+        /// The reference's message.
+        message: String,
+    },
+    /// A publication's counters could not be allocated.
+    NoCounterRecord,
     /// The native resource agent is not there to create the log buffer — its
     /// thread has died, which nothing else in this build can cause.
     AgentStopped,
@@ -113,6 +133,10 @@ impl std::fmt::Display for AddError {
                 "existing publication has clashing sessionId={session_id} for streamId={stream_id}"
             ),
             Self::Share(mismatch) => write!(f, "{mismatch}"),
+            Self::Channel(error) => write!(f, "{error}"),
+            Self::InvalidChannel(message) => f.write_str(message),
+            Self::Endpoint { message, .. } => f.write_str(message),
+            Self::NoCounterRecord => f.write_str("could not allocate the publication's counters"),
             Self::AgentStopped => f.write_str("the native resource agent has stopped"),
         }
     }
@@ -152,9 +176,16 @@ impl AddError {
             ))
             | Self::SessionClash { .. } => ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => ERROR_CODE_NOT_SUPPORTED,
-            Self::Params(_) | Self::NoClientRecord | Self::Share(_) | Self::AgentStopped => {
-                ERROR_CODE_GENERIC_ERROR
-            }
+            // A UDP channel the reference refuses *by name* is an invalid
+            // channel; a resolution failure is an errno and reads as generic.
+            Self::InvalidChannel(_) => ERROR_CODE_INVALID_CHANNEL,
+            Self::Channel(error) => error.error_code(),
+            Self::Endpoint { error_code, .. } => *error_code,
+            Self::Params(_)
+            | Self::NoClientRecord
+            | Self::Share(_)
+            | Self::NoCounterRecord
+            | Self::AgentStopped => ERROR_CODE_GENERIC_ERROR,
         }
     }
 }

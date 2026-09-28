@@ -18,6 +18,7 @@ use crate::buffer::{AtomicBuffer, ReadOnly};
 
 use super::descriptor;
 use super::frame::{DATA_HEADER_LENGTH, Frame};
+use super::position::align_up;
 
 /// What a scanner found at its cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +168,116 @@ impl<'a, Access> Scanner<'a, Access> {
                 frame_length,
             }
         }
+    }
+}
+
+/// The sender's question: how much of the term, from here, is *published* and
+/// sendable?
+///
+/// Mirrors `aeron_term_scanner_scan_for_availability`
+/// (`aeron-client/src/main/c/concurrent/aeron_term_scanner.h:26-63`), which the
+/// sender calls once per datagram it wants to put on the wire
+/// (`aeron-driver/src/main/c/aeron_network_publication.c:525`).
+///
+/// # Why the sender needs its own scan
+///
+/// A reader stops at the first unpublished frame and waits. A *sender* has to
+/// do something more delicate: it may send several frames in one datagram, it
+/// has to know when the datagram budget cuts a frame in half (and stop before
+/// it), and it has to carry a padding frame's **header** into the next datagram
+/// so the receiver can see the term's tail rather than a hole. That is the
+/// whole of the difference from [`Scanner`], and it is why the answer is three
+/// cases rather than a walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    /// `available` bytes from the cursor are published and sendable, and
+    /// `padding` of them belong to a padding frame past its own header — which
+    /// the sender includes, because a receiver that sees no padding frame sees
+    /// a gap.
+    Ready {
+        /// How many bytes may go into this datagram.
+        available: i32,
+        /// How much of `available` is a padding frame's tail.
+        padding: i32,
+    },
+    /// The budget ran out in the middle of a frame: the sender stops here and
+    /// comes back with the rest of the window. The reference reports this as a
+    /// negative count.
+    Limited {
+        /// The frame that did not fit, as a negative length — the reference's
+        /// own answer, kept so that a caller can tell a full frame from a
+        /// partial one.
+        frame_length: i32,
+    },
+    /// Nothing published at the cursor. The sender waits.
+    Empty,
+}
+
+/// Scan from `offset` for what a sender may put in one datagram, bounded by
+/// `max_length` (the datagram budget) and `term_length_left` (the term's end).
+///
+/// The lengths in `term_length_left` and `max_length` are the reference's
+/// `int32_t`s and the answer is in the same units, so a caller comparing them
+/// against frame lengths is comparing like with like.
+pub fn scan_for_availability(
+    term: &AtomicBuffer<'_, ReadOnly>,
+    offset: usize,
+    term_length_left: i32,
+    max_length: i32,
+) -> Availability {
+    let limit = max_length.min(term_length_left);
+    let mut available: i32 = 0;
+    let mut padding: i32 = 0;
+
+    loop {
+        // SAFETY-adjacent: `Frame::new` reads within the term, and the cursor
+        // never passes `limit`, which is at most `term_length_left`.
+        let frame = Frame::new(term, offset + available.unsigned_abs() as usize);
+
+        let Some(frame_length) = frame.frame_length() else {
+            break;
+        };
+
+        // `0` is "not written yet", negative is "claimed and being filled";
+        // either way there is nothing to send from here.
+        if frame_length <= 0 {
+            break;
+        }
+
+        let mut aligned = align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+
+        // A padding frame is sent as its header alone: the tail is not data,
+        // and the receiver has to see *something* at that offset.
+        if frame.is_padding() {
+            padding = aligned - DATA_HEADER_LENGTH as i32;
+            aligned = DATA_HEADER_LENGTH as i32;
+        }
+
+        available += aligned;
+
+        if available > limit {
+            // A frame that does not fit the datagram: unless it is the only
+            // one, the frames before it are still sendable.
+            available = if aligned == available {
+                -available
+            } else {
+                available - aligned
+            };
+            padding = 0;
+            break;
+        }
+
+        if padding != 0 || available >= limit {
+            break;
+        }
+    }
+
+    match available {
+        available if available > 0 => Availability::Ready { available, padding },
+        available if available < 0 => Availability::Limited {
+            frame_length: available,
+        },
+        _ => Availability::Empty,
     }
 }
 
@@ -354,6 +465,139 @@ mod tests {
             Step::End,
             scanner.advance(),
             "the limit is where a reader stops"
+        );
+    }
+
+    /// A term whose first `count` frames are `payloads`, with a padding frame
+    /// closing the tail at `pad_at` (offset) when one is asked for.
+    ///
+    /// The vectors are the reference's own
+    /// (`aeron-driver/src/test/c/aeron_term_scanner_test.cpp:34-200`), which is
+    /// the only place its scanner's edge cases are written down.
+    #[test]
+    fn availability_scans_the_frames_the_reference_scans() {
+        let mut bytes = term();
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            // One frame of a 33-byte payload: 33 + 32 = 65, aligned to 96.
+            assert_eq!(96, write_frame(&writer, 0, TYPE_DATA, &[0u8; 33]));
+        }
+
+        let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+
+        // The whole frame fits the datagram budget.
+        assert_eq!(
+            Availability::Ready {
+                available: 96,
+                padding: 0
+            },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 1408)
+        );
+
+        // One byte less than the frame, and nothing is sendable: the reference
+        // answers with the negated *aligned* length.
+        assert_eq!(
+            Availability::Limited { frame_length: -96 },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 95)
+        );
+
+        // Nothing written is nothing to send.
+        assert_eq!(
+            Availability::Empty,
+            scan_for_availability(&view, 96, TERM_LENGTH as i32 - 96, 1408)
+        );
+    }
+
+    #[test]
+    fn availability_takes_two_frames_that_fit_and_stops_at_one_that_does_not() {
+        let mut bytes = term();
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            // Two 100-byte payloads: 132 → 160 aligned each.
+            assert_eq!(160, write_frame(&writer, 0, TYPE_DATA, &[0u8; 100]));
+            assert_eq!(160, write_frame(&writer, 160, TYPE_DATA, &[0u8; 100]));
+        }
+
+        let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+
+        assert_eq!(
+            Availability::Ready {
+                available: 320,
+                padding: 0
+            },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 1408),
+            "both fit"
+        );
+
+        // A budget that cuts the second frame in half sends only the first.
+        assert_eq!(
+            Availability::Ready {
+                available: 160,
+                padding: 0
+            },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 200)
+        );
+
+        // And a budget smaller than the first frame sends nothing.
+        assert_eq!(
+            Availability::Limited { frame_length: -160 },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 159)
+        );
+    }
+
+    #[test]
+    fn availability_carries_a_padding_frame_as_its_header_alone() {
+        let mut bytes = term();
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            // A 64-byte payload (96 aligned) and then the term's tail as a
+            // padding frame of 128 aligned bytes.
+            assert_eq!(96, write_frame(&writer, 0, TYPE_DATA, &[0u8; 64]));
+            assert_eq!(128, write_frame(&writer, 96, TYPE_PAD, &[0u8; 96]));
+        }
+
+        let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+
+        assert_eq!(
+            Availability::Ready {
+                available: 96 + DATA_HEADER_LENGTH as i32,
+                padding: 128 - DATA_HEADER_LENGTH as i32,
+            },
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, 1408),
+            "the padding frame's header is sent, its tail is not"
+        );
+    }
+
+    #[test]
+    fn availability_stops_at_the_terms_end() {
+        let mut bytes = term();
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            // A frame right at the end of the term, and the same frame one
+            // term's end earlier with less room than it needs.
+            let last = TERM_LENGTH - 96;
+            assert_eq!(96, write_frame(&writer, last, TYPE_DATA, &[0u8; 64]));
+        }
+
+        let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+
+        assert_eq!(
+            Availability::Ready {
+                available: 96,
+                padding: 0
+            },
+            scan_for_availability(&view, TERM_LENGTH - 96, 96, 1408),
+            "a frame that ends exactly at the term's end is sendable"
+        );
+
+        assert_eq!(
+            Availability::Limited { frame_length: -96 },
+            scan_for_availability(&view, TERM_LENGTH - 96, 95, 1408),
+            "one that would run past it is not"
         );
     }
 }

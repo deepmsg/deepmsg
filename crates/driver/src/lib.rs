@@ -27,11 +27,20 @@ pub mod ipc_publication;
 pub mod ipc_publications;
 pub mod ipc_subscriptions;
 pub mod loss;
+pub mod loss_detector;
 pub mod media;
 pub mod native_resource_agent;
+pub mod network_publication;
+pub mod network_publications;
 pub mod position;
+pub mod protocol;
+pub mod publication_image;
+pub mod publication_images;
 pub mod publication_params;
+pub mod receive_endpoints;
 pub mod receiver;
+pub mod retransmit_handler;
+pub mod send_endpoints;
 pub mod sender;
 pub mod subscribable;
 /// The kernel seam: the one `unsafe` in this crate, and the only place the
@@ -39,3 +48,4 @@ pub mod subscribable;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod system_counters;
+pub mod udp_channel;

@@ -126,6 +126,21 @@ pub struct MappedFile {
 // is exactly the transfer this makes legal.
 unsafe impl Send for MappedFile {}
 
+// A mapping is also *shared* rather than moved: the conductor holds the CnC
+// file and the data plane's agents each derive their own counter views over the
+// same pages (P1-4). A mapping is a range of the process's address space that
+// every thread can already reach, so sharing a description of it adds no
+// capability, and what a thread may write through it is the atomic discipline
+// the counter regions impose — not something this impl grants or withholds.
+//
+// SAFETY: this impl exists so that `Arc<MappedFile>` may be shared, and the
+// safety argument is the same one `Send` above rests on plus one more: every
+// access through the description is an atomic access through `AtomicBuffer`,
+// whose borrows are what enforce the single-writer rules. The description
+// itself (`addr`, `len`, `writable`) is plain data, and no method of this type
+// reads through `addr` without going through that boundary.
+unsafe impl Sync for MappedFile {}
+
 impl MappedFile {
     /// Open `path` and map it read-only, shared with every other process.
     ///
