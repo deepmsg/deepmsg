@@ -3906,13 +3906,31 @@ mod tests {
             .expect("in range");
 
         client.poll();
-        assert_eq!(
-            Some(deepmsg_client::client::ClientError::DriverTimeout {
-                age_ms: deepmsg_client::client::DRIVER_TIMEOUT_MS + 1_000,
-                timeout_ms: deepmsg_client::client::DRIVER_TIMEOUT_MS,
-            }),
-            client.error(),
-            "a heartbeat past the timeout is a driver that is gone, not one that is slow"
+        let Some(deepmsg_client::client::ClientError::DriverTimeout { age_ms, timeout_ms }) =
+            client.error()
+        else {
+            panic!(
+                "a heartbeat past the timeout is a driver that is gone, not one that is \
+                 slow: {:?}",
+                client.error()
+            );
+        };
+
+        // The timeout is the contract. The age is *when the client looked*: the
+        // heartbeat above was written a second past the timeout, so what comes
+        // back is that second plus however long the poll itself took — the same
+        // millisecond in a quiet run, and one more whenever the clock ticks
+        // over between the two, which a loaded machine does about a run in
+        // three. So the age is a window, and the window is narrow: a client
+        // measuring from any other moment lands outside it by orders of
+        // magnitude, which is what it is here to catch.
+        assert_eq!(deepmsg_client::client::DRIVER_TIMEOUT_MS, timeout_ms);
+        assert!(
+            (deepmsg_client::client::DRIVER_TIMEOUT_MS + 1_000
+                ..=deepmsg_client::client::DRIVER_TIMEOUT_MS + 5_000)
+                .contains(&age_ms),
+            "the heartbeat was written 1000ms past the timeout, so the age is that plus \
+             the poll's own delay, not {age_ms}"
         );
     }
 
