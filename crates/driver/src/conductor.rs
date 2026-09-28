@@ -60,6 +60,7 @@ use deepmsg_cnc::command::{
     encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
     encode_subscription_ready, encode_unavailable_image,
 };
+use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
@@ -320,12 +321,15 @@ impl ClientEvents for Transmit<'_> {
 
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
-/// (`aeron_driver_conductor.c:3233-3237`).
+/// (`aeron_driver_conductor.c:3231-3235`).
 ///
 /// The code is recorded negated because the reference's `AERON_SET_ERR` is
 /// given `-AERON_ERROR_CODE_MALFORMED_COMMAND` there and the log keeps
 /// whatever that left — a detail of the in-process table, since the code never
-/// reaches the region.
+/// reaches the region. The description carries the reference's composition —
+/// the code's own line, then the recording site at the `AERON_SET_ERR`'s own
+/// line — because that text is what `ErrorStat` prints and what dedup keys
+/// on.
 fn malformed_command(
     type_id: i32,
     payload_len: usize,
@@ -335,7 +339,13 @@ fn malformed_command(
     *malformed += 1;
     faults.push((
         -ERROR_CODE_MALFORMED_COMMAND,
-        format!("command={type_id} too short: length={payload_len}"),
+        compose_description(
+            -ERROR_CODE_MALFORMED_COMMAND,
+            "aeron_driver_conductor_on_command",
+            "aeron_driver_conductor.c",
+            3232,
+            &format!("command={type_id} too short: length={payload_len}"),
+        ),
     ));
 }
 
@@ -1100,7 +1110,13 @@ impl Conductor {
                         *unknown += 1;
                         faults.push((
                             -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
-                            format!("command={unknown_type_id} unknown"),
+                            compose_description(
+                                -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+                                "aeron_driver_conductor_on_command",
+                                "aeron_driver_conductor.c",
+                                3219,
+                                &format!("command={unknown_type_id} unknown"),
+                            ),
                         ));
                     } else {
                         *unhandled += 1;
@@ -1315,10 +1331,12 @@ impl Conductor {
     /// The warning is the reference's own words, and the two numbers are
     /// printed the way its `PRId64` prints the `uint64_t` values it passes —
     /// as signed, which no real threshold or filesystem can tell apart.
+    /// The description carries the reference's composition — the code's own
+    /// line, then the recording site — which is what `ErrorStat` prints.
     fn record_storage_warnings(&mut self) {
         for warning in self.publications.poll_storage_warnings() {
             #[allow(clippy::cast_possible_wrap)] // printed as the reference prints it
-            let text = format!(
+            let message = format!(
                 "WARNING: space is running low: threshold={} usable={} in {}",
                 warning.threshold as i64,
                 warning.usable as i64,
@@ -1327,7 +1345,14 @@ impl Conductor {
             // Negated, because the reference's `AERON_SET_ERR` was given
             // `-AERON_ERROR_CODE_STORAGE_SPACE` and the log keeps what that
             // left (`:1370-1372`).
-            self.record_distinct(-ERROR_CODE_STORAGE_SPACE, &text);
+            let description = compose_description(
+                -ERROR_CODE_STORAGE_SPACE,
+                "aeron_driver_context_run_storage_checks",
+                "aeron_driver_context.c",
+                1370,
+                &message,
+            );
+            self.record_distinct(-ERROR_CODE_STORAGE_SPACE, &description);
         }
     }
 
@@ -1904,12 +1929,18 @@ mod tests {
         assert_eq!(Some(Command::Unknown(0x7F)), conductor.last_unhandled());
 
         // And the fault reaches the distinct error log in the adapter's
-        // words, with the errors counter bumped to match
+        // words — the composition the reference's `AERON_SET_ERR` builds —
+        // with the errors counter bumped to match
         // (`aeron_driver_conductor.c:3218-3221`).
         let mut errors = Vec::new();
         let log = conductor.cnc.error_log().expect("the error log");
         assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
-        assert_eq!("command=127 unknown", errors[0].text);
+        assert_eq!(
+            "(-6) unknown command type id\n\
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             command=127 unknown\n",
+            errors[0].text
+        );
         assert_eq!(
             Some(1),
             counter_value(&conductor, system_counters::id::ERRORS)
@@ -2269,13 +2300,18 @@ mod tests {
         assert_eq!(45, conductor.counters().id_high_water_mark());
 
         // And the fault reaches the distinct error log in the reference
-        // adapter's words, with the errors counter bumped to match
-        // (`aeron_driver_conductor.c:3233-3237`).
+        // adapter's words — composed, as its `AERON_SET_ERR` composes — with
+        // the errors counter bumped to match (`aeron_driver_conductor.c:3231-3235`).
         let mut errors = Vec::new();
         let log = conductor.cnc.error_log().expect("the error log");
         assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
         assert_eq!(
-            format!("command=9 too short: length={}", payload.len()),
+            format!(
+                "(-7) malformed command\n\
+                 [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3232] \
+                 command=9 too short: length={}\n",
+                payload.len()
+            ),
             errors[0].text
         );
         assert_eq!(
@@ -2357,15 +2393,17 @@ mod tests {
         assert_eq!(1, errors[0].observation_count);
         assert!(
             errors[0].text.starts_with(
-                "WARNING: space is running low: threshold=9223372036854775807 usable="
+                "(-12) insufficient storage space\n\
+                 [aeron_driver_context_run_storage_checks, aeron_driver_context.c:1370] \
+                 WARNING: space is running low: threshold=9223372036854775807 usable="
             ),
-            "the reference's words, with the threshold it was given: {}",
+            "the reference's composition and words, with the threshold it was given: {}",
             errors[0].text
         );
         assert!(
             errors[0]
                 .text
-                .ends_with(&format!(" in {}", temp.0.display())),
+                .ends_with(&format!(" in {}\n", temp.0.display())),
             "and the directory it asked about: {}",
             errors[0].text
         );

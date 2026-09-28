@@ -209,6 +209,80 @@ pub enum RecordError {
     Unrecordable { description: String },
 }
 
+/// The reference's description for a client error code
+/// (`aeron_error_code_str`, `aeron-client/src/main/c/util/aeron_error.c:195-230`).
+///
+/// The code the reference *records* is often negated — its `AERON_SET_ERR`
+/// calls on the recording sites are given `-ERROR_CODE_*` — and this table is
+/// keyed by the positive code, so pass `-code` for one of those.
+pub fn error_code_description(code: i32) -> &'static str {
+    match code {
+        1 => "invalid channel",
+        2 => "unknown subscription",
+        3 => "unknown publication",
+        4 => "channel endpoint error",
+        5 => "unknown counter",
+        6 => "unknown command type id",
+        7 => "malformed command",
+        8 => "not supported",
+        9 => "unknown host",
+        10 => "resource temporarily unavailable",
+        11 => "generic error, see message",
+        12 => "insufficient storage space",
+        _ => "unknown error code",
+    }
+}
+
+/// How much of an error message the reference's per-thread buffer can hold
+/// before its composition is cut short: `AERON_ERROR_MAX_TOTAL_LENGTH` is
+/// 8192 (`aeron_error.h:26`), and the trailer `strcpy` lands six bytes from
+/// the end (`sizeof - (strlen("...\n") + 2)`, `aeron_error.c:348`), so
+/// anything past byte 8186 is the trailer.
+const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
+
+/// Compose the description the reference records for an error set with
+/// `AERON_SET_ERR` (`aeron_err_set`, `aeron_error.c:351-375`, with the entry
+/// formatting at `:326-334`):
+///
+/// ```text
+/// (<code>) <the code's description>
+/// [<function>, <file>:<line>] <the message>
+/// ```
+///
+/// The line is the one the `AERON_SET_ERR` itself sits on — the macro's
+/// `__LINE__`, which the compiler resolves to the line bearing the macro
+/// name. The code appears as it was set, negated or not, and a non-positive
+/// code is described by [`error_code_description`] while a positive one would
+/// carry the OS's `strerror` text — which this build never records, so that
+/// half of the reference's behaviour is not modelled here.
+///
+/// The description ends in a newline and is capped at the reference's buffer:
+/// past byte 8186 the rest is replaced by the trailer `"...\n"` it `strcpy`s
+/// into place (`aeron_error.c:33,348`).
+pub fn compose_description(
+    error_code: i32,
+    function: &str,
+    file: &str,
+    line: u32,
+    message: &str,
+) -> String {
+    let mut composed = format!(
+        "({error_code}) {}\n[{function}, {file}:{line}] {message}\n",
+        error_code_description(error_code.abs()),
+    );
+
+    if composed.len() > ERROR_MESSAGE_LIMIT {
+        let mut cut = ERROR_MESSAGE_LIMIT;
+        while !composed.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        composed.truncate(cut);
+        composed.push_str("...\n");
+    }
+
+    composed
+}
+
 impl DistinctErrorLog {
     /// An empty log over a fresh region (`aeron_distinct_error_log_init`,
     /// `:30-56`).
@@ -349,6 +423,58 @@ impl DistinctErrorLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID;
+
+    #[test]
+    fn the_composition_matches_what_the_reference_records() {
+        // Read off a live 1.53.2 driver with `ErrorStat`: an unknown command
+        // type is recorded as two lines, the code's own description and then
+        // the recording site, and ends with a newline
+        // (`aeron_error.c:326-375`).
+        assert_eq!(
+            "(-6) unknown command type id\n\
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             command=153 unknown\n",
+            compose_description(
+                -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
+                "aeron_driver_conductor_on_command",
+                "aeron_driver_conductor.c",
+                3219,
+                "command=153 unknown",
+            )
+        );
+
+        // A code the table has no case for gets the reference's default
+        // (`aeron_error.c:307-309`).
+        assert_eq!(
+            "(99) unknown error code\n[f, f.c:1] m\n",
+            compose_description(99, "f", "f.c", 1, "m")
+        );
+    }
+
+    #[test]
+    fn a_message_past_the_buffer_is_cut_to_the_trailer() {
+        // The per-thread buffer is 8192 bytes and the trailer `strcpy`
+        // lands six from the end (`aeron_error.h:26`, `aeron_error.c:33,348`),
+        // so a composition that would run past byte 8186 ends with the
+        // reference's trailer instead.
+        let message = "x".repeat(9000);
+        let composed = compose_description(-7, "f", "f.c", 1, &message);
+
+        assert_eq!(ERROR_MESSAGE_LIMIT + 4, composed.len());
+        assert!(composed.starts_with("(-7) malformed command\n[f, f.c:1] "));
+        assert!(composed.ends_with("xxx...\n"), "the cut, then the trailer");
+    }
+
+    #[test]
+    fn the_code_descriptions_are_the_references_table() {
+        // `aeron_error_code_str` (`aeron_error.c:195-230`), the entries a
+        // driver-recorded code can reach.
+        assert_eq!("invalid channel", error_code_description(1));
+        assert_eq!("unknown counter", error_code_description(5));
+        assert_eq!("insufficient storage space", error_code_description(12));
+        assert_eq!("unknown error code", error_code_description(0));
+    }
 
     #[repr(align(64))]
     struct Region(Vec<u8>);

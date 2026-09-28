@@ -422,7 +422,7 @@ pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
 /// What the reference's command adapter reports for a command whose payload
 /// is shorter than its own header — recorded negated in the distinct error
 /// log, for the same reason as
-/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3233-3237`).
+/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3231-3235`).
 pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
 
 /// Encode `ON_OPERATION_SUCCEEDED`.
