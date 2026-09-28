@@ -507,8 +507,25 @@ impl ReceiverThread {
                         self.images.push(image);
                     }
                     ReceiverCommand::RemoveImage { registration_id } => {
-                        self.images
-                            .retain(|image| image.registration_id != registration_id);
+                        // The image goes, and its log buffer goes with it: the
+                        // file is unmapped and unlinked here because this is
+                        // the thread that owns the mapping.
+                        if let Some(index) = self
+                            .images
+                            .iter()
+                            .position(|image| image.registration_id == registration_id)
+                        {
+                            let image = self.images.swap_remove(index);
+
+                            if let Err(error) = image.into_log().remove() {
+                                let _ = self.events.send(ReceiverEvent::Fault {
+                                    error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                                    description: format!(
+                                        "could not remove an image's log buffer: {error}"
+                                    ),
+                                });
+                            }
+                        }
                         self.pending_setups
                             .retain(|pending| pending.session_id != registration_id as i32);
 

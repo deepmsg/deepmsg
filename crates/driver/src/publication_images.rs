@@ -422,6 +422,22 @@ impl PublicationImages {
         }
     }
 
+    /// Take the record out of the collection.
+    ///
+    /// The log buffer is not freed here: the *receiver* owns the mapping (the
+    /// image went there at create) and unmaps and unlinks it when its
+    /// `RemoveImage` command arrives — which is the same order every other
+    /// release in this driver keeps, and the one that cannot leave a file
+    /// mapped by a thread that no longer knows about it.
+    pub fn remove(&mut self, registration_id: i64) -> Option<PublicationImageRecord> {
+        let index = self
+            .images
+            .iter()
+            .position(|image| image.registration_id == registration_id)?;
+
+        Some(self.images.swap_remove(index))
+    }
+
     /// Close everything: the agent's thread, and the images with it.
     pub fn close(&mut self) {
         self.images.clear();

@@ -299,6 +299,12 @@ impl PublicationImage {
         }
     }
 
+    /// Give up the log buffer, for a caller that is about to unmap and unlink
+    /// it (`LogFile::remove`).
+    pub fn into_log(self) -> Box<LogFile> {
+        self.log
+    }
+
     /// The log buffer's path, which `ON_AVAILABLE_IMAGE` hands the client.
     pub fn path_bytes(&self) -> Vec<u8> {
         use std::os::unix::ffi::OsStrExt;

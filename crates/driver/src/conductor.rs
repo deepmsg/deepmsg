@@ -863,14 +863,7 @@ impl Conductor {
                     }
                 }
                 ReceiverEvent::ImageDone { registration_id } => {
-                    let _ = self.receiver.proxy().remove_image(registration_id);
-
-                    if let Some(image) = self.images.find(registration_id).cloned() {
-                        self.receive_endpoints.detach_image(image.endpoint_id);
-                    }
-
-                    self.subscriptions.forget_publication(registration_id);
-                    self.images.decref(registration_id);
+                    work += self.release_image(registration_id);
                 }
                 ReceiverEvent::Fault {
                     error_code,
@@ -882,6 +875,70 @@ impl Conductor {
         }
 
         work + self.poll_images(now_ns)
+    }
+
+    /// An image has finished its life: unlink it, tell its readers, give its
+    /// counters and its log buffer back, and let the endpoint go if nothing
+    /// reads it any more (`aeron_driver_conductor_image_transition_to_linger`
+    /// and the delete that follows it, `aeron_driver_conductor.c:5680-5720`).
+    ///
+    /// This is the receiving side's answer to a publication's revoke: a
+    /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
+    /// message per **subscription** that was reading it, as the reference sends
+    /// them (`:5690-5700`) — and only then is the log buffer unmapped.
+    fn release_image(&mut self, registration_id: i64) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let _ = self.receiver.proxy().remove_image(registration_id);
+
+        // The readers, told — before anything is freed, because the message
+        // names the file they were reading.
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        for link in self.subscriptions.readers_of(registration_id) {
+            transmit.unavailable_image(
+                registration_id,
+                link.registration_id,
+                image.stream_id,
+                &image.channel,
+            );
+        }
+
+        // The transmit borrows the faults list and the ring; it goes out of
+        // scope here so the counter regions can be taken below.
+        let _ = &transmit;
+
+        self.subscriptions.forget_publication(registration_id);
+        self.receive_endpoints.detach_image(image.endpoint_id);
+
+        // The counters and the log buffer. The image is gone from the
+        // receiver, so nothing is reading either of them.
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, image.counters.rcv_hwm, self.now_ms);
+            let _ = self
+                .counters
+                .free(&region, image.counters.rcv_pos, self.now_ms);
+        }
+
+        // The image's log buffer goes back through the agent, because a delete
+        // unmaps and unlinks a file — the same rule every other log buffer
+        // follows (`crate::native_resource_agent`).
+        let _ = self.images.remove(registration_id);
+
+        1
     }
 
     /// Take the image agent's completions: this is where an image whose log
@@ -3526,6 +3583,119 @@ mod tests {
             received_status,
             "the subscriber answers with a status message: without one the \
              publisher stops after one window"
+        );
+    }
+
+    /// An image that has finished its life is released, and every subscription
+    /// reading it is told (`ON_UNAVAILABLE_IMAGE`) — the receiving side of the
+    /// cleanup A9 asks about.
+    #[test]
+    fn an_image_that_is_done_is_released_and_its_readers_are_told() {
+        use crate::protocol::SetupFrame;
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &channel),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id: 99,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            if !conductor.publication_images().is_empty() {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let image = conductor.publication_images()[0].clone();
+        assert_eq!(1, image.refcount);
+
+        // The reader is told the log buffer is there before it is told it is
+        // gone: two messages, in that order.
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+
+        // The image has finished (the receiver said so) and the conductor
+        // releases it.
+        assert_eq!(1, conductor.release_image(image.registration_id));
+
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_UNAVAILABLE_IMAGE_TYPE_ID,
+        );
+        assert_eq!(image.registration_id.to_le_bytes(), payload[0..8]);
+        assert_eq!(11i64.to_le_bytes(), payload[8..16], "the reader is named");
+        assert_eq!(1001i32.to_le_bytes(), payload[16..20], "and the stream");
+
+        assert!(
+            conductor.publication_images().is_empty(),
+            "and the image is gone from the driver"
         );
     }
 
