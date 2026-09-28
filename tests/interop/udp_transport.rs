@@ -252,7 +252,7 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
                 .and_then(|seen| seen.first())
                 .map_or_else(|| "none".to_owned(), |first| format!("{first:?}")),
             subscriber.output(),
-            own.log_tail(40)
+            own.log_tail(60)
         );
     }
 
@@ -271,6 +271,153 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
     let _ = subscriber.terminate(Duration::from_secs(5));
     let _ = own.stop();
     let _ = reference.stop();
+}
+
+/// A5, the half that needs a second process: a frame this driver withholds is
+/// a frame a real receiver has to notice missing, ask for, and get on the
+/// second attempt.
+///
+/// Every other test of loss recovery in this build drives one frame through
+/// one function: the gap detector, the NAK, the resend. Each agrees with
+/// itself about what the other end would do. Here the wire is made to lose
+/// something — the one thing loopback never does — and the reference's own
+/// subscriber, behind the reference's own driver, is the judge of whether the
+/// stream came out whole anyway.
+///
+/// The two halves of the claim are separate assertions on purpose: that the
+/// subscriber got every message, and that this driver's own counters say it
+/// retransmitted. A message that arrived without a retransmission would mean
+/// the injection never hit a data frame, and a retransmission without the
+/// messages would mean the recovery made things worse.
+#[test]
+fn a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it() {
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let mut reference = ReferenceDriver::start(&reference_binary, "udp-loss-reference-subscriber")
+        .expect("start the reference driver");
+
+    // One data frame in every four is withheld. The count is over frames and
+    // the slot is the reference's, so the SETUP and heartbeat frames that go
+    // the same way are counted with the data frames
+    // (`media/aeron_send_channel_endpoint.c:391-403`, which is also where the
+    // reference's own generator is consulted).
+    let Some(mut own) = OwnDriver::start_with(
+        "udp-our-lossy-publisher",
+        &["-Ddeepmsg.debug.send.data.loss.drop.every=4"],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    // Offset four, because the tests in this file run in parallel and each
+    // offset is a port: two of them naming the same number is two drivers
+    // fighting over one socket.
+    let port = free_udp_port(4);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}");
+    let reference_dir = reference.aeron_dir().to_path_buf();
+
+    let mut subscriber = samples::Sample::start(
+        &subscriber_binary,
+        "subscriber",
+        &reference_dir,
+        &["-c", &channel, "-s", &STREAM_ID.to_string()],
+    );
+
+    subscriber.await_output(Duration::from_secs(20), "its channel", |output| {
+        output.contains("Subscribing to channel")
+    });
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver must publish a readable CnC file");
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // The stream has to be **many datagrams long**, which is what the count
+    // the generator keeps is over: a datagram carries as many frames as fit in
+    // the MTU, so a handful of small messages is one datagram and one withheld
+    // call would be the entire stream. Two hundred and fifty-six of them is
+    // sixteen kilobytes, a dozen datagrams, and several gaps in the middle of
+    // the stream — each of which owes the receiver a NAK and this driver a
+    // retransmission.
+    const MESSAGES: usize = 256;
+    let mut payloads = Vec::new();
+
+    for index in 0..MESSAGES {
+        let payload = format!("loss-frame-{index:03}");
+        offer_within(
+            &publisher,
+            publication_id,
+            payload.as_bytes(),
+            CONNECT_TIMEOUT,
+        )
+        .unwrap_or_else(|seen| {
+            panic!(
+                "the publication never opened its window ({payload}): {} attempts, first {:?}\n{}",
+                seen.len(),
+                seen.first(),
+                subscriber.output()
+            )
+        });
+        payloads.push(payload);
+    }
+
+    // The last message is the one that needs every earlier gap filled: it
+    // cannot arrive while the receiver is still waiting for something in
+    // front of it.
+    let last = payloads.last().cloned().expect("a last payload");
+    let output = subscriber.await_output(Duration::from_secs(30), "every message", |output| {
+        output.contains(&last)
+    });
+
+    let retransmits = counter_value_of(
+        &own_cnc,
+        deepmsg_driver::system_counters::id::RETRANSMITS_SENT,
+    );
+    let retransmitted_bytes = counter_value_of(
+        &own_cnc,
+        deepmsg_driver::system_counters::id::RETRANSMITTED_BYTES,
+    );
+
+    let _ = subscriber.terminate(Duration::from_secs(5));
+    let _ = own.stop();
+    let _ = reference.stop();
+
+    for payload in &payloads {
+        assert!(
+            output.contains(payload),
+            "the reference subscriber never received {payload}, so a withheld \
+             frame was not recovered:\n{output}"
+        );
+    }
+
+    assert!(
+        retransmits.is_some_and(|value| value > 0),
+        "a withheld frame is a frame a receiver has to ask for, and this \
+         driver counted no retransmission: {retransmits:?}\n\
+         the counters say:\n{}\nthis driver said:\n{}\nthe subscriber saw:\n{}",
+        counters_of(&own_cnc),
+        own.log_tail(60),
+        output
+    );
+    assert!(
+        retransmitted_bytes.is_some_and(|value| value > 0),
+        "the bytes of the answer are counted too: {retransmitted_bytes:?}"
+    );
 }
 
 /// A2: a reference publisher's messages, read by our client through our driver.
@@ -358,7 +505,7 @@ fn a_reference_publishers_messages_reach_our_subscriber() {
         counters_of(&own_cnc),
         client_view(&subscriber, subscription_id),
         publisher.output(),
-        own.log_tail(40)
+        own.log_tail(60)
     );
 
     let text = String::from_utf8_lossy(&received[0]).to_string();
@@ -621,12 +768,9 @@ fn a_full_window_stops_the_producer_and_a_larger_one_starts_it_again() {
     while Instant::now() < deadline {
         publisher.poll();
 
-        match publisher.offer(publication_id, &payload) {
-            Some(deepmsg_core::logbuffer::append::Appended::BackPressured) => {
-                blocked = true;
-                break;
-            }
-            Some(_) | None => {}
+        if let Some(Appended::BackPressured) = publisher.offer(publication_id, &payload) {
+            blocked = true;
+            break;
         }
 
         std::thread::sleep(Duration::from_millis(5));

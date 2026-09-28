@@ -203,6 +203,6 @@ fn counter_value(text: &str, label: &str) -> Option<i64> {
     text.lines()
         .find(|line| line.contains(label))
         .and_then(|line| line.split(':').nth(1))
-        .and_then(|rest| rest.trim().split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|value| value.parse().ok())
 }
