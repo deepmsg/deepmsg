@@ -348,6 +348,31 @@ The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
 
+Two settings are **read and not acted on**, which is not the same thing as
+being unknown, and both name the slice that will act on them:
+
+- `aeron.send.to.status.poll.ratio` (`aeronmd.h:257`, the reference's
+  sender idle-strategy duty-cycle ratio, `aeron_driver_sender.c:96`). This
+  build's sender polls its control sockets on every pass, which is the
+  strongest setting of the same knob; a value below `1` is refused and
+  anything else is accepted and has no effect. Acting on it means the sender's
+  idle strategy, which is P1-5's.
+- `aeron.spies.simulate.connection` (`aeronmd.h:178`) is read and reaches a
+  publication's parameters, but what acts on it is the *spy* machinery
+  (`aeron_network_publication.c:618`, `:761`), which this build does not have:
+  a subscription to a local network publication reads an image like any other
+  remote reader, so a publication never has a spy to count.
+
+`aeron.threading.mode` is the one setting of the reference's that this build
+does not read at all: its four values choose between dedicated, shared,
+shared-network and invoker threads
+(`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`, applied
+at `:447`), and this build has exactly one of them — dedicated, which is the
+reference's default, so a deployment that leaves it alone is served the same
+way. One that names another gets a driver that runs with the mode it named
+having no effect: worth a line here rather than a silent difference, and the
+honest place for the other three is a slice that wants them.
+
 `aeron.counters.free.to.reuse.timeout` follows the same rule and is one more
 name whose environment variable is not the property name in capitals
 (`AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT`, `aeronmd.h:525`).

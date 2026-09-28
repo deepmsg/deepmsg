@@ -321,7 +321,7 @@ impl PublicationImages {
             pending.control_address,
             pending.counters,
             window,
-            crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
+            config.status_message_timeout_ns,
             config.layout.page_size,
             pending.untethered,
             now.ns,

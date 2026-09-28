@@ -105,6 +105,15 @@ pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 /// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:205`).
 pub const RCV_INITIAL_WINDOW_LENGTH_DEFAULT: i32 = 128 * 1024;
 
+/// `AERON_RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:200`):
+/// 200 milliseconds, and the window after which a receiver decides the sender
+/// has gone.
+pub const RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT: i64 = 200 * 1000 * 1000;
+
+/// `AERON_SPIES_SIMULATE_CONNECTION_DEFAULT` (`aeron_driver_context.c:210`):
+/// false, so a stream with only spies looks unconnected until someone asks.
+pub const SPIES_SIMULATE_CONNECTION_DEFAULT: bool = false;
+
 /// `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT`
 /// (`aeron_driver_context.c:242`), which is clamped to
 /// [`crate::media::udp_transport`]'s sixteen by the context setter
@@ -290,6 +299,14 @@ pub struct DriverConfig {
     pub untethered_linger_timeout_ns: i64,
     /// And for the resting half (`aeron.untethered.resting.timeout`).
     pub untethered_resting_timeout_ns: i64,
+    /// Whether a publication counts its spies as receivers, so a stream with
+    /// only spies looks connected (`aeron.spies.simulate.connection`,
+    /// `aeronmd.h:178`, false by default).
+    ///
+    /// The setting is read and reaches a publication's parameters; what acts
+    /// on it is the *spy* machinery (`aeron_network_publication.c:618`, `:761`),
+    /// which this build does not have yet — see `docs/compat.md`.
+    pub spies_simulate_connection: bool,
     /// Whether a log buffer is left sparse
     /// (`aeron.term.buffer.sparse.file`, true by default).
     pub term_buffer_sparse_file: bool,
@@ -339,9 +356,16 @@ pub struct DriverConfig {
     /// `SO_SNDBUF`, likewise (`aeron.socket.so.sndbuf`; zero leaves the
     /// kernel's default, which is a socket *sending* into a local buffer).
     pub socket_so_sndbuf: i32,
-    /// The window a subscription offers a publication when the channel named
-    /// none (`aeron.receiver.window.length`,
+    /// The window a receiver offers a publication when the channel named none
+    /// (`aeron.rcv.initial.window.length`, which `aeronmd` turns into
+    /// `AERON_RCV_INITIAL_WINDOW_LENGTH`,
+    /// `aeron-driver/src/main/c/aeronmd.h:331`, read at
+    /// `aeron_driver_context.c:834-840`; see
     /// [`RCV_INITIAL_WINDOW_LENGTH_DEFAULT`]).
+    ///
+    /// It is the window an *image* advertises in its status messages, and so
+    /// the one the untethered state machine measures a reader's lag against
+    /// (`aeron_publication_image.c:1180-1181`, three quarters of it).
     pub receiver_window_length: i32,
     /// How many datagrams one send batch may carry
     /// (`aeron.network.publication.max.messages.per.send`, default four, one
@@ -350,6 +374,9 @@ pub struct DriverConfig {
     /// How many sender passes go by between two polls of the control sockets
     /// (`aeron.send.to.sm.poll.ratio`, [`SEND_TO_STATUS_POLL_RATIO_DEFAULT`]).
     pub send_to_sm_poll_ratio: u8,
+    /// How long a *receiver* may hear nothing before it declares the sender
+    /// gone (`aeron.rcv.status.message.timeout`, 200 milliseconds).
+    pub status_message_timeout_ns: i64,
     /// How long a publication waits for a status message before it decides its
     /// receivers are gone (`aeron.publication.connection.timeout`, five
     /// seconds).
@@ -406,6 +433,7 @@ impl Default for DriverConfig {
             untethered_window_limit_timeout_ns: UNTETHERED_WINDOW_LIMIT_TIMEOUT_NS_DEFAULT,
             untethered_linger_timeout_ns: UNTETHERED_LINGER_TIMEOUT_NS_DEFAULT,
             untethered_resting_timeout_ns: UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT,
+            spies_simulate_connection: SPIES_SIMULATE_CONNECTION_DEFAULT,
             term_buffer_sparse_file: TERM_BUFFER_SPARSE_FILE_DEFAULT,
             perform_storage_checks: PERFORM_STORAGE_CHECKS_DEFAULT,
             low_file_store_warning_threshold: LOW_FILE_STORE_WARNING_THRESHOLD_DEFAULT,
@@ -424,6 +452,7 @@ impl Default for DriverConfig {
             network_publication_max_messages_per_send:
                 NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT,
             send_to_sm_poll_ratio: SEND_TO_STATUS_POLL_RATIO_DEFAULT,
+            status_message_timeout_ns: RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             publication_connection_timeout_ns: PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
             retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
@@ -597,6 +626,103 @@ impl DriverConfig {
                 })?;
         }
 
+        // The network side's settings, each bounded the way the reference
+        // bounds it in `aeron_driver_context.c`. The bounds are the reference's
+        // `min`/`max` arguments rather than this build's own invention: a
+        // deployment that names a value the reference would have refused gets
+        // the same refusal here, and one it would have accepted gets in.
+        if let Some(value) = get(&Setting::TERM_BUFFER_LENGTH) {
+            config.term_buffer_length = parse_bounded_size32(
+                &Setting::TERM_BUFFER_LENGTH,
+                &value,
+                1024,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::MTU_LENGTH) {
+            config.mtu_length = parse_bounded_size32(
+                &Setting::MTU_LENGTH,
+                &value,
+                u64::try_from(crate::protocol::DataFrame::LENGTH).unwrap_or(u64::MAX),
+                crate::publication_params::MAX_UDP_PAYLOAD_LENGTH,
+            )?;
+        }
+        if let Some(value) = get(&Setting::PUBLICATION_WINDOW_LENGTH) {
+            config.publication_window_length = parse_bounded_size32(
+                &Setting::PUBLICATION_WINDOW_LENGTH,
+                &value,
+                0,
+                u64::try_from(deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH)
+                    .unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::SOCKET_SO_RCVBUF) {
+            config.socket_so_rcvbuf = parse_bounded_size32(
+                &Setting::SOCKET_SO_RCVBUF,
+                &value,
+                0,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::SOCKET_SO_SNDBUF) {
+            config.socket_so_sndbuf = parse_bounded_size32(
+                &Setting::SOCKET_SO_SNDBUF,
+                &value,
+                0,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::RCV_INITIAL_WINDOW_LENGTH) {
+            config.receiver_window_length = parse_bounded_size32(
+                &Setting::RCV_INITIAL_WINDOW_LENGTH,
+                &value,
+                256,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::RCV_STATUS_MESSAGE_TIMEOUT) {
+            let timeout = parse_duration_ns(&Setting::RCV_STATUS_MESSAGE_TIMEOUT, &value)?;
+            if timeout < 1_000 {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::RCV_STATUS_MESSAGE_TIMEOUT.property,
+                    value,
+                });
+            }
+            config.status_message_timeout_ns = timeout;
+        }
+        if let Some(value) = get(&Setting::SEND_TO_STATUS_POLL_RATIO) {
+            // The reference reads up to `INT32_MAX` and casts to `uint8_t`, so
+            // `256` arrives as zero polls between passes. This refuses it
+            // instead: a value that means a different value is worse than an
+            // error (the same rule `parse_bool` follows).
+            let ratio = parse_count(&Setting::SEND_TO_STATUS_POLL_RATIO, &value)?;
+            if !(1..=i64::from(u8::MAX)).contains(&ratio) {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::SEND_TO_STATUS_POLL_RATIO.property,
+                    value,
+                });
+            }
+            config.send_to_sm_poll_ratio = u8::try_from(ratio).unwrap_or(1);
+        }
+        if let Some(value) = get(&Setting::SPIES_SIMULATE_CONNECTION) {
+            config.spies_simulate_connection =
+                parse_bool(&Setting::SPIES_SIMULATE_CONNECTION, &value)?;
+        }
+        if let Some(value) = get(&Setting::MAX_RESEND) {
+            // `AERON_RETRANSMIT_HANDLER_MAX_RESEND_MAX` (`aeron_retransmit_handler.h:43`).
+            let resend = parse_count(&Setting::MAX_RESEND, &value)?;
+            if !(1..=256).contains(&resend) {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::MAX_RESEND.property,
+                    value,
+                });
+            }
+            #[allow(clippy::cast_possible_truncation)] // bounded by 256 above
+            {
+                config.max_resend = resend as i32;
+            }
+        }
+
         if let Some(value) = get(&Setting::DATA_LOSS_DROP_EVERY) {
             // Zero is "inject nothing", the same as leaving it unset; one
             // would withhold every frame, which no test means and a typo can
@@ -765,6 +891,73 @@ impl Setting {
     const LOW_FILE_STORE_WARNING_THRESHOLD: Self = Self {
         property: "low.file.store.warning.threshold",
         env: "AERON_LOW_FILE_STORE_WARNING_THRESHOLD",
+    };
+    /// `aeron.term.buffer.length`: the length of one term of a *network*
+    /// publication's log buffer (`aeronmd.h:137`, read at
+    /// `aeron_driver_context.c:712-717`, bounds 1024 to `INT32_MAX`).
+    const TERM_BUFFER_LENGTH: Self = Self {
+        property: "term.buffer.length",
+        env: "AERON_TERM_BUFFER_LENGTH",
+    };
+    /// `aeron.mtu.length`: the largest frame a network publication writes
+    /// (`aeronmd.h:193`, read at `:726-731`, bounded by the data header and the
+    /// largest UDP payload).
+    const MTU_LENGTH: Self = Self {
+        property: "mtu.length",
+        env: "AERON_MTU_LENGTH",
+    };
+    /// `aeron.publication.term.window.length`: how far ahead of its slowest
+    /// reader a network producer may run (`aeronmd.h:217`, read at `:747-752`,
+    /// zero meaning half a term).
+    const PUBLICATION_WINDOW_LENGTH: Self = Self {
+        property: "publication.term.window.length",
+        env: "AERON_PUBLICATION_TERM_WINDOW_LENGTH",
+    };
+    /// `aeron.socket.so.rcvbuf`: the socket buffer a channel that named none
+    /// gets (`aeronmd.h:233`, read at `:754-759`).
+    const SOCKET_SO_RCVBUF: Self = Self {
+        property: "socket.so.rcvbuf",
+        env: "AERON_SOCKET_SO_RCVBUF",
+    };
+    /// `aeron.socket.so.sndbuf` (`aeronmd.h:241`, read at `:761-766`).
+    const SOCKET_SO_SNDBUF: Self = Self {
+        property: "socket.so.sndbuf",
+        env: "AERON_SOCKET_SO_SNDBUF",
+    };
+    /// `aeron.rcv.initial.window.length`: the window a receiver offers when the
+    /// channel named none (`aeronmd.h:331`, read at `:834-839`).
+    ///
+    /// It is the window an image advertises, and so the one the untethered
+    /// state machine measures a reader's lag against.
+    const RCV_INITIAL_WINDOW_LENGTH: Self = Self {
+        property: "rcv.initial.window.length",
+        env: "AERON_RCV_INITIAL_WINDOW_LENGTH",
+    };
+    /// `aeron.rcv.status.message.timeout`: how long a receiver may hear nothing
+    /// before it decides the sender is gone (`aeronmd.h:265`, read at
+    /// `:820-825`).
+    const RCV_STATUS_MESSAGE_TIMEOUT: Self = Self {
+        property: "rcv.status.message.timeout",
+        env: "AERON_RCV_STATUS_MESSAGE_TIMEOUT",
+    };
+    /// `aeron.send.to.status.poll.ratio`: how many sender passes go by between
+    /// two polls of the control sockets (`aeronmd.h:257`, read at `:806-811`).
+    const SEND_TO_STATUS_POLL_RATIO: Self = Self {
+        property: "send.to.status.poll.ratio",
+        env: "AERON_SEND_TO_STATUS_POLL_RATIO",
+    };
+    /// `aeron.spies.simulate.connection`: whether a publication counts its
+    /// spies as receivers (`aeronmd.h:178`).
+    const SPIES_SIMULATE_CONNECTION: Self = Self {
+        property: "spies.simulate.connection",
+        env: "AERON_SPIES_SIMULATE_CONNECTION",
+    };
+    /// `aeron.max.resend`: how many times a term may be retransmitted
+    /// (`aeronmd.h:677`, read at `:916-921`, bounded by
+    /// `AERON_RETRANSMIT_HANDLER_MAX_RESEND_MAX`).
+    const MAX_RESEND: Self = Self {
+        property: "max.resend",
+        env: "AERON_MAX_RESEND",
     };
     /// `aeron.untethered.window.limit.timeout` (`aeronmd.h:611`).
     const UNTETHERED_WINDOW_LIMIT_TIMEOUT: Self = Self {
@@ -1029,6 +1222,31 @@ fn parse_size64(setting: &Setting, value: &str) -> Result<usize, ConfigError> {
             name: setting.property,
             value: value.to_owned(),
         })
+}
+
+/// A size setting with the reference's own bounds
+/// (`aeron_config_parse_size64`'s `min` and `max` arguments,
+/// `aeron-client/src/main/c/util/aeron_parse_util.c:170-268`), as the `i32` the
+/// driver holds it in.
+fn parse_bounded_size32(
+    setting: &Setting,
+    value: &str,
+    min: u64,
+    max: u64,
+) -> Result<i32, ConfigError> {
+    let parsed = u64::try_from(parse_size64(setting, value)?).unwrap_or(u64::MAX);
+
+    if parsed < min || parsed > max {
+        return Err(ConfigError::OutOfRange {
+            name: setting.property,
+            value: value.to_owned(),
+        });
+    }
+
+    i32::try_from(parsed).map_err(|_| ConfigError::OutOfRange {
+        name: setting.property,
+        value: value.to_owned(),
+    })
 }
 
 /// Parse a plain count, the way `aeron_config_parse_uint64` does: digits, and
@@ -1359,6 +1577,20 @@ mod tests {
                 ("AERON_DRIVER_TIMEOUT", "30000"),
                 ("AERON_DRIVER_TERMINATION_VALIDATOR", "allow"),
                 ("AERON_DIR_DELETE_ON_START", "true"),
+                // The network side's, which are the ones a deployment sets to
+                // size a UDP stream: each name is the reference's own
+                // (`aeronmd.h:137`, `:193`, `:217`, `:233`, `:241`, `:331`,
+                // `:265`, `:257`, `:677`, `:178`).
+                ("AERON_TERM_BUFFER_LENGTH", "1m"),
+                ("AERON_MTU_LENGTH", "2048"),
+                ("AERON_PUBLICATION_TERM_WINDOW_LENGTH", "64k"),
+                ("AERON_SOCKET_SO_RCVBUF", "1m"),
+                ("AERON_SOCKET_SO_SNDBUF", "512k"),
+                ("AERON_RCV_INITIAL_WINDOW_LENGTH", "64k"),
+                ("AERON_RCV_STATUS_MESSAGE_TIMEOUT", "1s"),
+                ("AERON_SEND_TO_STATUS_POLL_RATIO", "3"),
+                ("AERON_MAX_RESEND", "4"),
+                ("AERON_SPIES_SIMULATE_CONNECTION", "true"),
             ],
         )
         .expect("resolve");
@@ -1370,6 +1602,44 @@ mod tests {
         assert_eq!(30_000, config.driver_timeout_ms);
         assert_eq!(TerminationPolicy::Allow, config.termination);
         assert!(config.dirs_delete_on_start);
+
+        assert_eq!(1024 * 1024, config.term_buffer_length);
+        assert_eq!(2048, config.mtu_length);
+        assert_eq!(64 * 1024, config.publication_window_length);
+        assert_eq!(1024 * 1024, config.socket_so_rcvbuf);
+        assert_eq!(512 * 1024, config.socket_so_sndbuf);
+        assert_eq!(64 * 1024, config.receiver_window_length);
+        assert_eq!(1_000_000_000, config.status_message_timeout_ns);
+        assert_eq!(3, config.send_to_sm_poll_ratio);
+        assert_eq!(4, config.max_resend);
+        assert!(config.spies_simulate_connection);
+    }
+
+    #[test]
+    fn the_network_settings_refuse_what_the_reference_refuses() {
+        // Each of these is bounded in `aeron_driver_context.c` where it is
+        // read, and the bound is the reference's rather than this build's:
+        // `min`/`max` arguments (`:712-767`, `:806-839`, `:916-921`).
+        for (property, value) in [
+            ("term.buffer.length", "512"),         // below 1024
+            ("mtu.length", "16"),                  // below the data header
+            ("mtu.length", "65505"),               // above the largest UDP payload
+            ("rcv.initial.window.length", "255"),  // below 256
+            ("max.resend", "0"),                   // below one
+            ("max.resend", "257"),                 // above 256
+            ("send.to.status.poll.ratio", "0"),    // below one
+            ("send.to.status.poll.ratio", "256"),  // the reference truncates this to zero
+            ("rcv.status.message.timeout", "999"), // below a microsecond
+        ] {
+            let name = format!("deepmsg.{property}");
+            assert!(
+                matches!(
+                    resolve(&[("deepmsg.dir", "/tmp/x"), (name.as_str(), value)]),
+                    Err(ConfigError::OutOfRange { .. })
+                ),
+                "{property}={value} must be refused"
+            );
+        }
     }
 
     #[test]

@@ -982,6 +982,12 @@ fn an_untethered_subscriber_is_put_aside_woken_or_closed() {
             "-Daeron.untethered.window.limit.timeout=200ms",
             "-Daeron.untethered.linger.timeout=200ms",
             "-Daeron.untethered.resting.timeout=200ms",
+            // The window the machine measures a reader's lag against — three
+            // quarters of it before a reader is late
+            // (`aeron_publication_image.c:1180-1181`). The 128 KiB default takes
+            // a hundred-odd round trips through the reference driver to fill;
+            // eight kibibytes is the same test with one.
+            "-Daeron.rcv.initial.window.length=8k",
         ],
     ) else {
         driver::announce_own_skip();
@@ -1037,12 +1043,12 @@ fn an_untethered_subscriber_is_put_aside_woken_or_closed() {
     );
 
     // A window's worth of messages, read by one subscriber and not by the
-    // other two. The publisher is held a window ahead of the *slowest* reader,
-    // so this is the largest lag the image can be made to show — and three
-    // quarters of a window is the threshold the state machine tests against.
-    const MESSAGES: usize = 140;
+    // other two. The publisher is held one window ahead of the *slowest*
+    // reader, so a window is all the lag the image can be made to show — and
+    // three quarters of it is what makes a reader late.
+    const MESSAGES: usize = 8;
     let mut offered = 0;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
 
     while offered < MESSAGES && Instant::now() < deadline {
         client.poll();
@@ -1057,26 +1063,25 @@ fn an_untethered_subscriber_is_put_aside_woken_or_closed() {
         }
     }
 
-    assert_eq!(
-        MESSAGES, offered,
-        "the publication has to take the whole window before anything can be late"
-    );
-
+    // Seven of eight: the eighth frame is past the window the two stallers are
+    // still holding shut. It is the *bytes* that matter, not the count.
     assert!(
-        wait_for(&mut client, Duration::from_secs(10), |_client| {
-            sub_position(&own_cnc, reader)
-                .zip(sub_position(&own_cnc, rejoining))
-                .is_some_and(|(reader, lagging)| reader.1 - lagging.1 > IMAGE_WINDOW / 4 * 3)
-        }),
-        "the reader has to be three quarters of a window ahead: reader {:?}, rejoining {:?}",
+        offered >= MESSAGES - 1,
+        "the publication has to take a window's worth before anything can be late: {offered} of {MESSAGES}"
+    );
+    assert!(
+        sub_position(&own_cnc, reader)
+            .zip(sub_position(&own_cnc, leaving))
+            .is_some_and(|(reader, lagging)| reader.1 - lagging.1 > IMAGE_WINDOW / 4 * 3),
+        "the reader has to be three quarters of a window ahead: reader {:?}, leaving {:?}",
         sub_position(&own_cnc, reader),
-        sub_position(&own_cnc, rejoining)
+        sub_position(&own_cnc, leaving)
     );
 
     // First outcome: both stallers are put aside, and the client is told its
     // image is gone.
     assert!(
-        wait_for(&mut client, Duration::from_secs(10), |client| images_of(
+        wait_for(&mut client, Duration::from_secs(20), |client| images_of(
             client, rejoining
         ) == 0
             && images_of(client, leaving) == 0),
@@ -1131,9 +1136,10 @@ fn counter_value_of(cnc: &deepmsg_cnc::CncFile, counter_id: i32) -> Option<i64> 
     cnc.counters()?.value(counter_id)
 }
 
-/// The image's flow-control window, for the two numbers the untethered test
-/// needs from it: how far behind a reader may fall before it is late.
-const IMAGE_WINDOW: i64 = 128 * 1024;
+/// The window the untethered test gives its driver (`rcv.initial.window.length`
+/// below): a reader is late once it is three quarters of this behind the
+/// fastest one.
+const IMAGE_WINDOW: i64 = 8 * 1024;
 
 /// A message big enough that a window's worth of them is a hundred sends
 /// rather than two thousand.

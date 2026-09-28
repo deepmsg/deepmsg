@@ -24,7 +24,7 @@
 
 use deepmsg_core::logbuffer::descriptor;
 
-use crate::channel_uri::{ChannelUri, UriError};
+use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::config::DriverConfig;
 
 /// The parameter names this module reads
@@ -490,14 +490,34 @@ impl PublicationParams {
         config: &DriverConfig,
     ) -> Result<Self, PublicationParamsError> {
         // The defaults, in the reference's order and from the same settings
-        // (`aeron_driver_uri.c:224-254`).
+        // (`aeron_driver_uri.c:224-254`). Three of them are chosen by
+        // **transport**, which the reference spells as a ternary on every line
+        // (`:230`, `:232`, `:295`): a network publication is sized like a
+        // network publication, and one that names none of `term-length`,
+        // `mtu=` or `pub-wnd` gets the network defaults rather than the IPC
+        // ones. Reading them from the IPC settings for a UDP channel is a
+        // 64 MiB term where the reference has 16 MiB — visible in the SETUP
+        // frame and in the log file's own length.
+        let is_ipc = uri.transport() == Transport::Ipc;
         let mut params = Self {
-            term_length: config.ipc_term_buffer_length,
+            term_length: if is_ipc {
+                config.ipc_term_buffer_length
+            } else {
+                config.term_buffer_length
+            },
             term_length_named: false,
-            mtu_length: config.ipc_mtu_length,
+            mtu_length: if is_ipc {
+                config.ipc_mtu_length
+            } else {
+                config.mtu_length
+            },
             mtu_length_named: false,
             publication_window_length: 0,
-            max_resend: 0,
+            // The reference leaves this at zero and reads `context->max_resend`
+            // when the channel named none (`aeron_network_publication.c:144`),
+            // so zero here would be a driver that never retransmits. The
+            // setting is what the channel parameter overrides below.
+            max_resend: config.max_resend,
             entity_tag: -1,
             response_correlation_id: -1,
             session_id: None,
@@ -507,7 +527,7 @@ impl PublicationParams {
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
             is_sparse: config.term_buffer_sparse_file,
             signal_eos: true,
-            spies_simulate_connection: false,
+            spies_simulate_connection: config.spies_simulate_connection,
             starting_position: None,
             initial_term_id: 0,
         };
@@ -539,8 +559,14 @@ impl PublicationParams {
         // The window comes from the *final* term length, and the URI's own
         // `pub-wnd` is then checked against the final MTU and term length
         // (`aeron_driver_uri.c:280-302`).
-        params.publication_window_length =
-            producer_window_length(config.ipc_publication_window_length, params.term_length);
+        params.publication_window_length = producer_window_length(
+            if is_ipc {
+                config.ipc_publication_window_length
+            } else {
+                config.publication_window_length
+            },
+            params.term_length,
+        );
         if let Some(window) = uri.size(key::PUBLICATION_WINDOW)? {
             if window < u64::try_from(params.mtu_length).unwrap_or(u64::MAX)
                 || window > u64::try_from(params.term_length >> 1).unwrap_or(u64::MAX)
@@ -838,8 +864,39 @@ mod tests {
         assert_eq!(-1, params.entity_tag);
         assert_eq!(-1, params.response_correlation_id);
         assert_eq!(None, params.session_id);
-        assert_eq!(0, params.max_resend);
+        assert_eq!(
+            config().max_resend,
+            params.max_resend,
+            "a channel that names none gets the driver's `aeron.max.resend`, not zero: \
+             the reference reads `context->max_resend` where the channel named none \
+             (`aeron_network_publication.c:144`), and zero would be a publication \
+             that never retransmits"
+        );
         assert_eq!(None, params.starting_position);
+    }
+
+    #[test]
+    fn a_network_channel_is_sized_like_a_network_channel() {
+        // The reference chooses four defaults by *transport*, not once for both
+        // (`aeron_driver_uri.c:230`, `:232`, `:295`): a UDP channel that names
+        // no term, MTU or window gets the network settings. Reading them from
+        // the IPC ones is a 64 MiB term where the reference has 16 MiB — which
+        // is not an invisible number: the term length goes out in the SETUP
+        // frame and is the length of the log file the receiver maps.
+        let config = config();
+        let params = resolve_ok("aeron:udp?endpoint=localhost:40456");
+
+        assert_eq!(config.term_buffer_length, params.term_length);
+        assert_eq!(config.mtu_length, params.mtu_length);
+        assert_eq!(
+            producer_window_length(config.publication_window_length, params.term_length),
+            params.publication_window_length
+        );
+
+        // And the IPC side is unchanged: it is the one that was right.
+        let ipc = resolve_ok("aeron:ipc");
+        assert_eq!(config.ipc_term_buffer_length, ipc.term_length);
+        assert_eq!(config.ipc_mtu_length, ipc.mtu_length);
     }
 
     #[test]

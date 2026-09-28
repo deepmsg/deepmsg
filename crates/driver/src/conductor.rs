@@ -605,7 +605,7 @@ impl Conductor {
             cnc.layout().counters_values.len(),
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
-            crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
+            config.status_message_timeout_ns,
             config.receiver_window_length,
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
         )
