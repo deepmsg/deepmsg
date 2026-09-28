@@ -64,7 +64,12 @@ pub struct TransportParams {
 /// The methods are the ones this slice calls; `reconnect` and the poller's
 /// add/remove arrive with the features that need them (a re-resolving address,
 /// and the epoll poller).
-pub trait Transport {
+///
+/// `Send` because an endpoint is created on the conductor and then *moved* to
+/// the sender or the receiver, which is where its socket lives from then on
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2015` hands it over the
+/// same way).
+pub trait Transport: Send {
     /// Send up to sixteen datagrams, one per buffer, and answer with how many
     /// left the machine.
     ///
