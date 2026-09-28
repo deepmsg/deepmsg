@@ -39,6 +39,7 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
 
 use crate::flowcontrol::receiver_window_length;
+use crate::loss_detector::{Gap, LossDetector};
 use crate::protocol::{DataFrame, FrameHeader, HEADER_LENGTH, header_flags};
 use crate::subscribable::{Subscribable, TetherablePosition};
 use crate::system_counters::{self, System};
@@ -125,6 +126,10 @@ pub struct PublicationImage {
     /// Whether the sender revoked the stream (a `REVOKED` flag on an
     /// end-of-stream heartbeat).
     pub is_revoked: bool,
+    /// Where the stream ended, as the last end-of-stream frame said
+    /// (`connection->eos_position`): the position of that frame, not the high
+    /// water mark, which may have moved on.
+    pub eos_position: i64,
     /// Why this image was rejected, when it was — an image that cannot be
     /// built still has to tell its sender so (`:974-996`).
     pub invalidation_reason: Option<String>,
@@ -151,6 +156,9 @@ pub struct PublicationImage {
     max_receiver_window_length: i32,
     /// How long this image may go quiet before it drains.
     liveness_timeout_ns: i64,
+    /// The holes in this image's stream, and the timer on the one being asked
+    /// for (`aeron_publication_image_t.loss_detector`).
+    loss_detector: LossDetector,
     /// Where it is in its life.
     pub state: ImageState,
     /// When the state last changed, for the linger timeout.
@@ -269,6 +277,7 @@ impl PublicationImage {
             is_end_of_stream: false,
             is_sending_eos_sm: false,
             is_revoked: false,
+            eos_position: initial_position,
             invalidation_reason: None,
             next_sm_position: initial_position,
             next_sm_receiver_window_length: window,
@@ -284,6 +293,7 @@ impl PublicationImage {
             initial_window_length: window,
             max_receiver_window_length: window,
             liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS,
+            loss_detector: LossDetector::new(registration_id),
             state: ImageState::Active,
             time_of_last_state_change_ns: now_ns,
         }
@@ -475,7 +485,8 @@ impl PublicationImage {
         }
 
         // The end of the stream: where it ended, and whether it was revoked.
-        let eos_position = self.find_eos_position(counters, regions);
+        self.eos_position = packet_position;
+        let eos_position = self.find_eos_position();
         self.is_end_of_stream = true;
 
         if header.flags & header_flags::REVOKED != 0 {
@@ -489,10 +500,11 @@ impl PublicationImage {
         }
     }
 
-    /// Where the stream ended, from the last data frame
-    /// (`aeron_publication_find_eos_position`).
-    fn find_eos_position(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> i64 {
-        self.hwm_position(counters, regions)
+    /// Where the stream ended: the position of the frame that said so
+    /// (`aeron_publication_find_eos_position`, `:616-630`, which takes the
+    /// largest of its connections' positions).
+    const fn find_eos_position(&self) -> i64 {
+        self.eos_position
     }
 
     /// Remember where this connection answers
@@ -520,14 +532,14 @@ impl PublicationImage {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
-    ) -> usize {
+    ) -> Option<Gap> {
         let hwm_position = self.hwm_position(counters, regions);
 
         let Some(min_sub_pos) = self.subscribers.min_active_position(counters, regions) else {
             // Nobody is reading: there is no position to advance and no window
             // to offer. Status messages still go out on their timeout, which is
             // what keeps the sender's view of this endpoint alive.
-            return 0;
+            return None;
         };
 
         let max_sub_pos = self
@@ -538,9 +550,31 @@ impl PublicationImage {
         let rcv_pos = counters.value(regions, self.counters.rcv_pos).unwrap_or(0);
         let rebuild_position = rcv_pos.max(max_sub_pos);
 
-        // Where the contiguous data ends: the highest position whose term
-        // holds published frames from `rebuild_position` onwards.
-        let rebuilt = self.contiguous_position(rebuild_position, hwm_position);
+        // Where the reader may go, and which hole is in the way
+        // (`aeron_publication_image_track_rebuild`'s call to
+        // `aeron_loss_detector_scan`, `:519-528`).
+        let index = Position::from_raw(rebuild_position).index(self.position_bits_to_shift);
+        let scan = match self.log.term(index) {
+            Some(term) => self.loss_detector.scan(
+                &term.as_read_only(),
+                rebuild_position,
+                hwm_position,
+                self.term_length.unsigned_abs() as i32,
+                self.position_bits_to_shift,
+                self.initial_term_id,
+                now_ns,
+            ),
+            None => crate::loss_detector::ScanResult {
+                rebuild_offset: Position::from_raw(rebuild_position)
+                    .term_offset(self.position_bits_to_shift),
+                loss_found: false,
+                nak: None,
+            },
+        };
+
+        let term_offset =
+            Position::from_raw(rebuild_position).term_offset(self.position_bits_to_shift);
+        let rebuilt = (rebuild_position - i64::from(term_offset)) + i64::from(scan.rebuild_offset);
 
         system_counters::propose_max(counters, regions, self.counters.rcv_pos, rebuilt);
 
@@ -549,52 +583,11 @@ impl PublicationImage {
         let window_length = self.next_sm_receiver_window_length;
         let threshold = window_length / 4;
 
-        if min_sub_pos > self.next_sm_position + i64::from(threshold)
-            || window_length != self.next_sm_receiver_window_length
-        {
+        if min_sub_pos > self.next_sm_position + i64::from(threshold) {
             self.schedule_status_message(min_sub_pos, window_length, counters, regions, now_ns);
-            1
-        } else {
-            0
-        }
-    }
-
-    /// The highest position from `from` that a reader may be moved to: the end
-    /// of the contiguous run of published frames.
-    fn contiguous_position(&self, from: i64, hwm: i64) -> i64 {
-        let term_length = self.term_length.unsigned_abs() as usize;
-        let mut position = from;
-
-        while position < hwm {
-            let index = Position::from_raw(position).index(self.position_bits_to_shift);
-            let Some(term) = self.log.term(index) else {
-                break;
-            };
-
-            let offset = Position::from_raw(position).term_offset(self.position_bits_to_shift);
-            let offset = usize::try_from(offset.unsigned_abs()).unwrap_or(0);
-            let left = term_length - offset.min(term_length);
-
-            match deepmsg_core::logbuffer::scan::scan_for_availability(
-                &term.as_read_only(),
-                offset,
-                i32::try_from(left).unwrap_or(i32::MIN),
-                i32::try_from(left).unwrap_or(i32::MIN),
-            ) {
-                deepmsg_core::logbuffer::scan::Availability::Ready { available, padding } => {
-                    let step = i64::from(available + padding);
-
-                    if step <= 0 {
-                        break;
-                    }
-
-                    position += step;
-                }
-                _ => break,
-            }
         }
 
-        position.min(hwm)
+        scan.nak
     }
 
     /// Note what the next status message should say
@@ -883,4 +876,420 @@ pub fn tail_of(log: &LogFile, index: usize) -> Option<RawTail> {
         descriptor::TERM_TAIL_COUNTERS_OFFSET + index * descriptor::TERM_TAIL_COUNTER_STRIDE;
 
     metadata.load_i64_acquire(offset).map(RawTail::from_raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::channel_uri::ChannelUri;
+    use crate::protocol::FrameHeader;
+    use crate::subscribable::TetherState;
+    use deepmsg_core::buffer::AtomicBuffer;
+    use deepmsg_core::logbuffer::frame::Frame;
+
+    const TERM_LENGTH: i32 = 64 * 1024;
+    const SESSION_ID: i32 = 42;
+    const STREAM_ID: i32 = 1001;
+    const INITIAL_TERM_ID: i32 = 1_000;
+
+    /// The two counter regions, held so that a test can build a view over them
+    /// per call — the same fixture shape the rest of this crate's tests use,
+    /// because a view borrows the bytes and cannot be stored beside them.
+    struct Counters {
+        metadata: Vec<u8>,
+        values: Vec<u8>,
+    }
+
+    impl Counters {
+        fn new() -> Self {
+            Self {
+                metadata: vec![0u8; 64 * 1024 * 4],
+                values: vec![0u8; 64 * 1024],
+            }
+        }
+
+        fn open(&mut self) -> CounterRegions<'_> {
+            CounterRegions::new(
+                AtomicBuffer::from_slice_mut(&mut self.metadata).expect("aligned"),
+                AtomicBuffer::from_slice_mut(&mut self.values).expect("aligned"),
+            )
+            .expect("four-to-one")
+        }
+    }
+
+    /// The directory an image's log buffer lands in, removed when it goes.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        _dir: TempDir,
+        image: PublicationImage,
+        counters: CounterManager,
+        holder: Counters,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("deepmsg-image-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("a temp directory");
+
+            let log = deepmsg_core::logbuffer::logfile::LogFile::create(
+                &dir.join("image.logbuffer"),
+                TERM_LENGTH,
+                4096,
+                false,
+            )
+            .expect("a log buffer");
+
+            let mut holder = Counters::new();
+            let mut counters = CounterManager::new(64 * 1024, 1_000).expect("room");
+            let (rcv_hwm, rcv_pos) = {
+                let regions = holder.open();
+
+                let hwm = counters
+                    .allocate(&regions, 3, &[], b"rcv-hwm", 1)
+                    .expect("a counter");
+                let pos = counters
+                    .allocate(&regions, 5, &[], b"rcv-pos", 1)
+                    .expect("a counter");
+
+                (hwm, pos)
+            };
+
+            let setup = crate::protocol::SetupFrame {
+                term_offset: 0,
+                session_id: SESSION_ID,
+                stream_id: STREAM_ID,
+                initial_term_id: INITIAL_TERM_ID,
+                active_term_id: INITIAL_TERM_ID,
+                term_length: TERM_LENGTH,
+                mtu: 1408,
+                ttl: 0,
+            };
+
+            let uri = "aeron:udp?endpoint=127.0.0.1:40123";
+            let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+            let channel = crate::udp_channel::UdpChannel::resolve(uri.as_bytes(), &parsed)
+                .expect("a channel");
+
+            let image = PublicationImage::create(
+                7,
+                1,
+                &channel.original_uri,
+                Box::new(log),
+                &setup,
+                "127.0.0.1:5555".parse().expect("an address"),
+                "127.0.0.1:5555".parse().expect("an address"),
+                ImageCounters { rcv_hwm, rcv_pos },
+                128 * 1024,
+                STATUS_MESSAGE_TIMEOUT_NS,
+                4096,
+                0,
+            );
+
+            Self {
+                _dir: TempDir(dir),
+                image,
+                counters,
+                holder,
+            }
+        }
+    }
+
+    /// A data packet carrying one frame, **padded to the aligned frame
+    /// length** — which is what a sender puts on the wire and what
+    /// `validate_packet` requires: the frames in a datagram are aligned, so a
+    /// packet's length is always a multiple of the frame alignment.
+    fn packet(term_id: i32, term_offset: i32, payload: &[u8]) -> Vec<u8> {
+        let frame = crate::protocol::DataFrame {
+            term_offset,
+            session_id: SESSION_ID,
+            stream_id: STREAM_ID,
+            term_id,
+            reserved_value: 0,
+        };
+
+        let aligned = deepmsg_core::logbuffer::position::align_up(
+            i32::try_from(32 + payload.len()).expect("small"),
+            32,
+        );
+        let mut bytes = vec![0u8; usize::try_from(aligned).expect("small")];
+        assert!(
+            frame
+                .write_with_flags(
+                    &mut bytes,
+                    crate::protocol::header_flags::BEGIN | crate::protocol::header_flags::END
+                )
+                .is_some()
+        );
+        bytes[32..32 + payload.len()].copy_from_slice(payload);
+
+        // The frame's own length, which a writer sets from what it wrote —
+        // `DataFrame::write` writes the *fixed* header, whose length is the
+        // header's.
+        let header = FrameHeader {
+            frame_length: i32::try_from(32 + payload.len()).expect("small"),
+            version: crate::protocol::VERSION,
+            flags: crate::protocol::header_flags::BEGIN | crate::protocol::header_flags::END,
+            frame_type: crate::protocol::frame_type::DATA,
+        };
+        assert!(header.write(&mut bytes).is_some());
+
+        bytes
+    }
+
+    /// A reader's position counter, added to the image — and its **id**
+    /// returned, because that is what the image tracks: a position held under
+    /// the wrong counter is a reader that is not there.
+    fn add_reader(fixture: &mut Fixture) -> i32 {
+        let regions = fixture.holder.open();
+
+        let counter_id = fixture
+            .counters
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let _ = fixture.counters.set_value(&regions, counter_id, 0);
+
+        let position = TetherablePosition {
+            counter_id,
+            subscription_registration_id: 9,
+            time_of_last_update_ns: 0,
+            state: TetherState::Active,
+            is_tether: true,
+            is_rejoin: false,
+        };
+
+        fixture.image.add_subscriber(position);
+
+        counter_id
+    }
+
+    #[test]
+    fn a_packet_reaches_the_term_and_moves_the_high_water_mark() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+        let system = System::new(&fixture.counters, &regions);
+
+        let payload = b"the reference's bytes";
+        let bytes = packet(INITIAL_TERM_ID, 0, payload);
+
+        let accepted = fixture.image.insert_packet(
+            INITIAL_TERM_ID,
+            0,
+            &bytes,
+            "127.0.0.1:5555".parse().expect("an address"),
+            &system,
+            &fixture.counters,
+            &regions,
+            1_000,
+        );
+
+        assert_eq!(bytes.len(), accepted);
+        assert_eq!(
+            Some(i64::try_from(bytes.len()).expect("small")),
+            fixture
+                .counters
+                .value(&regions, fixture.image.counters.rcv_hwm)
+        );
+
+        // And the bytes are in the term, at their offset, with the frame's own
+        // header: what a reader maps and reads.
+        let term = fixture.image.log.term(0).expect("a term");
+        let frame = Frame::new(&term, 0);
+        let mut read_back = [0u8; 21];
+        frame.copy_payload(&mut read_back).expect("in range");
+        assert_eq!(payload, &read_back);
+
+        // A second copy of the same packet neither moves the high-water mark
+        // nor rewrites the term: the slot already holds a frame, and
+        // `insert_packet`'s rule is that a filled slot is left alone. That is
+        // what makes a retransmission idempotent.
+        let before = fixture
+            .counters
+            .value(&regions, fixture.image.counters.rcv_hwm);
+
+        assert!(
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                0,
+                &bytes,
+                "127.0.0.1:5555".parse().expect("an address"),
+                &system,
+                &fixture.counters,
+                &regions,
+                1_100,
+            ) > 0
+        );
+
+        assert_eq!(
+            before,
+            fixture
+                .counters
+                .value(&regions, fixture.image.counters.rcv_hwm),
+            "the high-water mark does not move for a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_hole_stops_the_reader_until_it_is_filled() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+        let system = System::new(&fixture.counters, &regions);
+        let source = "127.0.0.1:5555".parse().expect("an address");
+
+        // Two frames a hole apart. Each is 160 bytes aligned, so the frame
+        // that was missed would have occupied 160..320 and the next one starts
+        // where it would have ended — at 320.
+        let first = packet(INITIAL_TERM_ID, 0, &[1u8; 100]);
+        let third = packet(INITIAL_TERM_ID, 320, &[3u8; 100]);
+
+        assert!(
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                0,
+                &first,
+                source,
+                &system,
+                &fixture.counters,
+                &regions,
+                1_000
+            ) > 0
+        );
+        assert!(
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                320,
+                &third,
+                source,
+                &system,
+                &fixture.counters,
+                &regions,
+                1_000
+            ) > 0
+        );
+
+        // The reader may go as far as the hole and no further, and the hole is
+        // asked for once it has waited its delay.
+        let gap = fixture
+            .image
+            .track_rebuild(&fixture.counters, &regions, 1_000)
+            .or_else(|| {
+                fixture
+                    .image
+                    .track_rebuild(&fixture.counters, &regions, 1_000 + 1_000_000)
+            });
+
+        let gap = gap.expect("a hole is asked for");
+        assert_eq!(INITIAL_TERM_ID, gap.term_id);
+        assert_eq!(160, gap.term_offset, "where the frame was missed");
+        assert_eq!(160, gap.length, "and how much of it is missing");
+
+        assert_eq!(
+            Some(160),
+            fixture
+                .counters
+                .value(&regions, fixture.image.counters.rcv_pos),
+            "a reader stops at the hole"
+        );
+
+        // The retransmission arrives, and the reader moves past the hole — all
+        // the way to the end of what has been received.
+        let second = packet(INITIAL_TERM_ID, 160, &[2u8; 100]);
+        assert!(
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                160,
+                &second,
+                source,
+                &system,
+                &fixture.counters,
+                &regions,
+                2_000
+            ) > 0
+        );
+
+        let _ = fixture
+            .image
+            .track_rebuild(&fixture.counters, &regions, 2_100);
+
+        assert_eq!(
+            Some(480),
+            fixture
+                .counters
+                .value(&regions, fixture.image.counters.rcv_pos),
+            "both frames and the retransmitted one"
+        );
+    }
+
+    #[test]
+    fn an_end_of_stream_heartbeat_ends_the_image() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+        let system = System::new(&fixture.counters, &regions);
+
+        // A heartbeat: a whole data header whose frame length is zero, with
+        // the end-of-stream flag.
+        let frame = crate::protocol::DataFrame {
+            term_offset: 0,
+            session_id: SESSION_ID,
+            stream_id: STREAM_ID,
+            term_id: INITIAL_TERM_ID,
+            reserved_value: 0,
+        };
+        let mut bytes = [0u8; 32];
+        assert!(
+            frame
+                .write_with_flags(
+                    &mut bytes,
+                    crate::protocol::header_flags::BEGIN
+                        | crate::protocol::header_flags::END
+                        | crate::protocol::header_flags::EOS
+                )
+                .is_some()
+        );
+        let header = FrameHeader {
+            frame_length: 0,
+            version: crate::protocol::VERSION,
+            flags: crate::protocol::header_flags::BEGIN
+                | crate::protocol::header_flags::END
+                | crate::protocol::header_flags::EOS,
+            frame_type: crate::protocol::frame_type::DATA,
+        };
+        assert!(header.write(&mut bytes).is_some());
+
+        assert_eq!(
+            0,
+            fixture.image.insert_packet(
+                INITIAL_TERM_ID,
+                0,
+                &bytes,
+                "127.0.0.1:5555".parse().expect("an address"),
+                &system,
+                &fixture.counters,
+                &regions,
+                1_000
+            ),
+            "a heartbeat carries no bytes to insert"
+        );
+
+        assert!(fixture.image.is_end_of_stream);
+        assert!(!fixture.image.is_revoked);
+        assert_eq!(
+            Some(0),
+            fixture.image.end_of_stream_position(),
+            "the heartbeat's own position"
+        );
+    }
 }

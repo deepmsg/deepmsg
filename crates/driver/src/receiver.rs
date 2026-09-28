@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
 use crate::idle::Backoff;
-use crate::loss_detector::LossDetector;
+
 use crate::media::dispatcher::Interest;
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
@@ -403,8 +403,6 @@ struct ReceiverThread {
     events: Outbox<ReceiverEvent>,
     endpoints: Vec<(u64, Box<ReceiveChannelEndpoint>)>,
     images: Vec<PublicationImage>,
-    /// One loss detector per image, keyed by image registration id.
-    losses: Vec<(i64, LossDetector)>,
     pending_setups: Vec<PendingSetup>,
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
@@ -433,7 +431,6 @@ impl ReceiverThread {
             events,
             endpoints: Vec::new(),
             images: Vec::new(),
-            losses: Vec::new(),
             pending_setups: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
@@ -507,14 +504,11 @@ impl ReceiverThread {
                             );
                         }
 
-                        self.losses
-                            .push((registration_id, LossDetector::new(registration_id)));
                         self.images.push(image);
                     }
                     ReceiverCommand::RemoveImage { registration_id } => {
                         self.images
                             .retain(|image| image.registration_id != registration_id);
-                        self.losses.retain(|(id, _)| *id != registration_id);
                         self.pending_setups
                             .retain(|pending| pending.session_id != registration_id as i32);
 
@@ -818,8 +812,30 @@ impl ReceiverThread {
             };
 
             // What a reader may read, which is what the next status message
-            // will say.
-            work += image.track_rebuild(counters, regions, now_ns);
+            // will say — and the hole, if one is in the way and has waited long
+            // enough to be asked for (`send_pending_loss`, `:995-1075`).
+            let gap = image.track_rebuild(counters, regions, now_ns);
+
+            if let Some(gap) = gap {
+                let Some(control_address) = image.control_address else {
+                    continue;
+                };
+
+                if endpoint
+                    .send_nak(
+                        control_address,
+                        image.stream_id,
+                        image.session_id,
+                        gap.term_id,
+                        gap.term_offset,
+                        i32::try_from(gap.length).unwrap_or(i32::MAX),
+                    )
+                    .is_ok()
+                {
+                    system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                    work += 1;
+                }
+            }
 
             if image
                 .send_pending_status_message(endpoint, counters, regions, system, now_ns)

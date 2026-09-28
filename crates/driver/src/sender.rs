@@ -391,8 +391,14 @@ impl SenderThread {
     ) -> usize {
         let mut work = 0;
 
-        for (_, endpoint) in endpoints.iter_mut() {
-            let received = endpoint.transport_mut().receive(buffers, datagrams);
+        for index in 0..endpoints.len() {
+            // The borrow of this endpoint ends before the datagrams are
+            // dispatched, because a dispatch may need to *send* through any of
+            // them (a resend answers a NAK on the endpoint it arrived at).
+            let received = endpoints[index]
+                .1
+                .transport_mut()
+                .receive(buffers, datagrams);
 
             let received = match received {
                 Ok(received) => received,
@@ -420,6 +426,7 @@ impl SenderThread {
                     counters,
                     regions,
                     publications,
+                    endpoints,
                     &buffers[slot][..datagram.length],
                 );
             }
@@ -440,6 +447,7 @@ impl SenderThread {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut [NetworkPublication],
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
         bytes: &[u8],
     ) {
         let system = System::new(counters, regions);
@@ -474,11 +482,26 @@ impl SenderThread {
             }
             frame_type::NAK => {
                 if let Some(frame) = NakFrame::read(bytes) {
-                    if let Some(publication) =
-                        find_publication(publications, frame.stream_id, frame.session_id)
-                    {
-                        let _ = publication.on_nak(&frame, &system, now_ns);
-                    }
+                    let Some(index) =
+                        index_of_publication(publications, frame.stream_id, frame.session_id)
+                    else {
+                        return;
+                    };
+
+                    let endpoint_id = publications[index].endpoint_id;
+                    let Some(position) = endpoints.iter().position(|(id, _)| *id == endpoint_id)
+                    else {
+                        return;
+                    };
+
+                    let (_, endpoint) = &mut endpoints[position];
+                    let publication = &mut publications[index];
+
+                    // The resend happens *inside* `on_nak` when the channel's
+                    // delay is zero — the same place the reference's callback
+                    // fires (`aeron_retransmit_handler.c:110-124`).
+                    let _ =
+                        publication.on_nak(&frame, &system, endpoint, counters, regions, now_ns);
                 }
             }
             frame_type::ERR => {
@@ -576,6 +599,18 @@ impl SenderThread {
             );
         }
     }
+}
+
+/// The publication a control frame names, as an index — for a caller that
+/// needs another field beside it and so cannot hold the borrow.
+fn index_of_publication(
+    publications: &[NetworkPublication],
+    stream_id: i32,
+    session_id: i32,
+) -> Option<usize> {
+    publications.iter().position(|publication| {
+        publication.stream_id == stream_id && publication.session_id == session_id
+    })
 }
 
 /// The publication a control frame names

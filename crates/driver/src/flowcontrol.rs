@@ -128,11 +128,23 @@ pub trait Strategy {
 /// `aeron_max_flow_control_strategy_state_t` are the same struct with the same
 /// functions, `aeron_flow_control.c:30-40`); the multicast admission gate lives
 /// in the delivery layer, not here.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct MaxStrategy {
     /// How many receiver windows a retransmission may cover
     /// (`retransmit_receiver_window_multiple`).
     pub retransmit_receiver_window_multiple: usize,
+}
+
+impl Default for MaxStrategy {
+    /// The driver's own default multiple, **not** `usize::default()`: a
+    /// strategy whose multiple is zero is one that answers every NAK with a
+    /// zero-length retransmission, which is a driver that reports a loss it
+    /// never retransmits. The derived default would be exactly that.
+    fn default() -> Self {
+        Self {
+            retransmit_receiver_window_multiple: UNICAST_RRWM_DEFAULT,
+        }
+    }
 }
 
 /// The default retransmit receiver window multiple

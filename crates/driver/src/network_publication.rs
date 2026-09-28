@@ -916,7 +916,24 @@ impl NetworkPublication {
     }
 
     /// A NAK arrived (`aeron_network_publication_on_nak`, `:730-758`).
-    pub fn on_nak(&mut self, frame: &NakFrame, system: &System<'_>, now_ns: i64) -> NakOutcome {
+    ///
+    /// With a zero delay the handler answers with the retransmission it wants
+    /// sent *now*, and the reference sends it from inside the handler through
+    /// the `resend` callback it was given (`aeron_retransmit_handler_on_nak`,
+    /// `aeron_retransmit_handler.c:110-124`). This does the same: the answer is
+    /// a `NakOutcome::Send` the caller must not have to act on separately,
+    /// because a caller that forgot would be a driver that acknowledges a NAK
+    /// and sends nothing.
+    #[allow(clippy::too_many_arguments)] // the NAK and the things a resend needs
+    pub fn on_nak(
+        &mut self,
+        frame: &NakFrame,
+        system: &System<'_>,
+        endpoint: &mut SendChannelEndpoint,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> NakOutcome {
         system.increment(system_counters::id::NAK_MESSAGES_RECEIVED);
 
         let term_length = self.term_length as usize;
@@ -942,6 +959,10 @@ impl NetworkPublication {
         );
 
         let _ = mtu;
+
+        if let NakOutcome::Send(resend) = outcome {
+            let _ = self.resend(endpoint, resend, system, counters, regions);
+        }
 
         outcome
     }
@@ -1383,6 +1404,136 @@ mod tests {
             Some(window),
             counters.value(&regions, fixture.publication.counters.pub_lmt),
             "the producer may write a window ahead of what has been sent"
+        );
+    }
+
+    #[test]
+    fn a_nak_brings_a_frame_back() {
+        // A5's send half: a frame goes out, a NAK says it did not arrive, and
+        // the same bytes leave again. The channel's delay is zero here — the
+        // test fixture's handler — so the resend happens inside `on_nak`, which
+        // is where the reference's callback fires too.
+        let mut fixture = fixture();
+        publish_frame(&fixture.publication.log, 0, 0, 1_000, &[7u8; 100]);
+        let (counters, regions) = fixture.counters.open();
+        let system = System::new(&counters, &regions);
+
+        let mut endpoint_manager = CounterManager::new(64 * 1024, 1_000).expect("room");
+        let mut metadata = vec![0u8; 64 * 1024 * 4];
+        let mut values = vec![0u8; 64 * 1024];
+        let endpoint_regions = CounterRegions::new(
+            AtomicBuffer::from_slice_mut(&mut metadata).expect("aligned"),
+            AtomicBuffer::from_slice_mut(&mut values).expect("aligned"),
+        )
+        .expect("four-to-one");
+
+        let mut endpoint = SendChannelEndpoint::create(
+            fixture.channel.clone(),
+            &crate::media::TransportParams::default(),
+            &mut endpoint_manager,
+            &endpoint_regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        let _ = counters.set_value(&regions, fixture.publication.counters.snd_lmt, 4096);
+        let _ = counters.set_value(&regions, fixture.publication.counters.snd_pos, 0);
+
+        // The first send, which is what the NAK will say was lost.
+        assert_eq!(
+            1,
+            fixture
+                .publication
+                .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
+                .expect("a send")
+        );
+
+        let mut buffers = vec![vec![0u8; 2048]];
+        let first = receive(&fixture.listener, &mut buffers);
+        assert_eq!(1, first.len());
+
+        // The NAK names the whole frame, from its offset.
+        let nak = NakFrame {
+            session_id: 42,
+            stream_id: 1001,
+            term_id: 1_000,
+            term_offset: 0,
+            length: 160,
+        };
+
+        let outcome =
+            fixture
+                .publication
+                .on_nak(&nak, &system, &mut endpoint, &counters, &regions, 2_000);
+
+        assert!(
+            matches!(outcome, NakOutcome::Send(_)),
+            "a zero delay answers at once: {outcome:?}"
+        );
+
+        // And the frame is on the wire again, byte for byte.
+        let mut buffers = vec![vec![0u8; 2048]];
+        let resent = receive(&fixture.listener, &mut buffers);
+        assert_eq!(1, resent.len(), "the retransmission arrived");
+        assert_eq!(first[0], resent[0], "the same bytes, not new ones");
+
+        assert!(
+            system.value(system_counters::id::RETRANSMITS_SENT) >= 1,
+            "and it is counted"
+        );
+    }
+
+    #[test]
+    fn a_term_that_holds_nothing_is_not_a_reason_to_send() {
+        // The retransmit window's other edge: a NAK for a frame further back
+        // than half a term plus a maximum message names bytes the term no
+        // longer holds, and the reference refuses to answer it
+        // (`aeron_network_publication_resend`, `:655-665`).
+        let mut fixture = fixture();
+        let (counters, regions) = fixture.counters.open();
+        let system = System::new(&counters, &regions);
+
+        let mut endpoint_manager = CounterManager::new(64 * 1024, 1_000).expect("room");
+        let mut metadata = vec![0u8; 64 * 1024 * 4];
+        let mut values = vec![0u8; 64 * 1024];
+        let endpoint_regions = CounterRegions::new(
+            AtomicBuffer::from_slice_mut(&mut metadata).expect("aligned"),
+            AtomicBuffer::from_slice_mut(&mut values).expect("aligned"),
+        )
+        .expect("four-to-one");
+
+        let mut endpoint = SendChannelEndpoint::create(
+            fixture.channel.clone(),
+            &crate::media::TransportParams::default(),
+            &mut endpoint_manager,
+            &endpoint_regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        // The sender is a term ahead of what the NAK asks for.
+        let _ = counters.set_value(&regions, fixture.publication.counters.snd_pos, 64 * 1024);
+        let _ = counters.set_value(&regions, fixture.publication.counters.snd_lmt, 64 * 1024);
+
+        let nak = NakFrame {
+            session_id: 42,
+            stream_id: 1001,
+            term_id: 1_000,
+            term_offset: 0,
+            length: 160,
+        };
+
+        let _ =
+            fixture
+                .publication
+                .on_nak(&nak, &system, &mut endpoint, &counters, &regions, 2_000);
+
+        let mut buffers = vec![vec![0u8; 2048]];
+        assert!(
+            receive(&fixture.listener, &mut buffers).is_empty(),
+            "nothing is sent for a frame the term has moved past"
         );
     }
 
