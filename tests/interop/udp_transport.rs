@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::logbuffer::append::Appended;
+use deepmsg_driver::protocol::SetupFrame;
+use deepmsg_driver::sys::AddressFamily;
+use deepmsg_driver::sys::socket::DatagramSocket;
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 use deepmsg_tests::samples;
 
@@ -401,4 +404,122 @@ fn drain_messages(
     }
 
     collected
+}
+
+/// A11: a driver stopped while a UDP session is in flight stops cleanly.
+///
+/// The termination path is the one place where the data plane's threads have
+/// to be joined rather than left behind: a receiver holding a socket, a sender
+/// holding a publication's log buffer, and a conductor about to unmap the CnC
+/// file they both read from. A driver that skipped a join would fail here in
+/// one of two ways — a panic in its log, or an exit status that says it did not
+/// stop on purpose.
+#[test]
+fn a_udp_session_stops_cleanly_when_the_driver_is_asked_to() {
+    use deepmsg_client::terminate::{TerminationOutcome, request_driver_termination};
+
+    // The validator is what makes TERMINATE_DRIVER take effect rather than be
+    // refused; the delete-on-shutdown flag is what makes the clean stop
+    // observable from outside.
+    let Some(mut own) = OwnDriver::start_with(
+        "udp-terminate",
+        &[
+            "-Ddirs.delete.on.shutdown=true",
+            // The `deepmsg.` prefix is this build's own namespace for settings
+            // it added (ADR-0005); `crates/driver/tests/lifecycle.rs` uses the
+            // same spelling for the same reason.
+            "-Ddeepmsg.driver.termination.validator=allow",
+        ],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    // A live session: a subscription bound to a port, and a publisher sending
+    // into it from a plain socket. Both halves are up when the driver is asked
+    // to stop.
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let port = free_udp_port(5);
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+    publisher
+        .bind("127.0.0.1:0".parse().expect("an address"))
+        .expect("a bind");
+
+    let setup = SetupFrame {
+        term_offset: 0,
+        session_id: 7,
+        stream_id: STREAM_ID,
+        initial_term_id: 1_000,
+        active_term_id: 1_000,
+        term_length: 64 * 1024,
+        mtu: 1408,
+        ttl: 0,
+    };
+    let mut frame = [0u8; SetupFrame::LENGTH];
+    assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+    let _ = publisher.send_batch(
+        Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+        &[&frame],
+    );
+
+    // Let the driver build the image and answer with a status message, so both
+    // sides of the data plane are doing something when it is stopped.
+    for _ in 0..40 {
+        subscriber.poll();
+
+        if subscriber
+            .subscription(subscription_id)
+            .is_some_and(|subscription| !subscription.images().is_empty())
+        {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let outcome =
+        request_driver_termination(own.aeron_dir(), b"").expect("the request is well formed");
+
+    assert_eq!(
+        TerminationOutcome::Committed,
+        outcome,
+        "a driver with an allowing policy is asked, not refused"
+    );
+
+    // The driver has to *run* the command: the request is a record on its
+    // command ring, and a driver that is stopped by a signal before its next
+    // pass exits by that signal instead. The directory it deletes on shutdown
+    // is the observable proof that it got there on its own.
+    let dir = own.aeron_dir().to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    while Instant::now() < deadline && dir.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let status = own.stop().expect("the driver is stopped");
+    let log = own.log_tail(20);
+
+    assert!(
+        status.success(),
+        "a driver asked to stop exits successfully, got {status:?}: {log}"
+    );
+    assert!(
+        !log.contains("panicked"),
+        "and no thread it owns panicked on the way out: {log}"
+    );
+    assert!(
+        !dir.exists(),
+        "and it took its directory with it, which is the last thing it does"
+    );
 }

@@ -1068,6 +1068,12 @@ impl Conductor {
         self.running
     }
 
+    /// The network publications this driver owns, for a caller that needs to
+    /// look — a test, or a tool that wants the sessions it chose.
+    pub fn network_publications(&self) -> &[crate::network_publications::NetworkPublicationRecord] {
+        self.network_publications.publications()
+    }
+
     /// The images this driver is reading, for a caller that needs to look.
     pub fn publication_images(&self) -> &[crate::publication_images::PublicationImageRecord] {
         self.images.images()
@@ -3697,6 +3703,89 @@ mod tests {
             conductor.publication_images().is_empty(),
             "and the image is gone from the driver"
         );
+    }
+
+    /// A12: the session id a network publication runs under.
+    ///
+    /// Two publications on one channel and different streams get *different*
+    /// sessions — the whole point of speculating rather than picking one — and
+    /// a URI that names a session gets exactly that one. Both are what the
+    /// reference does with the same `SessionIds` the IPC path uses
+    /// (`aeron_driver_conductor.c:4455-4478`).
+    #[test]
+    fn network_publications_speculate_a_session_each_and_honour_a_named_one() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        for (correlation_id, stream_id) in [(21i64, 1001i32), (22, 1002)] {
+            send(
+                &conductor,
+                ADD_PUBLICATION_TYPE_ID,
+                &add_publication_payload(7, correlation_id, stream_id, &channel),
+            );
+            let _ = await_event(
+                &mut conductor,
+                &cnc,
+                &mut receiver,
+                &mut pending,
+                ON_PUBLICATION_READY_TYPE_ID,
+            );
+        }
+
+        let sessions: Vec<i32> = conductor
+            .network_publications()
+            .iter()
+            .map(|publication| publication.session_id)
+            .collect();
+
+        assert_eq!(2, sessions.len());
+        assert_ne!(
+            sessions[0], sessions[1],
+            "two streams on one channel are two sessions"
+        );
+
+        // And one that names its session keeps it.
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 23, 1003, &format!("{channel}|session-id=77")),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        let named = conductor
+            .network_publications()
+            .iter()
+            .find(|publication| publication.registration_id == 23)
+            .expect("the third publication");
+
+        assert_eq!(
+            77, named.session_id,
+            "a session the URI named is the one used"
+        );
+    }
+
+    /// A port nobody is listening on, for a test that only needs the shape of
+    /// a channel.
+    fn free_test_port() -> u16 {
+        let socket = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+
+        socket.local_address().expect("an address").port()
     }
 
     #[test]
