@@ -616,6 +616,27 @@ impl NetworkPublications {
         events.publication_ready(&ready, is_exclusive);
     }
 
+    /// Take a publication's record out of the collection, for a caller that is
+    /// about to release what it points at.
+    pub fn remove(&mut self, registration_id: i64) -> Option<NetworkPublicationRecord> {
+        let index = self
+            .publications
+            .iter()
+            .position(|publication| publication.registration_id == registration_id)?;
+
+        Some(self.publications.swap_remove(index))
+    }
+
+    /// The publications a client that is gone was holding
+    /// (`aeron_client_delete`'s sweep of a client's resources).
+    pub fn held_by(&self, client_id: i64) -> Vec<i64> {
+        self.publications
+            .iter()
+            .filter(|publication| publication.client_id == client_id)
+            .map(|publication| publication.registration_id)
+            .collect()
+    }
+
     /// Close everything: the agent's thread, and the publications with it.
     ///
     /// # Errors

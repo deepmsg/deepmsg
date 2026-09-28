@@ -41,7 +41,8 @@ use deepmsg_core::logbuffer::position::{Position, RawTail};
 use crate::flowcontrol::receiver_window_length;
 use crate::loss_detector::{Gap, LossDetector};
 use crate::protocol::{DataFrame, FrameHeader, HEADER_LENGTH, header_flags};
-use crate::subscribable::{Subscribable, TetherablePosition};
+use crate::publication_params::SubscriptionParams;
+use crate::subscribable::{Subscribable, TetherState, TetherablePosition};
 use crate::system_counters::{self, System};
 
 /// How long a status message may go unsent before one is sent anyway
@@ -57,6 +58,38 @@ pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
 /// (`AERON_IMAGE_SM_EOS_MULTIPLE`,
 /// `aeron-driver/src/main/c/aeron_publication_image.h:35`).
 pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
+
+/// What the untethered state machine decided about one reader
+/// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`).
+///
+/// The three events are the three things a *client* hears: an image it may no
+/// longer read, the same image again when the reader is woken, and — for a
+/// reader that is not rejoining — nothing at all, because its counter is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntetheredEvent {
+    /// The reader is behind and has been put aside: `ON_UNAVAILABLE_IMAGE`.
+    Unavailable {
+        /// The subscription that reads it.
+        subscription_registration_id: i64,
+        /// Its position counter.
+        counter_id: i32,
+    },
+    /// A resting reader is woken: the counter is seeded at the join position
+    /// and `ON_AVAILABLE_IMAGE` goes out again.
+    Available {
+        /// The subscription that reads it.
+        subscription_registration_id: i64,
+        /// Its position counter.
+        counter_id: i32,
+        /// Where it starts reading from.
+        join_position: i64,
+    },
+    /// A reader that is not rejoining is done: its counter is freed.
+    Closed {
+        /// The counter that goes back.
+        counter_id: i32,
+    },
+}
 
 /// Where an image is in its life
 /// (`aeron_publication_image_state_t`).
@@ -159,6 +192,15 @@ pub struct PublicationImage {
     /// The holes in this image's stream, and the timer on the one being asked
     /// for (`aeron_publication_image_t.loss_detector`).
     loss_detector: LossDetector,
+    /// How long a reader may fall behind before it is put aside
+    /// (`untethered-window-limit-timeout`, from the *channel's* parameters —
+    /// an image is created by a `SETUP`, so the subscription that reads it
+    /// inherits these rather than setting them).
+    pub untethered_window_limit_timeout_ns: i64,
+    /// How long it lingers before it is either closed or rested.
+    pub untethered_linger_timeout_ns: i64,
+    /// And how long it rests before it is woken.
+    pub untethered_resting_timeout_ns: i64,
     /// Where it is in its life.
     pub state: ImageState,
     /// When the state last changed, for the linger timeout.
@@ -186,6 +228,7 @@ impl PublicationImage {
         initial_window_length: i32,
         sm_timeout_ns: i64,
         page_size: usize,
+        untethered: SubscriptionParams,
         now_ns: i64,
     ) -> Self {
         let bits =
@@ -294,6 +337,9 @@ impl PublicationImage {
             max_receiver_window_length: window,
             liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS,
             loss_detector: LossDetector::new(registration_id),
+            untethered_window_limit_timeout_ns: untethered.untethered_window_limit_timeout_ns,
+            untethered_linger_timeout_ns: untethered.untethered_linger_timeout_ns,
+            untethered_resting_timeout_ns: untethered.untethered_resting_timeout_ns,
             state: ImageState::Active,
             time_of_last_state_change_ns: now_ns,
         }
@@ -685,6 +731,128 @@ impl PublicationImage {
         Ok(usize::from(sent > 0))
     }
 
+    /// The untethered subscriptions' state machine
+    /// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`).
+    ///
+    /// A **tethered** reader — which is the default — is never put aside: the
+    /// loop below only advances its timestamp. An untethered one is the
+    /// publisher's escape valve: a reader that falls more than a window behind
+    /// the fastest one is put down (so it stops holding the stream back), and
+    /// then either woken when it catches up on time or closed if it was not
+    /// rejoining.
+    ///
+    /// The window the "behind" test uses is the *image's* own advertised
+    /// window, and the reader's allowance is three quarters of it — a reader is
+    /// late when it is a full window behind the fastest reader and a quarter
+    /// of a window past that again
+    /// (`untethered_window_limit = (max_sub_pos - window) + window / 4`).
+    pub fn check_untethered_subscriptions(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> Vec<UntetheredEvent> {
+        let mut events = Vec::new();
+
+        let max_sub_pos = self
+            .subscribers
+            .max_active_position(counters, regions)
+            .unwrap_or(0);
+
+        let window_length = i64::from(self.next_sm_receiver_window_length);
+        let untethered_window_limit = (max_sub_pos - window_length) + (window_length / 4);
+
+        let positions = self.subscribers.positions().to_vec();
+
+        for position in positions {
+            if position.is_tether {
+                // A tethered reader keeps its claim on the stream whatever it
+                // does; only its timestamp moves.
+                let _ = self
+                    .subscribers
+                    .set_state(position.counter_id, position.state, now_ns);
+                continue;
+            }
+
+            let current = counters.value(regions, position.counter_id).unwrap_or(0);
+
+            match position.state {
+                TetherState::Active => {
+                    if current > untethered_window_limit {
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+                    } else if now_ns
+                        > position.time_of_last_update_ns + self.untethered_window_limit_timeout_ns
+                    {
+                        events.push(UntetheredEvent::Unavailable {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                        });
+
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Linger,
+                            now_ns,
+                        );
+                    }
+                }
+                TetherState::Linger => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_linger_timeout_ns
+                    {
+                        if position.is_rejoin {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Resting,
+                                now_ns,
+                            );
+                        } else {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Closed,
+                                now_ns,
+                            );
+                            let _ = self
+                                .subscribers
+                                .remove_position(position.counter_id, &mut NoHooks);
+
+                            events.push(UntetheredEvent::Closed {
+                                counter_id: position.counter_id,
+                            });
+                        }
+                    }
+                }
+                TetherState::Resting => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_resting_timeout_ns
+                    {
+                        let join_position = self
+                            .subscribers
+                            .min_active_position(counters, regions)
+                            .unwrap_or(0);
+
+                        let _ = counters.set_value(regions, position.counter_id, join_position);
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+
+                        events.push(UntetheredEvent::Available {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                            join_position,
+                        });
+                    }
+                }
+                TetherState::Closed => {}
+            }
+        }
+
+        events
+    }
+
     /// A time event for this image (`on_time_event`, `:1294-1355`).
     ///
     /// The three states are the whole of an image's life after it has been
@@ -999,6 +1167,9 @@ mod tests {
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 4096,
+                crate::publication_params::SubscriptionParams::defaults(
+                    &crate::config::DriverConfig::default(),
+                ),
                 0,
             );
 
@@ -1235,6 +1406,172 @@ mod tests {
                 .counters
                 .value(&regions, fixture.image.counters.rcv_pos),
             "both frames and the retransmitted one"
+        );
+    }
+
+    #[test]
+    fn a_tethered_reader_is_never_put_aside_and_an_untethered_one_is() {
+        // The publisher's escape valve: a reader that has asked *not* to be
+        // tethered, and falls behind, is put down — and then either woken or
+        // closed.
+        let mut fixture = Fixture::new();
+        let regions = fixture.holder.open();
+
+        // Two readers: one tethered and keeping up, one not tethered and
+        // behind. The "behind" test is relative to the *fastest* reader —
+        // `(max_sub_pos - window) + window / 4` — which is why a single reader
+        // can never be put aside: it is its own fastest reader.
+        let tethered = fixture
+            .counters
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let untethered = fixture
+            .counters
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+
+        for (counter_id, is_tether) in [(tethered, true), (untethered, false)] {
+            let position = if is_tether { 100_000 } else { 0 };
+            let _ = fixture.counters.set_value(&regions, counter_id, position);
+            fixture.image.add_subscriber(TetherablePosition {
+                counter_id,
+                subscription_registration_id: i64::from(counter_id) + 100,
+                time_of_last_update_ns: 0,
+                state: TetherState::Active,
+                is_tether,
+                is_rejoin: true,
+            });
+        }
+
+        // The tethered reader is 100,000 bytes ahead, which is more than a
+        // window: the untethered one is behind and moves, the tethered one
+        // does not.
+        let events = fixture.image.check_untethered_subscriptions(
+            &mut fixture.counters,
+            &regions,
+            fixture.image.untethered_window_limit_timeout_ns + 1,
+        );
+
+        assert_eq!(
+            vec![UntetheredEvent::Unavailable {
+                subscription_registration_id: i64::from(untethered) + 100,
+                counter_id: untethered,
+            }],
+            events,
+            "only the untethered reader is put aside"
+        );
+
+        assert_eq!(
+            TetherState::Active,
+            fixture
+                .image
+                .subscribers
+                .find_by_counter(tethered)
+                .expect("the tethered reader is still there")
+                .state
+        );
+
+        // It rests next, being a rejoin: no counter is freed.
+        let events = fixture.image.check_untethered_subscriptions(
+            &mut fixture.counters,
+            &regions,
+            fixture.image.untethered_window_limit_timeout_ns
+                + fixture.image.untethered_linger_timeout_ns
+                + 2,
+        );
+
+        assert!(events.is_empty(), "a rejoin rests rather than closing");
+        assert_eq!(
+            TetherState::Resting,
+            fixture
+                .image
+                .subscribers
+                .find_by_counter(untethered)
+                .expect("still attached")
+                .state
+        );
+
+        // And the resting timeout wakes it: the counter is seeded at the join
+        // position and the client is told the image is there again.
+        let events = fixture.image.check_untethered_subscriptions(
+            &mut fixture.counters,
+            &regions,
+            fixture.image.untethered_window_limit_timeout_ns
+                + fixture.image.untethered_linger_timeout_ns
+                + fixture.image.untethered_resting_timeout_ns
+                + 3,
+        );
+
+        assert!(
+            matches!(events.as_slice(), [UntetheredEvent::Available { .. }]),
+            "a resting reader is woken: {events:?}"
+        );
+        assert_eq!(
+            TetherState::Active,
+            fixture
+                .image
+                .subscribers
+                .find_by_counter(untethered)
+                .expect("still attached")
+                .state
+        );
+    }
+
+    #[test]
+    fn an_untethered_reader_that_is_not_rejoining_is_closed() {
+        let mut fixture = Fixture::new();
+        let regions = fixture.holder.open();
+
+        let counter_id = fixture
+            .counters
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let _ = fixture.counters.set_value(&regions, counter_id, 0);
+
+        // A tethered reader ahead of it, which is what makes it "behind".
+        let ahead = fixture
+            .counters
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let _ = fixture.counters.set_value(&regions, ahead, 100_000);
+
+        for (id, is_tether, is_rejoin) in [(counter_id, false, false), (ahead, true, false)] {
+            fixture.image.add_subscriber(TetherablePosition {
+                counter_id: id,
+                subscription_registration_id: i64::from(id) + 100,
+                time_of_last_update_ns: 0,
+                state: TetherState::Active,
+                is_tether,
+                is_rejoin,
+            });
+        }
+
+        let _ = fixture.image.check_untethered_subscriptions(
+            &mut fixture.counters,
+            &regions,
+            fixture.image.untethered_window_limit_timeout_ns + 1,
+        );
+
+        let events = fixture.image.check_untethered_subscriptions(
+            &mut fixture.counters,
+            &regions,
+            fixture.image.untethered_window_limit_timeout_ns
+                + fixture.image.untethered_linger_timeout_ns
+                + 2,
+        );
+
+        assert_eq!(
+            vec![UntetheredEvent::Closed { counter_id }],
+            events,
+            "a reader that is not rejoining is done"
+        );
+        assert!(
+            fixture
+                .image
+                .subscribers
+                .find_by_counter(counter_id)
+                .is_none(),
+            "and it leaves the image's set"
         );
     }
 

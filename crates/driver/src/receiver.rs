@@ -148,6 +148,14 @@ pub enum ReceiverEvent {
         /// Which one.
         registration_id: i64,
     },
+    /// The untethered state machine moved a reader: the conductor is the side
+    /// that can tell the client, and the only side that owns the transmitter.
+    Untethered {
+        /// Which image.
+        registration_id: i64,
+        /// What happened, per reader.
+        events: Vec<crate::publication_image::UntetheredEvent>,
+    },
     /// Something for the conductor to record.
     Fault {
         /// The protocol error code to record it under.
@@ -618,6 +626,14 @@ impl ReceiverThread {
             &system,
             now_ns,
         );
+
+        work += Self::check_untethered_subscriptions(
+            &mut self.images,
+            &mut self.counters,
+            &regions,
+            &self.events,
+            now_ns,
+        );
         work += self.run_time_events(&regions, now_ns);
         Self::track_cycle(
             &self.counters,
@@ -805,6 +821,34 @@ impl ReceiverThread {
             }
             _ => {}
         }
+    }
+
+    /// The untethered state machine for every image, once per pass
+    /// (`aeron_publication_image_check_untethered_subscriptions`, run from the
+    /// image's time event on the conductor in the reference and here from the
+    /// thread that owns the readers' positions).
+    fn check_untethered_subscriptions(
+        images: &mut [PublicationImage],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        events: &Outbox<ReceiverEvent>,
+        now_ns: i64,
+    ) -> usize {
+        let mut work = 0;
+
+        for image in images.iter_mut() {
+            let moved = image.check_untethered_subscriptions(counters, regions, now_ns);
+
+            if !moved.is_empty() {
+                work += moved.len();
+                let _ = events.send(ReceiverEvent::Untethered {
+                    registration_id: image.registration_id,
+                    events: moved,
+                });
+            }
+        }
+
+        work
     }
 
     /// Every image's status message, and the NAK its loss detector owes

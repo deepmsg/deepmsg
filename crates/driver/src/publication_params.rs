@@ -213,6 +213,25 @@ pub const REJOIN_STREAM_DEFAULT: bool = true;
 pub const CONTROL_MODE_RESPONSE: &str = "response";
 
 impl SubscriptionParams {
+    /// What a subscription gets when its channel names nothing: the driver's
+    /// own defaults, which are **not** `Default::default()` — a tethered
+    /// subscription is the default (`AERON_TETHER_SUBSCRIPTIONS_DEFAULT`,
+    /// true), and a derived `Default` would say the opposite. The same trap
+    /// `MaxStrategy` had.
+    pub const fn defaults(config: &DriverConfig) -> Self {
+        Self {
+            session_id: None,
+            is_tether: TETHER_SUBSCRIPTIONS_DEFAULT,
+            is_rejoin: REJOIN_STREAM_DEFAULT,
+            is_reliable: RELIABLE_STREAM_DEFAULT,
+            is_sparse: config.term_buffer_sparse_file,
+            is_response: false,
+            untethered_window_limit_timeout_ns: config.untethered_window_limit_timeout_ns,
+            untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
+            untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
+        }
+    }
+
     /// Read a channel URI into the parameters a subscription is created from.
     ///
     /// # Errors

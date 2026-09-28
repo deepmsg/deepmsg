@@ -865,6 +865,12 @@ impl Conductor {
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
                 }
+                ReceiverEvent::Untethered {
+                    registration_id,
+                    events,
+                } => {
+                    work += self.on_untethered(registration_id, &events);
+                }
                 ReceiverEvent::Fault {
                     error_code,
                     description,
@@ -875,6 +881,149 @@ impl Conductor {
         }
 
         work + self.poll_images(now_ns)
+    }
+
+    /// The untethered state machine moved one or more readers of an image
+    /// (`aeron_publication_image_check_untethered_subscriptions`'s three
+    /// outcomes, `aeron-driver/src/main/c/aeron_publication_image.c:1199-1270`).
+    ///
+    /// Three client-visible events, and they are not symmetric. A reader put
+    /// aside is told its image is gone; a reader woken is told the image is
+    /// there again, at the join position — which is why the message it gets is
+    /// the same `ON_AVAILABLE_IMAGE` it got when it first linked. A reader that
+    /// was not rejoining is told *nothing*: its counter is freed and its
+    /// subscription keeps the images it has.
+    fn on_untethered(
+        &mut self,
+        registration_id: i64,
+        events: &[crate::publication_image::UntetheredEvent],
+    ) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match *event {
+                crate::publication_image::UntetheredEvent::Unavailable {
+                    subscription_registration_id,
+                    ..
+                } => {
+                    // The channel is the *subscription's*, which is what the
+                    // reference's image-transition path sends
+                    // (`aeron_driver_conductor.c:1657-1663`).
+                    let channel = self
+                        .subscriptions
+                        .links()
+                        .iter()
+                        .find(|link| link.registration_id == subscription_registration_id)
+                        .map(|link| link.channel.clone())
+                        .unwrap_or_else(|| image.channel.clone());
+
+                    transmit.unavailable_image(
+                        registration_id,
+                        subscription_registration_id,
+                        image.stream_id,
+                        &channel,
+                    );
+                }
+                crate::publication_image::UntetheredEvent::Available {
+                    subscription_registration_id,
+                    counter_id,
+                    ..
+                } => {
+                    transmit.available_image(&deepmsg_cnc::command::ImageBuffersReady {
+                        correlation_id: registration_id,
+                        session_id: image.session_id,
+                        stream_id: image.stream_id,
+                        subscriber_registration_id: subscription_registration_id,
+                        subscriber_position_id: counter_id,
+                        log_file: image.path.as_os_str().as_encoded_bytes(),
+                        source_identity: image.source_identity.as_bytes(),
+                    });
+                }
+                crate::publication_image::UntetheredEvent::Closed { counter_id } => {
+                    if let Some(region) = self.cnc.counter_regions() {
+                        let _ = self.counters.free(&region, counter_id, self.now_ms);
+                    }
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Let go of a network publication: stop sending it, give its counters
+    /// back, and count one less reader on its endpoint
+    /// (`aeron_network_publication_close`,
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-360`).
+    ///
+    /// The IPC path does the same for its own publications
+    /// ([`IpcPublications::release_links`]); this is the half that was missing,
+    /// and its absence was silent: a client could remove a UDP publication and
+    /// the sender would keep sending it.
+    fn release_network_publication(&mut self, registration_id: i64) -> bool {
+        let Some(record) = self.network_publications.remove(registration_id) else {
+            return false;
+        };
+
+        let _ = self.sender.proxy().remove_publication(registration_id);
+
+        if let Some(region) = self.cnc.counter_regions() {
+            for counter_id in [
+                record.counters.pub_pos,
+                record.counters.pub_lmt,
+                record.counters.snd_pos,
+                record.counters.snd_lmt,
+                record.counters.snd_bpe,
+                record.counters.snd_naks_received,
+            ] {
+                let _ = self.counters.free(&region, counter_id, self.now_ms);
+            }
+        }
+
+        self.send_endpoints.detach_publication(record.endpoint_id);
+
+        true
+    }
+
+    /// Whatever a client left behind: the network publications it was holding
+    /// when it stopped being a client this driver knows.
+    ///
+    /// Called after the client paths that *remove* a record — a close and a
+    /// timeout — rather than from inside them, because the release needs the
+    /// sender's proxy and the endpoint registry, and neither belongs in the
+    /// client pool.
+    fn release_orphaned_network_publications(&mut self) -> usize {
+        let orphans: Vec<i64> = self
+            .network_publications
+            .publications()
+            .iter()
+            .filter(|publication| !self.clients.knows(publication.client_id))
+            .map(|publication| publication.registration_id)
+            .collect();
+
+        let mut released = 0;
+
+        for registration_id in orphans {
+            released += usize::from(self.release_network_publication(registration_id));
+        }
+
+        released
     }
 
     /// An image has finished its life: unlink it, tell its readers, give its
@@ -1254,6 +1403,11 @@ impl Conductor {
         let unknown = &mut self.unknown;
         let last_unhandled = &mut self.last_unhandled;
         let faults = &mut self.pending_log_errors;
+        // A publication whose *client* link was released in this drain: the
+        // release itself needs the sender and the endpoint registry, which the
+        // drain's closure cannot reach, so the ids are collected here and the
+        // work happens below it.
+        let mut pending_publication_releases: Vec<i64> = Vec::new();
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -1271,7 +1425,7 @@ impl Conductor {
             faults,
         };
 
-        commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        let drained = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -1396,6 +1550,7 @@ impl Conductor {
                                 }
 
                                 publications.release_links(&[link], counters, &counter_regions);
+                                pending_publication_releases.push(link.publication_registration_id);
                                 transmit.operation_succeeded(request.correlated.correlation_id);
                             }
                             None => {
@@ -1643,7 +1798,34 @@ impl Conductor {
                     *last_unhandled = Some(command);
                 }
             }
-        })
+        });
+
+        // A publication whose link was released: the network half stops
+        // sending it, gives its six counters back, and counts one less reader
+        // on its endpoint. The IPC half did its own release inside the drain.
+        let mut released = 0usize;
+
+        for registration_id in pending_publication_releases {
+            if let Some(record) = network_publications.remove(registration_id) {
+                let _ = sender.proxy().remove_publication(registration_id);
+
+                for counter_id in [
+                    record.counters.pub_pos,
+                    record.counters.pub_lmt,
+                    record.counters.snd_pos,
+                    record.counters.snd_lmt,
+                    record.counters.snd_bpe,
+                    record.counters.snd_naks_received,
+                ] {
+                    let _ = counters.free(&counter_regions, counter_id, now_ms);
+                }
+
+                send_endpoints.detach_publication(record.endpoint_id);
+                released += 1;
+            }
+        }
+
+        drained + released
     }
 
     /// Break a stall in the command ring, and count it when it breaks one.
@@ -1772,14 +1954,16 @@ impl Conductor {
             failures: &mut self.pending_broadcast_failures,
             faults: &mut self.pending_log_errors,
         };
-        self.clients.reap_expired(
+        let reaped = self.clients.reap_expired(
             self.now_ms,
             &mut self.counters,
             &counter_regions,
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
-        )
+        );
+
+        self.release_orphaned_network_publications() + reaped
     }
 
     /// Account for this pass's broadcast failures.
@@ -3786,6 +3970,63 @@ mod tests {
             .expect("a bind");
 
         socket.local_address().expect("an address").port()
+    }
+
+    /// Removing a UDP publication stops the sender and gives its six counters
+    /// back — the half of the removal path that was missing, and whose absence
+    /// would have been silent: the client is answered, and the sender keeps
+    /// sending.
+    #[test]
+    fn removing_a_udp_publication_stops_the_sender_and_frees_its_counters() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_test_port());
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 31, 1001, &channel),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(1, conductor.network_publications().len());
+
+        let counters_before = conductor.counters().free_list_len();
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &remove_publication_payload(7, 32, 31, 0, false),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
+        );
+        assert_eq!(32i64.to_le_bytes(), payload[0..8]);
+
+        assert!(
+            conductor.network_publications().is_empty(),
+            "the publication is gone from the driver"
+        );
+        assert_eq!(
+            counters_before + 6,
+            conductor.counters().free_list_len(),
+            "and its six counters came back"
+        );
     }
 
     #[test]

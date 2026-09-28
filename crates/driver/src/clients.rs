@@ -180,6 +180,14 @@ impl Clients {
     }
 
     /// The record for a client, if there is one.
+    /// Whether this driver knows a client, which is what a sweep for what a
+    /// *dead* client left behind asks.
+    pub fn knows(&self, client_id: i64) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.client_id == client_id)
+    }
+
     pub fn find(&self, client_id: i64) -> Option<&ClientRecord> {
         self.records
             .iter()

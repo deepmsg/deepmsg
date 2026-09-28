@@ -85,6 +85,9 @@ struct PendingImage {
     control_address: SocketAddr,
     /// Whether the image was rejected while it was being built.
     invalidation: Option<String>,
+    /// The untethered timeouts the channel named, which the image's readers
+    /// inherit (`untethered-window-limit-timeout` and its two siblings).
+    untethered: crate::publication_params::SubscriptionParams,
 }
 
 /// The images a driver owns.
@@ -177,6 +180,18 @@ impl PublicationImages {
             )));
         }
 
+        // The channel's subscription parameters: an image is created by a
+        // `SETUP`, so the timeouts its readers are held to come from the
+        // *channel* rather than from each subscription
+        // (`aeron_driver_uri_subscription_params` on the channel's URI).
+        let untethered = match crate::channel_uri::ChannelUri::parse(channel) {
+            Ok(uri) => crate::publication_params::SubscriptionParams::resolve(&uri, config)
+                .unwrap_or_else(|_| {
+                    crate::publication_params::SubscriptionParams::defaults(config)
+                }),
+            Err(_) => crate::publication_params::SubscriptionParams::defaults(config),
+        };
+
         let counters_pair = allocate_counters(
             counters,
             regions,
@@ -210,6 +225,7 @@ impl PublicationImages {
             source,
             control_address,
             invalidation: None,
+            untethered,
         });
 
         Ok(())
@@ -307,6 +323,7 @@ impl PublicationImages {
             window,
             crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
             config.layout.page_size,
+            pending.untethered,
             now.ns,
         );
 
