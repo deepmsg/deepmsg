@@ -540,7 +540,6 @@ impl Setting {
         property: "error.buffer.length",
         env: "AERON_ERROR_BUFFER_LENGTH",
     };
-    /// `aeron.client.liveness.timeout` (`:129`).
     /// `aeron.ipc.term.buffer.length` (`aeronmd.h:145`).
     const IPC_TERM_BUFFER_LENGTH: Self = Self {
         property: "ipc.term.buffer.length",

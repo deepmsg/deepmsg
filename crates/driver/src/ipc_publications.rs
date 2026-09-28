@@ -541,7 +541,7 @@ impl IpcPublications {
     /// positions and its own two counters back, hand the log buffer to the
     /// agent, and drop it from the list — the reference's
     /// `aeron_ipc_publication_entry_delete` (`:1428-1446`) followed by
-    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:588-604`).
+    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:196-214`).
     ///
     /// Returns the work done, for the cycle counter.
     pub fn on_time_event(

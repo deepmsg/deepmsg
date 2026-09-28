@@ -860,26 +860,28 @@ impl Conductor {
                     }
                     None => *malformed += 1,
                 },
-                // A subscription going away: every image it held is announced
-                // as gone, its positions are detached and its counters come
-                // back (`aeron_driver_conductor.c:5199-5267`).
+                // A subscription going away: its positions are detached and
+                // its counters come back (`aeron_driver_conductor.c:5199-5267`)
+                // — silently, which is the reference's answer in C and in
+                // Java alike: neither announces the images a removal takes
+                // away, so the acknowledgement is the whole event stream.
                 Command::RemoveSubscription => match decode_remove_subscription(payload) {
                     Some(request) => {
                         if subscriptions.has(request.registration_id) {
-                            // The acknowledgement first: the reference answers
-                            // before it announces the images it is taking away,
-                            // so a client that is waiting on the removal is not
-                            // handed an image event first.
-                            transmit.operation_succeeded(request.correlated.correlation_id);
-
+                            // The detachment first, the acknowledgement after
+                            // it: the reference unlinks every subscribable and
+                            // only then answers, so a client that reads its
+                            // events in order knows the removal has happened
+                            // once the answer arrives.
                             subscriptions.remove(
                                 request.registration_id,
                                 counters,
                                 &counter_regions,
                                 publications,
-                                &mut transmit,
                                 now_ms,
                             );
+
+                            transmit.operation_succeeded(request.correlated.correlation_id);
                         } else {
                             *subscription_failures += 1;
                             transmit.error(
@@ -2952,25 +2954,17 @@ mod tests {
         );
         conductor.do_work();
 
+        // The removal is silent in the reference, in C and in Java alike:
+        // no image is announced as gone, and the acknowledgement — which the
+        // reference sends only after the unlinking — is the whole event
+        // stream (`aeron_driver_conductor.c:5199-5267`).
         let events = drain(&cnc, &mut receiver);
-        assert_eq!(2, events.len(), "the acknowledgement, then the image");
+        assert_eq!(1, events.len(), "the acknowledgement, and nothing else");
         assert_eq!(
             deepmsg_cnc::command::ON_OPERATION_SUCCEEDED_TYPE_ID,
             events[0].0
         );
         assert_eq!(51i64.to_le_bytes(), events[0].1[0..8]);
-        assert_eq!(
-            deepmsg_cnc::command::ON_UNAVAILABLE_IMAGE_TYPE_ID,
-            events[1].0,
-            "the client has to know its image is gone"
-        );
-        assert_eq!(42i64.to_le_bytes(), events[1].1[0..8], "the publication");
-        assert_eq!(9i64.to_le_bytes(), events[1].1[8..16], "the subscription");
-        assert_eq!(
-            b"aeron:ipc",
-            &events[1].1[24..],
-            "the channel it subscribed with"
-        );
 
         assert!(conductor.subscriptions().links().is_empty());
         assert_eq!(

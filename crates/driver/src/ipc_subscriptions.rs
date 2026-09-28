@@ -366,24 +366,24 @@ impl IpcSubscriptions {
     /// `:5199-5267`).
     ///
     /// Every reader position is detached from its publication and its counter
-    /// given back, the client is told each image is gone, and the link is
-    /// dropped. Returns whether one was found — the reference's
-    /// `is_any_subscription_found`, which decides between an acknowledgement and
-    /// an error.
+    /// given back, and the link is dropped — with **no image message**: the
+    /// reference's removal path only unlinks, in C and in Java alike, so the
+    /// images a subscription held go unannounced and the acknowledgement is
+    /// the whole of what the client hears. Returns whether one was found —
+    /// the reference's `is_any_subscription_found`, which decides between an
+    /// acknowledgement and an error.
     ///
     /// The match is on the registration id **alone**: the reference does not
     /// check the client id here, so a client that knows a subscription's
     /// registration id can remove it even though it does not own it. That is
     /// reproduced rather than tightened — a driver that refused would be one
     /// where a legitimate removal failed.
-    #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn remove(
         &mut self,
         registration_id: i64,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
-        events: &mut impl ClientEvents,
         now_ms: i64,
     ) -> bool {
         let Some(index) = self
@@ -395,15 +395,6 @@ impl IpcSubscriptions {
         };
 
         let link = self.links.swap_remove(index);
-
-        for entry in &link.subscribables {
-            events.unavailable_image(
-                entry.publication_registration_id,
-                link.registration_id,
-                link.stream_id,
-                &link.channel,
-            );
-        }
 
         unlink_all(link, counters, regions, publications, now_ms);
 
@@ -443,7 +434,7 @@ impl IpcSubscriptions {
     ///
     /// No counters are freed here: a reader's `sub-pos` belongs to the
     /// *publication's* set, and the publication's close is what frees it
-    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:588-604`).
+    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:196-214`).
     /// Freeing them in both places would hand the same counter back twice, and
     /// the ordering here is the reference's — publications first.
     pub fn close(&mut self) {

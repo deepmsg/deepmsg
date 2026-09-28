@@ -252,9 +252,10 @@ impl IpcPublication {
     ///
     /// Every value written comes from `params`, which is the URI resolved
     /// against the driver's configuration (`crate::publication_params`), and
-    /// from `socket_buffers`, which is what the kernel reports: the six
-    /// socket-buffer fields are not zeroes, and two of them are the machine's
-    /// own receive and send buffer sizes (`aeron_ipc_publication.c:117-124`).
+    /// from `socket_buffers`, which is what the kernel reports: two of the six
+    /// socket-buffer fields are the machine's own receive and send buffer
+    /// sizes, and the other four are zeroes on both sides of the comparison
+    /// (`aeron_ipc_publication.c:118-124`).
     #[allow(clippy::too_many_arguments)] // one per source of a written field
     pub fn create(
         log: Box<LogFile>,
@@ -308,10 +309,13 @@ impl IpcPublication {
                 // The receiver window is an image's field: an IPC publication
                 // has no flow control to advertise.
                 receiver_window_length: 0,
-                // An IPC publication has no socket, so the three "this
-                // channel's" lengths stay zero — but the three the kernel was
-                // asked about are the kernel's answer, not zero
-                // (`aeron_ipc_publication.c:117-124`).
+                // Four of the six socket-buffer fields are zero, on both
+                // sides: the two a channel could configure are literal zeros
+                // on the reference's IPC path (`:119`, `:122`), and the two
+                // `os_max` fields are zero because the reference never writes
+                // them anywhere — its context is allocated zeroed and nothing
+                // in the driver tree assigns them. Only the two defaults are
+                // the kernel's answer (`:120`, `:123`).
                 socket_sndbuf_length: 0,
                 os_default_socket_sndbuf_length: socket_buffers.sndbuf,
                 os_max_socket_sndbuf_length: 0,
@@ -345,10 +349,20 @@ impl IpcPublication {
 
         // Nothing has been written, so the producer, the consumer and cleanup
         // all start where the tails say the stream is — which for a resumed
-        // stream is not zero (`aeron_ipc_publication.h:162-173` computes the
-        // same position from the same raw tail).
-        let clean_position =
-            Position::new(start_term_id, 0, bits_to_shift, params.initial_term_id).raw();
+        // stream is not zero: the reference takes all three from the producer
+        // position over the raw tail, starting offset included
+        // (`aeron_ipc_publication.c:182-184`).
+        #[allow(clippy::cast_possible_truncation)] // bounded by a term length
+        let starting_term_offset = params
+            .starting_position
+            .map_or(0, |position| position.term_offset as i32);
+        let start_position = Position::new(
+            start_term_id,
+            starting_term_offset,
+            bits_to_shift,
+            params.initial_term_id,
+        )
+        .raw();
 
         Ok(Self {
             registration_id: identity.registration_id,
@@ -360,9 +374,7 @@ impl IpcPublication {
             mtu_length: params.mtu_length,
             bits_to_shift,
             starting_term_id: start_term_id,
-            starting_term_offset: params
-                .starting_position
-                .map_or(0, |position| position.term_offset),
+            starting_term_offset: i64::from(starting_term_offset),
             channel: identity.channel,
             is_exclusive: identity.is_exclusive,
             response_correlation_id: params.response_correlation_id,
@@ -377,8 +389,8 @@ impl IpcPublication {
             untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
             trip_gain: params.publication_window_length / 8,
             trip_limit: 0,
-            consumer_position: clean_position,
-            clean_position,
+            consumer_position: start_position,
+            clean_position: start_position,
             refcount: 0,
             time_of_last_state_change_ns: 0,
             state: State::Active,
@@ -612,13 +624,13 @@ impl IpcPublication {
 
     /// One more client holds a link to this publication
     /// (`AERON_DRIVER_MANAGED_RESOURCE_INCREF`,
-    /// `aeron-driver/src/main/c/aeron_driver_common.h:183`).
+    /// `aeron-driver/src/main/c/aeron_driver_common.h:58`).
     pub fn incref(&mut self) {
         self.refcount += 1;
     }
 
     /// One fewer. `true` when that was the last link, which is when the
-    /// reference closes the publication (`aeron_driver_common.h:196-214`).
+    /// reference closes the publication (`aeron_ipc_publication.c:196-214`).
     pub fn decref(&mut self) -> bool {
         self.refcount -= 1;
         0 == self.refcount
@@ -1254,6 +1266,58 @@ mod tests {
             template_i32(&publication, frame::STREAM_ID_FIELD_OFFSET)
         );
         assert_eq!(17, template_i32(&publication, frame::TERM_ID_FIELD_OFFSET));
+    }
+
+    #[test]
+    fn a_resumed_stream_starts_its_consumer_where_the_offset_says() {
+        let dir = TempDir::new();
+        let log = Box::new(
+            LogFile::create(
+                &dir.0.join("pub.logbuffer"),
+                TERM_LENGTH,
+                PAGE_SIZE as usize,
+            )
+            .expect("a log buffer"),
+        );
+
+        let identity = PublicationIdentity {
+            registration_id: 99,
+            client_id: 7,
+            session_id: 100,
+            stream_id: 1001,
+            channel: b"aeron:ipc".to_vec(),
+            is_exclusive: false,
+        };
+        let mut params = publication_params();
+        params.starting_position = Some(crate::publication_params::StartingPosition {
+            initial_term_id: 17,
+            term_id: 19,
+            term_offset: 8192,
+        });
+
+        let publication = IpcPublication::create(
+            log,
+            identity,
+            &params,
+            PAGE_SIZE,
+            SocketBufferLengths {
+                rcvbuf: 212_992,
+                sndbuf: 212_992,
+            },
+            0,
+            0,
+        )
+        .expect("a publication");
+
+        // The consumer, like cleanup, starts where the tails say the stream
+        // is — the term the URI named *and* the offset into it — which is the
+        // reference's producer position over the freshly initialised tails
+        // (`aeron_ipc_publication.c:182-184`). Dropping the offset would put
+        // the limit logic a term's head behind a stream that resumed midway.
+        let bits = position::bits_to_shift(TERM_LENGTH).expect("a power of two");
+        let expected = Position::new(19, 8192, bits, 17).raw();
+        assert_eq!(expected, publication.consumer_position);
+        assert_eq!(expected, publication.clean_position);
     }
 
     #[test]
