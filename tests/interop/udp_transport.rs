@@ -946,6 +946,182 @@ fn two_of_our_clients_talk_over_udp_and_both_channels_report_active() {
     );
 }
 
+/// P1-4's untethered subscriptions, end to end: a reader that stops reading is
+/// put aside, and then either woken or closed.
+///
+/// The state machine has its own tests, one frame at a time, and what they
+/// cannot show is the half that leaves the driver: `ON_UNAVAILABLE_IMAGE` on a
+/// client's ring, an image that comes back at the join position, and a counter
+/// that goes back to the manager when the reader is not rejoining. Each of
+/// those is a *decision the conductor makes about someone else's memory*, and
+/// the only place to see one is a running driver with a real image.
+///
+/// The arrangement is three subscriptions on one image, because all three
+/// outcomes have the same precondition and it is not obvious:
+/// **"behind" is relative to the fastest reader**
+/// (`untethered_window_limit = (max_sub_pos - window) + window / 4`,
+/// `aeron_publication_image.c:1199-1215`), so a lone subscriber is never put
+/// aside however slowly it reads. One reader that keeps up is what makes the
+/// other two late at all.
+///
+/// The channel is our own driver's on both ends — one driver publishing and
+/// subscribing, which is the only arrangement in which the *receive* side of a
+/// network publication exists in a test without a second process.
+#[test]
+fn an_untethered_subscriber_is_put_aside_woken_or_closed() {
+    // The three stage timeouts are the driver's, not the channel's — and that
+    // is not a shortcut: the image reads them from the **endpoint's** URI
+    // (`aeron_publication_image.c:243`, `aeron_driver_uri_subscription_params`,
+    // which starts from the context's defaults), so a subscription that names
+    // them on a channel another subscription already created an endpoint for
+    // is naming them at nobody. Configuring the driver is what the image
+    // actually inherits.
+    let Some(mut own) = OwnDriver::start_with(
+        "udp-untethered",
+        &[
+            "-Daeron.untethered.window.limit.timeout=200ms",
+            "-Daeron.untethered.linger.timeout=200ms",
+            "-Daeron.untethered.resting.timeout=200ms",
+        ],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    // Offset six: the tests in this file run in parallel and each offset is a
+    // port.
+    let port = free_udp_port(6);
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+
+    // Two subscriptions that may be put aside, and they differ in one thing:
+    // whether they are rejoining the stream. A rejoining reader is woken when
+    // its time comes; one that is not is closed, and closing means its
+    // counter is freed — which is why that subscription needs no event.
+    let untethered = |rejoin: bool| format!("{channel}|tether=false|rejoin={rejoin}");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    let reader = client
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the reading subscription");
+    let rejoining = client
+        .add_subscription(&untethered(true), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the rejoining subscription");
+    let leaving = client
+        .add_subscription(&untethered(false), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the leaving subscription");
+
+    // The publication last, so every subscription joins where the image
+    // starts: the lag this test needs has to come from the data, not from the
+    // order the commands were sent in.
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    let all_three = |client: &mut Client| {
+        images_of(client, reader) > 0
+            && images_of(client, rejoining) > 0
+            && images_of(client, leaving) > 0
+    };
+
+    assert!(
+        wait_for(&mut client, CONNECT_TIMEOUT, all_three),
+        "all three subscriptions read one image: reader {}, rejoining {}, leaving {}",
+        images_of(&client, reader),
+        images_of(&client, rejoining),
+        images_of(&client, leaving)
+    );
+
+    // A window's worth of messages, read by one subscriber and not by the
+    // other two. The publisher is held a window ahead of the *slowest* reader,
+    // so this is the largest lag the image can be made to show — and three
+    // quarters of a window is the threshold the state machine tests against.
+    const MESSAGES: usize = 140;
+    let mut offered = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    while offered < MESSAGES && Instant::now() < deadline {
+        client.poll();
+
+        // Only the reader reads. `poll_subscription` is what moves a
+        // subscription's position, so leaving the other two out of this loop
+        // *is* the stall the test is about.
+        let _ = drain_messages(&mut client, reader, Duration::from_millis(1), 16);
+
+        if let Some(Appended::Ok { .. }) = client.offer(publication, &bulk_payload(offered)) {
+            offered += 1;
+        }
+    }
+
+    assert_eq!(
+        MESSAGES, offered,
+        "the publication has to take the whole window before anything can be late"
+    );
+
+    assert!(
+        wait_for(&mut client, Duration::from_secs(10), |_client| {
+            sub_position(&own_cnc, reader)
+                .zip(sub_position(&own_cnc, rejoining))
+                .is_some_and(|(reader, lagging)| reader.1 - lagging.1 > IMAGE_WINDOW / 4 * 3)
+        }),
+        "the reader has to be three quarters of a window ahead: reader {:?}, rejoining {:?}",
+        sub_position(&own_cnc, reader),
+        sub_position(&own_cnc, rejoining)
+    );
+
+    // First outcome: both stallers are put aside, and the client is told its
+    // image is gone.
+    assert!(
+        wait_for(&mut client, Duration::from_secs(10), |client| images_of(
+            client, rejoining
+        ) == 0
+            && images_of(client, leaving) == 0),
+        "both late readers are told their image is gone: rejoining {}, leaving {}, reader {}",
+        images_of(&client, rejoining),
+        images_of(&client, leaving),
+        images_of(&client, reader)
+    );
+    assert_eq!(
+        1,
+        images_of(&client, reader),
+        "the reader that kept up is untouched: the machine moved two readers, not the image"
+    );
+
+    // Second and third: the rejoining one is woken at the join position, and
+    // the one that is not rejoining does not come back — its counter is gone,
+    // which is the whole of what "closed" means to a client that was already
+    // told the image went away.
+    assert!(
+        wait_for(&mut client, Duration::from_secs(10), |client| images_of(
+            client, rejoining
+        ) > 0),
+        "the rejoining reader is woken and told its image is back"
+    );
+    assert_eq!(
+        0,
+        images_of(&client, leaving),
+        "the reader that is not rejoining is never told anything again"
+    );
+
+    let leaving_counter = sub_position(&own_cnc, leaving).map(|(counter_id, _)| counter_id);
+    let rejoining_counter = sub_position(&own_cnc, rejoining).map(|(counter_id, _)| counter_id);
+
+    let _ = own.stop();
+
+    assert_eq!(
+        None, leaving_counter,
+        "a closed reader's position counter goes back to the manager"
+    );
+    assert!(
+        rejoining_counter.is_some(),
+        "the one that was woken keeps the counter it came back with"
+    );
+}
+
 /// `AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ACTIVE`
 /// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:33`).
 const CHANNEL_STATUS_ACTIVE: i64 = 1;
@@ -953,4 +1129,68 @@ const CHANNEL_STATUS_ACTIVE: i64 = 1;
 /// One counter's value out of a live CnC file.
 fn counter_value_of(cnc: &deepmsg_cnc::CncFile, counter_id: i32) -> Option<i64> {
     cnc.counters()?.value(counter_id)
+}
+
+/// The image's flow-control window, for the two numbers the untethered test
+/// needs from it: how far behind a reader may fall before it is late.
+const IMAGE_WINDOW: i64 = 128 * 1024;
+
+/// A message big enough that a window's worth of them is a hundred sends
+/// rather than two thousand.
+fn bulk_payload(index: usize) -> Vec<u8> {
+    let mut payload = format!("untethered-{index:04}").into_bytes();
+    payload.resize(1000, b'.');
+
+    payload
+}
+
+/// The images a subscription holds, as the *client* sees them: an
+/// `ON_UNAVAILABLE_IMAGE` that has been polled removes one, and an
+/// `ON_AVAILABLE_IMAGE` adds one.
+fn images_of(client: &Client, registration_id: i64) -> usize {
+    client
+        .subscription(registration_id)
+        .map_or(0, |subscription| subscription.images().len())
+}
+
+/// Wait for the client to see something, polling events as it waits — an
+/// `ON_UNAVAILABLE_IMAGE` does not arrive by itself.
+fn wait_for<F>(client: &mut Client, within: Duration, mut predicate: F) -> bool
+where
+    F: FnMut(&mut Client) -> bool,
+{
+    let deadline = Instant::now() + within;
+
+    loop {
+        client.poll();
+
+        if predicate(client) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A subscription's `sub-pos` counter: the id the driver allocated for it and
+/// the position it holds, or `None` once the counter has been given back.
+///
+/// The label carries the subscription's registration id
+/// (`crate::position::stream_counter_label`'s shape), which is what makes one
+/// subscription's counter findable when a driver holds several.
+fn sub_position(cnc: &deepmsg_cnc::CncFile, registration_id: i64) -> Option<(i32, i64)> {
+    let counters = cnc.counters()?;
+    let prefix = format!("sub-pos: {registration_id} ");
+    let mut found = None;
+
+    counters.for_each(|descriptor| {
+        if found.is_none() && descriptor.label.starts_with(&prefix) {
+            found = Some((descriptor.counter_id, descriptor.value));
+        }
+    });
+
+    found
 }
