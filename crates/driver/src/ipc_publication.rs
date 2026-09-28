@@ -31,7 +31,9 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{self, Position, RawTail};
 
 use crate::publication_params::PublicationParams;
-use crate::subscribable::{Subscribable, SubscribableHooks, TetherablePosition};
+use crate::subscribable::{
+    Subscribable, SubscribableHooks, TetherState, TetherablePosition, UntetheredEvent,
+};
 use crate::sys::SocketBufferLengths;
 
 /// Where a publication is in its life
@@ -697,6 +699,25 @@ impl IpcPublication {
             .remove_position(counter_id, &mut ConnectionHook { metadata })
     }
 
+    /// Write the log's `is_connected` byte from what the readers are doing
+    /// (`aeron_ipc_publication.c:533-534`, where the reference recomputes it on
+    /// every ACTIVE tier).
+    ///
+    /// Our build otherwise keeps that byte through the add and remove hooks,
+    /// which is enough for a reader that *leaves* — but not for one that stops
+    /// being a working reader while staying in the set. The untethered machine
+    /// is what produces those: a resting reader is still there and still
+    /// counted, and a producer reading this byte is asking whether anyone is
+    /// reading at all.
+    pub fn update_connected_status(&self) {
+        let Some(metadata) = self.log.metadata() else {
+            return;
+        };
+
+        let connected = i32::from(self.subscribers.has_working_positions());
+        let _ = metadata.store_i32_release(descriptor::IS_CONNECTED_OFFSET, connected);
+    }
+
     /// Move a subscriber's position to another tether state.
     pub fn set_subscriber_state(
         &mut self,
@@ -722,6 +743,134 @@ impl IpcPublication {
             .map_or(self.consumer_position, |position| {
                 position.min(self.consumer_position)
             })
+    }
+
+    /// The untethered subscriptions' state machine, for a publication's own
+    /// readers (`aeron_ipc_publication_check_untethered_subscriptions`,
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:354-470`).
+    ///
+    /// The same three states as an image's readers, judged against the same
+    /// shape of limit, and differing in exactly three things — which is the
+    /// whole of what a reader comparing the two C functions has to hold in
+    /// mind:
+    ///
+    /// * the limit is measured against [`Self::consumer_position`], the
+    ///   **fastest** active reader (the reference's `:316`), where an image
+    ///   takes the maximum of its own readers' positions;
+    /// * the window is the publication's own [`Self::term_window_length`] —
+    ///   the `pub-wnd` the channel named — where an image uses the receiver
+    ///   window it advertises in its status messages;
+    /// * a woken reader starts at [`Self::join_position`], the slowest active
+    ///   reader and no later than `consumer_position`.
+    ///
+    /// A tethered reader is never put aside. Neither is one that is merely
+    /// slow: the limit moves with the fastest reader, so a publication whose
+    /// only reader has stopped has nothing for it to be behind — which is why
+    /// the reference can offer this as an escape valve at all.
+    ///
+    /// Returns what the conductor has to say about each reader it moved, in
+    /// the order the readers are held.
+    pub fn check_untethered_subscriptions(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> Vec<UntetheredEvent> {
+        let mut events = Vec::new();
+
+        let window_length = i64::from(self.term_window_length);
+        let untethered_window_limit =
+            (self.consumer_position - window_length) + (window_length / 4);
+
+        // Copied out for the same reason the image's copy is: a woken reader
+        // reads the whole set again for its join position, and the set cannot
+        // be read while it is being written. The reference walks the array it
+        // is writing into, which is the same thing with the aliasing left
+        // implicit.
+        let positions = self.subscribers.positions().to_vec();
+
+        for position in positions {
+            if position.is_tether {
+                // A tethered reader keeps its claim on the stream whatever it
+                // does; only its timestamp moves.
+                let _ = self
+                    .subscribers
+                    .set_state(position.counter_id, position.state, now_ns);
+                continue;
+            }
+
+            let current = counters.value(regions, position.counter_id).unwrap_or(0);
+
+            match position.state {
+                TetherState::Active => {
+                    if current > untethered_window_limit {
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+                    } else if now_ns
+                        > position.time_of_last_update_ns + self.untethered_window_limit_timeout_ns
+                    {
+                        events.push(UntetheredEvent::Unavailable {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                        });
+
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Linger,
+                            now_ns,
+                        );
+                    }
+                }
+                TetherState::Linger => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_linger_timeout_ns
+                    {
+                        if position.is_rejoin {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Resting,
+                                now_ns,
+                            );
+                        } else {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Closed,
+                                now_ns,
+                            );
+                            let _ = self.subscribers.clear_counter_id(position.counter_id);
+
+                            events.push(UntetheredEvent::Closed {
+                                counter_id: position.counter_id,
+                            });
+                        }
+                    }
+                }
+                TetherState::Resting => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_resting_timeout_ns
+                    {
+                        let join_position = self.join_position(counters, regions);
+
+                        let _ = counters.set_value(regions, position.counter_id, join_position);
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+
+                        events.push(UntetheredEvent::Available {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                            join_position,
+                        });
+                    }
+                }
+                TetherState::Closed => {}
+            }
+        }
+
+        events
     }
 
     /// Write `pub-pos` and recompute `pub-lmt`
@@ -993,6 +1142,262 @@ mod tests {
 
             (manager, regions)
         }
+    }
+
+    /// One reader, as the conductor leaves it when it links a subscriber.
+    fn reader(counter_id: i32, is_tether: bool, is_rejoin: bool) -> TetherablePosition {
+        TetherablePosition {
+            counter_id,
+            subscription_registration_id: i64::from(counter_id) + 100,
+            time_of_last_update_ns: 0,
+            state: TetherState::Active,
+            is_tether,
+            is_rejoin,
+        }
+    }
+
+    /// A publication with a stalled reader and one that keeps up, and the
+    /// positions the machine's limit is measured from.
+    ///
+    /// `consumer_position` is set by hand rather than by producing: the
+    /// machine reads the field the publication maintains (`:316`), and an
+    /// untethered test that had to fill a window first would be testing the
+    /// limit's *maintenance* instead of its use.
+    fn stalled_and_reading(
+        dir: &TempDir,
+        manager: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        is_rejoin: bool,
+    ) -> (IpcPublication, i32, i32) {
+        let mut publication = publication(dir, manager, regions);
+
+        let stalled = manager
+            .allocate(regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let reading = manager
+            .allocate(regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let _ = manager.set_value(regions, stalled, 0);
+        let _ = manager.set_value(regions, reading, 100_000);
+
+        publication.consumer_position = 100_000;
+
+        assert!(publication.add_subscriber(reader(stalled, false, is_rejoin)));
+        assert!(publication.add_subscriber(reader(reading, true, is_rejoin)));
+
+        (publication, stalled, reading)
+    }
+
+    #[test]
+    fn a_reader_that_stops_reading_is_put_aside_and_woken_at_the_join_position() {
+        let dir = TempDir::new();
+        let mut region_holder = Regions::new();
+        let (mut manager, regions) = region_holder.open();
+        let (mut publication, stalled, _) = stalled_and_reading(&dir, &mut manager, &regions, true);
+
+        // Behind by more than three quarters of the window, and quiet for
+        // longer than the window limit.
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns + 1,
+        );
+        assert_eq!(
+            vec![UntetheredEvent::Unavailable {
+                subscription_registration_id: i64::from(stalled) + 100,
+                counter_id: stalled,
+            }],
+            events,
+            "only the reader that is behind is put aside: the other one is tethered"
+        );
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns
+                + publication.untethered_linger_timeout_ns
+                + 2,
+        );
+        assert!(
+            events.is_empty(),
+            "a rejoining reader waits rather than closing"
+        );
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns
+                + publication.untethered_linger_timeout_ns
+                + publication.untethered_resting_timeout_ns
+                + 3,
+        );
+        assert_eq!(
+            vec![UntetheredEvent::Available {
+                subscription_registration_id: i64::from(stalled) + 100,
+                counter_id: stalled,
+                join_position: 100_000,
+            }],
+            events,
+            "woken where the slowest active reader is, which is the one that kept up"
+        );
+        assert_eq!(
+            Some(100_000),
+            manager.value(&regions, stalled),
+            "and its counter is seeded there, not left where it stalled"
+        );
+        assert_eq!(
+            Some(TetherState::Active),
+            publication
+                .subscribers
+                .find_by_counter(stalled)
+                .map(|position| position.state)
+        );
+    }
+
+    #[test]
+    fn a_reader_that_is_not_rejoining_is_closed_and_keeps_its_place_in_the_set() {
+        let dir = TempDir::new();
+        let mut region_holder = Regions::new();
+        let (mut manager, regions) = region_holder.open();
+        let (mut publication, stalled, _) =
+            stalled_and_reading(&dir, &mut manager, &regions, false);
+
+        let _ = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns + 1,
+        );
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns
+                + publication.untethered_linger_timeout_ns
+                + 2,
+        );
+        assert_eq!(
+            vec![UntetheredEvent::Closed {
+                counter_id: stalled
+            }],
+            events,
+            "a reader that is not rejoining is done"
+        );
+
+        let closed = publication
+            .subscribers
+            .find_by_subscription(i64::from(stalled) + 100);
+
+        assert_eq!(1, closed.len(), "the position is still there");
+        assert_eq!(TetherState::Closed, closed[0].state);
+        assert_eq!(
+            deepmsg_cnc::layout::NULL_COUNTER_ID,
+            closed[0].counter_id,
+            "and its id is no longer one the set points at, which is what stops \
+             the teardown giving the counter back twice"
+        );
+    }
+
+    #[test]
+    fn the_logs_connected_byte_follows_a_reader_that_is_woken() {
+        // Waking is the case the add and remove hooks cannot see: nothing is
+        // added and nothing is removed, so the log's `is_connected` byte is
+        // either the reference's per-tier recomputation (`:533-534`) or it is
+        // stale — and it is what a producer reads to tell "nobody is reading"
+        // from "a slow reader".
+        let dir = TempDir::new();
+        let mut region_holder = Regions::new();
+        let (mut manager, regions) = region_holder.open();
+        let (mut publication, _stalled, reading) =
+            stalled_and_reading(&dir, &mut manager, &regions, true);
+
+        let _ = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns + 1,
+        );
+        let _ = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns
+                + publication.untethered_linger_timeout_ns
+                + 2,
+        );
+
+        // The reader that kept up leaves while the other one waits. That is a
+        // removal, so the hook sees it: nobody is reading.
+        assert!(publication.remove_subscriber(reading).is_some());
+        publication.update_connected_status();
+        assert_eq!(
+            0,
+            metadata_i32(&publication, descriptor::IS_CONNECTED_OFFSET)
+        );
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_window_limit_timeout_ns
+                + publication.untethered_linger_timeout_ns
+                + publication.untethered_resting_timeout_ns
+                + 3,
+        );
+        assert_eq!(1, events.len(), "the waiting reader is woken");
+
+        publication.update_connected_status();
+        assert_eq!(
+            1,
+            metadata_i32(&publication, descriptor::IS_CONNECTED_OFFSET),
+            "and the producer can see someone reading again"
+        );
+    }
+
+    #[test]
+    fn a_tethered_reader_is_never_put_aside_and_neither_is_the_only_one() {
+        let dir = TempDir::new();
+        let mut region_holder = Regions::new();
+        let (mut manager, regions) = region_holder.open();
+        let mut publication = publication(&dir, &mut manager, &regions);
+
+        let one = manager
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let two = manager
+            .allocate(&regions, 4, &[], b"sub-pos", 1)
+            .expect("a counter");
+        let _ = manager.set_value(&regions, one, 0);
+        let _ = manager.set_value(&regions, two, 0);
+
+        publication.consumer_position = 100_000;
+
+        assert!(publication.add_subscriber(reader(one, true, true)));
+        assert!(publication.add_subscriber(reader(two, true, false)));
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_resting_timeout_ns * 4,
+        );
+        assert!(
+            events.is_empty(),
+            "a tethered reader keeps its claim forever"
+        );
+
+        // And an untethered one is only late *relative to another reader*: the
+        // limit moves with the fastest, so a publication whose only reader has
+        // stopped has nothing for it to be behind.
+        assert!(publication.remove_subscriber(two).is_some());
+        let lone = publication.subscribers.positions()[0].counter_id;
+        let _ = manager.set_value(&regions, lone, 40_000);
+        publication.consumer_position = 40_000;
+
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            publication.untethered_resting_timeout_ns * 4,
+        );
+        assert!(
+            events.is_empty(),
+            "the only reader is the fastest reader, however slowly it reads"
+        );
     }
 
     /// The parameters a bare `aeron:ipc` channel resolves to, with this
