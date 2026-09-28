@@ -209,14 +209,24 @@ pub enum RecordError {
     Unrecordable { description: String },
 }
 
-/// The reference's description for a client error code
-/// (`aeron_error_code_str`, `aeron-client/src/main/c/util/aeron_error.c:195-230`).
+/// The reference's description for a code a **driver** records
+/// (`aeron_error_code_str`, `aeron-client/src/main/c/util/aeron_error.c:190-309`).
+///
+/// This is the part of that table this build models: the reference has rows
+/// for its client-side codes (`AERON_CLIENT_ERROR_*`, `aeronc.h:32-35`) and
+/// the archive's (`AERON_ARCHIVE_ERROR_CODE_*`) as well, and those answer the
+/// default here. Nothing that records in this build reaches one.
+///
+/// Zero is not the default, because the reference's own switch puts
+/// `AERON_ERROR_CODE_UNUSED` on the same case as
+/// `AERON_ERROR_CODE_GENERIC_ERROR` (`:195-200`).
 ///
 /// The code the reference *records* is often negated — its `AERON_SET_ERR`
 /// calls on the recording sites are given `-ERROR_CODE_*` — and this table is
 /// keyed by the positive code, so pass `-code` for one of those.
 pub fn error_code_description(code: i32) -> &'static str {
     match code {
+        0 | 11 => "generic error, see message",
         1 => "invalid channel",
         2 => "unknown subscription",
         3 => "unknown publication",
@@ -227,8 +237,9 @@ pub fn error_code_description(code: i32) -> &'static str {
         8 => "not supported",
         9 => "unknown host",
         10 => "resource temporarily unavailable",
-        11 => "generic error, see message",
         12 => "insufficient storage space",
+        13 => "image rejected",
+        14 => "publication revoked",
         _ => "unknown error code",
     }
 }
@@ -445,10 +456,14 @@ mod tests {
         );
 
         // A code the table has no case for gets the reference's default
-        // (`aeron_error.c:307-309`).
+        // (`aeron_error.c:307-309`) — and it is negative because a *positive*
+        // code takes the reference's other branch, `aeron_strerror_r`
+        // (`:357-366`), which this build does not model: no recording site
+        // here sets one, so a positive code is outside the range this
+        // composition claims rather than a behaviour to match.
         assert_eq!(
-            "(99) unknown error code\n[f, f.c:1] m\n",
-            compose_description(99, "f", "f.c", 1, "m")
+            "(-99) unknown error code\n[f, f.c:1] m\n",
+            compose_description(-99, "f", "f.c", 1, "m")
         );
     }
 
@@ -468,12 +483,19 @@ mod tests {
 
     #[test]
     fn the_code_descriptions_are_the_references_table() {
-        // `aeron_error_code_str` (`aeron_error.c:195-230`), the entries a
+        // `aeron_error_code_str` (`aeron_error.c:190-309`), the entries a
         // driver-recorded code can reach.
         assert_eq!("invalid channel", error_code_description(1));
         assert_eq!("unknown counter", error_code_description(5));
         assert_eq!("insufficient storage space", error_code_description(12));
-        assert_eq!("unknown error code", error_code_description(0));
+        // The two rows the reference's switch shares, and past the driver's
+        // own range (`:195-200`, `:233-238`).
+        assert_eq!("generic error, see message", error_code_description(0));
+        assert_eq!("generic error, see message", error_code_description(11));
+        assert_eq!("image rejected", error_code_description(13));
+        assert_eq!("publication revoked", error_code_description(14));
+        // And the default for a code with no row (`:307-309`).
+        assert_eq!("unknown error code", error_code_description(99));
     }
 
     #[repr(align(64))]
