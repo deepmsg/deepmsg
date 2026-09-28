@@ -22,6 +22,43 @@
 use deepmsg_cnc::counters::{CounterDescriptor, CountersReader};
 use deepmsg_core::buffer::ReadWrite;
 
+/// A counter announcement from the broadcast, for whoever is watching.
+///
+/// The to-clients ring is one broadcast every client reads in full, so a
+/// client sees **every** counter appear and go away — its own, another
+/// client's, and the heartbeats the driver allocates on its own initiative.
+/// The reference delivers these through callback pairs an application
+/// registers (`aeron_add_available_counter_handler` /
+/// `aeron_add_unavailable_counter_handler`, fired from
+/// `aeron_client_conductor.c:850-895` and `:898-906`); this crate's shape is
+/// a queue the caller drains ([`crate::client::Client::counter_events`]),
+/// because a poll-driven client has no thread to run a callback on.
+///
+/// Neither kind of event carries a resource with it. A [`Counter`] handle is
+/// a name, and a slot that has been reclaimed already answers every question
+/// about itself with "gone" — which is exactly how the reference behaves too:
+/// its `on_unavailable_counter` fires the handlers and does not close or even
+/// look up the counter it names (`aeron_client_conductor.c:898-906`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterEvent {
+    /// A counter was allocated, by any client.
+    Ready {
+        /// The registration id it was allocated under — the owning client's
+        /// id for a heartbeat, the request's correlation id otherwise.
+        correlation_id: i64,
+        /// The counter's id, for [`CountersReader`].
+        counter_id: i32,
+    },
+    /// A counter went away — removed by its owner, or reclaimed with the
+    /// client that held it.
+    Unavailable {
+        /// The registration id it had been allocated under.
+        correlation_id: i64,
+        /// The id the slot had.
+        counter_id: i32,
+    },
+}
+
 /// A counter allocated by the driver on this client's behalf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Counter {

@@ -1428,6 +1428,7 @@ mod tests {
     use crate::config::{
         PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT, PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
     };
+    use deepmsg_client::counter::CounterEvent;
     use deepmsg_cnc::layout::NULL_VALUE;
     use deepmsg_cnc::{CncIdentity, CncLayout, TerminateDriver};
     use deepmsg_cnc::{Received, ToClientsReceiver};
@@ -3726,6 +3727,150 @@ mod tests {
                 .find_by_type_and_registration(100, counter.registration_id())
                 .is_none(),
             "the slot is reclaimed"
+        );
+    }
+
+    #[test]
+    fn counter_announcements_arrive_as_events_for_the_watchers() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        let counter = client
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of ours",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        // Two announcements crossed the broadcast while the add was waiting:
+        // this client's heartbeat — keyed by the client id — and the counter
+        // it asked for. Both are events for the watchers; only the second was
+        // also the reply the add was waiting on.
+        let events = client.counter_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CounterEvent::Ready { correlation_id, .. } if *correlation_id == client.client_id()
+            )),
+            "the heartbeat's announcement is an event, keyed by the client id"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CounterEvent::Ready { correlation_id, counter_id }
+                    if *correlation_id == counter.registration_id()
+                        && *counter_id == counter.counter_id()
+            )),
+            "and so is the counter the add asked for"
+        );
+
+        client
+            .remove_counter(&counter, std::time::Duration::from_secs(5))
+            .expect("removed");
+
+        // The acknowledgement is what unblocks the call; the announcement
+        // follows it on the broadcast and only a later poll reads it
+        // (`:6221-6235` — the reference's order too).
+        let mut unavailable = false;
+        for _ in 0..200 {
+            client.poll();
+            if client.counter_events().iter().any(|event| {
+                matches!(
+                    event,
+                    CounterEvent::Unavailable { correlation_id, .. }
+                        if *correlation_id == counter.registration_id()
+                )
+            }) {
+                unavailable = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(unavailable, "the removal is an event for the watchers too");
+    }
+
+    #[test]
+    fn another_clients_counters_arrive_as_events_too() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut watcher) = connected(&temp, &config);
+
+        // A second client on the same directory. The broadcast is one ring
+        // every client reads in full, so the watcher sees the other client's
+        // heartbeat and counter appear, though nothing of the watcher's was
+        // waiting for either.
+        let mut other =
+            deepmsg_client::client::Client::connect(&temp.0).expect("the other client connects");
+        let counter = other
+            .add_counter(
+                100,
+                b"a key",
+                "a counter of theirs",
+                std::time::Duration::from_secs(5),
+            )
+            .expect("the counter is allocated");
+
+        let mut saw_heartbeat = false;
+        let mut saw_counter = false;
+        for _ in 0..200 {
+            watcher.poll();
+            for event in watcher.counter_events() {
+                match event {
+                    CounterEvent::Ready { correlation_id, .. }
+                        if correlation_id == other.client_id() =>
+                    {
+                        saw_heartbeat = true;
+                    }
+                    CounterEvent::Ready { correlation_id, .. }
+                        if correlation_id == counter.registration_id() =>
+                    {
+                        saw_counter = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if saw_heartbeat && saw_counter {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            saw_heartbeat,
+            "the other client's heartbeat is an event here"
+        );
+        assert!(saw_counter, "and so is its counter");
+    }
+
+    #[test]
+    fn a_client_reads_the_counters_through_its_own_mapping() {
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let (_driver, mut client) = connected(&temp, &config);
+
+        client
+            .add_subscription("aeron:ipc", 1001, std::time::Duration::from_secs(5))
+            .expect("subscribed");
+
+        // The reader is over the client's own mapping of the file — the same
+        // one another process would map — and finds the heartbeat the driver
+        // allocated for it, holding a value this client's polls have been
+        // writing. This is the `aeron_counters_reader(client)` an
+        // `AeronStat`-shaped tool would walk (`aeron_client.c:276-286`).
+        let reader = client.counters_reader().expect("the counter regions");
+        let heartbeat = reader
+            .find_by_type_and_registration(
+                deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID,
+                client.client_id(),
+            )
+            .expect("the heartbeat is in the file");
+        assert!(
+            reader.value(heartbeat).unwrap_or(0) > 0,
+            "a living client has been writing its heartbeat"
         );
     }
 

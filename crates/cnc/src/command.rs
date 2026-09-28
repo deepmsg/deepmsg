@@ -576,6 +576,16 @@ pub enum Response<'a> {
         /// The counter's id, for `CountersReader`.
         counter_id: i32,
     },
+    /// A counter was removed — or taken with the client that owned it, which
+    /// the driver announces the same way. The payload is the same twelve bytes
+    /// [`Response::CounterReady`] carries.
+    CounterUnavailable {
+        /// The registration id the counter was allocated under — the client
+        /// id, when the driver allocated the counter itself.
+        correlation_id: i64,
+        /// The id the slot had, which is back in the pool now.
+        counter_id: i32,
+    },
     /// A command whose work is done, when the done thing has no handle to
     /// hand back: the driver's acknowledgement of a removal
     /// (`aeron_operation_succeeded_t`, eight bytes under the header).
@@ -1037,6 +1047,13 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
             },
             _ => Response::Other { type_id },
         },
+        ON_UNAVAILABLE_COUNTER_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(counter_id)) => Response::CounterUnavailable {
+                correlation_id,
+                counter_id,
+            },
+            _ => Response::Other { type_id },
+        },
         ON_OPERATION_SUCCEEDED_TYPE_ID => match le_i64(payload, 0) {
             Some(correlation_id) => Response::OperationSucceeded { correlation_id },
             None => Response::Other { type_id },
@@ -1430,6 +1447,7 @@ mod response_tests {
         for (type_id, bytes) in [
             (ON_SUBSCRIPTION_READY_TYPE_ID, vec![0u8; 8]),
             (ON_COUNTER_READY_TYPE_ID, vec![0u8; 4]),
+            (ON_UNAVAILABLE_COUNTER_TYPE_ID, vec![0u8; 4]),
             (ON_CLIENT_TIMEOUT_TYPE_ID, vec![0u8; 7]),
             (ON_ERROR_TYPE_ID, vec![0u8; 12]),
         ] {
@@ -1576,13 +1594,12 @@ mod response_tests {
         );
 
         // The removal type carries the same twelve bytes the ready type does,
-        // and this build's client does not model it — it is an event for the
-        // counter watchers, not a reply to a command, so it arrives as
-        // `Other`, which is the right answer for a response a client has
-        // nothing to do with.
+        // and decodes to its own variant: an event for the counter watchers,
+        // never a reply to a command — nothing waits on one.
         assert_eq!(
-            Response::Other {
-                type_id: ON_UNAVAILABLE_COUNTER_TYPE_ID,
+            Response::CounterUnavailable {
+                correlation_id: 7,
+                counter_id: 42,
             },
             decode_response(ON_UNAVAILABLE_COUNTER_TYPE_ID, &ready)
         );
