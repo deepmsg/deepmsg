@@ -146,6 +146,9 @@ pub struct NetworkPublication {
     /// Whether an answer has ever arrived; until it has, the publication keeps
     /// saying `SETUP` (`:595-600`).
     pub has_initial_connection: bool,
+    /// How far the terms have been zeroed behind the readers
+    /// (`aeron_network_publication_clean_buffer`, `:923-945`).
+    pub clean_position: i64,
     /// Whether a receiver asked for a `SETUP` and has not had one answered.
     pub is_setup_elicited: bool,
     /// When the receivers go quiet, this is when they are declared gone.
@@ -307,6 +310,10 @@ impl NetworkPublication {
             time_of_last_setup_ns: 0,
             time_of_last_data_or_heartbeat_ns: now_ns,
             has_initial_connection: false,
+            // Nothing has been sent yet, so nothing has been read past yet
+            // (`:249`; the reference also re-seats it on `snd-pos` when a
+            // publication is re-started, `:313`).
+            clean_position: 0,
             is_setup_elicited: false,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
@@ -1076,7 +1083,30 @@ impl NetworkPublication {
             let current = counters.value(regions, self.counters.pub_lmt).unwrap_or(0);
 
             if new_limit > current {
-                let _ = counters.set_value(regions, self.counters.pub_lmt, new_limit);
+                // The term one behind the slowest reader is one it is done with
+                // (`:985`).
+                self.clean_buffer(min_consumer - i64::from(self.term_length));
+
+                // The limit moves only once the zeroing has caught up with the
+                // term that is about to become the active one. A limit that
+                // outran the cleaning would let the producer write into slots
+                // still holding the previous generation, and this publication's
+                // scan for availability reads a term's frames rather than
+                // stopping at `pub-pos`.
+                let clean_position = self.clean_position;
+                let dirty_term_id = Position::from_raw(clean_position)
+                    .term_id(self.position_bits_to_shift, self.initial_term_id);
+                let active_term_id = Position::from_raw(new_limit)
+                    .term_id(self.position_bits_to_shift, self.initial_term_id);
+                let term_gap =
+                    deepmsg_core::logbuffer::position::term_count(active_term_id, dirty_term_id);
+                let clean_offset =
+                    Position::from_raw(clean_position).term_offset(self.position_bits_to_shift);
+
+                if term_gap < 2 || (term_gap == 2 && clean_offset != 0) {
+                    let _ = counters.set_value(regions, self.counters.pub_lmt, new_limit);
+                }
+
                 return true;
             }
 
@@ -1086,10 +1116,57 @@ impl NetworkPublication {
         if counters.value(regions, self.counters.pub_lmt).unwrap_or(0) > snd_pos {
             self.update_connected_status(counters, regions, false);
             let _ = counters.set_value(regions, self.counters.pub_lmt, snd_pos);
+            self.clean_buffer(snd_pos - i64::from(self.term_length));
             return true;
         }
 
         false
+    }
+
+    /// Zero the terms the readers have finished with, a chunk at a time
+    /// (`aeron_network_publication_clean_buffer`, `:923-945`).
+    ///
+    /// A producer reusing a term writes into slots the frames of a full buffer
+    /// ago still occupy, and the log buffer's rule — write only into an empty
+    /// slot — refuses that write. Zeroing behind the readers is what makes the
+    /// slots empty again.
+    ///
+    /// Everything past the first eight bytes is zeroed first, and the
+    /// frame-length word goes to zero last with a **release**: a reader that
+    /// already saw the old length finds the bytes it describes still untouched.
+    /// Zeroing the length first would let a reader see a frame whose body had
+    /// been cleared underneath it.
+    pub fn clean_buffer(&mut self, position: i64) {
+        if position <= self.clean_position {
+            return;
+        }
+
+        let index = Position::from_raw(self.clean_position).index(self.position_bits_to_shift);
+        let clean_offset = Position::from_raw(self.clean_position)
+            .term_offset(self.position_bits_to_shift)
+            .unsigned_abs() as usize;
+
+        let bytes_left_in_term = self.term_length as usize - clean_offset;
+        let bytes_to_clean = (position - self.clean_position) as usize;
+        let length = bytes_to_clean.min(bytes_left_in_term);
+
+        let Some(term) = self.log.term(index) else {
+            return;
+        };
+
+        let body = length.saturating_sub(std::mem::size_of::<i64>());
+        if term
+            .zero(clean_offset + std::mem::size_of::<i64>(), body)
+            .is_none()
+        {
+            return;
+        }
+
+        if term.store_i64_release(clean_offset, 0).is_none() {
+            return;
+        }
+
+        self.clean_position += length as i64;
     }
 }
 

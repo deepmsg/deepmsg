@@ -145,6 +145,9 @@ pub struct PublicationImage {
     next_sm_receiver_window_length: i32,
     /// What the last status message said, which is what bounds an over-run.
     last_sm_position: i64,
+    /// How far the terms have been zeroed behind the readers
+    /// (`aeron_publication_image_clean_buffer_to`, `:430-451`).
+    clean_position: i64,
     /// The position past which an arrival is an over-run.
     last_overrun_threshold: i64,
     /// The change number the last status message was sent for.
@@ -298,6 +301,7 @@ impl PublicationImage {
             next_sm_position: initial_position,
             next_sm_receiver_window_length: window,
             last_sm_position: initial_position,
+            clean_position: initial_position,
             last_overrun_threshold: initial_position + i64::from(setup.term_length / 2),
             last_sm_change_number: 0,
             sm_change_number: 0,
@@ -639,6 +643,10 @@ impl PublicationImage {
         let threshold = window_length / 4;
 
         if min_sub_pos > self.next_sm_position + i64::from(threshold) {
+            // A term behind the slowest reader is a term that reader is done
+            // with, and cleaning it here — in the same breath as the status
+            // message that reports it — is what the reference does (`:551`).
+            self.clean_buffer_to(min_sub_pos - i64::from(self.term_length.unsigned_abs() as i32));
             self.schedule_status_message(min_sub_pos, window_length, counters, regions, now_ns);
         }
 
@@ -660,6 +668,55 @@ impl PublicationImage {
         self.sm_change_number += 1;
 
         let _ = (counters, regions, now_ns);
+    }
+
+    /// Zero the terms the readers have finished with, a chunk at a time
+    /// (`aeron_publication_image_clean_buffer_to`, `:430-451`).
+    ///
+    /// Without this a reused term still holds the frames it held a full buffer
+    /// ago, and `insert_packet`'s "write only into an empty slot" rule — the
+    /// same one the reference's term rebuilder applies
+    /// (`aeron_term_rebuilder.h:30`) — refuses to replace them. The reader
+    /// then walks the *old* frames and returns messages from three terms back,
+    /// with nothing raised and no counter moved.
+    ///
+    /// Everything past the first eight bytes is zeroed first, and the
+    /// frame-length word goes to zero last with a **release**: a reader that
+    /// sees a zero length stops, and one that already saw the old length finds
+    /// the bytes it describes still untouched. Zeroing the length first would
+    /// let a reader see a frame whose body had been cleared underneath it.
+    fn clean_buffer_to(&mut self, position: i64) {
+        if position <= self.clean_position {
+            return;
+        }
+
+        let term_length = i64::from(self.term_length.unsigned_abs() as i32);
+        let index = Position::from_raw(self.clean_position).index(self.position_bits_to_shift);
+        let clean_offset = Position::from_raw(self.clean_position)
+            .term_offset(self.position_bits_to_shift)
+            .unsigned_abs() as usize;
+
+        let bytes_left_in_term = term_length as usize - clean_offset;
+        let bytes_to_clean = (position - self.clean_position) as usize;
+        let length = bytes_to_clean.min(bytes_left_in_term);
+
+        let Some(term) = self.log.term(index) else {
+            return;
+        };
+
+        let body = length.saturating_sub(std::mem::size_of::<i64>());
+        if term
+            .zero(clean_offset + std::mem::size_of::<i64>(), body)
+            .is_none()
+        {
+            return;
+        }
+
+        if term.store_i64_release(clean_offset, 0).is_none() {
+            return;
+        }
+
+        self.clean_position += length as i64;
     }
 
     /// Send a status message if one is due
