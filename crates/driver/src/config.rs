@@ -128,6 +128,11 @@ pub const RETRANSMIT_UNICAST_LINGER_NS_DEFAULT: i64 = 10_000_000;
 /// `AERON_RETRANSMIT_HANDLER_MAX_RESEND` (`aeron_driver_context.c:499`).
 pub const MAX_RESEND_DEFAULT: i32 = 16;
 
+/// `AERON_DRIVER_STREAM_SESSION_LIMIT_DEFAULT`
+/// (`aeron_driver_context.c:249`): no limit.
+#[allow(clippy::cast_sign_loss)] // the reference's own INT32_MAX default
+pub const STREAM_SESSION_LIMIT_DEFAULT: usize = i32::MAX as usize;
+
 /// The largest frame an IPC publication writes: 1408 bytes
 /// (`aeron.ipc.mtu.length`, `aeron_driver_context.c:187`).
 ///
@@ -359,6 +364,11 @@ pub struct DriverConfig {
     /// How many times a term may be retransmitted before the publication gives
     /// up on it (`aeron.max.resend`, sixteen).
     pub max_resend: i32,
+    /// How many sessions one stream may have before the driver stops making
+    /// images for it (`aeron.stream.session.limit`; the reference's default is
+    /// no limit at all, `INT32_MAX`,
+    /// `aeron-driver/src/main/c/aeron_driver_context.c:249`).
+    pub stream_session_limit: usize,
 }
 
 impl Default for DriverConfig {
@@ -405,6 +415,7 @@ impl Default for DriverConfig {
             retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
+            stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
         }
     }
 }

@@ -34,6 +34,15 @@ pub mod type_id {
     /// `AERON_COUNTER_PUBLISHER_POSITION_TYPE_ID` (`:100-102`), label
     /// `"pub-pos (concurrent)"` or `"pub-pos (exclusive)"`.
     pub const PUBLISHER_POSITION: i32 = 12;
+    /// `AERON_COUNTER_RECEIVER_HWM_TYPE_ID` (`:74-76`), label `"rcv-hwm"`.
+    pub const RECEIVER_HWM: i32 = 3;
+    /// `AERON_COUNTER_RECEIVER_POSITION_TYPE_ID` (`:86-88`), label `"rcv-pos"`.
+    pub const RECEIVER_POSITION: i32 = 5;
+    /// `AERON_COUNTER_SENDER_POSITION_TYPE_ID` (`:104-106`), label
+    /// `"snd-pos"`.
+    pub const SENDER_POSITION: i32 = 2;
+    /// `AERON_COUNTER_SENDER_LIMIT_TYPE_ID` (`:108-110`), label `"snd-lmt"`.
+    pub const SENDER_LIMIT: i32 = 9;
 }
 
 /// The key a stream-position counter carries

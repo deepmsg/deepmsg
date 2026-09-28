@@ -79,6 +79,9 @@ use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
+use crate::publication_images::PublicationImages;
+use crate::receive_endpoints::ReceiveChannelEndpoints;
+use crate::receiver::{Receiver, ReceiverEvent};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
@@ -423,6 +426,14 @@ pub struct Conductor {
     network_publications: NetworkPublications,
     /// The sender thread, whose proxy is how anything reaches it.
     sender: Sender,
+    /// The receive endpoints a subscription listens on, one per canonical
+    /// channel (`aeron_driver_conductor.c:2046-2115`).
+    receive_endpoints: ReceiveChannelEndpoints,
+    /// The images built from datagrams, and the thread that maps their log
+    /// buffers.
+    images: PublicationImages,
+    /// The receiver thread.
+    receiver: Receiver,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -586,6 +597,27 @@ impl Conductor {
         )
         .map_err(ConductorError::Agent)?;
 
+        // The receive side: the receiver thread first (it owns the sockets and
+        // the images), then the images manager, which is the other agent thread
+        // — the one that maps an *image's* log buffer.
+        let receiver = Receiver::start(
+            Arc::clone(&cnc),
+            cnc.layout().counters_values.len(),
+            free_to_reuse_ms(config.counter_free_to_reuse_ns),
+            usize::try_from(config.mtu_length).unwrap_or(1408),
+            crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
+            config.receiver_window_length,
+            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+        )
+        .map_err(ConductorError::Sender)?;
+
+        let images = PublicationImages::start(StorageChecks::new(
+            config.perform_storage_checks,
+            config.low_file_store_warning_threshold,
+            config.aeron_dir.clone(),
+        ))
+        .map_err(ConductorError::Agent)?;
+
         let conductor = Self {
             config: config.clone(),
             cnc,
@@ -600,6 +632,9 @@ impl Conductor {
             send_endpoints: SendChannelEndpoints::new(),
             network_publications,
             sender,
+            receive_endpoints: ReceiveChannelEndpoints::new(),
+            images,
+            receiver,
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -654,7 +689,8 @@ impl Conductor {
         let work = work_count
             + self.process_commands(now_ns)
             + self.poll_publications()
-            + self.update_publication_limits();
+            + self.update_publication_limits()
+            + self.poll_receiver(now_ns);
         // What the pass noticed and could not record while it held the file:
         // the errors behind the `ON_ERROR`s it sent, the command adapter's own
         // faults, the storage warnings, and the broadcasts the ring refused.
@@ -744,6 +780,196 @@ impl Conductor {
         work
     }
 
+    /// What the receiver thread has to say, and what follows from it.
+    ///
+    /// Two of its events are *commands in disguise*: a `SETUP` that arrived for
+    /// a session nothing serves is a request to build an image — the reference
+    /// sends it the same way, over its conductor proxy — and an image that has
+    /// finished its life is a request to release it. The third is a fault, for
+    /// the error log this thread does not write itself.
+    ///
+    /// The create itself is like every other create here: it burns a
+    /// registration id, asks the agent for a log buffer off-thread, and the
+    /// image is built when the buffer lands (`poll_images`).
+    fn poll_receiver(&mut self, now_ns: i64) -> usize {
+        let events = self.receiver.proxy().poll();
+        let mut work = 0;
+
+        for event in events {
+            work += 1;
+
+            match event {
+                ReceiverEvent::CreateImage {
+                    endpoint_id,
+                    stream_id,
+                    session_id,
+                    initial_term_id,
+                    active_term_id,
+                    term_offset,
+                    term_length,
+                    mtu,
+                    control_address,
+                    source,
+                } => {
+                    let Some(ring) = self.cnc.to_driver_ring() else {
+                        continue;
+                    };
+                    let Some(registration_id) = ring.next_correlation_id() else {
+                        continue;
+                    };
+
+                    let Some(entry) = self.receive_endpoints.get(endpoint_id) else {
+                        continue;
+                    };
+                    let channel = entry.channel.original_uri.clone();
+
+                    let setup = crate::protocol::SetupFrame {
+                        term_offset,
+                        session_id,
+                        stream_id,
+                        initial_term_id,
+                        active_term_id,
+                        term_length,
+                        mtu,
+                        ttl: 0,
+                    };
+
+                    let now = Now {
+                        ms: self.now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: self.liveness_timeout_ns,
+                    };
+
+                    let Some(regions) = self.cnc.counter_regions() else {
+                        continue;
+                    };
+
+                    let result = self.images.begin_create(
+                        registration_id,
+                        endpoint_id,
+                        &channel,
+                        &setup,
+                        source,
+                        control_address,
+                        &self.config,
+                        &mut self.counters,
+                        &regions,
+                        now,
+                    );
+
+                    if let Err(error) = result {
+                        self.pending_log_errors
+                            .push((error.error_code(), error.to_string()));
+                    }
+                }
+                ReceiverEvent::ImageDone { registration_id } => {
+                    let _ = self.receiver.proxy().remove_image(registration_id);
+
+                    if let Some(image) = self.images.find(registration_id).cloned() {
+                        self.receive_endpoints.detach_image(image.endpoint_id);
+                    }
+
+                    self.subscriptions.forget_publication(registration_id);
+                    self.images.decref(registration_id);
+                }
+                ReceiverEvent::Fault {
+                    error_code,
+                    description,
+                } => {
+                    self.pending_log_errors.push((error_code, description));
+                }
+            }
+        }
+
+        work + self.poll_images(now_ns)
+    }
+
+    /// Take the image agent's completions: this is where an image whose log
+    /// buffer was being created becomes one, where the subscriptions waiting
+    /// for that stream are given it, and where each of them is told.
+    fn poll_images(&mut self, now_ns: i64) -> usize {
+        if self.images.pending() == 0 {
+            return 0;
+        }
+
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let now = Now {
+            ms: self.now_ms,
+            ns: now_ns,
+            client_liveness_timeout_ns: self.liveness_timeout_ns,
+        };
+
+        let mut warnings = Vec::new();
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let created = self.images.poll(
+            &self.config,
+            &mut self.counters,
+            &counter_regions,
+            &mut self.receive_endpoints,
+            self.receiver.proxy(),
+            now,
+            &mut warnings,
+        );
+
+        for registration_id in &created {
+            // A link that fails is a subscription that will never read this
+            // image, and the client is waiting for exactly that message: it is
+            // recorded rather than dropped, because the alternative is a
+            // driver that looks healthy and delivers nothing.
+            let links = self.subscriptions.links().len();
+
+            if self
+                .subscriptions
+                .link_new_image(
+                    *registration_id,
+                    &mut self.images,
+                    &mut self.counters,
+                    &counter_regions,
+                    self.receiver.proxy(),
+                    now,
+                    &mut transmit,
+                )
+                .is_err()
+            {
+                transmit.record_fault(
+                    deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                    format!(
+                        "could not link a subscription to image {registration_id} ({links} links)"
+                    ),
+                );
+            }
+        }
+
+        for warning in warnings {
+            // The words are the reference's own shape for a low-space warning
+            // (`aeron_driver_context_run_storage_checks`), recorded where every
+            // other fault this pass noticed is.
+            transmit.record_fault(
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "usable fs space of {} bytes is below the {} byte threshold for {}",
+                    warning.usable,
+                    warning.threshold,
+                    warning.dir.display()
+                ),
+            );
+        }
+
+        created.len()
+    }
+
     /// What the sender thread has to say: an endpoint it closed, a publication
     /// it let go, and the faults it could not record itself (it has no error
     /// log of its own — the distinct log is the conductor's).
@@ -783,6 +1009,11 @@ impl Conductor {
     /// Whether the driver should keep running.
     pub const fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// The images this driver is reading, for a caller that needs to look.
+    pub fn publication_images(&self) -> &[crate::publication_images::PublicationImageRecord] {
+        self.images.images()
     }
 
     /// The counters this driver publishes. Read-only: only the conductor
@@ -900,6 +1131,10 @@ impl Conductor {
         // publications' own bookkeeping.
         let _ = self.sender.close();
         let _ = self.network_publications.close();
+        // And the receive side, in the same order and for the same reason: the
+        // thread that owns the sockets and the log buffers goes first.
+        let _ = self.receiver.close();
+        self.images.close();
         // The subscriptions own no counters: a reader's `sub-pos` is in the
         // publication's set, and the line above has already given it back.
         self.subscriptions.close();
@@ -940,6 +1175,9 @@ impl Conductor {
         let network_publications = &mut self.network_publications;
         let send_endpoints = &mut self.send_endpoints;
         let sender = &self.sender;
+        let receive_endpoints = &mut self.receive_endpoints;
+        let images = &mut self.images;
+        let receiver = &self.receiver;
         let publication_failures = &mut self.publication_failures;
         let subscriptions = &mut self.subscriptions;
         let subscription_failures = &mut self.subscription_failures;
@@ -1167,16 +1405,35 @@ impl Conductor {
                             client_liveness_timeout_ns: liveness_timeout_ns,
                         };
 
-                        if let Err(error) = subscriptions.add_subscription(
-                            &request,
-                            config,
-                            counters,
-                            &counter_regions,
-                            clients,
-                            publications,
-                            now,
-                            &mut transmit,
-                        ) {
+                        // As with publications: what the URI names decides
+                        // which half serves it, and nothing else.
+                        let subscription_result = match ChannelUri::parse(request.channel) {
+                            Ok(uri) if uri.transport() == Transport::Udp => subscriptions
+                                .add_network_subscription(
+                                    &request,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    receive_endpoints,
+                                    images,
+                                    receiver.proxy(),
+                                    now,
+                                    &mut transmit,
+                                ),
+                            _ => subscriptions.add_subscription(
+                                &request,
+                                config,
+                                counters,
+                                &counter_regions,
+                                clients,
+                                publications,
+                                now,
+                                &mut transmit,
+                            ),
+                        };
+
+                        if let Err(error) = subscription_result {
                             *subscription_failures += 1;
                             transmit.error(
                                 request.correlation_id,
@@ -3083,6 +3340,193 @@ mod tests {
         assert_eq!(5001i32.to_le_bytes(), payload[16..20]);
         assert_eq!(44i64.to_le_bytes(), payload[8..16], "its own publication");
         assert_eq!(2, conductor.publications().publications().len());
+    }
+
+    /// The receive path, driven by hand: a subscription binds a socket, a
+    /// `SETUP` arrives on it, an image is built from the setup, and the client
+    /// is told where the log buffer is.
+    ///
+    /// Every step here is one the reference's own publisher would take over the
+    /// wire; a plain socket takes them instead so that a failure can name the
+    /// step it failed at.
+    #[test]
+    fn a_udp_subscription_binds_a_socket_and_an_image_forms_on_a_setup() {
+        use crate::protocol::{DataFrame, FrameHeader, SetupFrame};
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::{DatagramSocket, Datagrams};
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A port nobody holds: the test's own socket will send to it, and the
+        // driver's receive endpoint will bind it.
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &channel),
+        );
+
+        // The reply carries the *endpoint's* channel status counter: a client
+        // that reads it learns whether the socket is up.
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
+
+        let status_counter_id = i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"));
+        assert!(status_counter_id >= 0, "the endpoint has a channel status");
+
+        // The `SETUP` a publisher sends when it finds a subscriber waiting.
+        let session_id = 99;
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        publisher.set_nonblocking().expect("non-blocking");
+
+        // The driver has to be given the pass to process the command before the
+        // socket exists.
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        // The image is built off the conductor's thread (a log buffer to map),
+        // so this waits for it rather than asserting after one pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut images = 0;
+
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            if conductor.publication_images().len() > images {
+                images = conductor.publication_images().len();
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            1, images,
+            "a setup with a subscriber waiting builds an image"
+        );
+
+        let image = conductor.publication_images()[0].clone();
+        assert_eq!(session_id, image.session_id);
+        assert_eq!(1001, image.stream_id);
+        assert_eq!(
+            1, image.refcount,
+            "the subscription that was waiting is linked to it"
+        );
+
+        // The reader is told where the image's log buffer is.
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_AVAILABLE_IMAGE_TYPE_ID,
+        );
+        assert_eq!(image.registration_id.to_le_bytes(), payload[0..8]);
+        assert!(
+            payload.windows(9).any(|window| window == b"logbuffer"),
+            "the message names the file"
+        );
+
+        // And a DATA frame now reaches the image: the high-water mark is what
+        // says so.
+        let data = DataFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            term_id: 1_000,
+            reserved_value: 0,
+        };
+        let payload_bytes = b"the reference's bytes";
+        let mut data_frame = vec![0u8; 32 + payload_bytes.len()];
+
+        assert!(
+            data.write_with_flags(&mut data_frame, crate::protocol::header_flags::UNFRAGMENTED)
+                .is_some()
+        );
+        data_frame[32..].copy_from_slice(payload_bytes);
+
+        let _ = publisher.send_batch(
+            Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+            &[&data_frame],
+        );
+
+        let mut received_status = false;
+        let mut buffers = vec![vec![0u8; 2048]];
+        let mut datagrams = Datagrams::new();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            let received = publisher
+                .receive_batch(&mut buffers, &mut datagrams)
+                .unwrap_or(0);
+
+            for (slot, datagram) in datagrams.as_slice()[..received].iter().enumerate() {
+                let packet = &buffers[slot][..datagram.length];
+
+                if let Some(header) = FrameHeader::read(packet) {
+                    if header.frame_type == crate::protocol::frame_type::SM {
+                        received_status = true;
+                    }
+                }
+            }
+
+            if received_status {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            received_status,
+            "the subscriber answers with a status message: without one the \
+             publisher stops after one window"
+        );
     }
 
     #[test]

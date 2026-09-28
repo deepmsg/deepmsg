@@ -17,6 +17,17 @@
 //! function; this keeps them in two modules and links across them in
 //! [`link_subscribable`], which takes both.
 //!
+//! # One set of links, two kinds of publication
+//!
+//! A subscription is a *reader*, and what it reads is either an IPC
+//! publication's log buffer — which this driver made and its producer writes —
+//! or a **network image** built from datagrams (`crate::publication_images`).
+//! The two are the same kind of thing to a link: a counter for the client's
+//! position, and an entry in a set the far side computes its limit from. That
+//! is why [`SubscriptionLinkEntry`] holds a [`SubscriptionTarget`] rather than a
+//! publication id, and why this module is still called `IpcSubscriptions` for
+//! historical reasons only — the links are the driver's, not IPC's.
+//!
 //! # Matching is a question about the stream, not the channel
 //!
 //! `link.stream_id == publication.stream_id`, and then the session: a
@@ -37,9 +48,13 @@ use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
 use crate::config::DriverConfig;
 use crate::ipc_publications::{AddError, IpcPublications};
+use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
+use crate::receive_endpoints::ReceiveChannelEndpoints;
+use crate::receiver::ReceiverProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
+use crate::udp_channel::UdpChannel;
 use crate::{ipc_publication::IpcPublication, position as counter_position};
 
 /// The channel an IPC image reports as its source
@@ -51,15 +66,40 @@ use crate::{ipc_publication::IpcPublication, position as counter_position};
 /// about what the reader asked for.
 pub const IPC_CHANNEL: &[u8] = b"aeron:ipc";
 
+/// What a reader reads (`aeron_subscribable_list_entry_t`'s `subscribable`
+/// pointer, `aeron-driver/src/main/c/aeron_driver_conductor.h:113-118`).
+///
+/// The reference holds a pointer to whichever subscribable — a publication's or
+/// an image's. Here the two collections are separate, so the *kind* is what
+/// survives; the id is a registration id in both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionTarget {
+    /// An IPC publication's log buffer.
+    IpcPublication(i64),
+    /// A network image's log buffer, built from datagrams.
+    Image(i64),
+}
+
+impl SubscriptionTarget {
+    /// The registration id of whatever this points at.
+    pub const fn registration_id(self) -> i64 {
+        match self {
+            Self::IpcPublication(registration_id) | Self::Image(registration_id) => registration_id,
+        }
+    }
+
+    /// Whether this is an image.
+    pub const fn is_image(self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+}
+
 /// One (subscription, publication) pair: a reader position, and the counter it
-/// is written through (`aeron_subscribable_list_entry_t`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.h:113-118`).
+/// is written through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionLinkEntry {
-    /// Which publication this reader reads. The reference holds a pointer to
-    /// the publication's subscribable; a registration id is the same
-    /// reference here and survives the publications being reordered.
-    pub publication_registration_id: i64,
+    /// Which publication or image this reader reads.
+    pub target: SubscriptionTarget,
     /// The `sub-pos` counter the client writes its position into.
     pub counter_id: i32,
 }
@@ -107,7 +147,12 @@ impl SubscriptionLink {
     pub fn reads(&self, publication_registration_id: i64) -> bool {
         self.subscribables
             .iter()
-            .any(|entry| entry.publication_registration_id == publication_registration_id)
+            .any(|entry| entry.target.registration_id() == publication_registration_id)
+    }
+
+    /// Whether this subscription reads that publication *as an image*.
+    pub fn reads_image(&self, image_registration_id: i64) -> bool {
+        self.reads(image_registration_id)
     }
 
     /// Whether this subscription reads that publication
@@ -139,6 +184,17 @@ pub enum AddSubscriptionError {
     /// A publication matched, but its reader position could not be created:
     /// no counter id left, or the log buffer refused it.
     Link,
+    /// A UDP channel this build refused
+    /// ([`crate::udp_channel::UdpChannelError`]).
+    Channel(Box<crate::udp_channel::UdpChannelError>),
+    /// The subscription's endpoint could not be made — a socket that will not
+    /// bind, most often because it is already bound.
+    Endpoint {
+        /// The reference's words, which name the channel.
+        message: String,
+    },
+    /// The receiver thread has stopped.
+    Receiver,
 }
 
 impl AddSubscriptionError {
@@ -156,7 +212,12 @@ impl AddSubscriptionError {
                 | UriError::MissingValue { .. },
             )) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            Self::Params(_) | Self::NoClientRecord | Self::Link => ERROR_CODE_GENERIC_ERROR,
+            Self::Channel(error) => error.error_code(),
+            Self::Params(_)
+            | Self::NoClientRecord
+            | Self::Link
+            | Self::Endpoint { .. }
+            | Self::Receiver => ERROR_CODE_GENERIC_ERROR,
         }
     }
 }
@@ -170,6 +231,9 @@ impl std::fmt::Display for AddSubscriptionError {
             }
             Self::NoClientRecord => f.write_str("failed to add client"),
             Self::Link => f.write_str("failed to allocate the subscriber position"),
+            Self::Channel(error) => write!(f, "{error}"),
+            Self::Endpoint { message } => f.write_str(message),
+            Self::Receiver => f.write_str("the receiver thread has stopped"),
         }
     }
 }
@@ -355,7 +419,7 @@ impl IpcSubscriptions {
     pub fn forget_publication(&mut self, publication_registration_id: i64) {
         for link in &mut self.links {
             link.subscribables
-                .retain(|entry| entry.publication_registration_id != publication_registration_id);
+                .retain(|entry| entry.target.registration_id() != publication_registration_id);
         }
     }
 
@@ -402,7 +466,7 @@ impl IpcSubscriptions {
 
         let link = self.links.swap_remove(index);
 
-        unlink_all(link, counters, regions, publications, now_ms);
+        unlink_all(link, counters, regions, publications, None, now_ms);
 
         true
     }
@@ -429,7 +493,7 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
-            unlink_all(link, counters, regions, publications, now_ms);
+            unlink_all(link, counters, regions, publications, None, now_ms);
             removed += 1;
         }
 
@@ -448,6 +512,325 @@ impl IpcSubscriptions {
     }
 }
 
+impl IpcSubscriptions {
+    /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
+    /// (`aeron_driver_conductor_on_add_network_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5156-5280`).
+    ///
+    /// The reply goes out before the matching, as it does for IPC and for the
+    /// same reason; what is different is that the subscription's endpoint has
+    /// to *exist* first, because a subscription that reads the network is a
+    /// socket bound to the endpoint parameter, and a client told its
+    /// subscription is ready should be able to receive.
+    ///
+    /// # Errors
+    ///
+    /// [`AddSubscriptionError`] for a channel the reference refuses or a socket
+    /// that cannot be bound.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn add_network_subscription(
+        &mut self,
+        request: &AddSubscriptionCommand<'_>,
+        config: &DriverConfig,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        clients: &mut Clients,
+        endpoints: &mut ReceiveChannelEndpoints,
+        images: &mut PublicationImages,
+        receiver: &ReceiverProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), AddSubscriptionError> {
+        let uri = ChannelUri::parse(request.channel)?;
+        if uri.transport() != Transport::Udp {
+            return Err(AddSubscriptionError::UnsupportedTransport);
+        }
+
+        let channel = UdpChannel::resolve(request.channel, &uri)
+            .map_err(Box::new)
+            .map_err(AddSubscriptionError::Channel)?;
+        let params = SubscriptionParams::resolve(&uri, config)?;
+
+        validate_for_subscription(&channel)?;
+
+        let Some(_client) = clients.get_or_add(
+            request.client_id,
+            now.ms,
+            now.client_liveness_timeout_ns,
+            counters,
+            regions,
+            events,
+        ) else {
+            return Err(AddSubscriptionError::NoClientRecord);
+        };
+
+        // The endpoint first: a subscription is a socket, and a channel whose
+        // socket cannot be bound is a subscription that cannot be served —
+        // which is a different answer from one that has nothing to read yet.
+        let endpoint_params = ReceiveChannelEndpoints::transport_params(config, &channel);
+        let (endpoint_id, channel_status_counter_id, new_endpoint) = endpoints
+            .get_or_add(
+                channel,
+                &endpoint_params,
+                config,
+                counters,
+                regions,
+                request.correlation_id,
+                now.ms,
+            )
+            .map_err(|error| AddSubscriptionError::Endpoint {
+                message: error.to_string(),
+            })?;
+
+        if let Some(endpoint) = new_endpoint {
+            receiver
+                .add_endpoint(endpoint_id, endpoint)
+                .map_err(|_| AddSubscriptionError::Receiver)?;
+        }
+
+        receiver
+            .add_subscription(endpoint_id, request.stream_id, params.session_id)
+            .map_err(|_| AddSubscriptionError::Receiver)?;
+
+        endpoints.attach_subscription(endpoint_id);
+
+        let link = SubscriptionLink {
+            registration_id: request.correlation_id,
+            client_id: request.client_id,
+            stream_id: request.stream_id,
+            session_id: params.session_id,
+            channel: request.channel.to_vec(),
+            is_tether: params.is_tether,
+            is_rejoin: params.is_rejoin,
+            is_response: params.is_response,
+            is_reliable: params.is_reliable,
+            is_sparse: params.is_sparse,
+            subscribables: Vec::new(),
+        };
+
+        // The reply first, with the endpoint's channel status: a client that
+        // reads it learns whether the socket is up, which for a subscriber is
+        // the only thing that can be known before a publisher exists.
+        events.subscription_ready(request.correlation_id, channel_status_counter_id);
+
+        self.links.push(link);
+
+        // Then every image that already matches.
+        let matching = images.matching(request.stream_id, params.session_id);
+        let index = self.links.len() - 1;
+
+        for image_registration_id in matching {
+            let _ = self.link_image(
+                index,
+                image_registration_id,
+                images,
+                counters,
+                regions,
+                receiver,
+                now,
+                events,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Give a subscription a reader position in an image, and tell its client
+    /// where the log buffer is
+    /// (`aeron_driver_conductor_link_subscribable`'s image case, `:3547-3617`
+    /// through `:5137`).
+    ///
+    /// The order is the same one IPC's link uses, and the same steps: allocate
+    /// the counter with the *join* position in its label, add the position to
+    /// the image's set — which is what a reader *is* — then seed the counter
+    /// and only then answer.
+    ///
+    /// # Errors
+    ///
+    /// A failure when the counter or the position cannot be created; the
+    /// subscription exists and its client has been told, so a failure here is
+    /// an image the client will never read rather than a failed command.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    #[allow(clippy::result_unit_err)] // the caller has nothing to do with the reason
+    pub fn link_image(
+        &mut self,
+        link_index: usize,
+        image_registration_id: i64,
+        images: &mut PublicationImages,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        receiver: &ReceiverProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), ()> {
+        let Some(image) = images.find(image_registration_id).cloned() else {
+            // The caller has just created it, so this is the collection
+            // disagreeing with itself rather than a client's mistake.
+            return Err(());
+        };
+
+        let Some(link) = self.links.get_mut(link_index) else {
+            return Err(());
+        };
+
+        if link.reads_image(image_registration_id) {
+            return Err(());
+        }
+
+        let joining_position = images.join_position(image_registration_id, counters, regions);
+
+        let Some(counter_id) = crate::position::allocate_subscription_position(
+            counters,
+            regions,
+            link.client_id,
+            link.registration_id,
+            image.session_id,
+            image.stream_id,
+            &link.channel,
+            joining_position,
+            now.ms,
+        ) else {
+            return Err(());
+        };
+
+        if counters
+            .set_reference_id(regions, counter_id, image_registration_id)
+            .is_none()
+        {
+            counters.free(regions, counter_id, now.ms);
+            return Err(());
+        }
+
+        let position = TetherablePosition {
+            counter_id,
+            subscription_registration_id: link.registration_id,
+            time_of_last_update_ns: now.ns,
+            state: TetherState::Active,
+            is_tether: link.is_tether,
+            is_rejoin: link.is_rejoin,
+        };
+
+        if receiver
+            .add_subscriber(image_registration_id, position)
+            .is_err()
+        {
+            counters.free(regions, counter_id, now.ms);
+            return Err(());
+        }
+
+        link.subscribables.push(SubscriptionLinkEntry {
+            target: SubscriptionTarget::Image(image_registration_id),
+            counter_id,
+        });
+
+        // The counter is seeded **after** the reader is in the set, which is
+        // the reference's order: a reader that appears with a position of zero
+        // while the image is a term ahead would look like one that had read
+        // nothing, and the window would be computed from that.
+        let _ = counters.set_value(regions, counter_id, joining_position);
+
+        let correlation_id = link.registration_id;
+        images.incref(image_registration_id);
+
+        events.available_image(&ImageBuffersReady {
+            correlation_id: image.registration_id,
+            session_id: image.session_id,
+            stream_id: image.stream_id,
+            subscriber_registration_id: correlation_id,
+            subscriber_position_id: counter_id,
+            log_file: image.path.as_os_str().as_encoded_bytes(),
+            source_identity: image.source_identity.as_bytes(),
+        });
+
+        Ok(())
+    }
+
+    /// Give every waiting subscription the image that has just appeared
+    /// (`link_matching_subscriptions`, run when an image is created).
+    ///
+    /// # Errors
+    ///
+    /// When a link failed. The caller records it: a subscription that was not
+    /// told about an image waits for ever otherwise.
+    #[allow(clippy::result_unit_err)] // the caller has nothing to do with the reason
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn link_new_image(
+        &mut self,
+        image_registration_id: i64,
+        images: &mut PublicationImages,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        receiver: &ReceiverProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), ()> {
+        let mut failures = 0;
+        let mut linked = 0;
+
+        for index in 0..self.links.len() {
+            let (stream_id, session_id) = {
+                let link = &self.links[index];
+                (link.stream_id, link.session_id)
+            };
+
+            let matches = images.find(image_registration_id).is_some_and(|image| {
+                image.stream_id == stream_id
+                    && (session_id.is_none() || session_id == Some(image.session_id))
+            });
+
+            if !matches {
+                continue;
+            }
+
+            if self
+                .link_image(
+                    index,
+                    image_registration_id,
+                    images,
+                    counters,
+                    regions,
+                    receiver,
+                    now,
+                    events,
+                )
+                .is_err()
+            {
+                failures += 1;
+            } else {
+                linked += 1;
+            }
+        }
+
+        let _ = linked;
+
+        if failures > 0 {
+            return Err(());
+        }
+
+        Ok(())
+    }
+}
+
+/// The checks a subscription's channel has to pass
+/// (`validate_control_for_subscription`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:614-628`).
+///
+/// # Errors
+///
+/// [`AddSubscriptionError::Endpoint`] for a channel that cannot be listened on.
+fn validate_for_subscription(channel: &UdpChannel) -> Result<(), AddSubscriptionError> {
+    if channel.has_explicit_control && channel.local_control.port() == 0 {
+        return Err(AddSubscriptionError::Endpoint {
+            message: format!(
+                "control has port=0 for subscription: channel={}",
+                String::from_utf8_lossy(&channel.original_uri)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Detach every reader a link holds and give its counter back
 /// (`aeron_driver_conductor_unlink_all_subscribable`, `:3679-3693`).
 ///
@@ -459,13 +842,23 @@ fn unlink_all(
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
     publications: &mut IpcPublications,
+    receiver: Option<&ReceiverProxy>,
     now_ms: i64,
 ) {
     for entry in &link.subscribables {
-        if let Some(publication) = publications
+        if entry.target.is_image() {
+            // An image's readers are removed by the receiver, which owns the
+            // image; the counter goes back here either way, and the reader
+            // waits at a position nothing feeds any more, which is what a
+            // removal means.
+            if let Some(receiver) = receiver {
+                let _ =
+                    receiver.remove_subscriber(entry.target.registration_id(), entry.counter_id);
+            }
+        } else if let Some(publication) = publications
             .publications_mut()
             .iter_mut()
-            .find(|publication| publication.registration_id == entry.publication_registration_id)
+            .find(|publication| publication.registration_id == entry.target.registration_id())
         {
             publication.remove_subscriber(entry.counter_id);
         }
@@ -539,7 +932,7 @@ fn link_subscribable(
     }
 
     link.subscribables.push(SubscriptionLinkEntry {
-        publication_registration_id: publication.registration_id,
+        target: SubscriptionTarget::IpcPublication(publication.registration_id),
         counter_id,
     });
 

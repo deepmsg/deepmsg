@@ -31,22 +31,65 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// Read from the CnC file *while the driver is still running*, which is the
 /// only time these have anything to say.
-fn driver_diagnostics(aeron_dir: &std::path::Path) -> String {
-    let Ok(cnc) = deepmsg_cnc::CncFile::open(aeron_dir, Duration::from_secs(5)) else {
-        return "the CnC file could not be read".to_owned();
+/// What the *client* sees: the subscriptions it holds and the images it has
+/// been told about. A driver that built an image and a client that never heard
+/// of one is a different failure from a client that has one and cannot read it.
+fn client_view(client: &Client, subscription_id: i64) -> String {
+    let orphaned = client.orphan_images();
+    let unknown = client.unknown_responses();
+    let discarded = client.discarded();
+    let laps = client.laps();
+    let Some(subscription) = client.subscription(subscription_id) else {
+        return format!(
+            "  the client has no such subscription (orphaned={orphaned} unknown={unknown} \
+             discarded={discarded} laps={laps})"
+        );
     };
+
+    let images = subscription.images();
+
+    if images.is_empty() {
+        return format!(
+            "  the subscription has no image (orphaned={orphaned} unknown={unknown} \
+             discarded={discarded} laps={laps})"
+        );
+    }
+
+    images
+        .iter()
+        .map(|image| {
+            format!(
+                "  image {} session {} position {}",
+                image.registration_id(),
+                image.session_id(),
+                image.position()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn counters_of(cnc: &deepmsg_cnc::CncFile) -> String {
     let Some(counters) = cnc.counters() else {
         return "the counter regions could not be read".to_owned();
     };
 
     let mut lines = Vec::new();
+    let mut total = 0;
+    let mut every = Vec::new();
     counters.for_each(|descriptor| {
+        total += 1;
+        every.push(format!(
+            "    #{} {:?}",
+            descriptor.counter_id, descriptor.label
+        ));
         // The system counters a UDP publication moves, by their reference
         // names (`aeron-driver/src/main/c/aeron_system_counters.c:24-71`).
         let named = match descriptor.counter_id {
             0 => "bytes sent",
             1 => "bytes received",
             8 => "status messages received",
+            7 => "status messages sent",
             9 => "heartbeats sent",
             11 => "retransmits sent",
             14 => "invalid packets",
@@ -61,10 +104,28 @@ fn driver_diagnostics(aeron_dir: &std::path::Path) -> String {
             || descriptor.label.starts_with("pub-lmt")
             || descriptor.label.starts_with("snd-pos")
             || descriptor.label.starts_with("pub-pos")
+            || descriptor.label.starts_with("rcv-hwm")
+            || descriptor.label.starts_with("rcv-pos")
+            || descriptor.label.starts_with("rcv-channel")
+            || descriptor.label.starts_with("sub-pos")
+            || descriptor.label.starts_with("snd-channel")
         {
             lines.push(format!("  {}: {}", descriptor.label, descriptor.value));
         }
     });
+
+    lines.insert(0, format!("  ({total} counters)"));
+    lines.extend(every.iter().take(8).cloned());
+
+    // The error log is where a driver says what it could not do.
+    if let Some(log) = cnc.error_log() {
+        let mut entries = Vec::new();
+        let _ = log.read(0, &mut entries);
+
+        for entry in entries {
+            lines.push(format!("  error: {}", entry.text));
+        }
+    }
 
     lines.join("\n")
 }
@@ -159,7 +220,7 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
     let _reference_cnc = reference
         .await_cnc(READY_TIMEOUT)
         .expect("the reference driver must publish a readable CnC file");
-    let _own_cnc = own
+    let own_cnc = own
         .await_cnc(READY_TIMEOUT)
         .expect("this driver must publish a readable CnC file");
 
@@ -175,7 +236,7 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
         // Everything our driver counted while the window stayed shut: the
         // frames it received, the invalid ones it refused, and the two limits
         // the publisher is held between.
-        let diagnostics = driver_diagnostics(own.aeron_dir());
+        let diagnostics = counters_of(&own_cnc);
 
         panic!(
             "the publication never opened its window: {} attempts, first {}\n\
@@ -207,4 +268,137 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
     let _ = subscriber.terminate(Duration::from_secs(5));
     let _ = own.stop();
     let _ = reference.stop();
+}
+
+/// A2: a reference publisher's messages, read by our client through our driver.
+///
+/// The other direction of A1, and the harder one: everything that has to work
+/// is on our side. The reference's `BasicPublisher` sends `SETUP` and `DATA`
+/// into a socket our driver bound, our driver has to notice a session nothing
+/// serves, ask for the setup, build an image from it, tell our client where the
+/// log buffer is, and then — the part no single-sided test can reach — send
+/// status messages the reference's flow control will believe, or the publisher
+/// stops after one window's worth of data.
+#[test]
+fn a_reference_publishers_messages_reach_our_subscriber() {
+    let Some(publisher_binary) = samples::locate("BasicPublisher") else {
+        driver::announce_tool_skip("BasicPublisher");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    // Two names, because the harness names each driver's log after the test —
+    // one name for both would put two drivers' output in one file.
+    let Some(mut own) = OwnDriver::start("udp-our-subscriber") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let mut reference = ReferenceDriver::start(&reference_binary, "udp-reference-publisher")
+        .expect("start the reference driver");
+
+    let port = free_udp_port(2);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}");
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver must publish a readable CnC file");
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    // The subscriber first: it is the side that binds the port, and the
+    // reference publisher would be sending into a closed one.
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let messages = 5;
+    let mut publisher = samples::Sample::start(
+        &publisher_binary,
+        "publisher",
+        reference.aeron_dir(),
+        &[
+            "-c",
+            &channel,
+            "-s",
+            &STREAM_ID.to_string(),
+            "-m",
+            &messages.to_string(),
+        ],
+    );
+
+    publisher.await_output(Duration::from_secs(20), "its publication", |output| {
+        output.contains("Publication") || output.contains("published")
+    });
+
+    let received = drain_messages(
+        &mut subscriber,
+        subscription_id,
+        Duration::from_secs(30),
+        messages,
+    );
+
+    let _ = publisher.terminate(Duration::from_secs(5));
+    let _ = own.stop();
+    let _ = reference.stop();
+
+    assert!(
+        !received.is_empty(),
+        "the subscription never assembled a message.\nour driver's counters:\n{}\n\
+         the client sees:\n{}\nthe publisher said:\n{}\nour driver said:\n{}",
+        counters_of(&own_cnc),
+        client_view(&subscriber, subscription_id),
+        publisher.output(),
+        own.log_tail(40)
+    );
+
+    let text = String::from_utf8_lossy(&received[0]).to_string();
+    assert!(
+        text.starts_with("Hello World!"),
+        "the bytes are the reference's own: {text:?}"
+    );
+    assert_eq!(
+        messages,
+        received.len(),
+        "every message the reference published arrived: {:?}",
+        received
+            .iter()
+            .map(|message| String::from_utf8_lossy(message).to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Collect `expected` messages, or as many as arrive before the deadline.
+fn drain_messages(
+    client: &mut Client,
+    subscription_id: i64,
+    within: Duration,
+    expected: usize,
+) -> Vec<Vec<u8>> {
+    use deepmsg_client::client::FRAGMENT_LIMIT;
+    use deepmsg_client::fragment_assembler::Message;
+
+    let deadline = Instant::now() + within;
+    let mut collected = Vec::new();
+
+    while Instant::now() < deadline && collected.len() < expected {
+        // `poll` is what reads the driver's events — an `ON_AVAILABLE_IMAGE`
+        // does not arrive by itself — and `poll_subscription` is what reads
+        // the image it attaches.
+        client.poll();
+
+        client.poll_subscription(subscription_id, FRAGMENT_LIMIT, |message: Message<'_>| {
+            collected.push(message.payload.to_vec());
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    collected
 }
