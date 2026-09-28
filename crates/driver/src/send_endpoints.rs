@@ -36,6 +36,7 @@
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::media::loss_generator::EveryNthDatagram;
 use crate::media::send_endpoint::{self, EndpointStatus, PublicationDispatch, SendChannelEndpoint};
 use crate::sys;
 use crate::udp_channel::{INVALID_TAG, UdpChannel};
@@ -187,6 +188,17 @@ impl std::error::Error for EndpointError {}
 pub struct SendChannelEndpoints {
     entries: Vec<SendChannelEndpointEntry>,
     next_id: u64,
+    /// The loss the driver was configured to inject: one outgoing datagram
+    /// in every `data_loss_drop_every` is withheld from every endpoint made
+    /// from here on. `None` — the driver nobody configured — is every
+    /// deployment.
+    ///
+    /// The reference keeps this on the driver *context*, as a supplier each
+    /// endpoint's create calls
+    /// (`aeron_driver_context.h:384-387`,
+    /// `media/aeron_send_channel_endpoint.c:237-240`); the registry is what
+    /// plays that part here.
+    data_loss_drop_every: Option<u64>,
 }
 
 impl SendChannelEndpoints {
@@ -195,7 +207,21 @@ impl SendChannelEndpoints {
         Self {
             entries: Vec::new(),
             next_id: 1,
+            data_loss_drop_every: None,
         }
+    }
+
+    /// Withhold one outgoing datagram in every `drop_every` from the
+    /// endpoints made here from now on.
+    ///
+    /// The reference's counterpart is
+    /// `aeron_driver_context_set_send_channel_loss_supplier`
+    /// (`aeron-driver/src/main/c/aeron_driver_context.c:2979-2989`):
+    /// set once, at start-up, before anything can be created. Each endpoint
+    /// gets its own generator, so each counts its own datagrams — which is
+    /// what the reference's per-endpoint attach does too.
+    pub fn attach_data_loss_generator(&mut self, drop_every: u64) {
+        self.data_loss_drop_every = Some(drop_every);
     }
 
     /// The endpoints, in the order they were created.
@@ -312,7 +338,7 @@ impl SendChannelEndpoints {
             return Err(EndpointError::NoAddress);
         }
 
-        let endpoint = SendChannelEndpoint::create(
+        let mut endpoint = SendChannelEndpoint::create(
             channel,
             params,
             counters,
@@ -324,6 +350,12 @@ impl SendChannelEndpoints {
             send_endpoint::SendEndpointError::NoCounter => EndpointError::NoCounter,
             send_endpoint::SendEndpointError::Socket(error) => EndpointError::Socket(error),
         })?;
+
+        // The supplier's call (`media/aeron_send_channel_endpoint.c:237-240`):
+        // a fresh generator per endpoint, so each counts its own datagrams.
+        if let Some(drop_every) = self.data_loss_drop_every {
+            endpoint.set_data_loss_generator(Box::new(EveryNthDatagram::new(drop_every)));
+        }
 
         // The status the counter holds: `ACTIVE` once the socket is there,
         // which is what a client reads to answer "is this channel's socket up

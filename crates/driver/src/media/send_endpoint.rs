@@ -30,6 +30,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 use crate::udp_channel::UdpChannel;
 use crate::{position as counter_position, sys};
 
+use super::loss_generator::LossGenerator;
 use super::{Transport, TransportParams};
 
 /// Where an endpoint is in its life
@@ -78,6 +79,12 @@ pub struct SendChannelEndpoint {
     pub channel: UdpChannel,
     /// The socket every publication on this channel sends through.
     transport: Box<dyn Transport>,
+    /// The frames this endpoint withholds on purpose, when a test asked it to
+    /// (`data_loss_generator`,
+    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.h:73`).
+    ///
+    /// `None` — the driver nobody configured — is every deployment.
+    data_loss_generator: Option<Box<dyn LossGenerator>>,
     /// The `snd-channel` counter, whose value is the endpoint's
     /// [`EndpointStatus`].
     channel_status_counter_id: i32,
@@ -148,6 +155,7 @@ impl SendChannelEndpoint {
             current_data_addr: channel.remote_data,
             channel,
             transport: Box::new(transport),
+            data_loss_generator: None,
             channel_status_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
@@ -156,7 +164,8 @@ impl SendChannelEndpoint {
     }
 
     /// Wrap an endpoint around a transport a caller built itself, for the
-    /// tests that inject loss or a stub.
+    /// tests that want a stub rather than a socket. Loss is injected into an
+    /// endpoint, not under it: [`Self::set_data_loss_generator`].
     ///
     /// # Errors
     ///
@@ -185,6 +194,7 @@ impl SendChannelEndpoint {
             current_data_addr: channel.remote_data,
             channel,
             transport,
+            data_loss_generator: None,
             channel_status_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
@@ -288,14 +298,66 @@ impl SendChannelEndpoint {
         self.current_data_addr
     }
 
+    /// Give this endpoint a generator that withholds some of what it sends.
+    ///
+    /// The reference fills the slot from the driver context's supplier, which
+    /// the endpoint's own create calls
+    /// (`aeron_send_channel_endpoint.c:237-240`) — so it is set once, before
+    /// anything sends, and `None` is the deployment nobody configured.
+    pub fn set_data_loss_generator(&mut self, generator: Box<dyn LossGenerator>) {
+        self.data_loss_generator = Some(generator);
+    }
+
     /// Send datagrams through the endpoint's socket
     /// (`aeron_send_channel_send`, `:383-414`).
+    ///
+    /// With a generator attached, each **datagram** is offered to it first and
+    /// the ones it refuses never reach the socket. They are still **counted as
+    /// handed over**, which is the whole point: a sender advances `snd-pos` by
+    /// what the endpoint took (`aeron_network_publication.c:555-562`), so a
+    /// datagram reported as sent is one the sender believes is on the wire —
+    /// and one the receiver never saw, which is what a gap is.
+    ///
+    /// A datagram is what the caller hands over here, not a frame: the unit is
+    /// whatever `send_data` scanned out of the term buffer, and it may carry
+    /// several frames (see [`crate::media::loss_generator`]).
+    ///
+    /// The datagrams that are kept are sent as one batch, so an injected loss
+    /// costs an allocation on the way past. Only the generator's presence
+    /// makes that path run at all; a driver without one sends the caller's
+    /// slice untouched.
     ///
     /// # Errors
     ///
     /// The transport's error; back pressure is `Ok(0)`.
     pub fn send(&mut self, buffers: &[&[u8]]) -> io::Result<usize> {
-        self.transport.send(Some(self.current_data_addr), buffers)
+        let address = self.current_data_addr;
+
+        let kept: Vec<&[u8]> = {
+            let Some(generator) = self.data_loss_generator.as_mut() else {
+                return self.transport.send(Some(address), buffers);
+            };
+
+            buffers
+                .iter()
+                .copied()
+                .filter(|buffer| !generator.should_drop(address, buffer, buffer.len()))
+                .collect()
+        };
+
+        let dropped = buffers.len() - kept.len();
+
+        if dropped == 0 {
+            return self.transport.send(Some(address), buffers);
+        }
+
+        let sent = if kept.is_empty() {
+            0
+        } else {
+            self.transport.send(Some(address), &kept)?
+        };
+
+        Ok(sent + dropped)
     }
 
     /// The address this endpoint's socket is bound to, which is what the
@@ -331,6 +393,10 @@ impl std::fmt::Debug for SendChannelEndpoint {
             .field("canonical_form", &self.channel.canonical_form)
             .field("channel_status_counter_id", &self.channel_status_counter_id)
             .field("publications", &self.publications.len())
+            .field(
+                "data_loss_generator",
+                &self.data_loss_generator.as_ref().map(|_| "attached"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -569,6 +635,59 @@ mod tests {
                 .expect("a receive")
         );
         assert_eq!(b"setup", &buffers[0][..5]);
+    }
+
+    #[test]
+    fn a_withheld_datagram_is_handed_over_without_leaving_the_socket() {
+        // This is where the gap a receiver sees comes from: a datagram the
+        // generator refuses still counts as handed over, so the sender
+        // advances `snd-pos` past it and never sends it again — and the
+        // datagram that is missing on the far side is what a NAK comes back
+        // for.
+        let listener = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        listener
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        listener.set_nonblocking().expect("non-blocking");
+        let bound = listener.local_address().expect("a bound address");
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel(&format!("aeron:udp?endpoint={bound}")),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        endpoint.set_data_loss_generator(Box::new(crate::media::EveryNthDatagram::new(3)));
+
+        for marker in 0..6u8 {
+            assert_eq!(
+                1,
+                endpoint.send(&[&[marker]]).expect("a send"),
+                "a withheld datagram is still one the endpoint took"
+            );
+        }
+
+        let mut buffers = vec![vec![0u8; 1408]; 8];
+        let mut datagrams = crate::sys::socket::Datagrams::new();
+        let received = listener
+            .receive_batch(&mut buffers, &mut datagrams)
+            .expect("a receive");
+
+        assert_eq!(
+            4, received,
+            "the third datagram and the sixth are the refused ones"
+        );
+
+        let arrived: Vec<u8> = buffers[..received].iter().map(|buffer| buffer[0]).collect();
+        assert_eq!(vec![0, 1, 3, 4], arrived);
     }
 
     #[test]

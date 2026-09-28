@@ -369,6 +369,19 @@ pub struct DriverConfig {
     /// no limit at all, `INT32_MAX`,
     /// `aeron-driver/src/main/c/aeron_driver_context.c:249`).
     pub stream_session_limit: usize,
+    /// Withhold one data frame in every this many from every send endpoint, so
+    /// that a test can exercise loss recovery on a wire that does not lose
+    /// anything (`debug.send.data.loss.drop.every`).
+    ///
+    /// **This has no counterpart in the reference.** Its debug loss surface is
+    /// eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}`
+    /// variables read by an installer that only a C++ test calls
+    /// (`media/aeron_debug_channel_endpoint_configuration.h:22-29`,
+    /// `.c:126-172`) — a driver started as a process, which every interop test
+    /// here is, has no way in. This build's own spelling is therefore a property of its own,
+    /// and its value is a count rather than a rate: `None` injects nothing.
+    /// `docs/compat.md` records the difference.
+    pub data_loss_drop_every: Option<u64>,
 }
 
 impl Default for DriverConfig {
@@ -415,6 +428,7 @@ impl Default for DriverConfig {
             retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
+            data_loss_drop_every: None,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
         }
     }
@@ -581,6 +595,23 @@ impl DriverConfig {
                     name: Setting::PUBLICATION_RESERVED_SESSION_ID_HIGH.property,
                     value,
                 })?;
+        }
+
+        if let Some(value) = get(&Setting::DATA_LOSS_DROP_EVERY) {
+            // Zero is "inject nothing", the same as leaving it unset; one
+            // would withhold every frame, which no test means and a typo can
+            // produce. A rate of one is refused here rather than obeyed, and
+            // a negative count falls out of the conversion the same way.
+            match u64::try_from(parse_count(&Setting::DATA_LOSS_DROP_EVERY, &value)?) {
+                Ok(0) => {}
+                Ok(1) | Err(_) => {
+                    return Err(ConfigError::OutOfRange {
+                        name: Setting::DATA_LOSS_DROP_EVERY.property,
+                        value,
+                    });
+                }
+                Ok(drop_every) => config.data_loss_drop_every = Some(drop_every),
+            }
         }
 
         // The one setting that is not read from anywhere: the kernel is asked.
@@ -779,6 +810,18 @@ impl Setting {
     const COUNTER_FREE_TO_REUSE_TIMEOUT: Self = Self {
         property: "counters.free.to.reuse.timeout",
         env: "AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT",
+    };
+    /// `deepmsg.debug.send.data.loss.drop.every`: withhold one data frame in
+    /// every this many from each send endpoint.
+    ///
+    /// The one setting here with no reference variable to borrow, so it
+    /// names its own — the same string the `DEEPMSG_` derivation produces,
+    /// spelled out because the table is where a reader looks for a setting's
+    /// names. See [`DriverConfig::data_loss_drop_every`] for why the
+    /// reference's eight `AERON_DEBUG_*` variables are not what this reads.
+    const DATA_LOSS_DROP_EVERY: Self = Self {
+        property: "debug.send.data.loss.drop.every",
+        env: "DEEPMSG_DEBUG_SEND_DATA_LOSS_DROP_EVERY",
     };
 }
 
@@ -1054,6 +1097,59 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         })
+    }
+
+    #[test]
+    fn a_loss_generator_is_installed_only_when_a_frame_count_was_asked_for() {
+        // The one setting with no reference variable behind it: our property,
+        // our spelling, and a count rather than the reference's rate.
+        assert_eq!(
+            Some(8),
+            resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[("DEEPMSG_DEBUG_SEND_DATA_LOSS_DROP_EVERY", "8")]
+            )
+            .expect("a config")
+            .data_loss_drop_every
+        );
+
+        assert_eq!(
+            Option::None,
+            resolve(&[("deepmsg.dir", "/tmp/aeron")])
+                .expect("a config")
+                .data_loss_drop_every,
+            "a driver nobody configured injects nothing"
+        );
+
+        assert_eq!(
+            Option::None,
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.send.data.loss.drop.every", "0")
+            ])
+            .expect("a config")
+            .data_loss_drop_every,
+            "zero is the same as unset"
+        );
+    }
+
+    #[test]
+    fn a_loss_rate_of_one_is_refused_rather_than_emptying_the_wire() {
+        // Every frame dropped is a driver that sends nothing at all, which is
+        // a typo or a missing digit rather than a configuration: it is worth a
+        // refusal, not a silent outage.
+        for value in ["1", "-1", "many"] {
+            assert!(
+                matches!(
+                    resolve(&[
+                        ("deepmsg.dir", "/tmp/aeron"),
+                        ("deepmsg.debug.send.data.loss.drop.every", value)
+                    ]),
+                    Err(ConfigError::OutOfRange { .. } | ConfigError::NotANumber { .. })
+                ),
+                "{value:?} must not install a generator"
+            );
+        }
     }
 
     #[test]

@@ -14,10 +14,10 @@
 //! this build uses before any kernel-bypass implementation exists:
 //!
 //! * **The loss injector.** A test that has to prove retransmission works
-//!   cannot wait for a real network to lose a packet — loopback does not — so
-//!   the reference ships transports that drop datagrams on purpose
-//!   (`media/aeron_udp_channel_transport_fixed_loss.c`) and so does this
-//!   ([`loss_transport`]).
+//!   cannot wait for a real network to lose a datagram — loopback does not —
+//!   so the reference ships generators that drop them on purpose and so does
+//!   this ([`loss_generator`]). They hang on the endpoints, which is where the
+//!   reference hangs them, and not on a transport.
 //! * **One place to be wrong about a syscall.** Every socket call in the
 //!   driver goes through [`udp_transport`], which is the only module above
 //!   [`crate::sys`] that touches one.
@@ -36,13 +36,13 @@ use std::io;
 use std::net::SocketAddr;
 
 pub mod dispatcher;
-pub mod loss_transport;
+pub mod loss_generator;
 pub mod receive_endpoint;
 pub mod send_endpoint;
 pub mod udp_transport;
 
 pub use crate::sys::socket::Datagrams;
-pub use loss_transport::LossTransport;
+pub use loss_generator::{EveryNthDatagram, LossGenerator};
 pub use send_endpoint::SendChannelEndpoint;
 pub use udp_transport::UdpTransport;
 

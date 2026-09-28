@@ -629,7 +629,17 @@ impl Conductor {
             clients: Clients::new(),
             publications,
             subscriptions: IpcSubscriptions::new(),
-            send_endpoints: SendChannelEndpoints::new(),
+            send_endpoints: {
+                // The supplier (`aeron_driver_context.c:2979-2989`), set at
+                // start-up: every endpoint made from here on carries a loss
+                // generator of its own. Nothing is attached unless the driver
+                // was configured to inject loss.
+                let mut endpoints = SendChannelEndpoints::new();
+                if let Some(drop_every) = config.data_loss_drop_every {
+                    endpoints.attach_data_loss_generator(drop_every);
+                }
+                endpoints
+            },
             network_publications,
             sender,
             receive_endpoints: ReceiveChannelEndpoints::new(),
