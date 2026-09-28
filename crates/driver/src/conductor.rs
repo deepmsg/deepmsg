@@ -5025,6 +5025,195 @@ mod tests {
         (driver, client)
     }
 
+    /// The images a subscription holds, as the *client* sees them: an
+    /// `ON_UNAVAILABLE_IMAGE` that has been polled takes one away, and an
+    /// `ON_AVAILABLE_IMAGE` puts one back.
+    fn images_of(client: &deepmsg_client::client::Client, registration_id: i64) -> usize {
+        client
+            .subscription(registration_id)
+            .map_or(0, |subscription| subscription.images().len())
+    }
+
+    /// Wait for the client to see something, polling events as it waits — an
+    /// `ON_UNAVAILABLE_IMAGE` does not arrive by itself.
+    fn wait_for<F>(
+        client: &mut deepmsg_client::client::Client,
+        within: std::time::Duration,
+        mut predicate: F,
+    ) -> bool
+    where
+        F: FnMut(&mut deepmsg_client::client::Client) -> bool,
+    {
+        let deadline = std::time::Instant::now() + within;
+
+        loop {
+            client.poll();
+
+            if predicate(client) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The untethered machine, end to end and through a client: a reader that
+    /// stops reading is put aside, and then either woken or closed.
+    ///
+    /// The IPC half of what `tests/interop/udp_transport.rs` does to an image,
+    /// and it lives here — and in the ordinary test run — because IPC needs no
+    /// socket and no second process. What it covers that the machine's own unit
+    /// tests cannot is everything that leaves the driver: `ON_UNAVAILABLE_IMAGE`
+    /// on a client's ring, an image that comes back at the join position, and a
+    /// counter that goes back to the manager.
+    ///
+    /// Three subscriptions on one publication, because all three outcomes have
+    /// the same precondition: **"behind" is relative to the fastest reader**
+    /// (`aeron_ipc_publication.c:357-360`), so a lone reader is never put aside
+    /// however slowly it reads. One reader that keeps up is what makes the
+    /// other two late.
+    #[test]
+    fn an_untethered_ipc_reader_is_put_aside_woken_or_closed() {
+        let temp = TempDir::new();
+        let config = DriverConfig {
+            // The machine runs on the conductor's timeout tier, and the three
+            // stages below are tens of milliseconds: at the default one-second
+            // tier each stage would cost a second and the test would be
+            // measuring the clock rather than the machine.
+            timer_interval_ns: 10_000_000,
+            ..publication_config(&temp.0)
+        };
+        let (_driver, mut client) = connected(&temp, &config);
+        let timeout = std::time::Duration::from_secs(5);
+
+        // The publication's channel carries the window the limit is measured
+        // against and the three timeouts. For a publication's own readers both
+        // come from *its* URI (`aeron_driver_uri.c:420-442`), not from the
+        // readers' — which is what makes this one channel a configuration for
+        // all of them.
+        // The three stages are long enough to be *observed*: a reader that is
+        // put aside and woken again is unavailable for the linger and resting
+        // timeouts and no longer, so a stage of tens of milliseconds would make
+        // the window this test looks through narrower than its own polling.
+        let channel = "aeron:ipc?pub-wnd=8192\
+                       |untethered-window-limit-timeout=300ms\
+                       |untethered-linger-timeout=300ms\
+                       |untethered-resting-timeout=300ms";
+
+        let reader = client
+            .add_subscription(channel, 1001, timeout)
+            .expect("the reader subscribes");
+        let rejoining = client
+            .add_subscription("aeron:ipc?tether=false|rejoin=true", 1001, timeout)
+            .expect("the rejoining reader subscribes");
+        let leaving = client
+            .add_subscription("aeron:ipc?tether=false|rejoin=false", 1001, timeout)
+            .expect("the leaving reader subscribes");
+
+        let publication = client
+            .add_publication(channel, 1001, timeout)
+            .expect("the publication");
+
+        assert!(
+            wait_for(&mut client, timeout, |client| {
+                images_of(client, reader) > 0
+                    && images_of(client, rejoining) > 0
+                    && images_of(client, leaving) > 0
+            }),
+            "all three readers hold the publication's log buffer: {} {} {}\n\
+             client error: {:?}\nsubscriptions: {:?}\npublication: {:?}",
+            images_of(&client, reader),
+            images_of(&client, rejoining),
+            images_of(&client, leaving),
+            client.error(),
+            client
+                .subscriptions()
+                .iter()
+                .map(|s| (
+                    s.registration_id(),
+                    s.images().len(),
+                    s.channel().to_owned()
+                ))
+                .collect::<Vec<_>>(),
+            client
+                .publications()
+                .iter()
+                .map(|p| p.registration_id())
+                .collect::<Vec<_>>()
+        );
+
+        // Less than the window, because the window is what holds the producer
+        // back: the slowest reader is still at its join position, so the
+        // producer may write one window past it and no further.
+        for index in 0..6 {
+            let mut payload = format!("untethered-{index}").into_bytes();
+            payload.resize(1200, b'.');
+
+            let deadline = std::time::Instant::now() + timeout;
+            let mut offered = false;
+
+            while !offered && std::time::Instant::now() < deadline {
+                client.poll();
+                read_the_reader(&mut client, reader);
+
+                offered = matches!(
+                    client.offer(publication, &payload),
+                    Some(deepmsg_core::logbuffer::append::Appended::Ok { .. })
+                );
+
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            assert!(offered, "the producer must be able to write its window");
+        }
+
+        // First outcome: both late readers are told their image is gone, and
+        // the reader that kept up is untouched. The reading happens here rather
+        // than in a loop before it because the two are the same window: being
+        // put aside lasts exactly two stages, and the machine is already
+        // running by the time the last message is written.
+        assert!(
+            wait_for(&mut client, timeout, |client| {
+                read_the_reader(client, reader);
+
+                images_of(client, rejoining) == 0 && images_of(client, leaving) == 0
+            }),
+            "both late readers are put aside: rejoining {}, leaving {}, reader {}",
+            images_of(&client, rejoining),
+            images_of(&client, leaving),
+            images_of(&client, reader)
+        );
+        assert_eq!(
+            1,
+            images_of(&client, reader),
+            "the machine moved who was late, not the publication"
+        );
+
+        // Second and third: the rejoining one is woken at the join position,
+        // and the one that is not rejoining is never told anything again.
+        assert!(
+            wait_for(&mut client, timeout, |client| images_of(client, rejoining)
+                > 0),
+            "the rejoining reader is woken with its image"
+        );
+        assert_eq!(
+            0,
+            images_of(&client, leaving),
+            "a reader that is not rejoining is closed, and closure is silent"
+        );
+    }
+
+    /// Read whatever the reader has, which is what moves its position.
+    fn read_the_reader(client: &mut deepmsg_client::client::Client, subscription_id: i64) {
+        use deepmsg_client::client::FRAGMENT_LIMIT;
+        use deepmsg_client::fragment_assembler::Message;
+
+        client.poll_subscription(subscription_id, FRAGMENT_LIMIT, |_message: Message<'_>| {});
+    }
+
     #[test]
     fn a_client_notices_a_driver_that_stopped_on_purpose() {
         let temp = TempDir::new();

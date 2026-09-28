@@ -27,7 +27,41 @@
 //! [`SubscribableHooks::position_removed`] is therefore passed the count as it
 //! was *before* the removal, because that is what the reference's hook can see.
 
+use deepmsg_cnc::layout::NULL_COUNTER_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
+
+/// What the untethered state machine decided about one reader
+/// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`,
+/// and its two siblings on the publication side).
+///
+/// The three events are the three things a *client* hears: an image it may no
+/// longer read, the same image again when the reader is woken, and — for a
+/// reader that is not rejoining — nothing at all, because its counter is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntetheredEvent {
+    /// The reader is behind and has been put aside: `ON_UNAVAILABLE_IMAGE`.
+    Unavailable {
+        /// The subscription that reads it.
+        subscription_registration_id: i64,
+        /// Its position counter.
+        counter_id: i32,
+    },
+    /// A resting reader is woken: the counter is seeded at the join position
+    /// and `ON_AVAILABLE_IMAGE` goes out again.
+    Available {
+        /// The subscription that reads it.
+        subscription_registration_id: i64,
+        /// Its position counter.
+        counter_id: i32,
+        /// Where it starts reading from.
+        join_position: i64,
+    },
+    /// A reader that is not rejoining is done: its counter is freed.
+    Closed {
+        /// The counter that goes back.
+        counter_id: i32,
+    },
+}
 
 /// Where a subscription's position sits in its tether life cycle
 /// (`aeron_subscription_tether_state_t`, `aeron_driver_common.h:73-77`).
@@ -222,6 +256,32 @@ impl Subscribable {
 
         hooks.position_removed(&position, working_before);
         self.positions.swap_remove(index);
+
+        Some(position)
+    }
+
+    /// Take a position's counter away while leaving the position where it is,
+    /// which is what a closed reader becomes
+    /// (`tetherable_position->counter_id = AERON_NULL_COUNTER_ID`,
+    /// `aeron_ipc_publication.c:423-426` and its two siblings).
+    ///
+    /// The counter has already been given back by the caller; this is what
+    /// stops anyone giving it back twice. The reference leaves the position in
+    /// the set — its state is what keeps it out of the way — and the teardown
+    /// that frees every reader's counter walks the whole set
+    /// (`aeron_ipc_publication.c:1104-1108`), so an id that is still there
+    /// would be freed a second time.
+    ///
+    /// Returns the position as it was, so a caller can name the counter in the
+    /// event it is about to send.
+    pub fn clear_counter_id(&mut self, counter_id: i32) -> Option<TetherablePosition> {
+        let index = self
+            .positions
+            .iter()
+            .position(|position| position.counter_id == counter_id)?;
+
+        let position = self.positions[index];
+        self.positions[index].counter_id = NULL_COUNTER_ID;
 
         Some(position)
     }

@@ -59,37 +59,10 @@ pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
 /// `aeron-driver/src/main/c/aeron_publication_image.h:35`).
 pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
 
-/// What the untethered state machine decided about one reader
-/// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`).
-///
-/// The three events are the three things a *client* hears: an image it may no
-/// longer read, the same image again when the reader is woken, and — for a
-/// reader that is not rejoining — nothing at all, because its counter is gone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UntetheredEvent {
-    /// The reader is behind and has been put aside: `ON_UNAVAILABLE_IMAGE`.
-    Unavailable {
-        /// The subscription that reads it.
-        subscription_registration_id: i64,
-        /// Its position counter.
-        counter_id: i32,
-    },
-    /// A resting reader is woken: the counter is seeded at the join position
-    /// and `ON_AVAILABLE_IMAGE` goes out again.
-    Available {
-        /// The subscription that reads it.
-        subscription_registration_id: i64,
-        /// Its position counter.
-        counter_id: i32,
-        /// Where it starts reading from.
-        join_position: i64,
-    },
-    /// A reader that is not rejoining is done: its counter is freed.
-    Closed {
-        /// The counter that goes back.
-        counter_id: i32,
-    },
-}
+/// The three outcomes of the untethered state machine. They live with the
+/// positions they are about ([`crate::subscribable::UntetheredEvent`]) because
+/// a publication's own readers reach them too, not just an image's.
+pub use crate::subscribable::UntetheredEvent;
 
 /// Where an image is in its life
 /// (`aeron_publication_image_state_t`).
@@ -814,9 +787,14 @@ impl PublicationImage {
                                 TetherState::Closed,
                                 now_ns,
                             );
-                            let _ = self
-                                .subscribers
-                                .remove_position(position.counter_id, &mut NoHooks);
+
+                            // The position stays where it is with an id that
+                            // is no longer a counter: the reference's
+                            // `AERON_NULL_COUNTER_ID` (`:1225-1240`). Removing
+                            // it here would be a second way for a reader to
+                            // leave this set, and the two would have to agree
+                            // about the hooks, the count and the order.
+                            let _ = self.subscribers.clear_counter_id(position.counter_id);
 
                             events.push(UntetheredEvent::Closed {
                                 counter_id: position.counter_id,
@@ -1565,13 +1543,26 @@ mod tests {
             events,
             "a reader that is not rejoining is done"
         );
+        // The position stays where it is, with an id that is no longer a
+        // counter — the reference's `counter_id = AERON_NULL_COUNTER_ID`
+        // (`:1225-1240`). Not leaving the set is the point: the teardown that
+        // gives every reader's counter back walks the whole set, so an id left
+        // sitting there would be given back twice.
+        let closed = fixture
+            .image
+            .subscribers
+            .find_by_subscription(i64::from(counter_id) + 100);
+
+        assert_eq!(1, closed.len(), "the position is still there");
+        assert_eq!(TetherState::Closed, closed[0].state);
+        assert_eq!(deepmsg_cnc::layout::NULL_COUNTER_ID, closed[0].counter_id);
         assert!(
             fixture
                 .image
                 .subscribers
                 .find_by_counter(counter_id)
                 .is_none(),
-            "and it leaves the image's set"
+            "and its counter is no longer one the set points at"
         );
     }
 
