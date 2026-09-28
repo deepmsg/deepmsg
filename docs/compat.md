@@ -252,6 +252,16 @@ and the rest are single lines where the reference sends an accumulated chain
 of every `AERON_SET_ERR` and `AERON_APPEND_ERR` on the path (e.g. `:4757`) —
 less context, the same code and the same correlation.
 
+Those words are also what an `ON_ERROR` records: answering an error and
+recording it are one act in the reference, which transmits the response and
+then falls through to its own `log_error:` label (`:2366-2370`), skipping the
+log only for `RESOURCE_TEMPORARILY_UNAVAILABLE` (`:2367`). This build keeps
+the two together the same way, so the entry holds the words the client was
+handed — which are the ones this paragraph just called diagnostic, rather
+than the composition an `AERON_SET_ERR` would have built. Asserted by
+`crates/driver/src/conductor.rs::an_unknown_removal_is_answered_with_the_references_code`
+and `::a_refused_log_buffer_is_answered_and_recorded`.
+
 ## The client's view of the ring, and of a message
 
 Four places where this build answers a question the reference answers
