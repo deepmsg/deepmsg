@@ -25,8 +25,20 @@ reference's own `AeronStat` (`crates/driver/tests/system_counters.rs`,
 `tests/interop/aeron_stat_counters.rs`). It knows its clients: a client exists
 from its first resource command, its liveness is a counter the client writes
 itself, and one that goes quiet is reaped and announced on the to-clients ring,
-which this build now writes. The remaining resource commands and the UDP data
-plane are the slices after it.
+which this build now writes.
+
+P1-4: the driver speaks UDP, both ways. A publication on
+`aeron:udp?endpoint=…` sends — `SETUP`, `DATA` and heartbeats on the wire, the
+frames laid out as `docs/protocol/wire-frames.md` describes — and a
+subscription on the same shape receives, building an *image* from the datagrams
+and answering with the status messages that are the publisher's flow control.
+The acceptance is two-sided and runs against the reference: our driver's
+publication reaching the reference's own `BasicSubscriber`, and the reference's
+own `BasicPublisher` reaching our client through our driver
+(`tests/interop/udp_transport.rs`). Loss detection, retransmission and the
+`max` flow control are in; multicast, response channels and the name-resolver
+agent are P1-5, and `docs/compat.md` lists every divergence with the test that
+pins it.
 
 Premium features (Cluster Standby and friends) are explicitly out of scope for
 now; the seams they need (cluster schemas, reserved counter ids, the

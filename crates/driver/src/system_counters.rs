@@ -195,19 +195,42 @@ const LABELS: [&str; COUNT] = [
     "Failed offers to NativeResourceAgentProxy",
 ];
 
-/// The runtime suffixes this build appends, and to which counters.
+/// The name of this driver's threading mode, in the reference's vocabulary
+/// (`aeron_driver_threading_mode_to_string`,
+/// `aeron-driver/src/main/c/aeron_driver_context.c:53-61`).
 ///
-/// The reference's list is longer (`aeron_driver_conductor.c:848-951`) — see
-/// the module docs for why the sender, receiver and name-resolver counters are
-/// left alone here. `INVOKER` is this driver's threading mode in the
-/// reference's vocabulary (`aeron_driver.c:495-503`): one thread invokes every
-/// agent, which is what `deepmsg-driver` does today.
-const RUNTIME_SUFFIXES: [(i32, &str); 3] = [
+/// `DEDICATED` is the mode this driver runs in from P1-4 on: the conductor, the
+/// sender and the receiver are three threads
+/// (`aeron_driver_context.h:174`, whose default it is). The label says so
+/// because that is what the label is *for* — a reader of `AeronStat` uses it to
+/// know what it is looking at.
+pub const THREADING_MODE: &str = "DEDICATED";
+
+/// The runtime suffixes this build appends, and to which counters
+/// (`aeron_driver_conductor.c:848-951`).
+///
+/// Every counter the reference appends a threading mode to is here, because
+/// this driver now runs the agents those counters measure. The name-resolver
+/// pair (32 and 33) is the exception: resolution is synchronous in this build
+/// (P1-5 adds the agent), so there is no resolver to name a threshold for — a
+/// label describing a thread that does not exist would be worse than its
+/// absence, and `docs/compat.md` carries the divergence.
+const RUNTIME_SUFFIXES: [(i32, &str); 7] = [
     (25, ": driverName="),
-    (id::CONDUCTOR_MAX_CYCLE_TIME, ": INVOKER"),
+    (id::CONDUCTOR_MAX_CYCLE_TIME, ": DEDICATED"),
     (
         id::CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED,
-        ": threshold=100ms INVOKER",
+        ": threshold=100ms DEDICATED",
+    ),
+    (id::SENDER_MAX_CYCLE_TIME, ": DEDICATED"),
+    (
+        id::SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+        ": threshold=100ms DEDICATED",
+    ),
+    (id::RECEIVER_MAX_CYCLE_TIME, ": DEDICATED"),
+    (
+        id::RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+        ": threshold=100ms DEDICATED",
     ),
 ];
 
@@ -568,24 +591,38 @@ mod tests {
         // The three this build appends to.
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
         assert_eq!(
-            "Conductor max cycle time doing its work in ns: INVOKER",
+            "Conductor max cycle time doing its work in ns: DEDICATED",
             label(&regions, 26)
         );
         assert_eq!(
-            "Conductor work cycle exceeded threshold count: threshold=100ms INVOKER",
+            "Conductor work cycle exceeded threshold count: threshold=100ms DEDICATED",
             label(&regions, 27)
         );
 
-        // And the ones it leaves alone, which the reference suffixes.
+        // The two agents P1-4 runs say which mode they run in, as the
+        // reference's do (`aeron_driver_conductor.c:867-888`).
         assert_eq!(
-            "Sender max cycle time doing its work in ns",
+            "Sender max cycle time doing its work in ns: DEDICATED",
             label(&regions, 28)
         );
         assert_eq!(
-            "Receiver max cycle time doing its work in ns",
+            "Receiver max cycle time doing its work in ns: DEDICATED",
             label(&regions, 30)
         );
+        assert_eq!(
+            "Sender work cycle exceeded threshold count: threshold=100ms DEDICATED",
+            label(&regions, 29)
+        );
+        assert_eq!(
+            "Receiver work cycle exceeded threshold count: threshold=100ms DEDICATED",
+            label(&regions, 31)
+        );
+
+        // The one pair this build leaves alone, because it has no resolver
+        // agent to name: resolution is synchronous here (P1-5 adds the agent),
+        // and a threshold label describes a thread that does not exist.
         assert_eq!("NameResolver exceeded threshold count", label(&regions, 33));
+        assert_eq!("NameResolver max time in ns", label(&regions, 32));
     }
 
     #[test]

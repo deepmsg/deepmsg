@@ -54,10 +54,12 @@ could say.
 The other labels the reference suffixes at runtime — the driver's threading
 mode, the resolver's name, the duty-cycle thresholds
 (`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
-reference's own text changes with its settings. deepmsg appends `INVOKER` to
-the conductor's two counters, matching the reference's word for a driver whose
-agents are invoked by one thread, and leaves the sender, receiver and
-name-resolver counters unsuffixed because those agents do not exist yet.
+reference's own text changes with its settings. deepmsg appends `DEDICATED` to
+the conductor's, the sender's and the receiver's cycle-time counters, matching
+the reference's word for a driver whose three agents are threads of their own —
+which is what P1-4 made this one. The name-resolver pair (32 and 33) is still
+left unsuffixed: resolution is synchronous here (P1-5 adds the agent), so a
+threshold label would name a thread that does not exist.
 
 The consequence for testing: a golden comparison of the two catalogues
 compares each label up to its first colon, and
@@ -261,6 +263,27 @@ handed — which are the ones this paragraph just called diagnostic, rather
 than the composition an `AERON_SET_ERR` would have built. Asserted by
 `crates/driver/src/conductor.rs::an_unknown_removal_is_answered_with_the_references_code`
 and `::a_refused_log_buffer_is_answered_and_recorded`.
+
+## The UDP data plane (P1-4)
+
+The network channel is now served, both ways: a publication on
+`aeron:udp?endpoint=…` sends, and a subscription on the same shape receives.
+The wire contract is `docs/protocol/wire-frames.md`; what follows is what this
+build does *differently* from the reference, and each row names where it can
+be falsified.
+
+| Divergence | Why, and where it shows |
+|---|---|
+| **Multicast, response channels, ATS and the timestamp-offset parameters are refused** (`NOT_SUPPORTED`) rather than served | P1-5 carries multicast (the `min` flow-control admission gate, `group`/`gtag`, setup-catchup windows on a group), response channels and ATS. The reference serves every one of them; a driver that *ignored* them would serve a different channel. `crates/driver/src/udp_channel.rs::a_multicast_endpoint_is_refused_rather_than_served_as_unicast`, `::the_unsupported_parameters_are_named_rather_than_dropped`. |
+| **`recvmmsg` is called without a timeout** | The reference passes a zero `timespec`, which the kernel reads as "return after the first datagram" — one syscall per datagram of a burst. This passes `NULL` on a non-blocking socket, which returns everything queued. Same datagrams, fewer syscalls (`aeron_udp_channel_transport.c:560`, `:577`). |
+| **A frame is copied into a scratch buffer before it is sent** | The reference hands `sendmmsg` an iovec pointing into the mapped term. `deepmsg_core::buffer` refuses to mint a `&[u8]` over memory another thread is writing — a false immutability promise is licence for the optimiser to hoist loads — and a syscall taking `&[u8]` is exactly that borrow. `crates/driver/src/network_publication.rs`'s module note. |
+| **A subscription's join position is the image's `rcv-pos`** | The reference takes the slowest *reader* when an image has several (`aeron_publication_image.h:376-396`), which needs the reader set — and that lives on the receiver thread that owns the image. `rcv-pos` is the position a reader may start at without seeing a hole, and for the one-reader case the two are the same number. `crates/driver/src/publication_images.rs::join_position`. |
+| **Name resolution is synchronous** (`getaddrinfo` in the resolve step), so the RES/`csv` table gossip and the resolver's cycle-time counters are absent | P1-5 carries the resolver agent. A literal address or a loopback name covers every interop case. `crates/driver/src/udp_channel.rs::a_host_is_resolved_by_the_system_when_it_is_not_a_literal`. |
+| **A channel-status counter's key is zero-filled past the channel** | The reference `memcpy`s the channel into an uninitialized struct, so the key's tail is whatever was on its stack (`aeron_position.c:220-222`). The bytes here are the same for the same channel every time, which is what a key is for. |
+| **Two native resource agents, not one** | `IpcPublications` and `PublicationsImages` each own one, because each maps its own log buffers. Invisible to a client (both are threads that map files); unifying them is a cleanup, not a contract. |
+
+The first row is the one a client can see from outside, and it is the reason
+the refusal exists: `NOT_SUPPORTED` is an answer, silence is not.
 
 ## The client's view of the ring, and of a message
 
