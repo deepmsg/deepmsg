@@ -549,6 +549,30 @@ impl ReceiverThread {
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             endpoint.add_destination(*destination);
+
+                            // The periodic entry asks a second from now and keeps
+                            // asking; this is the *first* ask, so that a source
+                            // with nothing to wait for hears it at once
+                            // (`aeron_receive_channel_endpoint.c:1145-1147`,
+                            // which sends one beside adding the entry).
+                            //
+                            // It goes to the same address the entry does: for a
+                            // channel that is not multicast and did name a
+                            // control, `current_control_addr` and `local_control`
+                            // are the same value (`media/aeron_receive_destination.c:117-124`).
+                            if let Some(address) = setup_address {
+                                let index = endpoint.destination_count() - 1;
+                                let _ = endpoint.send_sm_from(
+                                    index,
+                                    address,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    ReceiveChannelEndpoint::send_setup_flag(),
+                                );
+                            }
                         }
 
                         if let Some(setup) = setup {
