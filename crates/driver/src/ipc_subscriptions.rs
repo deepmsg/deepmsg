@@ -54,7 +54,7 @@ use crate::receive_endpoints::ReceiveChannelEndpoints;
 use crate::receiver::ReceiverProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{ipc_publication::IpcPublication, position as counter_position};
 
 /// The channel an IPC image reports as its source
@@ -161,6 +161,30 @@ impl SubscriptionLink {
     /// Whether this subscription reads that publication *as an image*.
     pub fn reads_image(&self, image_registration_id: i64) -> bool {
         self.reads(image_registration_id)
+    }
+
+    /// Whether this subscription reads an image on `endpoint_id` for
+    /// `(stream_id, session_id)`
+    /// (`aeron_driver_conductor_network_subscription_link_matches_allowing_wildcard`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:81-90`, whose two
+    /// clauses are the endpoint and
+    /// [`is_wildcard_or_session_id_match`](Self::matches_image)).
+    ///
+    /// The endpoint clause is the one a reader does not expect: an image is a
+    /// session read through **one** receive endpoint, so a subscription on
+    /// another channel shares neither its socket nor its session however much
+    /// the stream and session numbers agree. A subscription with no endpoint
+    /// at all is an IPC one, and no image is ever its.
+    ///
+    /// The session clause is the reference's `:75-79`, and the `is_response`
+    /// in it is load-bearing: a response subscription that named no session is
+    /// **not** a wildcard looking for whatever appears. It is waiting for a
+    /// RSP_SETUP to name its session, and until one does it reads nothing.
+    pub fn matches_image(&self, endpoint_id: u64, stream_id: i32, session_id: i32) -> bool {
+        self.endpoint_id == Some(endpoint_id)
+            && self.stream_id == stream_id
+            && ((self.session_id.is_none() && !self.is_response)
+                || self.session_id == Some(session_id))
     }
 
     /// Whether this subscription reads that publication
@@ -591,6 +615,10 @@ impl IpcSubscriptions {
         // socket cannot be bound is a subscription that cannot be served —
         // which is a different answer from one that has nothing to read yet.
         let endpoint_params = ReceiveChannelEndpoints::transport_params(config, &channel);
+        // Read before the channel moves into the endpoint: the mode decides
+        // what the receiver is told below, and the endpoint takes ownership.
+        let is_response_channel = channel.control_mode == ControlMode::Response;
+
         let (endpoint_id, channel_status_counter_id, new_endpoint) = endpoints
             .get_or_add(
                 channel,
@@ -611,9 +639,26 @@ impl IpcSubscriptions {
                 .map_err(|_| AddSubscriptionError::Receiver)?;
         }
 
-        receiver
-            .add_subscription(endpoint_id, request.stream_id, params.session_id)
-            .map_err(|_| AddSubscriptionError::Receiver)?;
+        // `aeron_driver_conductor.c:5072-5092`: a response subscription is
+        // **not** registered with the receiver — the reference calls
+        // `incref_to_response_stream` where every other mode calls
+        // `add_network_subscription_to_receiver`. There is no session to read
+        // until a RSP_SETUP names one, and registering one would have the
+        // receiver eliciting a setup for a session the far end has not
+        // published yet.
+        //
+        // The reference's response refcount (`response_stream_id_to_refcnt_map`,
+        // `aeron_receive_channel_endpoint.c:746-779`) is what holds the
+        // endpoint open in the meantime; this build keeps no such count because
+        // it releases no endpoint when its last subscription leaves
+        // (`receive_endpoints.rs::detach_subscription` has no caller), and a
+        // count nothing consults is not a fact about the wire. It arrives with
+        // the endpoint lifecycle.
+        if !is_response_channel {
+            receiver
+                .add_subscription(endpoint_id, request.stream_id, params.session_id)
+                .map_err(|_| AddSubscriptionError::Receiver)?;
+        }
 
         endpoints.attach_subscription(endpoint_id);
 
@@ -639,9 +684,11 @@ impl IpcSubscriptions {
 
         self.links.push(link);
 
-        // Then every image that already matches.
-        let matching = images.matching(request.stream_id, params.session_id);
+        // Then every image that already matches (`aeron_driver_conductor.c:5121-5143`,
+        // whose guard is the link's own endpoint as much as its stream and
+        // session).
         let index = self.links.len() - 1;
+        let matching = images.matching(&self.links[index]);
 
         for image_registration_id in matching {
             let _ = self.link_image(
@@ -792,14 +839,14 @@ impl IpcSubscriptions {
         let mut linked = 0;
 
         for index in 0..self.links.len() {
-            let (stream_id, session_id) = {
-                let link = &self.links[index];
-                (link.stream_id, link.session_id)
-            };
+            // The same rule the create-time match uses
+            // ([`SubscriptionLink::matches_image`]), and the two have to agree:
+            // an image that links to a subscription here is the image it reads
+            // for as long as it exists.
+            let link = &self.links[index];
 
             let matches = images.find(image_registration_id).is_some_and(|image| {
-                image.stream_id == stream_id
-                    && (session_id.is_none() || session_id == Some(image.session_id))
+                link.matches_image(image.endpoint_id, image.stream_id, image.session_id)
             });
 
             if !matches {
@@ -1106,6 +1153,47 @@ mod tests {
 
         let named = link(1001, Some(100), true);
         assert!(named.matches(&publication(100, 1001, false)));
+    }
+
+    #[test]
+    fn a_subscription_reads_an_image_on_its_own_endpoint_and_no_other() {
+        // `aeron_driver_conductor.c:87`: the endpoint is the first clause, and
+        // it is the one a reader would leave out. Two channels can name the
+        // same stream and be read on the same session, and an image is still
+        // only ever read through the endpoint that holds its socket.
+        let mut subscriber = link(1001, None, false);
+        subscriber.endpoint_id = Some(3);
+
+        assert!(subscriber.matches_image(3, 1001, 100));
+        assert!(
+            !subscriber.matches_image(4, 1001, 100),
+            "another endpoint: another socket, another session"
+        );
+
+        // An IPC subscription has no endpoint, and no image is ever its.
+        let ipc = link(1001, None, false);
+        assert!(ipc.endpoint_id.is_none());
+        assert!(!ipc.matches_image(3, 1001, 100));
+    }
+
+    #[test]
+    fn a_response_subscription_reads_no_image_until_a_session_is_named() {
+        // The same asymmetry as `matches`, and it is what makes the two agree:
+        // a response subscription that named no session is waiting for a
+        // RSP_SETUP, not looking for whatever appears
+        // (`aeron_driver_conductor.c:75-79`).
+        let mut response = link(1001, None, true);
+        response.endpoint_id = Some(3);
+
+        assert!(!response.matches_image(3, 1001, 100));
+
+        // Once the setup completes, the reference clears `is_response` and pins
+        // the session (`:7100-7105`), and the rule reads it like any other.
+        let mut completed = link(1001, Some(100), false);
+        completed.endpoint_id = Some(3);
+
+        assert!(completed.matches_image(3, 1001, 100));
+        assert!(!completed.matches_image(3, 1001, 101), "a named session");
     }
 
     #[test]

@@ -31,11 +31,18 @@
 //! publication and subscription *params* rather than channel ones and are read
 //! by [`crate::publication_params`]; what lives here is the transport: the
 //! addresses, the socket buffer sizes, the receiver window, the tag and the
-//! control mode. Multicast (`group`/`gtag`, a multicast endpoint), the
-//! timestamp-offset parameters and response channels are **refused** rather
-//! than ignored — a driver that dropped them silently would serve a channel
-//! that behaves like a different one. Both refusals are recorded in
-//! `docs/compat.md`.
+//! control mode. Multicast (`group`/`gtag`, a multicast endpoint) and the
+//! timestamp-offset parameters are **refused** rather than ignored — a driver
+//! that dropped them silently would serve a channel that behaves like a
+//! different one. Both refusals are recorded in `docs/compat.md`.
+//!
+//! `control-mode=response` is a channel like the others here: the reference
+//! resolves its addresses down the same path as every other mode
+//! (`aeron_udp_channel.c:346-381`), the only difference being that a response
+//! channel with nothing else to distinguish it is allowed through
+//! (`:336-344`) and that it is *not* a multi-destination mode
+//! ([`ControlMode::is_multi_destination`]). What is special about a response
+//! channel lives above this layer, in the conductor.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -533,8 +540,8 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
 /// The reference would serve every one of these. A driver that dropped them
 /// silently would be a driver whose channel behaved like a different one — a
 /// multicast group that receives nothing, a timestamped image without
-/// timestamps, a response channel that is not one — so they are refused and
-/// `docs/compat.md` carries the divergence.
+/// timestamps — so they are refused and `docs/compat.md` carries the
+/// divergence.
 ///
 /// # Errors
 ///
@@ -553,12 +560,6 @@ fn refuse_unsupported(uri: &ChannelUri<'_>) -> Result<(), UdpChannelError> {
                 "`{key}` is not served by this driver"
             )));
         }
-    }
-
-    if uri.value("control-mode") == Some("response") {
-        return Err(UdpChannelError::Unsupported(
-            "response channels are not served by this driver".to_owned(),
-        ));
     }
 
     Ok(())
@@ -1065,13 +1066,16 @@ mod tests {
             refuse("aeron:udp?mtu=1408")
         );
 
-        // Unless a control mode says where it is — the two modes that name
-        // their control address by other means.
-        assert!(ChannelUri::parse(b"aeron:udp?control-mode=manual").is_ok());
-        assert!(matches!(
-            refuse("aeron:udp?control-mode=response"),
-            UdpChannelError::Unsupported(_)
-        ));
+        // Unless a control mode says where it is — the two modes the reference
+        // exempts (`:336-344`).
+        assert_eq!(
+            ControlMode::Manual,
+            resolve("aeron:udp?control-mode=manual").control_mode
+        );
+        assert_eq!(
+            ControlMode::Response,
+            resolve("aeron:udp?control-mode=response").control_mode
+        );
     }
 
     #[test]
@@ -1182,10 +1186,13 @@ mod tests {
             "an unknown control mode is no mode at all (`:309-323`)"
         );
 
-        // `response` is a control mode that is not a multi-destination one, and
-        // it cannot be reached through `resolve` yet — this build refuses the
-        // channel outright (`:459-460`), so the mode is asked directly.
-        assert!(!ControlMode::Response.is_multi_destination());
+        // `response` is a control mode that is not a multi-destination one
+        // (`media/aeron_udp_channel.h:147-151`), even though its channel now
+        // resolves like any other.
+        assert!(
+            !resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=response")
+                .is_multi_destination()
+        );
     }
 
     #[test]
@@ -1399,7 +1406,6 @@ mod tests {
             "aeron:udp?endpoint=127.0.0.1:40123|media-rcv-ts-offset=0",
             "aeron:udp?endpoint=127.0.0.1:40123|channel-rcv-ts-offset=0",
             "aeron:udp?endpoint=127.0.0.1:40123|ats=1",
-            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=response",
         ] {
             let error = refuse(uri);
             assert!(
@@ -1407,6 +1413,36 @@ mod tests {
                 "{uri}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_response_channel_resolves_its_addresses_like_any_other() {
+        // The reference sends every control mode down the same resolution
+        // (`aeron_udp_channel.c:346-381`), and a response channel names its
+        // control address the way a manual one does.
+        let response = resolve(
+            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=response",
+        );
+        let manual = resolve(
+            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=manual",
+        );
+
+        assert_eq!(ControlMode::Response, response.control_mode);
+        assert_eq!(manual.remote_data, response.remote_data);
+        assert_eq!(manual.local_data, response.local_data);
+        assert_eq!(manual.local_control, response.local_control);
+        assert!(response.has_explicit_control);
+
+        // A response channel is *not* multi-destination, so it keeps the
+        // single-endpoint shape rather than the tracker's.
+        assert!(!response.is_multi_destination());
+        assert!(manual.is_multi_destination());
+
+        // And it is allowed to name nothing else at all (`:336-344`).
+        assert_eq!(
+            ControlMode::Response,
+            resolve("aeron:udp?control-mode=response").control_mode
+        );
     }
 
     #[test]

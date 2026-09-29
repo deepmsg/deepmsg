@@ -29,6 +29,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::ipc_subscriptions::SubscriptionLink;
+
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::{AddError, Now};
@@ -133,14 +135,18 @@ impl PublicationImages {
         self.pending.len()
     }
 
-    /// The images on one stream and session, which is what a subscription is
-    /// matched against (`find_matching_subscription_link`, and its mirror).
-    pub fn matching(&self, stream_id: i32, session_id: Option<i32>) -> Vec<i64> {
+    /// The images a subscription joins as it is created
+    /// (`aeron_driver_conductor.c:5121-5143`).
+    ///
+    /// The rule is [`SubscriptionLink::matches_image`], which the live
+    /// image-to-subscription path asks too — the two have to agree, because an
+    /// image a subscription is linked to at creation is one it reads for as
+    /// long as the image exists.
+    pub fn matching(&self, link: &SubscriptionLink) -> Vec<i64> {
         self.images
             .iter()
             .filter(|image| {
-                image.stream_id == stream_id
-                    && session_id.is_none_or(|session_id| image.session_id == session_id)
+                link.matches_image(image.endpoint_id, image.stream_id, image.session_id)
             })
             .map(|image| image.registration_id)
             .collect()
