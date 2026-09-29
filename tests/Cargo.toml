@@ -155,5 +155,13 @@ name = "response_channel"
 path = "interop/response_channel.rs"
 required-features = ["interop"]
 
+# P1-5's A8: the reference's own `response_client` and `response_server`, run
+# against a driver this build wrote. The only arrangement in which the nine-step
+# handshake is decided by two programs that share no code with it.
+[[test]]
+name = "response_channel_reference"
+path = "interop/response_channel_reference.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true

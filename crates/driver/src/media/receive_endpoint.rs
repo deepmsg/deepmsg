@@ -903,6 +903,52 @@ impl ReceiveChannelEndpoint {
             .elicit_setup_from_source(stream_id, session_id)
     }
 
+    /// Ask **every** destination for the stream
+    /// (`aeron_receive_channel_endpoint_elicit_setup`,
+    /// `media/aeron_receive_channel_endpoint.c:259-289`).
+    ///
+    /// Unconditional, and that is the reference's shape: the endpoint-level ask
+    /// is not a decision, it is the whole act, and it goes to every destination
+    /// the endpoint has. What decides *whether* to ask is the caller's, and the
+    /// guard there is the channel's — a channel that named no control address
+    /// has nowhere to send it (`aeron_driver_receiver.c:418-426`).
+    ///
+    /// It is a separate method from [`Self::elicit_setup`] because that one
+    /// answers a different question: it is the *data*-driven path
+    /// (`aeron_data_packet_dispatcher_elicit_setup_from_source`, `:616-659`),
+    /// which is asked once per session and decides whether an ask is owed at
+    /// all. This one is the ask.
+    ///
+    /// Returns how many destinations it reached, which is what the reference's
+    /// `work_count` counts.
+    pub fn elicit_setup_to_destinations(&mut self, stream_id: i32, session_id: i32) -> usize {
+        let mut reached = 0;
+
+        for index in 0..self.destinations.len() {
+            let Some(address) = self.destinations[index].setup_address() else {
+                continue;
+            };
+
+            if self
+                .send_sm_from(
+                    index,
+                    address,
+                    stream_id,
+                    session_id,
+                    0,
+                    0,
+                    0,
+                    Self::send_setup_flag(),
+                )
+                .is_ok()
+            {
+                reached += 1;
+            }
+        }
+
+        reached
+    }
+
     /// A status message's flags for the two cases this module sends.
     pub const fn send_setup_flag() -> u8 {
         crate::protocol::header_flags::SM_SEND_SETUP

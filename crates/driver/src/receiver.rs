@@ -719,7 +719,7 @@ impl ReceiverThread {
                             // send it, so the guard is the channel's
                             // (`:418-426`).
                             if endpoint.channel.has_explicit_control {
-                                endpoint.elicit_setup(stream_id, session_id);
+                                endpoint.elicit_setup_to_destinations(stream_id, session_id);
                             }
                         }
                     }
@@ -735,7 +735,7 @@ impl ReceiverThread {
                             // nowhere to send the request (`:418-426`), so the
                             // guard is the channel's, not the caller's.
                             if endpoint.channel.has_explicit_control {
-                                endpoint.elicit_setup(stream_id, session_id);
+                                endpoint.elicit_setup_to_destinations(stream_id, session_id);
                             }
                         }
                     }
