@@ -667,6 +667,38 @@ impl PublicationImage {
     /// from, and a source that is new gets a connection of its own. A
     /// connection with no control address yet takes this source as one, which
     /// is how an implicit-unicast image learns where to answer.
+    /// A destination this image now also hears from
+    /// (`aeron_publication_image_add_destination`, `:229-236`).
+    ///
+    /// When a client adds a destination to a subscription, every image already
+    /// running on that subscription's endpoint gets a connection for it
+    /// (`aeron_driver_receiver.c:483-486`) — so that the status messages and
+    /// NAKs about this stream go to the new source as well as to the ones that
+    /// were already there.
+    ///
+    /// An address the image already hears from is not added twice. One that is
+    /// [`None`] is a connection with no control address yet, which the first
+    /// packet to arrive on it will supply.
+    pub fn add_destination(&mut self, control_address: Option<SocketAddr>, now_ns: i64) {
+        if let Some(address) = control_address {
+            if self
+                .connections
+                .iter()
+                .any(|connection| connection.control_address == Some(address))
+            {
+                return;
+            }
+        }
+
+        self.connections.push(Connection {
+            control_address,
+            time_of_last_activity_ns: now_ns,
+            time_of_last_frame_ns: now_ns,
+            is_eos: false,
+            eos_position: 0,
+        });
+    }
+
     fn track_connection(&mut self, source: SocketAddr, now_ns: i64) {
         let index = match self
             .connections
@@ -1402,6 +1434,37 @@ mod tests {
     /// length** — which is what a sender puts on the wire and what
     /// `validate_packet` requires: the frames in a datagram are aligned, so a
     /// packet's length is always a multiple of the frame alignment.
+    /// A destination a client adds joins every image already running on that
+    /// endpoint (`aeron_driver_receiver.c:483-486`), so a stream that is already
+    /// up sends its status messages and NAKs to the new source as well.
+    ///
+    /// An address the image already hears from is not a second connection; one
+    /// with no address yet is a connection the first packet to arrive on it will
+    /// place.
+    #[test]
+    fn an_image_takes_a_destination_once() {
+        let mut fixture = Fixture::new();
+        let before = fixture.image.connections.len();
+        let address: SocketAddr = "127.0.0.1:40124".parse().expect("an address");
+
+        fixture.image.add_destination(Some(address), 1_000);
+        assert_eq!(before + 1, fixture.image.connections.len());
+
+        fixture.image.add_destination(Some(address), 2_000);
+        assert_eq!(
+            before + 1,
+            fixture.image.connections.len(),
+            "the same address is not a second connection"
+        );
+
+        fixture.image.add_destination(None, 3_000);
+        assert_eq!(
+            before + 2,
+            fixture.image.connections.len(),
+            "one with no address yet is still a connection"
+        );
+    }
+
     fn packet(term_id: i32, term_offset: i32, payload: &[u8]) -> Vec<u8> {
         let frame = crate::protocol::DataFrame {
             term_offset,

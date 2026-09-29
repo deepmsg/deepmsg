@@ -535,13 +535,15 @@ impl ReceiverThread {
                         // answer — a `SETUP` describing whatever the far end
                         // publishes — and that is what brings the stream into
                         // being.
+                        let now_ns = deepmsg_core::clock::monotonic_nano_time();
                         let setup = destination.setup_address().map(|address| PendingSetup {
                             endpoint_id,
                             stream_id: 0,
                             session_id: 0,
                             control_address: Some(address),
-                            time_of_status_message_ns: deepmsg_core::clock::monotonic_nano_time(),
+                            time_of_status_message_ns: now_ns,
                         });
+                        let setup_address = destination.setup_address();
 
                         if let Some((_, endpoint)) =
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
@@ -551,6 +553,16 @@ impl ReceiverThread {
 
                         if let Some(setup) = setup {
                             self.pending_setups.push(setup);
+                        }
+
+                        // And every image already running on that endpoint hears
+                        // from it too (`aeron_driver_receiver.c:483-486`): a
+                        // stream that is already up has to send its status
+                        // messages and NAKs to the new source as well.
+                        for image in self.images.iter_mut() {
+                            if image.endpoint_id == endpoint_id {
+                                image.add_destination(setup_address, now_ns);
+                            }
                         }
                     }
                     ReceiverCommand::RemoveDestination {
