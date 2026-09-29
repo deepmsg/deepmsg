@@ -307,7 +307,15 @@ impl NetworkPublication {
             retransmit_handler,
             signal_eos: params.signal_eos,
             subscribers: Subscribable::new(registration_id),
-            time_of_last_setup_ns: 0,
+            // The first `SETUP` is due at once. The reference seeds this a
+            // timeout and a nanosecond *before* now, so that
+            // `now_ns > time_of_last_setup_ns + SETUP_TIMEOUT_NS` already holds
+            // on the first pass (`aeron_network_publication.c:285`). Zero says
+            // the same thing only to a clock whose zero is the epoch; against a
+            // monotonic reading it holds the first `SETUP` back for the whole
+            // timeout, which is exactly the moment a sender that has met no
+            // receiver is supposed to be saying it.
+            time_of_last_setup_ns: now_ns.saturating_sub(SETUP_TIMEOUT_NS).saturating_sub(1),
             time_of_last_data_or_heartbeat_ns: now_ns,
             has_initial_connection: false,
             // Nothing has been sent yet, so nothing has been read past yet
@@ -881,12 +889,6 @@ impl NetworkPublication {
         Ok(total)
     }
 
-    /// A status message arrived (`aeron_network_publication_on_status_message`,
-    /// `:779-840`).
-    ///
-    /// The order is the reference's and each step is load-bearing: the sender's
-    /// liveness first (an end-of-stream status message is a receiver *leaving*,
-    /// so it removes rather than refreshes), then the flow control, then the
     /// A receiver asked for a `SETUP` because it has no image for this session
     /// (`aeron_network_publication_trigger_send_setup_frame`, `.h:245-271`).
     ///
@@ -913,18 +915,24 @@ impl NetworkPublication {
         self.is_setup_elicited = true;
     }
 
+    /// A status message arrived (`aeron_network_publication_on_status_message`,
+    /// `:779-840`).
+    ///
+    /// The order is the reference's and each step is load-bearing: the sender's
+    /// liveness first (an end-of-stream status message is a receiver *leaving*,
+    /// so it removes rather than refreshes), then the flow control, then the
     /// connected state recomputed from both.
     pub fn on_status_message(
         &mut self,
         frame: &StatusMessageFrame,
         flags: u8,
-        system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) {
-        system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
-
+        // `status-messages-received` is counted at the endpoint, before this —
+        // and whether or not a publication answered to the message
+        // (`media/aeron_send_channel_endpoint.c:625`).
         self.status_message_deadline_ns = now_ns + self.connection_timeout_ns;
 
         if flags & header_flags::SM_EOS != 0 {
@@ -1009,12 +1017,11 @@ impl NetworkPublication {
     pub fn on_error(
         &mut self,
         frame: &ErrorFrame,
-        system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) {
-        system.increment(system_counters::id::ERROR_FRAMES_RECEIVED);
-
+        // `error-frames-received` is counted at the endpoint, before the
+        // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
         self.remove_receiver(frame.receiver_id);
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
     }
@@ -1038,8 +1045,8 @@ impl NetworkPublication {
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) -> NakOutcome {
-        system.increment(system_counters::id::NAK_MESSAGES_RECEIVED);
-
+        // `nak-messages-received` is counted at the endpoint, once the report
+        // has been found well formed (`media/aeron_send_channel_endpoint.c:566`).
         // The system counter answers "is this driver being asked to
         // retransmit"; this one answers "which publication is"
         // (`aeron_network_publication.c:733`).
@@ -1552,7 +1559,6 @@ mod tests {
         // is limited to what has been sent, plus a term's window.
         let mut fixture = fixture();
         let (counters, regions) = fixture.counters.open();
-        let system = System::new(&counters, &regions);
 
         let frame = StatusMessageFrame {
             session_id: 42,
@@ -1565,7 +1571,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         assert!(fixture.publication.has_subscribers(&counters, &regions));
         assert_eq!(
@@ -1842,7 +1848,6 @@ mod tests {
     fn a_status_message_moves_the_limit_and_connects_the_publication() {
         let mut fixture = fixture();
         let (counters, regions) = fixture.counters.open();
-        let system = System::new(&counters, &regions);
 
         // A receiver that has read nothing and has room for 8 KiB, in the term
         // the publication is in.
@@ -1857,7 +1862,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         assert_eq!(
             Some(8192),
@@ -1881,7 +1886,6 @@ mod tests {
         fixture.publication.on_status_message(
             &frame,
             crate::protocol::header_flags::SM_EOS,
-            &system,
             &counters,
             &regions,
             1_100,
@@ -1909,7 +1913,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         // A heartbeat-less, data-less pass after the timeout: the receiver is
         // expired rather than simply never seen.
@@ -1948,7 +1952,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         let mut metadata = vec![0u8; 64 * 1024 * 4];
         let mut values = vec![0u8; 64 * 1024];

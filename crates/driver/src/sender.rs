@@ -48,11 +48,12 @@ use crate::idle::Backoff;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
-    ErrorFrame, FrameHeader, NakFrame, RttmFrame, StatusMessageFrame, frame_type, header_flags,
-    is_frame_valid,
+    ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RttmFrame,
+    StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
+use deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH;
 
 /// How many datagrams one poll may read
 /// (`AERON_DRIVER_SENDER_IO_VECTOR_LENGTH_MAX`,
@@ -466,59 +467,114 @@ impl SenderThread {
 
         match header.frame_type {
             frame_type::SM => {
-                if let Some(frame) = StatusMessageFrame::read(bytes) {
-                    if let Some(publication) =
-                        find_publication(publications, frame.stream_id, frame.session_id)
-                    {
-                        // `SEND_SETUP` is not a position report: it is a
-                        // receiver saying it has no image and wants the stream
-                        // described (`aeron_send_channel_endpoint.c:649-656`).
-                        if header.flags & header_flags::SM_SEND_SETUP != 0 {
-                            publication.trigger_send_setup_frame();
-                        } else {
-                            publication.on_status_message(
-                                &frame,
-                                header.flags,
-                                &system,
-                                counters,
-                                regions,
-                                now_ns,
-                            );
-                        }
-                    }
+                let Some(frame) = StatusMessageFrame::read(bytes) else {
+                    return;
+                };
+
+                // A status message is checked before anything reads a position
+                // out of it. What it is measured against is the publication's
+                // term length when a publication here answers to it, and the
+                // largest a term may be otherwise
+                // (`aeron_send_channel_endpoint.c:589-596`, `:613-617`).
+                let index = index_of_publication(publications, frame.stream_id, frame.session_id);
+                let term_length =
+                    index.map_or(TERM_MAX_LENGTH, |index| publications[index].term_length);
+
+                if !is_valid_status_message(&frame, term_length) {
+                    system.increment(system_counters::id::INVALID_PACKETS);
+                    return;
                 }
+
+                // Counted whether or not a publication here can read it: the
+                // counter answers "is the far end talking to us", which does not
+                // depend on our recognising what it said (`:625`).
+                system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
+
+                let Some(index) = index else {
+                    return;
+                };
+
+                // `SEND_SETUP` is not a position report — it is a receiver
+                // saying it has no image and wants the stream described
+                // (`aeron_send_channel_endpoint.c:649-656`) — so it is not put
+                // through the position check below.
+                if header.flags & header_flags::SM_SEND_SETUP != 0 {
+                    publications[index].trigger_send_setup_frame();
+                    return;
+                }
+
+                // NOT here: the publication-side position check
+                // (`aeron_network_publication_is_valid_status_message`,
+                // `aeron_network_publication.c:841-856`) and the
+                // `status-messages-rejected` counter it drives. It is part of
+                // this finding and is implemented, but it cannot be switched on
+                // while this tree's own receiver sends a status message the
+                // reference's publisher is required to refuse — see the batch's
+                // notes. Turning it on stops every UDP session here: no status
+                // message is accepted, `snd-lmt` never opens, and nothing is
+                // sent.
+
+                publications[index].on_status_message(
+                    &frame,
+                    header.flags,
+                    counters,
+                    regions,
+                    now_ns,
+                );
             }
             frame_type::NAK => {
-                if let Some(frame) = NakFrame::read(bytes) {
-                    let Some(index) =
-                        index_of_publication(publications, frame.stream_id, frame.session_id)
-                    else {
-                        return;
-                    };
+                let Some(frame) = NakFrame::read(bytes) else {
+                    return;
+                };
 
-                    let endpoint_id = publications[index].endpoint_id;
-                    let Some(position) = endpoints.iter().position(|(id, _)| *id == endpoint_id)
-                    else {
-                        return;
-                    };
+                // A gap report is only checked when a publication answers to it,
+                // because the term length it is measured against is that
+                // publication's (`:549-552`).
+                let Some(index) =
+                    index_of_publication(publications, frame.stream_id, frame.session_id)
+                else {
+                    return;
+                };
 
-                    let (_, endpoint) = &mut endpoints[position];
-                    let publication = &mut publications[index];
+                let endpoint_id = publications[index].endpoint_id;
+                let Some(position) = endpoints.iter().position(|(id, _)| *id == endpoint_id) else {
+                    return;
+                };
 
-                    // The resend happens *inside* `on_nak` when the channel's
-                    // delay is zero — the same place the reference's callback
-                    // fires (`aeron_retransmit_handler.c:110-124`).
-                    let _ =
-                        publication.on_nak(&frame, &system, endpoint, counters, regions, now_ns);
+                if !is_valid_nak(&frame, publications[index].term_length) {
+                    system.increment(system_counters::id::INVALID_PACKETS);
+                    return;
                 }
+
+                system.increment(system_counters::id::NAK_MESSAGES_RECEIVED);
+
+                let (_, endpoint) = &mut endpoints[position];
+                let publication = &mut publications[index];
+
+                // The resend happens *inside* `on_nak` when the channel's delay
+                // is zero — the same place the reference's callback fires
+                // (`aeron_retransmit_handler.c:110-124`).
+                let _ = publication.on_nak(&frame, &system, endpoint, counters, regions, now_ns);
             }
             frame_type::ERR => {
-                if let Some(frame) = ErrorFrame::read(bytes) {
-                    if let Some(publication) =
-                        find_publication(publications, frame.stream_id, frame.session_id)
-                    {
-                        publication.on_error(&frame, &system, counters, regions);
-                    }
+                let Some(frame) = ErrorFrame::read(bytes) else {
+                    return;
+                };
+
+                if !is_valid_error(&frame, header.frame_length) {
+                    system.increment(system_counters::id::INVALID_PACKETS);
+                    return;
+                }
+
+                // Counted before the lookup, like a status message: an error
+                // about a publication this endpoint no longer holds is still an
+                // error that arrived (`:686`).
+                system.increment(system_counters::id::ERROR_FRAMES_RECEIVED);
+
+                if let Some(publication) =
+                    find_publication(publications, frame.stream_id, frame.session_id)
+                {
+                    publication.on_error(&frame, counters, regions);
                 }
             }
             frame_type::RTTM => {
@@ -640,6 +696,47 @@ fn index_of_publication(
     })
 }
 
+/// Whether a gap report names a frame a term could hold
+/// (`aeron_send_channel_endpoint_is_valid_nak`,
+/// `media/aeron_send_channel_endpoint.c:519-526`).
+///
+/// A report that names an unaligned offset, or a length that runs past the end
+/// of the term, is one the retransmit path would otherwise read a frame out of
+/// at an offset no frame starts at.
+fn is_valid_nak(frame: &NakFrame, term_length: i32) -> bool {
+    let term_buffer_length = i64::from(term_length);
+    let term_offset = i64::from(frame.term_offset);
+
+    term_offset >= 0
+        && term_offset < term_buffer_length
+        && term_offset % i64::from(FRAME_ALIGNMENT as i32) == 0
+        && frame.length >= 0
+        && term_offset + i64::from(frame.length) <= term_buffer_length
+}
+
+/// Whether a status message reports a position and a window a term could hold
+/// (`aeron_send_channel_endpoint_is_valid_status_message`, `:589-596`).
+fn is_valid_status_message(frame: &StatusMessageFrame, term_length: i32) -> bool {
+    let term_buffer_length = i64::from(term_length);
+    let term_offset = i64::from(frame.consumption_term_offset);
+
+    term_offset >= 0
+        && term_offset < term_buffer_length
+        && term_offset % i64::from(FRAME_ALIGNMENT as i32) == 0
+        && frame.receiver_window >= 0
+        && i64::from(frame.receiver_window) <= (term_buffer_length >> 1)
+}
+
+/// Whether an error frame's text fits inside its own frame
+/// (`aeron_send_channel_endpoint_is_valid_error`, `:658-662`).
+fn is_valid_error(frame: &ErrorFrame, frame_length: i32) -> bool {
+    let error_length = i64::from(frame.error_length);
+
+    error_length >= 0
+        && error_length <= i64::from(MAX_ERROR_TEXT_LENGTH)
+        && error_length + i64::from(ErrorFrame::LENGTH as i32) <= i64::from(frame_length)
+}
+
 /// The publication a control frame names
 /// (`aeron_int64_to_ptr_hash_map_get(&endpoint->publication_dispatch_map, aeron_map_compound_key(stream_id, session_id))`).
 fn find_publication(
@@ -694,6 +791,92 @@ mod tests {
     }
 
     const TERM_LENGTH: i32 = 64 * 1024;
+
+    #[test]
+    fn a_nak_names_a_frame_a_term_can_hold() {
+        const TERM: i32 = 64 * 1024;
+
+        let nak = |term_offset: i32, length: i32| NakFrame {
+            session_id: 1,
+            stream_id: 2,
+            term_id: 3,
+            term_offset,
+            length,
+        };
+
+        assert!(is_valid_nak(&nak(0, 1024), TERM));
+        assert!(
+            is_valid_nak(&nak(1024, TERM - 1024), TERM),
+            "a report that reaches exactly the end of the term is one a term can hold"
+        );
+
+        assert!(
+            !is_valid_nak(&nak(8, 1024), TERM),
+            "an unaligned offset is one no frame starts at"
+        );
+        assert!(!is_valid_nak(&nak(-32, 1024), TERM));
+        assert!(
+            !is_valid_nak(&nak(0, TERM + 32), TERM),
+            "a length that reaches past the end of the term"
+        );
+        assert!(!is_valid_nak(&nak(0, -1), TERM));
+    }
+
+    #[test]
+    fn a_status_message_reports_a_position_and_a_window_a_term_can_hold() {
+        const TERM: i32 = 64 * 1024;
+
+        let sm = |consumption_term_offset: i32, receiver_window: i32| StatusMessageFrame {
+            session_id: 1,
+            stream_id: 2,
+            consumption_term_id: 3,
+            consumption_term_offset,
+            receiver_window,
+            receiver_id: 4,
+        };
+
+        assert!(is_valid_status_message(&sm(0, TERM / 2), TERM));
+        assert!(is_valid_status_message(&sm(1024, 0), TERM));
+
+        assert!(
+            !is_valid_status_message(&sm(0, TERM / 2 + 32), TERM),
+            "a window wider than half a term asks for more than a term holds"
+        );
+        assert!(!is_valid_status_message(&sm(0, -1), TERM));
+        assert!(!is_valid_status_message(&sm(8, 1024), TERM));
+        assert!(!is_valid_status_message(&sm(TERM, 1024), TERM));
+    }
+
+    #[test]
+    fn an_error_frame_carries_text_that_fits_it() {
+        const FRAME: i32 = 64;
+
+        let error = |error_length: i32| ErrorFrame {
+            session_id: 1,
+            stream_id: 2,
+            receiver_id: 3,
+            group_tag: 0,
+            error_code: 0,
+            error_length,
+        };
+
+        assert!(is_valid_error(&error(0), FRAME));
+        assert!(is_valid_error(&error(MAX_ERROR_TEXT_LENGTH), 1023 + 40));
+        assert!(
+            is_valid_error(&error(FRAME - 40), FRAME),
+            "the text exactly fills the frame"
+        );
+
+        assert!(!is_valid_error(&error(-1), FRAME));
+        assert!(
+            !is_valid_error(&error(MAX_ERROR_TEXT_LENGTH + 1), i32::MAX),
+            "more text than an error frame may carry"
+        );
+        assert!(
+            !is_valid_error(&error(FRAME - 40 + 32), FRAME),
+            "text that runs past the frame's own length"
+        );
+    }
 
     /// A sender thread and a publication producing to a socket this test owns.
     ///
