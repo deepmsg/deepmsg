@@ -121,6 +121,11 @@ pub struct NetworkPublicationRecord {
     pub endpoint_id: u64,
     /// The channel as the client sent it.
     pub channel: Vec<u8>,
+    /// Where its log buffer is. A second client given this publication maps the
+    /// *same* file, so the reply to its `ADD_PUBLICATION` has to name it
+    /// (`aeron_driver_conductor.c:4195-4196`, which answers with
+    /// `publication->log_file_name` on both the shared and the new path).
+    pub path: PathBuf,
     /// Whether the producer asked for a single-producer publication.
     pub is_exclusive: bool,
     /// The parameters it was created with, which a sharing publication has to
@@ -132,6 +137,17 @@ pub struct NetworkPublicationRecord {
     pub channel_status_counter_id: i32,
     /// How many clients hold a link to it (`publication_links`).
     pub refcount: i32,
+}
+
+impl NetworkPublicationRecord {
+    /// The log buffer's path, as the client's reply carries it.
+    ///
+    /// The bytes and not a `Path`: the reply is the reference's
+    /// `aeron_publication_buffers_ready_t`, whose tail is the file name as the
+    /// driver wrote it (`aeron_driver_conductor.c:2417`).
+    pub fn path_bytes(&self) -> Vec<u8> {
+        self.path.as_os_str().as_encoded_bytes().to_vec()
+    }
 }
 
 /// The network publications a driver owns.
@@ -567,6 +583,7 @@ impl NetworkPublications {
             stream_id: pending.stream_id,
             endpoint_id: pending.endpoint_id,
             channel: pending.channel.clone(),
+            path: pending.path.clone(),
             is_exclusive: pending.is_exclusive,
             params: pending.params,
             counters: pending.counters,
@@ -646,6 +663,13 @@ impl NetworkPublications {
         let publication = &mut self.publications[index];
         publication.refcount += 1;
 
+        // The *same* log buffer, so the same file name in the reply: a second
+        // client is handed a link onto the publication that exists, not a
+        // publication of its own, and a client that is told no file name has
+        // nothing to map and cannot offer at all
+        // (`aeron_driver_conductor.c:4195-4196`, which answers with the
+        // publication's `log_file_name` on this path too).
+        let log_file = publication.path_bytes();
         let ready = PublicationBuffersReady {
             correlation_id: request.correlation_id,
             registration_id: publication.registration_id,
@@ -653,7 +677,7 @@ impl NetworkPublications {
             stream_id: publication.stream_id,
             position_limit_counter_id: publication.counters.pub_lmt,
             channel_status_indicator_id: publication.channel_status_counter_id,
-            log_file: &[],
+            log_file: &log_file,
         };
 
         let publication_registration_id = publication.registration_id;
