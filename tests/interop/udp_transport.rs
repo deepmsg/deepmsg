@@ -1309,6 +1309,170 @@ fn a_stream_that_fills_terms_arrives_whole_and_in_order() {
     }
 }
 
+/// Pump both clients until the subscriber has `expected` messages, offering
+/// from `index` on as the far end's window allows, and no further than
+/// `offer_until`.
+///
+/// Returns what arrived. `index` advances as messages are accepted, so a second
+/// phase continues the stream rather than repeating it — and `offer_until`,
+/// rather than a global cap, is what keeps the first phase from spending the
+/// messages the second one needs.
+#[allow(clippy::too_many_arguments)] // two clients, their two ids, and the bounds
+fn pump_until(
+    publisher: &mut Client,
+    publication_id: i64,
+    subscriber: &mut Client,
+    subscription_id: i64,
+    offer_until: usize,
+    expected: usize,
+    index: &mut usize,
+    within: Duration,
+) -> Vec<Vec<u8>> {
+    let mut received = Vec::new();
+    let deadline = Instant::now() + within;
+
+    while Instant::now() < deadline && received.len() < expected {
+        publisher.poll();
+        subscriber.poll();
+
+        // Offering stops by itself once the window closes: a log buffer with no
+        // reader filling it answers `EndOfLog`.
+        while *index < offer_until {
+            match publisher.offer(publication_id, &stream_payload(*index)) {
+                Some(Appended::Ok { .. }) => *index += 1,
+                Some(_) | None => break,
+            }
+        }
+
+        read_ready(subscriber, subscription_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    received
+}
+
+/// A15: a receiver that restarts is answered, not ignored.
+///
+/// A publication that has met one receiver has closed its `SETUP` path for good
+/// — `!has_initial_connection || is_setup_elicited` is false from then on
+/// (`aeron_network_publication.c:586`). The only thing that re-opens it is a
+/// receiver saying `SEND_SETUP`, which is what a driver sends when a frame
+/// arrives for a session it holds no image for. A publisher that reads that
+/// status message as an ordinary position report records the receiver, never
+/// describes the stream, and leaves the restarted subscriber waiting for an
+/// image that is never offered.
+///
+/// The two drivers are separate on purpose: restarting the subscriber has to
+/// not restart the publisher, and the publication's memory of the first
+/// receiver has to survive into the second.
+#[test]
+fn a_receiver_that_restarts_is_answered_with_a_setup() {
+    let Some(mut publisher_driver) = OwnDriver::start("udp-restart-publisher") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publisher_cnc = publisher_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(9);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut publisher = Client::connect(publisher_driver.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // Phase one: a subscriber driver the publication meets and answers.
+    let Some(mut first_driver) = OwnDriver::start("udp-restart-subscriber-1") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let _ = first_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the subscriber's driver must publish a readable CnC file");
+
+    let mut first = Client::connect(first_driver.aeron_dir()).expect("connect our client");
+    let first_id = first
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut index = 0usize;
+    let received = pump_until(
+        &mut publisher,
+        publication_id,
+        &mut first,
+        first_id,
+        100,
+        100,
+        &mut index,
+        Duration::from_secs(30),
+    );
+
+    let _ = first_driver.stop();
+
+    assert!(
+        !received.is_empty(),
+        "the first subscriber must be served before the restart means anything.\n\
+         our driver said:\n{}",
+        publisher_driver.log_tail(60)
+    );
+
+    // Phase two: a driver that has never seen this stream, subscribing to the
+    // same channel. The publication is the same one, and its `SETUP` path is
+    // shut until something opens it again.
+    let Some(mut second_driver) = OwnDriver::start("udp-restart-subscriber-2") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let second_cnc = second_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the restarted driver must publish a readable CnC file");
+
+    let mut second = Client::connect(second_driver.aeron_dir()).expect("connect our client");
+    let second_id = second
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    pump_until(
+        &mut publisher,
+        publication_id,
+        &mut second,
+        second_id,
+        110,
+        1,
+        &mut index,
+        Duration::from_secs(8),
+    );
+
+    let log = publisher_driver.log_tail(60);
+    let view = client_view(&second, second_id);
+    let second_counters = counters_of(&second_cnc);
+    let publisher_counters = counters_of(&publisher_cnc);
+    let _ = second_driver.stop();
+    let _ = publisher_driver.stop();
+
+    // The claim under test is the image, which is what the `SETUP` buys:
+    // without one the receiver never learns the session's term length, initial
+    // term id or starting position, and has nothing to read from at all.
+    //
+    // What arrives *after* the image is built is deliberately not asserted
+    // here. The restarted subscriber's driver does receive the stream — its
+    // `rcv-hwm` reaches the publisher's `snd-pos` — but the image is created at
+    // position 0 rather than at the position the `SETUP` carried, so it has
+    // never been readable. That is a separate defect on the receiving side, and
+    // it is recorded rather than fixed in this batch.
+    assert!(
+        images_of(&second, second_id) > 0,
+        "a subscriber that restarted asked for a `SETUP` and was given nothing, so it built \
+         no image.\nthe restarted subscriber sees:\n{view}\nrestarted driver's counters:\n\
+         {second_counters}\npublisher's counters:\n{publisher_counters}\n\
+         publisher's log:\n{log}"
+    );
+}
+
 /// A13: a stream with nothing left to send asks for nothing.
 ///
 /// A heartbeat carries no payload, so the position it reports is the position it

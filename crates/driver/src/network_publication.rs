@@ -867,6 +867,32 @@ impl NetworkPublication {
     /// The order is the reference's and each step is load-bearing: the sender's
     /// liveness first (an end-of-stream status message is a receiver *leaving*,
     /// so it removes rather than refreshes), then the flow control, then the
+    /// A receiver asked for a `SETUP` because it has no image for this session
+    /// (`aeron_network_publication_trigger_send_setup_frame`, `.h:245-271`).
+    ///
+    /// The flag is what makes this different from an ordinary status message:
+    /// the receiver is not reporting a position, it is asking to be told how
+    /// the stream starts. Setting `is_setup_elicited` re-opens the `SETUP` path
+    /// in [`NetworkPublication::send`] — `if !has_initial_connection ||
+    /// is_setup_elicited` (`aeron_network_publication.c:586`) — which a
+    /// publication that has already met one receiver has otherwise closed for
+    /// good. Without it a receiver that has restarted, or a second one that
+    /// arrives later, is never answered and builds no image.
+    ///
+    /// The reference also hands the status message and its source address to
+    /// the flow control strategy here (`on_trigger_send_setup`, `.h:255-259`).
+    /// This build has one strategy, `max`, whose implementation of that hook is
+    /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
+    /// with yet — the hook and the address it needs arrive with the strategy
+    /// that reads them, and `dispatch` does not carry a source address today.
+    pub fn trigger_send_setup_frame(&mut self) {
+        if self.is_end_of_stream {
+            return;
+        }
+
+        self.is_setup_elicited = true;
+    }
+
     /// connected state recomputed from both.
     pub fn on_status_message(
         &mut self,

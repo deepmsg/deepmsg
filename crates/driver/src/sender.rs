@@ -48,7 +48,7 @@ use crate::idle::Backoff;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
-    ErrorFrame, FrameHeader, NakFrame, StatusMessageFrame, frame_type, is_frame_valid,
+    ErrorFrame, FrameHeader, NakFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
@@ -469,14 +469,21 @@ impl SenderThread {
                     if let Some(publication) =
                         find_publication(publications, frame.stream_id, frame.session_id)
                     {
-                        publication.on_status_message(
-                            &frame,
-                            header.flags,
-                            &system,
-                            counters,
-                            regions,
-                            now_ns,
-                        );
+                        // `SEND_SETUP` is not a position report: it is a
+                        // receiver saying it has no image and wants the stream
+                        // described (`aeron_send_channel_endpoint.c:649-656`).
+                        if header.flags & header_flags::SM_SEND_SETUP != 0 {
+                            publication.trigger_send_setup_frame();
+                        } else {
+                            publication.on_status_message(
+                                &frame,
+                                header.flags,
+                                &system,
+                                counters,
+                                regions,
+                                now_ns,
+                            );
+                        }
                     }
                 }
             }
