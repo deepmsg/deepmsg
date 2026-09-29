@@ -497,6 +497,20 @@ impl IpcSubscriptions {
         }
     }
 
+    /// Whether a **network** subscription with this registration id exists
+    /// (`aeron_driver_conductor.c:641-648`, which walks
+    /// `network_subscriptions`).
+    ///
+    /// The distinction is the reference's and it matters here: a publication
+    /// naming a `response-correlation-id` is naming a subscription a responder
+    /// will send to over UDP, and an IPC subscription has no endpoint to send
+    /// anything to. A link with no endpoint is an IPC one.
+    pub fn has_network(&self, registration_id: i64) -> bool {
+        self.links
+            .iter()
+            .any(|link| link.endpoint_id.is_some() && link.registration_id == registration_id)
+    }
+
     /// Whether a subscription with this registration id exists, which is what
     /// decides between an acknowledgement and an error before the removal
     /// itself happens (`aeron_driver_conductor.c:5203-5266`).

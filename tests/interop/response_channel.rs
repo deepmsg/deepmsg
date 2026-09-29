@@ -24,7 +24,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
+use deepmsg_client::client::{Client, CommandError, DEFAULT_TIMEOUT};
 use deepmsg_driver::protocol::{RspSetupFrame, SetupFrame};
 use deepmsg_driver::sys::AddressFamily;
 use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
@@ -480,6 +480,57 @@ fn a_session_the_subscription_did_not_name_poisons_the_link() {
         !named.image,
         "and the one it did name is dropped rather than read (`:7094-7096`): {named:?}"
     );
+
+    drop(client);
+    let _ = own.stop();
+}
+
+/// ⑩: a publication that claims to answer a subscription this driver does not
+/// hold is refused, rather than created to answer nothing.
+///
+/// `aeron_driver_conductor.c:631-656`. The correlation id is a **registration
+/// id**, which never crosses the wire, so a driver that accepted one it does
+/// not hold would create a publication whose response half can never be found —
+/// and the client would wait for an answer to a question nobody was asked.
+///
+/// The positive half of this is the two tests above, which name a subscription
+/// this driver really holds and are created: a check that refused everything
+/// would fail them.
+#[test]
+fn a_publication_that_names_no_ones_subscription_is_refused() {
+    let Some(mut own) = OwnDriver::start("response-unknown-subscription") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    let nowhere = free_udp_port(91);
+    let error = client
+        .add_publication(
+            &format!("aeron:udp?endpoint=127.0.0.1:{nowhere}|response-correlation-id=424242"),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect_err("a correlation id no subscription holds is not a subscription");
+
+    match error {
+        CommandError::Driver { code, message } => {
+            assert_eq!(
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                code,
+                "an EINVAL reaches a client as the generic code (`:2326-2341`)"
+            );
+            assert_eq!(
+                "unable to find response subscription for response-correlation-id=424242",
+                message
+            );
+        }
+        other => panic!("the driver refuses it: {other:?}"),
+    }
 
     drop(client);
     let _ = own.stop();

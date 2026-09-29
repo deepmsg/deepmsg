@@ -111,6 +111,17 @@ pub enum AddError {
         /// The reference's message.
         message: String,
     },
+    /// A publication named a `response-correlation-id` that no network
+    /// subscription on this driver carries
+    /// (`aeron_driver_conductor.c:631-656`).
+    ///
+    /// The id is a **registration id**, which never crosses the wire: a
+    /// publication that names one nobody holds is one that could never be
+    /// answered.
+    ResponseSubscription {
+        /// The id it named.
+        correlation_id: i64,
+    },
     /// A publication's counters could not be allocated.
     NoCounterRecord,
     /// The native resource agent is not there to create the log buffer — its
@@ -137,6 +148,10 @@ impl std::fmt::Display for AddError {
             Self::Channel(error) => write!(f, "{error}"),
             Self::InvalidChannel(message) => f.write_str(message),
             Self::Endpoint { message, .. } => f.write_str(message),
+            Self::ResponseSubscription { correlation_id } => write!(
+                f,
+                "unable to find response subscription for response-correlation-id={correlation_id}"
+            ),
             Self::NoCounterRecord => f.write_str("could not allocate the publication's counters"),
             Self::AgentStopped => f.write_str("the native resource agent has stopped"),
         }
@@ -185,6 +200,7 @@ impl AddError {
             Self::Params(_)
             | Self::NoClientRecord
             | Self::Share(_)
+            | Self::ResponseSubscription { .. }
             | Self::NoCounterRecord
             | Self::AgentStopped => ERROR_CODE_GENERIC_ERROR,
         }

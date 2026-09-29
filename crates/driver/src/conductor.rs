@@ -1553,6 +1553,7 @@ impl Conductor {
                                         clients,
                                         send_endpoints,
                                         sender.proxy(),
+                                        subscriptions,
                                         now,
                                         &mut transmit,
                                     )

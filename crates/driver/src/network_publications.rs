@@ -33,8 +33,9 @@
 use std::io;
 use std::path::PathBuf;
 
+use crate::ipc_subscriptions::IpcSubscriptions;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
-use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
@@ -48,7 +49,7 @@ use crate::publication_params::{PublicationParams, PublicationParamsError};
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -202,6 +203,7 @@ impl NetworkPublications {
         clients: &mut Clients,
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
+        subscriptions: &IpcSubscriptions,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
@@ -216,6 +218,7 @@ impl NetworkPublications {
         let params = PublicationParams::resolve(&uri, config)?;
 
         validate_for_publication(&channel)?;
+        validate_response_subscription(&channel, &params, subscriptions)?;
 
         // The client is registered before anything else happens for this
         // command, exactly as the IPC path does it.
@@ -890,6 +893,44 @@ fn validate_for_publication(channel: &UdpChannel) -> Result<(), AddError> {
     }
 
     Ok(())
+}
+
+/// `aeron_driver_conductor_validate_response_subscription`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:631-656`).
+///
+/// A publication that is not on a response channel but names a
+/// `response-correlation-id` is claiming to answer a subscription, and the claim
+/// has to be about a subscription **on this driver**: the id is a registration
+/// id, which never crosses the wire, so a publication naming one nobody holds
+/// is one that could never be answered.
+///
+/// A publication that *is* on a response channel is exempt, and not because it
+/// is trusted more: its correlation id names a local *image*, and
+/// [`crate::network_publications`]' response counterpart —
+/// `find_response_publication_image` — is what checks it, later, when the image
+/// it names has to exist.
+///
+/// # Errors
+///
+/// [`AddError::ResponseSubscription`] for an id no network subscription holds.
+fn validate_response_subscription(
+    channel: &UdpChannel,
+    params: &PublicationParams,
+    subscriptions: &IpcSubscriptions,
+) -> Result<(), AddError> {
+    if channel.control_mode == ControlMode::Response
+        || params.response_correlation_id == layout::NULL_VALUE
+    {
+        return Ok(());
+    }
+
+    if subscriptions.has_network(params.response_correlation_id) {
+        return Ok(());
+    }
+
+    Err(AddError::ResponseSubscription {
+        correlation_id: params.response_correlation_id,
+    })
 }
 
 /// The socket buffer lengths an endpoint is opened with, from the driver's
