@@ -156,3 +156,77 @@ fn the_probe_refuses_arguments_that_leave_it_nothing_to_do() {
         "no arguments at all is a usage error"
     );
 }
+
+/// Three free ports at once, so that the three addresses below are three
+/// different ones — asking one at a time can hand the same port back twice.
+fn three_free_ports() -> (u16, u16, u16) {
+    let sockets: Vec<UdpSocket> = (0..3)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("a socket"))
+        .collect();
+    let ports: Vec<u16> = sockets
+        .iter()
+        .map(|socket| socket.local_addr().expect("a bound address").port())
+        .collect();
+
+    (ports[0], ports[1], ports[2])
+}
+
+/// The other direction: the reference client adds a **source** to its own
+/// subscription, on our driver (`aeron_subscription_async_add_destination`).
+///
+/// This is the receive side of a multi-destination channel, and the harder one:
+/// the receiver is the side that has to speak first, because a sender that does
+/// not know it exists will never describe its stream. The destination's channel
+/// names a `control=` for exactly that reason — it is what makes this driver
+/// open the conversation (and keep opening it).
+#[test]
+fn a_reference_client_adds_a_source_to_our_subscription() {
+    let Some(probe) = build_probe() else {
+        driver::announce_tool_skip("the reference client library");
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("destination-probe-subscribe") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let aeron_dir = own.aeron_dir().to_path_buf();
+    let _ = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let (channel_port, endpoint_port, control_port) = three_free_ports();
+    let channel = manual_channel(channel_port);
+    let destination =
+        format!("aeron:udp?endpoint=localhost:{endpoint_port}|control=localhost:{control_port}");
+
+    let output = Command::new(&probe)
+        .arg("-d")
+        .arg(&aeron_dir)
+        .arg("-c")
+        .arg(&channel)
+        .arg("-s")
+        .arg(STREAM_ID.to_string())
+        .arg("-D")
+        .arg(&destination)
+        .arg("-S")
+        .output()
+        .expect("the probe runs");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let log = own.log_tail(60);
+    let _ = own.stop();
+
+    assert!(
+        output.status.success(),
+        "the reference client could not add a source to its subscription on this driver.\n\
+         it said:\n{stdout}\n{stderr}\nour driver said:\n{log}"
+    );
+
+    assert!(
+        stdout.contains("SUBSCRIPTION") && stdout.contains("DESTINATION"),
+        "the subscription has to exist and the source has to be answered:\n{stdout}"
+    );
+}

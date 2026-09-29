@@ -23,7 +23,12 @@
  * `aeron_async_destination_get_registration_id` is documented as returning
  * "correlation_id sent to driver").
  *
- * Usage: -d <aeron dir> -c <channel> -s <stream id> -D <destination uri>
+ * `-S` asks for a **subscription** instead of a publication and adds the
+ * destination as a source to it (`aeron_subscription_async_add_destination`):
+ * the receive side of a multi-destination channel, where the receiver is the
+ * one that has to speak first.
+ *
+ * Usage: -d <aeron dir> -c <channel> -s <stream id> -D <destination uri> [-S]
  */
 
 #include <inttypes.h>
@@ -59,16 +64,19 @@ int main(int argc, char **argv)
     const char *channel = NULL;
     const char *destination_uri = NULL;
     int32_t stream_id = 0;
+    int as_subscription = 0;
     int option;
     int status = 1;
 
     aeron_context_t *context = NULL;
     aeron_t *aeron = NULL;
     aeron_async_add_publication_t *add_publication = NULL;
+    aeron_async_add_subscription_t *add_subscription = NULL;
     aeron_async_destination_t *add_destination = NULL;
     aeron_publication_t *publication = NULL;
+    aeron_subscription_t *subscription = NULL;
 
-    while ((option = getopt(argc, argv, "d:c:s:D:")) != -1)
+    while ((option = getopt(argc, argv, "d:c:s:D:S")) != -1)
     {
         switch (option)
         {
@@ -86,6 +94,10 @@ int main(int argc, char **argv)
 
             case 'D':
                 destination_uri = optarg;
+                break;
+
+            case 'S':
+                as_subscription = 1;
                 break;
 
             default:
@@ -124,46 +136,87 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (aeron_async_add_publication(&add_publication, aeron, channel, stream_id) < 0)
+    if (as_subscription)
     {
-        fprintf(stderr, "aeron_async_add_publication: %s\n", aeron_errmsg());
-        goto cleanup;
-    }
-
-    while (running && NULL == publication)
-    {
-        if (aeron_async_add_publication_poll(&publication, add_publication) < 0)
+        if (aeron_async_add_subscription(
+                &add_subscription, aeron, channel, stream_id, NULL, NULL, NULL, NULL) < 0)
         {
-            fprintf(stderr, "aeron_async_add_publication_poll: %s\n", aeron_errmsg());
+            fprintf(stderr, "aeron_async_add_subscription: %s\n", aeron_errmsg());
             goto cleanup;
         }
 
-        aeron_main_do_work(aeron);
+        while (running && NULL == subscription)
+        {
+            if (aeron_async_add_subscription_poll(&subscription, add_subscription) < 0)
+            {
+                fprintf(stderr, "aeron_async_add_subscription_poll: %s\n", aeron_errmsg());
+                goto cleanup;
+            }
+
+            aeron_main_do_work(aeron);
+        }
+
+        if (NULL == subscription)
+        {
+            fprintf(stderr, "the subscription never appeared\n");
+            goto cleanup;
+        }
+
+        printf("SUBSCRIPTION\n");
+        fflush(stdout);
+
+        if (aeron_subscription_async_add_destination(
+                &add_destination, aeron, subscription, destination_uri) < 0)
+        {
+            fprintf(stderr, "aeron_subscription_async_add_destination: %s\n", aeron_errmsg());
+            goto cleanup;
+        }
     }
-
-    if (NULL == publication)
+    else
     {
-        fprintf(stderr, "the publication never appeared\n");
-        goto cleanup;
-    }
+        if (aeron_async_add_publication(&add_publication, aeron, channel, stream_id) < 0)
+        {
+            fprintf(stderr, "aeron_async_add_publication: %s\n", aeron_errmsg());
+            goto cleanup;
+        }
 
-    printf("PUBLICATION %" PRId32 "\n", aeron_publication_session_id(publication));
-    fflush(stdout);
+        while (running && NULL == publication)
+        {
+            if (aeron_async_add_publication_poll(&publication, add_publication) < 0)
+            {
+                fprintf(stderr, "aeron_async_add_publication_poll: %s\n", aeron_errmsg());
+                goto cleanup;
+            }
 
-    if (aeron_publication_async_add_destination(&add_destination, aeron, publication, destination_uri) < 0)
-    {
-        fprintf(stderr, "aeron_publication_async_add_destination: %s\n", aeron_errmsg());
-        goto cleanup;
+            aeron_main_do_work(aeron);
+        }
+
+        if (NULL == publication)
+        {
+            fprintf(stderr, "the publication never appeared\n");
+            goto cleanup;
+        }
+
+        printf("PUBLICATION %" PRId32 "\n", aeron_publication_session_id(publication));
+        fflush(stdout);
+
+        if (aeron_publication_async_add_destination(&add_destination, aeron, publication, destination_uri) < 0)
+        {
+            fprintf(stderr, "aeron_publication_async_add_destination: %s\n", aeron_errmsg());
+            goto cleanup;
+        }
     }
 
     int polled = 0;
     while (running && 0 == polled)
     {
-        polled = aeron_publication_async_destination_poll(add_destination);
+        polled = as_subscription
+            ? aeron_subscription_async_destination_poll(add_destination)
+            : aeron_publication_async_destination_poll(add_destination);
 
         if (polled < 0)
         {
-            fprintf(stderr, "aeron_publication_async_destination_poll: %s\n", aeron_errmsg());
+            fprintf(stderr, "aeron_async_destination_poll: %s\n", aeron_errmsg());
             goto cleanup;
         }
 
