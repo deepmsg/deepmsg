@@ -81,6 +81,67 @@ impl std::fmt::Display for ReceiveEndpointError {
 impl std::error::Error for ReceiveEndpointError {}
 
 /// A receive channel endpoint and its socket.
+impl ReceiveDestination {
+    /// The address this destination is actually bound to, as a counter a client
+    /// can find by the channel status it belongs to
+    /// (`rcv-local-sockaddr`, type 14).
+    pub const fn local_sockaddr_counter_id(&self) -> i32 {
+        self.local_sockaddr_counter_id
+    }
+}
+
+/// Allocate the counter that says where a destination is **actually** bound
+/// (`aeron_receive_destination.c:88-105`).
+///
+/// The address comes from the kernel, not from the channel: a destination is
+/// allowed to name port zero — a multi-destination one does — and then this
+/// counter's key is the only place the port that was chosen can be read from.
+/// That is what `ReplayMerge` reads when it has to resolve a replay port
+/// (`LocalSocketAddressStatus.findAddress`).
+///
+/// The value is the endpoint's state, as the channel status's is: the counter
+/// being there is the news, and the reader reads the key.
+///
+/// # Errors
+///
+/// `None` when the socket has no address to report or the manager has no room.
+/// Nothing is left behind.
+fn destination_local_sockaddr_counter(
+    transport: &dyn Transport,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    registration_id: i64,
+    channel_status_counter_id: i32,
+    now_ms: i64,
+) -> Option<i32> {
+    let local_sockaddr =
+        crate::udp_channel::format_source_identity(transport.local_address().ok()?).ok()?;
+
+    let counter_id = counter_position::allocate_local_sockaddr_counter(
+        counters,
+        regions,
+        counter_position::RECEIVE_LOCAL_SOCKADDR_NAME,
+        registration_id,
+        channel_status_counter_id,
+        &local_sockaddr,
+        now_ms,
+    )?;
+
+    if counters
+        .set_value(
+            regions,
+            counter_id,
+            counter_position::channel_status::ACTIVE,
+        )
+        .is_none()
+    {
+        counters.free(regions, counter_id, now_ms);
+        return None;
+    }
+
+    Some(counter_id)
+}
+
 /// One place a receive endpoint reads from
 /// (`aeron_receive_destination_t`, `media/aeron_receive_destination.h:26-44`).
 ///
@@ -100,6 +161,9 @@ pub struct ReceiveDestination {
     pub channel: UdpChannel,
     /// The socket it reads from and answers through.
     transport: Box<dyn Transport>,
+    /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
+    /// bound, which is not what the channel said when it named port zero.
+    local_sockaddr_counter_id: i32,
 }
 
 pub struct ReceiveChannelEndpoint {
@@ -174,10 +238,24 @@ impl ReceiveChannelEndpoint {
                 }
             };
 
+        let Some(local_sockaddr_counter_id) = destination_local_sockaddr_counter(
+            &transport,
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        ) else {
+            // The counter was allocated for an endpoint that will not exist.
+            counters.free(regions, channel_status_counter_id, now_ms);
+            return Err(ReceiveEndpointError::NoCounter);
+        };
+
         Ok(Self {
             destinations: vec![ReceiveDestination {
                 channel: channel.clone(),
                 transport: Box::new(transport),
+                local_sockaddr_counter_id,
             }],
             channel,
             channel_status_counter_id,
@@ -218,10 +296,23 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
+        let Some(local_sockaddr_counter_id) = destination_local_sockaddr_counter(
+            &*transport,
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        ) else {
+            counters.free(regions, channel_status_counter_id, now_ms);
+            return Err(ReceiveEndpointError::NoCounter);
+        };
+
         Ok(Self {
             destinations: vec![ReceiveDestination {
                 channel: channel.clone(),
                 transport,
+                local_sockaddr_counter_id,
             }],
             channel,
             channel_status_counter_id,
