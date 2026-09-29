@@ -49,7 +49,7 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
     ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE, ERROR_CODE_STORAGE_SPACE,
     ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
     ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
@@ -57,9 +57,10 @@ use deepmsg_cnc::command::{
     ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
     ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
     decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
-    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
-    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
-    encode_subscription_ready, encode_unavailable_image,
+    decode_destination_by_id_command, decode_destination_command, decode_remove_counter,
+    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
+    encode_counter_update, encode_error, encode_operation_succeeded, encode_subscription_ready,
+    encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -85,6 +86,9 @@ use crate::receiver::{Receiver, ReceiverEvent};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
+use crate::udp_channel::{
+    UdpChannel, UdpChannelError, validate_destination_prefix, validate_send_destination_uri,
+};
 
 /// At most one command per duty cycle
 /// (`aeron-driver/src/main/c/aeron_driver_context.h:53`).
@@ -1454,6 +1458,11 @@ impl Conductor {
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
         let mut pending_publication_releases: Vec<i64> = Vec::new();
+        // The destination commands, for the same reason: the *sender* is what
+        // puts a destination on a tracker, and the drain's closure cannot reach
+        // it. The payloads are kept verbatim, so that what is decoded below is
+        // what the client wrote.
+        let mut pending_destination_commands: Vec<(i32, Vec<u8>)> = Vec::new();
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -1825,6 +1834,12 @@ impl Conductor {
                     }
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
+                command @ (Command::AddDestination
+                | Command::RemoveDestination
+                | Command::RemoveDestinationById) => {
+                    pending_destination_commands.push((type_id, payload.to_vec()));
+                    let _ = command;
+                }
                 command => {
                     if let Command::Unknown(unknown_type_id) = command {
                         *unknown += 1;
@@ -1869,6 +1884,135 @@ impl Conductor {
                 send_endpoints.detach_publication(record.endpoint_id);
                 released += 1;
             }
+        }
+
+        // The destination commands.
+        //
+        // `REMOVE_DESTINATION_BY_ID` first, because it is the one command in the
+        // family whose failures the reference answers **nothing** to: it calls
+        // its handler without taking the result (`:3188-3200`), so the error for
+        // a publication it cannot find (`:5562-5578`) never reaches the
+        // `result < 0` that would send an `ON_ERROR` (`:3222-3225`). The client
+        // waits and times out. Q8 of the P1-5 plan decided to reproduce that
+        // rather than improve on it, so a lookup that finds nothing here answers
+        // nothing either — and `docs/compat.md` gets a line for it.
+        for (type_id, payload) in pending_destination_commands {
+            let command = Command::from_type_id(type_id);
+
+            if Command::RemoveDestinationById == command {
+                let Some(request) = decode_destination_by_id_command(&payload) else {
+                    malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    continue;
+                };
+
+                let Some(record) = network_publications.find(request.resource_registration_id)
+                else {
+                    continue;
+                };
+
+                let _ = sender.proxy().remove_destination_by_id(
+                    record.endpoint_id,
+                    request.destination_registration_id,
+                );
+
+                transmit.operation_succeeded(request.correlation_id);
+                continue;
+            }
+
+            let Some(request) = decode_destination_command(&payload) else {
+                malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                continue;
+            };
+
+            let Some(record) = network_publications.find(request.registration_id) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_UNKNOWN_PUBLICATION,
+                    format!(
+                        "unknown publication registration_id={}",
+                        request.registration_id
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            };
+
+            if let Err(error) = validate_destination_prefix(request.channel, "send") {
+                transmit.error(
+                    request.correlation_id,
+                    error.error_code(),
+                    error.to_string().as_bytes(),
+                );
+                continue;
+            }
+
+            // A destination whose name does not resolve is **kept** and the
+            // command still succeeds: the reference sets the address to
+            // `AF_UNSPEC` and falls through on purpose (`:5337-5343`), which is
+            // `None` here. Q9 of the P1-5 plan decided to reproduce it, with the
+            // consequence recorded in `compat.md:281` — this build has no
+            // re-resolution, so that destination never recovers.
+            let address = match validate_send_destination_uri(request.channel) {
+                Ok(address) => Some(address),
+                Err(UdpChannelError::Resolution(_)) => None,
+                Err(error) => {
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        error.to_string().as_bytes(),
+                    );
+                    continue;
+                }
+            };
+
+            let Ok(uri) = ChannelUri::parse(request.channel) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_INVALID_CHANNEL,
+                    b"incorrect URI format for destination",
+                );
+                continue;
+            };
+
+            let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_INVALID_CHANNEL,
+                    b"incorrect URI format for destination",
+                );
+                continue;
+            };
+
+            let registration_id = request.correlation_id;
+            let outcome = if Command::AddDestination == command {
+                sender.proxy().add_destination(
+                    record.endpoint_id,
+                    Box::new(channel),
+                    address,
+                    registration_id,
+                )
+            } else {
+                // A removal names a destination by its channel, and the channel
+                // that identifies one is the one it was added with — so the
+                // address is what the tracker matches on (`:311-350`).
+                address.map_or(Ok(()), |address| {
+                    sender
+                        .proxy()
+                        .remove_destination(record.endpoint_id, address)
+                })
+            };
+
+            if outcome.is_err() {
+                // The sender has gone; the client is answered anyway, because
+                // the reference answers before the sender applies anything
+                // (`:5366-5367`) and a client that is told nothing hangs.
+                transmit.record_fault(
+                    ERROR_CODE_GENERIC_ERROR,
+                    format!("destination command for publication {registration_id}"),
+                );
+            }
+
+            transmit.operation_succeeded(request.correlation_id);
         }
 
         drained + released
@@ -2645,12 +2789,13 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x07` is ADD_DESTINATION:
-        // still unimplemented (the network transport is P1-4), which is what a
-        // test wants from a stand-in — a command whose handling cannot start
-        // happening.
-        send(&conductor, 0x07, b"first");
-        send(&conductor, 0x07, b"second");
+        // pass read without any byte arithmetic. `0x10` is REJECT_IMAGE: still
+        // unimplemented, which is what a test wants from a stand-in — a command
+        // whose handling cannot start happening. (`0x07` used to be the
+        // stand-in until ADD_DESTINATION was implemented, which is exactly the
+        // way a stand-in like this stops being one.)
+        send(&conductor, 0x10, b"first");
+        send(&conductor, 0x10, b"second");
 
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
@@ -2673,16 +2818,88 @@ mod tests {
         );
     }
 
+    /// `ADD_DESTINATION` reaches a handler now, and what it answers is the
+    /// reference's own unknown-publication error (`:5411-5420`).
+    ///
+    /// The publication named does not exist, which is the point: the command
+    /// was decoded, looked up and answered, where before it was counted and
+    /// named. A test that only asserted the counter would pass on a handler
+    /// that answered nothing.
+    #[test]
+    fn an_add_destination_is_answered_rather_than_left_unhandled() {
+        use deepmsg_cnc::command::{ADD_DESTINATION_TYPE_ID, DestinationCommand, ON_ERROR_TYPE_ID};
+
+        let (temp, mut conductor) = running(TerminationPolicy::Deny);
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 4242,
+            channel: "aeron:udp?endpoint=127.0.0.1:40456",
+        };
+        let mut payload = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut payload));
+
+        send(&conductor, ADD_DESTINATION_TYPE_ID, &payload);
+        conductor.do_work();
+
+        assert_eq!(0, conductor.unhandled_commands(), "it is handled now");
+
+        let responses = drain(&cnc, &mut receiver);
+        assert_eq!(1, responses.len(), "one answer, and it is an error");
+        assert_eq!(ON_ERROR_TYPE_ID, responses[0].0);
+        assert_eq!(
+            9i64.to_le_bytes(),
+            responses[0].1[..8],
+            "answered against the command that asked"
+        );
+    }
+
+    /// `REMOVE_DESTINATION_BY_ID` is the one command in the family whose
+    /// failures the reference answers **nothing** to: it calls its handler
+    /// without taking the result (`:3188-3200`), so the error for a publication
+    /// it cannot find never reaches the `result < 0` that would send an
+    /// `ON_ERROR` (`:3222-3225`). Q8 of the P1-5 plan decided to reproduce that
+    /// rather than improve on it, so a client that names a publication the
+    /// driver does not have waits, and times out.
+    #[test]
+    fn a_remove_destination_by_id_that_finds_nothing_answers_nothing() {
+        use deepmsg_cnc::command::{DestinationByIdCommand, REMOVE_DESTINATION_BY_ID_TYPE_ID};
+
+        let (temp, mut conductor) = running(TerminationPolicy::Deny);
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        let command = DestinationByIdCommand {
+            client_id: 7,
+            correlation_id: 9,
+            resource_registration_id: 4242,
+            destination_registration_id: 43,
+        };
+        let mut payload = vec![0u8; DestinationByIdCommand::ENCODED_LENGTH];
+        assert!(command.encode_into(&mut payload));
+
+        send(&conductor, REMOVE_DESTINATION_BY_ID_TYPE_ID, &payload);
+        conductor.do_work();
+
+        assert_eq!(0, conductor.unhandled_commands(), "it is handled now");
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "not even the error — the reference sends none, and the client waits"
+        );
+        assert!(conductor.is_running(), "and nothing else happened");
+    }
+
     #[test]
     fn an_unimplemented_command_is_counted_and_named() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x07, b"aeron:ipc|1"); // ADD_DESTINATION
+        send(&conductor, 0x10, b"aeron:ipc|1"); // REJECT_IMAGE
         conductor.do_work();
 
         assert_eq!(1, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddDestination), conductor.last_unhandled());
+        assert_eq!(Some(Command::RejectImage), conductor.last_unhandled());
         assert!(conductor.is_running(), "and nothing else happened");
     }
 
@@ -2795,7 +3012,7 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x07, b"channel");
+        send(&conductor, 0x10, b"channel");
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands());
 

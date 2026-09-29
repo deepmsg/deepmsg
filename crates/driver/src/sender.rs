@@ -54,6 +54,7 @@ use crate::protocol::{
 };
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
+use crate::udp_channel::UdpChannel;
 use deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH;
 
 /// How many datagrams one poll may read
@@ -85,8 +86,57 @@ pub enum SenderCommand {
         /// Which one.
         id: u64,
     },
+    /// Put a destination on an endpoint's tracker
+    /// (`aeron_driver_sender_on_add_destination`,
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:350-363`).
+    ///
+    /// The conductor answers the *client* before this runs — the reference does
+    /// (`aeron_driver_conductor.c:5366-5367`) — so this is the sender catching
+    /// up, not a step anyone is waiting on.
+    AddDestination {
+        /// The endpoint whose tracker it goes on.
+        endpoint_id: u64,
+        /// The destination's channel, as the client named it. Boxed for the
+        /// same reason [`SenderCommand::AddEndpoint`]'s endpoint is: a channel
+        /// is much larger than the rest of these commands, and one variant
+        /// would otherwise set the size of every one.
+        channel: Box<UdpChannel>,
+        /// Where it resolved to; [`None`] is an address that did not resolve,
+        /// which is kept and skipped rather than refused (`:5337-5343`).
+        address: Option<SocketAddr>,
+        /// The id the client removes it by.
+        registration_id: i64,
+    },
+    /// Take a destination off an endpoint's tracker by the address it was added
+    /// with (`aeron_driver_sender_on_remove_destination`, `:365-385`).
+    RemoveDestination {
+        /// The endpoint whose tracker it comes off.
+        endpoint_id: u64,
+        /// Which destination.
+        address: SocketAddr,
+    },
+    /// The same, by the id the client was given.
+    RemoveDestinationById {
+        /// The endpoint whose tracker it comes off.
+        endpoint_id: u64,
+        /// Which destination.
+        registration_id: i64,
+    },
     /// Stop the thread.
     Stop,
+}
+
+impl SenderCommand {
+    /// The endpoint a destination command names, or [`None`] for the commands
+    /// that are not about destinations.
+    const fn destination_endpoint_id(&self) -> Option<u64> {
+        match self {
+            Self::AddDestination { endpoint_id, .. }
+            | Self::RemoveDestination { endpoint_id, .. }
+            | Self::RemoveDestinationById { endpoint_id, .. } => Some(*endpoint_id),
+            _ => None,
+        }
+    }
 }
 
 /// What the sender tells the conductor.
@@ -161,6 +211,60 @@ impl SenderProxy {
     pub fn remove_endpoint(&self, id: u64) -> io::Result<()> {
         self.commands
             .send(SenderCommand::RemoveEndpoint { id })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to put a destination on an endpoint's tracker.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_destination(
+        &self,
+        endpoint_id: u64,
+        channel: Box<UdpChannel>,
+        address: Option<SocketAddr>,
+        registration_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::AddDestination {
+                endpoint_id,
+                channel,
+                address,
+                registration_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to take a destination off an endpoint's tracker.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination(&self, endpoint_id: u64, address: SocketAddr) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveDestination {
+                endpoint_id,
+                address,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// The same, by the id the client was given.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination_by_id(
+        &self,
+        endpoint_id: u64,
+        registration_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveDestinationById {
+                endpoint_id,
+                registration_id,
+            })
             .map_err(|_| stopped())
     }
 
@@ -268,6 +372,13 @@ struct SenderThread {
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
+    /// Destination changes waiting for a pass that has the counters.
+    ///
+    /// The command loop has none — they arrive with [`SenderThread::do_work`] —
+    /// and a tracker writes `mdc-num-dest` whenever its table changes. The
+    /// reference applies these at the top of its send pass for the same reason
+    /// (`aeron_driver_sender.c:196-200`).
+    pending_destinations: Vec<SenderCommand>,
     last_cycle_ns: i64,
     idle: Backoff,
 }
@@ -289,6 +400,7 @@ impl SenderThread {
             publications: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
+            pending_destinations: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
             idle: Backoff::new(),
         }
@@ -317,6 +429,11 @@ impl SenderThread {
                     SenderCommand::RemoveEndpoint { id } => {
                         self.endpoints.retain(|(endpoint_id, _)| *endpoint_id != id);
                         let _ = self.events.send(SenderEvent::EndpointRemoved { id });
+                    }
+                    command @ (SenderCommand::AddDestination { .. }
+                    | SenderCommand::RemoveDestination { .. }
+                    | SenderCommand::RemoveDestinationById { .. }) => {
+                        self.pending_destinations.push(command);
                     }
                     SenderCommand::Stop => stop = true,
                 }
@@ -347,6 +464,15 @@ impl SenderThread {
         let Some(regions) = cnc.counter_regions() else {
             return 0;
         };
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+        Self::apply_destinations(
+            &mut self.endpoints,
+            &mut self.pending_destinations,
+            &self.counters,
+            &regions,
+            now_ns,
+        );
+
         let system = System::new(&self.counters, &regions);
 
         let mut work = Self::receive_control_frames(
@@ -376,6 +502,62 @@ impl SenderThread {
             &mut self.last_cycle_ns,
         );
         work
+    }
+
+    /// Apply the destination changes the conductor asked for
+    /// (`aeron_driver_sender_do_send`, `:196-200`).
+    ///
+    /// An endpoint that has gone away, or one whose channel is not
+    /// multi-destination, is skipped: the client has already been answered, and
+    /// a destination is not a thing to fail a pass over.
+    fn apply_destinations(
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        pending: &mut Vec<SenderCommand>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) {
+        for command in std::mem::take(pending) {
+            let Some(endpoint_id) = command.destination_endpoint_id() else {
+                continue;
+            };
+
+            let Some((_, endpoint)) = endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+            else {
+                continue;
+            };
+
+            let Some(tracker) = endpoint.destination_tracker_mut() else {
+                continue;
+            };
+
+            match command {
+                SenderCommand::AddDestination {
+                    channel,
+                    address,
+                    registration_id,
+                    ..
+                } => {
+                    tracker.manual_add(
+                        counters,
+                        regions,
+                        now_ns,
+                        *channel,
+                        address,
+                        registration_id,
+                    );
+                }
+                SenderCommand::RemoveDestination { address, .. } => {
+                    tracker.remove(counters, regions, &address);
+                }
+                SenderCommand::RemoveDestinationById {
+                    registration_id, ..
+                } => {
+                    tracker.remove_by_id(counters, regions, registration_id);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Read everything the endpoints' sockets hold and hand each frame to the
