@@ -91,7 +91,7 @@ impl ReceiveDestination {
     /// [`ReceiveEndpointError::Socket`] when the socket cannot be opened or
     /// bound, [`ReceiveEndpointError::NoCounter`] when the manager has no room
     /// for the counter that holds its address.
-    fn open(
+    pub fn open(
         channel: UdpChannel,
         params: &TransportParams,
         counters: &mut CounterManager,

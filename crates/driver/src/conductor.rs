@@ -78,6 +78,7 @@ use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::media::receive_endpoint::ReceiveDestination;
 use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
@@ -1923,19 +1924,111 @@ impl Conductor {
                     continue;
                 };
 
-                let not_served = if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
-                    "aeron:ipc destinations are not served by this driver"
-                } else if request.channel.starts_with(SPY_PREFIX.as_bytes()) {
-                    "aeron-spy: destinations are not served by this driver"
-                } else {
-                    "network destinations are not served by this driver yet"
+                if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_NOT_SUPPORTED,
+                        b"aeron:ipc destinations are not served by this driver",
+                    );
+                    continue;
+                }
+
+                if request.channel.starts_with(SPY_PREFIX.as_bytes()) {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_NOT_SUPPORTED,
+                        b"aeron-spy: destinations are not served by this driver",
+                    );
+                    continue;
+                }
+
+                // The network branch. A destination is added to the
+                // **subscription** the client named — that is what its
+                // registration id is — and through it to the endpoint that
+                // subscription reads on (`aeron_driver_conductor.c:5903-5919`).
+                let Some(link) = subscriptions.find(request.registration_id) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                        b"unknown subscription",
+                    );
+                    continue;
                 };
 
-                transmit.error(
-                    request.correlation_id,
-                    ERROR_CODE_NOT_SUPPORTED,
-                    not_served.as_bytes(),
-                );
+                let Some(endpoint_id) = link.endpoint_id else {
+                    // An IPC subscription has no socket, so there is nothing to
+                    // add a destination to. The triage above catches an
+                    // `aeron:ipc` destination before this; a link with no
+                    // endpoint here is an IPC subscription named by a network
+                    // destination, which names a channel it does not have.
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_NOT_SUPPORTED,
+                        b"an IPC subscription has no destination",
+                    );
+                    continue;
+                };
+
+                let Ok(uri) = ChannelUri::parse(request.channel) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_INVALID_CHANNEL,
+                        b"incorrect URI format for destination",
+                    );
+                    continue;
+                };
+
+                let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_INVALID_CHANNEL,
+                        b"incorrect URI format for destination",
+                    );
+                    continue;
+                };
+
+                if Command::AddReceiveDestination == command {
+                    let Some(entry) = receive_endpoints.get(endpoint_id) else {
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            b"the subscription's endpoint is gone",
+                        );
+                        continue;
+                    };
+                    let channel_status_counter_id = entry.channel_status_counter_id;
+
+                    let params = ReceiveChannelEndpoints::transport_params(config, &channel);
+                    let destination = match ReceiveDestination::open(
+                        channel,
+                        &params,
+                        counters,
+                        &counter_regions,
+                        request.registration_id,
+                        channel_status_counter_id,
+                        now_ms,
+                    ) {
+                        Ok(destination) => destination,
+                        Err(error) => {
+                            transmit.error(
+                                request.correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                error.to_string().as_bytes(),
+                            );
+                            continue;
+                        }
+                    };
+
+                    let _ = receiver
+                        .proxy()
+                        .add_destination(endpoint_id, Box::new(destination));
+                } else {
+                    let _ = receiver
+                        .proxy()
+                        .remove_destination(endpoint_id, Box::new(channel));
+                }
+
+                transmit.operation_succeeded(request.correlation_id);
                 continue;
             }
 
@@ -2902,11 +2995,12 @@ mod tests {
     /// unanswered, because a client told nothing waits out its timeout and
     /// neither of these is a command this driver will get to later.
     ///
-    /// The network branch lands on the same refusal **for now**. What it does
-    /// in the reference is add a destination to a receive endpoint, which is
-    /// the commit after this one, so this test records a temporary state and
-    /// will change when that lands — written down as what it is rather than as
-    /// the reference's behaviour.
+    /// The network branch is **served**: `ADD_RCV_DESTINATION` names a
+    /// subscription, and a destination is added to that subscription's receive
+    /// endpoint. The registration id here names no subscription, so the answer
+    /// is the reference's, and that is what this covers — the branch being
+    /// reached rather than refused. What a destination does once it is attached
+    /// is `media::receive_endpoint`'s tests.
     #[test]
     fn a_receive_destination_is_refused_by_the_prefix_it_names() {
         use deepmsg_cnc::command::{
@@ -2922,10 +3016,10 @@ mod tests {
                 "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
                 "aeron-spy: destinations are not served by this driver",
             ),
-            (
-                "aeron:udp?endpoint=127.0.0.1:40456",
-                "network destinations are not served by this driver yet",
-            ),
+            // The network branch is served now: what it does with a
+            // subscription that does not exist is the reference's own
+            // unknown-subscription error (`:5903-5919` reaches the link first).
+            ("aeron:udp?endpoint=127.0.0.1:40456", "unknown subscription"),
         ];
 
         for (channel, expected) in channels {

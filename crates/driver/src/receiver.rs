@@ -36,11 +36,13 @@ use crate::idle::Backoff;
 
 use crate::media::dispatcher::Interest;
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
+use crate::media::receive_endpoint::ReceiveDestination;
 use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
 use crate::publication_image::PublicationImage;
 use crate::subscribable::TetherablePosition;
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
+use crate::udp_channel::UdpChannel;
 
 /// How many datagrams one poll may read
 /// (`AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX`,
@@ -109,6 +111,28 @@ pub enum ReceiverCommand {
         registration_id: i64,
         /// The reader's counter.
         counter_id: i32,
+    },
+    /// Attach a destination a client added
+    /// (`aeron_driver_receiver_on_add_destination`, `:442-497`).
+    ///
+    /// The destination arrives **built** — its socket open, the counter holding
+    /// its address allocated — because the conductor is what has a counter
+    /// manager (`aeron_driver_conductor.c:5903-5919`). This is the same shape as
+    /// [`ReceiverCommand::AddEndpoint`], and for the same reason.
+    AddDestination {
+        /// Which endpoint reads from it.
+        endpoint_id: u64,
+        /// The destination itself.
+        destination: Box<ReceiveDestination>,
+    },
+    /// Take a destination off (`aeron_driver_receiver_on_remove_destination`).
+    RemoveDestination {
+        /// Which endpoint read from it.
+        endpoint_id: u64,
+        /// Which destination, by the channel it was added with — the reference
+        /// compares two by `aeron_udp_channel_equals`
+        /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+        channel: Box<UdpChannel>,
     },
     /// Stop the thread.
     Stop,
@@ -182,6 +206,38 @@ impl ReceiverProxy {
     pub fn add_endpoint(&self, id: u64, endpoint: Box<ReceiveChannelEndpoint>) -> io::Result<()> {
         self.commands
             .send(ReceiverCommand::AddEndpoint { id, endpoint })
+            .map_err(|_| stopped())
+    }
+
+    /// Hand the receiver a destination to start reading from.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_destination(
+        &self,
+        endpoint_id: u64,
+        destination: Box<ReceiveDestination>,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::AddDestination {
+                endpoint_id,
+                destination,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the receiver to stop reading from a destination.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination(&self, endpoint_id: u64, channel: Box<UdpChannel>) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RemoveDestination {
+                endpoint_id,
+                channel,
+            })
             .map_err(|_| stopped())
     }
 
@@ -463,6 +519,30 @@ impl ReceiverThread {
                 match command {
                     ReceiverCommand::AddEndpoint { id, endpoint } => {
                         self.endpoints.push((id, endpoint));
+                    }
+                    ReceiverCommand::AddDestination {
+                        endpoint_id,
+                        destination,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            endpoint.add_destination(*destination);
+                        }
+                    }
+                    ReceiverCommand::RemoveDestination {
+                        endpoint_id,
+                        channel,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            // The counter the destination held is not freed
+                            // here: the conductor allocated it, and giving a
+                            // counter back is the conductor's to do — the
+                            // receiver only stops reading.
+                            let _ = endpoint.remove_destination(&channel);
+                        }
                     }
                     ReceiverCommand::AddSubscription {
                         endpoint_id,

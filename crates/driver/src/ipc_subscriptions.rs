@@ -108,11 +108,16 @@ pub struct SubscriptionLinkEntry {
 /// `aeron-driver/src/main/c/aeron_driver_conductor.h:120-162`).
 ///
 /// The reference's struct is wider than this and most of the difference is
-/// network: an endpoint, a spy channel, a setup status and the group
-/// consideration are all about a transport that has to be *built* before it can
-/// be read from. An IPC subscription has nothing to set up — the log buffer it
-/// reads already exists — which is why this is the flags, the identity and the
-/// readers.
+/// network: a spy channel, a setup status and the group consideration are all
+/// about a transport that has to be *built* before it can be read from. An IPC
+/// subscription has nothing to set up — the log buffer it reads already exists
+/// — which is why this is the flags, the identity, the readers and, for a
+/// network subscription, [`SubscriptionLink::endpoint_id`].
+///
+/// The endpoint was left out until something needed it. `ADD_RCV_DESTINATION`
+/// is what needs it: a client adds a source to **a subscription**, and what a
+/// destination is added to is that subscription's receive endpoint
+/// (`aeron_driver_conductor.c:5903-5919`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionLink {
     /// The client's correlation id for the `ADD_SUBSCRIPTION`.
@@ -137,6 +142,9 @@ pub struct SubscriptionLink {
     pub is_reliable: bool,
     /// Whether its log buffers are sparse. No effect on IPC, likewise.
     pub is_sparse: bool,
+    /// The receive endpoint this subscription reads through, or [`None`] for an
+    /// IPC one — which has no socket, and so no destinations to add to it.
+    pub endpoint_id: Option<u64>,
     /// What it reads: one entry per publication it was matched with.
     pub subscribables: Vec<SubscriptionLinkEntry>,
 }
@@ -280,6 +288,20 @@ impl IpcSubscriptions {
         &self.links
     }
 
+    /// The subscription a client holds by the id it was answered with, which is
+    /// what `ADD_RCV_DESTINATION` names
+    /// (`aeron_driver_conductor_find_subscription_by_registration_id`).
+    ///
+    /// A destination is added to **a subscription**, not to a channel or an
+    /// endpoint: the client holds the subscription's registration id, and the
+    /// endpoint is what that subscription happens to read through
+    /// (`aeron_driver_conductor.c:5903-5919`).
+    pub fn find(&self, registration_id: i64) -> Option<&SubscriptionLink> {
+        self.links
+            .iter()
+            .find(|link| link.registration_id == registration_id)
+    }
+
     /// How many publications this subscription reads.
     pub fn images(&self) -> usize {
         self.links.iter().map(|link| link.subscribables.len()).sum()
@@ -338,6 +360,7 @@ impl IpcSubscriptions {
             is_response: params.is_response,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
+            endpoint_id: None,
             subscribables: Vec::new(),
         };
 
@@ -605,6 +628,7 @@ impl IpcSubscriptions {
             is_response: params.is_response,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
+            endpoint_id: Some(endpoint_id),
             subscribables: Vec::new(),
         };
 
@@ -1042,6 +1066,7 @@ mod tests {
             is_response,
             is_reliable: true,
             is_sparse: true,
+            endpoint_id: None,
             subscribables: Vec::new(),
         }
     }
