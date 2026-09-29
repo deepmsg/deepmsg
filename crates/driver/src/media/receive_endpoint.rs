@@ -81,11 +81,38 @@ impl std::fmt::Display for ReceiveEndpointError {
 impl std::error::Error for ReceiveEndpointError {}
 
 /// A receive channel endpoint and its socket.
-pub struct ReceiveChannelEndpoint {
-    /// The channel it was created for.
+/// One place a receive endpoint reads from
+/// (`aeron_receive_destination_t`, `media/aeron_receive_destination.h:26-44`).
+///
+/// The reference gives every destination **its own socket** (`transport`,
+/// `:34`) and its own channel, and a receive endpoint holds a list of them. A
+/// unicast channel has exactly one — the endpoint it named — and a
+/// multi-destination channel starts with none and gains them as clients add
+/// them (`aeron_driver_conductor.c:2099-2114`).
+///
+/// The reference's entry also carries the control address it answers through,
+/// whether the channel named one, and when something was last heard from it.
+/// None of those are here yet: nothing in this build reads them, and a field
+/// nothing writes is not a fact about the wire. They arrive with the
+/// destinations that can differ from one another.
+pub struct ReceiveDestination {
+    /// The channel this destination is for.
     pub channel: UdpChannel,
     /// The socket it reads from and answers through.
     transport: Box<dyn Transport>,
+}
+
+pub struct ReceiveChannelEndpoint {
+    /// The channel it was created for.
+    pub channel: UdpChannel,
+    /// Where this endpoint reads from, one entry per destination
+    /// (`destinations`, `aeron_receive_destination.h:26-44`).
+    ///
+    /// A unicast channel has one — the endpoint it named — and every path below
+    /// uses it. A multi-destination channel starts with none and gains them as
+    /// clients add them (`aeron_driver_conductor.c:2099-2114`), which is why the
+    /// callers handle the empty case rather than assuming a destination.
+    destinations: Vec<ReceiveDestination>,
     /// The `rcv-channel` counter, whose value is its state.
     channel_status_counter_id: i32,
     /// Which receiver this endpoint is, to a publisher that has several
@@ -148,8 +175,11 @@ impl ReceiveChannelEndpoint {
             };
 
         Ok(Self {
+            destinations: vec![ReceiveDestination {
+                channel: channel.clone(),
+                transport: Box::new(transport),
+            }],
             channel,
-            transport: Box::new(transport),
             channel_status_counter_id,
             receiver_id,
             dispatcher: DataPacketDispatcher::new(stream_session_limit),
@@ -189,8 +219,11 @@ impl ReceiveChannelEndpoint {
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
         Ok(Self {
+            destinations: vec![ReceiveDestination {
+                channel: channel.clone(),
+                transport,
+            }],
             channel,
-            transport,
             channel_status_counter_id,
             receiver_id,
             dispatcher: DataPacketDispatcher::new(stream_session_limit),
@@ -357,7 +390,13 @@ impl ReceiveChannelEndpoint {
         buffers: &mut [Vec<u8>],
         datagrams: &mut crate::sys::socket::Datagrams,
     ) -> io::Result<usize> {
-        self.transport.receive(buffers, datagrams)
+        match self.destination_mut() {
+            Some(destination) => destination.transport.receive(buffers, datagrams),
+            // A channel with no destinations has nothing to read, which is a
+            // state rather than a failure — the reference polls each of them
+            // and polls none when there are none.
+            None => Ok(0),
+        }
     }
 
     /// The address this endpoint's socket is bound to, which is the channel's
@@ -367,7 +406,13 @@ impl ReceiveChannelEndpoint {
     ///
     /// The error from `getsockname(2)`.
     pub fn local_address(&self) -> io::Result<SocketAddr> {
-        self.transport.local_address()
+        match self.destination() {
+            Some(destination) => destination.transport.local_address(),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "a channel with no destinations is bound to nothing",
+            )),
+        }
     }
 
     /// Where a status message about `source` should go
@@ -412,7 +457,10 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destination_mut() {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
     }
 
     /// Send a NAK (`aeron_receive_channel_endpoint_send_nak`, `:340-375`).
@@ -442,7 +490,10 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destination_mut() {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
     }
 
     /// Send an RTTM (`aeron_receive_channel_endpoint_send_rttm`, `:377-430`).
@@ -473,7 +524,25 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destination_mut() {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
+    }
+
+    /// The destination this endpoint reads from, or answers through.
+    ///
+    /// A unicast channel has exactly one, so every path here uses it. The
+    /// reference chooses by the destination a source belongs to, which needs the
+    /// per-destination control addresses that arrive with the multi-destination
+    /// work.
+    fn destination(&self) -> Option<&ReceiveDestination> {
+        self.destinations.first()
+    }
+
+    /// The same, mutably — reading is what needs it.
+    fn destination_mut(&mut self) -> Option<&mut ReceiveDestination> {
+        self.destinations.first_mut()
     }
 
     /// The state of one session, for the receiver's pending-setup sweep.
