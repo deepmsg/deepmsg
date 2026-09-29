@@ -50,8 +50,8 @@ use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
 use crate::flowcontrol::{MaxStrategy, Strategy, receiver_window_length};
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::protocol::{
-    DataFrame, ErrorFrame, FrameHeader, NakFrame, SetupFrame, StatusMessageFrame, frame_type,
-    header_flags,
+    DataFrame, ErrorFrame, FrameHeader, NakFrame, RttmFrame, SetupFrame, StatusMessageFrame,
+    frame_type, header_flags,
 };
 use crate::publication_params::PublicationParams;
 use crate::retransmit_handler::{Faults, NakOutcome, Resend, RetransmitHandler};
@@ -932,6 +932,54 @@ impl NetworkPublication {
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
+    }
+
+    /// A measurement request, answered when it asked to be
+    /// (`aeron_network_publication_on_rttm`, `:888-921`).
+    ///
+    /// `RTTM_REPLY` on the way in means *answer this*: a receiver measuring its
+    /// round trip sends the request with the flag
+    /// (`aeron_receive_channel_endpoint.c:407-410`, called with `is_reply` true
+    /// from `aeron_publication_image.c:1096`). The answer echoes the
+    /// requester's own timestamp and reports no time spent here, so what the
+    /// peer measures is its round trip and none of this driver's — and the
+    /// answer carries **no** flags, which is what stops it being answered in
+    /// turn.
+    ///
+    /// A publication that never answers leaves a peer on a congestion control
+    /// that measures round trips — `cubic` — with nothing to measure, whatever
+    /// flow control this end runs.
+    pub fn on_rttm(
+        &mut self,
+        frame: &RttmFrame,
+        flags: u8,
+        endpoint: &mut SendChannelEndpoint,
+        system: &System<'_>,
+    ) -> io::Result<usize> {
+        if flags & header_flags::RTTM_REPLY == 0 {
+            return Ok(0);
+        }
+
+        let reply = RttmFrame {
+            session_id: self.session_id,
+            stream_id: self.stream_id,
+            echo_timestamp: frame.echo_timestamp,
+            reception_delta: 0,
+            receiver_id: frame.receiver_id,
+        };
+
+        let mut buffer = [0u8; RttmFrame::LENGTH];
+        if reply.write(&mut buffer).is_none() {
+            return Ok(0);
+        }
+
+        let sent = endpoint.send(&[&buffer])?;
+
+        if sent < 1 {
+            system.increment(system_counters::id::SHORT_SENDS);
+        }
+
+        Ok(sent)
     }
 
     /// An error frame arrived, which the reference treats as a receiver going

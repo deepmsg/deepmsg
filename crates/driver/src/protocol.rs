@@ -1059,9 +1059,11 @@ impl RttmFrame {
     /// Write an RTTM frame to `buffer` with `flags` in the header.
     ///
     /// The one flag here is [`header_flags::RTTM_REPLY`], which a receiver sets
-    /// on the answer it echoes back so that the answer is not answered in turn
-    /// (`aeron_receive_channel_endpoint.c:409`,
-    /// `aeron_network_publication.c:893`).
+    /// on its **request** — it is a request to be answered, not a mark on the
+    /// answer (`aeron_receive_channel_endpoint.c:409`, reached with `is_reply`
+    /// true from `aeron_publication_image.c:1096`). The answer a publication
+    /// sends carries no flags (`aeron_network_publication.c:893`, `:902`),
+    /// which is what stops it being answered in turn.
     ///
     /// # Errors
     ///

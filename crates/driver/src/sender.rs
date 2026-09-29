@@ -48,7 +48,8 @@ use crate::idle::Backoff;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
-    ErrorFrame, FrameHeader, NakFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
+    ErrorFrame, FrameHeader, NakFrame, RttmFrame, StatusMessageFrame, frame_type, header_flags,
+    is_frame_valid,
 };
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
@@ -377,7 +378,7 @@ impl SenderThread {
 
     /// Read everything the endpoints' sockets hold and hand each frame to the
     /// publication it names (`aeron_send_channel_endpoint_dispatch`,
-    /// `media/aeron_send_channel_endpoint.c:466-513`).
+    /// `media/aeron_send_channel_endpoint.c:463-516`).
     #[allow(clippy::too_many_arguments)] // the fields of one pass, made explicit
     fn receive_control_frames(
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
@@ -438,7 +439,7 @@ impl SenderThread {
     }
 
     /// One frame, to the publication that names it
-    /// (`aeron_send_channel_endpoint_dispatch`, `:466-513`).
+    /// (`aeron_send_channel_endpoint_dispatch`, `:463-516`).
     ///
     /// An associated function rather than a method so that the borrow of the
     /// datagram buffers and the borrow of the publication list are visibly
@@ -521,9 +522,28 @@ impl SenderThread {
                 }
             }
             frame_type::RTTM => {
-                // A measurement reply. The `max` strategy asks for none and has
-                // nothing to do with the answer — the reference's `max` is a
-                // no-op for it too (`aeron_flow_control.c:87-105`).
+                // A measurement request. Answering it is the publication's job,
+                // not the flow control strategy's: the strategy that *asks* for
+                // measurements is the peer's, and the one here has nothing to
+                // do with the answer (`aeron_send_channel_endpoint.c:709-728`).
+                if let Some(frame) = RttmFrame::read(bytes) {
+                    let Some(index) =
+                        index_of_publication(publications, frame.stream_id, frame.session_id)
+                    else {
+                        return;
+                    };
+
+                    let endpoint_id = publications[index].endpoint_id;
+                    let Some(position) = endpoints.iter().position(|(id, _)| *id == endpoint_id)
+                    else {
+                        return;
+                    };
+
+                    let (_, endpoint) = &mut endpoints[position];
+                    let publication = &mut publications[index];
+
+                    let _ = publication.on_rttm(&frame, header.flags, endpoint, &system);
+                }
             }
             _ => {}
         }
