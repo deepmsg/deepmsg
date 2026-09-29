@@ -204,6 +204,24 @@ impl PublicationImages {
             now.ms,
         )?;
 
+        // Both position counters start at the join position, not at zero
+        // (`aeron_publication_image.c:391-392`). An image is created for a
+        // stream that is already running, so its own position *is* where the
+        // stream is: a zero here says the image has read nothing and is owed
+        // everything from the beginning, which is a position the sender
+        // overwrote long ago.
+        //
+        // It is not only the image's own accounting. A subscription that links
+        // to this image starts where `rcv-pos` says (`join_position`,
+        // `aeron_publication_image.h:376-396`), so an unseeded `rcv-pos` starts
+        // every late subscriber — and every subscriber that joins after a
+        // restart — reading from position zero, where there is nothing left to
+        // read.
+        let (join_position, _) = crate::publication_image::stream_start(setup);
+
+        let _ = counters.set_value(regions, counters_pair.rcv_hwm, join_position);
+        let _ = counters.set_value(regions, counters_pair.rcv_pos, join_position);
+
         let path = image_path(&config.aeron_dir, registration_id);
 
         self.agent
