@@ -442,7 +442,7 @@ impl ReceiverThread {
             pending_setups: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
-            last_cycle_ns: deepmsg_core::clock::epoch_nano_time(),
+            last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
             idle: Backoff::new(),
         }
     }
@@ -596,7 +596,7 @@ impl ReceiverThread {
             return 0;
         };
         let system = System::new(&self.counters, &regions);
-        let now_ns = deepmsg_core::clock::epoch_nano_time();
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
         let mut work = Self::receive_datagrams(
             &mut self.endpoints,
@@ -894,6 +894,15 @@ impl ReceiverThread {
                     .is_ok()
                 {
                     system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                    // …and the same count under the image that asked for it:
+                    // the system counter says the driver is retransmitting,
+                    // this one says for which stream
+                    // (`aeron_publication_image.c:1052`).
+                    let _ = system_counters::increment(
+                        counters,
+                        regions,
+                        image.counters().rcv_naks_sent,
+                    );
                     work += 1;
                 }
             }
@@ -998,7 +1007,7 @@ impl ReceiverThread {
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
     ) {
-        let now_ns = deepmsg_core::clock::epoch_nano_time();
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 

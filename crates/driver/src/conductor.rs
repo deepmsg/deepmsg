@@ -499,9 +499,15 @@ impl Conductor {
             ToClientsTransmitter::new(&region).ok_or(ConductorError::NoEventRing)?
         };
 
-        let now_ns = clock::epoch_nano_time();
+        // Two readings with two jobs, and they cannot be the same one: `now_ms`
+        // is a date that goes into shared memory, while `now_ns` seeds the duty
+        // cycle's deadlines, which are only ever compared against other
+        // monotonic readings. Seeding those from the epoch would put every
+        // deadline 1.7e18 nanoseconds in the future and freeze the clock cache
+        // and the timeout tier with it.
         let mut clock = CachedClock::new();
-        let now_ms = clock.update(now_ns);
+        let now_ms = clock.update(clock::epoch_nano_time());
+        let now_ns = clock::monotonic_nano_time();
 
         let mut counters = CounterManager::new(
             cnc.layout().counters_values.len(),
@@ -677,13 +683,19 @@ impl Conductor {
 
     /// One duty cycle. The return value is the reference's `work_count`.
     pub fn do_work(&mut self) -> usize {
-        let now_ns = clock::epoch_nano_time();
+        // The cycle's deadlines are measured against a clock that cannot go
+        // backwards, and `now_ms` — which every timestamp another process reads
+        // is built from — against the epoch. The reference keeps the same two
+        // apart: a monotonic `nano_clock` for the driver's timing, and a
+        // realtime reading taken once per millisecond for the cache
+        // (`aeron_driver_conductor.c:3276-3280`).
+        let now_ns = clock::monotonic_nano_time();
         let mut work_count = 0;
 
         self.track_cycle(now_ns);
 
         if now_ns > self.clock_update_deadline_ns {
-            self.now_ms = self.clock.update(now_ns);
+            self.now_ms = self.clock.update(clock::epoch_nano_time());
             self.clock_update_deadline_ns = now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS);
         }
 
@@ -753,8 +765,10 @@ impl Conductor {
         };
 
         let now = Now {
+            // `ms` is a date and goes into shared memory; `ns` is only ever
+            // compared against other `ns` readings, so it is monotonic.
             ms: self.now_ms,
-            ns: clock::epoch_nano_time(),
+            ns: clock::monotonic_nano_time(),
             client_liveness_timeout_ns: self.liveness_timeout_ns,
         };
 
@@ -854,8 +868,30 @@ impl Conductor {
                         continue;
                     };
 
+                    // The image's counters belong to the client that asked for
+                    // the subscription, not to the driver
+                    // (`aeron_driver_conductor.c:6652`, `:6667`, `:6682`, each
+                    // passing `subscription_link->client_id`). The reference
+                    // carries the link on the command itself; here the link is
+                    // the one this image is for — the same stream, and either
+                    // it named no session or it named this one. A stream two
+                    // clients both read is owned by the first of them, which is
+                    // the same one-link answer the reference gives.
+                    let client_id = self
+                        .subscriptions
+                        .links()
+                        .iter()
+                        .find(|link| {
+                            link.stream_id == setup.stream_id
+                                && link
+                                    .session_id
+                                    .is_none_or(|session_id| session_id == setup.session_id)
+                        })
+                        .map_or(0, |link| link.client_id);
+
                     let result = self.images.begin_create(
                         registration_id,
+                        client_id,
                         endpoint_id,
                         &channel,
                         &setup,

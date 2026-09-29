@@ -160,6 +160,7 @@ impl PublicationImages {
     pub fn begin_create(
         &mut self,
         registration_id: i64,
+        client_id: i64,
         endpoint_id: u64,
         channel: &[u8],
         setup: &SetupFrame,
@@ -196,6 +197,7 @@ impl PublicationImages {
             counters,
             regions,
             registration_id,
+            client_id,
             setup.session_id,
             setup.stream_id,
             channel,
@@ -467,13 +469,21 @@ impl PublicationImages {
     }
 }
 
-/// The counters an image's client reads
-/// (`aeron_counter_receiver_hwm_allocate` and `_position_allocate`,
-/// `aeron-driver/src/main/c/aeron_position.c:155-202`).
+/// The counters an image's client reads: `rcv-hwm` and `rcv-pos`
+/// (`aeron_position.c:157-199`) and `rcv-naks-sent`
+/// (`aeron_driver_conductor.c:6680-6683`).
+///
+/// All three are owned by the client that asked for the subscription, not by
+/// the driver that allocated them: the reference passes
+/// `subscription_link->client_id` to each, and a tool that groups counters by
+/// owner — or reclaims them when a client goes — reads that field, not the
+/// registration id.
+#[allow(clippy::too_many_arguments)] // the identity the three keys are built from
 fn allocate_counters(
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
     registration_id: i64,
+    client_id: i64,
     session_id: i32,
     stream_id: i32,
     channel: &[u8],
@@ -485,7 +495,7 @@ fn allocate_counters(
             regions,
             name,
             type_id,
-            0,
+            client_id,
             registration_id,
             session_id,
             stream_id,
@@ -508,7 +518,19 @@ fn allocate_counters(
         return Err(AddError::NoCounterRecord);
     };
 
-    Ok(ImageCounters { rcv_hwm, rcv_pos })
+    let Some(rcv_naks_sent) = allocate(
+        counters,
+        "rcv-naks-sent",
+        counter_position::type_id::RECEIVER_NAKS_SENT,
+    ) else {
+        return Err(AddError::NoCounterRecord);
+    };
+
+    Ok(ImageCounters {
+        rcv_hwm,
+        rcv_pos,
+        rcv_naks_sent,
+    })
 }
 
 /// Where an image's log buffer goes

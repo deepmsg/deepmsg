@@ -50,8 +50,8 @@ use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
 use crate::flowcontrol::{MaxStrategy, Strategy, receiver_window_length};
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::protocol::{
-    DataFrame, ErrorFrame, FrameHeader, NakFrame, SetupFrame, StatusMessageFrame, frame_type,
-    header_flags,
+    DataFrame, ErrorFrame, FrameHeader, NakFrame, RttmFrame, SetupFrame, StatusMessageFrame,
+    frame_type, header_flags,
 };
 use crate::publication_params::PublicationParams;
 use crate::retransmit_handler::{Faults, NakOutcome, Resend, RetransmitHandler};
@@ -146,6 +146,9 @@ pub struct NetworkPublication {
     /// Whether an answer has ever arrived; until it has, the publication keeps
     /// saying `SETUP` (`:595-600`).
     pub has_initial_connection: bool,
+    /// How far the terms have been zeroed behind the readers
+    /// (`aeron_network_publication_clean_buffer`, `:923-945`).
+    pub clean_position: i64,
     /// Whether a receiver asked for a `SETUP` and has not had one answered.
     pub is_setup_elicited: bool,
     /// When the receivers go quiet, this is when they are declared gone.
@@ -304,9 +307,21 @@ impl NetworkPublication {
             retransmit_handler,
             signal_eos: params.signal_eos,
             subscribers: Subscribable::new(registration_id),
-            time_of_last_setup_ns: 0,
+            // The first `SETUP` is due at once. The reference seeds this a
+            // timeout and a nanosecond *before* now, so that
+            // `now_ns > time_of_last_setup_ns + SETUP_TIMEOUT_NS` already holds
+            // on the first pass (`aeron_network_publication.c:285`). Zero says
+            // the same thing only to a clock whose zero is the epoch; against a
+            // monotonic reading it holds the first `SETUP` back for the whole
+            // timeout, which is exactly the moment a sender that has met no
+            // receiver is supposed to be saying it.
+            time_of_last_setup_ns: now_ns.saturating_sub(SETUP_TIMEOUT_NS).saturating_sub(1),
             time_of_last_data_or_heartbeat_ns: now_ns,
             has_initial_connection: false,
+            // Nothing has been sent yet, so nothing has been read past yet
+            // (`:249`; the reference also re-seats it on `snd-pos` when a
+            // publication is re-started, `:313`).
+            clean_position: 0,
             is_setup_elicited: false,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
@@ -505,7 +520,11 @@ impl NetworkPublication {
 
         let _ = (counters, regions);
 
-        Ok(sent)
+        // Bytes, like the rest of the send path (`:576`). The caller checks
+        // only the sign of this one, so the unit is the caller's business
+        // either way — but a `SETUP` that said "1" for a 48-byte frame would be
+        // a number in the wrong unit waiting for someone to believe it.
+        Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
     /// Say something if the stream has been quiet
@@ -578,7 +597,9 @@ impl NetworkPublication {
         system.increment(system_counters::id::HEARTBEATS_SENT);
         self.time_of_last_data_or_heartbeat_ns = now_ns;
 
-        Ok(sent)
+        // Bytes: this value is what a pass that sent no data reports, and the
+        // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:457`).
+        Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
     /// Whether the log buffer's metadata says the publication was revoked
@@ -596,6 +617,12 @@ impl NetworkPublication {
     /// The sender's position advances by what the kernel took **only if it took
     /// everything**: a partial send is a datagram still waiting for room, and a
     /// position that moved past it would lose it.
+    ///
+    /// Returns the **bytes** that went out, which is what the reference returns
+    /// (`:576`) and what the sender counts as `bytes-sent`
+    /// (`aeron_driver_sender.c:457`). Not the datagram count: those differ by
+    /// three orders of magnitude, and a counter named `bytes-sent` that held
+    /// `1000` for a megabyte of frames is a counter that lies.
     ///
     /// # Errors
     ///
@@ -685,16 +712,23 @@ impl NetworkPublication {
 
         let frames = bounds.len();
 
-        let sent = if frames > 0 {
-            let slices: Vec<&[u8]> = bounds
-                .iter()
-                .map(|(offset, length)| &scratch[*offset..*offset + *length])
-                .collect();
+        let slices: Vec<&[u8]> = bounds
+            .iter()
+            .map(|(offset, length)| &scratch[*offset..*offset + *length])
+            .collect();
 
+        let sent = if frames > 0 {
             endpoint.send(&slices)?
         } else {
             0
         };
+
+        // What this returns is **bytes**, not datagrams: the sender adds it to
+        // `bytes-sent`, and the reference's `send_data` returns the byte count
+        // its `do_send` accumulated (`aeron_network_publication.c:576`,
+        // `aeron_driver_sender.c:457`). A partial send is the first `sent`
+        // datagrams — `send` reports how many of the batch it took, in order.
+        let bytes_sent: usize = slices.iter().take(sent).map(|slice| slice.len()).sum();
 
         self.scratch = scratch;
 
@@ -707,19 +741,20 @@ impl NetworkPublication {
                 system.increment(system_counters::id::SHORT_SENDS);
             }
         } else if self.track_sender_limits && available_window <= 0 {
+            let _ = system_counters::increment(counters, regions, self.counters.snd_bpe);
             system.increment(system_counters::id::SENDER_FLOW_CONTROL_LIMITS);
-            system.increment(system_counters::id::FLOW_CONTROL_OVER_RUNS);
             self.track_sender_limits = false;
         }
 
         if blocked && self.track_sender_limits {
+            let _ = system_counters::increment(counters, regions, self.counters.snd_bpe);
             system.increment(system_counters::id::SENDER_FLOW_CONTROL_LIMITS);
             self.track_sender_limits = false;
         }
 
         let _ = position;
 
-        Ok(sent)
+        Ok(bytes_sent)
     }
 
     /// Serve what the retransmit handler owes
@@ -854,6 +889,32 @@ impl NetworkPublication {
         Ok(total)
     }
 
+    /// A receiver asked for a `SETUP` because it has no image for this session
+    /// (`aeron_network_publication_trigger_send_setup_frame`, `.h:245-271`).
+    ///
+    /// The flag is what makes this different from an ordinary status message:
+    /// the receiver is not reporting a position, it is asking to be told how
+    /// the stream starts. Setting `is_setup_elicited` re-opens the `SETUP` path
+    /// in [`NetworkPublication::send`] — `if !has_initial_connection ||
+    /// is_setup_elicited` (`aeron_network_publication.c:586`) — which a
+    /// publication that has already met one receiver has otherwise closed for
+    /// good. Without it a receiver that has restarted, or a second one that
+    /// arrives later, is never answered and builds no image.
+    ///
+    /// The reference also hands the status message and its source address to
+    /// the flow control strategy here (`on_trigger_send_setup`, `.h:255-259`).
+    /// This build has one strategy, `max`, whose implementation of that hook is
+    /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
+    /// with yet — the hook and the address it needs arrive with the strategy
+    /// that reads them, and `dispatch` does not carry a source address today.
+    pub fn trigger_send_setup_frame(&mut self) {
+        if self.is_end_of_stream {
+            return;
+        }
+
+        self.is_setup_elicited = true;
+    }
+
     /// A status message arrived (`aeron_network_publication_on_status_message`,
     /// `:779-840`).
     ///
@@ -865,13 +926,13 @@ impl NetworkPublication {
         &mut self,
         frame: &StatusMessageFrame,
         flags: u8,
-        system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) {
-        system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
-
+        // `status-messages-received` is counted at the endpoint, before this —
+        // and whether or not a publication answered to the message
+        // (`media/aeron_send_channel_endpoint.c:625`).
         self.status_message_deadline_ns = now_ns + self.connection_timeout_ns;
 
         if flags & header_flags::SM_EOS != 0 {
@@ -900,17 +961,67 @@ impl NetworkPublication {
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
     }
 
+    /// A measurement request, answered when it asked to be
+    /// (`aeron_network_publication_on_rttm`, `:888-921`).
+    ///
+    /// `RTTM_REPLY` on the way in means *answer this*: a receiver measuring its
+    /// round trip sends the request with the flag
+    /// (`aeron_receive_channel_endpoint.c:407-410`, called with `is_reply` true
+    /// from `aeron_publication_image.c:1096`). The answer echoes the
+    /// requester's own timestamp and reports no time spent here, so what the
+    /// peer measures is its round trip and none of this driver's — and the
+    /// answer carries **no** flags, which is what stops it being answered in
+    /// turn.
+    ///
+    /// A publication that never answers leaves a peer on a congestion control
+    /// that measures round trips — `cubic` — with nothing to measure, whatever
+    /// flow control this end runs.
+    pub fn on_rttm(
+        &mut self,
+        frame: &RttmFrame,
+        flags: u8,
+        endpoint: &mut SendChannelEndpoint,
+        system: &System<'_>,
+    ) -> io::Result<usize> {
+        if flags & header_flags::RTTM_REPLY == 0 {
+            return Ok(0);
+        }
+
+        let reply = RttmFrame {
+            session_id: self.session_id,
+            stream_id: self.stream_id,
+            echo_timestamp: frame.echo_timestamp,
+            reception_delta: 0,
+            receiver_id: frame.receiver_id,
+        };
+
+        let mut buffer = [0u8; RttmFrame::LENGTH];
+        if reply.write(&mut buffer).is_none() {
+            return Ok(0);
+        }
+
+        let sent = endpoint.send(&[&buffer])?;
+
+        if sent < 1 {
+            system.increment(system_counters::id::SHORT_SENDS);
+        }
+
+        // Bytes, like the rest of the send path (`:576`). The reference
+        // discards this value; it is counted here only so that no caller has to
+        // know which of the send paths are in which unit.
+        Ok(if sent < 1 { 0 } else { buffer.len() })
+    }
+
     /// An error frame arrived, which the reference treats as a receiver going
     /// away (`aeron_network_publication_on_error`, `:858-887`).
     pub fn on_error(
         &mut self,
         frame: &ErrorFrame,
-        system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) {
-        system.increment(system_counters::id::ERROR_FRAMES_RECEIVED);
-
+        // `error-frames-received` is counted at the endpoint, before the
+        // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
         self.remove_receiver(frame.receiver_id);
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
     }
@@ -934,7 +1045,12 @@ impl NetworkPublication {
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) -> NakOutcome {
-        system.increment(system_counters::id::NAK_MESSAGES_RECEIVED);
+        // `nak-messages-received` is counted at the endpoint, once the report
+        // has been found well formed (`media/aeron_send_channel_endpoint.c:566`).
+        // The system counter answers "is this driver being asked to
+        // retransmit"; this one answers "which publication is"
+        // (`aeron_network_publication.c:733`).
+        let _ = system_counters::increment(counters, regions, self.counters.snd_naks_received);
 
         let term_length = self.term_length as usize;
         let term_window = self.term_window_length as usize;
@@ -1076,7 +1192,30 @@ impl NetworkPublication {
             let current = counters.value(regions, self.counters.pub_lmt).unwrap_or(0);
 
             if new_limit > current {
-                let _ = counters.set_value(regions, self.counters.pub_lmt, new_limit);
+                // The term one behind the slowest reader is one it is done with
+                // (`:985`).
+                self.clean_buffer(min_consumer - i64::from(self.term_length));
+
+                // The limit moves only once the zeroing has caught up with the
+                // term that is about to become the active one. A limit that
+                // outran the cleaning would let the producer write into slots
+                // still holding the previous generation, and this publication's
+                // scan for availability reads a term's frames rather than
+                // stopping at `pub-pos`.
+                let clean_position = self.clean_position;
+                let dirty_term_id = Position::from_raw(clean_position)
+                    .term_id(self.position_bits_to_shift, self.initial_term_id);
+                let active_term_id = Position::from_raw(new_limit)
+                    .term_id(self.position_bits_to_shift, self.initial_term_id);
+                let term_gap =
+                    deepmsg_core::logbuffer::position::term_count(active_term_id, dirty_term_id);
+                let clean_offset =
+                    Position::from_raw(clean_position).term_offset(self.position_bits_to_shift);
+
+                if term_gap < 2 || (term_gap == 2 && clean_offset != 0) {
+                    let _ = counters.set_value(regions, self.counters.pub_lmt, new_limit);
+                }
+
                 return true;
             }
 
@@ -1086,10 +1225,57 @@ impl NetworkPublication {
         if counters.value(regions, self.counters.pub_lmt).unwrap_or(0) > snd_pos {
             self.update_connected_status(counters, regions, false);
             let _ = counters.set_value(regions, self.counters.pub_lmt, snd_pos);
+            self.clean_buffer(snd_pos - i64::from(self.term_length));
             return true;
         }
 
         false
+    }
+
+    /// Zero the terms the readers have finished with, a chunk at a time
+    /// (`aeron_network_publication_clean_buffer`, `:923-945`).
+    ///
+    /// A producer reusing a term writes into slots the frames of a full buffer
+    /// ago still occupy, and the log buffer's rule — write only into an empty
+    /// slot — refuses that write. Zeroing behind the readers is what makes the
+    /// slots empty again.
+    ///
+    /// Everything past the first eight bytes is zeroed first, and the
+    /// frame-length word goes to zero last with a **release**: a reader that
+    /// already saw the old length finds the bytes it describes still untouched.
+    /// Zeroing the length first would let a reader see a frame whose body had
+    /// been cleared underneath it.
+    pub fn clean_buffer(&mut self, position: i64) {
+        if position <= self.clean_position {
+            return;
+        }
+
+        let index = Position::from_raw(self.clean_position).index(self.position_bits_to_shift);
+        let clean_offset = Position::from_raw(self.clean_position)
+            .term_offset(self.position_bits_to_shift)
+            .unsigned_abs() as usize;
+
+        let bytes_left_in_term = self.term_length as usize - clean_offset;
+        let bytes_to_clean = (position - self.clean_position) as usize;
+        let length = bytes_to_clean.min(bytes_left_in_term);
+
+        let Some(term) = self.log.term(index) else {
+            return;
+        };
+
+        let body = length.saturating_sub(std::mem::size_of::<i64>());
+        if term
+            .zero(clean_offset + std::mem::size_of::<i64>(), body)
+            .is_none()
+        {
+            return;
+        }
+
+        if term.store_i64_release(clean_offset, 0).is_none() {
+            return;
+        }
+
+        self.clean_position += length as i64;
     }
 }
 
@@ -1373,7 +1559,6 @@ mod tests {
         // is limited to what has been sent, plus a term's window.
         let mut fixture = fixture();
         let (counters, regions) = fixture.counters.open();
-        let system = System::new(&counters, &regions);
 
         let frame = StatusMessageFrame {
             session_id: 42,
@@ -1386,7 +1571,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         assert!(fixture.publication.has_subscribers(&counters, &regions));
         assert_eq!(
@@ -1440,18 +1625,19 @@ mod tests {
         let _ = counters.set_value(&regions, fixture.publication.counters.snd_lmt, 4096);
         let _ = counters.set_value(&regions, fixture.publication.counters.snd_pos, 0);
 
-        // The first send, which is what the NAK will say was lost.
-        assert_eq!(
-            1,
-            fixture
-                .publication
-                .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
-                .expect("a send")
-        );
+        // The first send, which is what the NAK will say was lost. `send_data`
+        // reports **bytes**, so what it returns is checked against what arrived
+        // rather than against a count of datagrams
+        // (`aeron_network_publication.c:576`).
+        let sent = fixture
+            .publication
+            .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
+            .expect("a send");
 
         let mut buffers = vec![vec![0u8; 2048]];
         let first = receive(&fixture.listener, &mut buffers);
         assert_eq!(1, first.len());
+        assert_eq!(first[0].len(), sent, "the bytes that went out");
 
         // The NAK names the whole frame, from its offset.
         let nak = NakFrame {
@@ -1589,11 +1775,10 @@ mod tests {
             .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
             .expect("a send");
 
-        assert_eq!(1, sent, "one datagram");
-
         let mut buffers = vec![vec![0u8; MTU as usize + 64]];
         let datagrams = receive(&fixture.listener, &mut buffers);
-        assert_eq!(1, datagrams.len());
+        assert_eq!(1, datagrams.len(), "one datagram");
+        assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 
         // What arrived is the frame itself, header and all, with its published
         // length and the payload the producer wrote — and it is the *aligned*
@@ -1663,7 +1848,6 @@ mod tests {
     fn a_status_message_moves_the_limit_and_connects_the_publication() {
         let mut fixture = fixture();
         let (counters, regions) = fixture.counters.open();
-        let system = System::new(&counters, &regions);
 
         // A receiver that has read nothing and has room for 8 KiB, in the term
         // the publication is in.
@@ -1678,7 +1862,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         assert_eq!(
             Some(8192),
@@ -1702,7 +1886,6 @@ mod tests {
         fixture.publication.on_status_message(
             &frame,
             crate::protocol::header_flags::SM_EOS,
-            &system,
             &counters,
             &regions,
             1_100,
@@ -1730,7 +1913,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         // A heartbeat-less, data-less pass after the timeout: the receiver is
         // expired rather than simply never seen.
@@ -1769,7 +1952,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&frame, 0, &system, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, &counters, &regions, 1_000);
 
         let mut metadata = vec![0u8; 64 * 1024 * 4];
         let mut values = vec![0u8; 64 * 1024];
@@ -1803,11 +1986,10 @@ mod tests {
             )
             .expect("a send");
 
-        assert_eq!(1, sent);
-
         let mut buffers = vec![vec![0u8; MTU as usize]];
         let datagrams = receive(&fixture.listener, &mut buffers);
-        assert_eq!(1, datagrams.len());
+        assert_eq!(1, datagrams.len(), "one datagram");
+        assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 
         let header = FrameHeader::read(&datagrams[0]).expect("a header");
         assert_eq!(frame_type::DATA, header.frame_type);

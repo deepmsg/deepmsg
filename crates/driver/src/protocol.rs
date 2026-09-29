@@ -510,6 +510,28 @@ impl DataFrame {
         })
     }
 
+    /// The `term_offset` of a frame that is DATA **or** PAD.
+    ///
+    /// The reference reads both through the same `aeron_data_header_t *`: it
+    /// admits a frame whose type passes `0 == (frame_type & 0xFFFE)` — DATA and
+    /// PAD, the only two it expects in a term — and then takes
+    /// `frame->term_offset` without looking at the type again
+    /// (`aeron_publication_image.c:685-690`). The header layouts are the same
+    /// struct: `AERON_HDR_TYPE_PAD` is a data header with a zero payload
+    /// (`aeron_udp_protocol.h:172`), and `term_offset` sits at `:59` of the
+    /// same `:56-65` layout.
+    ///
+    /// [`DataFrame::read`] cannot serve a caller that has admitted a PAD — it
+    /// refuses one by design — so a receiver walking a term reads the field
+    /// through here after establishing the type is one of the two.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the buffer is too short to hold the field.
+    pub fn term_offset_of(buffer: &[u8]) -> Option<i32> {
+        read_i32(buffer, 8)
+    }
+
     /// Write a DATA frame to `buffer`, with `flags` zeroed.
     ///
     /// A DATA frame with no flags set is not one any receiver expects to act
@@ -1037,9 +1059,11 @@ impl RttmFrame {
     /// Write an RTTM frame to `buffer` with `flags` in the header.
     ///
     /// The one flag here is [`header_flags::RTTM_REPLY`], which a receiver sets
-    /// on the answer it echoes back so that the answer is not answered in turn
-    /// (`aeron_receive_channel_endpoint.c:409`,
-    /// `aeron_network_publication.c:893`).
+    /// on its **request** — it is a request to be answered, not a mark on the
+    /// answer (`aeron_receive_channel_endpoint.c:409`, reached with `is_reply`
+    /// true from `aeron_publication_image.c:1096`). The answer a publication
+    /// sends carries no flags (`aeron_network_publication.c:893`, `:902`),
+    /// which is what stops it being answered in turn.
     ///
     /// # Errors
     ///

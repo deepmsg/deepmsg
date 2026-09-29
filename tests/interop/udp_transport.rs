@@ -1200,3 +1200,473 @@ fn sub_position(cnc: &deepmsg_cnc::CncFile, registration_id: i64) -> Option<(i32
 
     found
 }
+
+/// The payload of message `index`, which **says which message it is**.
+///
+/// A count cannot tell a message that arrived from a message that arrived
+/// wearing another's bytes — which is what reading a frame out of a reused term
+/// produces — so every assertion below compares bytes.
+fn stream_payload(index: usize) -> Vec<u8> {
+    /// A payload big enough that a thousand of them cross a dozen terms of the
+    /// smallest term a channel may name.
+    const PAYLOAD: usize = 1000;
+
+    let mut payload = format!("msg-{index:06}-").into_bytes();
+    payload.resize(PAYLOAD, b'a' + (index % 26) as u8);
+
+    payload
+}
+
+/// Take whatever the subscription has right now, without waiting for more.
+fn read_ready(client: &mut Client, subscription_id: i64, into: &mut Vec<Vec<u8>>) {
+    use deepmsg_client::client::FRAGMENT_LIMIT;
+    use deepmsg_client::fragment_assembler::Message;
+
+    client.poll();
+    client.poll_subscription(subscription_id, FRAGMENT_LIMIT, |message: Message<'_>| {
+        into.push(message.payload.to_vec());
+    });
+}
+
+/// A12: a stream long enough to fill terms, and to come back to one it filled
+/// before, arrives whole and in order.
+///
+/// Every earlier UDP test here published a handful of messages into a buffer
+/// they never left: a term holds about sixty of these payloads, so the last
+/// datagram of a term — the one carrying the PAD that fills it out — and the
+/// reuse of a term a full buffer later were both out of reach. They are the two
+/// places where the receive path reads what a term *holds* rather than what just
+/// arrived, and neither is visible until a stream gets there.
+#[test]
+fn a_stream_that_fills_terms_arrives_whole_and_in_order() {
+    const MESSAGES: usize = 1000;
+
+    let Some(mut own) = OwnDriver::start("udp-many-terms") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    // The smallest term length a channel may name, so a thousand of these
+    // payloads cross sixteen of them and term 0 is met a second time at
+    // message 186.
+    let port = free_udp_port(7);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let mut offered = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    while Instant::now() < deadline && received.len() < MESSAGES {
+        publisher.poll();
+        subscriber.poll();
+
+        while offered < MESSAGES {
+            match publisher.offer(publication_id, &stream_payload(offered)) {
+                Some(Appended::Ok { .. }) => offered += 1,
+                // The window is closed until a status message says otherwise,
+                // and the reader below is what moves it.
+                Some(_) | None => break,
+            }
+        }
+
+        read_ready(&mut subscriber, subscription_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let log = own.log_tail(60);
+    let _ = own.stop();
+
+    assert_eq!(
+        MESSAGES,
+        received.len(),
+        "every message must arrive.\ncounter dump:\n{}\nthe client sees:\n{}\nour driver said:\n{log}",
+        counters_of(&own_cnc),
+        client_view(&subscriber, subscription_id)
+    );
+
+    for (index, message) in received.iter().enumerate() {
+        assert_eq!(
+            &stream_payload(index),
+            message,
+            "message {index} is not the one that was sent.\ncounter dump:\n{}\nour driver said:\n{log}",
+            counters_of(&own_cnc)
+        );
+    }
+
+    // `bytes-sent` is a **byte** count, not a datagram count. A thousand of
+    // these payloads is more than a megabyte of frames — each one 1000 bytes
+    // plus a 32-byte header, aligned to 32 — and the sender adds what each send
+    // path reports, which used to be datagrams and so read about a thousand.
+    let bytes_sent = counter_value_of(&own_cnc, deepmsg_driver::system_counters::id::BYTES_SENT);
+    assert!(
+        bytes_sent.is_some_and(|bytes| bytes >= 1_000_000),
+        "bytes-sent counts bytes, and a megabyte went out: {bytes_sent:?}\n{}",
+        counters_of(&own_cnc)
+    );
+}
+
+/// Pump both clients until the subscriber has `expected` messages, offering
+/// from `index` on as the far end's window allows, and no further than
+/// `offer_until`.
+///
+/// Returns what arrived. `index` advances as messages are accepted, so a second
+/// phase continues the stream rather than repeating it — and `offer_until`,
+/// rather than a global cap, is what keeps the first phase from spending the
+/// messages the second one needs.
+#[allow(clippy::too_many_arguments)] // two clients, their two ids, and the bounds
+fn pump_until(
+    publisher: &mut Client,
+    publication_id: i64,
+    subscriber: &mut Client,
+    subscription_id: i64,
+    offer_until: usize,
+    expected: usize,
+    index: &mut usize,
+    within: Duration,
+) -> Vec<Vec<u8>> {
+    let mut received = Vec::new();
+    let deadline = Instant::now() + within;
+
+    while Instant::now() < deadline && received.len() < expected {
+        publisher.poll();
+        subscriber.poll();
+
+        // Offering stops by itself once the window closes: a log buffer with no
+        // reader filling it answers `EndOfLog`.
+        while *index < offer_until {
+            match publisher.offer(publication_id, &stream_payload(*index)) {
+                Some(Appended::Ok { .. }) => *index += 1,
+                Some(_) | None => break,
+            }
+        }
+
+        read_ready(subscriber, subscription_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    received
+}
+
+/// A counter the CnC file holds, found by a fragment of its label: its id, its
+/// type, its owner, and the label it was found by.
+fn counter_like(cnc: &deepmsg_cnc::CncFile, needle: &str) -> Option<(i32, i32, i64, String)> {
+    let counters = cnc.counters()?;
+    let mut found = None;
+
+    counters.for_each(|descriptor| {
+        if found.is_none() && descriptor.label.contains(needle) {
+            found = Some((
+                descriptor.counter_id,
+                descriptor.type_id,
+                descriptor.owner_id,
+                descriptor.label.clone(),
+            ));
+        }
+    });
+
+    found
+}
+
+/// A16: an image's counters are named, typed and *owned* from the moment the
+/// image exists.
+///
+/// `rcv-naks-sent` is how a client sees whether its own stream is being asked to
+/// retransmit, and it is a counter of the image beside `rcv-hwm` and `rcv-pos`:
+/// the reference allocates all three together and hands each the subscribing
+/// client's id (`aeron_driver_conductor.c:6650`, `:6665`, `:6680-6683`). A
+/// counter born without an owner is one a tool that groups counters by owner —
+/// or reclaims them when a client goes — files under the driver rather than
+/// under the client that reads it.
+#[test]
+fn an_images_counters_are_owned_by_its_subscriber() {
+    let Some(mut own) = OwnDriver::start("udp-image-counters") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(10);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // An image exists once frames have been read, and the counters are
+    // allocated before it can read any.
+    let mut index = 0usize;
+    let received = pump_until(
+        &mut publisher,
+        publication_id,
+        &mut subscriber,
+        subscription_id,
+        10,
+        10,
+        &mut index,
+        Duration::from_secs(30),
+    );
+
+    let dump = counters_of(&own_cnc);
+    let _ = own.stop();
+
+    assert_eq!(10, received.len(), "the image must exist.\n{dump}");
+
+    let mut owners = Vec::new();
+
+    for label in ["rcv-hwm", "rcv-pos", "rcv-naks-sent"] {
+        let Some((counter_id, type_id, owner_id, found)) = counter_like(&own_cnc, label) else {
+            panic!("no {label} counter on the image.\n{dump}");
+        };
+
+        assert_ne!(0, owner_id, "{found} (#{counter_id}) has no owner.\n{dump}");
+        owners.push((label, type_id, owner_id));
+    }
+
+    assert_eq!(
+        (3, 5, 20),
+        (owners[0].1, owners[1].1, owners[2].1),
+        "the three type ids are the reference's: {owners:?}"
+    );
+    assert!(
+        owners.windows(2).all(|pair| pair[0].2 == pair[1].2),
+        "one image's counters are owned by one client: {owners:?}"
+    );
+}
+
+/// A15: a receiver that restarts is answered, not ignored.
+///
+/// A publication that has met one receiver has closed its `SETUP` path for good
+/// — `!has_initial_connection || is_setup_elicited` is false from then on
+/// (`aeron_network_publication.c:586`). The only thing that re-opens it is a
+/// receiver saying `SEND_SETUP`, which is what a driver sends when a frame
+/// arrives for a session it holds no image for. A publisher that reads that
+/// status message as an ordinary position report records the receiver, never
+/// describes the stream, and leaves the restarted subscriber waiting for an
+/// image that is never offered.
+///
+/// The two drivers are separate on purpose: restarting the subscriber has to
+/// not restart the publisher, and the publication's memory of the first
+/// receiver has to survive into the second.
+#[test]
+fn a_receiver_that_restarts_is_answered_with_a_setup() {
+    let Some(mut publisher_driver) = OwnDriver::start("udp-restart-publisher") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publisher_cnc = publisher_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(9);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut publisher = Client::connect(publisher_driver.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // Phase one: a subscriber driver the publication meets and answers.
+    let Some(mut first_driver) = OwnDriver::start("udp-restart-subscriber-1") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let _ = first_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the subscriber's driver must publish a readable CnC file");
+
+    let mut first = Client::connect(first_driver.aeron_dir()).expect("connect our client");
+    let first_id = first
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut index = 0usize;
+    let received = pump_until(
+        &mut publisher,
+        publication_id,
+        &mut first,
+        first_id,
+        100,
+        100,
+        &mut index,
+        Duration::from_secs(30),
+    );
+
+    let _ = first_driver.stop();
+
+    assert!(
+        !received.is_empty(),
+        "the first subscriber must be served before the restart means anything.\n\
+         our driver said:\n{}",
+        publisher_driver.log_tail(60)
+    );
+
+    // Phase two: a driver that has never seen this stream, subscribing to the
+    // same channel. The publication is the same one, and its `SETUP` path is
+    // shut until something opens it again.
+    let Some(mut second_driver) = OwnDriver::start("udp-restart-subscriber-2") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let second_cnc = second_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the restarted driver must publish a readable CnC file");
+
+    let mut second = Client::connect(second_driver.aeron_dir()).expect("connect our client");
+    let second_id = second
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    pump_until(
+        &mut publisher,
+        publication_id,
+        &mut second,
+        second_id,
+        110,
+        1,
+        &mut index,
+        Duration::from_secs(8),
+    );
+
+    let log = publisher_driver.log_tail(60);
+    let view = client_view(&second, second_id);
+    let second_counters = counters_of(&second_cnc);
+    let publisher_counters = counters_of(&publisher_cnc);
+    let _ = second_driver.stop();
+    let _ = publisher_driver.stop();
+
+    // The claim under test is the image, which is what the `SETUP` buys:
+    // without one the receiver never learns the session's term length, initial
+    // term id or starting position, and has nothing to read from at all.
+    //
+    // What arrives *after* the image is built is deliberately not asserted
+    // here. The restarted subscriber's driver does receive the stream — its
+    // `rcv-hwm` reaches the publisher's `snd-pos` — but the image is created at
+    // position 0 rather than at the position the `SETUP` carried, so it has
+    // never been readable. That is a separate defect on the receiving side, and
+    // it is recorded rather than fixed in this batch.
+    assert!(
+        images_of(&second, second_id) > 0,
+        "a subscriber that restarted asked for a `SETUP` and was given nothing, so it built \
+         no image.\nthe restarted subscriber sees:\n{view}\nrestarted driver's counters:\n\
+         {second_counters}\npublisher's counters:\n{publisher_counters}\n\
+         publisher's log:\n{log}"
+    );
+}
+
+/// A13: a stream with nothing left to send asks for nothing.
+///
+/// A heartbeat carries no payload, so the position it reports is the position it
+/// arrived at. A receiver that adds a frame header's worth on top of that
+/// advertises a high-water mark for eight bytes no sender will ever send, and
+/// the loss detector reports the hole every NAK period for as long as the stream
+/// stays idle — a retransmission storm over a stream with nothing to retransmit,
+/// and a high-water mark that walks into the next term on its own.
+#[test]
+fn an_idle_stream_asks_for_nothing() {
+    const MESSAGES: usize = 8;
+
+    let Some(mut own) = OwnDriver::start("udp-idle-stream") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(8);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // A few messages, so the two ends have found each other and the stream is
+    // live; then nothing at all.
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let mut offered = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    while Instant::now() < deadline && received.len() < MESSAGES {
+        publisher.poll();
+        subscriber.poll();
+
+        while offered < MESSAGES {
+            match publisher.offer(publication_id, &stream_payload(offered)) {
+                Some(Appended::Ok { .. }) => offered += 1,
+                Some(_) | None => break,
+            }
+        }
+
+        read_ready(&mut subscriber, subscription_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        MESSAGES,
+        received.len(),
+        "the messages that set the stream up must arrive before it goes idle.\n\
+         counter dump:\n{}\nour driver said:\n{}",
+        counters_of(&own_cnc),
+        own.log_tail(60)
+    );
+
+    // Whatever the NAK count is now is the baseline. Heartbeats are what keeps
+    // the two ends believing in each other while nothing is sent, and a
+    // heartbeat is not a reason to ask for a retransmission.
+    let nak_id = deepmsg_driver::system_counters::id::NAK_MESSAGES_SENT;
+    let before = counter_value_of(&own_cnc, nak_id);
+    let deadline = Instant::now() + Duration::from_secs(3);
+
+    while Instant::now() < deadline {
+        publisher.poll();
+        subscriber.poll();
+        read_ready(&mut subscriber, subscription_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let after = counter_value_of(&own_cnc, nak_id);
+    let dump = counters_of(&own_cnc);
+    let log = own.log_tail(60);
+    let _ = own.stop();
+
+    assert_eq!(
+        before, after,
+        "an idle stream must send no NAKs: the counter went from {before:?} to {after:?} over \
+         three seconds in which nothing was published.\ncounter dump:\n{dump}\nour driver said:\n{log}"
+    );
+}

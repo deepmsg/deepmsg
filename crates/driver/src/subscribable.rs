@@ -269,7 +269,7 @@ impl Subscribable {
     /// stops anyone giving it back twice. The reference leaves the position in
     /// the set — its state is what keeps it out of the way — and the teardown
     /// that frees every reader's counter walks the whole set
-    /// (`aeron_ipc_publication.c:1104-1108`), so an id that is still there
+    /// (`aeron_ipc_publication.c:205-208`), so an id that is still there
     /// would be freed a second time.
     ///
     /// Returns the position as it was, so a caller can name the counter in the
