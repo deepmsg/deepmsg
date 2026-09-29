@@ -672,6 +672,76 @@ impl SetupFrame {
     }
 }
 
+/// `aeron_response_setup_header_t` (`aeron_udp_protocol.h:158-165`): the frame
+/// a receiver sends back when the SETUP it received asked for a response
+/// (`AERON_SETUP_HEADER_SEND_RESPONSE_FLAG`, `:202`).
+///
+/// [`RspSetupFrame::LENGTH`] is 20 — the header plus three `i32`s. The struct
+/// sits in the file's `#pragma pack(1)` block (`:124-166`), so there is no
+/// padding between its fields and the wire size is the sum.
+///
+/// The frame carries **no correlation id**. The sender's identity travels in
+/// the header's `session_id`/`stream_id`, which are the pair the far end
+/// looks its publication up by; the correlation id is read from that
+/// publication's own `response_correlation_id`
+/// (`aeron_send_channel_endpoint.c:738-748`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspSetupFrame {
+    /// `(aeron_udp_protocol.h:161)` — the session the *sender's* publication
+    /// runs under, so the far end can find it.
+    pub session_id: i32,
+    /// `(aeron_udp_protocol.h:162)` — likewise its stream.
+    pub stream_id: i32,
+    /// `(aeron_udp_protocol.h:163)` — the session the far end's subscription
+    /// should adopt for the response stream it is about to read
+    /// (`aeron_driver_conductor.c:7100-7105`).
+    pub response_session_id: i32,
+}
+
+impl RspSetupFrame {
+    /// `sizeof(aeron_response_setup_header_t)` — 20, header included
+    /// (`aeron_udp_protocol.h:158-165`).
+    pub const LENGTH: usize = 20;
+
+    /// Read an RSP_SETUP frame from `buffer`.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the buffer is shorter than [`RspSetupFrame::LENGTH`] or the
+    /// header is not RSP_SETUP.
+    pub fn read(buffer: &[u8]) -> Option<Self> {
+        header_of(buffer, frame_type::RSP_SETUP)?;
+
+        Some(Self {
+            session_id: read_i32(buffer, 8)?,
+            stream_id: read_i32(buffer, 12)?,
+            response_session_id: read_i32(buffer, 16)?,
+        })
+    }
+
+    /// Write an RSP_SETUP frame to `buffer`.
+    ///
+    /// The flags byte is zero and there is no `write_with_flags`: the
+    /// reference sets it to `UINT8_C(0)` and reads nothing from it
+    /// (`aeron_receive_channel_endpoint.c:446`), so the type defines no flag
+    /// bits for a caller to choose between.
+    ///
+    /// # Errors
+    ///
+    /// `None`, with nothing written, if `buffer` is shorter than
+    /// [`RspSetupFrame::LENGTH`].
+    pub fn write(&self, buffer: &mut [u8]) -> Option<()> {
+        if buffer.len() < Self::LENGTH {
+            return None;
+        }
+
+        fixed_header(frame_type::RSP_SETUP, Self::LENGTH, 0).write(buffer)?;
+        write_i32(buffer, 8, self.session_id)?;
+        write_i32(buffer, 12, self.stream_id)?;
+        write_i32(buffer, 16, self.response_session_id)
+    }
+}
+
 /// `aeron_nak_header_t` (`aeron_udp_protocol.h:67-76`): a receiver reporting a
 /// gap, and the frame the retransmit path runs on.
 ///
@@ -1355,6 +1425,45 @@ mod tests {
     }
 
     #[test]
+    fn rsp_setup_frame_golden_vector() {
+        // `sizeof(aeron_response_setup_header_t)` under the file's
+        // `#pragma pack(1)` block (`aeron_udp_protocol.h:124-166`): the 8-byte
+        // header plus three `i32`s and nothing between them.
+        let bytes: [u8; 20] = [
+            0x14, 0x00, 0x00, 0x00, // frame_length = 20
+            0x00, // version
+            0x00, // flags — always zero for this type (`:446`)
+            0x0B, 0x00, // type = RSP_SETUP
+            0x11, 0x11, 0x11, 0x11, // session_id
+            0x22, 0x22, 0x22, 0x22, // stream_id
+            0x33, 0x33, 0x33, 0x33, // response_session_id
+        ];
+
+        let frame = RspSetupFrame::read(&bytes).expect("an RSP_SETUP frame");
+        assert_eq!(
+            frame,
+            RspSetupFrame {
+                session_id: 0x1111_1111,
+                stream_id: 0x2222_2222,
+                response_session_id: 0x3333_3333,
+            }
+        );
+
+        let mut out = [0u8; RspSetupFrame::LENGTH];
+        frame.write(&mut out).expect("written");
+        assert_eq!(out, bytes);
+
+        assert!(
+            RspSetupFrame::read(&bytes[..19]).is_none(),
+            "one byte short"
+        );
+        assert!(
+            RspSetupFrame::read(&header_bytes(frame_type::SM, 20, 0)).is_none(),
+            "the type is checked, not just the length"
+        );
+    }
+
+    #[test]
     fn nak_frame_golden_vector() {
         let bytes: [u8; 28] = [
             0x1C, 0x00, 0x00, 0x00, // frame_length = 28
@@ -1895,6 +2004,15 @@ mod tests {
             let mut out = [0u8; NakFrame::LENGTH];
             nak.write(&mut out).expect("written");
             assert_eq!(NakFrame::read(&out), Some(nak));
+
+            let rsp_setup = RspSetupFrame {
+                session_id: value,
+                stream_id: next,
+                response_session_id: third,
+            };
+            let mut out = [0u8; RspSetupFrame::LENGTH];
+            rsp_setup.write(&mut out).expect("written");
+            assert_eq!(RspSetupFrame::read(&out), Some(rsp_setup));
 
             let sm = StatusMessageFrame {
                 session_id: value,
