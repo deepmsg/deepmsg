@@ -268,9 +268,42 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
         "on the stream the publication named:\n{output}"
     );
 
+    // A17: a session the reference believes refuses no status message.
+    //
+    // The two numbers are asserted together because either alone is worthless.
+    // A zero on a counter that was never given anything to refuse is not the
+    // check working, it is the check not being reached — and a count of status
+    // messages received is the proof that this session used the path this
+    // counts. What it does *not* prove is that the check is switched on: with
+    // the comparison in `sender.rs` removed nothing is refused either, and this
+    // assertion stays green. The test that holds the check itself in place is
+    // `a_status_message_is_only_valid_where_the_publication_can_place_it`
+    // (`network_publication.rs`), against
+    // `aeron_network_publication_is_valid_status_message`
+    // (`aeron_network_publication.c:841-856`).
+    let received_status_messages = counter_like(&own_cnc, "Status Messages received")
+        .and_then(|(counter_id, _, _, _)| counter_value_of(&own_cnc, counter_id));
+    let rejected_status_messages = counter_like(&own_cnc, "Status Messages rejected")
+        .and_then(|(counter_id, _, _, _)| counter_value_of(&own_cnc, counter_id));
+    // Read before the driver goes, which is when this file still exists.
+    let dump = counters_of(&own_cnc);
+
     let _ = subscriber.terminate(Duration::from_secs(5));
     let _ = own.stop();
     let _ = reference.stop();
+
+    assert!(
+        matches!(received_status_messages, Some(count) if count > 0),
+        "the reference subscriber has to have sent status messages before a count of refused \
+         ones means anything: {received_status_messages:?} received, \
+         {rejected_status_messages:?} rejected.\ncounter dump:\n{dump}"
+    );
+    assert_eq!(
+        Some(0),
+        rejected_status_messages,
+        "a status message the reference sent about a stream it is reading is one this publication \
+         can place, so none of them may be refused (`aeron_network_publication.c:841-856`)."
+    );
 }
 
 /// A5, the half that needs a second process: a frame this driver withholds is
