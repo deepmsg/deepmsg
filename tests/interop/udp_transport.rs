@@ -268,9 +268,42 @@ fn our_udp_publication_reaches_a_reference_subscriber() {
         "on the stream the publication named:\n{output}"
     );
 
+    // A17: a session the reference believes refuses no status message.
+    //
+    // The two numbers are asserted together because either alone is worthless.
+    // A zero on a counter that was never given anything to refuse is not the
+    // check working, it is the check not being reached — and a count of status
+    // messages received is the proof that this session used the path this
+    // counts. What it does *not* prove is that the check is switched on: with
+    // the comparison in `sender.rs` removed nothing is refused either, and this
+    // assertion stays green. The test that holds the check itself in place is
+    // `a_status_message_is_only_valid_where_the_publication_can_place_it`
+    // (`network_publication.rs`), against
+    // `aeron_network_publication_is_valid_status_message`
+    // (`aeron_network_publication.c:841-856`).
+    let received_status_messages = counter_like(&own_cnc, "Status Messages received")
+        .and_then(|(counter_id, _, _, _)| counter_value_of(&own_cnc, counter_id));
+    let rejected_status_messages = counter_like(&own_cnc, "Status Messages rejected")
+        .and_then(|(counter_id, _, _, _)| counter_value_of(&own_cnc, counter_id));
+    // Read before the driver goes, which is when this file still exists.
+    let dump = counters_of(&own_cnc);
+
     let _ = subscriber.terminate(Duration::from_secs(5));
     let _ = own.stop();
     let _ = reference.stop();
+
+    assert!(
+        matches!(received_status_messages, Some(count) if count > 0),
+        "the reference subscriber has to have sent status messages before a count of refused \
+         ones means anything: {received_status_messages:?} received, \
+         {rejected_status_messages:?} rejected.\ncounter dump:\n{dump}"
+    );
+    assert_eq!(
+        Some(0),
+        rejected_status_messages,
+        "a status message the reference sent about a stream it is reading is one this publication \
+         can place, so none of them may be refused (`aeron_network_publication.c:841-856`)."
+    );
 }
 
 /// A5, the half that needs a second process: a frame this driver withholds is
@@ -1680,5 +1713,198 @@ fn an_idle_stream_asks_for_nothing() {
         before, after,
         "an idle stream must send no NAKs: the counter went from {before:?} to {after:?} over \
          three seconds in which nothing was published.\ncounter dump:\n{dump}\nour driver said:\n{log}"
+    );
+}
+
+/// The message number the reference's streaming sample writes into the first
+/// eight bytes of every payload (`StreamingPublisher.cpp:206`), or `None` for a
+/// payload too short to hold one.
+///
+/// A count of messages cannot say whether a subscriber that joined a running
+/// stream began at the beginning, at the end, or in the middle of a term it
+/// read out of a buffer that had been reused — and those are the three things
+/// that look identical from a count. The number says which.
+fn reference_message_number(payload: &[u8]) -> Option<i64> {
+    payload
+        .get(..8)
+        .and_then(|head| <[u8; 8]>::try_from(head).ok())
+        .map(i64::from_le_bytes)
+}
+
+/// A16: a subscriber that meets a stream already running is told where the
+/// stream *is*, not where it began.
+///
+/// An image is born at the position its `SETUP` describes, and the reference
+/// seeds its two position counters with that position the moment it builds one
+/// (`aeron_publication_image.c:391-392`). A receiver whose counters start at
+/// zero is owed everything from the beginning of a stream that has been reused
+/// many times over, and a subscription that links to an image begins reading at
+/// `rcv-pos` (`aeron_publication_image.h:376-396`) — so a late subscriber
+/// reads where the frames were overwritten a full buffer ago.
+///
+/// The publisher is the reference's own streaming sample behind the reference's
+/// own driver: our driver is the only thing under test, and the position it
+/// hands its own reader has to be the one the reference's `SETUP` named. The
+/// sample writes the message number into the first eight bytes of every payload
+/// (`StreamingPublisher.cpp:206`), which is what lets the late subscriber say
+/// *where* it joined rather than only that it read something.
+///
+/// One unicast endpoint holds one binder, so "a subscriber that joins late" is
+/// reached the only way this channel shape allows: the driver holding the
+/// endpoint goes away, and a driver that has never seen this stream takes it.
+/// That is also the pair of shapes P1-5 exists for — an MDC receiver arriving
+/// after the stream started, and `ReplayMerge` crossing from replay to live —
+/// so the case met here is the same case, met earlier.
+#[test]
+fn a_late_subscriber_meets_a_reference_publisher_where_the_stream_is() {
+    /// Enough messages to carry the stream past several of the smallest terms,
+    /// so that the beginning is long gone by the time the late subscriber
+    /// arrives.
+    const EARLY: usize = 200;
+
+    /// A payload about a sixteenth of a 64 KiB term, so `EARLY` of them are
+    /// several terms rather than part of one.
+    const LENGTH: &str = "1000";
+
+    /// More than any run of this test will publish, so the sample is still
+    /// streaming when the late subscriber joins rather than having finished.
+    const ENOUGH: &str = "2000000";
+
+    let Some(publisher_binary) = samples::locate("StreamingPublisher") else {
+        driver::announce_tool_skip("StreamingPublisher");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let mut reference = ReferenceDriver::start(&reference_binary, "udp-late-reference-publisher")
+        .expect("start the reference driver");
+    let reference_dir = reference.aeron_dir().to_path_buf();
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver must publish a readable CnC file");
+
+    let port = free_udp_port(11);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    // The subscriber that binds the endpoint, and the one that lets the
+    // publication move at all: a unicast channel has one endpoint, and this
+    // driver is holding it.
+    let Some(mut early_driver) = OwnDriver::start("udp-late-early") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let _ = early_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the early subscriber's driver must publish a readable CnC file");
+
+    let mut early = Client::connect(early_driver.aeron_dir()).expect("connect our client");
+    let early_id = early
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = samples::Sample::start(
+        &publisher_binary,
+        "publisher",
+        &reference_dir,
+        &[
+            "-c",
+            &channel,
+            "-s",
+            &STREAM_ID.to_string(),
+            "-m",
+            ENOUGH,
+            "-L",
+            LENGTH,
+        ],
+    );
+
+    let early_received = drain_messages(&mut early, early_id, Duration::from_secs(60), EARLY);
+    let early_count = early_received.len();
+    let _ = early_driver.stop();
+
+    assert!(
+        early_count >= EARLY,
+        "the stream has to have run before a late subscriber means anything: {early_count} of \
+         {EARLY} messages arrived.\nthe publisher said:\n{}",
+        publisher.output()
+    );
+
+    // Phase two: a driver that has never seen this stream takes the endpoint.
+    // The publication is the same one, and it has been running for several
+    // terms.
+    let Some(mut late_driver) = OwnDriver::start("udp-late-joiner") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let late_cnc = late_driver
+        .await_cnc(READY_TIMEOUT)
+        .expect("the late subscriber's driver must publish a readable CnC file");
+
+    let mut late = Client::connect(late_driver.aeron_dir()).expect("connect our client");
+    let late_id = late
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    while Instant::now() < deadline && received.len() < 10 {
+        late.poll();
+        read_ready(&mut late, late_id, &mut received);
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let view = client_view(&late, late_id);
+    let late_counters = counters_of(&late_cnc);
+    let publisher_output = publisher.output();
+
+    // Read while the driver is still running, which is the only time the image's
+    // counters have anything to say.
+    let image_counter = |label: &str| {
+        counter_like(&late_cnc, label)
+            .and_then(|(counter_id, _, _, _)| counter_value_of(&late_cnc, counter_id))
+    };
+
+    let rcv_pos = image_counter("rcv-pos");
+    let rcv_hwm = image_counter("rcv-hwm");
+    let sub_pos = sub_position(&late_cnc, late_id).map(|(_, value)| value);
+
+    let _ = publisher.terminate(Duration::from_secs(5));
+    let _ = late_driver.stop();
+    let _ = reference.stop();
+
+    let evidence = format!(
+        "the late subscriber sees:\n{view}\n\
+         its image's counters: rcv-pos {rcv_pos:?}, rcv-hwm {rcv_hwm:?}, \
+         its subscription's sub-pos {sub_pos:?}\n\
+         the late driver's counters:\n{late_counters}\n\
+         the publisher said:\n{publisher_output}"
+    );
+
+    assert!(
+        !received.is_empty(),
+        "a subscriber that joined a stream already running read nothing.\n{evidence}"
+    );
+
+    // The claim the whole test is for. A subscriber that began at message zero
+    // began at a position the stream left behind several terms ago, which is
+    // what an image with counters seeded at zero makes it do.
+    let first = reference_message_number(&received[0]);
+    assert!(
+        matches!(first, Some(number) if number > 0),
+        "a subscriber that met a running stream must begin where the stream is, not at message \
+         zero; the first payload it assembled carries {first:?}.\n{evidence}"
+    );
+
+    assert!(
+        matches!(rcv_pos, Some(position) if position > 0)
+            && matches!(sub_pos, Some(position) if position > 0),
+        "an image built from a `SETUP` naming a position must take that position, not zero \
+         (`aeron_publication_image.c:391-392`).\n{evidence}"
     );
 }
