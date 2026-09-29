@@ -15,7 +15,8 @@
 //! refresh: the caller knows its own duty cycle, and a clock that refreshed
 //! itself on a timer would be a second scheduler inside the first one.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch.
 ///
@@ -28,6 +29,38 @@ pub fn epoch_nano_time() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
         .unwrap_or(i64::MAX)
+}
+
+/// The reading [`monotonic_nano_time`] counts from.
+static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
+
+/// Nanoseconds from a clock that only goes forwards, for measuring elapsed time
+/// inside the driver.
+///
+/// [`epoch_nano_time`] answers "what time is it", which is what a timestamp
+/// another process will read has to mean. Nothing that *compares* two readings
+/// may use it. An NTP step, a leap second or a hand-set clock moves every
+/// deadline at once: backwards, and a timeout stops expiring — a liveness check
+/// that never fires, a retransmit that never lingers out; forwards, and every
+/// connection times out together, every heartbeat goes out in one pass.
+///
+/// The driver's own timing — liveness timeouts, NAK delays and linger, the
+/// status-message and heartbeat cadences, retransmit delays — wants a clock
+/// that cannot go backwards. That is what the reference's `nano_clock` is:
+/// `aeron_nano_clock` (`aeron-client/src/main/c/util/aeron_clock.c:113-122`)
+/// calls `aeron_clock_gettime_monotonic`, and it is the default
+/// `context->nano_clock` the sender and receiver read
+/// (`aeron_driver_sender.c:136`, `aeron_driver_receiver.c:128`).
+///
+/// The value is nanoseconds since the first call in this process, so it is a
+/// duration and not a date: it is meaningless to anything outside this process,
+/// and nothing here writes it to shared memory.
+///
+/// Saturates rather than panicking, like [`epoch_nano_time`].
+pub fn monotonic_nano_time() -> i64 {
+    let base = MONOTONIC_BASE.get_or_init(Instant::now);
+
+    i64::try_from(base.elapsed().as_nanos()).unwrap_or(i64::MAX)
 }
 
 /// Milliseconds since the Unix epoch.
@@ -89,6 +122,15 @@ mod tests {
             clock.epoch_ms(),
             "a rounded value would be in the future"
         );
+    }
+
+    #[test]
+    fn the_monotonic_clock_advances_and_never_goes_backwards() {
+        let first = monotonic_nano_time();
+        let second = monotonic_nano_time();
+
+        assert!(first >= 0);
+        assert!(second >= first, "{second} came after {first}");
     }
 
     #[test]

@@ -499,9 +499,15 @@ impl Conductor {
             ToClientsTransmitter::new(&region).ok_or(ConductorError::NoEventRing)?
         };
 
-        let now_ns = clock::epoch_nano_time();
+        // Two readings with two jobs, and they cannot be the same one: `now_ms`
+        // is a date that goes into shared memory, while `now_ns` seeds the duty
+        // cycle's deadlines, which are only ever compared against other
+        // monotonic readings. Seeding those from the epoch would put every
+        // deadline 1.7e18 nanoseconds in the future and freeze the clock cache
+        // and the timeout tier with it.
         let mut clock = CachedClock::new();
-        let now_ms = clock.update(now_ns);
+        let now_ms = clock.update(clock::epoch_nano_time());
+        let now_ns = clock::monotonic_nano_time();
 
         let mut counters = CounterManager::new(
             cnc.layout().counters_values.len(),
@@ -677,13 +683,19 @@ impl Conductor {
 
     /// One duty cycle. The return value is the reference's `work_count`.
     pub fn do_work(&mut self) -> usize {
-        let now_ns = clock::epoch_nano_time();
+        // The cycle's deadlines are measured against a clock that cannot go
+        // backwards, and `now_ms` — which every timestamp another process reads
+        // is built from — against the epoch. The reference keeps the same two
+        // apart: a monotonic `nano_clock` for the driver's timing, and a
+        // realtime reading taken once per millisecond for the cache
+        // (`aeron_driver_conductor.c:3276-3280`).
+        let now_ns = clock::monotonic_nano_time();
         let mut work_count = 0;
 
         self.track_cycle(now_ns);
 
         if now_ns > self.clock_update_deadline_ns {
-            self.now_ms = self.clock.update(now_ns);
+            self.now_ms = self.clock.update(clock::epoch_nano_time());
             self.clock_update_deadline_ns = now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS);
         }
 
@@ -753,8 +765,10 @@ impl Conductor {
         };
 
         let now = Now {
+            // `ms` is a date and goes into shared memory; `ns` is only ever
+            // compared against other `ns` readings, so it is monotonic.
             ms: self.now_ms,
-            ns: clock::epoch_nano_time(),
+            ns: clock::monotonic_nano_time(),
             client_liveness_timeout_ns: self.liveness_timeout_ns,
         };
 

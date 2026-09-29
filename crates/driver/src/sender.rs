@@ -287,7 +287,7 @@ impl SenderThread {
             publications: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
-            last_cycle_ns: deepmsg_core::clock::epoch_nano_time(),
+            last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
             idle: Backoff::new(),
         }
     }
@@ -462,7 +462,7 @@ impl SenderThread {
             return;
         }
 
-        let now_ns = deepmsg_core::clock::epoch_nano_time();
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
         match header.frame_type {
             frame_type::SM => {
@@ -561,7 +561,7 @@ impl SenderThread {
         regions: &CounterRegions<'_>,
         events: &Channel<SenderEvent>,
     ) -> usize {
-        let now_ns = deepmsg_core::clock::epoch_nano_time();
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let mut work = 0;
 
         for publication in publications.iter_mut() {
@@ -607,7 +607,7 @@ impl SenderThread {
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
     ) {
-        let now_ns = deepmsg_core::clock::epoch_nano_time();
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 
