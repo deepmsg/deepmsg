@@ -699,6 +699,28 @@ impl ReceiverThread {
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             endpoint.add_subscription_by_session(stream_id, session_id);
+
+                            // And then the ask, which is the whole reason a
+                            // session-addressed subscription exists here: a
+                            // response subscription names no session until the
+                            // far end's `RSP_SETUP` says which one it is, and
+                            // *this* is where that session is finally asked
+                            // for by name (`aeron_driver_receiver.c:401-409`).
+                            //
+                            // Unlike the ask beside a destination
+                            // (`:475-486`), this one carries a real stream and
+                            // session, and that is not a detail: the far end
+                            // finds its publication by
+                            // `(stream_id << 32) | session_id`, so an ask with
+                            // no session in it reaches no publication at all —
+                            // it reaches only the destination tracker.
+                            //
+                            // A channel with no control address has nowhere to
+                            // send it, so the guard is the channel's
+                            // (`:418-426`).
+                            if endpoint.channel.has_explicit_control {
+                                endpoint.elicit_setup(stream_id, session_id);
+                            }
                         }
                     }
                     ReceiverCommand::RequestSetup {
