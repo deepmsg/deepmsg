@@ -120,9 +120,18 @@ pub struct Connection {
     /// When a **frame** was last seen on it (`time_of_last_frame_ns`).
     pub time_of_last_frame_ns: i64,
     /// Whether this connection has said the stream is over.
+    ///
+    /// **Not yet written.** The reference sets this and the position beside it
+    /// in `aeron_publication_image_all_eos` (`:594-612`), which is called from
+    /// the packet path because it needs to know *which* connection ended.
+    /// [`PublicationImage::on_heartbeat`] is where the end of the stream is
+    /// seen here and it is not given the source, so with one connection the
+    /// image's own `eos_position` is what is used and these two describe a
+    /// shape that nothing fills yet. They are filled when multiple connections
+    /// make "which one ended" a question worth asking.
     pub is_eos: bool,
     /// Where the stream ended, as this connection said
-    /// (`connection->eos_position`).
+    /// (`connection->eos_position`) — not yet written, see [`Connection::is_eos`].
     pub eos_position: i64,
 }
 

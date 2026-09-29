@@ -678,12 +678,39 @@ impl SenderThread {
                 // depend on our recognising what it said (`:625`).
                 system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
 
-                // The endpoint's destinations see it before any publication
-                // does, and on a dynamic channel a status message from
-                // somewhere unknown *creates* a destination
-                // (`aeron_send_channel_endpoint.c:636-645`). It happens whether
-                // or not a publication here answers to the frame, which is why
-                // it is above the lookup rather than inside it.
+                let is_send_setup = header.flags & header_flags::SM_SEND_SETUP != 0;
+
+                // A position the publication cannot place is one it must not act
+                // on (`aeron_network_publication_is_valid_status_message`,
+                // `aeron_network_publication.c:841-856`) — and one the
+                // *destinations* must not act on either. The reference refuses
+                // it before the tracker ever sees it
+                // (`aeron_send_channel_endpoint.c:627-634`), so a message that
+                // is not believed cannot keep a destination alive or bring one
+                // into being.
+                //
+                // `SEND_SETUP` is not a position report — it is a receiver
+                // saying it has no image and wants the stream described
+                // (`:649-656`) — so it is exempt from that check, which is what
+                // the reference's guard says too.
+                if !is_send_setup {
+                    if let Some(index) = index {
+                        let snd_pos = counters
+                            .value(regions, publications[index].counters.snd_pos)
+                            .unwrap_or(0);
+
+                        if !publications[index].is_valid_status_message(&frame, snd_pos) {
+                            system.increment(system_counters::id::STATUS_MESSAGES_REJECTED);
+                            return;
+                        }
+                    }
+                }
+
+                // What was not refused reaches the endpoint's destinations, and
+                // reaches them whether or not a publication here answers to the
+                // frame: on a dynamic channel a status message from somewhere
+                // unknown *creates* a destination, which is the only way such a
+                // channel learns one (`:636-645`).
                 if let Some(address) = source {
                     if let Some(tracker) = endpoints[endpoint_index].1.destination_tracker_mut() {
                         tracker.on_status_message(
@@ -700,24 +727,8 @@ impl SenderThread {
                     return;
                 };
 
-                // `SEND_SETUP` is not a position report — it is a receiver
-                // saying it has no image and wants the stream described
-                // (`aeron_send_channel_endpoint.c:649-656`) — so it is not put
-                // through the position check below.
-                if header.flags & header_flags::SM_SEND_SETUP != 0 {
+                if is_send_setup {
                     publications[index].trigger_send_setup_frame();
-                    return;
-                }
-
-                // A position the publication cannot place is one it must not act
-                // on (`aeron_network_publication_is_valid_status_message`,
-                // `aeron_network_publication.c:841-856`).
-                let snd_pos = counters
-                    .value(regions, publications[index].counters.snd_pos)
-                    .unwrap_or(0);
-
-                if !publications[index].is_valid_status_message(&frame, snd_pos) {
-                    system.increment(system_counters::id::STATUS_MESSAGES_REJECTED);
                     return;
                 }
 
