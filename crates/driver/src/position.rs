@@ -267,6 +267,10 @@ pub fn allocate_subscription_position(
 pub const SEND_CHANNEL_STATUS_NAME: &str = "snd-channel";
 /// The receive endpoint's name.
 pub const RECEIVE_CHANNEL_STATUS_NAME: &str = "rcv-channel";
+/// The name a multi-destination send endpoint's destination count carries
+/// (`AERON_COUNTER_CHANNEL_MDC_NUM_DESTINATIONS_NAME`,
+/// `aeron-client/src/main/c/aeron_counters.h:117`).
+pub const MDC_NUM_DESTINATIONS_NAME: &str = "mdc-num-dest";
 
 /// The type ids the channel-status counters carry
 /// (`aeron-client/src/main/c/aeron_counters.h:86-90`).
@@ -275,6 +279,10 @@ pub mod channel_type_id {
     pub const SEND_CHANNEL_STATUS: i32 = 6;
     /// `AERON_COUNTER_RECEIVE_CHANNEL_STATUS_TYPE_ID`, label `"rcv-channel"`.
     pub const RECEIVE_CHANNEL_STATUS: i32 = 7;
+    /// `AERON_COUNTER_CHANNEL_NUM_DESTINATIONS_TYPE_ID`, label
+    /// `"mdc-num-dest"` — how many destinations a multi-destination send
+    /// endpoint currently has (`aeron_counters.h:118`).
+    pub const MDC_NUM_DESTINATIONS: i32 = 18;
 }
 
 /// What a channel-status counter holds
