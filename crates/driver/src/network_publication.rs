@@ -512,7 +512,11 @@ impl NetworkPublication {
 
         let _ = (counters, regions);
 
-        Ok(sent)
+        // Bytes, like the rest of the send path (`:576`). The caller checks
+        // only the sign of this one, so the unit is the caller's business
+        // either way — but a `SETUP` that said "1" for a 48-byte frame would be
+        // a number in the wrong unit waiting for someone to believe it.
+        Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
     /// Say something if the stream has been quiet
@@ -585,7 +589,9 @@ impl NetworkPublication {
         system.increment(system_counters::id::HEARTBEATS_SENT);
         self.time_of_last_data_or_heartbeat_ns = now_ns;
 
-        Ok(sent)
+        // Bytes: this value is what a pass that sent no data reports, and the
+        // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:457`).
+        Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
     /// Whether the log buffer's metadata says the publication was revoked
@@ -603,6 +609,12 @@ impl NetworkPublication {
     /// The sender's position advances by what the kernel took **only if it took
     /// everything**: a partial send is a datagram still waiting for room, and a
     /// position that moved past it would lose it.
+    ///
+    /// Returns the **bytes** that went out, which is what the reference returns
+    /// (`:576`) and what the sender counts as `bytes-sent`
+    /// (`aeron_driver_sender.c:457`). Not the datagram count: those differ by
+    /// three orders of magnitude, and a counter named `bytes-sent` that held
+    /// `1000` for a megabyte of frames is a counter that lies.
     ///
     /// # Errors
     ///
@@ -692,16 +704,23 @@ impl NetworkPublication {
 
         let frames = bounds.len();
 
-        let sent = if frames > 0 {
-            let slices: Vec<&[u8]> = bounds
-                .iter()
-                .map(|(offset, length)| &scratch[*offset..*offset + *length])
-                .collect();
+        let slices: Vec<&[u8]> = bounds
+            .iter()
+            .map(|(offset, length)| &scratch[*offset..*offset + *length])
+            .collect();
 
+        let sent = if frames > 0 {
             endpoint.send(&slices)?
         } else {
             0
         };
+
+        // What this returns is **bytes**, not datagrams: the sender adds it to
+        // `bytes-sent`, and the reference's `send_data` returns the byte count
+        // its `do_send` accumulated (`aeron_network_publication.c:576`,
+        // `aeron_driver_sender.c:457`). A partial send is the first `sent`
+        // datagrams — `send` reports how many of the batch it took, in order.
+        let bytes_sent: usize = slices.iter().take(sent).map(|slice| slice.len()).sum();
 
         self.scratch = scratch;
 
@@ -727,7 +746,7 @@ impl NetworkPublication {
 
         let _ = position;
 
-        Ok(sent)
+        Ok(bytes_sent)
     }
 
     /// Serve what the retransmit handler owes
@@ -979,7 +998,10 @@ impl NetworkPublication {
             system.increment(system_counters::id::SHORT_SENDS);
         }
 
-        Ok(sent)
+        // Bytes, like the rest of the send path (`:576`). The reference
+        // discards this value; it is counted here only so that no caller has to
+        // know which of the send paths are in which unit.
+        Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
     /// An error frame arrived, which the reference treats as a receiver going
@@ -1597,18 +1619,19 @@ mod tests {
         let _ = counters.set_value(&regions, fixture.publication.counters.snd_lmt, 4096);
         let _ = counters.set_value(&regions, fixture.publication.counters.snd_pos, 0);
 
-        // The first send, which is what the NAK will say was lost.
-        assert_eq!(
-            1,
-            fixture
-                .publication
-                .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
-                .expect("a send")
-        );
+        // The first send, which is what the NAK will say was lost. `send_data`
+        // reports **bytes**, so what it returns is checked against what arrived
+        // rather than against a count of datagrams
+        // (`aeron_network_publication.c:576`).
+        let sent = fixture
+            .publication
+            .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
+            .expect("a send");
 
         let mut buffers = vec![vec![0u8; 2048]];
         let first = receive(&fixture.listener, &mut buffers);
         assert_eq!(1, first.len());
+        assert_eq!(first[0].len(), sent, "the bytes that went out");
 
         // The NAK names the whole frame, from its offset.
         let nak = NakFrame {
@@ -1746,11 +1769,10 @@ mod tests {
             .send_data(&mut endpoint, &system, &counters, &regions, 1_000)
             .expect("a send");
 
-        assert_eq!(1, sent, "one datagram");
-
         let mut buffers = vec![vec![0u8; MTU as usize + 64]];
         let datagrams = receive(&fixture.listener, &mut buffers);
-        assert_eq!(1, datagrams.len());
+        assert_eq!(1, datagrams.len(), "one datagram");
+        assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 
         // What arrived is the frame itself, header and all, with its published
         // length and the payload the producer wrote — and it is the *aligned*
@@ -1960,11 +1982,10 @@ mod tests {
             )
             .expect("a send");
 
-        assert_eq!(1, sent);
-
         let mut buffers = vec![vec![0u8; MTU as usize]];
         let datagrams = receive(&fixture.listener, &mut buffers);
-        assert_eq!(1, datagrams.len());
+        assert_eq!(1, datagrams.len(), "one datagram");
+        assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 
         let header = FrameHeader::read(&datagrams[0]).expect("a header");
         assert_eq!(frame_type::DATA, header.frame_type);

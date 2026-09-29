@@ -1307,6 +1307,17 @@ fn a_stream_that_fills_terms_arrives_whole_and_in_order() {
             counters_of(&own_cnc)
         );
     }
+
+    // `bytes-sent` is a **byte** count, not a datagram count. A thousand of
+    // these payloads is more than a megabyte of frames — each one 1000 bytes
+    // plus a 32-byte header, aligned to 32 — and the sender adds what each send
+    // path reports, which used to be datagrams and so read about a thousand.
+    let bytes_sent = counter_value_of(&own_cnc, deepmsg_driver::system_counters::id::BYTES_SENT);
+    assert!(
+        bytes_sent.is_some_and(|bytes| bytes >= 1_000_000),
+        "bytes-sent counts bytes, and a megabyte went out: {bytes_sent:?}\n{}",
+        counters_of(&own_cnc)
+    );
 }
 
 /// Pump both clients until the subscriber has `expected` messages, offering
