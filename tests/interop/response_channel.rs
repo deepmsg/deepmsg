@@ -119,7 +119,7 @@ impl FarEnd {
     }
     /// Send `frame` to `address`.
     fn send(&self, address: SocketAddr, frame: &[u8]) {
-        let _ = self.socket.send_batch(Some(address), &[&frame]);
+        let _ = self.socket.send_batch(Some(address), &[frame]);
     }
 
     /// Wait for the driver's `SETUP` on `stream_id`, and report what it said.

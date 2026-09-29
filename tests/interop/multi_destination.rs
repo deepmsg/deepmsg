@@ -356,10 +356,9 @@ impl ReferenceSubscriber {
         self.sample
             .output()
             .lines()
-            .filter(|line| {
+            .rfind(|line| {
                 line.starts_with("Available image ") || line.starts_with("Unavailable image ")
             })
-            .next_back()
             .is_some_and(|line| line.starts_with("Available image "))
     }
 
