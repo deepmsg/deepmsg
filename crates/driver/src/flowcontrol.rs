@@ -50,6 +50,9 @@ pub struct MaxOptions {
 pub enum FlowControlError {
     /// A strategy this build does not have.
     UnknownStrategy(String),
+    /// `fc=` with nothing before the first comma
+    /// (`aeron_flow_control.c:425-431`).
+    NoStrategyName,
     /// An option the strategy does not recognise.
     UnrecognisedOption(String),
     /// `rrwm:` with something that is not a positive number.
@@ -61,6 +64,9 @@ impl std::fmt::Display for FlowControlError {
         match self {
             Self::UnknownStrategy(name) => {
                 write!(f, "unknown flow control strategy: {name}")
+            }
+            Self::NoStrategyName => {
+                write!(f, "No flow control strategy name specified")
             }
             Self::UnrecognisedOption(option) => write!(
                 f,
@@ -156,6 +162,69 @@ impl Default for MaxStrategy {
 /// window itself, because the receiver asks for what it is missing and the
 /// answer is bounded by the term rather than by the window most of the time.
 pub const UNICAST_RRWM_DEFAULT: usize = 16;
+
+/// The default retransmit receiver window multiple for a **multicast or
+/// multi-destination** endpoint
+/// (`AERON_MULTICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE`,
+/// `aeron-driver/src/main/c/aeron_flow_control.h:30`, which the context starts
+/// from at `aeron_driver_context.c:504`).
+///
+/// Four receiver windows against unicast's sixteen. A multicast retransmission
+/// goes to every receiver on the group, so it is held to what the receiver that
+/// asked could hold rather than to what the term allows.
+pub const MULTICAST_RRWM_DEFAULT: usize = 4;
+
+/// The strategy an endpoint's channel asks for
+/// (`aeron_default_multicast_flow_control_strategy_supplier`,
+/// `aeron_flow_control.c:400-475`).
+///
+/// The selector is entered for **every** publication and takes the *endpoint's*
+/// channel (`aeron_driver_conductor.c:4492-4496`), not the publication's. What
+/// it branches on is whether that channel is multi-destination or multicast.
+///
+/// A **unicast** channel never looks at `fc=`: the unicast supplier is chosen
+/// outright and the parameter is ignored
+/// (`aeron_unicast_flow_control_strategy_supplier`, `:326-365`, which reads no
+/// options at all). So a unicast channel naming `fc=min` is not refused for it —
+/// it is served as though the parameter were not there. This build used to parse
+/// `fc=` on every channel and answer `GENERIC_ERROR` for anything but `max`,
+/// which is a refusal the reference does not make.
+///
+/// A **multi-destination** channel reads it, and the name before the first comma
+/// picks the supplier: `max` is the only one this build has, so `min` and
+/// `tagged` come back as strategies it does not have rather than as malformed
+/// channels. No `fc=` at all falls to the context's multicast supplier, which is
+/// `max` (`aeron_driver_context.c:201`).
+///
+/// # Errors
+///
+/// [`FlowControlError::NoStrategyName`] for an `fc=` with nothing before its
+/// first comma, [`FlowControlError::UnknownStrategy`] for a name this build
+/// cannot serve, and the option errors of [`MaxStrategy::from_options`].
+pub fn strategy_for_channel(
+    is_multi_destination: bool,
+    fc: Option<&str>,
+    unicast_rrwm: usize,
+    multicast_rrwm: usize,
+) -> Result<MaxStrategy, FlowControlError> {
+    if !is_multi_destination {
+        return Ok(MaxStrategy {
+            retransmit_receiver_window_multiple: unicast_rrwm,
+        });
+    }
+
+    let Some(options) = fc else {
+        return Ok(MaxStrategy {
+            retransmit_receiver_window_multiple: multicast_rrwm,
+        });
+    };
+
+    match options.split(',').next().unwrap_or("") {
+        "max" => MaxStrategy::from_options(multicast_rrwm, Some(options)),
+        "" => Err(FlowControlError::NoStrategyName),
+        name => Err(FlowControlError::UnknownStrategy(name.to_owned())),
+    }
+}
 
 impl MaxStrategy {
     /// The strategy the reference builds from a `fc=max` channel: the driver's
@@ -382,6 +451,83 @@ mod tests {
             MaxStrategy::from_options(UNICAST_RRWM_DEFAULT, Some("max,rrwm:7"))
                 .expect("a strategy")
                 .retransmit_receiver_window_multiple
+        );
+    }
+
+    /// A unicast channel never reads `fc=`. The reference picks the unicast
+    /// supplier outright and hands it no options at all
+    /// (`aeron_unicast_flow_control_strategy_supplier`, `aeron_flow_control.c:326-365`),
+    /// so a parameter naming a strategy this driver does not have is not a
+    /// refusal — it is a parameter that was never consulted.
+    ///
+    /// This build used to parse `fc=` on every channel and answer
+    /// `GENERIC_ERROR` for anything but `max`, which the reference does not do.
+    #[test]
+    fn a_unicast_channel_is_served_as_though_fc_were_not_there() {
+        let rrwm = |fc| {
+            strategy_for_channel(false, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
+                .expect("a unicast channel cannot be refused for its `fc=`")
+                .retransmit_receiver_window_multiple
+        };
+
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(None));
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("max")));
+        // Not `7`: the option is not read either.
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("max,rrwm:7")));
+        // And not an error, which is the whole point.
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("min")));
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("tagged")));
+        assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("nonsense")));
+    }
+
+    /// A multi-destination channel does read it, and no `fc=` at all falls to
+    /// the context's multicast supplier, which is `max`
+    /// (`aeron_driver_context.c:201`).
+    #[test]
+    fn a_multi_destination_channel_reads_fc_and_defaults_to_four() {
+        let rrwm = |fc| {
+            strategy_for_channel(true, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
+                .expect("a strategy")
+                .retransmit_receiver_window_multiple
+        };
+
+        assert_eq!(4, MULTICAST_RRWM_DEFAULT, "the context's own default");
+        assert_eq!(MULTICAST_RRWM_DEFAULT, rrwm(None));
+        assert_eq!(MULTICAST_RRWM_DEFAULT, rrwm(Some("max")));
+        assert_eq!(
+            7,
+            rrwm(Some("max,rrwm:7")),
+            "the option is read here, unlike the unicast branch"
+        );
+    }
+
+    /// The two strategies this build does not have come back as such, and an
+    /// `fc=` with nothing before its comma is the reference's own distinct
+    /// refusal (`aeron_flow_control.c:425-431`).
+    #[test]
+    fn a_multi_destination_channel_naming_a_strategy_this_build_lacks_is_refused() {
+        let refusal = |fc| {
+            strategy_for_channel(true, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
+                .expect_err("this build cannot serve that strategy")
+        };
+
+        assert_eq!(
+            FlowControlError::UnknownStrategy("min".to_owned()),
+            refusal(Some("min"))
+        );
+        assert_eq!(
+            FlowControlError::UnknownStrategy("tagged".to_owned()),
+            refusal(Some("tagged"))
+        );
+        assert_eq!(
+            FlowControlError::UnknownStrategy("cubic".to_owned()),
+            refusal(Some("cubic"))
+        );
+        assert_eq!(FlowControlError::NoStrategyName, refusal(Some("")));
+        assert_eq!(
+            FlowControlError::NoStrategyName,
+            refusal(Some(",rrwm:7")),
+            "a comma straight away is the same as nothing at all"
         );
     }
 }

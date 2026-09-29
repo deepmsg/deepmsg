@@ -60,6 +60,21 @@ pub enum ControlMode {
     Response,
 }
 
+impl ControlMode {
+    /// Whether a channel in this mode is a **multi-destination** channel
+    /// (`aeron_udp_channel_is_multi_destination`,
+    /// `media/aeron_udp_channel.h:147-151`).
+    ///
+    /// That is not "has had a destination added": it is a property of the
+    /// control mode, and it is what makes a channel a member of the
+    /// multi-destination *category* — the thing that decides whether the send
+    /// endpoint keeps a destination tracker, whether the channel has group
+    /// semantics, and which flow-control supplier it gets.
+    pub const fn is_multi_destination(self) -> bool {
+        matches!(self, Self::Manual | Self::Dynamic)
+    }
+}
+
 /// Which address the channel's `interface=` parameter asked for
 /// (`aeron_interface_split`, `aeron-client/src/main/c/util/aeron_parse_util.c:455-560`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +202,27 @@ impl From<UriError> for UdpChannelError {
 }
 
 impl UdpChannel {
+    /// Whether this is a multi-destination channel
+    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+    pub const fn is_multi_destination(&self) -> bool {
+        self.control_mode.is_multi_destination()
+    }
+
+    /// Whether this channel has group semantics
+    /// (`aeron_udp_channel_has_group_semantics`, `media/aeron_udp_channel.h:153-156`):
+    /// multicast, or multi-destination.
+    ///
+    /// The two are one predicate in the reference because both name a channel
+    /// that may have several receivers at once, which is what the setup frame's
+    /// `GROUP` flag and the log buffer's `group` byte are about. In this build
+    /// the multicast arm is unreachable — multicast channels are refused at
+    /// parse (`aeron_udp_channel.c` is not consulted for them here) — so the
+    /// multi-destination arm is the whole of it, and the `||` is kept so the
+    /// predicate reads as the reference's.
+    pub const fn has_group_semantics(&self) -> bool {
+        self.is_multicast || self.control_mode.is_multi_destination()
+    }
+
     /// Read a `aeron:udp` URI into the addresses an endpoint works with
     /// (`aeron_udp_channel_finish_parse`, `aeron_udp_channel.c:278-523`).
     ///
@@ -954,6 +990,53 @@ mod tests {
         );
         assert_eq!(ControlMode::Dynamic, channel.control_mode);
         assert!(channel.has_explicit_control);
+    }
+
+    /// A multi-destination channel is one whose **control mode** says so, not
+    /// one that has had a destination added
+    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+    ///
+    /// This is the fact the rest of P1-5 hangs off: it decides whether a send
+    /// endpoint keeps a destination tracker, whether the channel has group
+    /// semantics, and which flow-control supplier it is given.
+    #[test]
+    fn the_control_mode_is_what_makes_a_channel_multi_destination() {
+        assert!(
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual")
+                .is_multi_destination()
+        );
+        assert!(
+            resolve(
+                "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=dynamic"
+            )
+            .is_multi_destination()
+        );
+
+        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:40123").is_multi_destination());
+        assert!(
+            !resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=nonsense")
+                .is_multi_destination(),
+            "an unknown control mode is no mode at all (`:309-323`)"
+        );
+
+        // `response` is a control mode that is not a multi-destination one, and
+        // it cannot be reached through `resolve` yet — this build refuses the
+        // channel outright (`:459-460`), so the mode is asked directly.
+        assert!(!ControlMode::Response.is_multi_destination());
+    }
+
+    #[test]
+    fn group_semantics_follow_the_multi_destination_category() {
+        assert!(
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual").has_group_semantics()
+        );
+        assert!(
+            resolve(
+                "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=dynamic"
+            )
+            .has_group_semantics()
+        );
+        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:40123").has_group_semantics());
     }
 
     #[test]

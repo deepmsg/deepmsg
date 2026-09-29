@@ -271,7 +271,11 @@ impl NetworkPublication {
                 // Group semantics, a response channel, a rejoin and a reliable
                 // stream are multicast or response-channel ideas: a unicast
                 // publication writes them false (`:226-229`).
-                group: 0u8,
+                //
+                // `group` is not among the ones this build always answers false
+                // to — it is the endpoint channel's group semantics, the same
+                // value the setup frame's `GROUP` flag carries (`:136`, `:224`).
+                group: u8::from(retransmit_handler.has_group_semantics()),
                 is_response: false,
                 rejoin: false,
                 reliable: false,
@@ -2117,5 +2121,92 @@ mod tests {
             1,
         )
         .expect("an endpoint")
+    }
+
+    /// The descriptor's `group` byte, read straight out of the log file
+    /// (`GROUP_OFFSET`, `aeron_logbuffer_descriptor.h:74`).
+    ///
+    /// The descriptor sits at the **end** of the file, after the terms
+    /// (`metadata_offset = length - METADATA_LENGTH`,
+    /// `crates/core/src/logbuffer/logfile.rs:90`) — not at the start, which is
+    /// where the terms are.
+    fn group_byte(path: &std::path::Path) -> u8 {
+        use deepmsg_core::logbuffer::descriptor;
+
+        let length = std::fs::metadata(path).expect("the log file").len() as usize;
+        let offset = length - descriptor::METADATA_LENGTH + descriptor::GROUP_OFFSET;
+
+        let mapping =
+            deepmsg_core::pal::MappedFile::open_readonly(path).expect("map the log buffer");
+        let region = mapping.region(offset, 1).expect("the descriptor byte");
+
+        region.load_u8(0).expect("readable")
+    }
+
+    /// The log buffer's `group` byte is the **endpoint channel's** group
+    /// semantics — the same value the setup frame's `GROUP` flag carries
+    /// (`aeron_network_publication_create` computes it at `:136` and writes it
+    /// into the descriptor at `:224`).
+    ///
+    /// A reader of the log buffer uses that byte to tell a multicast or
+    /// multi-destination stream from a unicast one, so a publication that left
+    /// it at zero while putting `GROUP` on the wire would be describing itself
+    /// two different ways. This build did exactly that: the flag was read from
+    /// the handler, which was built with a hardcoded `false`.
+    #[test]
+    fn the_log_buffer_says_whether_the_channel_has_group_semantics() {
+        for (has_group_semantics, expected) in [(false, 0u8), (true, 1u8)] {
+            let dir = TempDir::new();
+            let log = dir.log_buffer(TERM_LENGTH);
+
+            let listener = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            listener
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            listener.set_nonblocking().expect("non-blocking");
+            let bound = listener.local_address().expect("a bound address");
+
+            let uri = format!("aeron:udp?endpoint={bound}");
+            let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+            let _channel = UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel");
+
+            let _publication = NetworkPublication::create(
+                7,
+                9,
+                42,
+                1001,
+                1,
+                uri.as_bytes(),
+                log,
+                &params(TERM_LENGTH, MTU, 32 * 1024),
+                false,
+                PublicationCounters {
+                    pub_pos: 0,
+                    pub_lmt: 1,
+                    snd_pos: 2,
+                    snd_lmt: 3,
+                    snd_bpe: 4,
+                    snd_naks_received: 5,
+                },
+                4,
+                MaxStrategy::default(),
+                RetransmitHandler::new(0, 5_000_000, has_group_semantics, 1),
+                4096,
+                crate::sys::SocketBufferLengths {
+                    rcvbuf: 0,
+                    sndbuf: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .expect("a publication");
+
+            assert_eq!(
+                expected,
+                group_byte(&dir.0.join("publication.logbuffer")),
+                "group semantics {has_group_semantics}"
+            );
+        }
     }
 }

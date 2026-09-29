@@ -39,7 +39,6 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
 use crate::config::DriverConfig;
-use crate::flowcontrol::MaxStrategy;
 use crate::ipc_publication::ShareMismatch;
 use crate::ipc_publications::{AddError, Now, SessionIds};
 use crate::media::TransportParams;
@@ -64,6 +63,21 @@ struct PendingNetworkPublication {
     is_exclusive: bool,
     /// The channel as the client sent it.
     channel: Vec<u8>,
+    /// The channel of the **endpoint** this publication will send through.
+    ///
+    /// Not always the same channel as the one above, and it is this one that
+    /// decides the flow control, the group flag and the log buffer's `group`
+    /// byte (`aeron_network_publication_create` reads
+    /// `endpoint->conductor_fields.udp_channel`, `:136`; the strategy selector
+    /// is handed the same one, `aeron_driver_conductor.c:4492-4496`). A second
+    /// publication can share an endpoint whose agreement check looks at
+    /// timestamp offsets, MTU and buffer lengths and at neither `control-mode`
+    /// nor `fc=` (`validate_channel_against_send_channel_endpoint`,
+    /// `:1907-1953`), and the canonical form two channels have to match carries
+    /// only the two addresses (`aeron_uri_udp_canonicalise`,
+    /// `aeron_udp_channel.c:148-208`) — so the endpoint keeps the channel it was
+    /// created from, and that is the channel read.
+    endpoint_channel: UdpChannel,
     /// The parameters the URI resolved to.
     params: PublicationParams,
     /// The endpoint the publication will send through.
@@ -220,6 +234,11 @@ impl NetworkPublications {
         // second publication on the same channel shares it.
         let endpoint_params = transport_params(config, &channel);
 
+        // `get_or_add` consumes the channel, and the fallback below needs one
+        // even though it should never be reached: the registry always holds an
+        // entry for an id it just handed out.
+        let named_channel = channel.clone();
+
         let outcome = endpoints
             .get_or_add(
                 channel,
@@ -252,6 +271,15 @@ impl NetworkPublications {
                 return Err(AddError::AgentStopped);
             }
         }
+
+        // The endpoint's channel, which is what the decisions below are made
+        // from — see the field's note for why it is not this publication's.
+        // `get_or_add` has already registered the entry either way, so the
+        // fallback is a wrong strategy rather than a panic if that ever stops
+        // being true.
+        let endpoint_channel = endpoints
+            .get(endpoint_id)
+            .map_or_else(|| named_channel.clone(), |entry| entry.channel.clone());
 
         // A publication that already exists on this endpoint and stream may be
         // shared (`:4287-4320`).
@@ -342,6 +370,7 @@ impl NetworkPublications {
             stream_id: request.stream_id,
             is_exclusive,
             channel: request.channel.to_vec(),
+            endpoint_channel,
             params,
             endpoint_id,
             channel_status_counter_id,
@@ -443,15 +472,20 @@ impl NetworkPublications {
         now: Now,
         events: &mut impl ClientEvents,
     ) {
-        // `fc=` names the flow-control strategy; the unicast default is `max`
-        // (`aeron_flow_control_strategy_supplier_load`, `aeron_flow_control.c:74-79`).
+        // The flow-control strategy comes from the **endpoint's** channel, and a
+        // unicast one never reads `fc=` at all — see
+        // [`crate::flowcontrol::strategy_for_channel`], which is the selector
+        // `aeron_default_multicast_flow_control_strategy_supplier`
+        // (`aeron_flow_control.c:400-475`) in Rust.
         let fc = ChannelUri::parse(&pending.channel)
             .ok()
             .and_then(|uri| uri.value("fc").map(str::to_owned));
 
-        let flow_control = match MaxStrategy::from_options(
-            crate::flowcontrol::UNICAST_RRWM_DEFAULT,
+        let flow_control = match crate::flowcontrol::strategy_for_channel(
+            pending.endpoint_channel.is_multi_destination(),
             fc.as_deref(),
+            crate::flowcontrol::UNICAST_RRWM_DEFAULT,
+            crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
         ) {
             Ok(strategy) => strategy,
             Err(error) => {
@@ -467,10 +501,15 @@ impl NetworkPublications {
         // The retransmit handler's delay is the driver's unicast delay — zero
         // when nothing configured it, which is what makes a NAK answered at
         // once (`aeron_network_publication_create`, `:145-160`).
+        //
+        // Group semantics come from the endpoint's channel too (`:136`), and
+        // they are not only the setup frame's `GROUP` flag: the handler holds a
+        // section per receiver when a channel has them, and the log buffer's
+        // `group` byte is written from the same value (`:224`).
         let retransmit_handler = RetransmitHandler::new(
             config.retransmit_unicast_delay_ns,
             config.retransmit_unicast_linger_ns,
-            false,
+            pending.endpoint_channel.has_group_semantics(),
             usize::try_from(pending.params.max_resend.max(0))
                 .unwrap_or(1)
                 .max(1),
