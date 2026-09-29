@@ -203,6 +203,31 @@ pub struct PublicationImage {
     pub time_of_last_state_change_ns: i64,
 }
 
+/// Where a stream starts, and the term geometry that says so, from the `SETUP`
+/// that described it (`aeron_publication_image.c:377-392`).
+///
+/// The stream begins at the sender's **active** term and offset, not at zero:
+/// an image is created for a stream that is already running, and a subscription
+/// that links to that image begins reading at the same place
+/// (`aeron_publication_image.h:376-396`).
+///
+/// The fallback for a term length that is not a power of two is the one
+/// `aeron_publication_image_create` has always used, kept here so that the two
+/// callers agree on it.
+pub fn stream_start(setup: &crate::protocol::SetupFrame) -> (i64, u32) {
+    let bits = deepmsg_core::logbuffer::position::bits_to_shift(setup.term_length).unwrap_or(16);
+
+    let position = Position::new(
+        setup.active_term_id,
+        setup.term_offset,
+        bits,
+        setup.initial_term_id,
+    )
+    .raw();
+
+    (position, bits)
+}
+
 impl PublicationImage {
     /// Create an image over a log buffer the conductor has already mapped
     /// (`aeron_publication_image_create`,
@@ -227,15 +252,7 @@ impl PublicationImage {
         untethered: SubscriptionParams,
         now_ns: i64,
     ) -> Self {
-        let bits =
-            deepmsg_core::logbuffer::position::bits_to_shift(setup.term_length).unwrap_or(16);
-        let initial_position = Position::new(
-            setup.active_term_id,
-            setup.term_offset,
-            bits,
-            setup.initial_term_id,
-        )
-        .raw();
+        let (initial_position, bits) = stream_start(setup);
 
         // The window the receiver offers: its configured one, cut to half a
         // term because a receiver needs the other half to keep reading

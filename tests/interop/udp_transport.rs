@@ -1328,6 +1328,11 @@ fn a_stream_that_fills_terms_arrives_whole_and_in_order() {
 /// phase continues the stream rather than repeating it — and `offer_until`,
 /// rather than a global cap, is what keeps the first phase from spending the
 /// messages the second one needs.
+/// How many messages one pass of [`pump_until`] may publish. Small enough that
+/// the stream is still moving when the next subscriber joins, large enough that
+/// a test does not take all day.
+const OFFER_BATCH: usize = 8;
+
 #[allow(clippy::too_many_arguments)] // two clients, their two ids, and the bounds
 fn pump_until(
     publisher: &mut Client,
@@ -1346,11 +1351,22 @@ fn pump_until(
         publisher.poll();
         subscriber.poll();
 
-        // Offering stops by itself once the window closes: a log buffer with no
-        // reader filling it answers `EndOfLog`.
-        while *index < offer_until {
+        // A few at a time, not as many as the window takes. A publisher that
+        // empties its whole allowance in one pass is a stream that has already
+        // finished by the time a subscriber arrives, which is not the stream a
+        // late subscriber meets — and the point of the second phase is that the
+        // stream is still running when it joins.
+        //
+        // Offering also stops by itself once the window closes: a log buffer
+        // with no reader filling it answers `EndOfLog`.
+        let mut batch = OFFER_BATCH;
+
+        while batch > 0 && *index < offer_until {
             match publisher.offer(publication_id, &stream_payload(*index)) {
-                Some(Appended::Ok { .. }) => *index += 1,
+                Some(Appended::Ok { .. }) => {
+                    *index += 1;
+                    batch -= 1;
+                }
                 Some(_) | None => break,
             }
         }
@@ -1542,7 +1558,7 @@ fn a_receiver_that_restarts_is_answered_with_a_setup() {
         .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the UDP subscription");
 
-    pump_until(
+    let after_restart = pump_until(
         &mut publisher,
         publication_id,
         &mut second,
@@ -1560,20 +1576,16 @@ fn a_receiver_that_restarts_is_answered_with_a_setup() {
     let _ = second_driver.stop();
     let _ = publisher_driver.stop();
 
-    // The claim under test is the image, which is what the `SETUP` buys:
-    // without one the receiver never learns the session's term length, initial
-    // term id or starting position, and has nothing to read from at all.
-    //
-    // What arrives *after* the image is built is deliberately not asserted
-    // here. The restarted subscriber's driver does receive the stream — its
-    // `rcv-hwm` reaches the publisher's `snd-pos` — but the image is created at
-    // position 0 rather than at the position the `SETUP` carried, so it has
-    // never been readable. That is a separate defect on the receiving side, and
-    // it is recorded rather than fixed in this batch.
+    // Two claims, and the second is the one that took the work. The image is
+    // what the `SETUP` buys; the message is what the image is for. A receiver
+    // that restarts has to be answered *and* has to go on reading from where
+    // the stream is — an image whose position counters start at zero is owed
+    // everything from the beginning, and the beginning is not there any more
+    // (`aeron_publication_image.c:391-392`).
     assert!(
-        images_of(&second, second_id) > 0,
-        "a subscriber that restarted asked for a `SETUP` and was given nothing, so it built \
-         no image.\nthe restarted subscriber sees:\n{view}\nrestarted driver's counters:\n\
+        !after_restart.is_empty(),
+        "a subscriber that restarted asked for a `SETUP` and then read nothing.\n\
+         the restarted subscriber sees:\n{view}\nrestarted driver's counters:\n\
          {second_counters}\npublisher's counters:\n{publisher_counters}\n\
          publisher's log:\n{log}"
     );

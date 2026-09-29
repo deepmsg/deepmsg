@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
-use deepmsg_driver::protocol::StatusMessageFrame;
+use deepmsg_driver::protocol::{SetupFrame, StatusMessageFrame};
 use deepmsg_driver::sys::AddressFamily;
 use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT};
@@ -63,6 +63,7 @@ fn aeron_stat_reads_the_network_counters_a_udp_session_moves() {
     let mut datagrams = Datagrams::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut publisher_address = None;
+    let mut setup = None;
 
     while Instant::now() < deadline && publisher_address.is_none() {
         publisher.poll();
@@ -74,7 +75,7 @@ fn aeron_stat_reads_the_network_counters_a_udp_session_moves() {
         for (slot, datagram) in datagrams.as_slice()[..received].iter().enumerate() {
             if datagram.length > 0 {
                 publisher_address = Some(datagram.source.expect("a source"));
-                let _ = slot;
+                setup = SetupFrame::read(&buffers[slot][..datagram.length]);
             }
         }
 
@@ -82,15 +83,26 @@ fn aeron_stat_reads_the_network_counters_a_udp_session_moves() {
     }
 
     let publisher_address = publisher_address.expect("the publication says SETUP before it sends");
+    let setup = setup.expect("the first thing a publication says is a SETUP");
 
     // One status message: a receiver with room for 64 KiB, which is what opens
     // the publication's window.
+    //
+    // It reports the position the `SETUP` described — where the publisher is —
+    // because that is what a receiver reports, and because the publisher is
+    // required to refuse anything else: a position outside half a term behind
+    // `snd-pos` to a term and a half in front of it is not one the publication
+    // can act on (`aeron_network_publication.c:841-856`). Zeros are not a
+    // position either — against a random `initial_term_id` they resolve to
+    // somewhere astronomically far from the stream, and this fixture used to
+    // send exactly that, which only worked while the driver was laxer than the
+    // reference.
     let session_id = session_of(&own_cnc, publication_id);
     let sm = StatusMessageFrame {
         session_id,
         stream_id: STREAM_ID,
-        consumption_term_id: 0,
-        consumption_term_offset: 0,
+        consumption_term_id: setup.active_term_id,
+        consumption_term_offset: setup.term_offset,
         receiver_window: 64 * 1024,
         receiver_id: 1,
     };
