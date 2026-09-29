@@ -89,6 +89,13 @@ pub struct SendChannelEndpoint {
     /// The `snd-channel` counter, whose value is the endpoint's
     /// [`EndpointStatus`].
     channel_status_counter_id: i32,
+    /// The `snd-local-sockaddr` counter, whose **key** is the address the
+    /// socket was actually bound to (`aeron_send_channel_endpoint.c:211-228`).
+    ///
+    /// The port is the reason it exists: a channel is allowed to name port
+    /// zero, and then the port the kernel chose is readable from nowhere else.
+    /// A client that has to tell someone where to reply finds it here.
+    local_sockaddr_counter_id: i32,
     /// Where data is sent. The channel's remote address until a re-resolution
     /// moves it (P1-5).
     current_data_addr: SocketAddr,
@@ -179,6 +186,25 @@ impl SendChannelEndpoint {
                 }
             };
 
+        let local_sockaddr_counter_id = match publish_local_sockaddr(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &transport,
+            counters,
+            regions,
+            registration_id,
+            now_ms,
+        ) {
+            Ok(counter_id) => counter_id,
+            Err(error) => {
+                if let Some(tracker) = &destination_tracker {
+                    counters.free(regions, tracker.num_destinations_counter_id(), now_ms);
+                }
+                counters.free(regions, channel_status_counter_id, now_ms);
+                return Err(error);
+            }
+        };
+
         Ok(Self {
             current_data_addr: channel.remote_data,
             channel,
@@ -186,6 +212,7 @@ impl SendChannelEndpoint {
             data_loss_generator: None,
             destination_tracker,
             channel_status_counter_id,
+            local_sockaddr_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -228,6 +255,25 @@ impl SendChannelEndpoint {
                 }
             };
 
+        let local_sockaddr_counter_id = match publish_local_sockaddr(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &*transport,
+            counters,
+            regions,
+            registration_id,
+            now_ms,
+        ) {
+            Ok(counter_id) => counter_id,
+            Err(error) => {
+                if let Some(tracker) = &destination_tracker {
+                    counters.free(regions, tracker.num_destinations_counter_id(), now_ms);
+                }
+                counters.free(regions, channel_status_counter_id, now_ms);
+                return Err(error);
+            }
+        };
+
         Ok(Self {
             current_data_addr: channel.remote_data,
             channel,
@@ -235,6 +281,7 @@ impl SendChannelEndpoint {
             data_loss_generator: None,
             destination_tracker,
             channel_status_counter_id,
+            local_sockaddr_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -282,16 +329,27 @@ impl SendChannelEndpoint {
         )
     }
 
-    /// Hand this endpoint's freed counter back, when the endpoint is gone
+    /// Hand this endpoint's counters back, when the endpoint is gone
     /// (`aeron_send_channel_endpoint_delete`,
-    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:268-290`).
+    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:250-269`,
+    /// which frees the channel status, the local sockaddr and the destination
+    /// count, in that order). The answer is the channel status's, which is the
+    /// one callers act on.
     pub fn free_counter(
         &self,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         now_ms: i64,
     ) -> bool {
-        counters.free(regions, self.channel_status_counter_id, now_ms)
+        let channel_status = counters.free(regions, self.channel_status_counter_id, now_ms);
+        counters.free(regions, self.local_sockaddr_counter_id, now_ms);
+        channel_status
+    }
+
+    /// The `snd-local-sockaddr` counter a client reads to learn the address
+    /// this endpoint's socket was bound to.
+    pub const fn local_sockaddr_counter_id(&self) -> i32 {
+        self.local_sockaddr_counter_id
     }
 
     /// Add a publication to the dispatch map
@@ -530,6 +588,77 @@ impl std::error::Error for SendEndpointError {}
 ///
 /// Returns the parameter that disagreed, with what was asked for and what
 /// exists, or `None` when both agree.
+/// Publish the address the socket was bound to, the two ways the reference
+/// publishes it (`aeron_send_channel_endpoint.c:158-228`): the channel status's
+/// label gains the address, and a counter of type 14 is allocated whose **key**
+/// is the address.
+///
+/// The socket is asked rather than the channel believed. A channel may name
+/// port zero — a multi-destination one usually does — and the kernel's answer
+/// is the only true one.
+///
+/// # Errors
+///
+/// [`SendEndpointError::Socket`] when the socket has no address to report, or
+/// [`SendEndpointError::NoCounter`] when the manager is full. The caller is
+/// left holding the counter it already allocated, and frees it.
+fn publish_local_sockaddr(
+    channel_status_counter_id: i32,
+    channel: &[u8],
+    transport: &dyn Transport,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    registration_id: i64,
+    now_ms: i64,
+) -> Result<i32, SendEndpointError> {
+    let local_sockaddr = crate::udp_channel::format_source_identity(
+        transport
+            .local_address()
+            .map_err(SendEndpointError::Socket)?,
+    )
+    .map_err(|error| SendEndpointError::Socket(io::Error::other(error)))?;
+
+    // `"%s: %.*s %.*s"` — the name, the channel, the address
+    // (`aeron_position.c:229-244`), replacing the label the counter was
+    // allocated with. The channel is bytes rather than text, as it is there:
+    // it is whatever the client sent, and this end never decodes it.
+    let mut label = format!("{}: ", counter_position::SEND_CHANNEL_STATUS_NAME).into_bytes();
+    label.extend_from_slice(channel);
+    label.push(b' ');
+    label.extend_from_slice(local_sockaddr.as_bytes());
+
+    counters
+        .update_label(regions, channel_status_counter_id, &label)
+        .ok_or(SendEndpointError::NoCounter)?;
+
+    let counter_id = counter_position::allocate_local_sockaddr_counter(
+        counters,
+        regions,
+        counter_position::SEND_LOCAL_SOCKADDR_NAME,
+        registration_id,
+        channel_status_counter_id,
+        &local_sockaddr,
+        now_ms,
+    )
+    .ok_or(SendEndpointError::NoCounter)?;
+
+    // The value is the endpoint's state, as the channel status's is: the
+    // counter being there is the news, and a reader reads the key.
+    if counters
+        .set_value(
+            regions,
+            counter_id,
+            counter_position::channel_status::ACTIVE,
+        )
+        .is_none()
+    {
+        counters.free(regions, counter_id, now_ms);
+        return Err(SendEndpointError::NoCounter);
+    }
+
+    Ok(counter_id)
+}
+
 /// The destination tracker a channel gets, and the `mdc-num-dest` counter that
 /// goes with it (`aeron_send_channel_endpoint_create`, `:61-88`, `:182-188`).
 ///

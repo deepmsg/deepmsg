@@ -788,6 +788,10 @@ mod tests {
             )
             .expect("an endpoint");
 
+        let EndpointOutcome::Created { endpoint, .. } = &outcome else {
+            panic!("the first channel creates the endpoint");
+        };
+        let bound = endpoint.local_address().expect("a bound address");
         let id = outcome.channel_status_counter_id();
 
         // Decoded the way a client decodes it, through the counter region's
@@ -805,14 +809,16 @@ mod tests {
             descriptor.type_id
         );
         assert_eq!(77, descriptor.registration_id);
-        assert_eq!(
-            "snd-channel: aeron:udp?endpoint=127.0.0.1:40123",
-            descriptor.label
-        );
+        // The label is the channel **and the address the socket was bound to**
+        // (`aeron_position.c:229-244`, called from
+        // `media/aeron_send_channel_endpoint.c:202-210`). The channel named no
+        // local port, so the kernel chose one, and the label is where a reader
+        // finds which.
+        let uri = "aeron:udp?endpoint=127.0.0.1:40123";
+        assert_eq!(format!("snd-channel: {uri} {bound}"), descriptor.label);
 
         // Its key is the channel's length and the channel
         // (`aeron_channel_endpoint_status_key_layout_t`).
-        let uri = "aeron:udp?endpoint=127.0.0.1:40123";
         let key = regions.reader().key(id).expect("a key");
         assert_eq!(
             i32::try_from(uri.len()).expect("small"),
@@ -826,6 +832,88 @@ mod tests {
         assert_eq!(
             Some(counter_position::channel_status::ACTIVE),
             counters.value(&regions, id)
+        );
+    }
+
+    #[test]
+    fn the_local_sockaddr_counter_is_the_address_the_socket_was_bound_to() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+
+        let outcome = endpoints
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                &defaults(),
+                &mut counters,
+                &regions,
+                78,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+
+        let EndpointOutcome::Created { endpoint, .. } = &outcome else {
+            panic!("the first channel creates the endpoint");
+        };
+
+        let id = endpoint.local_sockaddr_counter_id();
+        let mut descriptor = None;
+        regions.reader().for_each(|entry| {
+            if entry.counter_id == id {
+                descriptor = Some(entry.clone());
+            }
+        });
+        let descriptor = descriptor.expect("a counter");
+
+        // Type 14, registered to this endpoint
+        // (`aeron_counter_local_sockaddr_indicator_allocate`,
+        // `aeron_position.c:276-311`).
+        assert_eq!(counter_position::LOCAL_SOCKADDR_TYPE_ID, descriptor.type_id);
+        assert_eq!(78, descriptor.registration_id);
+
+        // Its value is the endpoint's state, as the channel status's is: the
+        // counter being there is the news.
+        assert_eq!(
+            Some(counter_position::channel_status::ACTIVE),
+            counters.value(&regions, id)
+        );
+
+        // And its **key** is the address — which is the whole reason it
+        // exists, because this channel names no local port and the kernel
+        // chose one. The layout is the channel status's id, the length, then
+        // the text (`aeron_local_sockaddr_key_layout_t`).
+        let bound = endpoint
+            .local_address()
+            .expect("a bound address")
+            .to_string();
+
+        // The socket's address, not the channel's: the channel's `endpoint` is
+        // where this endpoint *sends*, and it is a different address entirely.
+        assert_ne!("127.0.0.1:40123", bound);
+
+        let key = regions.reader().key(id).expect("a key");
+        assert_eq!(
+            outcome.channel_status_counter_id().to_le_bytes().as_slice(),
+            &key[..4]
+        );
+        assert_eq!(
+            i32::try_from(bound.len()).expect("small"),
+            i32::from_le_bytes(key[4..8].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            bound,
+            String::from_utf8_lossy(&key[8..8 + bound.len()]).to_string()
+        );
+
+        // The label says the same thing in text, with the channel status id
+        // first (`aeron_position.c:295-297`).
+        assert_eq!(
+            format!(
+                "snd-local-sockaddr: {} {bound}",
+                outcome.channel_status_counter_id()
+            ),
+            descriptor.label
         );
     }
 

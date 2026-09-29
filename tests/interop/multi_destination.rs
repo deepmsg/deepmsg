@@ -332,6 +332,19 @@ impl ReferenceSubscriber {
             .collect()
     }
 
+    /// The port the sample reported as the source of the image it has — this
+    /// driver's address, as the wire saw it
+    /// (`aeron-samples/src/main/cpp/BasicSubscriber.cpp:110-116`).
+    fn image_source_port(&self) -> Option<u16> {
+        self.sample
+            .output()
+            .lines()
+            .find(|line| line.starts_with("Available image "))
+            .and_then(|line| line.rsplit_once("from ").map(|(_head, address)| address))
+            .and_then(|address| address.trim().rsplit_once(':'))
+            .and_then(|(_ip, port)| port.trim().parse().ok())
+    }
+
     /// Whether this subscriber has an image right now: the last thing it said
     /// about images was that one became available.
     ///
@@ -739,15 +752,7 @@ fn removing_a_destination_leaves_the_other_one_receiving() {
 /// The label rather than the number is matched: ids are handed out in
 /// allocation order, and only the label says what a counter *is*.
 fn mdc_num_dest(stat_binary: &Path, dir: &Path) -> Result<i64, String> {
-    let output = std::process::Command::new(stat_binary)
-        .arg("-d")
-        .arg(dir)
-        .arg("-w")
-        .arg("false")
-        .output()
-        .map_err(|error| format!("run AeronStat: {error}"))?;
-
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = aeron_stat_text(stat_binary, dir)?;
 
     for line in text.lines() {
         let Some((_id, rest)) = line.trim_start().split_once(':') else {
@@ -768,6 +773,46 @@ fn mdc_num_dest(stat_binary: &Path, dir: &Path) -> Result<i64, String> {
     }
 
     Err(format!("no mdc-num-dest counter in:\n{text}"))
+}
+
+/// What the reference's own viewer says about a driver's counters.
+fn aeron_stat_text(stat_binary: &Path, dir: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(stat_binary)
+        .arg("-d")
+        .arg(dir)
+        .arg("-w")
+        .arg("false")
+        .output()
+        .map_err(|error| format!("run AeronStat: {error}"))?;
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The address in the `snd-local-sockaddr` counter's label: where this driver's
+/// send socket was bound, as another program reads it.
+///
+/// The label is `snd-local-sockaddr: <channel status id> <ip:port>`
+/// (`aeron_position.c:295-297`).
+fn send_local_sockaddr(stat_binary: &Path, dir: &Path) -> Result<String, String> {
+    let text = aeron_stat_text(stat_binary, dir)?;
+
+    for line in text.lines() {
+        let Some((_id, rest)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        let Some((_value, label)) = rest.rsplit_once(" - ") else {
+            continue;
+        };
+
+        if let Some(rest) = label.trim().strip_prefix("snd-local-sockaddr: ") {
+            return rest
+                .rsplit_once(' ')
+                .map(|(_status_id, address)| address.to_string())
+                .ok_or_else(|| format!("an address was expected in {label:?}\n{text}"));
+        }
+    }
+
+    Err(format!("no snd-local-sockaddr counter in:\n{text}"))
 }
 
 /// A3, the manual half: `mdc-num-dest` follows the client's commands and
@@ -1021,4 +1066,99 @@ fn a_dynamic_channels_destinations_follow_the_status_messages() {
         "and five seconds without one has to remove it.\nour driver said:\n{log}"
     );
     let _ = publication_id;
+}
+
+/// A15, the sending half: the address a send endpoint is bound to is readable,
+/// and it is the address that is really on the wire.
+///
+/// Two independent readings of one fact, which is the point. One is the
+/// reference's own counter viewer printing this driver's
+/// `snd-local-sockaddr` label; the other is the reference's own subscriber
+/// reporting where the bytes it received came from. The label is a claim this
+/// driver makes about itself; the subscriber's line is what the kernel did.
+///
+/// Only the **port** is compared, and that is not a weakening: this channel
+/// names no local address, so the socket is bound to the wildcard and
+/// `getsockname` says `0.0.0.0:<port>` while the datagrams that reach a
+/// subscriber on loopback come from `127.0.0.1:<port>`. The port is the part
+/// that was unknowable before the socket existed — which is why the counter
+/// exists at all, and what `ReplayMerge` reads it for.
+#[test]
+fn the_address_a_send_endpoint_is_bound_to_is_what_a_reader_finds() {
+    let Some(stat_binary) = driver::locate_aeron_stat() else {
+        driver::announce_tool_skip("AeronStat");
+        return;
+    };
+
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("mdc-send-local-sockaddr") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+    let dir = own.aeron_dir().to_path_buf();
+
+    let channel = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(61));
+    let subscriber = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-address-subscriber",
+        &channel,
+    );
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(MANUAL_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the manual publication");
+    publisher
+        .add_destination(publication_id, &channel, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the destination");
+
+    // Any traffic will do, and the publication's own periodic `SETUP` is the
+    // first of it: what is being read is an address, not a payload.
+    let up = warm_up(
+        &publisher,
+        publication_id,
+        &[&subscriber],
+        Duration::from_secs(20),
+    );
+
+    let label = send_local_sockaddr(&stat_binary, &dir);
+    let from_the_wire = subscriber.image_source_port();
+
+    let log = own.log_tail(60);
+    subscriber.stop();
+    let _ = own.stop();
+
+    assert!(
+        up,
+        "the subscriber never formed an image\nour driver said:\n{log}"
+    );
+
+    let label = label.unwrap_or_else(|error| panic!("{error}\nour driver said:\n{log}"));
+    let label_port: u16 = label
+        .rsplit_once(':')
+        .and_then(|(_ip, port)| port.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no port in the counter's address {label:?}"));
+
+    let wire_port = from_the_wire.expect("the subscriber reports where its image came from");
+
+    assert_ne!(0, label_port, "the port has to be the one the kernel chose");
+    assert_eq!(
+        wire_port, label_port,
+        "the counter says {label}, and the bytes that reached the subscriber \
+         came from port {wire_port}\nour driver said:\n{log}"
+    );
 }
