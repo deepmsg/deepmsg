@@ -82,11 +82,83 @@ impl std::error::Error for ReceiveEndpointError {}
 
 /// A receive channel endpoint and its socket.
 impl ReceiveDestination {
+    /// A destination with a socket of its own
+    /// (`aeron_receive_destination_create`,
+    /// `media/aeron_receive_destination.c:30-139`).
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveEndpointError::Socket`] when the socket cannot be opened or
+    /// bound, [`ReceiveEndpointError::NoCounter`] when the manager has no room
+    /// for the counter that holds its address.
+    fn open(
+        channel: UdpChannel,
+        params: &TransportParams,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        registration_id: i64,
+        channel_status_counter_id: i32,
+        now_ms: i64,
+    ) -> Result<Self, ReceiveEndpointError> {
+        let transport = super::udp_transport::UdpTransport::open(channel.remote_data, None, params)
+            .map_err(ReceiveEndpointError::Socket)?;
+
+        Self::attach(
+            channel,
+            Box::new(transport),
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        )
+    }
+
+    /// The same around a transport a caller built — the tests' seam, and the
+    /// shape the conductor hands a destination over in.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveEndpointError::NoCounter`] when the manager has no room, or the
+    /// socket has no address to report.
+    fn attach(
+        channel: UdpChannel,
+        transport: Box<dyn Transport>,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        registration_id: i64,
+        channel_status_counter_id: i32,
+        now_ms: i64,
+    ) -> Result<Self, ReceiveEndpointError> {
+        let local_sockaddr_counter_id = destination_local_sockaddr_counter(
+            &*transport,
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        )
+        .ok_or(ReceiveEndpointError::NoCounter)?;
+
+        Ok(Self {
+            channel,
+            transport,
+            local_sockaddr_counter_id,
+        })
+    }
+
     /// The address this destination is actually bound to, as a counter a client
     /// can find by the channel status it belongs to
     /// (`rcv-local-sockaddr`, type 14).
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// The channel this destination is for, which is what identifies it: the
+    /// reference compares two by `aeron_udp_channel_equals` when one is removed
+    /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+    pub const fn channel(&self) -> &UdpChannel {
+        &self.channel
     }
 }
 
@@ -227,36 +299,30 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
-        // The receive side binds the *endpoint* — where a subscription
-        // listens — and is never connected: it answers whoever writes to it.
-        let transport =
-            match super::udp_transport::UdpTransport::open(channel.remote_data, None, params) {
-                Ok(transport) => transport,
-                Err(error) => {
-                    counters.free(regions, channel_status_counter_id, now_ms);
-                    return Err(ReceiveEndpointError::Socket(error));
-                }
-            };
-
-        let Some(local_sockaddr_counter_id) = destination_local_sockaddr_counter(
-            &transport,
+        // The endpoint's first destination opens the socket, because the
+        // socket *is* a destination's: the receive side binds the endpoint —
+        // where a subscription listens — and is never connected, because it
+        // answers whoever writes to it (`aeron_receive_destination.c:30-139`).
+        let destination = match ReceiveDestination::open(
+            channel.clone(),
+            params,
             counters,
             regions,
             registration_id,
             channel_status_counter_id,
             now_ms,
-        ) else {
-            // The counter was allocated for an endpoint that will not exist.
-            counters.free(regions, channel_status_counter_id, now_ms);
-            return Err(ReceiveEndpointError::NoCounter);
+        ) {
+            Ok(destination) => destination,
+            Err(error) => {
+                // The counters were allocated for an endpoint that will not
+                // exist.
+                counters.free(regions, channel_status_counter_id, now_ms);
+                return Err(error);
+            }
         };
 
         Ok(Self {
-            destinations: vec![ReceiveDestination {
-                channel: channel.clone(),
-                transport: Box::new(transport),
-                local_sockaddr_counter_id,
-            }],
+            destinations: vec![destination],
             channel,
             channel_status_counter_id,
             receiver_id,
@@ -296,24 +362,24 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
-        let Some(local_sockaddr_counter_id) = destination_local_sockaddr_counter(
-            &*transport,
+        let destination = match ReceiveDestination::attach(
+            channel.clone(),
+            transport,
             counters,
             regions,
             registration_id,
             channel_status_counter_id,
             now_ms,
-        ) else {
-            counters.free(regions, channel_status_counter_id, now_ms);
-            return Err(ReceiveEndpointError::NoCounter);
+        ) {
+            Ok(destination) => destination,
+            Err(error) => {
+                counters.free(regions, channel_status_counter_id, now_ms);
+                return Err(error);
+            }
         };
 
         Ok(Self {
-            destinations: vec![ReceiveDestination {
-                channel: channel.clone(),
-                transport,
-                local_sockaddr_counter_id,
-            }],
+            destinations: vec![destination],
             channel,
             channel_status_counter_id,
             receiver_id,
@@ -489,6 +555,39 @@ impl ReceiveChannelEndpoint {
             // polls none when there are none.
             None => Ok(0),
         }
+    }
+
+    /// Attach a destination a client added
+    /// (`aeron_receive_channel_endpoint_add_destination`).
+    ///
+    /// The destination arrives **built** — its socket open, the counter holding
+    /// its address allocated — because the conductor is what has a counter
+    /// manager (`aeron_driver_conductor.c:5903-5919`: it creates the destination
+    /// and hands it to the receiver, exactly as it hands over an endpoint).
+    /// This is the receiver's half: the endpoint holds it, and the next pass
+    /// reads from it.
+    pub fn add_destination(&mut self, destination: ReceiveDestination) {
+        self.destinations.push(destination);
+    }
+
+    /// Take a destination off, answering with it when there was one.
+    ///
+    /// A destination is identified by its channel, which is how the reference
+    /// compares two (`media/aeron_receive_channel_endpoint.c:877-905`). The
+    /// counters it holds are the caller's to give back, because the caller
+    /// allocated them.
+    pub fn remove_destination(&mut self, channel: &UdpChannel) -> Option<ReceiveDestination> {
+        let index = self
+            .destinations
+            .iter()
+            .position(|destination| destination.channel.canonical_form == channel.canonical_form)?;
+
+        Some(self.destinations.swap_remove(index))
+    }
+
+    /// The destinations, in the order they were added.
+    pub fn destinations(&self) -> &[ReceiveDestination] {
+        &self.destinations
     }
 
     /// How many places this endpoint reads from.
@@ -706,5 +805,169 @@ impl std::fmt::Debug for ReceiveChannelEndpoint {
             .field("streams", &self.dispatcher.stream_count())
             .field("subscriptions", &self.subscription_count())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    const VALUES_LENGTH: usize = 64 * 1024;
+
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
+
+    struct Fixture {
+        metadata: Region,
+        values: Region,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                metadata: Region(vec![0u8; VALUES_LENGTH * 4]),
+                values: Region(vec![0u8; VALUES_LENGTH]),
+            }
+        }
+
+        fn open(&mut self) -> (CounterManager, CounterRegions<'_>) {
+            let regions = CounterRegions::new(
+                AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned"),
+                AtomicBuffer::from_slice_mut(&mut self.values.0).expect("aligned"),
+            )
+            .expect("four-to-one");
+            let manager = CounterManager::new(VALUES_LENGTH, 1_000).expect("room");
+
+            (manager, regions)
+        }
+    }
+
+    /// A transport that is somewhere and moves nothing.
+    struct Stub(SocketAddr);
+
+    impl Transport for Stub {
+        fn send(&mut self, _address: Option<SocketAddr>, _buffers: &[&[u8]]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn receive(
+            &mut self,
+            _buffers: &mut [Vec<u8>],
+            _datagrams: &mut crate::sys::socket::Datagrams,
+        ) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn local_address(&self) -> io::Result<SocketAddr> {
+            Ok(self.0)
+        }
+
+        fn receive_buffer_size(&self) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn channel(uri: &str) -> UdpChannel {
+        let parsed = crate::channel_uri::ChannelUri::parse(uri.as_bytes()).expect("a URI");
+        UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
+    }
+
+    fn stub(port: u16) -> Box<dyn Transport> {
+        Box::new(Stub(SocketAddr::from(([127, 0, 0, 1], port))))
+    }
+
+    /// Every destination brings its own address counter, and two destinations
+    /// do not share one (`rcv-local-sockaddr`, type 14).
+    #[test]
+    fn a_destination_brings_its_own_socket_and_its_own_address_counter() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let first = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            stub(40123),
+            &mut counters,
+            &regions,
+            7,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        let second = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            stub(40124),
+            &mut counters,
+            &regions,
+            8,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert_ne!(
+            first.local_sockaddr_counter_id(),
+            second.local_sockaddr_counter_id()
+        );
+        assert_eq!(
+            0,
+            first.local_sockaddr_counter_id(),
+            "the first counter a fresh manager hands out"
+        );
+    }
+
+    /// An endpoint holds what it is given and reads from all of them: one on
+    /// creation, and as many more as clients add.
+    #[test]
+    fn an_endpoint_holds_the_destinations_it_is_given() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            stub(40123),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        assert_eq!(1, endpoint.destination_count(), "one to start with");
+
+        let added = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            stub(40124),
+            &mut counters,
+            &regions,
+            8,
+            endpoint.channel_status_counter_id(),
+            1_000,
+        )
+        .expect("a destination");
+
+        endpoint.add_destination(added);
+        assert_eq!(2, endpoint.destination_count());
+
+        let removed = endpoint
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
+            .expect("the destination that was added");
+
+        assert_eq!(
+            channel("aeron:udp?endpoint=127.0.0.1:40124").canonical_form,
+            removed.channel().canonical_form,
+            "and it is the one that was added"
+        );
+        assert_eq!(1, endpoint.destination_count());
+        assert!(
+            endpoint
+                .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40999"))
+                .is_none(),
+            "a channel no destination has removes nothing"
+        );
     }
 }
