@@ -476,18 +476,29 @@ impl ReceiveChannelEndpoint {
     /// # Errors
     ///
     /// The transport's error; an empty socket is `Ok(0)`.
-    pub fn receive(
+    pub fn receive_from(
         &mut self,
+        index: usize,
         buffers: &mut [Vec<u8>],
         datagrams: &mut crate::sys::socket::Datagrams,
     ) -> io::Result<usize> {
-        match self.destination_mut() {
+        match self.destinations.get_mut(index) {
             Some(destination) => destination.transport.receive(buffers, datagrams),
-            // A channel with no destinations has nothing to read, which is a
-            // state rather than a failure — the reference polls each of them
-            // and polls none when there are none.
+            // A destination that is not there has nothing to read, which is a
+            // state rather than a failure — the reference polls each of them and
+            // polls none when there are none.
             None => Ok(0),
         }
+    }
+
+    /// How many places this endpoint reads from.
+    ///
+    /// A unicast channel has one; a multi-destination channel has as many as
+    /// clients have added. The receiver polls every one of them
+    /// (`aeron_driver_receiver_do_work`, `:130-260`, which polls the transport
+    /// poller — every transport in it).
+    pub fn destination_count(&self) -> usize {
+        self.destinations.len()
     }
 
     /// The address this endpoint's socket is bound to, which is the channel's

@@ -674,49 +674,64 @@ impl ReceiverThread {
         let mut work = 0;
 
         for (endpoint_id, endpoint) in endpoints.iter_mut() {
-            let received = match endpoint.receive(buffers, datagrams) {
-                Ok(received) => received,
-                Err(error) => {
-                    let _ = events.send(ReceiverEvent::Fault {
-                        error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
-                        description: format!("could not receive on a channel: {error}"),
-                    });
-                    continue;
-                }
-            };
-
-            if received == 0 {
-                continue;
-            }
-
-            let batch = *datagrams;
-            let mut bytes_received = 0i64;
-
-            for (slot, datagram) in batch.as_slice().iter().enumerate() {
-                bytes_received += i64::try_from(datagram.length).unwrap_or(0);
-                work += 1;
-
-                let Some(source) = datagram.source else {
-                    continue;
+            // Every destination, not just the first: a multi-destination channel
+            // has one socket per destination and a datagram that arrives on any
+            // of them is a datagram this endpoint has to read
+            // (`aeron_driver_receiver_do_work`, `:130-260`). With one
+            // destination — which is every channel until a client adds another —
+            // this is the single poll it always was.
+            //
+            // Which destination a datagram arrived on is *not* passed on yet.
+            // Its only reader is the reply path — an answer has to leave through
+            // the socket it arrived on, not through the first one — and that
+            // arrives with the commands that create a second destination. The
+            // compiler objected to the parameter existing before then, correctly:
+            // a parameter nothing reads is not a fact about the wire.
+            for destination_index in 0..endpoint.destination_count() {
+                let received = match endpoint.receive_from(destination_index, buffers, datagrams) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        let _ = events.send(ReceiverEvent::Fault {
+                            error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                            description: format!("could not receive on a channel: {error}"),
+                        });
+                        continue;
+                    }
                 };
 
-                let packet = &buffers[slot][..datagram.length];
-                Self::dispatch(
-                    *endpoint_id,
-                    endpoint,
-                    images,
-                    pending_setups,
-                    packet,
-                    source,
-                    system,
-                    counters,
-                    regions,
-                    events,
-                    now_ns,
-                );
-            }
+                if received == 0 {
+                    continue;
+                }
 
-            system.add(system_counters::id::BYTES_RECEIVED, bytes_received);
+                let batch = *datagrams;
+                let mut bytes_received = 0i64;
+
+                for (slot, datagram) in batch.as_slice().iter().enumerate() {
+                    bytes_received += i64::try_from(datagram.length).unwrap_or(0);
+                    work += 1;
+
+                    let Some(source) = datagram.source else {
+                        continue;
+                    };
+
+                    let packet = &buffers[slot][..datagram.length];
+                    Self::dispatch(
+                        *endpoint_id,
+                        endpoint,
+                        images,
+                        pending_setups,
+                        packet,
+                        source,
+                        system,
+                        counters,
+                        regions,
+                        events,
+                        now_ns,
+                    );
+                }
+
+                system.add(system_counters::id::BYTES_RECEIVED, bytes_received);
+            }
         }
 
         work
