@@ -87,6 +87,10 @@ pub struct ImageCounters {
     pub rcv_hwm: i32,
     /// `rcv-pos`: how far a reader may safely be moved.
     pub rcv_pos: i32,
+    /// `rcv-naks-sent`: the gap reports this image has asked for
+    /// (`aeron_counter_receiver_naks_sent_allocate`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6680-6683`).
+    pub rcv_naks_sent: i32,
 }
 
 /// An image: a stream rebuilt from datagrams.
@@ -1200,7 +1204,7 @@ mod tests {
 
             let mut holder = Counters::new();
             let mut counters = CounterManager::new(64 * 1024, 1_000).expect("room");
-            let (rcv_hwm, rcv_pos) = {
+            let (rcv_hwm, rcv_pos, rcv_naks_sent) = {
                 let regions = holder.open();
 
                 let hwm = counters
@@ -1209,8 +1213,11 @@ mod tests {
                 let pos = counters
                     .allocate(&regions, 5, &[], b"rcv-pos", 1)
                     .expect("a counter");
+                let naks = counters
+                    .allocate(&regions, 20, &[], b"rcv-naks-sent", 1)
+                    .expect("a counter");
 
-                (hwm, pos)
+                (hwm, pos, naks)
             };
 
             let setup = crate::protocol::SetupFrame {
@@ -1237,7 +1244,11 @@ mod tests {
                 &setup,
                 "127.0.0.1:5555".parse().expect("an address"),
                 "127.0.0.1:5555".parse().expect("an address"),
-                ImageCounters { rcv_hwm, rcv_pos },
+                ImageCounters {
+                    rcv_hwm,
+                    rcv_pos,
+                    rcv_naks_sent,
+                },
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 4096,

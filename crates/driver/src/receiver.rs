@@ -894,6 +894,15 @@ impl ReceiverThread {
                     .is_ok()
                 {
                     system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                    // …and the same count under the image that asked for it:
+                    // the system counter says the driver is retransmitting,
+                    // this one says for which stream
+                    // (`aeron_publication_image.c:1052`).
+                    let _ = system_counters::increment(
+                        counters,
+                        regions,
+                        image.counters().rcv_naks_sent,
+                    );
                     work += 1;
                 }
             }

@@ -714,12 +714,13 @@ impl NetworkPublication {
                 system.increment(system_counters::id::SHORT_SENDS);
             }
         } else if self.track_sender_limits && available_window <= 0 {
+            let _ = system_counters::increment(counters, regions, self.counters.snd_bpe);
             system.increment(system_counters::id::SENDER_FLOW_CONTROL_LIMITS);
-            system.increment(system_counters::id::FLOW_CONTROL_OVER_RUNS);
             self.track_sender_limits = false;
         }
 
         if blocked && self.track_sender_limits {
+            let _ = system_counters::increment(counters, regions, self.counters.snd_bpe);
             system.increment(system_counters::id::SENDER_FLOW_CONTROL_LIMITS);
             self.track_sender_limits = false;
         }
@@ -968,6 +969,11 @@ impl NetworkPublication {
         now_ns: i64,
     ) -> NakOutcome {
         system.increment(system_counters::id::NAK_MESSAGES_RECEIVED);
+
+        // The system counter answers "is this driver being asked to
+        // retransmit"; this one answers "which publication is"
+        // (`aeron_network_publication.c:733`).
+        let _ = system_counters::increment(counters, regions, self.counters.snd_naks_received);
 
         let term_length = self.term_length as usize;
         let term_window = self.term_window_length as usize;

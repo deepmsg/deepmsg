@@ -854,8 +854,30 @@ impl Conductor {
                         continue;
                     };
 
+                    // The image's counters belong to the client that asked for
+                    // the subscription, not to the driver
+                    // (`aeron_driver_conductor.c:6652`, `:6667`, `:6682`, each
+                    // passing `subscription_link->client_id`). The reference
+                    // carries the link on the command itself; here the link is
+                    // the one this image is for — the same stream, and either
+                    // it named no session or it named this one. A stream two
+                    // clients both read is owned by the first of them, which is
+                    // the same one-link answer the reference gives.
+                    let client_id = self
+                        .subscriptions
+                        .links()
+                        .iter()
+                        .find(|link| {
+                            link.stream_id == setup.stream_id
+                                && link
+                                    .session_id
+                                    .is_none_or(|session_id| session_id == setup.session_id)
+                        })
+                        .map_or(0, |link| link.client_id);
+
                     let result = self.images.begin_create(
                         registration_id,
+                        client_id,
                         endpoint_id,
                         &channel,
                         &setup,

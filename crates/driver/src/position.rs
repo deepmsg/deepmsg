@@ -38,6 +38,9 @@ pub mod type_id {
     pub const RECEIVER_HWM: i32 = 3;
     /// `AERON_COUNTER_RECEIVER_POSITION_TYPE_ID` (`:86-88`), label `"rcv-pos"`.
     pub const RECEIVER_POSITION: i32 = 5;
+    /// `AERON_COUNTER_RECEIVER_NAKS_SENT_TYPE_ID` (`:124`), label
+    /// `"rcv-naks-sent"`.
+    pub const RECEIVER_NAKS_SENT: i32 = 20;
     /// `AERON_COUNTER_SENDER_POSITION_TYPE_ID` (`:104-106`), label
     /// `"snd-pos"`.
     pub const SENDER_POSITION: i32 = 2;

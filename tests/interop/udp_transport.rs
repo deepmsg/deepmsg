@@ -1352,6 +1352,101 @@ fn pump_until(
     received
 }
 
+/// A counter the CnC file holds, found by a fragment of its label: its id, its
+/// type, its owner, and the label it was found by.
+fn counter_like(cnc: &deepmsg_cnc::CncFile, needle: &str) -> Option<(i32, i32, i64, String)> {
+    let counters = cnc.counters()?;
+    let mut found = None;
+
+    counters.for_each(|descriptor| {
+        if found.is_none() && descriptor.label.contains(needle) {
+            found = Some((
+                descriptor.counter_id,
+                descriptor.type_id,
+                descriptor.owner_id,
+                descriptor.label.clone(),
+            ));
+        }
+    });
+
+    found
+}
+
+/// A16: an image's counters are named, typed and *owned* from the moment the
+/// image exists.
+///
+/// `rcv-naks-sent` is how a client sees whether its own stream is being asked to
+/// retransmit, and it is a counter of the image beside `rcv-hwm` and `rcv-pos`:
+/// the reference allocates all three together and hands each the subscribing
+/// client's id (`aeron_driver_conductor.c:6650`, `:6665`, `:6680-6683`). A
+/// counter born without an owner is one a tool that groups counters by owner —
+/// or reclaims them when a client goes — files under the driver rather than
+/// under the client that reads it.
+#[test]
+fn an_images_counters_are_owned_by_its_subscriber() {
+    let Some(mut own) = OwnDriver::start("udp-image-counters") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(10);
+    let channel = format!("aeron:udp?endpoint=localhost:{port}|term-length=65536");
+
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect our client");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // An image exists once frames have been read, and the counters are
+    // allocated before it can read any.
+    let mut index = 0usize;
+    let received = pump_until(
+        &mut publisher,
+        publication_id,
+        &mut subscriber,
+        subscription_id,
+        10,
+        10,
+        &mut index,
+        Duration::from_secs(30),
+    );
+
+    let dump = counters_of(&own_cnc);
+    let _ = own.stop();
+
+    assert_eq!(10, received.len(), "the image must exist.\n{dump}");
+
+    let mut owners = Vec::new();
+
+    for label in ["rcv-hwm", "rcv-pos", "rcv-naks-sent"] {
+        let Some((counter_id, type_id, owner_id, found)) = counter_like(&own_cnc, label) else {
+            panic!("no {label} counter on the image.\n{dump}");
+        };
+
+        assert_ne!(0, owner_id, "{found} (#{counter_id}) has no owner.\n{dump}");
+        owners.push((label, type_id, owner_id));
+    }
+
+    assert_eq!(
+        (3, 5, 20),
+        (owners[0].1, owners[1].1, owners[2].1),
+        "the three type ids are the reference's: {owners:?}"
+    );
+    assert!(
+        owners.windows(2).all(|pair| pair[0].2 == pair[1].2),
+        "one image's counters are owned by one client: {owners:?}"
+    );
+}
+
 /// A15: a receiver that restarts is answered, not ignored.
 ///
 /// A publication that has met one receiver has closed its `SETUP` path for good
