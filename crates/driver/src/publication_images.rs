@@ -112,6 +112,25 @@ struct PendingImage {
     /// The untethered timeouts the channel named, which the image's readers
     /// inherit (`untethered-window-limit-timeout` and its two siblings).
     untethered: crate::publication_params::SubscriptionParams,
+    /// Whether this image is one of a group, which lands in the log buffer's
+    /// `group` byte (`aeron_driver_conductor_treat_image_as_multicast`,
+    /// `aeron_driver_conductor.c:674-680`).
+    group_semantics: bool,
+}
+
+/// Whether an image is one of a group
+/// (`aeron_driver_conductor_treat_image_as_multicast`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:674-680`): the channel's
+/// own group semantics, **or** the `SETUP`'s `GROUP` flag.
+///
+/// The two are one question because both name a channel that may have several
+/// receivers at once, which is what the log buffer's `group` byte is about — so
+/// a channel whose URI does not say it is one is still a group if the far end
+/// says so. The reference's third arm, a `group=` parameter forced true, is not
+/// parsed in this build.
+fn image_group_semantics(uri: &crate::channel_uri::ChannelUri<'_>, setup_flags: u8) -> bool {
+    crate::udp_channel::UdpChannel::uri_has_group_semantics(uri)
+        || setup_flags & crate::protocol::header_flags::SETUP_GROUP != 0
 }
 
 /// The images a driver owns.
@@ -214,12 +233,18 @@ impl PublicationImages {
         // `SETUP`, so the timeouts its readers are held to come from the
         // *channel* rather than from each subscription
         // (`aeron_driver_uri_subscription_params` on the channel's URI).
-        let untethered = match crate::channel_uri::ChannelUri::parse(channel) {
-            Ok(uri) => crate::publication_params::SubscriptionParams::resolve(&uri, config)
-                .unwrap_or_else(|_| {
-                    crate::publication_params::SubscriptionParams::defaults(config)
-                }),
-            Err(_) => crate::publication_params::SubscriptionParams::defaults(config),
+        let (untethered, group_semantics) = match crate::channel_uri::ChannelUri::parse(channel) {
+            Ok(uri) => (
+                crate::publication_params::SubscriptionParams::resolve(&uri, config)
+                    .unwrap_or_else(|_| {
+                        crate::publication_params::SubscriptionParams::defaults(config)
+                    }),
+                image_group_semantics(&uri, setup_flags),
+            ),
+            Err(_) => (
+                crate::publication_params::SubscriptionParams::defaults(config),
+                false,
+            ),
         };
 
         let counters_pair = allocate_counters(
@@ -276,6 +301,7 @@ impl PublicationImages {
             control_address,
             invalidation: None,
             untethered,
+            group_semantics,
         });
 
         Ok(())
@@ -374,6 +400,7 @@ impl PublicationImages {
             config.status_message_timeout_ns,
             config.layout.page_size,
             pending.untethered,
+            pending.group_semantics,
             now.ns,
         );
 
@@ -599,4 +626,37 @@ pub fn os_defaults() -> sys::SocketBufferLengths {
         rcvbuf: 0,
         sndbuf: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::protocol::header_flags;
+
+    fn uri(text: &str) -> crate::channel_uri::ChannelUri<'_> {
+        crate::channel_uri::ChannelUri::parse(text.as_bytes()).expect("a URI")
+    }
+
+    /// Both halves of the predicate, and each on its own: a channel that says
+    /// it is a group, a channel that does not but whose `SETUP` does, and one
+    /// that is neither. A hardcoded answer satisfies at most two of the three.
+    #[test]
+    fn an_image_is_a_group_when_either_the_channel_or_the_setup_says_so() {
+        let multi_destination = uri("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual");
+        let plain = uri("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert!(
+            image_group_semantics(&multi_destination, 0),
+            "a multi-destination channel is a group on its own"
+        );
+        assert!(
+            image_group_semantics(&plain, header_flags::SETUP_GROUP),
+            "and a channel that is not one is still a group if the far end says so"
+        );
+        assert!(
+            !image_group_semantics(&plain, 0),
+            "but neither saying it is not a group"
+        );
+    }
 }

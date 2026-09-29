@@ -330,6 +330,7 @@ impl PublicationImage {
         sm_timeout_ns: i64,
         page_size: usize,
         untethered: SubscriptionParams,
+        group_semantics: bool,
         now_ns: i64,
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
@@ -379,8 +380,18 @@ impl PublicationImage {
                     untethered_window_limit_timeout_ns: 0,
                     untethered_linger_timeout_ns: 0,
                     untethered_resting_timeout_ns: 0,
-                    group: 0,
-                    is_response: false,
+                    // The two the channel and the `SETUP` decide, rather than
+                    // the image: whether this stream is one of a group, and
+                    // whether this subscription exists to carry the answers to
+                    // a request (`aeron_publication_image.c:277-278`, which
+                    // reads `treat_as_multicast` and `params.is_response`).
+                    //
+                    // Both are read off the *channel*'s URI and the frame that
+                    // opened the stream — not off the subscription that happens
+                    // to be reading, which is why a second reader of the same
+                    // stream sees the same two bytes.
+                    group: u8::from(group_semantics),
+                    is_response: untethered.is_response,
                     rejoin: false,
                     reliable: true,
                     sparse: false,
@@ -1457,6 +1468,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with(false, false)
+        }
+
+        /// The same, with the two bytes the channel and the `SETUP` decide set
+        /// rather than absent (`aeron_publication_image.c:277-278`).
+        fn with(group_semantics: bool, is_response: bool) -> Self {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir =
@@ -1505,6 +1522,11 @@ mod tests {
             let channel = crate::udp_channel::UdpChannel::resolve(uri.as_bytes(), &parsed)
                 .expect("a channel");
 
+            let mut untethered = crate::publication_params::SubscriptionParams::defaults(
+                &crate::config::DriverConfig::default(),
+            );
+            untethered.is_response = is_response;
+
             let image = PublicationImage::create(
                 7,
                 1,
@@ -1521,9 +1543,8 @@ mod tests {
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 4096,
-                crate::publication_params::SubscriptionParams::defaults(
-                    &crate::config::DriverConfig::default(),
-                ),
+                untethered,
+                group_semantics,
                 0,
             );
 
@@ -1533,6 +1554,57 @@ mod tests {
                 counters,
                 holder,
             }
+        }
+    }
+
+    /// The two metadata bytes that belong to the channel and the `SETUP`
+    /// rather than to the image: whether this stream is one of a group, and
+    /// whether this subscription exists to carry the answers to a request
+    /// (`aeron_publication_image.c:277-278`, which writes `treat_as_multicast`
+    /// and `params.is_response`).
+    ///
+    /// Read back off the file rather than off the image, because the file is
+    /// the contract: it is what a reader that maps the image sees, and the only
+    /// place a tool that reads bytes can learn either fact. The pair is the
+    /// judgement — one fixture that is neither, one that is both — so a
+    /// hardcoded answer satisfies neither half.
+    #[test]
+    fn an_image_says_whether_it_is_a_group_and_whether_it_answers_a_request() {
+        for (group_semantics, is_response) in [(false, false), (true, true)] {
+            let fixture = Fixture::with(group_semantics, is_response);
+            let bytes =
+                std::fs::read(fixture._dir.0.join("image.logbuffer")).expect("the log buffer");
+
+            // The metadata block sits at the **end** of a log buffer, not the
+            // front (`LogFile::create`: the length less the block), so the
+            // offsets below are relative to it.
+            let block =
+                &bytes[deepmsg_core::logbuffer::logfile::LogFile::log_length(TERM_LENGTH, 4096)
+                    .expect("a length")
+                    - descriptor::METADATA_LENGTH..];
+
+            // The anchor, so that a zero below cannot be "this is not the block
+            // the image wrote": the registration id the fixture passes is 7.
+            assert_eq!(
+                7,
+                i64::from_le_bytes(
+                    block[descriptor::CORRELATION_ID_OFFSET..descriptor::CORRELATION_ID_OFFSET + 8]
+                        .try_into()
+                        .expect("eight bytes")
+                ),
+                "the block being read has to be the one this image wrote"
+            );
+
+            assert_eq!(
+                u8::from(group_semantics),
+                block[descriptor::GROUP_OFFSET],
+                "group_semantics={group_semantics} has to reach the metadata"
+            );
+            assert_eq!(
+                u8::from(is_response),
+                block[descriptor::IS_RESPONSE_OFFSET],
+                "is_response={is_response} has to reach the metadata"
+            );
         }
     }
 

@@ -230,6 +230,19 @@ impl UdpChannel {
         self.is_multicast || self.control_mode.is_multi_destination()
     }
 
+    /// [`UdpChannel::has_group_semantics`] for a channel that has been parsed
+    /// but not resolved into an address.
+    ///
+    /// An image is created from a channel's *bytes* — the conductor hands
+    /// `PublicationImages::begin_create` the URI it was given — and one bit is
+    /// not worth resolving a second time, with the interface lookup and the
+    /// host resolution that implies. The multicast arm is out of reach in this
+    /// build either way (multicast channels are refused at parse), so the
+    /// control mode is the whole of it, exactly as it is for the method above.
+    pub(crate) fn uri_has_group_semantics(uri: &ChannelUri<'_>) -> bool {
+        read_control_mode(uri).is_ok_and(ControlMode::is_multi_destination)
+    }
+
     /// Read a `aeron:udp` URI into the addresses an endpoint works with
     /// (`aeron_udp_channel_finish_parse`, `aeron_udp_channel.c:278-523`).
     ///
