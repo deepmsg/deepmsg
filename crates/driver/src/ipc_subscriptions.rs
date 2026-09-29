@@ -104,6 +104,23 @@ pub struct SubscriptionLinkEntry {
     pub counter_id: i32,
 }
 
+/// How far a network subscription's setup has got
+/// (`aeron_subscription_link_setup_status_t`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.h:94-100`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStatus {
+    /// Nothing has answered yet. Every subscription starts here; for an IPC one
+    /// and for every network mode but response, it is also where it ends,
+    /// because nothing consults it.
+    Pending,
+    /// A RSP_SETUP named this subscription's session.
+    Complete,
+    /// A RSP_SETUP arrived with a session the subscription's own `session-id=`
+    /// contradicts. It will never be read, and later response setups for the
+    /// same correlation id are ignored (`aeron_driver_conductor.c:7069-7070`).
+    Error,
+}
+
 /// One subscription (`aeron_subscription_link_t`,
 /// `aeron-driver/src/main/c/aeron_driver_conductor.h:120-162`).
 ///
@@ -137,6 +154,15 @@ pub struct SubscriptionLink {
     pub is_rejoin: bool,
     /// Whether it is a response channel.
     pub is_response: bool,
+    /// How far its setup has got
+    /// (`AERON_SUBSCRIPTION_LINK_SETUP_STATUS_*`,
+    /// `aeron_driver_conductor.h:94-100`).
+    ///
+    /// Only a response subscription ever leaves [`SetupStatus::Pending`]: the
+    /// reference sets it for every network subscription but reads it in one
+    /// place, [`IpcSubscriptions::on_response_setup`], where `Complete` means
+    /// the setup that just arrived is a second one.
+    pub setup_status: SetupStatus,
     /// Whether the channel is reliable. No effect on IPC, recorded because the
     /// link is where the reference records it.
     pub is_reliable: bool,
@@ -382,6 +408,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
             endpoint_id: None,
@@ -560,6 +587,97 @@ impl IpcSubscriptions {
 }
 
 impl IpcSubscriptions {
+    /// A responder answered a publication that asked for a response channel
+    /// (`aeron_driver_conductor_on_response_setup`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:7060-7115`).
+    ///
+    /// This is where a response subscription stops being one. Until a
+    /// RSP_SETUP arrives it reads nothing — it is not registered with the
+    /// receiver at all — and what the frame carries is the **session** it
+    /// should read, which is the one thing it could not know. So the
+    /// subscription is given that session, told it is no longer a response
+    /// channel, and registered like any other reader; from here on the
+    /// difference is gone.
+    ///
+    /// # Returns
+    ///
+    /// The error to record, when the subscription named a session that the
+    /// response publication contradicts. Nothing else here is an error: a
+    /// correlation id no subscription carries is a frame for another driver's
+    /// client, and the reference walks past it.
+    pub fn on_response_setup(
+        &mut self,
+        response_correlation_id: i64,
+        response_session_id: i32,
+        receiver: &ReceiverProxy,
+    ) -> Option<(i32, String)> {
+        for index in 0..self.links.len() {
+            let link = &mut self.links[index];
+
+            if link.registration_id != response_correlation_id
+                || link.setup_status == SetupStatus::Error
+            {
+                continue;
+            }
+
+            if link.setup_status == SetupStatus::Complete {
+                // A second response setup for a subscription that is already
+                // reading. The answer is to ask the far end to describe itself
+                // again (`aeron_driver_receiver.c:412-427`), which is what
+                // re-opens a publication that has met a receiver before
+                // (`aeron_network_publication.c:586-589`).
+                if let (Some(endpoint_id), Some(session_id)) = (link.endpoint_id, link.session_id) {
+                    let _ = receiver.request_setup(endpoint_id, link.stream_id, session_id);
+                }
+
+                continue;
+            }
+
+            if let Some(named) = link.session_id {
+                if named != response_session_id {
+                    // The subscription said which session it would read and
+                    // the response publication says otherwise. The reference
+                    // drops the named session as well as poisoning the link,
+                    // and **returns** rather than continuing — so a later
+                    // link with the same correlation id is not examined
+                    // (`:7094-7098`).
+                    link.session_id = None;
+                    link.setup_status = SetupStatus::Error;
+
+                    return Some((
+                        deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                        format!(
+                            "failed to setup response subscription (registrationId={}, channel={}), \
+                             because it contains `session-id` parameter that does not match \
+                             `session-id={}` of the response publication",
+                            link.registration_id,
+                            String::from_utf8_lossy(&link.channel),
+                            response_session_id
+                        ),
+                    ));
+                }
+            }
+
+            link.session_id = Some(response_session_id);
+            link.is_response = false;
+            link.setup_status = SetupStatus::Complete;
+
+            if let Some(endpoint_id) = link.endpoint_id {
+                // The same call the subscription's own creation makes, and the
+                // one it deliberately did not make then. The reference pairs it
+                // with `decref_to_response_stream`; this build keeps no
+                // response refcount to give back (see `add_network_subscription`).
+                let _ = receiver.add_subscription(
+                    endpoint_id,
+                    link.stream_id,
+                    Some(response_session_id),
+                );
+            }
+        }
+
+        None
+    }
+
     /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
     /// (`aeron_driver_conductor_on_add_network_subscription`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5156-5280`).
@@ -671,6 +789,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
             endpoint_id: Some(endpoint_id),
@@ -1111,6 +1230,7 @@ mod tests {
             is_tether: true,
             is_rejoin: false,
             is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: true,
             is_sparse: true,
             endpoint_id: None,

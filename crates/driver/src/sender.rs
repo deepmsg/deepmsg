@@ -43,14 +43,14 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender as Channel};
 use std::thread::JoinHandle;
 
-use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
+use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
 use crate::idle::Backoff;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
-    ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RttmFrame,
-    StatusMessageFrame, frame_type, header_flags, is_frame_valid,
+    ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame,
+    RttmFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
@@ -152,6 +152,21 @@ pub enum SenderEvent {
     PublicationRemoved {
         /// Which publication.
         registration_id: i64,
+    },
+    /// A responder answered a publication that asked for a response channel
+    /// (`aeron_driver_conductor_proxy_on_response_setup`,
+    /// `aeron_driver_conductor_proxy.c:157-172`).
+    ///
+    /// The frame named the publication; the correlation id is read off the
+    /// publication itself, which is what ties the answer to the subscription
+    /// waiting for it — the frame carries no correlation id of its own
+    /// (`aeron_send_channel_endpoint.c:738-748`).
+    ResponseSetup {
+        /// The registration id of the subscription the publication was made
+        /// for.
+        response_correlation_id: i64,
+        /// The session that subscription should now read.
+        response_session_id: i32,
     },
     /// Something for the conductor to record: a socket that refused a send, a
     /// frame that could not be believed.
@@ -615,6 +630,7 @@ impl SenderThread {
                     index,
                     datagram.source,
                     &buffers[slot][..datagram.length],
+                    events,
                 );
             }
 
@@ -639,6 +655,7 @@ impl SenderThread {
         endpoint_index: usize,
         source: Option<SocketAddr>,
         bytes: &[u8],
+        events: &Channel<SenderEvent>,
     ) {
         let system = System::new(counters, regions);
 
@@ -825,6 +842,33 @@ impl SenderThread {
                         regions,
                         now_ns,
                     );
+                }
+            }
+            frame_type::RSP_SETUP => {
+                // A responder answering a publication that asked for a
+                // response channel. The reference does three things and no
+                // more (`aeron_send_channel_endpoint.c:730-751`): find the
+                // publication the frame names, read *its* correlation id, and
+                // report that to the conductor. An unresolvable frame, or one
+                // whose publication never asked for a response, is silence —
+                // there is no counter and no error, because a publication the
+                // far end knows about and this endpoint does not is not a
+                // fault, it is a stale frame.
+                let Some(frame) = RspSetupFrame::read(bytes) else {
+                    return;
+                };
+
+                if let Some(publication) =
+                    find_publication(publications, frame.stream_id, frame.session_id)
+                {
+                    let response_correlation_id = publication.response_correlation_id;
+
+                    if response_correlation_id != layout::NULL_VALUE {
+                        let _ = events.send(SenderEvent::ResponseSetup {
+                            response_correlation_id,
+                            response_session_id: frame.response_session_id,
+                        });
+                    }
                 }
             }
             _ => {}

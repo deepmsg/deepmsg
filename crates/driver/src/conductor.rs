@@ -1251,6 +1251,18 @@ impl Conductor {
                 } => {
                     self.pending_log_errors.push((error_code, description));
                 }
+                crate::sender::SenderEvent::ResponseSetup {
+                    response_correlation_id,
+                    response_session_id,
+                } => {
+                    if let Some((error_code, description)) = self.subscriptions.on_response_setup(
+                        response_correlation_id,
+                        response_session_id,
+                        self.receiver.proxy(),
+                    ) {
+                        self.pending_log_errors.push((error_code, description));
+                    }
+                }
                 crate::sender::SenderEvent::EndpointRemoved { .. }
                 | crate::sender::SenderEvent::PublicationRemoved { .. } => {
                     // The conductor's own bookkeeping for a removal arrives

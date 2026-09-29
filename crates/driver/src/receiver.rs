@@ -79,6 +79,21 @@ pub enum ReceiverCommand {
         /// The session it named.
         session_id: i32,
     },
+    /// Ask the far end to describe a stream again
+    /// (`aeron_driver_receiver_on_request_setup`, `:412-427`).
+    ///
+    /// The reference does this only when the channel named a control address —
+    /// that is where the request goes, and a channel that named none has
+    /// nowhere to send one — and only for a session it already knows, which is
+    /// why the session is not optional here.
+    RequestSetup {
+        /// Which endpoint reads it.
+        endpoint_id: u64,
+        /// The stream.
+        stream_id: i32,
+        /// The session.
+        session_id: i32,
+    },
     /// A subscription went away.
     RemoveSubscription {
         /// Which endpoint read it.
@@ -265,6 +280,26 @@ impl ReceiverProxy {
         };
 
         self.commands.send(command).map_err(|_| stopped())
+    }
+
+    /// Ask the receiver to elicit a setup for a session it reads.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn request_setup(
+        &self,
+        endpoint_id: u64,
+        stream_id: i32,
+        session_id: i32,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RequestSetup {
+                endpoint_id,
+                stream_id,
+                session_id,
+            })
+            .map_err(|_| stopped())
     }
 
     /// Tell the receiver a subscription went away.
@@ -622,6 +657,22 @@ impl ReceiverThread {
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             endpoint.add_subscription_by_session(stream_id, session_id);
+                        }
+                    }
+                    ReceiverCommand::RequestSetup {
+                        endpoint_id,
+                        stream_id,
+                        session_id,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            // A channel that named no control address has
+                            // nowhere to send the request (`:418-426`), so the
+                            // guard is the channel's, not the caller's.
+                            if endpoint.channel.has_explicit_control {
+                                endpoint.elicit_setup(stream_id, session_id);
+                            }
                         }
                     }
                     ReceiverCommand::RemoveSubscription {

@@ -151,6 +151,15 @@ pub struct NetworkPublication {
     pub clean_position: i64,
     /// Whether a receiver asked for a `SETUP` and has not had one answered.
     pub is_setup_elicited: bool,
+    /// The registration id of the subscription this publication answers, or
+    /// [`layout::NULL_VALUE`] when it is not a response publication
+    /// (`aeron_network_publication.c:317`).
+    ///
+    /// It is the whole of the tie between a response setup frame and the
+    /// subscription waiting for it: the frame names the *publication*, and this
+    /// is the only thing that says which subscription that publication was
+    /// made for (`aeron_send_channel_endpoint.c:738-748`).
+    pub response_correlation_id: i64,
     /// When the receivers go quiet, this is when they are declared gone.
     pub status_message_deadline_ns: i64,
     /// How long that is (`connection_timeout_ns`).
@@ -327,6 +336,7 @@ impl NetworkPublication {
             // publication is re-started, `:313`).
             clean_position: 0,
             is_setup_elicited: false,
+            response_correlation_id: params.response_correlation_id,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
             receivers: Vec::new(),
