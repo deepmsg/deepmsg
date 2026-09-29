@@ -1,9 +1,25 @@
-//! A4: a reference publisher's messages, arriving through a **receive
-//! destination** we added to a manual subscription.
+//! The destination plane at the message level, in both directions.
 //!
-//! Every other interop test in this tree gives the subscription an address of
-//! its own — `aeron:udp?endpoint=…` — and that address is where the publisher
-//! sends. This one gives the subscription **none**: the channel is
+//! Every other interop test in this tree puts the reference opposite a single
+//! address: a channel's own `endpoint`, which is where one side sends and the
+//! other listens. A destination is the thing that replaces that — the channel
+//! itself may name no address at all, and the addresses are the ones clients
+//! add.
+//!
+//! **A1/A2/A3 (sending):** our publication takes destinations and fans out to
+//! two reference subscribers, each behind its own reference driver. This is the
+//! only test in the tree where one publication's bytes have to reach two
+//! independent receivers.
+//!
+//! **A4 (receiving):** a reference publisher's messages, arriving through a
+//! **receive destination** we added to a manual subscription.
+//!
+//! The receive side is described first below because its shape is the
+//! surprising one; the send side reuses the same two facts.
+//!
+//! ## A4: a reference publisher's messages, through a receive destination
+//!
+//! This one gives the subscription **no** address of its own: the channel is
 //! `aeron:udp?control-mode=manual`, a channel with no socket until something
 //! is added to it, and the only address in the whole arrangement is the one in
 //! the destination a client adds (`aeron_subscription_async_add_destination`).
@@ -38,10 +54,12 @@
 //! session is an outbound `SETUP` from the publication and no `SEND_SETUP`
 //! appears at any point.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT, FRAGMENT_LIMIT};
 use deepmsg_client::fragment_assembler::Message;
+use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 use deepmsg_tests::samples;
 
@@ -253,5 +271,627 @@ fn a_reference_publishers_messages_reach_our_receive_destination() {
     assert!(
         !publisher_said[connected_at..].contains("not connected to a subscriber"),
         "the reference publisher lost its subscriber after it had one:\n{publisher_said}"
+    );
+}
+
+/// A reference subscriber behind its own reference driver.
+///
+/// Each one binds the port its channel names, so each is a separate receiver
+/// with a separate `aeron.dir` — which is what makes this two destinations
+/// rather than one driver with two sockets.
+struct ReferenceSubscriber {
+    driver: ReferenceDriver,
+    sample: samples::Sample,
+}
+
+impl ReferenceSubscriber {
+    fn start(
+        driver_binary: &std::path::Path,
+        subscriber_binary: &std::path::Path,
+        name: &str,
+        channel: &str,
+    ) -> Self {
+        let mut driver = ReferenceDriver::start(driver_binary, name).expect("start the driver");
+        driver
+            .await_cnc(READY_TIMEOUT)
+            .expect("the reference driver must publish a readable CnC file");
+
+        let sample = samples::Sample::start(
+            subscriber_binary,
+            "subscriber",
+            driver.aeron_dir(),
+            &["-c", channel, "-s", &STREAM_ID.to_string()],
+        );
+        sample.await_output(Duration::from_secs(20), "its subscription", |output| {
+            output.contains("Subscription channel status")
+        });
+
+        Self { driver, sample }
+    }
+
+    /// The payloads it has printed that begin with `prefix`, in order.
+    ///
+    /// The sample prints one line per *message* — its own assembler has
+    /// already put fragments back together
+    /// (`aeron-samples/src/main/cpp/BasicSubscriber.cpp:72-78`) — so what comes
+    /// out is the application's payload and not the wire's frames.
+    ///
+    /// The prefix is how a test separates what it is asserting on from what it
+    /// published to get here: a warm-up message is not a fact about anything,
+    /// and this suite's payloads all name their own phase.
+    fn received(&self, prefix: &str) -> Vec<String> {
+        self.sample
+            .output()
+            .lines()
+            .filter(|line| line.starts_with("Message to stream "))
+            .filter_map(|line| {
+                let rest = line.split_once("<<")?.1;
+                Some(rest.strip_suffix(">>")?.to_string())
+            })
+            .filter(|payload| payload.starts_with(prefix))
+            .collect()
+    }
+
+    /// Whether this subscriber has an image right now: the last thing it said
+    /// about images was that one became available.
+    ///
+    /// The sample prints both transitions
+    /// (`aeron-samples/src/main/cpp/BasicSubscriber.cpp:110-122`), so "it has
+    /// one" is a statement about the *order* of those two lines rather than
+    /// about either one alone.
+    fn has_image(&self) -> bool {
+        self.sample
+            .output()
+            .lines()
+            .filter(|line| {
+                line.starts_with("Available image ") || line.starts_with("Unavailable image ")
+            })
+            .next_back()
+            .is_some_and(|line| line.starts_with("Available image "))
+    }
+
+    /// Wait for `expected` payloads beginning with `prefix`, or give up.
+    fn await_received(&self, prefix: &str, expected: usize, within: Duration) -> Vec<String> {
+        let deadline = Instant::now() + within;
+        let mut payloads = self.received(prefix);
+
+        while payloads.len() < expected && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            payloads = self.received(prefix);
+        }
+
+        payloads
+    }
+
+    fn stop(self) {
+        let mut sample = self.sample;
+        let mut driver = self.driver;
+        let _ = sample.terminate(Duration::from_secs(5));
+        let _ = driver.stop();
+    }
+}
+
+/// A1: one publication, two destinations, two reference drivers.
+///
+/// The send side of the destination plane, and the thing none of the
+/// single-address tests can reach: `send()` has to fan out, and a *control*
+/// frame — the `SETUP` that brings each image into being — has to go to each
+/// destination by the same route the data does. Get that wrong and the
+/// failure is not a corrupt byte, it is a subscriber that never hears anything
+/// at all, because a publication with no image never opens its window.
+///
+/// The two subscribers are the reference's *own* sample programs behind the
+/// reference's *own* driver, so neither side of the fan-out shares code with
+/// this build: whatever they print, they printed from bytes this driver put on
+/// the wire.
+#[test]
+fn our_publications_destinations_reach_two_reference_subscribers() {
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("mdc-our-publisher") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    // Readiness only; nothing here asserts on the counters.
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let channel_one = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(21));
+    let channel_two = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(22));
+
+    // The subscribers first: each binds the port its own destination will
+    // name, and a destination is only an address — nothing would retry into a
+    // port that was closed when the command was issued.
+    let first = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-reference-subscriber-1",
+        &channel_one,
+    );
+    let second = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-reference-subscriber-2",
+        &channel_two,
+    );
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(MANUAL_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the manual publication");
+
+    publisher
+        .add_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the first destination");
+    publisher
+        .add_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the second destination");
+
+    // Both destinations have to be *up* before anything is asserted about the
+    // messages, and getting the second one up is itself the interesting part.
+    //
+    // A publication announces itself to every destination on a 100 ms cadence
+    // **only while it has no connection at all** (`aeron_network_publication.c:586-589`),
+    // and the two `add_destination` commands are serviced a few milliseconds
+    // apart — so the first `SETUP` can go out to the first destination alone,
+    // the first subscriber answers it, and the announcement stops before the
+    // second destination ever sees one. Measured, on this test: the wire shows
+    // `SETUP → :28502` on its own, then the first `DATA` to both destinations,
+    // and only *then* a `SEND_SETUP` from :28503 — the second subscriber
+    // eliciting a `SETUP` for a session it is receiving data for and knows
+    // nothing about (`aeron_data_packet_dispatcher.c:616-659`).
+    //
+    // That is the protocol working, not a defect: a destination added to a
+    // publication that is already connected joins **mid-stream**, through the
+    // same elicitation path a late subscriber uses. The warm-up below is
+    // therefore not a workaround — it is the thing that has to happen, and the
+    // assertion after it is that it happened.
+    let warm_up = warm_up(
+        &publisher,
+        publication_id,
+        &[&first, &second],
+        Duration::from_secs(20),
+    );
+
+    let first_has_image = first.has_image();
+    let second_has_image = second.has_image();
+    let log = own.log_tail(60);
+
+    assert!(
+        warm_up && first_has_image && second_has_image,
+        "a destination that never comes up cannot receive anything: \
+         first={first_has_image} second={second_has_image}\nour driver said:\n{log}"
+    );
+
+    // Every payload carries its own number, so a subscriber that received the
+    // right *count* of the wrong bytes is a failure rather than a pass.
+    let messages = 5;
+    let payloads: Vec<Vec<u8>> = (0..messages)
+        .map(|index| format!("destination {index}").into_bytes())
+        .collect();
+
+    let offered = offer_all(
+        &publisher,
+        publication_id,
+        &payloads,
+        Duration::from_secs(20),
+    );
+
+    let first_saw = first.await_received("destination ", messages, Duration::from_secs(20));
+    let second_saw = second.await_received("destination ", messages, Duration::from_secs(20));
+
+    let log = own.log_tail(60);
+    first.stop();
+    second.stop();
+    let _ = own.stop();
+
+    let expected: Vec<String> = payloads
+        .iter()
+        .map(|payload| String::from_utf8_lossy(payload).to_string())
+        .collect();
+
+    assert_eq!(
+        offered, messages,
+        "the publication's window never opened for every message — a destination \
+         that never answered cannot be offered to.\nour driver said:\n{log}"
+    );
+    assert_eq!(
+        expected, first_saw,
+        "the first subscriber did not receive what was published\nour driver said:\n{log}"
+    );
+    assert_eq!(
+        expected, second_saw,
+        "the second subscriber did not receive what was published\nour driver said:\n{log}"
+    );
+}
+
+/// Offer throwaway payloads until every subscriber has an image, or give up.
+///
+/// The payloads are distinguishable from the ones a test asserts on — they
+/// carry `warmup` — because the point is to get each destination to the state
+/// where it *can* receive, and which of the warm-up messages a destination
+/// caught on the way up is not a fact about anything.
+///
+/// An offer that comes back `NotConnected` is expected: the window is closed
+/// until the first subscriber's status message arrives, and that subscriber
+/// only has somewhere to send one after the publication's own `SETUP` reached
+/// it.
+fn warm_up(
+    client: &Client,
+    publication_id: i64,
+    subscribers: &[&ReferenceSubscriber],
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    let mut index = 0;
+
+    while Instant::now() < deadline {
+        if subscribers.iter().all(|subscriber| subscriber.has_image()) {
+            return true;
+        }
+
+        let payload = format!("warmup {index}");
+        let _ = client.offer(publication_id, payload.as_bytes());
+        index += 1;
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    subscribers.iter().all(|subscriber| subscriber.has_image())
+}
+
+/// Offer every payload, retrying until the window opens, and answer how many
+/// went through.
+///
+/// The window is closed until each subscriber's status message has reached the
+/// publication, and a subscriber learns where to send one only after the first
+/// `SETUP` reaches it — so the first attempts are expected to come back
+/// `NotConnected`, and that is the chain this test is about rather than a
+/// reason to fail.
+fn offer_all(
+    client: &Client,
+    publication_id: i64,
+    payloads: &[Vec<u8>],
+    within: Duration,
+) -> usize {
+    let deadline = Instant::now() + within;
+    let mut offered = 0;
+
+    while offered < payloads.len() && Instant::now() < deadline {
+        match client.offer(publication_id, &payloads[offered]) {
+            Some(Appended::Ok { .. }) => offered += 1,
+            Some(Appended::BackPressured | Appended::NotConnected) | None => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => panic!("the driver refused the payload: {other:?}"),
+        }
+    }
+
+    offered
+}
+
+/// A2: removing a destination takes exactly one receiver out of the fan-out.
+///
+/// The claim is narrow and worth stating precisely: after the removal the
+/// *removed* subscriber receives none of the messages published **from then
+/// on**, and the other one still receives all of them. Nothing is asserted
+/// about frames already in flight — a datagram sent a microsecond before the
+/// command was serviced is not a stale destination. That is why the payloads
+/// carry their phase as well as their number: a test that counted messages
+/// would be measuring the race rather than the removal.
+///
+/// Both commands are exercised, because both are one conversation with the
+/// driver and only one of them is by URI: `remove_destination` matches on the
+/// channel, `remove_destination_by_id` on the registration id the *add*
+/// answered with.
+#[test]
+fn removing_a_destination_leaves_the_other_one_receiving() {
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("mdc-remove-destination") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let channel_one = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(31));
+    let channel_two = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(32));
+
+    let first = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-remove-subscriber-1",
+        &channel_one,
+    );
+    let second = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-remove-subscriber-2",
+        &channel_two,
+    );
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(MANUAL_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the manual publication");
+
+    let _first_destination = publisher
+        .add_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the first destination");
+    let second_destination = publisher
+        .add_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the second destination");
+
+    // Both destinations have to be up before anything is asserted about the
+    // messages: the second one joins mid-stream through the elicitation path,
+    // exactly as in A1, and a message it was never able to receive is not a
+    // fact about removal.
+    let up = warm_up(
+        &publisher,
+        publication_id,
+        &[&first, &second],
+        Duration::from_secs(20),
+    );
+    assert!(
+        up,
+        "both destinations have to be up before removal means anything"
+    );
+
+    let messages = 3;
+    let bodies = |phase: &str| -> Vec<String> {
+        (0..messages)
+            .map(|index| format!("{phase} {index}"))
+            .collect()
+    };
+    let as_bytes = |phase: &str| -> Vec<Vec<u8>> {
+        bodies(phase).into_iter().map(String::into_bytes).collect()
+    };
+
+    // Both destinations live: both subscribers have to see these.
+    let before = as_bytes("before");
+    assert_eq!(
+        before.len(),
+        offer_all(&publisher, publication_id, &before, Duration::from_secs(20)),
+        "both destinations are added by now, so every message has to be offered"
+    );
+    let _ = first.await_received("before ", messages, Duration::from_secs(20));
+    let _ = second.await_received("before ", messages, Duration::from_secs(20));
+
+    // One destination leaves, by URI.
+    publisher
+        .remove_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the removal");
+
+    let mid = as_bytes("mid");
+    assert_eq!(
+        mid.len(),
+        offer_all(&publisher, publication_id, &mid, Duration::from_secs(20)),
+        "the remaining destination still has to take every message"
+    );
+    let second_saw_mid = second.await_received("mid ", messages, Duration::from_secs(20));
+    let first_saw_mid = first.received("mid ");
+    let first_saw_before = first.received("before ");
+
+    // And the last one leaves, by id — nothing is left to send to.
+    publisher
+        .remove_destination_by_id(publication_id, second_destination, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the removal by id");
+
+    let after = as_bytes("after");
+    let _ = offer_all(&publisher, publication_id, &after, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(500));
+    let second_saw_after = second.received("after ");
+
+    let log = own.log_tail(60);
+    first.stop();
+    second.stop();
+    let _ = own.stop();
+
+    // Phase one: the first subscriber was receiving, which is what makes the
+    // silence after its removal a statement about removal rather than about a
+    // destination that never worked at all.
+    assert_eq!(
+        messages,
+        first_saw_before.len(),
+        "the first subscriber has to have been receiving before it was removed: \
+         {first_saw_before:?}"
+    );
+    assert!(
+        first_saw_mid.is_empty(),
+        "the removed subscriber received messages published after its removal: {first_saw_mid:?}"
+    );
+    assert_eq!(
+        bodies("mid"),
+        second_saw_mid,
+        "the destination that stayed has to keep receiving\nour driver said:\n{log}"
+    );
+    assert!(
+        second_saw_after.is_empty(),
+        "with every destination removed nothing is left to send to, but the last \
+         subscriber received: {second_saw_after:?}"
+    );
+}
+
+/// Read `mdc-num-dest` out of a driver's own counters, with the reference's own
+/// viewer (`AeronStat -d <dir> -w false`).
+///
+/// The label rather than the number is matched: ids are handed out in
+/// allocation order, and only the label says what a counter *is*.
+fn mdc_num_dest(stat_binary: &Path, dir: &Path) -> Result<i64, String> {
+    let output = std::process::Command::new(stat_binary)
+        .arg("-d")
+        .arg(dir)
+        .arg("-w")
+        .arg("false")
+        .output()
+        .map_err(|error| format!("run AeronStat: {error}"))?;
+
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    for line in text.lines() {
+        let Some((_id, rest)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        let Some((value, label)) = rest.rsplit_once(" - ") else {
+            continue;
+        };
+
+        // The label carries the channel after a colon (`mdc-num-dest: <channel>`),
+        // as every channel-scoped counter does.
+        if label.trim().starts_with("mdc-num-dest") {
+            return value
+                .trim()
+                .parse::<i64>()
+                .map_err(|error| format!("parse {value:?}: {error}\n{text}"));
+        }
+    }
+
+    Err(format!("no mdc-num-dest counter in:\n{text}"))
+}
+
+/// A3, the manual half: `mdc-num-dest` follows the client's commands and
+/// nothing else.
+///
+/// This is the counter that says how many places a multi-destination channel
+/// is sending to, read by the *reference's* own counter viewer rather than by
+/// this build's reader — so it is a statement about the CnC file as another
+/// program sees it, not about what this driver believes it wrote.
+///
+/// The last step is the one with a rule in it: a **manual** channel's
+/// destinations never time out (`aeron_udp_destination_tracker.c:107-118`
+/// removes an entry for inactivity only when the control mode is *dynamic*),
+/// so stopping the subscriber behind a destination does not take the
+/// destination away. A count that fell there would be this driver expiring
+/// something the reference keeps.
+///
+/// The dynamic half — an entry that a subscriber's status message *creates*,
+/// and that five seconds of silence removes — is not here: it needs a
+/// subscriber whose status messages reach this publication's control address,
+/// which is its own arrangement.
+#[test]
+fn the_destination_count_follows_the_destinations_of_a_manual_channel() {
+    let Some(stat_binary) = driver::locate_aeron_stat() else {
+        driver::announce_tool_skip("AeronStat");
+        return;
+    };
+
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("mdc-destination-count") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+    let dir = own.aeron_dir().to_path_buf();
+
+    let channel_one = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(41));
+    let channel_two = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(42));
+
+    let mut first = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-count-subscriber-1",
+        &channel_one,
+    );
+    let second = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-count-subscriber-2",
+        &channel_two,
+    );
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    // One reading per step, each after the driver has answered the command
+    // that changed it — the commands are synchronous, so the counter is a
+    // statement about a completed operation rather than about a race.
+    let mut readings: Vec<(&str, Result<i64, String>)> = Vec::new();
+
+    let publication_id = publisher
+        .add_publication(MANUAL_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the manual publication");
+    readings.push(("after the publication", mdc_num_dest(&stat_binary, &dir)));
+
+    publisher
+        .add_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the first destination");
+    readings.push(("after one destination", mdc_num_dest(&stat_binary, &dir)));
+
+    publisher
+        .add_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the second destination");
+    readings.push(("after two destinations", mdc_num_dest(&stat_binary, &dir)));
+
+    publisher
+        .remove_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the removal");
+    readings.push(("after removing one", mdc_num_dest(&stat_binary, &dir)));
+
+    // The subscriber behind the remaining destination goes away. On a manual
+    // channel that is not a reason to forget it.
+    first.stop();
+    let mut second_sample = second;
+    let _ = second_sample.sample.terminate(Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(7));
+    readings.push((
+        "seven seconds after the subscriber stopped",
+        mdc_num_dest(&stat_binary, &dir),
+    ));
+
+    publisher
+        .remove_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the removal");
+    readings.push(("after removing the last", mdc_num_dest(&stat_binary, &dir)));
+
+    let _ = second_sample.driver.stop();
+    let log = own.log_tail(60);
+    let _ = own.stop();
+
+    let values: Vec<i64> = readings
+        .iter()
+        .map(|(step, reading)| {
+            *reading
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{step}: {error}\nour driver said:\n{log}"))
+        })
+        .collect();
+
+    assert_eq!(
+        vec![0, 1, 2, 1, 1, 0],
+        values,
+        "the count has to follow the commands and nothing else: {:?}",
+        readings.iter().map(|(step, _)| *step).collect::<Vec<_>>()
     );
 }
