@@ -140,10 +140,13 @@ impl ReceiveDestination {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
+        let has_explicit_control = channel.has_explicit_control;
+
         Ok(Self {
             channel,
             transport,
             local_sockaddr_counter_id,
+            has_explicit_control,
         })
     }
 
@@ -152,6 +155,22 @@ impl ReceiveDestination {
     /// (`rcv-local-sockaddr`, type 14).
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// Whether the receiver has to ask this destination to describe its stream
+    /// (`has_explicit_control`).
+    pub const fn has_explicit_control(&self) -> bool {
+        self.has_explicit_control
+    }
+
+    /// Where the ask goes: the channel's own control address
+    /// (`udp_channel->local_control`,
+    /// `media/aeron_receive_channel_endpoint.c:1138-1139`).
+    ///
+    /// [`None`] for a destination that has nothing to ask.
+    pub fn setup_address(&self) -> Option<SocketAddr> {
+        self.has_explicit_control
+            .then_some(self.channel.local_control)
     }
 
     /// The channel this destination is for, which is what identifies it: the
@@ -236,6 +255,16 @@ pub struct ReceiveDestination {
     /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
     /// bound, which is not what the channel said when it named port zero.
     local_sockaddr_counter_id: i32,
+    /// Whether the destination's channel named a `control=`
+    /// (`has_explicit_control`).
+    ///
+    /// This is what decides whether the receiver **opens the conversation**:
+    /// a destination with an explicit control address is one the sender does
+    /// not know about, so the receiver has to ask (`aeron_driver_receiver.c:475-486`,
+    /// which adds a periodic pending setup for exactly these and no others).
+    /// A destination the sender already knows — an implicit-unicast one — is
+    /// asked for nothing.
+    has_explicit_control: bool,
 }
 
 pub struct ReceiveChannelEndpoint {
@@ -970,6 +999,55 @@ mod tests {
             first.local_sockaddr_counter_id(),
             "the first counter a fresh manager hands out"
         );
+    }
+
+    /// Only a destination whose channel named a `control=` has anything to ask
+    /// (`aeron_driver_receiver.c:475-486`).
+    ///
+    /// This is the condition the receiver pushes a periodic pending setup on: a
+    /// sender that does not know the receiver exists will never describe its
+    /// stream, so the receiver has to say so — and keep saying so, which is what
+    /// makes the entry periodic. A destination the sender already knows is asked
+    /// for nothing.
+    #[test]
+    fn only_a_destination_with_a_control_address_has_something_to_ask() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let with_control = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            stub(40123),
+            &mut counters,
+            &regions,
+            7,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert!(
+            with_control.has_explicit_control(),
+            "the channel named a control address"
+        );
+        assert_eq!(
+            Some("127.0.0.1:40124".parse().expect("an address")),
+            with_control.setup_address(),
+            "and the ask goes to it"
+        );
+
+        let without = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            stub(40125),
+            &mut counters,
+            &regions,
+            8,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert!(!without.has_explicit_control());
+        assert_eq!(None, without.setup_address(), "nothing to ask");
     }
 
     /// An endpoint holds what it is given and reads from all of them: one on

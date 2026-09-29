@@ -524,10 +524,33 @@ impl ReceiverThread {
                         endpoint_id,
                         destination,
                     } => {
+                        // A destination whose channel named a `control=` is one
+                        // the sender does not know about: the receiver has to
+                        // ask, and has to keep asking until it is answered
+                        // (`aeron_driver_receiver.c:475-486`, which adds a
+                        // periodic pending setup for exactly these).
+                        //
+                        // Session and stream are zero, as they are there: the
+                        // ask is not about a stream yet. What it is for is the
+                        // answer — a `SETUP` describing whatever the far end
+                        // publishes — and that is what brings the stream into
+                        // being.
+                        let setup = destination.setup_address().map(|address| PendingSetup {
+                            endpoint_id,
+                            stream_id: 0,
+                            session_id: 0,
+                            control_address: Some(address),
+                            time_of_status_message_ns: deepmsg_core::clock::monotonic_nano_time(),
+                        });
+
                         if let Some((_, endpoint)) =
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             endpoint.add_destination(*destination);
+                        }
+
+                        if let Some(setup) = setup {
+                            self.pending_setups.push(setup);
                         }
                     }
                     ReceiverCommand::RemoveDestination {
