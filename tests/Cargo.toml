@@ -134,5 +134,12 @@ name = "udp_counters"
 path = "interop/udp_counters.rs"
 required-features = ["interop"]
 
+# The reference's own C client, compiled from `fixtures/destination_probe.c`,
+# asking this driver to add a destination — nothing shipped exercises that API.
+[[test]]
+name = "destination_probe"
+path = "interop/destination_probe.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true
