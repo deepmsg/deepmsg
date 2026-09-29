@@ -819,7 +819,7 @@ fn the_destination_count_follows_the_destinations_of_a_manual_channel() {
     let channel_one = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(41));
     let channel_two = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(42));
 
-    let mut first = ReferenceSubscriber::start(
+    let first = ReferenceSubscriber::start(
         &reference_binary,
         &subscriber_binary,
         "mdc-count-subscriber-1",
@@ -894,4 +894,131 @@ fn the_destination_count_follows_the_destinations_of_a_manual_channel() {
         "the count has to follow the commands and nothing else: {:?}",
         readings.iter().map(|(step, _)| *step).collect::<Vec<_>>()
     );
+}
+
+/// Read `mdc-num-dest` until it is `expected`, or give up.
+fn await_mdc_num_dest(
+    stat_binary: &Path,
+    dir: &Path,
+    expected: i64,
+    within: Duration,
+) -> Result<i64, String> {
+    let deadline = Instant::now() + within;
+    let mut reading = mdc_num_dest(stat_binary, dir);
+
+    while Instant::now() < deadline {
+        if matches!(reading, Ok(value) if value == expected) {
+            return reading;
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+        reading = mdc_num_dest(stat_binary, dir);
+    }
+
+    reading
+}
+
+/// A3, the dynamic half: on a `control-mode=dynamic` channel the destinations
+/// are not the client's — they are made and unmade by the status messages that
+/// arrive at the channel's own control address.
+///
+/// The arrangement is what makes this a different test from the manual half.
+/// The publication **binds** the control address (`control=localhost:C`) and
+/// has no destination at all until something talks to it; the subscriber binds
+/// its own endpoint `P` and sends its control messages *to C*
+/// (`aeron_udp_channel.c:465-487`: a channel that names a `control=` sends its
+/// control frames there). So the subscriber speaks first — the same shape as a
+/// destination with an explicit control address — and the publication learns
+/// where to send data from the **source** of what arrived
+/// (`aeron_udp_destination_tracker.c:263-300`).
+///
+/// Both halves of the entry's life are asserted, and they have different
+/// causes: one status message **creates** it, and five seconds without one
+/// **removes** it (`AERON_UDP_DESTINATION_TRACKER_DESTINATION_TIMEOUT_NS`,
+/// `media/aeron_udp_destination_tracker.h:30-53`; this build's value is the
+/// same five seconds, `destination_tracker.rs:39`). A manual channel never
+/// does the second — that is the half above.
+#[test]
+fn a_dynamic_channels_destinations_follow_the_status_messages() {
+    let Some(stat_binary) = driver::locate_aeron_stat() else {
+        driver::announce_tool_skip("AeronStat");
+        return;
+    };
+
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let Some(mut own) = OwnDriver::start("mdc-dynamic-destination-count") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+    let dir = own.aeron_dir().to_path_buf();
+
+    let subscriber_channel = format!(
+        "aeron:udp?endpoint=localhost:{}|control=localhost:{}",
+        free_udp_port(51),
+        free_udp_port(52)
+    );
+    let publication_channel = format!(
+        "aeron:udp?control=localhost:{}|control-mode=dynamic",
+        free_udp_port(52)
+    );
+
+    // The publication first: it binds the control address the subscriber will
+    // talk to, and there is nothing on the other side yet.
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication_id = publisher
+        .add_publication(&publication_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the dynamic publication");
+
+    let empty = mdc_num_dest(&stat_binary, &dir);
+
+    let subscriber = ReferenceSubscriber::start(
+        &reference_binary,
+        &subscriber_binary,
+        "mdc-dynamic-subscriber",
+        &subscriber_channel,
+    );
+
+    // The subscriber's own `SEND_SETUP` is the first status message to arrive
+    // at C, and it is what makes the entry.
+    let created = await_mdc_num_dest(&stat_binary, &dir, 1, Duration::from_secs(20));
+
+    // Stop it and wait out the timeout: no more status messages arrive, so the
+    // entry expires. Nothing about the *client* changes — the publication is
+    // still open — which is what makes this a statement about the tracker.
+    subscriber.stop();
+    let expired = await_mdc_num_dest(&stat_binary, &dir, 0, Duration::from_secs(20));
+
+    let log = own.log_tail(60);
+    let _ = own.stop();
+
+    assert_eq!(
+        Ok(0),
+        empty,
+        "a dynamic publication starts with no destinations — nothing has talked \
+         to it yet.\nour driver said:\n{log}"
+    );
+    assert_eq!(
+        Ok(1),
+        created,
+        "the subscriber's status message has to create a destination.\nour driver said:\n{log}"
+    );
+    assert_eq!(
+        Ok(0),
+        expired,
+        "and five seconds without one has to remove it.\nour driver said:\n{log}"
+    );
+    let _ = publication_id;
 }
