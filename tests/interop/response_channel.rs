@@ -162,6 +162,45 @@ impl FarEnd {
         let _ = self.socket.send_batch(Some(to), &[&frame]);
     }
 
+    /// The ask a receive endpoint makes when it knows a stream and a session
+    /// but has no image for them: a status message that is nothing but
+    /// `SEND_SETUP` (`aeron_receive_channel_endpoint_elicit_setup`,
+    /// `media/aeron_receive_channel_endpoint.c:259-289` — stream, session, and
+    /// three zeroes, which is why the window here is zero and not the 64K a
+    /// position report would carry).
+    ///
+    /// It is the **session** that makes this one work, and it is why a
+    /// requester has to wait for the far end's `RSP_SETUP` before it can ask:
+    /// the far end finds its publication by `(stream_id << 32) | session_id`
+    /// (`aeron_send_channel_endpoint.c:614-616`), so an ask that names no
+    /// session reaches no publication at all.
+    ///
+    /// It goes to the channel's `control=` address, where the far end's send
+    /// endpoint is bound — and that far end learns **this** socket's address as
+    /// the only one it may ever answer
+    /// (`aeron_network_publication.h:263-273`).
+    fn elicit(&self, control: u16, stream_id: i32, session_id: i32) {
+        let sm = StatusMessageFrame {
+            session_id,
+            stream_id,
+            consumption_term_id: 0,
+            consumption_term_offset: 0,
+            receiver_window: 0,
+            receiver_id: 1,
+        };
+
+        let mut frame = [0u8; StatusMessageFrame::LENGTH];
+        assert!(
+            sm.write_with_flags(&mut frame, header_flags::SM_SEND_SETUP)
+                .is_some()
+        );
+
+        let _ = self.socket.send_batch(
+            Some(format!("127.0.0.1:{control}").parse().expect("an address")),
+            &[&frame],
+        );
+    }
+
     /// Every `RSP_SETUP` that arrives within `within`.
     fn take_rsp_setups(&mut self, within: Duration) -> Vec<RspSetupFrame> {
         let deadline = Instant::now() + within;
@@ -675,7 +714,7 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
     // from the image the requester's `SETUP` made, and asks for no image of its
     // own. So one has to exist here: a requester sends a `SETUP` that asks for
     // a response channel, and this driver makes the image it describes.
-    let requester = FarEnd::open(free_udp_port(105));
+    let mut requester = FarEnd::open(free_udp_port(105));
     requester.send_a_setup_asking(
         answer_endpoint,
         STREAM_ID,
@@ -686,11 +725,18 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
     let image = await_image(&mut client, subscription_id, Duration::from_secs(5))
         .expect("a SETUP that asks for a response channel makes an image");
 
-    let answering_port = free_udp_port(103);
+    // And the channel it answers on is the reference's response channel: a
+    // `control=` and **no** `endpoint=` (`samples_configuration.h:34`). That
+    // is not decoration. It is what makes the two ends meet — the requester's
+    // receive endpoint elicits *to* the control address, and the publication's
+    // send endpoint is bound there (`aeron_send_channel_endpoint.c:112-116`),
+    // so the ask arrives; while the publication itself has nowhere to send
+    // until the ask tells it where (`aeron_network_publication.c:355-378`).
+    let response_control = free_udp_port(103);
     let _answering = client
         .add_publication(
             &format!(
-                "aeron:udp?endpoint=127.0.0.1:{answering_port}\
+                "aeron:udp?control=127.0.0.1:{response_control}\
                  |response-correlation-id={image}|control-mode=response"
             ),
             STREAM_ID,
@@ -698,7 +744,19 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
         )
         .expect("a response publication is one this driver serves");
 
-    let mut answerer = FarEnd::open(answering_port);
+    // The one fact a requester cannot guess is which session the publication
+    // speaks on, and the image is where it is told
+    // (`aeron_publication_image.c:899-923`).
+    let said = requester
+        .take_rsp_setups(Duration::from_secs(5))
+        .pop()
+        .expect("the image says which session it answers on");
+
+    // Only now can the ask be made, and it is made by name: that session is
+    // what the far end looks its publication up by.
+    let mut answerer = FarEnd::open(free_udp_port(106));
+    answerer.elicit(response_control, STREAM_ID, said.response_session_id);
+
     let answered = answerer
         .await_setup(STREAM_ID, Duration::from_secs(5))
         .expect("a publication describes itself");
@@ -966,12 +1024,15 @@ fn the_image_answers_the_publication_that_asked_for_a_response_channel() {
     let image = await_image(&mut client, request, Duration::from_secs(5))
         .expect("a SETUP that asks for a response channel makes an image");
 
-    // The answer: a response publication naming that image.
-    let answering_endpoint = free_udp_port(123);
+    // The answer: a response publication naming that image, on the reference's
+    // response channel — a `control=` and no `endpoint=` at all
+    // (`samples_configuration.h:34`), which is what gives the requester's ask
+    // somewhere to arrive.
+    let response_control = free_udp_port(123);
     let _answering = client
         .add_publication(
             &format!(
-                "aeron:udp?endpoint=127.0.0.1:{answering_endpoint}\
+                "aeron:udp?control=127.0.0.1:{response_control}\
                  |control-mode=response|response-correlation-id={image}"
             ),
             STREAM_ID,
@@ -979,19 +1040,25 @@ fn the_image_answers_the_publication_that_asked_for_a_response_channel() {
         )
         .expect("the image that asked for a response channel is one this answers");
 
-    let mut answerer = FarEnd::open(answering_endpoint);
-    let described = answerer
-        .await_setup(STREAM_ID, Duration::from_secs(5))
-        .expect("a publication describes itself");
-
     // The first half. The session the image says is the publication's own,
-    // read from the publication's `SETUP` by the *other* end of the pair —
-    // which is the point: it is the one fact the publisher could not have
-    // known and had to be told.
+    // read by the *other* end of the pair — which is the point: it is the one
+    // fact the publisher could not have known and had to be told, and it is
+    // also the only thing that makes the ask below land, because the far end
+    // looks its publication up by `(stream << 32) | session`.
     let said = requester
         .take_rsp_setups(Duration::from_secs(5))
         .pop()
         .expect("the image answers a publication that asked for a response channel");
+
+    // Now the requester can ask — from the socket that means to receive the
+    // answer, since that is the address the publication is entitled to reply
+    // to (`aeron_network_publication.h:263-273`).
+    let mut answerer = FarEnd::open(free_udp_port(124));
+    answerer.elicit(response_control, STREAM_ID, said.response_session_id);
+
+    let described = answerer
+        .await_setup(STREAM_ID, Duration::from_secs(5))
+        .expect("a publication describes itself");
 
     assert_eq!(
         described.session_id, said.response_session_id,

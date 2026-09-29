@@ -759,7 +759,7 @@ impl SenderThread {
                 };
 
                 if is_send_setup {
-                    publications[index].trigger_send_setup_frame();
+                    publications[index].trigger_send_setup_frame(source);
                     return;
                 }
 

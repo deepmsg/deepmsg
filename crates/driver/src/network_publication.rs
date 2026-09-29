@@ -40,6 +40,7 @@
 //! through two modules to save it, which this slice does not spend.
 
 use std::io;
+use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 use deepmsg_core::logbuffer::descriptor;
@@ -168,6 +169,15 @@ pub struct NetworkPublication {
     /// `SEND_RESPONSE` bit in its `SETUP`), and a publication that *is* one
     /// never asks — it is the answer.
     pub is_response: bool,
+    /// The one address a response publication may send to, learned from the
+    /// frame that asked for the channel
+    /// (`endpoint_address`, `aeron_network_publication.h:243-274`).
+    ///
+    /// `None` is the reference's `AF_UNSPEC`, and it is not "send nowhere
+    /// special" — it is **send nothing**. A response publication's peer is the
+    /// one that asked, and until one has, there is nobody entitled to its data
+    /// (`aeron_network_publication.c:355-378`).
+    endpoint_address: Option<SocketAddr>,
     /// When the receivers go quiet, this is when they are declared gone.
     pub status_message_deadline_ns: i64,
     /// How long that is (`connection_timeout_ns`).
@@ -346,6 +356,7 @@ impl NetworkPublication {
             is_setup_elicited: false,
             response_correlation_id: params.response_correlation_id,
             is_response: params.is_response,
+            endpoint_address: None,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
             receivers: Vec::new(),
@@ -542,7 +553,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -627,7 +638,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -757,7 +768,7 @@ impl NetworkPublication {
             .collect();
 
         let sent = if frames > 0 {
-            endpoint.send(&slices, counters, regions, now_ns)?
+            self.do_send(endpoint, &slices, counters, regions, now_ns)?
         } else {
             0
         };
@@ -898,7 +909,13 @@ impl NetworkPublication {
                 break;
             }
 
-            let sent = endpoint.send(&[&scratch[..available]], counters, regions, now_ns)?;
+            let sent = self.do_send(
+                endpoint,
+                &[&scratch[..available]],
+                counters,
+                regions,
+                now_ns,
+            )?;
 
             if sent < 1 {
                 system.increment(system_counters::id::SHORT_SENDS);
@@ -971,12 +988,61 @@ impl NetworkPublication {
     /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
     /// with yet — the hook and the address it needs arrive with the strategy
     /// that reads them, and `dispatch` does not carry a source address today.
-    pub fn trigger_send_setup_frame(&mut self) {
+    /// `address` is where the message that elicited this came from, and for a
+    /// response publication it is the **only** place this publication may ever
+    /// send: the peer that asked for the channel is the one that elicited, and
+    /// it is learned here or not at all
+    /// (`aeron_network_publication_trigger_send_setup_frame`,
+    /// `aeron_network_publication.h:243-274`).
+    /// `elicited_from` is where the message came from. It is optional only
+    /// because this build's transport can be asked not to report a source;
+    /// a datagram off a socket always has one, and a response publication
+    /// learns its peer from nothing else.
+    pub fn trigger_send_setup_frame(&mut self, elicited_from: Option<SocketAddr>) {
         if self.is_end_of_stream {
             return;
         }
 
         self.is_setup_elicited = true;
+
+        if self.is_response {
+            if let Some(address) = elicited_from {
+                self.endpoint_address = Some(address);
+            }
+        }
+    }
+
+    /// Hand one batch to the transport, or refuse to
+    /// (`aeron_network_publication_do_send`, `:355-378`).
+    ///
+    /// Every frame a publication sends goes through here, which is the whole
+    /// point: a response publication's restriction is not a rule about its data
+    /// frames, it is a rule about *this publication*, and the reference reaches
+    /// it from the setup, the heartbeat, the data path, the retransmit path and
+    /// the RTTM answer alike.
+    ///
+    /// A response publication that has learned no address sends nothing at all
+    /// — not to the endpoint's address, which is a different peer entirely.
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    fn do_send(
+        &self,
+        endpoint: &mut SendChannelEndpoint,
+        buffers: &[&[u8]],
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> io::Result<usize> {
+        if self.is_response {
+            return match self.endpoint_address {
+                Some(address) => endpoint.send_to(address, buffers),
+                None => Ok(0),
+            };
+        }
+
+        endpoint.send(buffers, counters, regions, now_ns)
     }
 
     /// A status message arrived (`aeron_network_publication_on_status_message`,
@@ -1084,7 +1150,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);

@@ -479,6 +479,29 @@ impl SendChannelEndpoint {
         Ok(sent + dropped)
     }
 
+    /// Hand one batch to one address, and to nothing else
+    /// (`aeron_send_channel_send_endpoint_address`, `:424-438`).
+    ///
+    /// This is the whole of a response publication's output. It has no
+    /// destinations to fan out to, and it may not use the endpoint's own
+    /// address: the only peer entitled to its data is the one that asked for
+    /// the channel.
+    ///
+    /// The reference's version consults neither the loss generator nor the
+    /// destination tracker, and neither does this one — the frame goes to the
+    /// address it was given, or nowhere.
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    pub fn send_to(&mut self, address: SocketAddr, buffers: &[&[u8]]) -> io::Result<usize> {
+        if buffers.is_empty() {
+            return Ok(0);
+        }
+
+        self.transport.send(Some(address), buffers)
+    }
+
     /// Hand one batch to whoever this endpoint sends through
     /// (`aeron_send_channel_send`, `:410-425`).
     ///
