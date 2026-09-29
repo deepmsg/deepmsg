@@ -1196,6 +1196,7 @@ mod tests {
             max_resend: 0,
             entity_tag: -1,
             response_correlation_id: -1,
+            is_response: false,
             session_id: Some(session_id),
             linger_timeout_ns: 5_000_000_000,
             untethered_window_limit_timeout_ns: 5_000_000_000,

@@ -129,6 +129,15 @@ pub struct PublicationParams {
     pub entity_tag: i64,
     /// Which request this channel answers, or `-1`.
     pub response_correlation_id: i64,
+    /// Whether this publication is the *answer* half of a request, which is
+    /// what `control-mode=response` on the publication's channel means
+    /// (`aeron_driver_uri.c:247-250`).
+    ///
+    /// It is the opposite of what `response_correlation_id` says: a publication
+    /// that is a response one is the answer, and one that is not but names a
+    /// correlation id is the *question* — the one whose `SETUP` asks for a
+    /// response channel.
+    pub is_response: bool,
     /// The session the URI asked for. `None` means "pick one" — the driver
     /// speculates from the sessions already in use on this stream.
     pub session_id: Option<i32>,
@@ -520,6 +529,7 @@ impl PublicationParams {
             max_resend: config.max_resend,
             entity_tag: -1,
             response_correlation_id: -1,
+            is_response: false,
             session_id: None,
             linger_timeout_ns: config.publication_linger_timeout_ns,
             untethered_window_limit_timeout_ns: config.untethered_window_limit_timeout_ns,
@@ -599,6 +609,7 @@ impl PublicationParams {
             params.spies_simulate_connection = spies;
         }
         params.response_correlation_id = read_response_correlation_id(uri)?;
+        params.is_response = is_response_channel(uri);
 
         if let Some(window_limit) = uri.duration_ns(key::UNTETHERED_WINDOW_LIMIT_TIMEOUT)? {
             params.untethered_window_limit_timeout_ns = window_limit;

@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, CommandError, DEFAULT_TIMEOUT};
-use deepmsg_driver::protocol::{RspSetupFrame, SetupFrame};
+use deepmsg_driver::protocol::{RspSetupFrame, SetupFrame, header_flags};
 use deepmsg_driver::sys::AddressFamily;
 use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT};
@@ -43,6 +43,18 @@ fn free_udp_port(offset: u16) -> u16 {
     let base = 20_000 + (std::process::id() as u16 % 20_000);
 
     base.saturating_add(offset)
+}
+
+/// What a publisher's `SETUP` said: the session it is running, the flags byte,
+/// and where it came from.
+///
+/// That last one is the only way to reach a publication at all — it binds a port
+/// it never named, so a responder learns it from the first thing the publisher
+/// sends, which is the whole reason a response channel has a handshake.
+struct Announced {
+    session_id: i32,
+    flags: u8,
+    from: SocketAddr,
 }
 
 /// The far end of a session: a socket that is not the driver.
@@ -110,21 +122,19 @@ impl FarEnd {
         let _ = self.socket.send_batch(Some(address), &[&frame]);
     }
 
-    /// Wait for the driver's `SETUP` on `stream_id`, and report the session it
-    /// announced together with where it came from.
-    ///
-    /// That address is the only way to reach a publication: it binds a port it
-    /// never named, so a responder learns it from the first thing the publisher
-    /// sends — which is the whole reason a response channel has a handshake at
-    /// all.
-    fn await_setup(&mut self, stream_id: i32, within: Duration) -> Option<(i32, SocketAddr)> {
+    /// Wait for the driver's `SETUP` on `stream_id`, and report what it said.
+    fn await_setup(&mut self, stream_id: i32, within: Duration) -> Option<Announced> {
         let deadline = Instant::now() + within;
 
         while Instant::now() < deadline {
             if let Some((bytes, source)) = self.take() {
                 if let Some(setup) = SetupFrame::read(&bytes) {
                     if setup.stream_id == stream_id {
-                        return source.map(|source| (setup.session_id, source));
+                        return source.map(|from| Announced {
+                            session_id: setup.session_id,
+                            flags: bytes[5],
+                            from,
+                        });
                     }
                 }
             }
@@ -328,19 +338,19 @@ fn a_response_setup_is_what_makes_a_session_readable() {
         .expect("our driver must confirm the UDP publication");
 
     let mut responder = FarEnd::open(publication_port);
-    let (request_session, publisher) = responder
+    let announced = responder
         .await_setup(STREAM_ID, Duration::from_secs(5))
         .expect("a publication describes itself before anything can answer it");
 
     let response_session = 4242;
     let frame = RspSetupFrame {
-        session_id: request_session,
+        session_id: announced.session_id,
         stream_id: STREAM_ID,
         response_session_id: response_session,
     };
     let mut bytes = [0u8; RspSetupFrame::LENGTH];
     frame.write(&mut bytes).expect("written");
-    responder.send(publisher, &bytes);
+    responder.send(announced.from, &bytes);
 
     // The session the subscription was *not* told to read. It is the one the
     // far end would use if this were an ordinary subscriber, which is exactly
@@ -433,18 +443,18 @@ fn a_session_the_subscription_did_not_name_poisons_the_link() {
         .expect("our driver must confirm the UDP publication");
 
     let mut responder = FarEnd::open(publication_port);
-    let (request_session, publisher) = responder
+    let announced = responder
         .await_setup(STREAM_ID, Duration::from_secs(5))
         .expect("a publication describes itself before anything can answer it");
 
     let frame = RspSetupFrame {
-        session_id: request_session,
+        session_id: announced.session_id,
         stream_id: STREAM_ID,
         response_session_id: offered_session,
     };
     let mut bytes = [0u8; RspSetupFrame::LENGTH];
     frame.write(&mut bytes).expect("written");
-    responder.send(publisher, &bytes);
+    responder.send(announced.from, &bytes);
 
     let mut reader = FarEnd::open(control);
 
@@ -531,6 +541,114 @@ fn a_publication_that_names_no_ones_subscription_is_refused() {
         }
         other => panic!("the driver refuses it: {other:?}"),
     }
+
+    drop(client);
+    let _ = own.stop();
+}
+
+/// ⑩: the publication that asks for a response channel says so in its `SETUP`,
+/// and one that *is* the answer does not.
+///
+/// `aeron_network_publication.c:392-400`: `SEND_RESPONSE` is set by a
+/// publication that is not itself a response channel and names a correlation id
+/// — the question — and never by one that is — the answer. That single bit is
+/// the whole of how the far end learns it must reply with a `RSP_SETUP`, and it
+/// is not echoed back, or the two ends would ask each other forever.
+///
+/// Three publications, one test, because the rule has two halves and a flag
+/// that was always set would pass a test of either alone.
+#[test]
+fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
+    let Some(mut own) = OwnDriver::start("response-setup-flag") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    // The subscription a response publication would answer. It is an ordinary
+    // one: what `validate_response_subscription` asks is that the id names a
+    // network subscription here, not what kind.
+    let answer_endpoint = free_udp_port(101);
+    let subscription_id = client
+        .add_subscription(
+            &format!("aeron:udp?endpoint=127.0.0.1:{answer_endpoint}"),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP subscription");
+
+    // The question: not a response channel, but made to answer one.
+    let asking_port = free_udp_port(102);
+    let _asking = client
+        .add_publication(
+            &format!(
+                "aeron:udp?endpoint=127.0.0.1:{asking_port}\
+                 |response-correlation-id={subscription_id}"
+            ),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP publication");
+
+    let mut asker = FarEnd::open(asking_port);
+    let asked = asker
+        .await_setup(STREAM_ID, Duration::from_secs(5))
+        .expect("a publication describes itself");
+
+    assert_ne!(
+        0,
+        asked.flags & header_flags::SETUP_SEND_RESPONSE,
+        "the publication that asks for a response channel says so: {:#04x}",
+        asked.flags
+    );
+
+    // The answer: a response channel names a correlation id too, and must not
+    // ask for a response of its own.
+    let answering_port = free_udp_port(103);
+    let _answering = client
+        .add_publication(
+            &format!(
+                "aeron:udp?endpoint=127.0.0.1:{answering_port}\
+                 |response-correlation-id={subscription_id}|control-mode=response"
+            ),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a response publication is one this driver serves");
+
+    let mut answerer = FarEnd::open(answering_port);
+    let answered = answerer
+        .await_setup(STREAM_ID, Duration::from_secs(5))
+        .expect("a publication describes itself");
+
+    assert_eq!(
+        0,
+        answered.flags & header_flags::SETUP_SEND_RESPONSE,
+        "the answer does not ask for one of its own, or the two ends would ask \
+         each other forever: {:#04x}",
+        answered.flags
+    );
+
+    // And the ordinary case, which is the one every other test relies on.
+    let plain_port = free_udp_port(104);
+    let _plain = client
+        .add_publication(
+            &format!("aeron:udp?endpoint=127.0.0.1:{plain_port}"),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP publication");
+
+    let mut plain = FarEnd::open(plain_port);
+    let described = plain
+        .await_setup(STREAM_ID, Duration::from_secs(5))
+        .expect("a publication describes itself");
+
+    assert_eq!(0, described.flags & header_flags::SETUP_SEND_RESPONSE);
 
     drop(client);
     let _ = own.stop();

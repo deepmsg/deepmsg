@@ -41,7 +41,7 @@
 
 use std::io;
 
-use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
@@ -160,6 +160,14 @@ pub struct NetworkPublication {
     /// is the only thing that says which subscription that publication was
     /// made for (`aeron_send_channel_endpoint.c:738-748`).
     pub response_correlation_id: i64,
+    /// Whether this publication *is* the response half — the one a responder
+    /// creates with `control-mode=response` (`aeron_network_publication.c:316`).
+    ///
+    /// It is the opposite end of the same idea: a publication that is not a
+    /// response one but names a subscription asks for a response channel (the
+    /// `SEND_RESPONSE` bit in its `SETUP`), and a publication that *is* one
+    /// never asks — it is the answer.
+    pub is_response: bool,
     /// When the receivers go quiet, this is when they are declared gone.
     pub status_message_deadline_ns: i64,
     /// How long that is (`connection_timeout_ns`).
@@ -285,7 +293,7 @@ impl NetworkPublication {
                 // to — it is the endpoint channel's group semantics, the same
                 // value the setup frame's `GROUP` flag carries (`:136`, `:224`).
                 group: u8::from(retransmit_handler.has_group_semantics()),
-                is_response: false,
+                is_response: params.is_response,
                 rejoin: false,
                 reliable: false,
                 sparse: params.is_sparse,
@@ -337,6 +345,7 @@ impl NetworkPublication {
             clean_position: 0,
             is_setup_elicited: false,
             response_correlation_id: params.response_correlation_id,
+            is_response: params.is_response,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
             receivers: Vec::new(),
@@ -512,11 +521,22 @@ impl NetworkPublication {
         };
 
         let mut buffer = [0u8; SetupFrame::LENGTH];
-        let flags = if self.retransmit_handler.has_group_semantics() {
+        // `:392-400`. A publication that is not itself a response channel but
+        // was made to answer one says so here, and that bit is the whole of how
+        // the far end learns it must answer with a `RSP_SETUP`: a responder's
+        // own publication never sets it, so the request is never echoed.
+        let send_response_flag =
+            if !self.is_response && self.response_correlation_id != layout::NULL_VALUE {
+                header_flags::SETUP_SEND_RESPONSE
+            } else {
+                0
+            };
+        let group_flag = if self.retransmit_handler.has_group_semantics() {
             header_flags::SETUP_GROUP
         } else {
             0
         };
+        let flags = send_response_flag | group_flag;
 
         if frame.write_with_flags(&mut buffer, flags).is_none() {
             return Ok(0);
@@ -1517,6 +1537,7 @@ mod tests {
             max_resend: 0,
             entity_tag: -1,
             response_correlation_id: -1,
+            is_response: false,
             session_id: Some(42),
             linger_timeout_ns: 5_000_000_000,
             untethered_window_limit_timeout_ns: 5_000_000_000,
