@@ -141,5 +141,12 @@ name = "destination_probe"
 path = "interop/destination_probe.rs"
 required-features = ["interop"]
 
+# P1-5's A4: a reference `BasicPublisher`, its messages read by our client
+# through a subscription whose only address is a receive destination.
+[[test]]
+name = "multi_destination"
+path = "interop/multi_destination.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true
