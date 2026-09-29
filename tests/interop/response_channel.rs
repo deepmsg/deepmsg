@@ -83,8 +83,19 @@ impl FarEnd {
         }
     }
 
-    /// A `SETUP` for `stream_id` announcing `session_id`, sent to `port`.
+    /// A `SETUP` for `stream_id` announcing `session_id`, sent to `port`, with
+    /// nothing asked for.
     fn send_a_setup(&self, port: u16, stream_id: i32, session_id: i32) {
+        self.send_a_setup_asking(port, stream_id, session_id, 0);
+    }
+
+    /// The same, with `flags` in the header.
+    ///
+    /// The one flag that matters here is
+    /// [`header_flags::SETUP_SEND_RESPONSE`], which is the sender saying it
+    /// wants a response channel: it is the header's to say, so it cannot be
+    /// left out of a hand-built frame that is meant to be one.
+    fn send_a_setup_asking(&self, port: u16, stream_id: i32, session_id: i32, flags: u8) {
         let setup = SetupFrame {
             term_offset: 0,
             session_id,
@@ -96,7 +107,7 @@ impl FarEnd {
             ttl: 0,
         };
         let mut frame = [0u8; SetupFrame::LENGTH];
-        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+        assert!(setup.write_with_flags(&mut frame, flags).is_some());
 
         let _ = self.socket.send_batch(
             Some(format!("127.0.0.1:{port}").parse().expect("an address")),
@@ -608,12 +619,29 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
 
     // The answer: a response channel names a correlation id too, and must not
     // ask for a response of its own.
+    //
+    // The id it names is an **image's** (`find_response_publication_image`),
+    // which is what the reference's own `response_server` names — it learns it
+    // from the image the requester's `SETUP` made, and asks for no image of its
+    // own. So one has to exist here: a requester sends a `SETUP` that asks for
+    // a response channel, and this driver makes the image it describes.
+    let requester = FarEnd::open(free_udp_port(105));
+    requester.send_a_setup_asking(
+        answer_endpoint,
+        STREAM_ID,
+        21,
+        header_flags::SETUP_SEND_RESPONSE,
+    );
+
+    let image = await_image(&mut client, subscription_id, Duration::from_secs(5))
+        .expect("a SETUP that asks for a response channel makes an image");
+
     let answering_port = free_udp_port(103);
     let _answering = client
         .add_publication(
             &format!(
                 "aeron:udp?endpoint=127.0.0.1:{answering_port}\
-                 |response-correlation-id={subscription_id}|control-mode=response"
+                 |response-correlation-id={image}|control-mode=response"
             ),
             STREAM_ID,
             DEFAULT_TIMEOUT,
@@ -649,6 +677,183 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
         .expect("a publication describes itself");
 
     assert_eq!(0, described.flags & header_flags::SETUP_SEND_RESPONSE);
+
+    drop(client);
+    let _ = own.stop();
+}
+
+/// The registration id of the first image a subscription sees, polled for.
+fn await_image(client: &mut Client, registration_id: i64, within: Duration) -> Option<i64> {
+    let deadline = Instant::now() + within;
+
+    while Instant::now() < deadline {
+        client.poll();
+
+        if let Some(image) = client
+            .subscription(registration_id)
+            .and_then(|subscription| subscription.images().first())
+        {
+            return Some(image.registration_id());
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    None
+}
+
+/// What the driver said when it refused a publication.
+#[track_caller]
+fn refusal(result: Result<i64, CommandError>) -> (i32, String) {
+    match result {
+        Err(CommandError::Driver { code, message }) => (code, message),
+        Ok(registration_id) => {
+            panic!("the driver served a publication it must refuse: {registration_id}")
+        }
+        Err(error) => panic!("the driver must refuse this: {error:?}"),
+    }
+}
+
+/// ⑩: the image a response publication names is found by registration id — and
+/// the id alone is not enough.
+///
+/// `find_response_publication_image` (`aeron_driver_conductor.c:1787-1833`)
+/// walks the images for the id in `response-correlation-id` and then asks the
+/// one it found whether its sender wanted a response channel. That is the flags
+/// byte of the `SETUP` that made the image, which is the header's to say and is
+/// nowhere in the frame's body — so it is the one thing a driver has to carry
+/// across from the socket to the image to answer this question at all.
+///
+/// One driver, one command shape, and two hand-built `SETUP`s that differ by
+/// that single byte. The control is what makes the first half evidence: a
+/// driver that never carried the flag across refuses *both*, and a driver that
+/// never looked at it serves both.
+///
+/// The four refusals are the reference's, and the last two are on a channel
+/// that already has a publication — which is the *other* call site
+/// (`:4350-4370`, where the image is looked for after the agreement with the
+/// publication being shared, not before it).
+#[test]
+fn a_response_publication_finds_only_the_image_that_asked_for_one() {
+    let Some(mut own) = OwnDriver::start("response-publication-image") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    // Two ordinary subscriptions. What a response publication names is an
+    // *image*, and a response subscription never has one (⑨), so the image has
+    // to be made for a reader.
+    let asking_endpoint = free_udp_port(111);
+    let asking = client
+        .add_subscription(
+            &format!("aeron:udp?endpoint=127.0.0.1:{asking_endpoint}"),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP subscription");
+
+    let quiet_endpoint = free_udp_port(112);
+    let quiet = client
+        .add_subscription(
+            &format!("aeron:udp?endpoint=127.0.0.1:{quiet_endpoint}"),
+            STREAM_ID + 1,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP subscription");
+
+    // The far end makes both images. The one difference between them is the
+    // byte under test.
+    let asker = FarEnd::open(free_udp_port(113));
+    asker.send_a_setup_asking(
+        asking_endpoint,
+        STREAM_ID,
+        11,
+        header_flags::SETUP_SEND_RESPONSE,
+    );
+
+    let quiet_far = FarEnd::open(free_udp_port(114));
+    quiet_far.send_a_setup(quiet_endpoint, STREAM_ID + 1, 12);
+
+    let asking_image = await_image(&mut client, asking, Duration::from_secs(5))
+        .expect("a SETUP for a stream we read makes an image");
+    let quiet_image = await_image(&mut client, quiet, Duration::from_secs(5))
+        .expect("a SETUP for a stream we read makes an image");
+
+    // The image that asked for a response channel is the one this answers, and
+    // this is the whole of what the id means — it names an image on this
+    // driver, and nothing about it crossed the wire.
+    let answering_endpoint = free_udp_port(115);
+    let answered_channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{answering_endpoint}\
+         |control-mode=response|response-correlation-id={asking_image}"
+    );
+    let answering = client
+        .add_publication(&answered_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the image that asked for a response channel is one this answers");
+
+    // The same command on the same channel is the *same* publication, so this
+    // is the shared path — where the reference looks the image up after the
+    // agreement rather than before it, and finds it again.
+    let _shared = client
+        .add_publication(&answered_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication that already answers this image may be shared");
+
+    // The image that never asked. Same channel, same stream, same command — the
+    // correlation id is the only difference, and it is one the driver must
+    // refuse: the image is real, and it is answering nothing.
+    let (code, message) = refusal(client.add_publication(
+        &format!(
+            "aeron:udp?endpoint=127.0.0.1:{answering_endpoint}\
+             |control-mode=response|response-correlation-id={quiet_image}"
+        ),
+        STREAM_ID,
+        DEFAULT_TIMEOUT,
+    ));
+
+    assert_eq!(deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR, code);
+    assert_eq!(
+        format!("image.correlationId={quiet_image} did not request a response channel"),
+        message
+    );
+
+    // An id that names no image at all.
+    let absent = i64::MAX - 1;
+    let (code, message) = refusal(client.add_publication(
+        &format!(
+            "aeron:udp?endpoint=127.0.0.1:{answering_endpoint}\
+             |control-mode=response|response-correlation-id={absent}"
+        ),
+        STREAM_ID,
+        DEFAULT_TIMEOUT,
+    ));
+
+    assert_eq!(deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR, code);
+    assert_eq!(format!("image.correlationId={absent} not found"), message);
+
+    // A response channel that names nothing cannot name an image either. This
+    // one is a channel of its own, so it is the *other* call site: the image is
+    // looked for before the log buffer is asked for.
+    let unnamed_endpoint = free_udp_port(116);
+    let (code, message) = refusal(client.add_publication(
+        &format!("aeron:udp?endpoint=127.0.0.1:{unnamed_endpoint}|control-mode=response"),
+        STREAM_ID,
+        DEFAULT_TIMEOUT,
+    ));
+
+    assert_eq!(deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR, code);
+    assert_eq!(
+        "control-mode=response was specified, but no response-correlation-id set",
+        message
+    );
+
+    // What was served is still served: the refusals did not take the
+    // publication with them.
+    assert!(client.publication(answering).is_some());
 
     drop(client);
     let _ = own.stop();

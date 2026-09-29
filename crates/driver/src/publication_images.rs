@@ -67,6 +67,25 @@ pub struct PublicationImageRecord {
     pub time_of_last_state_change_ns: i64,
     /// How many subscriptions read it.
     pub refcount: i32,
+    /// The header flags of the `SETUP` that started it
+    /// (`aeron_publication_image.h:73`, where the image carries the sender's
+    /// byte across from the frame).
+    ///
+    /// Kept on the record rather than only on the receiver's image because the
+    /// one reader is the conductor, which never touches the image itself: a
+    /// response publication names an image by registration id and has to be
+    /// told whether that image's sender asked for a response channel at all
+    /// ([`Self::has_send_response_setup`], `find_response_publication_image`).
+    pub setup_flags: u8,
+}
+
+impl PublicationImageRecord {
+    /// Whether the `SETUP` that started this image asked for a response
+    /// channel (`aeron_publication_image_has_send_response_setup`,
+    /// `aeron_publication_image.h:346-349`).
+    pub const fn has_send_response_setup(&self) -> bool {
+        self.setup_flags & crate::protocol::header_flags::SETUP_SEND_RESPONSE != 0
+    }
 }
 
 /// An image whose log buffer is being created.
@@ -81,6 +100,9 @@ struct PendingImage {
     /// The `SETUP` that started it, which is where the stream's first position,
     /// term length and MTU come from.
     setup: SetupFrame,
+    /// The header flags of that `SETUP`, which the frame's own body does not
+    /// carry ([`PublicationImage::setup_flags`]).
+    setup_flags: u8,
     /// Where the packets came from.
     source: SocketAddr,
     /// Where a control frame goes.
@@ -170,6 +192,7 @@ impl PublicationImages {
         endpoint_id: u64,
         channel: &[u8],
         setup: &SetupFrame,
+        setup_flags: u8,
         source: SocketAddr,
         control_address: SocketAddr,
         config: &crate::config::DriverConfig,
@@ -248,6 +271,7 @@ impl PublicationImages {
             counters: counters_pair,
             path,
             setup: *setup,
+            setup_flags,
             source,
             control_address,
             invalidation: None,
@@ -377,6 +401,7 @@ impl PublicationImages {
             state: ImageState::Active,
             time_of_last_state_change_ns: now.ns,
             refcount: 0,
+            setup_flags: pending.setup_flags,
         });
 
         Some(pending.registration_id)

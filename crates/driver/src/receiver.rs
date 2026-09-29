@@ -176,6 +176,13 @@ pub enum ReceiverEvent {
         term_length: i32,
         /// The sender's MTU.
         mtu: i32,
+        /// The header flags of that `SETUP`. They ride beside
+        /// [`SetupFrame`](crate::protocol::SetupFrame) rather than inside it
+        /// because they belong to the frame *header*: the body the frame
+        /// carries is the same whatever the sender asked for, and the one bit
+        /// the driver acts on — whether a response channel is wanted back — is
+        /// the header's to say.
+        setup_flags: u8,
         /// Where a control frame goes: the source of the `SETUP`, or the
         /// channel's control address.
         control_address: std::net::SocketAddr,
@@ -1028,6 +1035,7 @@ impl ReceiverThread {
                 let Some(setup) = SetupFrame::read(packet) else {
                     return;
                 };
+                let setup_flags = header.flags;
 
                 if !endpoint
                     .dispatcher_mut()
@@ -1048,6 +1056,7 @@ impl ReceiverThread {
                     term_offset: setup.term_offset,
                     term_length: setup.term_length,
                     mtu: setup.mtu,
+                    setup_flags,
                     control_address,
                     source,
                 });

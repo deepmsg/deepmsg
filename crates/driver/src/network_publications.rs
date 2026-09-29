@@ -37,6 +37,8 @@ use crate::ipc_subscriptions::IpcSubscriptions;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
+use deepmsg_core::logbuffer::descriptor;
+
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
 use crate::config::DriverConfig;
@@ -45,7 +47,10 @@ use crate::ipc_publications::{AddError, Now, SessionIds};
 use crate::media::TransportParams;
 use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
 use crate::network_publication::{NetworkPublication, PublicationCounters};
-use crate::publication_params::{PublicationParams, PublicationParamsError};
+use crate::publication_images::PublicationImages;
+use crate::publication_params::{
+    PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError,
+};
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
@@ -220,6 +225,7 @@ impl NetworkPublications {
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
         subscriptions: &IpcSubscriptions,
+        images: &PublicationImages,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
@@ -231,7 +237,7 @@ impl NetworkPublications {
 
         let channel = UdpChannel::resolve(request.channel, &uri)
             .map_err(|error| AddError::Channel(Box::new(error)))?;
-        let params = PublicationParams::resolve(&uri, config)?;
+        let mut params = PublicationParams::resolve(&uri, config)?;
 
         validate_for_publication(&channel)?;
         validate_response_subscription(&channel, &params, subscriptions)?;
@@ -314,6 +320,12 @@ impl NetworkPublications {
             if let Some(index) = self.find_shareable(endpoint_id, request.stream_id) {
                 publication_matches(&self.publications[index], &params).map_err(AddError::Share)?;
 
+                // The image comes after the agreement and not before it
+                // (`:4350-4370`): a second publication that disagrees with the
+                // one it would share is refused for *that*, whatever it named
+                // for a correlation id.
+                find_response_publication_image(images, &named_channel, &params)?;
+
                 self.link(
                     index,
                     request,
@@ -352,6 +364,27 @@ impl NetworkPublications {
                     .map(|publication| (publication.stream_id, publication.session_id)),
             ),
         };
+
+        // A response publication whose correlation id is the prototype names no
+        // image, and still gets the smallest term there is (`:4314-4317`): the
+        // prototype is what a client sends before it has been told a session
+        // id, so what it makes is a throwaway and there is nothing to reserve a
+        // term for.
+        if params.is_response && params.response_correlation_id == PROTOTYPE_CORRELATION_ID {
+            params.term_length = descriptor::TERM_MIN_LENGTH;
+        }
+
+        // The reference finds the image in `create_publication`, one state
+        // further on (`:4416`), because there it has had to wait for the log
+        // buffer to land before it can do anything at all. This is the third
+        // deliberate reorder: the resolve half is synchronous here, so the
+        // image is looked for *before* the buffer is asked for. Everything the
+        // reference orders around the buffer keeps its order — the image comes
+        // after the session clash check and after the prototype clamp, and
+        // before the counters are allocated — and the buffer itself is the only
+        // thing that moves, which it does to the side that wastes less: a
+        // publication that will be refused does not map one.
+        find_response_publication_image(images, &named_channel, &params)?;
 
         // The six counters a network publication's client reads
         // (`:4508-4531`).
@@ -955,6 +988,71 @@ fn validate_response_subscription(
     Err(AddError::ResponseSubscription {
         correlation_id: params.response_correlation_id,
     })
+}
+
+/// `aeron_driver_conductor_find_response_publication_image`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1787-1833`).
+///
+/// A publication on a `control-mode=response` channel is the *answering* half
+/// of a response channel: the client publishing into it is the one a request
+/// was addressed to, and what it names — `response-correlation-id` — is the
+/// registration id of the **image** that request arrived on. That id is a
+/// registration id and never crosses the wire, so an id this driver holds no
+/// image for is an answer to nobody.
+///
+/// Three ways to be refused, and all three are refused before anything is
+/// created:
+///
+/// * no correlation id at all — a response channel that names no image is not
+///   one;
+/// * an id that names nothing on this driver;
+/// * an id that names a real image whose `SETUP` never asked for a response
+///   channel, which is an image that is answering nothing.
+///
+/// The prototype value ([`PROTOTYPE_CORRELATION_ID`]) is a fourth case and not
+/// a refusal: it is what a client sends when it has no image yet, and it means
+/// "none", so the caller clamps the term length for it instead
+/// (`:4314-4317`).
+///
+/// # Errors
+///
+/// [`AddError::NoResponseCorrelationId`], [`AddError::ImageNotFound`] and
+/// [`AddError::ImageDidNotRequestResponseChannel`], in the order the reference
+/// tries them.
+fn find_response_publication_image(
+    images: &PublicationImages,
+    channel: &UdpChannel,
+    params: &PublicationParams,
+) -> Result<(), AddError> {
+    if channel.control_mode != ControlMode::Response {
+        return Ok(());
+    }
+
+    if params.response_correlation_id == layout::NULL_VALUE {
+        return Err(AddError::NoResponseCorrelationId);
+    }
+
+    if params.response_correlation_id == PROTOTYPE_CORRELATION_ID {
+        return Ok(());
+    }
+
+    let Some(image) = images
+        .images()
+        .iter()
+        .find(|image| image.registration_id == params.response_correlation_id)
+    else {
+        return Err(AddError::ImageNotFound {
+            correlation_id: params.response_correlation_id,
+        });
+    };
+
+    if !image.has_send_response_setup() {
+        return Err(AddError::ImageDidNotRequestResponseChannel {
+            correlation_id: params.response_correlation_id,
+        });
+    }
+
+    Ok(())
 }
 
 /// The socket buffer lengths an endpoint is opened with, from the driver's

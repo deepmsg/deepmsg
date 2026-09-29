@@ -838,6 +838,7 @@ impl Conductor {
                     term_offset,
                     term_length,
                     mtu,
+                    setup_flags,
                     control_address,
                     source,
                 } => {
@@ -901,6 +902,7 @@ impl Conductor {
                         endpoint_id,
                         &channel,
                         &setup,
+                        setup_flags,
                         source,
                         control_address,
                         &self.config,
@@ -1554,6 +1556,7 @@ impl Conductor {
                                         send_endpoints,
                                         sender.proxy(),
                                         subscriptions,
+                                        images,
                                         now,
                                         &mut transmit,
                                     )
