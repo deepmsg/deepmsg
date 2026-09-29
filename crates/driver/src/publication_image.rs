@@ -129,6 +129,22 @@ pub struct PublicationImage {
     pub control_address: Option<SocketAddr>,
     /// When a packet was last seen, which is what decides draining.
     pub time_of_last_packet_ns: i64,
+    /// Whether a subscription has ever been linked to this image.
+    ///
+    /// The reference links a subscription to the image **before** the receiver
+    /// is given it — `aeron_driver_conductor.c:6763` links the subscribable,
+    /// `:6782` hands the image over — so an image it creates is never one with
+    /// no readers, and its `has_working_positions` test (`:1318`) never has to
+    /// tell "not linked yet" from "everyone left".
+    ///
+    /// Here the two are separate commands on the receiver's queue, and the time
+    /// event at the end of a pass can run between them. An image that had just
+    /// been created would then be drained for having no subscribers, and would
+    /// answer a sender that has done nothing wrong with an end-of-stream. This
+    /// flag stands in for the reference's ordering: until a subscription has
+    /// been linked, "no subscribers" is not yet a fact about the image, and the
+    /// liveness timeout is what retires one nobody ever links.
+    pub has_been_linked: bool,
     /// Whether the sender has said the stream is over.
     pub is_end_of_stream: bool,
     /// Whether the status messages being sent carry the end-of-stream flag.
@@ -297,6 +313,7 @@ impl PublicationImage {
             subscribers: Subscribable::new(registration_id),
             control_address: Some(control_address),
             time_of_last_packet_ns: now_ns,
+            has_been_linked: false,
             is_end_of_stream: false,
             is_sending_eos_sm: false,
             is_revoked: false,
@@ -344,6 +361,10 @@ impl PublicationImage {
     pub fn add_subscriber(&mut self, position: TetherablePosition) -> bool {
         let mut hooks = NoHooks;
         self.subscribers.add_position(position, &mut hooks);
+
+        // From here on "no subscribers" means every reader has gone, which is
+        // what the drain decision is for ([`PublicationImage::has_been_linked`]).
+        self.has_been_linked = true;
 
         true
     }
@@ -942,7 +963,7 @@ impl PublicationImage {
                 let quiet = now_ns > self.time_of_last_packet_ns + self.liveness_timeout_ns;
                 let drained = self.is_end_of_stream && self.is_drained(counters, regions);
 
-                if !self.has_subscribers() || quiet || drained {
+                if (self.has_been_linked && !self.has_subscribers()) || quiet || drained {
                     self.state = ImageState::Draining;
                     self.time_of_last_state_change_ns = now_ns;
                     self.is_sending_eos_sm = true;
@@ -1749,6 +1770,46 @@ mod tests {
                 .is_none(),
             "and its counter is no longer one the set points at"
         );
+    }
+
+    /// A time event between an image's creation and its first subscription is
+    /// the one thing that must not retire it.
+    ///
+    /// The image is handed to the receiver thread and linked to its
+    /// subscription by two separate commands, so a pass can end between them.
+    /// The image created in that window has no subscribers because nobody has
+    /// been given the chance to add one — not because everyone left — and a
+    /// drain here answers a sender that has done nothing wrong with an
+    /// end-of-stream (`aeron_driver_conductor.c:6763` links before `:6782`
+    /// hands over, which is the ordering this stands in for).
+    #[test]
+    fn an_image_nobody_has_linked_yet_is_not_drained() {
+        let mut fixture = Fixture::new();
+
+        // No time has passed, so the liveness timeout cannot be the clause that
+        // decides this: only the one about subscribers can.
+        {
+            let regions = fixture.holder.open();
+            assert!(!fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        }
+        assert_eq!(
+            ImageState::Active,
+            fixture.image.state,
+            "an image created but not yet linked waits"
+        );
+
+        // Once a subscription has been linked, the same clause is the right one
+        // again: a reader that goes away does drain the image.
+        let reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+
+        assert!(!fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert!(fixture.image.remove_subscriber(reader));
+        assert!(
+            fixture.image.on_time_event(&fixture.counters, &regions, 0),
+            "the last reader leaving is what the clause is for"
+        );
+        assert_eq!(ImageState::Draining, fixture.image.state);
     }
 
     /// A heartbeat proposes the position it arrived at, and nothing on top.
