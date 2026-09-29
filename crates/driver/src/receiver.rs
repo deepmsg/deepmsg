@@ -878,32 +878,38 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
-                let Some(control_address) = image.control_address else {
-                    continue;
-                };
+                // A NAK goes to every connection this image hears from, like a
+                // status message: each receiver has its own view of what is
+                // missing, and one of them having it is not the others having
+                // it. With one connection this is the message it always was.
+                for connection in &image.connections {
+                    let Some(control_address) = connection.control_address else {
+                        continue;
+                    };
 
-                if endpoint
-                    .send_nak(
-                        control_address,
-                        image.stream_id,
-                        image.session_id,
-                        gap.term_id,
-                        gap.term_offset,
-                        i32::try_from(gap.length).unwrap_or(i32::MAX),
-                    )
-                    .is_ok()
-                {
-                    system.increment(system_counters::id::NAK_MESSAGES_SENT);
-                    // …and the same count under the image that asked for it:
-                    // the system counter says the driver is retransmitting,
-                    // this one says for which stream
-                    // (`aeron_publication_image.c:1052`).
-                    let _ = system_counters::increment(
-                        counters,
-                        regions,
-                        image.counters().rcv_naks_sent,
-                    );
-                    work += 1;
+                    if endpoint
+                        .send_nak(
+                            control_address,
+                            image.stream_id,
+                            image.session_id,
+                            gap.term_id,
+                            gap.term_offset,
+                            i32::try_from(gap.length).unwrap_or(i32::MAX),
+                        )
+                        .is_ok()
+                    {
+                        system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                        // …and the same count under the image that asked for
+                        // it: the system counter says the driver is
+                        // retransmitting, this one says for which stream
+                        // (`aeron_publication_image.c:1052`).
+                        let _ = system_counters::increment(
+                            counters,
+                            regions,
+                            image.counters().rcv_naks_sent,
+                        );
+                        work += 1;
+                    }
                 }
             }
 

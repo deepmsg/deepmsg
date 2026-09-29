@@ -94,6 +94,38 @@ pub struct ImageCounters {
 }
 
 /// An image: a stream rebuilt from datagrams.
+/// One place this image hears from
+/// (`aeron_publication_image_connection_t`, `aeron_publication_image.h:37-49`).
+///
+/// The reference keys these by **receive destination** and keeps the control
+/// address beside it (`:555-576`). This build has no receive destinations yet —
+/// they arrive with multi-destination channels — so a connection is found by
+/// the source its packets come from, which for the single implicit-unicast
+/// source of a P1-4 channel is the same thing.
+///
+/// Every field is here because the shape is what the multi-destination work
+/// needs; with one connection, `is_eos` and `eos_position` have exactly one
+/// entry to describe and the image's own `eos_position` is that entry's.
+#[derive(Clone, Copy, Debug)]
+pub struct Connection {
+    /// Where status messages and NAKs for this connection go (`control_addr`),
+    /// taken from the channel's control address or from the first packet that
+    /// arrived (`aeron_publication_image_connection_set_control_address`,
+    /// `:30-37`).
+    pub control_address: Option<SocketAddr>,
+    /// When anything was last seen on this connection
+    /// (`time_of_last_activity_ns`), which is what liveness is measured
+    /// against.
+    pub time_of_last_activity_ns: i64,
+    /// When a **frame** was last seen on it (`time_of_last_frame_ns`).
+    pub time_of_last_frame_ns: i64,
+    /// Whether this connection has said the stream is over.
+    pub is_eos: bool,
+    /// Where the stream ended, as this connection said
+    /// (`connection->eos_position`).
+    pub eos_position: i64,
+}
+
 pub struct PublicationImage {
     /// The conductor's registration id for this image, which is what
     /// `ON_AVAILABLE_IMAGE` names and what a public `AeronStat` shows.
@@ -123,10 +155,14 @@ pub struct PublicationImage {
     pub counters: ImageCounters,
     /// Who is reading, and how far (`subscribable`).
     pub subscribers: Subscribable,
-    /// Where status messages and NAKs go: the source of the packets this image
-    /// was built from, or the channel's control address when it named one
-    /// (`aeron_publication_image_connection_set_control_address`, `:30-37`).
-    pub control_address: Option<SocketAddr>,
+    /// Where this image hears from, one entry per source
+    /// (`connections`, `aeron_publication_image.h:76-84`).
+    ///
+    /// Status messages and NAKs go to **each** of these, not to one address
+    /// (`:901-925`), which is what lets an image with several receivers answer
+    /// all of them. With one source there is one entry, and the behaviour is
+    /// what it was.
+    pub connections: Vec<Connection>,
     /// When a packet was last seen, which is what decides draining.
     pub time_of_last_packet_ns: i64,
     /// Whether a subscription has ever been linked to this image.
@@ -328,7 +364,13 @@ impl PublicationImage {
             log,
             counters,
             subscribers: Subscribable::new(registration_id),
-            control_address: Some(control_address),
+            connections: vec![Connection {
+                control_address: Some(control_address),
+                time_of_last_activity_ns: now_ns,
+                time_of_last_frame_ns: now_ns,
+                is_eos: false,
+                eos_position: 0,
+            }],
             time_of_last_packet_ns: now_ns,
             has_been_linked: false,
             is_end_of_stream: false,
@@ -608,13 +650,42 @@ impl PublicationImage {
         self.eos_position
     }
 
-    /// Remember where this connection answers
-    /// (`aeron_publication_image_track_connection`, `:555-600`): the source of
-    /// the packets, which is the implicit-unicast control address.
+    /// Remember that this source is still there
+    /// (`aeron_publication_image_track_connection`, `:557-592`).
+    ///
+    /// The reference finds the connection by **destination** and adds one if
+    /// the destination is new; here it is found by the source its packets come
+    /// from, and a source that is new gets a connection of its own. A
+    /// connection with no control address yet takes this source as one, which
+    /// is how an implicit-unicast image learns where to answer.
     fn track_connection(&mut self, source: SocketAddr, now_ns: i64) {
-        if self.control_address.is_none() {
-            self.control_address = Some(source);
+        let index = match self
+            .connections
+            .iter()
+            .position(|connection| connection.control_address == Some(source))
+        {
+            Some(index) => index,
+            None => {
+                self.connections.push(Connection {
+                    control_address: None,
+                    time_of_last_activity_ns: now_ns,
+                    time_of_last_frame_ns: now_ns,
+                    is_eos: false,
+                    eos_position: 0,
+                });
+
+                self.connections.len() - 1
+            }
+        };
+
+        let connection = &mut self.connections[index];
+
+        if connection.control_address.is_none() {
+            connection.control_address = Some(source);
         }
+
+        connection.time_of_last_activity_ns = now_ns;
+        connection.time_of_last_frame_ns = now_ns;
 
         self.time_of_last_packet_ns = now_ns;
     }
@@ -790,9 +861,9 @@ impl PublicationImage {
             return Ok(0);
         }
 
-        let Some(control_address) = self.control_address else {
+        if self.connections.is_empty() {
             return Ok(0);
-        };
+        }
 
         if self.sm_change_number == self.last_sm_change_number && !has_timed_out {
             return Ok(0);
@@ -809,15 +880,28 @@ impl PublicationImage {
             0
         };
 
-        let sent = endpoint.send_sm(
-            control_address,
-            self.stream_id,
-            self.session_id,
-            term_id,
-            term_offset,
-            self.next_sm_receiver_window_length,
-            flags,
-        )?;
+        // One status message per connection that is still there
+        // (`aeron_publication_image_send_pending_status_message`, `:901-925`):
+        // each receiver is told the position and window it needs to hear, and
+        // a connection with nowhere to answer is skipped rather than guessed
+        // at.
+        let mut sent = 0usize;
+
+        for connection in &self.connections {
+            let Some(control_address) = connection.control_address else {
+                continue;
+            };
+
+            sent += endpoint.send_sm(
+                control_address,
+                self.stream_id,
+                self.session_id,
+                term_id,
+                term_offset,
+                self.next_sm_receiver_window_length,
+                flags,
+            )?;
+        }
 
         if sent > 0 {
             system.increment(system_counters::id::STATUS_MESSAGES_SENT);
