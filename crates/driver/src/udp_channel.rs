@@ -381,6 +381,100 @@ fn read_control_mode(uri: &ChannelUri<'_>) -> Result<ControlMode, UdpChannelErro
     Ok(mode)
 }
 
+/// The prefix a spy channel carries (`AERON_SPY_PREFIX`,
+/// `aeron-client/src/main/c/uri/aeron_uri.h:36`).
+pub const SPY_PREFIX: &str = "aeron-spy:";
+
+/// The keys a destination URI may not carry
+/// (`AERON_DRIVER_CONDUCTOR_INVALID_DESTINATION_KEYS`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:52-60`).
+///
+/// Each of them describes the *channel a publication or subscription owns* —
+/// its MTU, its window, its socket buffers, its response correlation — and a
+/// destination is a place inside such a channel, not a channel of its own. A
+/// destination that named one would be asking for a setting nothing would read.
+pub const INVALID_DESTINATION_KEYS: [&str; 5] = [
+    "mtu",
+    "rcv-wnd",
+    "so-rcvbuf",
+    "so-sndbuf",
+    "response-correlation-id",
+];
+
+/// Refuse a spy channel as a destination
+/// (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`).
+///
+/// # Errors
+///
+/// [`UdpChannelError::InvalidChannel`], in the reference's words.
+pub fn validate_destination_prefix(channel: &[u8], direction: &str) -> Result<(), UdpChannelError> {
+    if channel.len() >= SPY_PREFIX.len() && channel.starts_with(SPY_PREFIX.as_bytes()) {
+        return Err(UdpChannelError::InvalidChannel(format!(
+            "Aeron spies are invalid as {direction} destinations: {}",
+            String::from_utf8_lossy(channel)
+        )));
+    }
+
+    Ok(())
+}
+
+/// A destination URI a send endpoint can be given, resolved to where it points
+/// (`aeron_driver_conductor_validate_send_destination_uri`, `:5369-5410`, and
+/// `aeron_driver_conductor_validate_destination_uri_params`, `:411-460`).
+///
+/// The resolution is **synchronous**, which is where this build's
+/// `compat.md:281` deviation lives: the reference hands the name to a native
+/// resource agent and answers the client before it is resolved. The behaviour a
+/// caller sees is the same either way — a name that does not resolve becomes a
+/// destination with no address — so the difference is when the work happens,
+/// not what it produces.
+///
+/// # Errors
+///
+/// [`UdpChannelError::InvalidChannel`] for a URI that is not UDP, names no
+/// endpoint, names port zero, carries one of [`INVALID_DESTINATION_KEYS`], or
+/// asks for `control-mode=response`; and [`UdpChannelError::Resolve`] for a host
+/// that does not resolve.
+pub fn validate_send_destination_uri(channel: &[u8]) -> Result<SocketAddr, UdpChannelError> {
+    let uri = ChannelUri::parse(channel)?;
+    let text = String::from_utf8_lossy(channel);
+
+    if uri.transport() != Transport::Udp || uri.value("endpoint").is_none() {
+        return Err(UdpChannelError::InvalidChannel(format!(
+            "incorrect URI format for destination: {text}"
+        )));
+    }
+
+    for key in INVALID_DESTINATION_KEYS {
+        if uri.value(key).is_some() {
+            return Err(UdpChannelError::InvalidChannel(format!(
+                "destinations must not contain the key: {key} channel={text}"
+            )));
+        }
+    }
+
+    if uri.value("control-mode") == Some("response") {
+        return Err(UdpChannelError::InvalidChannel(format!(
+            "destinations may not specify control-mode=response channel={text}"
+        )));
+    }
+
+    let endpoint = uri.value("endpoint").expect("checked above");
+
+    // Port zero is refused rather than resolved: a destination that names no
+    // port is one the driver cannot send to, and the reference refuses it by
+    // name before it resolves anything (`:5394-5404`).
+    if let Some((_, port)) = endpoint.rsplit_once(':') {
+        if "0" == port {
+            return Err(UdpChannelError::InvalidChannel(format!(
+                "endpoint has port=0 for send destination: channel={text}"
+            )));
+        }
+    }
+
+    resolve_host_and_port(endpoint)
+}
+
 /// The channel tag: `tags=` up to the first comma
 /// (`aeron_udp_uri_params_func`, `aeron-client/src/main/c/uri/aeron_uri.c:166-177`).
 ///
@@ -990,6 +1084,70 @@ mod tests {
         );
         assert_eq!(ControlMode::Dynamic, channel.control_mode);
         assert!(channel.has_explicit_control);
+    }
+
+    /// A spy is not a destination: it names a publication's own log buffer, not
+    /// a place to send datagrams (`:392-407`).
+    #[test]
+    fn a_spy_is_refused_as_a_destination() {
+        assert!(validate_destination_prefix(b"aeron:udp?endpoint=127.0.0.1:40123", "send").is_ok());
+        assert!(matches!(
+            validate_destination_prefix(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123", "send"),
+            Err(UdpChannelError::InvalidChannel(message))
+                if message.starts_with("Aeron spies are invalid as send destinations:")
+        ));
+    }
+
+    /// What a destination URI has to be, and the four ways it can fail
+    /// (`:5369-5410`, `:411-460`).
+    #[test]
+    fn a_send_destination_is_a_udp_endpoint_with_a_port() {
+        assert_eq!(
+            "127.0.0.1:40456".parse::<SocketAddr>().expect("an address"),
+            validate_send_destination_uri(b"aeron:udp?endpoint=127.0.0.1:40456")
+                .expect("a destination")
+        );
+
+        let refusal = |channel: &[u8]| {
+            validate_send_destination_uri(channel)
+                .expect_err("this destination is refused")
+                .to_string()
+        };
+
+        // Not UDP at all.
+        assert!(
+            refusal(b"aeron:ipc?endpoint=127.0.0.1:40456")
+                .contains("incorrect URI format for destination")
+        );
+
+        // UDP, but naming nowhere to send. Which of the two refusals it is
+        // depends on where the URI parser gives up, and either is a refusal.
+        assert!(
+            validate_send_destination_uri(b"aeron:udp").is_err(),
+            "a destination with no endpoint is refused"
+        );
+
+        // Naming nowhere to send *from* the far end's point of view.
+        assert!(
+            refusal(b"aeron:udp?endpoint=127.0.0.1:0")
+                .contains("endpoint has port=0 for send destination")
+        );
+
+        // A key that belongs to the channel, not to a place inside it.
+        for key in INVALID_DESTINATION_KEYS {
+            let channel = format!("aeron:udp?endpoint=127.0.0.1:40456|{key}=1");
+            assert!(
+                refusal(channel.as_bytes())
+                    .contains(&format!("destinations must not contain the key: {key}")),
+                "{key}"
+            );
+        }
+
+        // A response channel is a channel, not a destination.
+        assert!(
+            refusal(b"aeron:udp?endpoint=127.0.0.1:40456|control-mode=response")
+                .contains("destinations may not specify control-mode=response")
+        );
     }
 
     /// A multi-destination channel is one whose **control mode** says so, not
