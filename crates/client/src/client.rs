@@ -36,9 +36,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deepmsg_cnc::command::{
-    ADD_COUNTER_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter,
-    AddPublication, AddSubscription, Correlated, REMOVE_COUNTER_TYPE_ID, RemoveCounter, Response,
-    decode_response,
+    ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID,
+    ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication,
+    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand,
+    REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
@@ -746,6 +748,192 @@ impl Client {
             .retain(|held| held.registration_id() != counter.registration_id());
 
         Ok(())
+    }
+
+    /// Add a destination to a publication and wait for the driver to confirm
+    /// it.
+    ///
+    /// Returns the destination's **registration id**, and that is the
+    /// correlation id this request used. There is no separate allocation for a
+    /// destination in the reference either: its client completes a registering
+    /// resource when the reply's correlation id matches the id it is waiting on
+    /// (`aeron_client_conductor.c:975-991`), and
+    /// `aeron_async_destination_get_registration_id` documents its return value
+    /// as "correlation_id sent to driver" (`aeronc.h:2697-2705`).
+    ///
+    /// The URI is **not** parsed here. The reference's client only null-checks
+    /// it (`aeron_client.c:635-652`); what a destination URI may be is the
+    /// driver's question (`aeron_driver_conductor_validate_send_destination_uri`,
+    /// `aeron_driver_conductor.c:5369-5410`). A bad URI therefore comes back as
+    /// the driver's own `ON_ERROR`, in the driver's words, rather than as a
+    /// second refusal worded here that no other client would recognise.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it, or no reply arrived within `timeout`.
+    pub fn add_destination(
+        &mut self,
+        publication_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        self.destination_command(ADD_DESTINATION_TYPE_ID, publication_id, uri, timeout)
+    }
+
+    /// Remove a destination from a publication by its URI, and wait for the
+    /// driver to confirm it.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] as [`Client::add_destination`], including for a URI the
+    /// publication does not have a destination on.
+    pub fn remove_destination(
+        &mut self,
+        publication_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        self.destination_command(REMOVE_DESTINATION_TYPE_ID, publication_id, uri, timeout)
+            .map(|_| ())
+    }
+
+    /// Remove a publication's destination by the id [`Client::add_destination`]
+    /// returned, and wait for the driver to confirm it.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] — but read
+    /// [`CommandError::TimedOut`] before treating one as a transport failure.
+    /// This is the one command in the family whose failures the reference
+    /// answers **nothing** to: `REMOVE_DESTINATION_BY_ID` calls its handler
+    /// without taking the result
+    /// (`aeron_driver_conductor.c:3188-3200`), so the error the handler returns
+    /// for a publication it cannot find (`:5562-5578`) never reaches the
+    /// `result < 0` that would send an `ON_ERROR`. Every other destination
+    /// command assigns it (`:3020`, `:3035`, `:3055-3062`, `:3083-3090`). A
+    /// caller that passes an unknown publication waits for an answer that is
+    /// not coming, and the reference's own clients do the same — so a timeout
+    /// here is the reference's behaviour, not a broken connection.
+    pub fn remove_destination_by_id(
+        &mut self,
+        publication_id: i64,
+        destination_id: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = DestinationByIdCommand {
+            client_id: self.client_id,
+            correlation_id,
+            resource_registration_id: publication_id,
+            destination_registration_id: destination_id,
+        };
+
+        let mut payload = vec![0u8; DestinationByIdCommand::ENCODED_LENGTH];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(
+            REMOVE_DESTINATION_BY_ID_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(())
+    }
+
+    /// Add a destination to a subscription — a source it will also accept the
+    /// stream from — and wait for the driver to confirm it.
+    ///
+    /// Returns the destination's registration id, as
+    /// [`Client::add_destination`] does, and for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused
+    /// it, or no reply arrived within `timeout`.
+    pub fn add_rcv_destination(
+        &mut self,
+        subscription_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        self.destination_command(
+            ADD_RECEIVE_DESTINATION_TYPE_ID,
+            subscription_id,
+            uri,
+            timeout,
+        )
+    }
+
+    /// Remove a source from a subscription, and wait for the driver to confirm
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] as [`Client::add_rcv_destination`].
+    pub fn remove_rcv_destination(
+        &mut self,
+        subscription_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        self.destination_command(
+            REMOVE_RECEIVE_DESTINATION_TYPE_ID,
+            subscription_id,
+            uri,
+            timeout,
+        )
+        .map(|_| ())
+    }
+
+    /// Write one of the four destination commands that carry a URI, and wait
+    /// for its answer.
+    ///
+    /// All four answer with the same eight-byte `aeron_operation_succeeded_t` —
+    /// a bare correlation id (`aeron_control_protocol.h:117-121`) — so one
+    /// helper serves them, and the caller decides what the id means. Which of
+    /// the four was sent lives in the record's type id and nowhere in the
+    /// payload, which is why `type_id` is a parameter here and not a field of
+    /// the record.
+    ///
+    /// `registration_id` is the publication or subscription the destination
+    /// belongs to; the driver tells the two apart by the type id.
+    fn destination_command(
+        &mut self,
+        type_id: i32,
+        registration_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = DestinationCommand {
+            client_id: self.client_id,
+            correlation_id,
+            registration_id,
+            channel: uri,
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(type_id, &payload, correlation_id, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(correlation_id)
     }
 
     /// Offer a payload on a publication.
