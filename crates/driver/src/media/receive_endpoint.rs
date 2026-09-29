@@ -303,26 +303,38 @@ impl ReceiveChannelEndpoint {
         // socket *is* a destination's: the receive side binds the endpoint —
         // where a subscription listens — and is never connected, because it
         // answers whoever writes to it (`aeron_receive_destination.c:30-139`).
-        let destination = match ReceiveDestination::open(
-            channel.clone(),
-            params,
-            counters,
-            regions,
-            registration_id,
-            channel_status_counter_id,
-            now_ms,
-        ) {
-            Ok(destination) => destination,
-            Err(error) => {
-                // The counters were allocated for an endpoint that will not
-                // exist.
-                counters.free(regions, channel_status_counter_id, now_ms);
-                return Err(error);
+        //
+        // **Except on a manual channel, which starts with none at all.** The
+        // reference creates this one only `if (AERON_UDP_CHANNEL_CONTROL_MODE_MANUAL
+        // != channel->control_mode)` (`aeron_driver_conductor.c:2099-2114`): a
+        // manual channel's sources are the ones a client names with
+        // `ADD_RCV_DESTINATION`, and until one is named there is nowhere to
+        // listen. Every other channel is told where to listen by its own
+        // channel, so it starts with that one.
+        let destinations = if ControlMode::Manual == channel.control_mode {
+            Vec::new()
+        } else {
+            match ReceiveDestination::open(
+                channel.clone(),
+                params,
+                counters,
+                regions,
+                registration_id,
+                channel_status_counter_id,
+                now_ms,
+            ) {
+                Ok(destination) => vec![destination],
+                Err(error) => {
+                    // The counters were allocated for an endpoint that will not
+                    // exist.
+                    counters.free(regions, channel_status_counter_id, now_ms);
+                    return Err(error);
+                }
             }
         };
 
         Ok(Self {
-            destinations: vec![destination],
+            destinations,
             channel,
             channel_status_counter_id,
             receiver_id,
@@ -362,24 +374,31 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
-        let destination = match ReceiveDestination::attach(
-            channel.clone(),
-            transport,
-            counters,
-            regions,
-            registration_id,
-            channel_status_counter_id,
-            now_ms,
-        ) {
-            Ok(destination) => destination,
-            Err(error) => {
-                counters.free(regions, channel_status_counter_id, now_ms);
-                return Err(error);
+        // The same rule as [`Self::create`]: a manual channel starts with no
+        // destinations, and a transport a caller supplied for one is not
+        // attached to anything.
+        let destinations = if ControlMode::Manual == channel.control_mode {
+            Vec::new()
+        } else {
+            match ReceiveDestination::attach(
+                channel.clone(),
+                transport,
+                counters,
+                regions,
+                registration_id,
+                channel_status_counter_id,
+                now_ms,
+            ) {
+                Ok(destination) => vec![destination],
+                Err(error) => {
+                    counters.free(regions, channel_status_counter_id, now_ms);
+                    return Err(error);
+                }
             }
         };
 
         Ok(Self {
-            destinations: vec![destination],
+            destinations,
             channel,
             channel_status_counter_id,
             receiver_id,
@@ -937,7 +956,11 @@ mod tests {
         )
         .expect("an endpoint");
 
-        assert_eq!(1, endpoint.destination_count(), "one to start with");
+        assert_eq!(
+            0,
+            endpoint.destination_count(),
+            "a manual channel starts with none: its sources are the ones a client names"
+        );
 
         let added = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40124"),
@@ -951,7 +974,7 @@ mod tests {
         .expect("a destination");
 
         endpoint.add_destination(added);
-        assert_eq!(2, endpoint.destination_count());
+        assert_eq!(1, endpoint.destination_count());
 
         let removed = endpoint
             .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
@@ -962,7 +985,7 @@ mod tests {
             removed.channel().canonical_form,
             "and it is the one that was added"
         );
-        assert_eq!(1, endpoint.destination_count());
+        assert_eq!(0, endpoint.destination_count());
         assert!(
             endpoint
                 .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40999"))
