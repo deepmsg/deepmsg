@@ -438,6 +438,8 @@ impl NetworkPublication {
             bytes_sent = self.heartbeat_message_check(
                 endpoint,
                 system,
+                counters,
+                regions,
                 now_ns,
                 active_term_id,
                 term_offset,
@@ -510,7 +512,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -537,10 +539,13 @@ impl NetworkPublication {
     /// A heartbeat is a **zero-length DATA frame** with both the begin and end
     /// flags: it carries no payload, and it is what tells a receiver the stream
     /// is alive and where it stands.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn heartbeat_message_check(
         &mut self,
         endpoint: &mut SendChannelEndpoint,
         system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
         now_ns: i64,
         active_term_id: i32,
         term_offset: i32,
@@ -592,7 +597,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -722,7 +727,7 @@ impl NetworkPublication {
             .collect();
 
         let sent = if frames > 0 {
-            endpoint.send(&slices)?
+            endpoint.send(&slices, counters, regions, now_ns)?
         } else {
             0
         };
@@ -780,7 +785,7 @@ impl NetworkPublication {
 
         for resend in due {
             if self
-                .resend(endpoint, resend, system, counters, regions)
+                .resend(endpoint, resend, system, counters, regions, now_ns)
                 .is_err()
             {
                 break;
@@ -808,6 +813,7 @@ impl NetworkPublication {
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
+        now_ns: i64,
     ) -> io::Result<usize> {
         let sender_position = counters.value(regions, self.counters.snd_pos).unwrap_or(0);
         let resend_position = Position::new(
@@ -862,7 +868,7 @@ impl NetworkPublication {
                 break;
             }
 
-            let sent = endpoint.send(&[&scratch[..available]])?;
+            let sent = endpoint.send(&[&scratch[..available]], counters, regions, now_ns)?;
 
             if sent < 1 {
                 system.increment(system_counters::id::SHORT_SENDS);
@@ -1004,12 +1010,16 @@ impl NetworkPublication {
     /// A publication that never answers leaves a peer on a congestion control
     /// that measures round trips — `cubic` — with nothing to measure, whatever
     /// flow control this end runs.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     pub fn on_rttm(
         &mut self,
         frame: &RttmFrame,
         flags: u8,
         endpoint: &mut SendChannelEndpoint,
         system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
     ) -> io::Result<usize> {
         if flags & header_flags::RTTM_REPLY == 0 {
             return Ok(0);
@@ -1028,7 +1038,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = endpoint.send(&[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -1105,7 +1115,7 @@ impl NetworkPublication {
         let _ = mtu;
 
         if let NakOutcome::Send(resend) = outcome {
-            let _ = self.resend(endpoint, resend, system, counters, regions);
+            let _ = self.resend(endpoint, resend, system, counters, regions, now_ns);
         }
 
         outcome

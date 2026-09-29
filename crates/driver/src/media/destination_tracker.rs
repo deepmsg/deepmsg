@@ -148,6 +148,12 @@ impl DestinationTracker {
         self.is_manual_control_mode
     }
 
+    /// The `mdc-num-dest` counter, so that whoever removes the endpoint can
+    /// give it back.
+    pub fn num_destinations_counter_id(&self) -> i32 {
+        self.num_destinations_counter_id
+    }
+
     /// Send one datagram to every destination
     /// (`aeron_udp_destination_tracker_send`, `:99-169`).
     ///
@@ -162,9 +168,9 @@ impl DestinationTracker {
     /// so that a destination does not vanish from under the loop.
     pub fn send(
         &mut self,
-        transport: &mut impl Transport,
+        transport: &mut dyn Transport,
         buffers: &[&[u8]],
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) -> usize {
@@ -217,7 +223,7 @@ impl DestinationTracker {
     /// one.
     pub fn on_status_message(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         receiver_id: i64,
         addr: &SocketAddr,
@@ -262,7 +268,7 @@ impl DestinationTracker {
     /// the conductor tell the two apart.
     pub fn manual_add(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
         uri: UdpChannel,
@@ -295,7 +301,7 @@ impl DestinationTracker {
     /// `address_compare` (`:311-321`): family first, then address **and port**.
     pub fn remove(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         addr: &SocketAddr,
     ) -> Option<UdpChannel> {
@@ -314,7 +320,7 @@ impl DestinationTracker {
     /// (`aeron_udp_destination_tracker_remove_destination_by_id`, `:352-379`).
     pub fn remove_by_id(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         registration_id: i64,
     ) -> Option<UdpChannel> {
@@ -347,7 +353,7 @@ impl DestinationTracker {
     #[allow(clippy::too_many_arguments)] // one per field of the reference's entry
     fn add(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         receiver_id: i64,
         is_receiver_id_valid: bool,
@@ -383,7 +389,7 @@ impl DestinationTracker {
     /// destinations should say for itself whose destinations may go.
     fn remove_inactive(
         &mut self,
-        counters: &mut CounterManager,
+        counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
     ) {
@@ -400,7 +406,7 @@ impl DestinationTracker {
     /// `mdc-num-dest` is the table's length, and it is written whenever the
     /// table changes (`:100`, `:249`, `:341`, `:370`) — including when nothing
     /// changed, which costs one store and saves a comparison.
-    fn set_num_destinations(&self, counters: &mut CounterManager, regions: &CounterRegions<'_>) {
+    fn set_num_destinations(&self, counters: &CounterManager, regions: &CounterRegions<'_>) {
         #[allow(clippy::cast_possible_wrap)] // a table of destinations is not 2^63 long
         let length = self.destinations.len() as i64;
 
@@ -528,7 +534,7 @@ mod tests {
     #[test]
     fn the_destination_count_is_what_the_counter_says() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
         assert_eq!(
@@ -538,7 +544,7 @@ mod tests {
         );
 
         assert!(tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40124),
@@ -548,7 +554,7 @@ mod tests {
         assert_eq!(Some(1), counters.value(&regions, counter_id));
 
         tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40125),
@@ -557,18 +563,18 @@ mod tests {
         );
         assert_eq!(Some(2), counters.value(&regions, counter_id));
 
-        assert!(tracker.remove_by_id(&mut counters, &regions, 42).is_some());
+        assert!(tracker.remove_by_id(&counters, &regions, 42).is_some());
         assert_eq!(Some(1), counters.value(&regions, counter_id));
 
         assert!(
             tracker
-                .remove(&mut counters, &regions, &address(40125))
+                .remove(&counters, &regions, &address(40125))
                 .is_some()
         );
         assert_eq!(Some(0), counters.value(&regions, counter_id));
 
         assert!(
-            tracker.remove_by_id(&mut counters, &regions, 42).is_none(),
+            tracker.remove_by_id(&counters, &regions, 42).is_none(),
             "removing what is not there removes nothing"
         );
         assert_eq!(Some(0), counters.value(&regions, counter_id));
@@ -579,11 +585,11 @@ mod tests {
     #[test]
     fn a_removal_answers_with_the_channel_it_removed() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
         tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40124),
@@ -591,7 +597,7 @@ mod tests {
             42,
         );
 
-        let removed = tracker.remove(&mut counters, &regions, &address(40124));
+        let removed = tracker.remove(&counters, &regions, &address(40124));
         assert!(removed.is_some(), "the destination was there");
         assert!(tracker.is_empty());
     }
@@ -602,16 +608,16 @@ mod tests {
     #[test]
     fn a_status_message_teaches_a_dynamic_channel_a_destination() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
-        let known = tracker.on_status_message(&mut counters, &regions, -1234, &address(40124), NOW);
+        let known = tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW);
         assert!(!known, "nothing was there to match");
         assert_eq!(1, tracker.len(), "and it is a destination now");
         assert_eq!(NULL_VALUE, tracker.destinations()[0].registration_id);
 
         assert!(
-            tracker.on_status_message(&mut counters, &regions, -1234, &address(40124), NOW + 1),
+            tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW + 1),
             "the same receiver again is matched, not added twice"
         );
         assert_eq!(1, tracker.len());
@@ -623,10 +629,10 @@ mod tests {
     #[test]
     fn a_status_message_does_not_teach_a_manual_channel_one() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
-        assert!(!tracker.on_status_message(&mut counters, &regions, -1234, &address(40124), NOW));
+        assert!(!tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW));
         assert!(
             tracker.is_empty(),
             "manual destinations are named, not learned"
@@ -642,21 +648,21 @@ mod tests {
     #[test]
     fn a_bound_destination_is_matched_by_id_and_port_not_by_address() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
-        tracker.on_status_message(&mut counters, &regions, -1234, &address(40124), NOW);
+        tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW);
 
         let from_elsewhere = SocketAddr::from(([10, 0, 0, 9], 40124));
         assert!(
-            tracker.on_status_message(&mut counters, &regions, -1234, &from_elsewhere, NOW + 1),
+            tracker.on_status_message(&counters, &regions, -1234, &from_elsewhere, NOW + 1),
             "the id and the port are what matched"
         );
         assert_eq!(1, tracker.len(), "not a second destination");
 
         // A different port is a different destination, whatever the id says.
         let other_port = SocketAddr::from(([10, 0, 0, 9], 40125));
-        assert!(!tracker.on_status_message(&mut counters, &regions, -1234, &other_port, NOW + 2));
+        assert!(!tracker.on_status_message(&counters, &regions, -1234, &other_port, NOW + 2));
         assert_eq!(2, tracker.len(), "a second destination, learned from it");
     }
 
@@ -667,13 +673,13 @@ mod tests {
     fn only_a_dynamic_channel_forgets_a_destination_that_went_quiet() {
         for (is_manual, expected) in [(true, 1usize), (false, 0usize)] {
             let mut fixture = Fixture::new();
-            let (mut counters, regions, counter_id) = fixture.open();
+            let (counters, regions, counter_id) = fixture.open();
             let mut tracker =
                 DestinationTracker::new(is_manual, DESTINATION_TIMEOUT_NS, counter_id);
             let mut transport = Recorder::default();
 
             tracker.manual_add(
-                &mut counters,
+                &counters,
                 &regions,
                 NOW,
                 channel(40124),
@@ -684,14 +690,14 @@ mod tests {
             // A manual channel has to be given it: `manual_add` is a no-op on a
             // dynamic one, so that side is fed by a status message instead.
             if !is_manual {
-                tracker.on_status_message(&mut counters, &regions, -1, &address(40124), NOW);
+                tracker.on_status_message(&counters, &regions, -1, &address(40124), NOW);
             }
             assert_eq!(1, tracker.len());
 
             let sent = tracker.send(
                 &mut transport,
                 &[b"payload"],
-                &mut counters,
+                &counters,
                 &regions,
                 NOW + DESTINATION_TIMEOUT_NS + 1,
             );
@@ -721,11 +727,11 @@ mod tests {
     #[test]
     fn manual_add_does_nothing_on_a_dynamic_channel() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
         assert!(!tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40124),
@@ -742,13 +748,13 @@ mod tests {
     #[test]
     fn an_unresolved_destination_is_skipped_rather_than_sent_to() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
         let mut transport = Recorder::default();
 
-        tracker.manual_add(&mut counters, &regions, NOW, channel(40124), None, 42);
+        tracker.manual_add(&counters, &regions, NOW, channel(40124), None, 42);
         tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40125),
@@ -756,7 +762,7 @@ mod tests {
             43,
         );
 
-        let sent = tracker.send(&mut transport, &[b"payload"], &mut counters, &regions, NOW);
+        let sent = tracker.send(&mut transport, &[b"payload"], &counters, &regions, NOW);
 
         assert_eq!(vec![address(40125)], transport.sent_to);
         assert_eq!(1, sent, "the batch went out");
@@ -769,7 +775,7 @@ mod tests {
     #[test]
     fn one_destination_refusing_the_batch_reports_none_of_it() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
         let mut transport = Recorder {
             refuse: vec![address(40124)],
@@ -778,7 +784,7 @@ mod tests {
 
         for port in [40124u16, 40125] {
             tracker.manual_add(
-                &mut counters,
+                &counters,
                 &regions,
                 NOW,
                 channel(port),
@@ -787,7 +793,7 @@ mod tests {
             );
         }
 
-        let sent = tracker.send(&mut transport, &[b"payload"], &mut counters, &regions, NOW);
+        let sent = tracker.send(&mut transport, &[b"payload"], &counters, &regions, NOW);
 
         assert_eq!(0, sent, "a partial send is reported as none of it");
         assert_eq!(
@@ -802,12 +808,12 @@ mod tests {
     #[test]
     fn the_rotation_moves_which_destination_goes_first() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
         for port in [40124u16, 40125, 40126] {
             tracker.manual_add(
-                &mut counters,
+                &counters,
                 &regions,
                 NOW,
                 channel(port),
@@ -819,7 +825,7 @@ mod tests {
         let mut first_of_each_pass = Vec::new();
         for _ in 0..3 {
             let mut transport = Recorder::default();
-            let sent = tracker.send(&mut transport, &[b"payload"], &mut counters, &regions, NOW);
+            let sent = tracker.send(&mut transport, &[b"payload"], &counters, &regions, NOW);
 
             assert_eq!(1, sent);
             assert_eq!(3, transport.sent_to.len(), "every destination each pass");
@@ -839,11 +845,11 @@ mod tests {
     #[test]
     fn an_error_is_attributed_to_the_destination_it_came_from() {
         let mut fixture = Fixture::new();
-        let (mut counters, regions, counter_id) = fixture.open();
+        let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
         tracker.manual_add(
-            &mut counters,
+            &counters,
             &regions,
             NOW,
             channel(40124),

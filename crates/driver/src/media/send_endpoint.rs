@@ -27,9 +27,10 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, sys};
 
+use super::destination_tracker::{DESTINATION_TIMEOUT_NS, DestinationTracker};
 use super::loss_generator::LossGenerator;
 use super::{Transport, TransportParams};
 
@@ -91,6 +92,13 @@ pub struct SendChannelEndpoint {
     /// Where data is sent. The channel's remote address until a re-resolution
     /// moves it (P1-5).
     current_data_addr: SocketAddr,
+    /// Where this endpoint sends, when its channel has several destinations
+    /// (`destination_tracker`, `aeron_send_channel_endpoint.h:62`).
+    ///
+    /// A unicast endpoint has none: it sends to the one address its channel
+    /// named. A multi-destination one sends to each of these, and a dynamic one
+    /// learns them from the status messages that come back.
+    destination_tracker: Option<DestinationTracker>,
     /// The publications reachable here, in insertion order.
     publications: Vec<PublicationDispatch>,
     /// `SO_RCVBUF` this endpoint asked for, zero meaning the driver's default
@@ -137,9 +145,18 @@ impl SendChannelEndpoint {
         )
         .ok_or(SendEndpointError::NoCounter)?;
 
+        // A multi-destination channel is **never** connected
+        // (`aeron_send_channel_endpoint_create`, `:76-88`): the reference's
+        // `else if` puts the connect on the branch the tracker is not on, and it
+        // has to be there — a connected UDP socket has one peer, and a send to
+        // any other address is refused by the kernel, which would leave every
+        // destination but the channel's own address unreachable.
+        let connect_to = (channel.has_explicit_endpoint && !channel.is_multi_destination())
+            .then_some(channel.remote_data);
+
         let transport = match super::udp_transport::UdpTransport::open(
             channel.local_control,
-            channel.has_explicit_endpoint.then_some(channel.remote_data),
+            connect_to,
             params,
         ) {
             Ok(transport) => transport,
@@ -151,11 +168,23 @@ impl SendChannelEndpoint {
             }
         };
 
+        let destination_tracker =
+            match destination_tracker_for(&channel, counters, regions, registration_id, now_ms) {
+                Ok(tracker) => tracker,
+                Err(error) => {
+                    // The counter was allocated for an endpoint that will not
+                    // exist, exactly as for a socket that would not open.
+                    counters.free(regions, channel_status_counter_id, now_ms);
+                    return Err(error);
+                }
+            };
+
         Ok(Self {
             current_data_addr: channel.remote_data,
             channel,
             transport: Box::new(transport),
             data_loss_generator: None,
+            destination_tracker,
             channel_status_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
@@ -190,11 +219,21 @@ impl SendChannelEndpoint {
         )
         .ok_or(SendEndpointError::NoCounter)?;
 
+        let destination_tracker =
+            match destination_tracker_for(&channel, counters, regions, registration_id, now_ms) {
+                Ok(tracker) => tracker,
+                Err(error) => {
+                    counters.free(regions, channel_status_counter_id, now_ms);
+                    return Err(error);
+                }
+            };
+
         Ok(Self {
             current_data_addr: channel.remote_data,
             channel,
             transport,
             data_loss_generator: None,
+            destination_tracker,
             channel_status_counter_id,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
@@ -205,6 +244,22 @@ impl SendChannelEndpoint {
     /// The channel-status counter a client reads.
     pub const fn channel_status_counter_id(&self) -> i32 {
         self.channel_status_counter_id
+    }
+
+    /// Where this endpoint sends when its channel has several destinations, so
+    /// that the sender can hand an arriving status message to it
+    /// (`aeron_send_channel_endpoint_on_status_message`, `:636-645`).
+    ///
+    /// [`None`] for a unicast channel: there is nothing to learn from a status
+    /// message when there is one address, and it is the one the channel named.
+    pub fn destination_tracker_mut(&mut self) -> Option<&mut DestinationTracker> {
+        self.destination_tracker.as_mut()
+    }
+
+    /// The same, for the destinations an error frame is attributed to
+    /// (`aeron_send_channel_endpoint_on_error`, `:688-692`).
+    pub fn destination_tracker(&self) -> Option<&DestinationTracker> {
+        self.destination_tracker.as_ref()
     }
 
     /// Write the channel status
@@ -330,12 +385,18 @@ impl SendChannelEndpoint {
     /// # Errors
     ///
     /// The transport's error; back pressure is `Ok(0)`.
-    pub fn send(&mut self, buffers: &[&[u8]]) -> io::Result<usize> {
+    pub fn send(
+        &mut self,
+        buffers: &[&[u8]],
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> io::Result<usize> {
         let address = self.current_data_addr;
 
         let kept: Vec<&[u8]> = {
             let Some(generator) = self.data_loss_generator.as_mut() else {
-                return self.transport.send(Some(address), buffers);
+                return self.send_to_all(buffers, counters, regions, now_ns, address);
             };
 
             buffers
@@ -348,16 +409,49 @@ impl SendChannelEndpoint {
         let dropped = buffers.len() - kept.len();
 
         if dropped == 0 {
-            return self.transport.send(Some(address), buffers);
+            return self.send_to_all(buffers, counters, regions, now_ns, address);
         }
 
         let sent = if kept.is_empty() {
             0
         } else {
-            self.transport.send(Some(address), &kept)?
+            self.send_to_all(&kept, counters, regions, now_ns, address)?
         };
 
         Ok(sent + dropped)
+    }
+
+    /// Hand one batch to whoever this endpoint sends through
+    /// (`aeron_send_channel_send`, `:410-425`).
+    ///
+    /// With a destination tracker the batch goes to **every** destination, and
+    /// what comes back is the reference's answer: the batch size, or zero if
+    /// any destination turned it away — which reads to the caller exactly like
+    /// back pressure, and is meant to: nothing advanced, send it again.
+    ///
+    /// The generator is consulted **once**, against the channel's own remote
+    /// address, before the fan-out. The reference's sits under the transport
+    /// and would be consulted per destination instead. The two differ only for
+    /// a multi-destination channel with loss injection configured, which is a
+    /// combination no test makes: injection exists for the unicast interop
+    /// tests, where there is one address.
+    fn send_to_all(
+        &mut self,
+        buffers: &[&[u8]],
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+        address: SocketAddr,
+    ) -> io::Result<usize> {
+        let Some(tracker) = self.destination_tracker.as_mut() else {
+            if buffers.is_empty() {
+                return Ok(0);
+            }
+
+            return self.transport.send(Some(address), buffers);
+        };
+
+        Ok(tracker.send(self.transport.as_mut(), buffers, counters, regions, now_ns))
     }
 
     /// The address this endpoint's socket is bound to, which is what the
@@ -436,6 +530,52 @@ impl std::error::Error for SendEndpointError {}
 ///
 /// Returns the parameter that disagreed, with what was asked for and what
 /// exists, or `None` when both agree.
+/// The destination tracker a channel gets, and the `mdc-num-dest` counter that
+/// goes with it (`aeron_send_channel_endpoint_create`, `:61-88`, `:182-188`).
+///
+/// Only a multi-destination channel has one — a channel whose control mode is
+/// `manual` or `dynamic`
+/// ([`crate::udp_channel::UdpChannel::is_multi_destination`]). A unicast
+/// endpoint sends to the one address its channel named, and a `connect`ed
+/// socket is what holds it there.
+///
+/// Which of the two control modes it is decides whether the destinations can
+/// ever expire: a manual channel's were named by a client, so they stay
+/// ([`DestinationTracker`]).
+///
+/// # Errors
+///
+/// [`SendEndpointError::NoCounter`] when the manager has no room for the
+/// `mdc-num-dest` counter.
+fn destination_tracker_for(
+    channel: &UdpChannel,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    registration_id: i64,
+    now_ms: i64,
+) -> Result<Option<DestinationTracker>, SendEndpointError> {
+    if !channel.is_multi_destination() {
+        return Ok(None);
+    }
+
+    let counter_id = counter_position::allocate_channel_status_counter(
+        counters,
+        regions,
+        counter_position::MDC_NUM_DESTINATIONS_NAME,
+        counter_position::channel_type_id::MDC_NUM_DESTINATIONS,
+        registration_id,
+        &channel.original_uri,
+        now_ms,
+    )
+    .ok_or(SendEndpointError::NoCounter)?;
+
+    Ok(Some(DestinationTracker::new(
+        ControlMode::Manual == channel.control_mode,
+        DESTINATION_TIMEOUT_NS,
+        counter_id,
+    )))
+}
+
 pub fn buffer_mismatch(
     channel: &UdpChannel,
     socket_rcvbuf: usize,
@@ -624,7 +764,12 @@ mod tests {
         )
         .expect("an endpoint");
 
-        assert_eq!(1, endpoint.send(&[b"setup"]).expect("a send"));
+        assert_eq!(
+            1,
+            endpoint
+                .send(&[b"setup"], &counters, &regions, 0)
+                .expect("a send")
+        );
 
         let mut buffers = vec![vec![0u8; 1408]];
         let mut datagrams = crate::sys::socket::Datagrams::new();
@@ -670,7 +815,9 @@ mod tests {
         for marker in 0..6u8 {
             assert_eq!(
                 1,
-                endpoint.send(&[&[marker]]).expect("a send"),
+                endpoint
+                    .send(&[&[marker]], &counters, &regions, 0)
+                    .expect("a send"),
                 "a withheld datagram is still one the endpoint took"
             );
         }
@@ -724,5 +871,114 @@ mod tests {
             counters.free_list_len(),
             "the counter allocated for an endpoint that will not exist goes back"
         );
+    }
+
+    /// A unicast endpoint has nowhere to fan out to: it sends to the one
+    /// address its channel named
+    /// (`aeron_send_channel_endpoint_create`, `:76-88`).
+    #[test]
+    fn a_unicast_endpoint_has_no_destinations() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        assert!(endpoint.destination_tracker().is_none());
+        assert!(endpoint.destination_tracker_mut().is_none());
+    }
+
+    /// A multi-destination one does, and with the counter that counts them
+    /// (`:182-188`).
+    #[test]
+    fn a_multi_destination_endpoint_counts_its_destinations() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        let counter_id = endpoint
+            .destination_tracker()
+            .expect("a multi-destination channel has one")
+            .num_destinations_counter_id();
+
+        assert_eq!(Some(0), counters.value(&regions, counter_id), "none yet");
+
+        endpoint
+            .destination_tracker_mut()
+            .expect("a tracker")
+            .manual_add(
+                &counters,
+                &regions,
+                0,
+                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                Some("127.0.0.1:40124".parse().expect("an address")),
+                42,
+            );
+
+        assert_eq!(Some(1), counters.value(&regions, counter_id));
+    }
+
+    /// The datagram goes to the destinations, not to the address the channel
+    /// named (`aeron_send_channel_send`, `:410-418`).
+    ///
+    /// The destination here is a socket the test holds, so what arrives can be
+    /// read back. That the channel's own address is a *different* socket is the
+    /// point: a unicast endpoint would have sent there.
+    #[test]
+    fn a_multi_destination_endpoint_sends_to_its_destinations() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let destination = listener.local_addr().expect("a bound address");
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+        )
+        .expect("an endpoint");
+
+        endpoint
+            .destination_tracker_mut()
+            .expect("a tracker")
+            .manual_add(
+                &counters,
+                &regions,
+                0,
+                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                Some(destination),
+                42,
+            );
+
+        let sent = endpoint
+            .send(&[b"payload"], &counters, &regions, 0)
+            .expect("a send");
+
+        let mut buffer = [0u8; 64];
+        let (length, _) = listener.recv_from(&mut buffer).expect("the datagram");
+
+        assert_eq!(b"payload", &buffer[..length]);
+        assert_eq!(1, sent, "the batch was handed over");
     }
 }

@@ -38,6 +38,7 @@
 //! allocation stays on the conductor, where the ownership rules are.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender as Channel};
 use std::thread::JoinHandle;
@@ -429,6 +430,8 @@ impl SenderThread {
                     regions,
                     publications,
                     endpoints,
+                    index,
+                    datagram.source,
                     &buffers[slot][..datagram.length],
                 );
             }
@@ -445,11 +448,14 @@ impl SenderThread {
     /// An associated function rather than a method so that the borrow of the
     /// datagram buffers and the borrow of the publication list are visibly
     /// disjoint.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut [NetworkPublication],
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        endpoint_index: usize,
+        source: Option<SocketAddr>,
         bytes: &[u8],
     ) {
         let system = System::new(counters, regions);
@@ -489,6 +495,24 @@ impl SenderThread {
                 // counter answers "is the far end talking to us", which does not
                 // depend on our recognising what it said (`:625`).
                 system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
+
+                // The endpoint's destinations see it before any publication
+                // does, and on a dynamic channel a status message from
+                // somewhere unknown *creates* a destination
+                // (`aeron_send_channel_endpoint.c:636-645`). It happens whether
+                // or not a publication here answers to the frame, which is why
+                // it is above the lookup rather than inside it.
+                if let Some(address) = source {
+                    if let Some(tracker) = endpoints[endpoint_index].1.destination_tracker_mut() {
+                        tracker.on_status_message(
+                            counters,
+                            regions,
+                            frame.receiver_id,
+                            &address,
+                            now_ns,
+                        );
+                    }
+                }
 
                 let Some(index) = index else {
                     return;
@@ -599,7 +623,15 @@ impl SenderThread {
                     let (_, endpoint) = &mut endpoints[position];
                     let publication = &mut publications[index];
 
-                    let _ = publication.on_rttm(&frame, header.flags, endpoint, &system);
+                    let _ = publication.on_rttm(
+                        &frame,
+                        header.flags,
+                        endpoint,
+                        &system,
+                        counters,
+                        regions,
+                        now_ns,
+                    );
                 }
             }
             _ => {}
