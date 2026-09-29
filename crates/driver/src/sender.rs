@@ -503,16 +503,17 @@ impl SenderThread {
                     return;
                 }
 
-                // NOT here: the publication-side position check
-                // (`aeron_network_publication_is_valid_status_message`,
-                // `aeron_network_publication.c:841-856`) and the
-                // `status-messages-rejected` counter it drives. It is part of
-                // this finding and is implemented, but it cannot be switched on
-                // while this tree's own receiver sends a status message the
-                // reference's publisher is required to refuse — see the batch's
-                // notes. Turning it on stops every UDP session here: no status
-                // message is accepted, `snd-lmt` never opens, and nothing is
-                // sent.
+                // A position the publication cannot place is one it must not act
+                // on (`aeron_network_publication_is_valid_status_message`,
+                // `aeron_network_publication.c:841-856`).
+                let snd_pos = counters
+                    .value(regions, publications[index].counters.snd_pos)
+                    .unwrap_or(0);
+
+                if !publications[index].is_valid_status_message(&frame, snd_pos) {
+                    system.increment(system_counters::id::STATUS_MESSAGES_REJECTED);
+                    return;
+                }
 
                 publications[index].on_status_message(
                     &frame,

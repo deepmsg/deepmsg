@@ -889,6 +889,30 @@ impl NetworkPublication {
         Ok(total)
     }
 
+    /// Whether a status message reports a position this publication can place
+    /// (`aeron_network_publication_is_valid_status_message`, `:841-856`).
+    ///
+    /// A receiver that reports a position far outside where this publication is
+    /// has the wrong session, or a state this publication cannot reconcile with
+    /// its own — and `snd-lmt` is computed from that position, so acting on it
+    /// would open a window the log cannot follow. The band is a term and a half
+    /// wide: half a term behind `snd-pos`, a term and a half in front of it.
+    pub fn is_valid_status_message(&self, frame: &StatusMessageFrame, snd_pos: i64) -> bool {
+        let sm_position = Position::new(
+            frame.consumption_term_id,
+            frame.consumption_term_offset,
+            self.position_bits_to_shift,
+            self.initial_term_id,
+        )
+        .raw();
+
+        let term_buffer_length = i64::from(self.term_length);
+        let half_term = term_buffer_length >> 1;
+
+        sm_position >= (snd_pos - half_term)
+            && sm_position <= (snd_pos + term_buffer_length + half_term)
+    }
+
     /// A receiver asked for a `SETUP` because it has no image for this session
     /// (`aeron_network_publication_trigger_send_setup_frame`, `.h:245-271`).
     ///
@@ -1393,6 +1417,62 @@ mod tests {
 
     const TERM_LENGTH: i32 = 64 * 1024;
     const MTU: i32 = 1408;
+
+    /// A status message is only acted on where the publication can place it
+    /// (`aeron_network_publication_is_valid_status_message`, `:841-856`).
+    ///
+    /// The band is half a term behind `snd-pos` to a term and a half in front of
+    /// it. A receiver outside that is not describing this stream, and `snd-lmt`
+    /// is computed from what it reports — acting on it would open a window the
+    /// log cannot follow.
+    #[test]
+    fn a_status_message_is_only_valid_where_the_publication_can_place_it() {
+        let fixture = fixture();
+        let publication = &fixture.publication;
+
+        let bits = publication.position_bits_to_shift;
+        let initial_term_id = publication.initial_term_id;
+        let term_length = i64::from(publication.term_length);
+        let half_term = term_length >> 1;
+
+        // A position, as a receiver would report it: back through the
+        // publication's own term geometry.
+        let at = |raw: i64| StatusMessageFrame {
+            session_id: publication.session_id,
+            stream_id: publication.stream_id,
+            consumption_term_id: Position::from_raw(raw).term_id(bits, initial_term_id),
+            consumption_term_offset: Position::from_raw(raw).term_offset(bits),
+            receiver_window: 0,
+            receiver_id: 1,
+        };
+
+        let snd_pos = term_length * 3;
+
+        assert!(publication.is_valid_status_message(&at(snd_pos), snd_pos));
+
+        for inside in [
+            snd_pos - half_term,
+            snd_pos - 32,
+            snd_pos + term_length,
+            snd_pos + term_length + half_term,
+        ] {
+            assert!(
+                publication.is_valid_status_message(&at(inside), snd_pos),
+                "{inside} is inside the band"
+            );
+        }
+
+        for outside in [
+            snd_pos - half_term - 32,
+            snd_pos + term_length + half_term + 32,
+            snd_pos + term_length * 8,
+        ] {
+            assert!(
+                !publication.is_valid_status_message(&at(outside), snd_pos),
+                "{outside} is outside the band"
+            );
+        }
+    }
 
     struct Fixture {
         /// Held for its `Drop`: the log buffer the publication owns lives here.
