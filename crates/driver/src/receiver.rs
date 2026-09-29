@@ -127,6 +127,22 @@ pub enum ReceiverCommand {
         /// The reader's counter.
         counter_id: i32,
     },
+    /// Tell an image which session to answer a response channel with, or — with
+    /// [`RESPONSE_NULL_SESSION_ID`](crate::publication_image::RESPONSE_NULL_SESSION_ID)
+    /// — that it owes nobody one
+    /// (`aeron_publication_image_set_response_session_id`,
+    /// `aeron_publication_image.h:352-356`).
+    ///
+    /// It is a command rather than something the conductor writes because the
+    /// image belongs to this thread, and it is one command for both directions
+    /// because the reference's "clear it" is its "set it" with the sentinel
+    /// (`aeron_publication_image_remove_response_session_id`, `:1389-1392`).
+    SetResponseSessionId {
+        /// Which image.
+        registration_id: i64,
+        /// The session, or the sentinel.
+        response_session_id: i64,
+    },
     /// Attach a destination a client added
     /// (`aeron_driver_receiver_on_add_destination`, `:442-497`).
     ///
@@ -368,6 +384,25 @@ impl ReceiverProxy {
             .send(ReceiverCommand::RemoveSubscriber {
                 registration_id,
                 counter_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell an image which session to answer a response channel with, or that
+    /// it owes nobody one.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn set_response_session_id(
+        &self,
+        registration_id: i64,
+        response_session_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::SetResponseSessionId {
+                registration_id,
+                response_session_id,
             })
             .map_err(|_| stopped())
     }
@@ -778,6 +813,18 @@ impl ReceiverThread {
                             .find(|image| image.registration_id == registration_id)
                         {
                             image.remove_subscriber(counter_id);
+                        }
+                    }
+                    ReceiverCommand::SetResponseSessionId {
+                        registration_id,
+                        response_session_id,
+                    } => {
+                        if let Some(image) = self
+                            .images
+                            .iter_mut()
+                            .find(|image| image.registration_id == registration_id)
+                        {
+                            image.set_response_session_id(response_session_id);
                         }
                     }
                     ReceiverCommand::Stop => stop = true,

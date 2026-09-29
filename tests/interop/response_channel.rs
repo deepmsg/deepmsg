@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, CommandError, DEFAULT_TIMEOUT};
-use deepmsg_driver::protocol::{RspSetupFrame, SetupFrame, header_flags};
+use deepmsg_driver::protocol::{RspSetupFrame, SetupFrame, StatusMessageFrame, header_flags};
 use deepmsg_driver::sys::AddressFamily;
 use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT};
@@ -55,6 +55,14 @@ struct Announced {
     session_id: i32,
     flags: u8,
     from: SocketAddr,
+    /// Where the publication says its stream starts. A subscriber's status
+    /// message reports the position it has *read*, and the only position a
+    /// subscriber with a fresh socket can honestly report is the one the
+    /// `SETUP` named — which is also the only way a hand-built status message
+    /// passes the validity band the publication applies to it
+    /// (`is_valid_status_message`, `aeron_network_publication.c:841-856`).
+    active_term_id: i32,
+    term_offset: i32,
 }
 
 /// The far end of a session: a socket that is not the driver.
@@ -133,6 +141,46 @@ impl FarEnd {
         let _ = self.socket.send_batch(Some(address), &[frame]);
     }
 
+    /// A status message for `described`, sent to `to`.
+    ///
+    /// This is what a subscriber says to a publication, and the only thing a
+    /// publication counts as a reader: without one, a publication has no live
+    /// receiver and nothing it does about response channels ever moves on.
+    fn send_a_status_message(&self, to: SocketAddr, described: &Announced) {
+        let sm = StatusMessageFrame {
+            session_id: described.session_id,
+            stream_id: STREAM_ID,
+            consumption_term_id: described.active_term_id,
+            consumption_term_offset: described.term_offset,
+            receiver_window: 64 * 1024,
+            receiver_id: 1,
+        };
+
+        let mut frame = [0u8; StatusMessageFrame::LENGTH];
+        assert!(sm.write_with_flags(&mut frame, 0).is_some());
+
+        let _ = self.socket.send_batch(Some(to), &[&frame]);
+    }
+
+    /// Every `RSP_SETUP` that arrives within `within`.
+    fn take_rsp_setups(&mut self, within: Duration) -> Vec<RspSetupFrame> {
+        let deadline = Instant::now() + within;
+        let mut setups = Vec::new();
+
+        while Instant::now() < deadline {
+            match self.take() {
+                Some((bytes, _)) => {
+                    if let Some(setup) = RspSetupFrame::read(&bytes) {
+                        setups.push(setup);
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+
+        setups
+    }
+
     /// Wait for the driver's `SETUP` on `stream_id`, and report what it said.
     fn await_setup(&mut self, stream_id: i32, within: Duration) -> Option<Announced> {
         let deadline = Instant::now() + within;
@@ -145,6 +193,8 @@ impl FarEnd {
                             session_id: setup.session_id,
                             flags: bytes[5],
                             from,
+                            active_term_id: setup.active_term_id,
+                            term_offset: setup.term_offset,
                         });
                     }
                 }
@@ -854,6 +904,115 @@ fn a_response_publication_finds_only_the_image_that_asked_for_one() {
     // What was served is still served: the refusals did not take the
     // publication with them.
     assert!(client.publication(answering).is_some());
+
+    drop(client);
+    let _ = own.stop();
+}
+
+/// ⑩: the image answers the publication that asked for a response channel, and
+/// then stops once it has been answered.
+///
+/// The publisher that asked for a response channel cannot know the session its
+/// responses will arrive on — that is the *image's* session, on the far side of
+/// the handshake — and a `RSP_SETUP` is the only frame that says it
+/// (`aeron_receive_channel_endpoint_send_response_setup`,
+/// `media/aeron_receive_channel_endpoint.c:432-466`). It goes out on the
+/// status-message timer, because an image has no other timer, and it goes out
+/// through the connection the request arrived on
+/// (`aeron_publication_image_send_pending_status_message`, `:899-923`).
+///
+/// It stops when the publication reports a live receiver, which is the end of
+/// the handshake: the conductor clears what it set
+/// (`aeron_driver_conductor.c:4227-4232` sets it, `:7117-7131` clears it).
+///
+/// Both halves are asserted, and the second is what makes the first mean
+/// something: an image that said it once and an image that says it forever both
+/// satisfy "a `RSP_SETUP` arrived", and only the second is a handshake that
+/// finishes.
+#[test]
+fn the_image_answers_the_publication_that_asked_for_a_response_channel() {
+    let Some(mut own) = OwnDriver::start("response-image-answers") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+    // The request side: an ordinary subscription, because an image is made for
+    // a stream this driver reads.
+    let request_endpoint = free_udp_port(121);
+    let request = client
+        .add_subscription(
+            &format!("aeron:udp?endpoint=127.0.0.1:{request_endpoint}"),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("our driver must confirm the UDP subscription");
+
+    // The far end that asks for a response channel. It binds its own port, and
+    // that address is where the answer will come back — it is the connection's
+    // control address, because this channel named no `control=`.
+    let mut requester = FarEnd::open(free_udp_port(122));
+    requester.send_a_setup_asking(
+        request_endpoint,
+        STREAM_ID,
+        31,
+        header_flags::SETUP_SEND_RESPONSE,
+    );
+
+    let image = await_image(&mut client, request, Duration::from_secs(5))
+        .expect("a SETUP that asks for a response channel makes an image");
+
+    // The answer: a response publication naming that image.
+    let answering_endpoint = free_udp_port(123);
+    let _answering = client
+        .add_publication(
+            &format!(
+                "aeron:udp?endpoint=127.0.0.1:{answering_endpoint}\
+                 |control-mode=response|response-correlation-id={image}"
+            ),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("the image that asked for a response channel is one this answers");
+
+    let mut answerer = FarEnd::open(answering_endpoint);
+    let described = answerer
+        .await_setup(STREAM_ID, Duration::from_secs(5))
+        .expect("a publication describes itself");
+
+    // The first half. The session the image says is the publication's own,
+    // read from the publication's `SETUP` by the *other* end of the pair —
+    // which is the point: it is the one fact the publisher could not have
+    // known and had to be told.
+    let said = requester
+        .take_rsp_setups(Duration::from_secs(5))
+        .pop()
+        .expect("the image answers a publication that asked for a response channel");
+
+    assert_eq!(
+        described.session_id, said.response_session_id,
+        "the response session is the publication's, which is what the handshake is for"
+    );
+
+    // The second half. A subscriber answers the publication, so it has a live
+    // receiver — and the image that was saying the session has nothing left to
+    // say. Two status-message periods is long enough that an image still saying
+    // it would have said it again.
+    let _ = requester.take_rsp_setups(Duration::from_millis(50));
+
+    answerer.send_a_status_message(described.from, &described);
+
+    let afterwards = requester.take_rsp_setups(Duration::from_millis(700));
+
+    assert!(
+        afterwards.is_empty(),
+        "an answered image stops saying the session: {} more arrived",
+        afterwards.len()
+    );
 
     drop(client);
     let _ = own.stop();

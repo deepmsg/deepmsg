@@ -51,6 +51,7 @@ use crate::publication_images::PublicationImages;
 use crate::publication_params::{
     PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError,
 };
+use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
@@ -90,6 +91,12 @@ struct PendingNetworkPublication {
     endpoint_id: u64,
     /// The channel-status counter the reply carries.
     channel_status_counter_id: i32,
+    /// The image this publication answers, when it is a response publication
+    /// and one was found. Carried from the resolve step to the create step
+    /// because what the image has to be told is the *publication's* session id,
+    /// which does not exist until the create runs
+    /// (`aeron_driver_conductor.c:4227-4232`).
+    response_publication_image: Option<i64>,
     /// The counters allocated for this publication.
     counters: PublicationCounters,
     /// `so-sndbuf` the channel named, which the log buffer's metadata records.
@@ -226,6 +233,7 @@ impl NetworkPublications {
         sender: &SenderProxy,
         subscriptions: &IpcSubscriptions,
         images: &PublicationImages,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
@@ -324,7 +332,8 @@ impl NetworkPublications {
                 // (`:4350-4370`): a second publication that disagrees with the
                 // one it would share is refused for *that*, whatever it named
                 // for a correlation id.
-                find_response_publication_image(images, &named_channel, &params)?;
+                let response_image =
+                    find_response_publication_image(images, &named_channel, &params)?;
 
                 self.link(
                     index,
@@ -335,6 +344,18 @@ impl NetworkPublications {
                     clients,
                     events,
                 );
+
+                // And what the image is owed is said after the link, because it
+                // is the *publication's* session the image has to be told, and
+                // the publication it answered with is the one that already
+                // existed (`:4227-4232`, which is the last thing the reference's
+                // link does).
+                if let Some(image) = response_image {
+                    let _ = receiver.set_response_session_id(
+                        image,
+                        i64::from(self.publications[index].session_id),
+                    );
+                }
 
                 return Ok(());
             }
@@ -384,7 +405,8 @@ impl NetworkPublications {
         // before the counters are allocated — and the buffer itself is the only
         // thing that moves, which it does to the side that wastes less: a
         // publication that will be refused does not map one.
-        find_response_publication_image(images, &named_channel, &params)?;
+        let response_publication_image =
+            find_response_publication_image(images, &named_channel, &params)?;
 
         // The six counters a network publication's client reads
         // (`:4508-4531`).
@@ -431,6 +453,7 @@ impl NetworkPublications {
             channel_rcvbuf: endpoint_params.socket_rcvbuf,
             session_id,
             path,
+            response_publication_image,
         });
 
         Ok(())
@@ -449,6 +472,7 @@ impl NetworkPublications {
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
         sender: &SenderProxy,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> usize {
@@ -474,6 +498,7 @@ impl NetworkPublications {
                         regions,
                         clients,
                         sender,
+                        receiver,
                         now,
                         events,
                     );
@@ -521,6 +546,7 @@ impl NetworkPublications {
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
         sender: &SenderProxy,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) {
@@ -646,6 +672,14 @@ impl NetworkPublications {
         };
 
         events.publication_ready(&ready, pending.is_exclusive);
+
+        // And then the image is told which session to answer with, which is the
+        // last thing the reference's link does (`:4227-4232`) — after the client
+        // has been answered, because a client that has been answered is one
+        // that may offer, and the image's answer is not on that path.
+        if let Some(image) = pending.response_publication_image {
+            let _ = receiver.set_response_session_id(image, i64::from(pending.session_id));
+        }
     }
 
     /// A publication a second `ADD_PUBLICATION` might share: same endpoint,
@@ -1019,13 +1053,19 @@ fn validate_response_subscription(
 /// [`AddError::NoResponseCorrelationId`], [`AddError::ImageNotFound`] and
 /// [`AddError::ImageDidNotRequestResponseChannel`], in the order the reference
 /// tries them.
+/// # Returns
+///
+/// The registration id of the image, when there is one. `None` is a channel
+/// that is not a response channel at all and the prototype case, which the
+/// caller treats differently: the first has nothing to look for and the second
+/// has nothing to find.
 fn find_response_publication_image(
     images: &PublicationImages,
     channel: &UdpChannel,
     params: &PublicationParams,
-) -> Result<(), AddError> {
+) -> Result<Option<i64>, AddError> {
     if channel.control_mode != ControlMode::Response {
-        return Ok(());
+        return Ok(None);
     }
 
     if params.response_correlation_id == layout::NULL_VALUE {
@@ -1033,7 +1073,7 @@ fn find_response_publication_image(
     }
 
     if params.response_correlation_id == PROTOTYPE_CORRELATION_ID {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(image) = images
@@ -1052,7 +1092,7 @@ fn find_response_publication_image(
         });
     }
 
-    Ok(())
+    Ok(Some(image.registration_id))
 }
 
 /// The socket buffer lengths an endpoint is opened with, from the driver's

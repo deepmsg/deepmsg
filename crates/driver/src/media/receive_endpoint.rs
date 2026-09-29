@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::protocol::{NakFrame, RttmFrame, StatusMessageFrame};
+use crate::protocol::{NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame};
 use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, system_counters};
 
@@ -738,6 +738,48 @@ impl ReceiveChannelEndpoint {
 
         let mut buffer = [0u8; StatusMessageFrame::LENGTH];
         if frame.write_with_flags(&mut buffer, flags).is_none() {
+            return Ok(0);
+        }
+
+        match self.destinations.get_mut(index) {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
+    }
+
+    /// Send a `RSP_SETUP`
+    /// (`aeron_receive_channel_endpoint_send_response_setup`, `:432-466`).
+    ///
+    /// This is the answer an image owes a publication whose `SETUP` carried
+    /// [`header_flags::SETUP_SEND_RESPONSE`](crate::protocol::header_flags::SETUP_SEND_RESPONSE):
+    /// the publisher asked for a response channel and cannot know the session
+    /// the answers will arrive on, because it is *this image's*. The frame
+    /// carries no correlation id — a registration id never crosses the wire —
+    /// so the session is the whole of what it says
+    /// (`aeron_udp_protocol.h:158-165`).
+    ///
+    /// It leaves through the destination the request arrived on, the same one a
+    /// status message would ([`Self::send_sm_from`]).
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    pub fn send_response_setup(
+        &mut self,
+        index: usize,
+        destination: SocketAddr,
+        stream_id: i32,
+        session_id: i32,
+        response_session_id: i32,
+    ) -> io::Result<usize> {
+        let frame = RspSetupFrame {
+            session_id,
+            stream_id,
+            response_session_id,
+        };
+
+        let mut buffer = [0u8; RspSetupFrame::LENGTH];
+        if frame.write(&mut buffer).is_none() {
             return Ok(0);
         }
 

@@ -993,11 +993,13 @@ impl NetworkPublication {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
-    ) {
+    ) -> Option<i64> {
         // `status-messages-received` is counted at the endpoint, before this —
         // and whether or not a publication answered to the message
         // (`media/aeron_send_channel_endpoint.c:625`).
         self.status_message_deadline_ns = now_ns + self.connection_timeout_ns;
+
+        let had_receivers = self.has_receivers();
 
         if flags & header_flags::SM_EOS != 0 {
             self.remove_receiver(frame.receiver_id);
@@ -1023,6 +1025,20 @@ impl NetworkPublication {
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
+
+        // A publication that has just acquired its **first** live receiver
+        // reports the fact (`:805-812`), and the correlation id it reports is
+        // its own `response-correlation-id` — for the publication a response
+        // channel was asked for, that is the registration id of the *image*
+        // which owes it a response setup, and the conductor is what can reach
+        // that image (`aeron_driver_conductor_on_response_connected`,
+        // `aeron_driver_conductor.c:7117-7131`).
+        //
+        // It is reported whether or not this publication is on a response
+        // channel, as the reference reports it: what makes it meaningful is the
+        // conductor's lookup by registration id, which an id that names no
+        // image simply misses.
+        (!had_receivers && self.has_receivers()).then_some(self.response_correlation_id)
     }
 
     /// A measurement request, answered when it asked to be

@@ -168,6 +168,20 @@ pub enum SenderEvent {
         /// The session that subscription should now read.
         response_session_id: i32,
     },
+    /// A publication heard from a live receiver for the first time
+    /// (`aeron_driver_conductor_proxy_on_response_connected`,
+    /// `aeron_driver_conductor_proxy.c:160-170`).
+    ///
+    /// The handshake a response channel runs is one-way until this: the image
+    /// keeps saying the response session on every status-message period, and
+    /// this is how it is told to stop. What is reported is the publication's
+    /// own `response-correlation-id`, which for the publication that asked for
+    /// a response channel is the registration id of the image that owes it.
+    ResponseConnected {
+        /// The registration id the publication names, whether or not it names
+        /// an image on this driver.
+        response_correlation_id: i64,
+    },
     /// Something for the conductor to record: a socket that refused a send, a
     /// frame that could not be believed.
     Fault {
@@ -749,13 +763,17 @@ impl SenderThread {
                     return;
                 }
 
-                publications[index].on_status_message(
+                if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
                     header.flags,
                     counters,
                     regions,
                     now_ns,
-                );
+                ) {
+                    let _ = events.send(SenderEvent::ResponseConnected {
+                        response_correlation_id,
+                    });
+                }
             }
             frame_type::NAK => {
                 let Some(frame) = NakFrame::read(bytes) else {

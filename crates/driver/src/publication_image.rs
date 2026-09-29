@@ -59,6 +59,21 @@ pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
 /// `aeron-driver/src/main/c/aeron_publication_image.h:35`).
 pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
 
+/// The value [`PublicationImage::response_session_id`] holds when this image
+/// owes nobody a response setup
+/// (`AERON_PUBLICATION_RESPONSE_NULL_RESPONSE_SESSION_ID`,
+/// `aeron-driver/src/main/c/aeron_publication_image.c:28`).
+///
+/// It is deliberately **not** a valid session id and deliberately not zero: a
+/// session id is an `i32`, and the sentinel is far outside that range, which is
+/// the whole of how "is there one?" is answered
+/// (`aeron_publication_image_check_and_get_response_session_id`, `:59-66`
+/// casts to `i32` and asks whether the cast was lossless).
+/// Written through `u64` because the reference writes the same bit pattern as
+/// `INT64_C(0xF000000000000000)`, which C makes negative — the value here is
+/// that same negative number, not the unsigned one.
+pub const RESPONSE_NULL_SESSION_ID: i64 = 0xF000_0000_0000_0000u64 as i64;
+
 /// The three outcomes of the untethered state machine. They live with the
 /// positions they are about ([`crate::subscribable::UntetheredEvent`]) because
 /// a publication's own readers reach them too, not just an image's.
@@ -246,6 +261,26 @@ pub struct PublicationImage {
     pub state: ImageState,
     /// When the state last changed, for the linger timeout.
     pub time_of_last_state_change_ns: i64,
+    /// The session this image owes a `RSP_SETUP` to, or
+    /// [`RESPONSE_NULL_SESSION_ID`] when it owes one to nobody.
+    ///
+    /// Written by the conductor, once a response publication has named this
+    /// image and linked to it (`aeron_driver_conductor.c:4227-4232`), and
+    /// cleared once the publication has heard from a live receiver of its own
+    /// (`aeron_driver_conductor_on_response_connected`, `:7117-7131`). Until
+    /// then the image says the session on every status-message period, because
+    /// the publisher cannot ask again and has nothing else to learn it from.
+    response_session_id: i64,
+    /// Whether the conductor has asked for the next status message to be sent
+    /// now rather than when it is due
+    /// (`aeron_publication_image_request_next_sm_deadline_reset`,
+    /// `aeron_publication_image.h:363-373`).
+    ///
+    /// A response setup rides the status-message timer — an image has no other
+    /// timer — so a conductor that has just set a session id would otherwise
+    /// wait out the remainder of the period before the frame the publisher is
+    /// blocked on goes anywhere.
+    is_next_sm_deadline_reset_requested: bool,
 }
 
 /// Where a stream starts, and the term geometry that says so, from the `SETUP`
@@ -408,7 +443,40 @@ impl PublicationImage {
             untethered_resting_timeout_ns: untethered.untethered_resting_timeout_ns,
             state: ImageState::Active,
             time_of_last_state_change_ns: now_ns,
+            response_session_id: RESPONSE_NULL_SESSION_ID,
+            is_next_sm_deadline_reset_requested: false,
         }
+    }
+
+    /// Tell this image to say `response_session_id` to the publication that
+    /// asked for a response channel
+    /// (`aeron_publication_image_set_response_session_id`,
+    /// `aeron_publication_image.h:352-356`).
+    ///
+    /// The two together — the session and the request that the timer be brought
+    /// forward — are one act in the reference's caller
+    /// (`aeron_driver_conductor.c:4227-4232`), and they are one act here too:
+    /// an image told a session it will not say for another period has been told
+    /// nothing the publisher can use.
+    pub fn set_response_session_id(&mut self, response_session_id: i64) {
+        self.response_session_id = response_session_id;
+        self.is_next_sm_deadline_reset_requested = true;
+    }
+
+    /// Stop owing a response setup
+    /// (`aeron_publication_image_remove_response_session_id`, `:1389-1392`).
+    pub fn remove_response_session_id(&mut self) {
+        self.set_response_session_id(RESPONSE_NULL_SESSION_ID);
+    }
+
+    /// The session to say in a response setup, when there is one
+    /// (`aeron_publication_image_check_and_get_response_session_id`, `:59-66`).
+    ///
+    /// "There is one" is a question about the *range*: a session id is an
+    /// `i32`, so a value that does not survive the narrowing is the sentinel
+    /// rather than a session.
+    fn response_session_id_to_send(&self) -> Option<i32> {
+        i32::try_from(self.response_session_id).ok()
     }
 
     /// Give up the log buffer, for a caller that is about to unmap and unlink
@@ -892,6 +960,15 @@ impl PublicationImage {
         system: &System<'_>,
         now_ns: i64,
     ) -> std::io::Result<usize> {
+        // A requested reset is applied before the deadline is read, which is
+        // the whole of what makes it a request rather than a second timer
+        // (`:868-874`). The deadline goes to `now_ns - 1` and not to `now_ns`,
+        // because the test below is strict.
+        if self.is_next_sm_deadline_reset_requested {
+            self.is_next_sm_deadline_reset_requested = false;
+            self.next_sm_deadline_ns = now_ns - 1;
+        }
+
         let has_timed_out = self.next_sm_deadline_ns < now_ns;
 
         if self.invalidation_reason.is_some() {
@@ -908,6 +985,35 @@ impl PublicationImage {
 
         if self.sm_change_number == self.last_sm_change_number && !has_timed_out {
             return Ok(0);
+        }
+
+        // The response setup goes first, and on the same timer as the status
+        // message (`:899-923`): it is the answer to a `SETUP` that asked for a
+        // response channel, and the publisher is waiting on it before it can
+        // complete the handshake, so it is not something to be deferred until
+        // the ordinary message is due.
+        //
+        // The connections it goes to are the ones an ordinary status message
+        // would go to, which here is every connection with somewhere to answer
+        // — this build never drops a connection, so it applies no liveness test
+        // to either loop (`aeron_publication_image_connection_is_alive` has no
+        // counterpart here yet).
+        if has_timed_out {
+            if let Some(response_session_id) = self.response_session_id_to_send() {
+                for connection in &self.connections {
+                    let Some(control_address) = connection.control_address else {
+                        continue;
+                    };
+
+                    endpoint.send_response_setup(
+                        0,
+                        control_address,
+                        self.stream_id,
+                        self.session_id,
+                        response_session_id,
+                    )?;
+                }
+            }
         }
 
         let term_id = Position::from_raw(self.next_sm_position)

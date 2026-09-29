@@ -803,6 +803,7 @@ impl Conductor {
             &counter_regions,
             &mut self.clients,
             self.sender.proxy(),
+            self.receiver.proxy(),
             now,
             &mut transmit,
         );
@@ -1265,6 +1266,29 @@ impl Conductor {
                         self.pending_log_errors.push((error_code, description));
                     }
                 }
+                crate::sender::SenderEvent::ResponseConnected {
+                    response_correlation_id,
+                } => {
+                    // The image that owed this publication a response setup has
+                    // now been answered — the publication has a live receiver,
+                    // which is the end of the handshake — so it stops saying
+                    // the session (`aeron_driver_conductor.c:7117-7131`).
+                    //
+                    // The reference sweeps every image and clears each match
+                    // rather than stopping at the first, and clears whether or
+                    // not the image's `SETUP` asked for a response channel: the
+                    // lookup is by registration id alone. That is kept as it is,
+                    // including its sharp edge — a *request* publication reports
+                    // its subscription's registration id here, which is a
+                    // different id space from an image's, so an id that names
+                    // both would clear the wrong image's session.
+                    if self.images.find(response_correlation_id).is_some() {
+                        let _ = self.receiver.proxy().set_response_session_id(
+                            response_correlation_id,
+                            crate::publication_image::RESPONSE_NULL_SESSION_ID,
+                        );
+                    }
+                }
                 crate::sender::SenderEvent::EndpointRemoved { .. }
                 | crate::sender::SenderEvent::PublicationRemoved { .. } => {
                     // The conductor's own bookkeeping for a removal arrives
@@ -1557,6 +1581,7 @@ impl Conductor {
                                         sender.proxy(),
                                         subscriptions,
                                         images,
+                                        receiver.proxy(),
                                         now,
                                         &mut transmit,
                                     )
