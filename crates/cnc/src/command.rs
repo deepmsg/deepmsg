@@ -1032,6 +1032,195 @@ pub fn decode_remove_subscription(payload: &[u8]) -> Option<RemoveSubscription> 
     })
 }
 
+/// `AERON_COMMAND_ADD_DESTINATION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:32`).
+pub const ADD_DESTINATION_TYPE_ID: i32 = 0x07;
+
+/// `AERON_COMMAND_REMOVE_DESTINATION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:33`).
+pub const REMOVE_DESTINATION_TYPE_ID: i32 = 0x08;
+
+/// `AERON_COMMAND_ADD_RCV_DESTINATION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:37`).
+pub const ADD_RECEIVE_DESTINATION_TYPE_ID: i32 = 0x0C;
+
+/// `AERON_COMMAND_REMOVE_RCV_DESTINATION`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:38`).
+pub const REMOVE_RECEIVE_DESTINATION_TYPE_ID: i32 = 0x0D;
+
+/// `AERON_COMMAND_REMOVE_DESTINATION_BY_ID`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:42`).
+pub const REMOVE_DESTINATION_BY_ID_TYPE_ID: i32 = 0x11;
+
+/// A destination payload before its channel: the 16-byte correlated header, the
+/// `registration_id` of the endpoint the destination belongs to, and the channel
+/// length (`aeron_control_protocol.h:162-168`).
+///
+/// The reference declares this record under `#pragma pack(4)`
+/// (`aeron_control_protocol.h:62-63`), and the pragma is load-bearing rather
+/// than cosmetic. Measured against that header on this machine, the struct is 28
+/// bytes with `registration_id` at 16 and `channel_length` at 24, so the URI
+/// begins at 28. The same fields declared without the pragma are 32: the
+/// trailing `int32_t` is padded out to the struct's eight-byte alignment, and
+/// the URI would begin four bytes late — a driver reading at 28 would take four
+/// bytes of the URI's own tail as its first character
+/// (`aeron_driver_conductor.c:3012-3013` bounds the record by this same 28, and
+/// the reference's own test helper copies a channel to
+/// `sizeof(aeron_destination_command_t)`,
+/// `aeron-driver/src/test/c/aeron_driver_conductor_test.h:536`).
+pub const DESTINATION_COMMAND_HEADER_LENGTH: usize = 28;
+
+/// `aeron_destination_by_id_command_t` — 32 bytes, and **no channel**
+/// (`aeron_control_protocol.h:170-176`).
+///
+/// A pair of registration ids names the destination instead of its URI: the
+/// resource it was added to, and the destination itself. That is what lets a
+/// client remove a destination it has already been told about without repeating
+/// the channel — and the record is fixed-length for exactly that reason, so
+/// there is no `channel_length` to sanity-check against.
+pub const DESTINATION_BY_ID_COMMAND_LENGTH: usize = 32;
+
+/// A destination command as a client writes it: `ADD_DESTINATION`,
+/// `REMOVE_DESTINATION`, `ADD_RCV_DESTINATION` or `REMOVE_RCV_DESTINATION`.
+///
+/// One record serves all four because they ask one question — *this endpoint,
+/// this URI* — and differ only in which way a destination tracker is moved.
+/// Which of the four a record is, is carried by the ring record's `msg_type_id`
+/// and by nothing in the payload (see the module note), so one encoder writes
+/// all four and the caller supplies the type.
+///
+/// The channel is **not** NUL-terminated: it is `channel_length` raw bytes
+/// immediately after the header, exactly as a subscription's is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestinationCommand<'c> {
+    /// Who is asking. The driver registers it on first sight, as it does a
+    /// publication's or a subscription's client.
+    pub client_id: i64,
+    /// What the answer is matched to.
+    pub correlation_id: i64,
+    /// The publication or subscription the destination belongs to. Which of the
+    /// two it is comes from the command's type id, not from this field.
+    pub registration_id: i64,
+    /// The destination's channel URI, e.g. `aeron:udp?endpoint=localhost:1234`.
+    pub channel: &'c str,
+}
+
+impl<'c> DestinationCommand<'c> {
+    /// How many bytes this command occupies in a record payload.
+    pub const fn encoded_length(&self) -> usize {
+        DESTINATION_COMMAND_HEADER_LENGTH + self.channel.len()
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`DestinationCommand::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        let Ok(channel_length) = i32::try_from(self.channel.len()) else {
+            return false;
+        };
+
+        out[0..8].copy_from_slice(&self.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.registration_id.to_le_bytes());
+        out[24..28].copy_from_slice(&channel_length.to_le_bytes());
+        out[DESTINATION_COMMAND_HEADER_LENGTH..].copy_from_slice(self.channel.as_bytes());
+
+        true
+    }
+}
+
+/// A destination command as it arrives: the receiving side of
+/// [`DestinationCommand`].
+///
+/// The channel is borrowed as bytes rather than as a `str`, unlike the encoder's:
+/// these bytes come from another process and are not known to be UTF-8 until the
+/// URI parser that wants them says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestinationCommandReceived<'a> {
+    /// Who is asking.
+    pub client_id: i64,
+    /// What the answer is matched to.
+    pub correlation_id: i64,
+    /// The publication or subscription the destination belongs to.
+    pub registration_id: i64,
+    /// The destination's channel URI as raw bytes, **not** NUL-terminated.
+    pub channel: &'a [u8],
+}
+
+/// Decode any of the four destination commands that carry a channel.
+///
+/// A channel length that runs past the payload is refused rather than clamped,
+/// for the same reason a subscription's is: the URI decides which socket a
+/// datagram is sent to or expected from, and a silently truncated one names a
+/// destination nobody asked for.
+pub fn decode_destination_command(payload: &[u8]) -> Option<DestinationCommandReceived<'_>> {
+    let correlated = decode_correlated(payload)?;
+    let registration_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
+    let channel_length = usize::try_from(le_i32(payload, CORRELATED_COMMAND_LENGTH + 8)?).ok()?;
+    let channel = payload.get(
+        DESTINATION_COMMAND_HEADER_LENGTH
+            ..DESTINATION_COMMAND_HEADER_LENGTH.checked_add(channel_length)?,
+    )?;
+
+    Some(DestinationCommandReceived {
+        client_id: correlated.client_id,
+        correlation_id: correlated.correlation_id,
+        registration_id,
+        channel,
+    })
+}
+
+/// `REMOVE_DESTINATION_BY_ID` as a client writes it.
+///
+/// There is no channel to write: the two registration ids are the whole request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DestinationByIdCommand {
+    /// Who is asking.
+    pub client_id: i64,
+    /// What the answer is matched to.
+    pub correlation_id: i64,
+    /// The publication or subscription the destination was added to.
+    pub resource_registration_id: i64,
+    /// The destination, as the reply to its `ADD` named it.
+    pub destination_registration_id: i64,
+}
+
+impl DestinationByIdCommand {
+    /// How many bytes this command occupies in a record payload. Fixed, because
+    /// this record has no variable-length part.
+    pub const ENCODED_LENGTH: usize = DESTINATION_BY_ID_COMMAND_LENGTH;
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`DestinationByIdCommand::ENCODED_LENGTH`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != Self::ENCODED_LENGTH {
+            return false;
+        }
+
+        out[0..8].copy_from_slice(&self.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.resource_registration_id.to_le_bytes());
+        out[24..32].copy_from_slice(&self.destination_registration_id.to_le_bytes());
+
+        true
+    }
+}
+
+/// Decode `REMOVE_DESTINATION_BY_ID`.
+pub fn decode_destination_by_id_command(payload: &[u8]) -> Option<DestinationByIdCommand> {
+    let correlated = decode_correlated(payload)?;
+
+    Some(DestinationByIdCommand {
+        client_id: correlated.client_id,
+        correlation_id: correlated.correlation_id,
+        resource_registration_id: le_i64(payload, CORRELATED_COMMAND_LENGTH)?,
+        destination_registration_id: le_i64(payload, CORRELATED_COMMAND_LENGTH + 8)?,
+    })
+}
+
 /// Decode a response payload.
 ///
 /// A payload too short for its own type is reported as [`Response::Other`]
@@ -1903,6 +2092,173 @@ mod response_tests {
             },
             decode_response(ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, &ready),
             "the exclusive reply carries the same payload under a different id"
+        );
+    }
+
+    /// The record a destination command is, byte for byte, against the layout
+    /// the reference declares under `#pragma pack(4)`
+    /// (`aeron_control_protocol.h:162-168`).
+    ///
+    /// The offsets below were **measured** against that header on this machine,
+    /// not read off the pragma: `sizeof(aeron_destination_command_t)` is 28,
+    /// `registration_id` sits at 16 and `channel_length` at 24. Declaring the
+    /// same fields without the pragma gives 32 and moves the URI to 32 — which
+    /// is why the number is worth pinning to a real compile rather than to a
+    /// reading of the source.
+    #[test]
+    fn a_destination_command_is_the_record_the_reference_declares() {
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 42,
+            channel: "aeron:udp?endpoint=localhost:40456",
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(
+            28 + 34,
+            out.len(),
+            "28 bytes of header, then the URI with no terminator"
+        );
+        assert_eq!(7i64.to_le_bytes(), out[0..8], "client_id");
+        assert_eq!(9i64.to_le_bytes(), out[8..16], "correlation_id");
+        assert_eq!(42i64.to_le_bytes(), out[16..24], "registration_id at 16");
+        assert_eq!(34i32.to_le_bytes(), out[24..28], "channel_length at 24");
+        assert_eq!(
+            b"aeron:udp?endpoint=localhost:40456",
+            &out[28..],
+            "the URI begins at 28, where the packed struct ends"
+        );
+    }
+
+    /// `aeron_destination_by_id_command_t`: 32 bytes and no channel
+    /// (`aeron_control_protocol.h:170-176`).
+    #[test]
+    fn a_destination_by_id_command_is_the_record_the_reference_declares() {
+        let command = DestinationByIdCommand {
+            client_id: 7,
+            correlation_id: 9,
+            resource_registration_id: 42,
+            destination_registration_id: 43,
+        };
+        let mut out = vec![0u8; DestinationByIdCommand::ENCODED_LENGTH];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(32, out.len(), "no channel, so a fixed 32 bytes");
+        assert_eq!(7i64.to_le_bytes(), out[0..8], "client_id");
+        assert_eq!(9i64.to_le_bytes(), out[8..16], "correlation_id");
+        assert_eq!(42i64.to_le_bytes(), out[16..24], "the resource at 16");
+        assert_eq!(43i64.to_le_bytes(), out[24..32], "the destination at 24");
+    }
+
+    #[test]
+    fn a_destination_command_round_trips_through_its_decoder() {
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 42,
+            channel: "aeron:udp?endpoint=localhost:40456",
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(
+            Some(DestinationCommandReceived {
+                client_id: 7,
+                correlation_id: 9,
+                registration_id: 42,
+                channel: b"aeron:udp?endpoint=localhost:40456",
+            }),
+            decode_destination_command(&out)
+        );
+    }
+
+    #[test]
+    fn a_destination_by_id_command_round_trips_through_its_decoder() {
+        let command = DestinationByIdCommand {
+            client_id: 7,
+            correlation_id: 9,
+            resource_registration_id: 42,
+            destination_registration_id: 43,
+        };
+        let mut out = vec![0u8; DestinationByIdCommand::ENCODED_LENGTH];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(Some(command), decode_destination_by_id_command(&out));
+    }
+
+    /// The boundary the length check sits on. A destination with an empty URI is
+    /// not something a client sends — the parser would refuse it — but a decoder
+    /// that refused the *record* for it would be refusing for a reason that
+    /// belongs to the layer above.
+    #[test]
+    fn a_destination_command_with_no_channel_still_decodes() {
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 42,
+            channel: "",
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        assert_eq!(28, out.len(), "the header alone");
+        assert_eq!(
+            Some(DestinationCommandReceived {
+                client_id: 7,
+                correlation_id: 9,
+                registration_id: 42,
+                channel: &[],
+            }),
+            decode_destination_command(&out)
+        );
+    }
+
+    #[test]
+    fn a_destination_channel_that_runs_past_the_payload_is_refused() {
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 42,
+            channel: "aeron:ipc",
+        };
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+        assert!(
+            decode_destination_command(&out).is_some(),
+            "the record as written decodes"
+        );
+
+        // The same bytes with a length word claiming four more than are there.
+        out[24..28].copy_from_slice(&(9i32 + 4).to_le_bytes());
+        assert_eq!(
+            None,
+            decode_destination_command(&out),
+            "a channel that runs past the payload is refused, not clamped"
+        );
+
+        // And a payload too short to hold the header at all.
+        assert_eq!(None, decode_destination_command(&out[..27]));
+        assert_eq!(
+            None,
+            decode_destination_by_id_command(&out[..31]),
+            "the fixed record is refused when it is short too"
+        );
+    }
+
+    #[test]
+    fn the_destination_type_ids_are_the_references() {
+        assert_eq!(
+            (0x07, 0x08, 0x0C, 0x0D, 0x11),
+            (
+                ADD_DESTINATION_TYPE_ID,
+                REMOVE_DESTINATION_TYPE_ID,
+                ADD_RECEIVE_DESTINATION_TYPE_ID,
+                REMOVE_RECEIVE_DESTINATION_TYPE_ID,
+                REMOVE_DESTINATION_BY_ID_TYPE_ID,
+            ),
+            "aeron_control_protocol.h:32-42"
         );
     }
 }
