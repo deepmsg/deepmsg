@@ -50,7 +50,7 @@ const RECEIVE_SLOTS: usize = 16;
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
 /// `aeron-driver/src/main/c/aeron_driver_receiver.c:47` — 100 ms).
-pub const PENDING_SETUP_TIMEOUT_NS: i64 = 100_000_000;
+pub const PENDING_SETUP_TIMEOUT_NS: i64 = 1_000_000_000;
 
 /// What the conductor asks the receiver to do.
 pub enum ReceiverCommand {
@@ -390,8 +390,16 @@ struct PendingSetup {
     endpoint_id: u64,
     stream_id: i32,
     session_id: i32,
-    /// Where the eliciting status message goes.
-    control_address: std::net::SocketAddr,
+    /// Where the eliciting status message goes, or [`None`] when it goes to
+    /// wherever the packets came from.
+    ///
+    /// This is also what makes an entry **periodic**
+    /// (`aeron_driver_receiver_add_pending_setup`, `:653-687`: `is_periodic` is
+    /// false, and set true only when a control address was given). A periodic
+    /// entry is asked again every [`PENDING_SETUP_TIMEOUT_NS`]; one that is not
+    /// periodic is **given up on** after that long, and the session's interest
+    /// is dropped so that the next frame from it asks again.
+    control_address: Option<std::net::SocketAddr>,
     /// When it was last sent.
     time_of_status_message_ns: i64,
 }
@@ -927,7 +935,7 @@ impl ReceiverThread {
     /// Ask again for the `SETUP` of a session that has not answered
     /// (`aeron_driver_receiver.c:211-252`).
     fn send_pending_setups(
-        pending_setups: &mut [PendingSetup],
+        pending_setups: &mut Vec<PendingSetup>,
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
         system: &System<'_>,
         now_ns: i64,
@@ -947,11 +955,24 @@ impl ReceiverThread {
                 .iter_mut()
                 .find(|(id, _)| *id == pending.endpoint_id)
             else {
+                // The endpoint is gone, so there is nothing left to ask and
+                // nothing left to tell. The entry goes with it.
+                pending_setups.swap_remove(index);
+                continue;
+            };
+
+            let Some(control_address) = pending.control_address else {
+                // Not periodic: a session that has not answered in a second is
+                // given up on (`:215-227`), and dropping the interest is what
+                // lets the next frame from it ask again.
+                endpoint.remove_pending_setup(pending.stream_id, pending.session_id);
+                pending_setups.swap_remove(index);
+                work += 1;
                 continue;
             };
 
             let sent = endpoint.send_sm(
-                pending.control_address,
+                control_address,
                 pending.stream_id,
                 pending.session_id,
                 0,

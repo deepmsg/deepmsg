@@ -491,6 +491,18 @@ impl ReceiveChannelEndpoint {
     /// Ask the source of a packet for a `SETUP`
     /// (`elicit_setup_from_source`, `:616-659`) and answer whether the status
     /// message should be sent.
+    /// Give up on a session that never answered
+    /// (`aeron_receive_channel_endpoint_on_remove_pending_setup`, `RCE:1127-1177`
+    /// reaching the dispatcher): its interest is dropped, so the next frame
+    /// from it asks for a `SETUP` again.
+    ///
+    /// This is what a **non-periodic** pending setup does when it expires — the
+    /// one a data frame elicited. A periodic one, which a destination with a
+    /// control address creates, is asked again instead.
+    pub fn remove_pending_setup(&mut self, stream_id: i32, session_id: i32) {
+        self.dispatcher.remove_pending_setup(stream_id, session_id);
+    }
+
     pub fn elicit_setup(&mut self, stream_id: i32, session_id: i32) -> bool {
         self.dispatcher
             .elicit_setup_from_source(stream_id, session_id)
