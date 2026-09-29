@@ -470,6 +470,35 @@ mod tests {
         assert_eq!(Interest::None, dispatcher.on_data(1001, 7, false));
     }
 
+    /// The "once" is a lease, not a promise: a session that never answers is
+    /// given up on and the next frame from it asks again
+    /// (`aeron_driver_receiver.c:215-227`, the branch that drops a
+    /// non-periodic pending setup).
+    ///
+    /// Without this the state said `PendingSetup` for ever, so a sender that
+    /// missed the first request was never asked a second time — and the
+    /// receiver sat waiting for a `SETUP` nobody had been told to send.
+    #[test]
+    fn giving_up_on_a_pending_setup_lets_the_next_packet_ask_again() {
+        let mut dispatcher = DataPacketDispatcher::new(16);
+        dispatcher.add_subscription(1001);
+
+        assert_eq!(Interest::ElicitSetup, dispatcher.on_data(1001, 7, false));
+        assert!(dispatcher.elicit_setup_from_source(1001, 7));
+
+        // The second packet asks for nothing while the first ask is live.
+        assert_eq!(Interest::None, dispatcher.on_data(1001, 7, false));
+        assert!(!dispatcher.elicit_setup_from_source(1001, 7));
+
+        // The ask is given up on.
+        dispatcher.remove_pending_setup(1001, 7);
+        assert_eq!(ImageState::Unknown, dispatcher.state_of(1001, 7));
+
+        // And the next packet asks again.
+        assert_eq!(Interest::ElicitSetup, dispatcher.on_data(1001, 7, false));
+        assert!(dispatcher.elicit_setup_from_source(1001, 7));
+    }
+
     #[test]
     fn an_end_of_stream_packet_never_asks_for_a_setup() {
         let mut dispatcher = DataPacketDispatcher::new(16);

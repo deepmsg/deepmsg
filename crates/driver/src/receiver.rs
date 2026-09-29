@@ -611,6 +611,7 @@ impl ReceiverThread {
             &mut self.images,
             &mut self.buffers,
             &mut self.datagrams,
+            &mut self.pending_setups,
             &system,
             &self.counters,
             &regions,
@@ -661,6 +662,7 @@ impl ReceiverThread {
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
+        pending_setups: &mut Vec<PendingSetup>,
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -703,6 +705,7 @@ impl ReceiverThread {
                     *endpoint_id,
                     endpoint,
                     images,
+                    pending_setups,
                     packet,
                     source,
                     system,
@@ -726,6 +729,7 @@ impl ReceiverThread {
         endpoint_id: u64,
         endpoint: &mut ReceiveChannelEndpoint,
         images: &mut [PublicationImage],
+        pending_setups: &mut Vec<PendingSetup>,
         packet: &[u8],
         source: std::net::SocketAddr,
         system: &System<'_>,
@@ -788,6 +792,25 @@ impl ReceiverThread {
                         {
                             system.increment(system_counters::id::STATUS_MESSAGES_SENT);
                         }
+
+                        // And remember that we asked — **without** a control
+                        // address, which is what makes this entry non-periodic
+                        // (`aeron_driver_receiver_add_pending_setup`, `:653-687`:
+                        // this path is given a `NULL` there).
+                        //
+                        // That is the whole point of recording it: a session
+                        // that never answers is given up on after a second, its
+                        // interest is dropped, and the next frame from it asks
+                        // again. `elicit_setup` alone answers yes once per
+                        // session for ever, so before this a sender that missed
+                        // the first request was never asked a second time.
+                        pending_setups.push(PendingSetup {
+                            endpoint_id,
+                            stream_id: frame.stream_id,
+                            session_id: frame.session_id,
+                            control_address: None,
+                            time_of_status_message_ns: now_ns,
+                        });
                     }
                     Interest::None => {}
                 }
@@ -1014,16 +1037,6 @@ impl ReceiverThread {
         }
 
         work
-    }
-
-    /// Remember a pending setup, so it is asked for again if nothing answers.
-    ///
-    /// The receiver is the one that noticed the session missing, so it records
-    /// it where the eliciting status message is sent from — one hop fewer than
-    /// sending the note back to the conductor and returning it as a command.
-    #[allow(dead_code)] // called by the dispatch path once the loss seam lands
-    pub fn push_pending_setup(&mut self, setup: PendingSetup) {
-        self.pending_setups.push(setup);
     }
 
     /// The cycle-time counters, which are 30 and 31
