@@ -50,17 +50,17 @@
 
 use deepmsg_cnc::command::{
     ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
-    ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE, ERROR_CODE_STORAGE_SPACE,
-    ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
-    ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
-    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
-    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
-    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
-    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
-    decode_destination_by_id_command, decode_destination_command, decode_remove_counter,
-    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
-    encode_counter_update, encode_error, encode_operation_succeeded, encode_subscription_ready,
-    encode_unavailable_image,
+    ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
+    ERROR_CODE_STORAGE_SPACE, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER,
+    ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
+    ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady,
+    REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter, decode_add_publication,
+    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
+    decode_destination_command, decode_remove_counter, decode_remove_publication,
+    decode_remove_subscription, encode_client_timeout, encode_counter_update, encode_error,
+    encode_operation_succeeded, encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -87,7 +87,8 @@ use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
-    UdpChannel, UdpChannelError, validate_destination_prefix, validate_send_destination_uri,
+    IPC_PREFIX, SPY_PREFIX, UdpChannel, UdpChannelError, validate_destination_prefix,
+    validate_send_destination_uri,
 };
 
 /// At most one command per duty cycle
@@ -1834,11 +1835,12 @@ impl Conductor {
                     }
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
-                command @ (Command::AddDestination
+                Command::AddDestination
                 | Command::RemoveDestination
-                | Command::RemoveDestinationById) => {
+                | Command::RemoveDestinationById
+                | Command::AddReceiveDestination
+                | Command::RemoveReceiveDestination => {
                     pending_destination_commands.push((type_id, payload.to_vec()));
-                    let _ = command;
                 }
                 command => {
                     if let Command::Unknown(unknown_type_id) = command {
@@ -1898,6 +1900,44 @@ impl Conductor {
         // nothing either — and `docs/compat.md` gets a line for it.
         for (type_id, payload) in pending_destination_commands {
             let command = Command::from_type_id(type_id);
+
+            // A receive destination is triaged by the prefix of the channel it
+            // names (`aeron_driver_conductor.c:3051-3065`): `aeron:ipc` is one
+            // kind of destination, `aeron-spy:` another, and everything else is
+            // a network one.
+            //
+            // The two this build does not serve are refused **by name**, which
+            // is what §2.1 of the P1-5 plan asks for — a client told nothing
+            // waits out its timeout, and these are not commands this driver is
+            // going to get to later. The **network** branch is refused here too
+            // for now, and that is temporary: what it does is add a destination
+            // to a receive endpoint, which is the next commit. Until that
+            // exists there is nothing for it to do but say so, and saying so is
+            // better than a client waiting. `docs/compat.md` needs a line for
+            // it, and the next commit removes the need.
+            if Command::AddReceiveDestination == command
+                || Command::RemoveReceiveDestination == command
+            {
+                let Some(request) = decode_destination_command(&payload) else {
+                    malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    continue;
+                };
+
+                let not_served = if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
+                    "aeron:ipc destinations are not served by this driver"
+                } else if request.channel.starts_with(SPY_PREFIX.as_bytes()) {
+                    "aeron-spy: destinations are not served by this driver"
+                } else {
+                    "network destinations are not served by this driver yet"
+                };
+
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_NOT_SUPPORTED,
+                    not_served.as_bytes(),
+                );
+                continue;
+            }
 
             if Command::RemoveDestinationById == command {
                 let Some(request) = decode_destination_by_id_command(&payload) else {
@@ -2854,6 +2894,74 @@ mod tests {
             responses[0].1[..8],
             "answered against the command that asked"
         );
+    }
+
+    /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
+    /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel. Both
+    /// kinds this build does not serve are refused **by name** rather than left
+    /// unanswered, because a client told nothing waits out its timeout and
+    /// neither of these is a command this driver will get to later.
+    ///
+    /// The network branch lands on the same refusal **for now**. What it does
+    /// in the reference is add a destination to a receive endpoint, which is
+    /// the commit after this one, so this test records a temporary state and
+    /// will change when that lands — written down as what it is rather than as
+    /// the reference's behaviour.
+    #[test]
+    fn a_receive_destination_is_refused_by_the_prefix_it_names() {
+        use deepmsg_cnc::command::{
+            ADD_RECEIVE_DESTINATION_TYPE_ID, DestinationCommand, ON_ERROR_TYPE_ID,
+        };
+
+        let channels = [
+            (
+                "aeron:ipc",
+                "aeron:ipc destinations are not served by this driver",
+            ),
+            (
+                "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
+                "aeron-spy: destinations are not served by this driver",
+            ),
+            (
+                "aeron:udp?endpoint=127.0.0.1:40456",
+                "network destinations are not served by this driver yet",
+            ),
+        ];
+
+        for (channel, expected) in channels {
+            let (temp, mut conductor) = running(TerminationPolicy::Deny);
+            let (cnc, mut receiver) = events_reader(&temp.0);
+
+            let command = DestinationCommand {
+                client_id: 7,
+                correlation_id: 9,
+                registration_id: 4242,
+                channel,
+            };
+            let mut payload = vec![0u8; command.encoded_length()];
+            assert!(command.encode_into(&mut payload));
+
+            send(&conductor, ADD_RECEIVE_DESTINATION_TYPE_ID, &payload);
+            conductor.do_work();
+
+            assert_eq!(0, conductor.unhandled_commands(), "{channel}");
+
+            let responses = drain(&cnc, &mut receiver);
+            assert_eq!(1, responses.len(), "{channel}: one answer, and an error");
+            assert_eq!(ON_ERROR_TYPE_ID, responses[0].0, "{channel}");
+            assert_eq!(
+                9i64.to_le_bytes(),
+                responses[0].1[..8],
+                "{channel}: answered against the command that asked"
+            );
+            assert!(
+                responses[0]
+                    .1
+                    .windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{channel}: the refusal names what it refused"
+            );
+        }
     }
 
     /// `REMOVE_DESTINATION_BY_ID` is the one command in the family whose

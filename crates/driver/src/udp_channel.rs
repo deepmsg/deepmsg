@@ -385,6 +385,11 @@ fn read_control_mode(uri: &ChannelUri<'_>) -> Result<ControlMode, UdpChannelErro
 /// `aeron-client/src/main/c/uri/aeron_uri.h:36`).
 pub const SPY_PREFIX: &str = "aeron-spy:";
 
+/// The prefix an IPC channel carries (`AERON_IPC_CHANNEL`,
+/// `aeron-client/src/main/c/uri/aeron_uri.h:35`), which the destination triage
+/// matches on its length alone (`aeron_driver_conductor.c:3051`).
+pub const IPC_PREFIX: &str = "aeron:ipc";
+
 /// The keys a destination URI may not carry
 /// (`AERON_DRIVER_CONDUCTOR_INVALID_DESTINATION_KEYS`,
 /// `aeron-driver/src/main/c/aeron_driver_conductor.c:52-60`).
