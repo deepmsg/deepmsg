@@ -663,6 +663,41 @@ impl ReceiveChannelEndpoint {
         receiver_window: i32,
         flags: u8,
     ) -> io::Result<usize> {
+        self.send_sm_from(
+            0,
+            destination,
+            stream_id,
+            session_id,
+            consumption_term_id,
+            consumption_term_offset,
+            receiver_window,
+            flags,
+        )
+    }
+
+    /// The same, through the destination at `index`.
+    ///
+    /// A datagram arrives on **one** destination's socket, and an answer has to
+    /// leave through that one — a status message that went out of another
+    /// destination's socket would be a receiver reporting a position to a sender
+    /// that never asked it (`aeron_receive_channel_endpoint_send_sm`, which
+    /// takes the destination it is answering).
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    #[allow(clippy::too_many_arguments)] // the status message's fields
+    pub fn send_sm_from(
+        &mut self,
+        index: usize,
+        destination: SocketAddr,
+        stream_id: i32,
+        session_id: i32,
+        consumption_term_id: i32,
+        consumption_term_offset: i32,
+        receiver_window: i32,
+        flags: u8,
+    ) -> io::Result<usize> {
         let frame = StatusMessageFrame {
             session_id,
             stream_id,
@@ -677,7 +712,7 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        match self.destination_mut() {
+        match self.destinations.get_mut(index) {
             Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
             None => Ok(0),
         }

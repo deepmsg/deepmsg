@@ -797,6 +797,7 @@ impl ReceiverThread {
                     let packet = &buffers[slot][..datagram.length];
                     Self::dispatch(
                         *endpoint_id,
+                        destination_index,
                         endpoint,
                         images,
                         pending_setups,
@@ -820,8 +821,10 @@ impl ReceiverThread {
     /// One datagram, to the dispatcher
     /// (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         endpoint_id: u64,
+        destination_index: usize,
         endpoint: &mut ReceiveChannelEndpoint,
         images: &mut [PublicationImage],
         pending_setups: &mut Vec<PendingSetup>,
@@ -874,7 +877,8 @@ impl ReceiverThread {
                         // (`elicit_setup_from_source`, `:616-659`).
                         if endpoint.elicit_setup(frame.stream_id, frame.session_id)
                             && endpoint
-                                .send_sm(
+                                .send_sm_from(
+                                    destination_index,
                                     endpoint.control_address(source),
                                     frame.stream_id,
                                     frame.session_id,
