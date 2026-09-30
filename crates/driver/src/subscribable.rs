@@ -260,6 +260,19 @@ impl Subscribable {
         Some(position)
     }
 
+    /// Empty the set, for a caller that has already given every reader's
+    /// counter back (`aeron_ipc_publication_reject`'s `aeron_free` of the
+    /// array, `aeron_ipc_publication.c:263-271`).
+    ///
+    /// Unlike [`Self::remove_position`] this runs no hook: the reference does
+    /// not either — it frees the array the positions lived in — and the
+    /// `is_connected` byte the hooks maintain is written by that caller
+    /// directly, before it gets here.
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.inactive_count = 0;
+    }
+
     /// Take a position's counter away while leaving the position where it is,
     /// which is what a closed reader becomes
     /// (`tetherable_position->counter_id = AERON_NULL_COUNTER_ID`,

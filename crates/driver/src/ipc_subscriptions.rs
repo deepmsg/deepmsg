@@ -983,6 +983,58 @@ impl IpcSubscriptions {
         }
     }
 
+    /// A publication is being rejected: tell every subscription reading it
+    /// that the image is gone, and drop those readers from the subscriptions
+    /// (`aeron_driver_conductor_unlink_ipc_subscriptions`,
+    /// `aeron_driver_conductor.c:6453-6473`).
+    ///
+    /// Nothing is freed here. The counter a reader was given belongs to the
+    /// publication's own set, and that set is what gives it back a step later
+    /// (`aeron_ipc_publication.c:256-271`: `unlink_subscribable` drops the
+    /// link's entries, then the subscribable's array is freed) — freeing it
+    /// here as well would give the same counter back twice.
+    ///
+    /// The message names what the **link** holds — its own stream id and its
+    /// own channel — where the revoke path names the publication's stream and
+    /// the constant `aeron:ipc`. That asymmetry is the reference's, and the two
+    /// are thirty lines apart in the conductor (`:6462-6468` against
+    /// `:503-517`).
+    ///
+    /// # Returns
+    ///
+    /// How many subscriptions were told.
+    pub fn unlink_publication(
+        &mut self,
+        publication_registration_id: i64,
+        events: &mut impl ClientEvents,
+    ) -> usize {
+        let mut told = 0;
+
+        for link in &mut self.links {
+            let before = link.subscribables.len();
+
+            link.subscribables.retain(|entry| {
+                !matches!(
+                    entry.target,
+                    SubscriptionTarget::IpcPublication(registration_id)
+                        if registration_id == publication_registration_id
+                )
+            });
+
+            if link.subscribables.len() != before {
+                events.unavailable_image(
+                    publication_registration_id,
+                    link.registration_id,
+                    link.stream_id,
+                    &link.channel,
+                );
+                told += 1;
+            }
+        }
+
+        told
+    }
+
     /// Whether a **network** subscription with this registration id exists
     /// (`aeron_driver_conductor.c:641-648`, which walks
     /// `network_subscriptions`).

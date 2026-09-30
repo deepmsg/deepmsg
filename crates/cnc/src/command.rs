@@ -433,6 +433,20 @@ pub const ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE: i32 = 10;
 /// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3231-3235`).
 pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
 
+/// `AERON_ERROR_CODE_IMAGE_REJECTED` (`aeron_client_error.h:23`).
+///
+/// What a publication is told when its image was rejected — the code the driver
+/// puts on the `ON_PUBLICATION_ERROR` it owes the publisher, and the one the
+/// receiver puts on the `ERR` frame that carries the news across the wire
+/// (`aeron_receive_channel_endpoint.c:489` and `aeron_ipc_publication.c:245`).
+pub const ERROR_CODE_IMAGE_REJECTED: i32 = 13;
+
+/// `AERON_ERROR_CODE_PUBLICATION_REVOKED` (`aeron_client_error.h:24`).
+///
+/// The same message for a different reason: `REMOVE_PUBLICATION` with the
+/// revoke flag cuts the stream off on purpose, and a publisher is told so.
+pub const ERROR_CODE_PUBLICATION_REVOKED: i32 = 14;
+
 /// Encode `ON_OPERATION_SUCCEEDED`.
 pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
     correlation_id.to_le_bytes()
@@ -450,6 +464,155 @@ pub fn encode_error(correlation_id: i64, error_code: i32, message: &[u8]) -> Vec
     out[8..12].copy_from_slice(&error_code.to_le_bytes());
     out[12..16].copy_from_slice(&(message.len() as i32).to_le_bytes());
     out[ERROR_RESPONSE_HEADER_LENGTH..].copy_from_slice(message);
+
+    out
+}
+
+/// `AERON_RESPONSE_ON_PUBLICATION_ERROR`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:57`).
+///
+/// A publication's client is told its stream failed — an image was rejected, or
+/// the publication was revoked. It carries no correlation id: it is not an
+/// answer to a command, it is news about a resource the client already holds,
+/// named by that resource's registration id.
+pub const ON_PUBLICATION_ERROR_TYPE_ID: i32 = 0x0F0C;
+
+/// `offsetof(aeron_publication_error_values_t, error_message)` — 68
+/// (`aeron-client/src/main/c/aeronc.h:73-88`, inside that header's own
+/// `#pragma pack(push) / pack(4)` region).
+///
+/// The struct's three trailing members would land here under natural alignment
+/// too — every one of them is already four-byte aligned — so unlike
+/// `REJECT_IMAGE`'s, this offset is the same either way. It is asserted rather
+/// than assumed because the field before it is a sixteen-byte address and the
+/// two are easy to transpose.
+pub const PUBLICATION_ERROR_HEADER_LENGTH: usize = 68;
+
+/// `AERON_RESPONSE_ADDRESS_TYPE_IPV4` / `_IPV6`
+/// (`aeron-client/src/main/c/aeronc.h:39-40`).
+pub const ADDRESS_TYPE_IPV4: i16 = 0x1;
+/// The same, for an address the driver took from an IPv6 socket.
+pub const ADDRESS_TYPE_IPV6: i16 = 0x2;
+
+/// The payload of `ON_PUBLICATION_ERROR`, before its message.
+///
+/// The Rust spelling of `aeron_publication_error_values_t`
+/// (`aeron-client/src/main/c/aeronc.h:73-88`) with the same field order, which
+/// is the part that matters: 68 bytes with `receiver_id` at 24 and
+/// `error_code` at 60, and a struct that transposed the address type and the
+/// port would give a client a publication error it reads as coming from
+/// nowhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationError<'a> {
+    /// The publication this is about — its registration id, which is what the
+    /// client's `Publication` holds.
+    pub registration_id: i64,
+    /// Which destination the error came from, when it came from one. The IPC
+    /// path has no destination and sends [`crate::layout::NULL_VALUE`].
+    pub destination_registration_id: i64,
+    /// The stream's session, so the client can match the news to a publication
+    /// whose registration id it may already have forgotten.
+    pub session_id: i32,
+    /// And its stream id.
+    pub stream_id: i32,
+    /// Who refused it, when a receiver did. The IPC path has no receiver.
+    pub receiver_id: i64,
+    /// The group, when the frame carried one. [`crate::layout::NULL_VALUE`]
+    /// otherwise, which is also what a reader must see when
+    /// `has_group_tag` was clear (`aeron_network_publication.c:880`).
+    pub group_tag: i64,
+    /// Where the error came from, or [`None`] for nowhere in particular: the
+    /// reference's `address_type` of zero, and the IPC path's loopback address
+    /// is an address like any other, so it is sent as one.
+    pub source: Option<std::net::SocketAddr>,
+    /// Why.
+    pub error_code: i32,
+    /// The words. Not NUL-terminated on the wire, and their length is in the
+    /// header (`aeron_driver_conductor.c:2321`).
+    pub message: &'a [u8],
+}
+
+/// A [`PublicationError`] whose message it owns.
+///
+/// The reference builds its version of this in one place and calls the
+/// conductor's handler with it — a stack buffer that lives for the call
+/// (`aeron_driver_conductor_proxy_on_publication_error`,
+/// `aeron_driver_conductor_proxy.c:207-242`). Here the words come off a
+/// datagram the sender reuses on its next pass, so they have to be taken out of
+/// it before the frame is handed on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedPublicationError {
+    /// The publication this is about.
+    pub registration_id: i64,
+    /// Which destination the error came from, when one was found.
+    pub destination_registration_id: i64,
+    /// The stream's session.
+    pub session_id: i32,
+    /// And its stream.
+    pub stream_id: i32,
+    /// Who refused it.
+    pub receiver_id: i64,
+    /// The group, when the frame carried one.
+    pub group_tag: i64,
+    /// Where it came from.
+    pub source: Option<std::net::SocketAddr>,
+    /// Why.
+    pub error_code: i32,
+    /// The words.
+    pub message: Vec<u8>,
+}
+
+impl OwnedPublicationError {
+    /// Borrow it as the response it becomes.
+    pub fn as_error(&self) -> PublicationError<'_> {
+        PublicationError {
+            registration_id: self.registration_id,
+            destination_registration_id: self.destination_registration_id,
+            session_id: self.session_id,
+            stream_id: self.stream_id,
+            receiver_id: self.receiver_id,
+            group_tag: self.group_tag,
+            source: self.source,
+            error_code: self.error_code,
+            message: &self.message,
+        }
+    }
+}
+
+/// Encode `ON_PUBLICATION_ERROR`.
+///
+/// The response the reference builds is `offsetof(error_message)` long plus the
+/// message (`aeron_driver_conductor.c:2319-2323`), and the address is narrowed
+/// from a `sockaddr_storage` into the sixteen bytes the client reads: four for
+/// IPv4, sixteen for IPv6, and a type of zero with everything blanked when the
+/// family is neither (`:2297-2315`).
+pub fn encode_publication_error(error: &PublicationError<'_>) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)] // a message this build writes, far below i32::MAX
+    let mut out = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH + error.message.len()];
+
+    out[0..8].copy_from_slice(&error.registration_id.to_le_bytes());
+    out[8..16].copy_from_slice(&error.destination_registration_id.to_le_bytes());
+    out[16..20].copy_from_slice(&error.session_id.to_le_bytes());
+    out[20..24].copy_from_slice(&error.stream_id.to_le_bytes());
+    out[24..32].copy_from_slice(&error.receiver_id.to_le_bytes());
+    out[32..40].copy_from_slice(&error.group_tag.to_le_bytes());
+
+    let (address_type, port, address) = match error.source {
+        Some(std::net::SocketAddr::V4(v4)) => {
+            let mut address = [0u8; 16];
+            address[..4].copy_from_slice(&v4.ip().octets());
+            (ADDRESS_TYPE_IPV4, v4.port(), address)
+        }
+        Some(std::net::SocketAddr::V6(v6)) => (ADDRESS_TYPE_IPV6, v6.port(), v6.ip().octets()),
+        None => (0, 0, [0u8; 16]),
+    };
+
+    out[40..42].copy_from_slice(&address_type.to_le_bytes());
+    out[42..44].copy_from_slice(&port.to_le_bytes());
+    out[44..60].copy_from_slice(&address);
+    out[60..64].copy_from_slice(&error.error_code.to_le_bytes());
+    out[64..68].copy_from_slice(&(error.message.len() as i32).to_le_bytes());
+    out[PUBLICATION_ERROR_HEADER_LENGTH..].copy_from_slice(error.message);
 
     out
 }
@@ -1048,16 +1211,61 @@ pub const REJECT_IMAGE_TYPE_ID: i32 = 0x10;
 /// caller's words as a length.
 pub const REJECT_IMAGE_HEADER_LENGTH: usize = CORRELATED_COMMAND_LENGTH + 8 + 8 + 4;
 
+/// `sizeof(aeron_reject_image_command_t)` — 40, which is **not**
+/// [`REJECT_IMAGE_HEADER_LENGTH`].
+///
+/// The struct's trailing `char reason_text[1]` takes its 37-byte layout up to
+/// its own four-byte alignment, and the dispatch is what compares a record
+/// against this rather than against `offsetof` — `length <
+/// sizeof(aeron_reject_image_command_t)` is its first shape check
+/// (`aeron_driver_conductor.c:3177-3180`) — so a record that carries the header
+/// and nothing else is refused before the handler is called.
+///
+/// That is not a hypothetical: the reference's own Java client sends
+/// `MINIMUM_SIZE + reason.length()` = `36 + n`
+/// (`RejectImageFlyweight.computeLength`), so its empty reason is a 36-byte
+/// record, and the reference driver calls it malformed.
+pub const REJECT_IMAGE_MINIMUM_LENGTH: usize = 40;
+
 /// The most reason text `REJECT_IMAGE` may carry, `AERON_ERROR_MAX_TEXT_LENGTH`
 /// (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:225`).
 ///
 /// The reference refuses a longer one with `"Invalidation reason_text must be
-/// 1023 bytes or less"` (`aeron_driver_conductor.c:6360-6364`), and it refuses
-/// on the **declared** length before it looks at the bytes. This bound is
-/// checked the same way and is deliberately not a limit on the payload: a
-/// record that declares more text than it carries is refused for the other
-/// reason.
+/// 1023 bytes or less"` (`aeron_driver_conductor.c:6357-6364`), on the
+/// **declared** length and before it looks at the bytes. It is the *handler*'s
+/// check and not the dispatch's, which is why the two refusals below are kept
+/// apart: this one comes back to the client as an `ON_ERROR`, and the shape
+/// ones never reach a handler at all.
 pub const MAX_REASON_TEXT_LENGTH: usize = 1023;
+
+/// Why a `REJECT_IMAGE` was refused.
+///
+/// The distinction is the reference's, and it is not cosmetic: a record too
+/// short or too truncated for the struct is the dispatch's
+/// `goto malformed_command` (`aeron_driver_conductor.c:3177-3185`), which
+/// records the command and answers the client **nothing**, while an over-long
+/// reason is refused inside the handler (`:6357-6364`), whose `-1` the dispatch
+/// turns into an `ON_ERROR` on that command's correlation id
+/// (`:3224-3227`). A decoder that folded them together would have to make one
+/// of those two answers wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectImageError {
+    /// Shorter than [`REJECT_IMAGE_MINIMUM_LENGTH`], or shorter than the reason
+    /// it declares. Both of the dispatch's shape checks, and both a
+    /// `malformed_command`.
+    Malformed,
+    /// The declared reason is longer than [`MAX_REASON_TEXT_LENGTH`].
+    ///
+    /// It carries who asked, because this refusal has a reader: the reference's
+    /// `-1` from the handler becomes an `ON_ERROR` **on the command's
+    /// correlation id**, and a record that got this far is one whose shape
+    /// checks passed, so the id is in it. The other refusal has no such reader
+    /// — a malformed command is recorded and answered with silence.
+    ReasonTooLong {
+        /// Who sent the command that was refused.
+        correlated: Correlated,
+    },
+}
 
 /// `REJECT_IMAGE` as it arrives.
 ///
@@ -1085,29 +1293,55 @@ pub struct RejectImage<'t> {
 
 /// Decode `REJECT_IMAGE`.
 ///
-/// Refuses a reason that runs past the payload rather than clamping it, for the
-/// reason the other decoders do: the text is published to every reader of the
-/// stream, and a silently truncated one would say something the caller did not.
-pub fn decode_reject_image(payload: &[u8]) -> Option<RejectImage<'_>> {
-    let correlated = decode_correlated(payload)?;
-    let image_correlation_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
-    let position = le_i64(payload, CORRELATED_COMMAND_LENGTH + 8)?;
-
-    let length_offset = CORRELATED_COMMAND_LENGTH + 16;
-    let reason_length = usize::try_from(le_i32(payload, length_offset)?).ok()?;
-
-    if reason_length > MAX_REASON_TEXT_LENGTH {
-        return None;
+/// The three refusals are the reference's three, **in its order**, because the
+/// order is what decides which one a record gets when it is several kinds of
+/// wrong at once:
+///
+/// 1. `length < sizeof(aeron_reject_image_command_t)` (`:3177-3180`);
+/// 2. `length < offsetof(reason_text) + reason_length` (`:3182-3185`) — so a
+///    negative declared length lands here too, the reference's `size_t`
+///    arithmetic making the sum enormous;
+/// 3. and only then the handler's `AERON_ERROR_MAX_TEXT_LENGTH <
+///    reason_length` (`:6357-6364`).
+///
+/// A reason that declares more bytes than the record carries is refused rather
+/// than clamped, for the reason the other decoders do: the text is published to
+/// every reader of the stream, and a silently truncated one would say something
+/// the caller did not.
+pub fn decode_reject_image(payload: &[u8]) -> Result<RejectImage<'_>, RejectImageError> {
+    if payload.len() < REJECT_IMAGE_MINIMUM_LENGTH {
+        return Err(RejectImageError::Malformed);
     }
 
-    let start = length_offset + 4;
-    let reason = payload.get(start..start.checked_add(reason_length)?)?;
+    let correlated = decode_correlated(payload).ok_or(RejectImageError::Malformed)?;
+    let image_correlation_id =
+        le_i64(payload, CORRELATED_COMMAND_LENGTH).ok_or(RejectImageError::Malformed)?;
+    let position =
+        le_i64(payload, CORRELATED_COMMAND_LENGTH + 8).ok_or(RejectImageError::Malformed)?;
 
-    Some(RejectImage {
+    let length_offset = CORRELATED_COMMAND_LENGTH + 16;
+    let declared = le_i32(payload, length_offset).ok_or(RejectImageError::Malformed)?;
+
+    let reason_length = usize::try_from(declared).map_err(|_| RejectImageError::Malformed)?;
+
+    let start = length_offset + 4;
+    let end = REJECT_IMAGE_HEADER_LENGTH
+        .checked_add(reason_length)
+        .ok_or(RejectImageError::Malformed)?;
+
+    if payload.len() < end {
+        return Err(RejectImageError::Malformed);
+    }
+
+    if reason_length > MAX_REASON_TEXT_LENGTH {
+        return Err(RejectImageError::ReasonTooLong { correlated });
+    }
+
+    Ok(RejectImage {
         correlated,
         image_correlation_id,
         position,
-        reason,
+        reason: &payload[start..end],
     })
 }
 
@@ -2377,10 +2611,30 @@ mod response_tests {
     }
 
     #[test]
-    fn a_reject_image_with_no_reason_is_fine() {
-        // The reason is optional in practice: the reference's own bound is an
-        // upper one, and a length of zero is a legal command.
-        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+    fn a_reject_image_minimum_is_the_struct_and_not_the_offset() {
+        // 40 and 36, asserted together because the two numbers are one edit
+        // away from each other and only the first is what the dispatch
+        // compares a record against
+        // (`aeron_driver_conductor.c:3177-3180`).
+        assert_eq!(40, REJECT_IMAGE_MINIMUM_LENGTH);
+        assert_eq!(36, REJECT_IMAGE_HEADER_LENGTH);
+    }
+
+    #[test]
+    fn a_reason_of_no_length_is_legal_but_a_record_of_that_size_is_not() {
+        // Both halves matter. A declared length of zero is a legal reason, and
+        // the record still has to be `sizeof` long: the reference refuses 36
+        // bytes, which is exactly what its own Java client sends for an empty
+        // reason (`RejectImageFlyweight.computeLength`).
+        let mut header_only = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+        header_only[16..24].copy_from_slice(&11i64.to_le_bytes());
+
+        assert_eq!(
+            Err(RejectImageError::Malformed),
+            decode_reject_image(&header_only)
+        );
+
+        let mut payload = vec![0u8; REJECT_IMAGE_MINIMUM_LENGTH];
         payload[16..24].copy_from_slice(&11i64.to_le_bytes());
 
         let command = decode_reject_image(&payload).expect("should decode");
@@ -2391,14 +2645,23 @@ mod response_tests {
 
     #[test]
     fn refuses_a_reason_longer_than_the_reference_allows() {
-        // `AERON_ERROR_MAX_TEXT_LENGTH + 1`. The reference refuses this on the
-        // declared length before it reads a byte of the text
-        // (`aeron_driver_conductor.c:6360-6364`), so the payload here is header
-        // only and the refusal must not be for want of bytes.
-        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+        // `AERON_ERROR_MAX_TEXT_LENGTH + 1`, with all 1024 bytes present: the
+        // dispatch's shape checks pass, so this reaches the handler's bound
+        // (`aeron_driver_conductor.c:6357-6364`) and is refused for *that*
+        // reason and not for want of bytes.
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH + 1024];
+        payload[8..16].copy_from_slice(&9i64.to_le_bytes());
         payload[32..36].copy_from_slice(&1024i32.to_le_bytes());
 
-        assert!(decode_reject_image(&payload).is_none());
+        assert_eq!(
+            Err(RejectImageError::ReasonTooLong {
+                correlated: Correlated {
+                    client_id: 0,
+                    correlation_id: 9,
+                },
+            }),
+            decode_reject_image(&payload)
+        );
     }
 
     #[test]
@@ -2409,16 +2672,138 @@ mod response_tests {
         let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH + 4];
         payload[32..36].copy_from_slice(&10i32.to_le_bytes());
 
-        assert!(decode_reject_image(&payload).is_none());
+        assert_eq!(
+            Err(RejectImageError::Malformed),
+            decode_reject_image(&payload)
+        );
+    }
+
+    #[test]
+    fn a_shape_refusal_wins_over_an_over_long_reason() {
+        // The order, pinned. A record that declares 1024 bytes and carries none
+        // of them is *both* too truncated and over the bound, and the reference
+        // answers the first: its truncation check is in the dispatch, above the
+        // call, and the handler's bound is only ever reached by a record that
+        // got past it (`aeron_driver_conductor.c:3177-3185` before `:6357`).
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+        payload[32..36].copy_from_slice(&1024i32.to_le_bytes());
+
+        assert_eq!(
+            Err(RejectImageError::Malformed),
+            decode_reject_image(&payload)
+        );
+    }
+
+    #[test]
+    fn refuses_a_negative_reason_length() {
+        // The reference's second shape check is `length < offsetof(reason_text)
+        // + command->reason_length`, where `offsetof` is a `size_t`: a negative
+        // length added to it is enormous, so the comparison is true and the
+        // record is malformed rather than read backwards.
+        let mut payload = vec![0u8; REJECT_IMAGE_MINIMUM_LENGTH];
+        payload[32..36].copy_from_slice(&(-1i32).to_le_bytes());
+
+        assert_eq!(
+            Err(RejectImageError::Malformed),
+            decode_reject_image(&payload)
+        );
     }
 
     #[test]
     fn refuses_a_truncated_reject_image() {
-        for length in [0, 8, REJECT_IMAGE_HEADER_LENGTH - 1] {
-            assert!(
-                decode_reject_image(&vec![0u8; length]).is_none(),
+        for length in [
+            0,
+            8,
+            REJECT_IMAGE_HEADER_LENGTH - 1,
+            REJECT_IMAGE_MINIMUM_LENGTH - 1,
+        ] {
+            assert_eq!(
+                Err(RejectImageError::Malformed),
+                decode_reject_image(&vec![0u8; length]),
                 "a {length}-byte payload is not a REJECT_IMAGE"
             );
         }
+    }
+
+    #[test]
+    fn a_publication_error_header_is_sixty_eight_bytes() {
+        // `offsetof(aeron_publication_error_values_t, error_message)`, and the
+        // offsets of the two fields a reader of the record has to find: the
+        // message length sits where a reader would look for the error code if
+        // the address block were a byte short.
+        assert_eq!(68, PUBLICATION_ERROR_HEADER_LENGTH);
+        assert_eq!(0x0F0C, ON_PUBLICATION_ERROR_TYPE_ID);
+        assert_eq!(60, 68 - 4 - 4);
+    }
+
+    #[test]
+    fn encodes_a_publication_error_with_an_ipv4_source() {
+        let error = PublicationError {
+            registration_id: 11,
+            destination_registration_id: -1,
+            session_id: 1001,
+            stream_id: 1002,
+            receiver_id: 13,
+            group_tag: -1,
+            source: Some("127.0.0.1:40456".parse().expect("an address")),
+            error_code: ERROR_CODE_IMAGE_REJECTED,
+            message: b"Needs to be closed",
+        };
+
+        let encoded = encode_publication_error(&error);
+
+        assert_eq!(68 + 18, encoded.len());
+        assert_eq!(11, i64::from_le_bytes(encoded[0..8].try_into().unwrap()));
+        assert_eq!(-1, i64::from_le_bytes(encoded[8..16].try_into().unwrap()));
+        assert_eq!(
+            1001,
+            i32::from_le_bytes(encoded[16..20].try_into().unwrap())
+        );
+        assert_eq!(
+            1002,
+            i32::from_le_bytes(encoded[20..24].try_into().unwrap())
+        );
+        assert_eq!(13, i64::from_le_bytes(encoded[24..32].try_into().unwrap()));
+        assert_eq!(-1, i64::from_le_bytes(encoded[32..40].try_into().unwrap()));
+        assert_eq!(
+            ADDRESS_TYPE_IPV4,
+            i16::from_le_bytes(encoded[40..42].try_into().unwrap())
+        );
+        assert_eq!(
+            40456,
+            u16::from_le_bytes(encoded[42..44].try_into().unwrap())
+        );
+        // Four bytes of address and twelve of nothing: the client is given a
+        // sixteen-byte field whatever the family is
+        // (`aeron_driver_conductor.c:2301-2304`).
+        assert_eq!([127, 0, 0, 1], encoded[44..48]);
+        assert_eq!([0u8; 12], encoded[48..60]);
+        assert_eq!(13, i32::from_le_bytes(encoded[60..64].try_into().unwrap()));
+        assert_eq!(18, i32::from_le_bytes(encoded[64..68].try_into().unwrap()));
+        assert_eq!(b"Needs to be closed", &encoded[68..]);
+    }
+
+    #[test]
+    fn encodes_a_publication_error_with_no_source() {
+        // The reference's third branch: no family, so no type, no port and a
+        // blank address (`aeron_driver_conductor.c:2312-2315`).
+        let error = PublicationError {
+            registration_id: 11,
+            destination_registration_id: -1,
+            session_id: 1001,
+            stream_id: 1002,
+            receiver_id: -1,
+            group_tag: -1,
+            source: None,
+            error_code: ERROR_CODE_IMAGE_REJECTED,
+            message: b"because",
+        };
+
+        let encoded = encode_publication_error(&error);
+
+        assert_eq!(0, i16::from_le_bytes(encoded[40..42].try_into().unwrap()));
+        assert_eq!(0, u16::from_le_bytes(encoded[42..44].try_into().unwrap()));
+        assert_eq!([0u8; 16], encoded[44..60]);
+        assert_eq!(b"because", &encoded[68..]);
     }
 }
