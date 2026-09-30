@@ -1834,9 +1834,10 @@ fn reference_message_number(payload: &[u8]) -> Option<i64> {
 /// One unicast endpoint holds one binder, so "a subscriber that joins late" is
 /// reached the only way this channel shape allows: the driver holding the
 /// endpoint goes away, and a driver that has never seen this stream takes it.
-/// That is also the pair of shapes P1-5 exists for — an MDC receiver arriving
-/// after the stream started, and `ReplayMerge` crossing from replay to live —
-/// so the case met here is the same case, met earlier.
+/// That is also the shape a multi-destination receiver has to meet on a manual
+/// channel — arriving after the stream started — and the shape `ReplayMerge`
+/// meets when it crosses from replay to live, so the case met here is the same
+/// case, met earlier.
 #[test]
 fn a_late_subscriber_meets_a_reference_publisher_where_the_stream_is() {
     /// Enough messages to carry the stream past several of the smallest terms,

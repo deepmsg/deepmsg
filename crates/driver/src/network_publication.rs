@@ -478,7 +478,8 @@ impl NetworkPublication {
             // `:616-638`: an idle pass is the flow control's chance to move the
             // limit — the `max` strategy does nothing with it, and the
             // strategies that do (a multicast sender waiting for receivers)
-            // arrive in P1-5.
+            // belong to multicast, refused here and recorded in
+            // `docs/compat.md`.
             let snd_lmt = counters.value(regions, self.counters.snd_lmt).unwrap_or(0);
             let new_limit =
                 self.flow_control
@@ -1241,9 +1242,10 @@ impl NetworkPublication {
         }
 
         // `spies_simulate_connection` is the `ssc` parameter; this build has no
-        // spies yet, so a local reader never counts as a connection here. The
-        // parameter is read from the metadata the publication was created with
-        // once spies arrive in P1-5.
+        // spy link, so a local reader never counts as a connection here. The
+        // parameter is read, reaches a publication's metadata, and nothing acts
+        // on it — `docs/compat.md` lists it among the settings read and not
+        // acted on.
         let _ = (counters, regions);
 
         false

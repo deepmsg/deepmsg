@@ -1937,9 +1937,9 @@ impl Conductor {
         // its handler without taking the result (`:3188-3200`), so the error for
         // a publication it cannot find (`:5562-5578`) never reaches the
         // `result < 0` that would send an `ON_ERROR` (`:3222-3225`). The client
-        // waits and times out. Q8 of the P1-5 plan decided to reproduce that
-        // rather than improve on it, so a lookup that finds nothing here answers
-        // nothing either — and `docs/compat.md` gets a line for it.
+        // waits and times out. The silence is reproduced rather than improved
+        // on, so a lookup that finds nothing here answers nothing either, and
+        // `docs/compat.md` carries the line for it.
         for (type_id, payload) in pending_destination_commands {
             let command = Command::from_type_id(type_id);
 
@@ -1948,15 +1948,10 @@ impl Conductor {
             // kind of destination, `aeron-spy:` another, and everything else is
             // a network one.
             //
-            // The two this build does not serve are refused **by name**, which
-            // is what §2.1 of the P1-5 plan asks for — a client told nothing
-            // waits out its timeout, and these are not commands this driver is
-            // going to get to later. The **network** branch is refused here too
-            // for now, and that is temporary: what it does is add a destination
-            // to a receive endpoint, which is the next commit. Until that
-            // exists there is nothing for it to do but say so, and saying so is
-            // better than a client waiting. `docs/compat.md` needs a line for
-            // it, and the next commit removes the need.
+            // The two this build does not serve are refused **by name** — a
+            // client told nothing waits out its timeout, and these are not
+            // commands this driver is going to get to later. Both refusals are
+            // recorded in `docs/compat.md`.
             if Command::AddReceiveDestination == command
                 || Command::RemoveReceiveDestination == command
             {
@@ -2123,9 +2118,9 @@ impl Conductor {
             // A destination whose name does not resolve is **kept** and the
             // command still succeeds: the reference sets the address to
             // `AF_UNSPEC` and falls through on purpose (`:5337-5343`), which is
-            // `None` here. Q9 of the P1-5 plan decided to reproduce it, with the
-            // consequence recorded in `compat.md:281` — this build has no
-            // re-resolution, so that destination never recovers.
+            // `None` here. The consequence is in `docs/compat.md`'s
+            // name-resolution row: this build has no re-resolution, so that
+            // destination never recovers.
             let address = match validate_send_destination_uri(request.channel) {
                 Ok(address) => Some(address),
                 Err(UdpChannelError::Resolution(_)) => None,
@@ -3103,9 +3098,9 @@ mod tests {
     /// failures the reference answers **nothing** to: it calls its handler
     /// without taking the result (`:3188-3200`), so the error for a publication
     /// it cannot find never reaches the `result < 0` that would send an
-    /// `ON_ERROR` (`:3222-3225`). Q8 of the P1-5 plan decided to reproduce that
-    /// rather than improve on it, so a client that names a publication the
-    /// driver does not have waits, and times out.
+    /// `ON_ERROR` (`:3222-3225`). This build reproduces that rather than
+    /// improving on it — `docs/compat.md` carries the line — so a client that
+    /// names a publication the driver does not have waits, and times out.
     #[test]
     fn a_remove_destination_by_id_that_finds_nothing_answers_nothing() {
         use deepmsg_cnc::command::{DestinationByIdCommand, REMOVE_DESTINATION_BY_ID_TYPE_ID};

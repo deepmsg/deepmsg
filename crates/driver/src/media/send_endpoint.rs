@@ -17,10 +17,12 @@
 //!
 //! # Which socket a publication sends through
 //!
-//! Unicast, no destinations tracker: `current_data_addr`, which starts as the
-//! channel's `remote_data` and is where a connected transport already points
-//! (`aeron_send_channel_send`, `:383-414`). Multi-destination channels — the
-//! `destination_tracker` branch — are P1-5.
+//! A channel with one destination sends to `current_data_addr`, which starts as
+//! the channel's `remote_data` and is where a connected transport already points
+//! (`aeron_send_channel_send`, `:383-414`). A multi-destination channel sends to
+//! each entry of its [`DestinationTracker`] instead, and a response publication
+//! sends only where it was asked to; [`SendChannelEndpoint::send_to`] is the one
+//! place those answers are turned into a syscall.
 
 use std::io;
 use std::net::SocketAddr;
@@ -96,8 +98,9 @@ pub struct SendChannelEndpoint {
     /// zero, and then the port the kernel chose is readable from nowhere else.
     /// A client that has to tell someone where to reply finds it here.
     local_sockaddr_counter_id: i32,
-    /// Where data is sent. The channel's remote address until a re-resolution
-    /// moves it (P1-5).
+    /// Where data is sent. The channel's remote address; nothing here
+    /// re-resolves it, and `docs/compat.md`'s name-resolution row is where that
+    /// absence is recorded.
     current_data_addr: SocketAddr,
     /// Where this endpoint sends, when its channel has several destinations
     /// (`destination_tracker`, `aeron_send_channel_endpoint.h:62`).

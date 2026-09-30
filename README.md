@@ -36,9 +36,20 @@ The acceptance is two-sided and runs against the reference: our driver's
 publication reaching the reference's own `BasicSubscriber`, and the reference's
 own `BasicPublisher` reaching our client through our driver
 (`tests/interop/udp_transport.rs`). Loss detection, retransmission and the
-`max` flow control are in; multicast, response channels and the name-resolver
-agent are P1-5, and `docs/compat.md` lists every divergence with the test that
-pins it.
+`max` flow control are in.
+
+P1-5: the driver fans out, and it answers. A publication on a
+multi-destination channel sends to every destination it holds — the ones a
+client added on a `control-mode=manual` channel, and on a `dynamic` one also
+the ones a status message reveals — and a subscription with receive
+destinations reads each of them on its own socket. Response channels are served
+end to end: the `control-mode=response` subscription, the `SEND_RESPONSE` bit in
+the SETUP of a publication that carries `response-correlation-id=`, the
+RSP_SETUP an image sends back, and a response publication that sends only where
+it was asked to. Acceptance is against the reference on both sides
+(`tests/interop/multi_destination.rs`, `tests/interop/response_channel_reference.rs`).
+Multicast, ATS and the name-resolver agent are still refused, and
+`docs/compat.md` lists every divergence with the test that pins it.
 
 Premium features (Cluster Standby and friends) are explicitly out of scope for
 now; the seams they need (cluster schemas, reserved counter ids, the

@@ -212,9 +212,9 @@ pub const THREADING_MODE: &str = "DEDICATED";
 /// Every counter the reference appends a threading mode to is here, because
 /// this driver now runs the agents those counters measure. The name-resolver
 /// pair (32 and 33) is the exception: resolution is synchronous in this build
-/// (P1-5 adds the agent), so there is no resolver to name a threshold for — a
-/// label describing a thread that does not exist would be worse than its
-/// absence, and `docs/compat.md` carries the divergence.
+/// and there is no resolver to name a threshold for — a label describing a
+/// thread that does not exist would be worse than its absence, and
+/// `docs/compat.md` carries the divergence.
 const RUNTIME_SUFFIXES: [(i32, &str); 7] = [
     (25, ": driverName="),
     (id::CONDUCTOR_MAX_CYCLE_TIME, ": DEDICATED"),
@@ -619,8 +619,8 @@ mod tests {
         );
 
         // The one pair this build leaves alone, because it has no resolver
-        // agent to name: resolution is synchronous here (P1-5 adds the agent),
-        // and a threshold label describes a thread that does not exist.
+        // agent to name: resolution is synchronous here, and a threshold label
+        // describes a thread that does not exist.
         assert_eq!("NameResolver exceeded threshold count", label(&regions, 33));
         assert_eq!("NameResolver max time in ns", label(&regions, 32));
     }

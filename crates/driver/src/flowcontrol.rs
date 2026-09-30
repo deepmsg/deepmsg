@@ -8,15 +8,19 @@
 //! [the rule the stub recorded][`Strategy::on_sm`] holds here too: this is the
 //! only place `snd-lmt` moves.
 //!
-//! # What P1-4 carries
+//! # What this build carries
 //!
 //! `max`, which is the unicast default: a status message says how far its
 //! receiver has read and how much room it has, and the sender limit becomes the
 //! far edge of that window — never less than it already was
-//! (`aeron_flow_control.c:108-127`). The `min` strategy's admission gate,
-//! `tagged`'s per-tag limits and the multicast variants arrive with multicast
-//! in P1-5, as does the sender-side retransmit window the same options parse
-//! (`rrwm:`), which is read but not yet used.
+//! (`aeron_flow_control.c:108-127`). A multi-destination channel is given the
+//! same `max` under that channel's own retransmit multiple; `rrwm:` is the one
+//! option `fc=` parses, and [`strategy_for_channel`] is where the choice
+//! between the two suppliers is made. The `min` strategy's admission gate,
+//! `tagged`'s per-tag limits and the multicast variants are **not** served:
+//! multicast is refused outright (`docs/compat.md`), and a `fc=` naming `min`
+//! or `tagged` comes back as a strategy this build does not have rather than as
+//! a malformed channel.
 //!
 //! # Names, and where they are read
 //!

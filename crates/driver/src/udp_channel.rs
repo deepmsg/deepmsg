@@ -1176,9 +1176,9 @@ mod tests {
     /// one that has had a destination added
     /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
     ///
-    /// This is the fact the rest of P1-5 hangs off: it decides whether a send
-    /// endpoint keeps a destination tracker, whether the channel has group
-    /// semantics, and which flow-control supplier it is given.
+    /// Three things hang off it: whether a send endpoint keeps a destination
+    /// tracker, whether the channel has group semantics, and which flow-control
+    /// supplier it is given.
     #[test]
     fn the_control_mode_is_what_makes_a_channel_multi_destination() {
         assert!(

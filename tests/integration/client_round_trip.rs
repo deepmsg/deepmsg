@@ -362,10 +362,10 @@ fn every_destination_operation_completes_on_the_same_reply() {
 /// result, so the `-1` it returns for a publication it cannot find (`:5562-5578`)
 /// never reaches the `result < 0` at `:3222-3225` that would send an `ON_ERROR`.
 /// Every other destination command assigns it (`:3020`, `:3035`, `:3055-3062`,
-/// `:3083-3090`). Q8 of the P1-5 plan decided to reproduce this rather than
-/// improve on it, so a caller that names an unknown publication waits — and this
-/// pins that the wait ends on the caller's own deadline, against the id it used,
-/// rather than hanging or blaming a connection.
+/// `:3083-3090`). This build reproduces that rather than improving on it —
+/// `docs/compat.md` carries the line — so a caller that names an unknown
+/// publication waits. This pins that the wait ends on the caller's own deadline,
+/// against the id it used, rather than hanging or blaming a connection.
 #[test]
 fn removing_a_destination_by_id_waits_for_an_answer_that_never_comes() {
     let cnc = live_cnc();

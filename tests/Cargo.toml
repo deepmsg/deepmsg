@@ -141,21 +141,21 @@ name = "destination_probe"
 path = "interop/destination_probe.rs"
 required-features = ["interop"]
 
-# P1-5's A4: a reference `BasicPublisher`, its messages read by our client
+# A4 (receiving): a reference `BasicPublisher`, its messages read by our client
 # through a subscription whose only address is a receive destination.
 [[test]]
 name = "multi_destination"
 path = "interop/multi_destination.rs"
 required-features = ["interop"]
 
-# P1-5's ⑨: a response subscription is served, and is not a reader — the same
-# SETUP forms an image at an ordinary subscription and none at a response one.
+# A7: a response subscription is served, and is not a reader — the same SETUP
+# forms an image at an ordinary subscription and none at a response one.
 [[test]]
 name = "response_channel"
 path = "interop/response_channel.rs"
 required-features = ["interop"]
 
-# P1-5's A8: the reference's own `response_client` and `response_server`, run
+# A8: the reference's own `response_client` and `response_server`, run
 # against a driver this build wrote. The only arrangement in which the nine-step
 # handshake is decided by two programs that share no code with it.
 [[test]]
