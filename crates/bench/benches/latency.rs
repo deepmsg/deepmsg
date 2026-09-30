@@ -332,12 +332,12 @@ fn reference(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result<Row,
         pong_stream_id.as_str(),
     ];
 
-    let mut echo = Sample::start(&pong, "bench-pong", dir, &channels);
+    let mut echo = Sample::start_silent(&pong, "bench-pong", dir, &channels);
 
     let length = pairing.length.to_string();
     let messages = args.messages.to_string();
     let warmup = pairing.warmup.to_string();
-    let mut measure = Sample::start(
+    let mut measure = Sample::start_silent(
         &ping,
         "bench-ping",
         dir,
