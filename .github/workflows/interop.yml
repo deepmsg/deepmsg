@@ -1,0 +1,172 @@
+name: interop
+
+# The reference's own system tests, run against **this build's media driver**.
+#
+# The reference selects an external driver with one system property and hands it
+# a configuration as environment variables (`CTestMediaDriver.java:218-260`,
+# `:332`), so the only thing replaced is the binary. Nothing on the Java side is
+# a stand-in: `TestMediaDriver`, `SystemTestWatcher` and the 72 test classes are
+# the reference's own, which is what makes the result mean something.
+#
+# Three things this job is not:
+#
+#   1. **It does not replace `check`.** The Rust gates, the interop targets'
+#      compile-and-lint, and the workspace tests all stay where they are — they
+#      need no reference checkout and are minutes faster than this.
+#   2. **A green run here is a weaker signal than it looks.** 58 of the 82 OSS
+#      test classes ask for `ThreadingMode.SHARED`, which this driver does not
+#      have; the harness sends `AERON_THREADING_MODE` and the driver ignores it,
+#      so everything below runs under `DEDICATED`. A test that passes because it
+#      never actually shared a thread is not evidence about `SHARED`. See G4-1.
+#   3. **It does not run the whole system-test task.** `archive`, `cluster` and
+#      `security` are out of scope (the archive is C-less by design), and so are
+#      the four classes the reference itself partitions out by tag — `slow`,
+#      `logging`, `topology` and `bindings` have their own Gradle tasks.
+#
+# It runs on pull requests and is expected to be **red until the repair plan's
+# slices land**: a red here is a list of known gaps, not a broken build. The job
+# summary says which gap each failure belongs to.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The exact reference commit the byte contracts were read from
+  # (`docs/reference.md`). Every cache key below is derived from it, so bumping
+  # it invalidates the reference build in one place.
+  AERON_COMMIT: 664f58e705
+
+jobs:
+  system-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the reference at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: aeron-io/aeron
+          ref: ${{ env.AERON_COMMIT }}
+          path: ../aeron
+
+      - name: Install the pinned Rust toolchain
+        # `cargo` resolves to the channel in `rust-toolchain.toml`, so this is
+        # the same one `check` uses.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --no-self-update
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache the reference build
+        id: reference-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ../aeron/*/build
+          # Keyed on the reference commit, so a bump rebuilds it. The second
+          # component is a manual salt: change it to force a rebuild when the
+          # caches are suspected rather than the code.
+          key: aeron-${{ env.AERON_COMMIT }}-v1
+
+      # Printed rather than assumed. Without this a cache that silently stopped
+      # matching degrades into "every pull request rebuilds the reference" and
+      # nobody notices — the job just gets slower.
+      - name: Report whether the cache matched
+        run: |
+          echo "reference cache: ${{ steps.reference-cache.outputs.cache-hit == 'true' && 'HIT' || 'MISS' }}"
+          echo "### Reference build cache: ${{ steps.reference-cache.outputs.cache-hit == 'true' && 'hit' || 'miss' }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build this driver
+        run: cargo build -p deepmsg-driver
+
+      # One Gradle invocation per test class, and the reason is a finding rather
+      # than a preference: at least one OSS test waits for behaviour this driver
+      # does not have in a loop with no timeout at all —
+      #
+      #     while (null == (counter = client.getCounter(correlationId))) Thread.yield();
+      #     (CounterTest.java:640, waiting for a static counter)
+      #
+      # — and `Thread.yield()` swallows the interrupt, so the reference's own
+      # `InterruptingTestCallback` cannot break it either. In a single run one
+      # such class spins the worker forever, the results task never executes,
+      # and **not one XML file is written**: the whole run is lost, not just the
+      # class. Per class, the damage is bounded and the outcome is recorded.
+      #
+      # 120s per class. Ordinary classes finish in under twenty seconds; the
+      # slowest observed was 65.
+      - name: Run the OSS system tests
+        working-directory: ../aeron
+        run: |
+          set -u
+          cat > /tmp/classes.py <<'PY'
+          # The OSS set: the reference's own `io/aeron/` and `io/aeron/driver/`,
+          # minus what the default `test` task would never run anyway.
+          import pathlib, re
+
+          TAGS = ("SlowTest", "LoggingTest", "TopologyTest", "BindingsTest")
+          root = pathlib.Path("aeron-system-tests/src/test/java")
+
+          for path in sorted(list(root.glob("io/aeron/*.java")) + list(root.glob("io/aeron/driver/*.java"))):
+              text = path.read_text()
+              if not re.search(r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory)", text):
+                  continue  # a helper or an abstract base
+              if "DriverLoggingSystemTest" in path.name:
+                  continue  # excluded by build.gradle:1145, run by its own task
+              head = text[: text.index("class ") + 80]
+              if any(re.search(r"@" + t + r"\b", head) for t in TAGS):
+                  continue  # a class-level tag: excludeTags 'any()' drops it
+              methods = re.findall(r"((?:@\w+(?:\([^)]*\))?\s*)+)\s+void\s+\w+", text)
+              tested = [m for m in methods if "@Test" in m]
+              if tested and all(any("@" + t in m for t in TAGS) for m in tested):
+                  continue  # every test tagged: same exclusion
+              print(str(path.relative_to(root))[:-5].replace("/", "."))
+          PY
+          python3 /tmp/classes.py > /tmp/classes.txt
+          echo "running $(wc -l < /tmp/classes.txt) classes"
+
+          mkdir -p /tmp/results /tmp/logs
+          : > /tmp/status.tsv
+          while read -r cls; do
+            rm -rf aeron-system-tests/build/test-results/test
+            timeout 120 ./gradlew --quiet :aeron-system-tests:test \
+              --tests "$cls" \
+              -Daeron.test.system.aeronmd.path="$GITHUB_WORKSPACE/target/debug/deepmsg-driver" \
+              > "/tmp/logs/$cls.log" 2>&1
+            rc=$?
+            cp -n aeron-system-tests/build/test-results/test/TEST-*.xml /tmp/results/ 2>/dev/null || true
+            case $rc in
+              0)   echo -e "$cls\tok" ;;
+              124) echo -e "$cls\tTIMEOUT after 120s" ;;
+              *)   echo -e "$cls\tfailed" ;;
+            esac | tee -a /tmp/status.tsv
+            # A hung class leaves its driver behind; kill only the ones this
+            # script started, identified by the directory they were given.
+            for pid in $(pgrep -x deepmsg-driver || true); do
+              tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                | grep -q "^AERON_DIR=/dev/shm/aeron-" && kill -9 "$pid" || true
+            done
+          done < /tmp/classes.txt
+
+      - name: Summarise
+        if: always()
+        run: python3 .github/scripts/interop-summary.py /tmp/results /tmp/status.tsv >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-test-results
+          path: |
+            /tmp/results
+            /tmp/status.tsv
+            /tmp/logs
+          if-no-files-found: warn
