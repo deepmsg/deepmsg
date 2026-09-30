@@ -35,6 +35,7 @@
 //! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
 //! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
 
+use deepmsg_cnc::command::PublicationError;
 use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
@@ -97,6 +98,17 @@ pub trait ClientEvents {
         stream_id: i32,
         channel: &[u8],
     );
+
+    /// `ON_PUBLICATION_ERROR`: a publication the client holds has failed — its
+    /// image was rejected, or it was revoked.
+    ///
+    /// Not an answer to a command, so it carries no correlation id: it names
+    /// the publication the client already knows by registration id
+    /// (`aeron_driver_conductor.c:2263-2323`). Two paths produce it and they
+    /// meet in one handler — the IPC publication a client asked to reject
+    /// (`aeron_ipc_publication.c:249`) and the network publication whose
+    /// receiver refused it (`aeron_network_publication.c:873`).
+    fn publication_error(&mut self, error: &PublicationError<'_>);
 
     /// `ON_PUBLICATION_READY` or `ON_EXCLUSIVE_PUBLICATION_READY`: the log
     /// buffer exists and the client may map it.
@@ -520,6 +532,15 @@ mod tests {
 
         fn error(&mut self, correlation_id: i64, error_code: i32, _message: &[u8]) {
             self.0.push(format!("error:{correlation_id}:{error_code}"));
+        }
+
+        fn publication_error(&mut self, error: &PublicationError<'_>) {
+            self.0.push(format!(
+                "publication-error:{}:{}:{}",
+                error.registration_id,
+                error.error_code,
+                String::from_utf8_lossy(error.message)
+            ));
         }
 
         fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
@@ -955,6 +976,7 @@ mod tests {
             fn counter_unavailable(&mut self, _registration_id: i64, _counter_id: i32) {}
             fn operation_succeeded(&mut self, _correlation_id: i64) {}
             fn error(&mut self, _correlation_id: i64, _error_code: i32, _message: &[u8]) {}
+            fn publication_error(&mut self, _error: &PublicationError<'_>) {}
             fn publication_ready(
                 &mut self,
                 _ready: &PublicationBuffersReady<'_>,

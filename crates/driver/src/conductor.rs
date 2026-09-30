@@ -54,13 +54,14 @@ use deepmsg_cnc::command::{
     ERROR_CODE_STORAGE_SPACE, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER,
     ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
     ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
-    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
-    ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady,
-    REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter, decode_add_publication,
-    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
-    decode_destination_command, decode_remove_counter, decode_remove_publication,
-    decode_remove_subscription, encode_client_timeout, encode_counter_update, encode_error,
-    encode_operation_succeeded, encode_subscription_ready, encode_unavailable_image,
+    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_PUBLICATION_ERROR_TYPE_ID,
+    ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID,
+    PublicationBuffersReady, PublicationError, REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError,
+    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
+    decode_destination_by_id_command, decode_destination_command, decode_reject_image,
+    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
+    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
+    encode_publication_error, encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -338,6 +339,42 @@ impl ClientEvents for Transmit<'_> {
         self.record_fault(error_code, String::from_utf8_lossy(message).into_owned());
     }
 
+    /// Answer with an `ON_PUBLICATION_ERROR` — and record it, because the
+    /// reference does not do the one without the other.
+    ///
+    /// The entry is written *before* the message and in a different shape from
+    /// an `ON_ERROR`'s: the reference builds one line of its own
+    /// (`aeron_driver_conductor.c:2269-2287`) and hands it to
+    /// `aeron_driver_conductor_log_explicit_error`, which records it verbatim
+    /// and raises the errors counter (`:1203-1211`). There is no `AERON_SET_ERR`
+    /// site in it, so unlike every other entry this one has no `[func,
+    /// file:line]` half — the line itself is the whole of what is recorded.
+    ///
+    /// Every field of the command goes into it, including the ones the response
+    /// does not carry (`destination_registration_id`) and the message with its
+    /// length, so the entry says what arrived rather than what was sent.
+    fn publication_error(&mut self, error: &PublicationError<'_>) {
+        self.record_fault(
+            error.error_code,
+            format!(
+                "onPublicationError: registrationId={}, destinationRegistrationId={}, \
+                 sessionId={}, streamId={}, receiverId={}, groupId={}, errorCode={}, \
+                 errorMessage={}",
+                error.registration_id,
+                error.destination_registration_id,
+                error.session_id,
+                error.stream_id,
+                error.receiver_id,
+                error.group_tag,
+                error.error_code,
+                String::from_utf8_lossy(error.message),
+            ),
+        );
+
+        let payload = encode_publication_error(error);
+        self.send(ON_PUBLICATION_ERROR_TYPE_ID, &payload);
+    }
+
     fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
         let payload = ready.encode();
         self.send(PublicationBuffersReady::type_id(is_exclusive), &payload);
@@ -482,6 +519,10 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
+    /// Publications a receiver refused, as the sender heard it: each owes its
+    /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
+    /// datagram they arrived in.
+    pending_publication_errors: Vec<deepmsg_cnc::command::OwnedPublicationError>,
 }
 
 impl Conductor {
@@ -692,6 +733,7 @@ impl Conductor {
             last_unhandled: None,
             pending_log_errors: Vec::new(),
             pending_untethered: Vec::new(),
+            pending_publication_errors: Vec::new(),
         };
 
         Ok(conductor)
@@ -768,8 +810,9 @@ impl Conductor {
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
         // The order matters and is left to right: the events are taken off the
-        // sender first, and what was taken is what the flush sends.
-        let mut work = self.poll_sender_events() + self.flush_untethered();
+        // sender first, and what was taken is what the flushes send.
+        let mut work =
+            self.poll_sender_events() + self.flush_untethered() + self.flush_publication_errors();
 
         if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
             return work;
@@ -1164,6 +1207,39 @@ impl Conductor {
         work
     }
 
+    /// Tell the publications a receiver refused, in the words that receiver
+    /// used (`aeron_driver_conductor_on_publication_error`,
+    /// `aeron_driver_conductor.c:2263-2323`).
+    ///
+    /// The handler is the same one the IPC path reaches through
+    /// `aeron_ipc_publication_reject` (`aeron_ipc_publication.c:249`) — one
+    /// function, two ways in, which is why the response is built here from the
+    /// same [`PublicationError`] either way.
+    fn flush_publication_errors(&mut self) -> usize {
+        if self.pending_publication_errors.is_empty() {
+            return 0;
+        }
+
+        let pending = std::mem::take(&mut self.pending_publication_errors);
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        for error in &pending {
+            transmit.publication_error(&error.as_error());
+        }
+
+        pending.len()
+    }
+
     /// Tell every spy reading a publication that it is gone, and give their
     /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
     ///
@@ -1403,6 +1479,12 @@ impl Conductor {
                     description,
                 } => {
                     self.pending_log_errors.push((error_code, description));
+                }
+                crate::sender::SenderEvent::PublicationError { error } => {
+                    // A response rather than a fault: the publication's client
+                    // is owed an `ON_PUBLICATION_ERROR`, which only the pass
+                    // that holds the ring can write.
+                    self.pending_publication_errors.push(error);
                 }
                 crate::sender::SenderEvent::ResponseSetup {
                     response_correlation_id,
@@ -2048,6 +2130,81 @@ impl Conductor {
                     }
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
+                // A client refusing an image it was reading.
+                //
+                // Two targets, and the second is the one to miss: when no
+                // **image** answers that registration id the driver looks among
+                // its **IPC publications**, because for `aeron:ipc` what a
+                // subscriber was handed *is* the publication
+                // (`aeron_driver_conductor.c:6367-6398`). Both branches are
+                // answered the same way afterwards — the rejections counter,
+                // then `ON_OPERATION_SUCCEEDED` — and only a client that named
+                // neither hears an error.
+                Command::RejectImage => match decode_reject_image(payload) {
+                    Err(RejectImageError::Malformed) => {
+                        malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    }
+                    Err(RejectImageError::ReasonTooLong { correlated }) => {
+                        // The handler's refusal, which the dispatch turns into
+                        // an `ON_ERROR` on the command's own correlation id
+                        // (`aeron_driver_conductor.c:6357-6364`, then its
+                        // `result < 0` at `:3224-3227`).
+                        transmit.error(
+                            correlated.correlation_id,
+                            ERROR_CODE_GENERIC_ERROR,
+                            b"Invalidation reason_text must be 1023 bytes or less",
+                        );
+                    }
+                    Ok(request) => {
+                        let image_correlation_id = request.image_correlation_id;
+
+                        let rejected = if images.find(image_correlation_id).is_some() {
+                            // The image belongs to the receiver, so this is a
+                            // command to that thread rather than a change here:
+                            // all the conductor knows is *that* the image
+                            // exists, and the receiver is what has the
+                            // connections to send an `ERR` frame down
+                            // (`aeron_driver_receiver_proxy_on_invalidate_image`,
+                            // `aeron_driver_receiver_proxy.c:252-274`).
+                            let _ =
+                                receiver
+                                    .proxy()
+                                    .invalidate_image(image_correlation_id, request.reason.to_vec());
+
+                            true
+                        } else {
+                            publications.reject(
+                                image_correlation_id,
+                                request.reason,
+                                counters,
+                                &counter_regions,
+                                subscriptions,
+                                &mut transmit,
+                                now_ns,
+                                now_ms,
+                            )
+                        };
+
+                        if rejected {
+                            let _ = system_counters::increment(
+                                counters,
+                                &counter_regions,
+                                system_counters::id::IMAGES_REJECTED,
+                            );
+
+                            transmit.operation_succeeded(request.correlated.correlation_id);
+                        } else {
+                            transmit.error(
+                                request.correlated.correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                format!(
+                                    "Unable to resolve image for correlationId={image_correlation_id}"
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
+                },
                 Command::AddDestination
                 | Command::RemoveDestination
                 | Command::RemoveDestinationById
@@ -2500,8 +2657,11 @@ impl Conductor {
             &counter_regions,
             &mut self.subscriptions,
             &mut transmit,
-            now_ns,
-            self.now_ms,
+            Now {
+                ms: self.now_ms,
+                ns: now_ns,
+                client_liveness_timeout_ns: self.liveness_timeout_ns,
+            },
         )
     }
 
@@ -3199,13 +3359,14 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x10` is REJECT_IMAGE: still
-        // unimplemented, which is what a test wants from a stand-in — a command
-        // whose handling cannot start happening. (`0x07` used to be the
-        // stand-in until ADD_DESTINATION was implemented, which is exactly the
+        // pass read without any byte arithmetic. `0x12` is
+        // GET_NEXT_AVAILABLE_SESSION_ID: still unimplemented, which is what a
+        // test wants from a stand-in — a command whose handling cannot start
+        // happening. (`0x07` was the stand-in until ADD_DESTINATION was
+        // implemented, and `0x10` until REJECT_IMAGE was, which is exactly the
         // way a stand-in like this stops being one.)
-        send(&conductor, 0x10, b"first");
-        send(&conductor, 0x10, b"second");
+        send(&conductor, 0x12, b"first");
+        send(&conductor, 0x12, b"second");
 
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
@@ -3374,12 +3535,15 @@ mod tests {
     fn an_unimplemented_command_is_counted_and_named() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x10, b"aeron:ipc|1"); // REJECT_IMAGE
+        send(&conductor, 0x12, &[0u8; 24]); // GET_NEXT_AVAILABLE_SESSION_ID
         conductor.do_work();
 
         assert_eq!(1, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::RejectImage), conductor.last_unhandled());
+        assert_eq!(
+            Some(Command::GetNextAvailableSessionId),
+            conductor.last_unhandled()
+        );
         assert!(conductor.is_running(), "and nothing else happened");
     }
 
@@ -3492,7 +3656,7 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x10, b"channel");
+        send(&conductor, 0x12, b"channel");
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands());
 
@@ -5559,6 +5723,682 @@ mod tests {
         assert_eq!(
             Some(0),
             conductor.publications().publications()[0].end_of_stream_position()
+        );
+    }
+
+    /// A `REJECT_IMAGE` payload (`aeron_control_protocol.h:220-227`): the
+    /// correlated head, the target's registration id, where the rejecting
+    /// client had read to, and the reason with its own length.
+    ///
+    /// The record's shape is checked before anything else, and a reason of four
+    /// characters is the shortest one that makes the record
+    /// `sizeof(aeron_reject_image_command_t)` — 40 bytes
+    /// (`aeron_driver_conductor.c:3177-3180`).
+    fn reject_image_payload(
+        client_id: i64,
+        correlation_id: i64,
+        image_correlation_id: i64,
+        position: i64,
+        reason: &[u8],
+    ) -> Vec<u8> {
+        assert!(
+            40 <= 36 + reason.len(),
+            "a record shorter than the struct is malformed, not a short command"
+        );
+
+        let mut out = vec![0u8; 36 + reason.len()];
+        out[0..8].copy_from_slice(&client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&image_correlation_id.to_le_bytes());
+        out[24..32].copy_from_slice(&position.to_le_bytes());
+        out[32..36].copy_from_slice(
+            &i32::try_from(reason.len())
+                .expect("a reason far below i32::MAX")
+                .to_le_bytes(),
+        );
+        out[36..].copy_from_slice(reason);
+
+        out
+    }
+
+    #[test]
+    fn a_rejected_ipc_publication_tells_its_publisher_and_takes_its_readers_away() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        let reader_counter_id = conductor.subscriptions().links()[0].subscribables[0].counter_id;
+        let free_before = conductor.counters().free_list_len();
+
+        // The id a client would have been handed for an IPC image is the
+        // publication's own registration id — the correlation id of its
+        // `ADD_PUBLICATION` — which is why one command has two targets.
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_PUBLICATION_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the publisher is told");
+
+        assert_eq!(42i64.to_le_bytes(), payload[0..8], "the publication named");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[8..16],
+            "an IPC publication answers no destination"
+        );
+        assert_eq!(
+            conductor.publications().publications()[0].session_id,
+            i32::from_le_bytes(payload[16..20].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            1001,
+            i32::from_le_bytes(payload[20..24].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[24..32],
+            "…and hears from no receiver"
+        );
+        assert_eq!(NULL_VALUE.to_le_bytes(), payload[32..40], "nor a group");
+        assert_eq!(
+            1,
+            i16::from_le_bytes(payload[40..42].try_into().expect("two bytes")),
+            "the loopback source is sent as an ordinary IPv4 address"
+        );
+        assert_eq!([127, 0, 0, 1], payload[44..48]);
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            i32::from_le_bytes(payload[60..64].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            18,
+            i32::from_le_bytes(payload[64..68].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Needs to be closed",
+            &payload[68..],
+            "the client's own words"
+        );
+
+        // The reader is told the image is gone and loses its position.
+        let unavailable = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_UNAVAILABLE_IMAGE_TYPE_ID)
+            .expect("the reader is told");
+        assert_eq!(42i64.to_le_bytes(), unavailable.1[0..8]);
+        assert_eq!(9i64.to_le_bytes(), unavailable.1[8..16]);
+        assert!(
+            conductor.subscriptions().links()[0]
+                .subscribables
+                .is_empty(),
+            "the subscription holds no reader for it any more"
+        );
+        assert_eq!(
+            free_before + 1,
+            conductor.counters().free_list_len(),
+            "and the reader's counter came back"
+        );
+        assert!(
+            counter_value(&conductor, reader_counter_id).is_some(),
+            "the id is still a readable slot — `free` reclaims it, it does not erase it"
+        );
+
+        // Both halves of the answer, in the reference's order: the counter,
+        // then the completion.
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID)
+        );
+        assert_eq!(0, conductor.unhandled_commands());
+    }
+
+    #[test]
+    fn a_reader_that_arrives_while_a_publication_is_rejected_is_not_linked() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+        drain(&cnc, &mut receiver);
+
+        assert!(conductor.publications().publications()[0].is_in_cool_down());
+
+        // A second reader, arriving inside the cool down. It is told its
+        // subscription exists — that is a fact about the subscription — and it
+        // is *not* given an image, which is what refusing readers means.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 10, 1001, "aeron:ipc"),
+        );
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        let events = drain(&cnc, &mut receiver);
+
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "the subscription itself is fine"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_AVAILABLE_IMAGE_TYPE_ID),
+            "but nothing links it to a publication that is refusing readers"
+        );
+    }
+
+    #[test]
+    fn a_reject_image_that_names_nothing_is_answered_with_the_references_error() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 12_345, 0, b"nowhere"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(
+            8i64.to_le_bytes(),
+            payload[0..8],
+            "on its own correlation id"
+        );
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Unable to resolve image for correlationId=12345",
+            &payload[16..],
+            "the reference's words (aeron_driver_conductor.c:6389-6392)"
+        );
+
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED),
+            "nothing was rejected"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID),
+            "and nothing succeeded"
+        );
+    }
+
+    #[test]
+    fn an_invalidation_reason_longer_than_the_reference_allows_is_answered_with_an_error() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        let reason = vec![b'x'; 1024];
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, &reason),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(8i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Invalidation reason_text must be 1023 bytes or less",
+            &payload[16..],
+            "the reference's words (aeron_driver_conductor.c:6357-6364)"
+        );
+
+        // The publication is untouched: the bound was refused before the
+        // registration id in the command was ever looked up.
+        assert!(!conductor.publications().publications()[0].is_in_cool_down());
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+    }
+
+    #[test]
+    fn a_reject_image_shorter_than_its_own_struct_is_malformed() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        // 36 bytes is `offsetof(reason_text)` and not `sizeof` — the record the
+        // reference's own Java client would send for an empty reason, and one
+        // its dispatch refuses before any handler sees it
+        // (`aeron_driver_conductor.c:3177-3180`).
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &[0u8; 36],
+        );
+        conductor.do_work();
+
+        assert_eq!(1, conductor.malformed_commands());
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "a malformed command is recorded, not answered"
+        );
+    }
+
+    /// Read this test's own socket until an `ERR` frame turns up, or the
+    /// deadline passes.
+    ///
+    /// An image sends its status messages on the same socket, so what arrives
+    /// first is whatever it said before it was rejected; the frame is picked
+    /// out by type rather than by being the next datagram.
+    fn await_error_frame(
+        socket: &crate::sys::socket::DatagramSocket,
+        within: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        use crate::protocol::{FrameHeader, frame_type};
+        use crate::sys::socket::Datagrams;
+
+        let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 2048]).collect();
+        let mut datagrams = Datagrams::new();
+        let until = std::time::Instant::now() + within;
+
+        while std::time::Instant::now() < until {
+            if let Ok(_count) = socket.receive_batch(&mut buffers, &mut datagrams) {
+                for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
+                    let packet = &buffers[slot][..datagram.length];
+
+                    if FrameHeader::read(packet)
+                        .is_some_and(|header| header.frame_type == frame_type::ERR)
+                    {
+                        return Some(packet.to_vec());
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        None
+    }
+
+    /// A publication sending to a socket this test owns, the driver's own send
+    /// address, and the session the publication runs under.
+    ///
+    /// The address is learned the way a receiver learns it: the publication
+    /// says `SETUP` to its endpoint on a timer, and where that datagram came
+    /// from is where to answer it.
+    fn publishing_to_a_socket() -> (
+        TempDir,
+        Conductor,
+        CncFile,
+        ToClientsReceiver,
+        crate::sys::socket::DatagramSocket,
+        std::net::SocketAddr,
+        i32,
+    ) {
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        socket.set_nonblocking().expect("non-blocking");
+        let endpoint = socket.local_address().expect("an address");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, &format!("aeron:udp?endpoint={endpoint}")),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four bytes"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut driver_address = None;
+
+        while std::time::Instant::now() < deadline && driver_address.is_none() {
+            conductor.do_work();
+            driver_address = next_datagram(&socket).map(|(_, source)| source);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let driver_address = driver_address.expect("the publication says SETUP to its endpoint");
+
+        (
+            temp,
+            conductor,
+            cnc,
+            receiver,
+            socket,
+            driver_address,
+            session_id,
+        )
+    }
+
+    /// Read this test's own socket once, with where the datagram came from.
+    fn next_datagram(
+        socket: &crate::sys::socket::DatagramSocket,
+    ) -> Option<(Vec<u8>, std::net::SocketAddr)> {
+        use crate::sys::socket::Datagrams;
+
+        let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 2048]).collect();
+        let mut datagrams = Datagrams::new();
+
+        if let Ok(_count) = socket.receive_batch(&mut buffers, &mut datagrams) {
+            for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
+                if let Some(source) = datagram.source {
+                    return Some((buffers[slot][..datagram.length].to_vec(), source));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// The other end of the same chain: an `ERR` frame that arrives at **this**
+    /// driver's own publication has to reach that publication's client.
+    ///
+    /// This is the half a publisher actually sees, and the two ends are in one
+    /// process whenever a client publishes and subscribes to one stream — which
+    /// is what every one of the reference's own rejection tests does. Without
+    /// it the frame leaves and nothing tells the client, so `RejectImageTest`
+    /// waits out its deadline with the whole mechanism working underneath.
+    #[test]
+    fn an_error_frame_from_a_live_receiver_reaches_the_publications_client() {
+        use crate::protocol::{ErrorFrame, StatusMessageFrame};
+
+        let (_temp, mut conductor, cnc, mut receiver, socket, driver_address, session_id) =
+            publishing_to_a_socket();
+        let mut pending = Vec::new();
+
+        // A status message makes the publication record this receiver, which is
+        // what an `ERR` from it is checked against a moment later.
+        // The publication's own first term — which is a value the driver made
+        // up, not one this test can guess — because a status message a term and
+        // a half outside it is refused before it reaches the publication at all
+        // (`aeron_network_publication_is_valid_status_message`, `:841-856`).
+        let initial_term_id = conductor.network_publications()[0].params.initial_term_id;
+        let status = StatusMessageFrame {
+            session_id,
+            stream_id: 1001,
+            consumption_term_id: initial_term_id,
+            consumption_term_offset: 0,
+            receiver_window: 0,
+            receiver_id: 99,
+        };
+        let mut frame = [0u8; StatusMessageFrame::LENGTH];
+        assert!(status.write_with_flags(&mut frame, 0).is_some());
+        socket
+            .send_batch(Some(driver_address), &[&frame])
+            .expect("a send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline
+            && counter_value(
+                &conductor,
+                crate::system_counters::id::STATUS_MESSAGES_RECEIVED,
+            )
+            .unwrap_or(0)
+                < 1
+        {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            Some(1),
+            counter_value(
+                &conductor,
+                crate::system_counters::id::STATUS_MESSAGES_RECEIVED
+            ),
+            "the sender has the receiver now"
+        );
+
+        // And the refusal.
+        let reason = b"Needs to be closed";
+        let refusal = ErrorFrame {
+            session_id,
+            stream_id: 1001,
+            receiver_id: 99,
+            group_tag: 0,
+            error_code: deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error_length: i32::try_from(reason.len()).expect("a short reason"),
+        };
+        let mut frame = [0u8; ErrorFrame::LENGTH + 18];
+        assert!(refusal.write(&mut frame[..ErrorFrame::LENGTH]).is_some());
+        frame[ErrorFrame::LENGTH..].copy_from_slice(reason);
+        socket
+            .send_batch(Some(driver_address), &[&frame])
+            .expect("a send");
+
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(42i64.to_le_bytes(), payload[0..8], "the publication named");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[8..16],
+            "this channel has no destination tracker to name one from"
+        );
+        assert_eq!(
+            session_id,
+            i32::from_le_bytes(payload[16..20].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            1001,
+            i32::from_le_bytes(payload[20..24].try_into().expect("four bytes"))
+        );
+        assert_eq!(99i64.to_le_bytes(), payload[24..32], "who refused it");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[32..40],
+            "the frame carried no group tag, so the field is ignored"
+        );
+        assert_eq!(
+            1,
+            i16::from_le_bytes(payload[40..42].try_into().expect("two bytes")),
+            "and the datagram's source is sent as an ordinary IPv4 address"
+        );
+        assert_eq!(
+            socket.local_address().expect("an address").port(),
+            u16::from_le_bytes(payload[42..44].try_into().expect("two bytes"))
+        );
+        assert_eq!([127, 0, 0, 1], payload[44..48]);
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            i32::from_le_bytes(payload[60..64].try_into().expect("four bytes"))
+        );
+        assert_eq!(b"Needs to be closed", &payload[68..]);
+    }
+
+    #[test]
+    fn a_rejected_network_image_is_refused_by_the_receiver_that_owns_it() {
+        use crate::protocol::{FrameHeader, SetupFrame, frame_type};
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A port nobody holds: the driver's receive endpoint will bind it, and
+        // this test's socket is the publisher that sends to it.
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &format!("aeron:udp?endpoint=127.0.0.1:{port}")),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+
+        let session_id = 99;
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        publisher.set_nonblocking().expect("non-blocking");
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        // The image is built off the conductor's thread — there is a log buffer
+        // to map — so this waits for it rather than asserting after one pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline && conductor.publication_images().is_empty() {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let image_registration_id = conductor.publication_images()[0].registration_id;
+        assert_eq!(session_id, conductor.publication_images()[0].session_id);
+
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, image_registration_id, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        // The other branch of the handler, and the reason the two are one
+        // command: an id that names an image is *not* looked for among the IPC
+        // publications, so no publisher is told anything here.
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_PUBLICATION_ERROR_TYPE_ID),
+            "an image is not an IPC publication, and nothing here publishes"
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID)
+        );
+
+        // And the publisher is told — on the wire, by the receiver, which is the
+        // only half of this that a client on the other end can see.
+        let frame = await_error_frame(&publisher, std::time::Duration::from_secs(5))
+            .expect("an ERR frame reaches the publisher");
+        let error = crate::protocol::ErrorFrame::read(&frame).expect("an ERR frame");
+
+        assert_eq!(
+            frame_type::ERR,
+            FrameHeader::read(&frame).expect("a header").frame_type
+        );
+        assert_eq!(session_id, error.session_id);
+        assert_eq!(1001, error.stream_id);
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error.error_code
+        );
+        assert_eq!(
+            b"Needs to be closed",
+            error.text(&frame).expect("the reason it was given")
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::ERROR_FRAMES_SENT)
         );
     }
 

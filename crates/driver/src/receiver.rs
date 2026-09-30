@@ -113,6 +113,27 @@ pub enum ReceiverCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Refuse an image: a client rejected it, and its publisher has to be told
+    /// (`aeron_driver_receiver_on_invalidate_image`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:633-649`).
+    ///
+    /// The command reaches the conductor first, which is what knows whether an
+    /// image answers that registration id at all; what arrives here is the
+    /// reason, because the reason is what the `ERR` frames carry and the
+    /// receiver's thread is what sends them.
+    ///
+    /// **No position.** `REJECT_IMAGE` carries where the rejecting client had
+    /// read to, and the reference drops it twice over: its receiver command has
+    /// the field and never reads it (`aeron_driver_receiver.c:636-648`), and
+    /// `aeron_publication_image_invalidate` does not take one
+    /// (`aeron_publication_image.c:1383-1387`). A field nothing reads is not a
+    /// fact about the wire, so it is not carried here.
+    InvalidateImage {
+        /// Which image.
+        image_correlation_id: i64,
+        /// The rejecting client's own words, which ride the `ERR` frames.
+        reason: Vec<u8>,
+    },
     /// Give an image a reader (`link_subscribable`'s image case).
     AddSubscriber {
         /// Which image.
@@ -384,6 +405,20 @@ impl ReceiverProxy {
             .send(ReceiverCommand::RemoveSubscriber {
                 registration_id,
                 counter_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Refuse an image: reject it, and let it say so to its publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn invalidate_image(&self, image_correlation_id: i64, reason: Vec<u8>) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::InvalidateImage {
+                image_correlation_id,
+                reason,
             })
             .map_err(|_| stopped())
     }
@@ -811,6 +846,25 @@ impl ReceiverThread {
                                     );
                                 }
                             }
+                        }
+                    }
+                    ReceiverCommand::InvalidateImage {
+                        image_correlation_id,
+                        reason,
+                    } => {
+                        // The image is marked, not removed: what happens next
+                        // is that it tells its publisher, on the status
+                        // message's own timer, and only the conductor's
+                        // removal takes it away. A command that cannot find
+                        // its image is one that was removed between the two
+                        // threads, which is a race the reference has too — its
+                        // loop simply finds nothing (`:640-648`).
+                        if let Some(image) = self
+                            .images
+                            .iter_mut()
+                            .find(|image| image.registration_id == image_correlation_id)
+                        {
+                            image.invalidate(&reason);
                         }
                     }
                     ReceiverCommand::AddSubscriber {

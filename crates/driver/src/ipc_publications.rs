@@ -37,9 +37,10 @@ use std::path::PathBuf;
 
 use deepmsg_cnc::command::{
     AddPublicationCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
-    ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_STORAGE_SPACE,
-    ImageBuffersReady, PublicationBuffersReady,
+    ERROR_CODE_IMAGE_REJECTED, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED,
+    ERROR_CODE_STORAGE_SPACE, ImageBuffersReady, PublicationBuffersReady, PublicationError,
 };
+use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position;
@@ -718,6 +719,98 @@ impl IpcPublications {
         }
     }
 
+    /// Cut a publication off from its readers, because a client asked
+    /// (`aeron_ipc_publication_reject`, `aeron_ipc_publication.c:216-277`).
+    ///
+    /// Three things, in the reference's order, and the order is the part a
+    /// caller has to keep:
+    ///
+    /// 1. the **publisher** is told first — an `ON_PUBLICATION_ERROR` naming the
+    ///    publication, carrying the client's own words;
+    /// 2. then, if the publication was not already refusing readers, it stops
+    ///    accepting them: the log's `is_connected` byte closes, every
+    ///    subscription reading it is told the image is gone and loses the
+    ///    reader, and the readers' counters are given back;
+    /// 3. and the silence is set to last [`IpcPublication::liveness_timeout_ns`]
+    ///    from now.
+    ///
+    /// **The command's `position` is not used here.** It travels into the
+    /// receiver's `ERR` frame on the network path, and the reference's IPC path
+    /// drops it: an IPC publication has no image to invalidate at a position,
+    /// and the publisher is told the news without one
+    /// (`aeron_ipc_publication_reject` takes no such argument at all).
+    ///
+    /// The reason is at most 1023 bytes when it gets here — that bound is the
+    /// decoder's, refused before the handler runs
+    /// ([`deepmsg_cnc::command::MAX_REASON_TEXT_LENGTH`]) — so the clipping the
+    /// reference does inside its own version (`:227`) has nothing to clip.
+    ///
+    /// # Returns
+    ///
+    /// Whether a publication was found under that registration id.
+    #[allow(clippy::too_many_arguments)] // the conductor's own collaborators
+    pub fn reject(
+        &mut self,
+        registration_id: i64,
+        reason: &[u8],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        subscriptions: &mut IpcSubscriptions,
+        events: &mut impl ClientEvents,
+        now_ns: i64,
+        now_ms: i64,
+    ) -> bool {
+        let Some(index) = self
+            .publications
+            .iter()
+            .position(|publication| publication.registration_id == registration_id)
+        else {
+            return false;
+        };
+
+        let (session_id, stream_id, already_refusing) = {
+            let publication = &self.publications[index];
+
+            (
+                publication.session_id,
+                publication.stream_id,
+                publication.is_in_cool_down(),
+            )
+        };
+
+        events.publication_error(&PublicationError {
+            registration_id,
+            // An IPC publication answers no destination and hears from no
+            // receiver, so three of these are the reference's `AERON_NULL_VALUE`
+            // (`aeron_ipc_publication.c:238-243`).
+            destination_registration_id: NULL_VALUE,
+            session_id,
+            stream_id,
+            receiver_id: NULL_VALUE,
+            group_tag: NULL_VALUE,
+            // …and its source is a freshly zeroed loopback `sockaddr_in` with a
+            // zero port (`:231-236`), which the client reads back as an
+            // ordinary IPv4 address rather than as an absence.
+            source: Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))),
+            error_code: ERROR_CODE_IMAGE_REJECTED,
+            message: reason,
+        });
+
+        if !already_refusing {
+            let publication = &mut self.publications[index];
+            publication.mark_disconnected();
+            subscriptions.unlink_publication(registration_id, events);
+            publication.clear_subscribers(counters, regions, now_ms);
+        }
+
+        self.publications[index].enter_cool_down(now_ns);
+
+        true
+    }
+
     /// The timeout tier's turn for every publication
     /// (`aeron_driver_conductor_on_check_managed_resources`, `:1691-1712`):
     /// advance the ones on their way out, and remove the ones that are done.
@@ -735,10 +828,11 @@ impl IpcPublications {
         regions: &CounterRegions<'_>,
         subscriptions: &mut IpcSubscriptions,
         events: &mut impl ClientEvents,
-        now_ns: i64,
-        now_ms: i64,
+        now: Now,
     ) -> usize {
         let mut work = 0;
+        let now_ns = now.ns;
+        let now_ms = now.ms;
 
         for index in 0..self.publications.len() {
             // The revoke is the active state's only duty here: a publication
@@ -790,6 +884,19 @@ impl IpcPublications {
                 // just took out of the working count is one the producer can
                 // no longer see reading.
                 self.publications[index].update_connected_status();
+
+                // A publication rejected a liveness timeout ago is readable
+                // again, and this is where it comes back
+                // (`aeron_ipc_publication_check_cooldown_status`, `:546`).
+                // Without it a rejection would be permanent, which is not what
+                // the reference's cool down means: it is a *pause*, and the
+                // readers that were unlinked are re-linked to the same
+                // publication rather than to a new one.
+                if self.publications[index].cool_down_has_expired(now_ns) {
+                    let publication = &mut self.publications[index];
+                    subscriptions.link_publication(publication, counters, regions, now, events);
+                    work += 1;
+                }
             }
 
             work += usize::from(self.publications[index].on_time_event(counters, regions, now_ns));

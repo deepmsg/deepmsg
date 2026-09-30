@@ -1255,16 +1255,24 @@ impl NetworkPublication {
 
     /// An error frame arrived, which the reference treats as a receiver going
     /// away (`aeron_network_publication_on_error`, `:858-887`).
+    ///
+    /// Returns whether that receiver was one this publication was still waiting
+    /// on — the reference's `liveness_on_remote_close`, and the whole of what
+    /// decides whether its client hears about it (`:872-875`): an `ERR` from a
+    /// receiver the publication has already given up on is news about nothing.
     pub fn on_error(
         &mut self,
         frame: &ErrorFrame,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
-    ) {
+    ) -> bool {
         // `error-frames-received` is counted at the endpoint, before the
         // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
-        self.remove_receiver(frame.receiver_id);
+        let was_live = self.remove_receiver(frame.receiver_id);
+
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
+
+        was_live
     }
 
     /// A NAK arrived (`aeron_network_publication_on_nak`, `:730-758`).
@@ -2087,6 +2095,65 @@ mod tests {
             Some(window),
             counters.value(&regions, fixture.publication.counters.pub_lmt),
             "the producer may write a window ahead of what has been sent"
+        );
+    }
+
+    #[test]
+    fn an_error_only_reports_a_receiver_the_publication_was_waiting_on() {
+        // The reference's `liveness_on_remote_close`
+        // (`aeron_network_publication.c:41-47`) is what decides whether a
+        // publisher hears about a refusal at all: an `ERR` names a receiver,
+        // and one this publication has already given up on is news about
+        // nothing (`:872-875`).
+        let mut fixture = fixture();
+        let (counters, regions) = fixture.counters.open();
+
+        let frame = |receiver_id| ErrorFrame {
+            session_id: 42,
+            stream_id: 1001,
+            receiver_id,
+            group_tag: 0,
+            error_code: deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error_length: 18,
+        };
+
+        // Nobody has been heard from, so this receiver is not one to report.
+        assert!(
+            !fixture
+                .publication
+                .on_error(&frame(99), &counters, &regions)
+        );
+
+        // A status message is how a receiver makes itself known.
+        let status = StatusMessageFrame {
+            session_id: 42,
+            stream_id: 1001,
+            consumption_term_id: 1_000,
+            consumption_term_offset: 0,
+            receiver_window: 8192,
+            receiver_id: 99,
+        };
+        fixture
+            .publication
+            .on_status_message(&status, 0, &counters, &regions, 1_000);
+
+        assert!(
+            fixture
+                .publication
+                .on_error(&frame(99), &counters, &regions),
+            "this one was live"
+        );
+
+        assert!(
+            !fixture
+                .publication
+                .on_error(&frame(99), &counters, &regions),
+            "and it is not any more: the refusal took it out of the set"
+        );
+
+        assert!(
+            !fixture.publication.has_subscribers(&counters, &regions),
+            "which is what the producer's connection byte follows"
         );
     }
 

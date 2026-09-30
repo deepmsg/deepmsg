@@ -33,6 +33,7 @@
 
 use std::net::SocketAddr;
 
+use deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
@@ -218,7 +219,11 @@ pub struct PublicationImage {
     pub eos_position: i64,
     /// Why this image was rejected, when it was — an image that cannot be
     /// built still has to tell its sender so (`:974-996`).
-    pub invalidation_reason: Option<String>,
+    ///
+    /// Bytes and not a string: the reason is a client's, it crosses the wire in
+    /// a `REJECT_IMAGE` and goes back out in an `ERR` frame, and nothing
+    /// between the two is entitled to decide it was UTF-8.
+    pub invalidation_reason: Option<Vec<u8>>,
     /// The position the next status message reports.
     next_sm_position: i64,
     /// The window the next status message advertises.
@@ -982,12 +987,51 @@ impl PublicationImage {
 
         let has_timed_out = self.next_sm_deadline_ns < now_ns;
 
+        // A rejected image has nothing to say about positions any more.
+        // Everything it sends from here on is the refusal itself, as an `ERR`
+        // frame per connection rather than a status message — and it is sent
+        // **again on every period that times out**, because a datagram that
+        // goes missing must not leave a publisher waiting for a reason nobody
+        // will send twice (`aeron_publication_image.c:877-896`).
+        //
+        // The reference's guard is `is_sm_enabled && next_sm_deadline_ns <
+        // now`, where the flag is cleared once the image leaves its active
+        // state (`:1394-1400`). This build does not model that flag — the
+        // status-message path below has always run on the deadline alone — and
+        // it does not have to here: an image that was just rejected is active
+        // in both, which is the only state this branch is reached in.
         if self.invalidation_reason.is_some() {
+            let mut sent = 0usize;
+
             if has_timed_out {
+                {
+                    let reason = self.invalidation_reason.as_deref().unwrap_or_default();
+
+                    for connection in &self.connections {
+                        let Some(control_address) = connection.control_address else {
+                            continue;
+                        };
+
+                        if endpoint
+                            .send_error_frame(
+                                control_address,
+                                self.stream_id,
+                                self.session_id,
+                                ERROR_CODE_IMAGE_REJECTED,
+                                reason,
+                                system,
+                            )
+                            .is_ok()
+                        {
+                            sent += 1;
+                        }
+                    }
+                }
+
                 self.next_sm_deadline_ns = now_ns + self.sm_timeout_ns;
             }
 
-            return Ok(0);
+            return Ok(usize::from(sent > 0));
         }
 
         if self.connections.is_empty() {
@@ -1261,12 +1305,18 @@ impl PublicationImage {
     /// Reject the image, with the reason (`aeron_publication_image_invalidate`,
     /// `:1383-1389`): a sender whose image could not be built is told with an
     /// `ERR` frame rather than left sending into silence.
-    pub fn invalidate(&mut self, reason: &str) {
-        self.invalidation_reason = Some(reason.to_owned());
+    ///
+    /// All this does is keep the words. The frames go out from
+    /// [`Self::send_pending_status_message`], on the status message's own
+    /// timer — the reference splits it the same way, and for the same reason:
+    /// this runs on the thread that *decides*, and that one runs on the thread
+    /// that *sends*.
+    pub fn invalidate(&mut self, reason: &[u8]) {
+        self.invalidation_reason = Some(reason.to_vec());
     }
 
     /// The reason this image was rejected, if it was.
-    pub fn invalidation_reason(&self) -> Option<&str> {
+    pub fn invalidation_reason(&self) -> Option<&[u8]> {
         self.invalidation_reason.as_deref()
     }
 

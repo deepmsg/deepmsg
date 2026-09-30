@@ -40,7 +40,9 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::protocol::{NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame};
+use crate::protocol::{
+    ErrorFrame, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame,
+};
 use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, system_counters};
 
@@ -960,6 +962,89 @@ impl ReceiveChannelEndpoint {
         }
     }
 
+    /// Tell a publisher its image was refused
+    /// (`aeron_receiver_channel_endpoint_send_error_frame`, `:466-509`).
+    ///
+    /// This is the **only** frame this endpoint sends that is not an answer to
+    /// something the far end asked for: a status message, a NAK and an RTTM all
+    /// report on data that arrived, and an `ERR` reports a decision the reader
+    /// made. It goes to the connection's control address, like the rest.
+    ///
+    /// The text is clipped to [`MAX_ERROR_TEXT_LENGTH`], which is the frame's
+    /// own bound and the client's — `strnlen(invalidation_reason,
+    /// AERON_ERROR_MAX_TEXT_LENGTH)` is what the reference measures with
+    /// (`:479`), so a longer reason is cut here rather than sent and cut there.
+    ///
+    /// The buffer is a stack array sized for the largest frame the format
+    /// allows, as the reference's is (`AERON_ERROR_MAX_FRAME_LENGTH`), and the
+    /// counters are raised here for the same reason they are there: the
+    /// distinction between a frame that went and one that was cut short is only
+    /// visible to whoever saw the socket's answer.
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    pub fn send_error_frame(
+        &mut self,
+        destination: SocketAddr,
+        stream_id: i32,
+        session_id: i32,
+        error_code: i32,
+        invalidation_reason: &[u8],
+        system: &system_counters::System<'_>,
+    ) -> io::Result<usize> {
+        #[allow(clippy::cast_sign_loss)] // the constant is 1023
+        let limit = MAX_ERROR_TEXT_LENGTH as usize;
+        let reason = &invalidation_reason[..invalidation_reason.len().min(limit)];
+
+        #[allow(clippy::cast_possible_truncation)] // bounded by the limit above
+        let error_length = reason.len() as i32;
+
+        let frame = ErrorFrame {
+            session_id,
+            stream_id,
+            receiver_id: self.receiver_id,
+            // Written even when the flag says to ignore it, which is what the
+            // reference does (`:488-489`). The flag is never set here: a group
+            // tag belongs to a multicast channel, and this build's endpoints do
+            // not carry one yet.
+            group_tag: 0,
+            error_code,
+            error_length,
+        };
+
+        let mut buffer = [0u8; ErrorFrame::LENGTH + MAX_ERROR_TEXT_LENGTH as usize];
+        if frame.write(&mut buffer[..ErrorFrame::LENGTH]).is_none() {
+            return Ok(0);
+        }
+
+        buffer[ErrorFrame::LENGTH..ErrorFrame::LENGTH + reason.len()].copy_from_slice(reason);
+
+        let length = ErrorFrame::LENGTH + reason.len();
+        let sent = match self.destination_mut() {
+            Some(entry) => entry
+                .transport
+                .send(Some(destination), &[&buffer[..length]])?,
+            None => return Ok(0),
+        };
+
+        if sent < 1 {
+            // One datagram, not one frame's worth of bytes. The reference
+            // compares what the socket wrote against the `iovec` it was handed
+            // (`:496-502`), which is a byte count — but its socket is UDP, so a
+            // partial write cannot happen there, and a short send means a
+            // transport underneath that cut the frame in two. This build's
+            // [`Transport::send`](super::Transport::send) answers with how many
+            // *datagrams* left, so the same counter stands for the frame that
+            // did not go at all.
+            self.short_send(system, sent, 1);
+        } else {
+            system.increment(system_counters::id::ERROR_FRAMES_SENT);
+        }
+
+        Ok(sent)
+    }
+
     /// The destination this endpoint reads from, or answers through.
     ///
     /// A unicast channel has exactly one, so every path here uses it. The
@@ -1153,6 +1238,53 @@ mod tests {
         Box::new(Stub(SocketAddr::from(([127, 0, 0, 1], port))))
     }
 
+    /// A transport that keeps what it was handed, for the frames that *leave* —
+    /// which the stub above cannot answer, because "what went out" is the whole
+    /// of what an `ERR` frame is.
+    ///
+    /// The handle is shared rather than borrowed because a transport is moved
+    /// into the endpoint, and behind a mutex because a transport is `Send`.
+    #[derive(Clone, Default)]
+    struct Sent(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl Sent {
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.0.lock().expect("no other thread holds it").clone()
+        }
+
+        fn last(&self) -> Vec<u8> {
+            self.frames().pop().expect("a frame went out")
+        }
+    }
+
+    impl Transport for Sent {
+        fn send(&mut self, _address: Option<SocketAddr>, buffers: &[&[u8]]) -> io::Result<usize> {
+            let mut frames = self.0.lock().expect("no other thread holds it");
+
+            for buffer in buffers {
+                frames.push(buffer.to_vec());
+            }
+
+            Ok(buffers.len())
+        }
+
+        fn receive(
+            &mut self,
+            _buffers: &mut [Vec<u8>],
+            _datagrams: &mut crate::sys::socket::Datagrams,
+        ) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn local_address(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 40123)))
+        }
+
+        fn receive_buffer_size(&self) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
     /// Every destination brings its own address counter, and two destinations
     /// do not share one (`rcv-local-sockaddr`, type 14).
     #[test]
@@ -1297,5 +1429,109 @@ mod tests {
                 .is_none(),
             "a channel no destination has removes nothing"
         );
+    }
+
+    /// An endpoint of a test's own, with a transport that keeps what leaves.
+    fn endpoint_that_records(
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> (ReceiveChannelEndpoint, Sent) {
+        let sent = Sent::default();
+
+        let endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            Box::new(sent.clone()),
+            1234,
+            16,
+            counters,
+            regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        (endpoint, sent)
+    }
+
+    /// The frame a rejected image puts on the wire, byte for byte — the only
+    /// way a publisher learns *why* its stream stopped.
+    #[test]
+    fn an_error_frame_carries_the_reason_and_the_receiver_that_refused_it() {
+        use crate::protocol::{FrameHeader, frame_type};
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
+        let system = system_counters::System::new(&counters, &regions);
+
+        let reason = b"Needs to be closed";
+        let length = endpoint
+            .send_error_frame(
+                "127.0.0.1:40456".parse().expect("an address"),
+                1001,
+                42,
+                deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+                reason,
+                &system,
+            )
+            .expect("a send");
+
+        assert_eq!(1, length, "one datagram left");
+        assert_eq!(1, system.value(system_counters::id::ERROR_FRAMES_SENT));
+        assert_eq!(0, system.value(system_counters::id::SHORT_SENDS));
+
+        let frame = sent.last();
+        let header = FrameHeader::read(&frame).expect("a header");
+
+        assert_eq!(frame_type::ERR, header.frame_type);
+        assert_eq!(
+            i32::try_from(ErrorFrame::LENGTH + reason.len()).expect("a short frame"),
+            header.frame_length,
+            "the length covers the text as well as the header"
+        );
+
+        let error = ErrorFrame::read(&frame).expect("an ERR frame");
+
+        assert_eq!(42, error.session_id);
+        assert_eq!(1001, error.stream_id);
+        assert_eq!(
+            1234, error.receiver_id,
+            "the endpoint's own id — the publisher's liveness signal"
+        );
+        assert_eq!(0, error.group_tag, "no group tag is set on this channel");
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error.error_code
+        );
+        assert_eq!(reason.len() as i32, error.error_length);
+        assert_eq!(reason, error.text(&frame).expect("its text"));
+    }
+
+    /// The text is clipped to the frame's own bound, which is the one the
+    /// reference measures with (`aeron_receive_channel_endpoint.c:479`).
+    #[test]
+    fn an_over_long_reason_is_clipped_to_the_frames_own_bound() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
+        let system = system_counters::System::new(&counters, &regions);
+
+        let reason = vec![b'x'; 2000];
+        endpoint
+            .send_error_frame(
+                "127.0.0.1:40456".parse().expect("an address"),
+                1001,
+                42,
+                deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+                &reason,
+                &system,
+            )
+            .expect("a send");
+
+        let frame = sent.last();
+        let error = ErrorFrame::read(&frame).expect("an ERR frame");
+
+        assert_eq!(MAX_ERROR_TEXT_LENGTH, error.error_length);
+        assert_eq!(ErrorFrame::LENGTH + 1023, frame.len());
     }
 }
