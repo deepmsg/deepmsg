@@ -60,17 +60,25 @@ jobs:
       # is what keeps that equivalence honest: if the tag ever moved, or a typo
       # landed in `AERON_COMMIT`, this fails here instead of producing a run
       # against a tree the byte contracts were not read from.
+      #
+      # The comparison is a **prefix** one, and that is not a loosening: the
+      # constant is a ten-character abbreviation and `rev-parse HEAD` prints all
+      # forty, so an equality test fails on the correct commit. It did, the first
+      # time this ran — the clone was right and the assertion was wrong. A full
+      # SHA in the constant still compares exactly, because equality is a prefix.
       - name: Check out the reference at the pinned commit
         working-directory: ${{ github.workspace }}/..
         run: |
           git clone --quiet --depth 1 --branch 1.53.2 \
             https://github.com/aeron-io/aeron.git aeron
           actual=$(git -C aeron rev-parse HEAD)
-          echo "reference at $actual"
-          test "$actual" = "$AERON_COMMIT" || {
-            echo "::error::the 1.53.2 tag is $actual, not the pinned $AERON_COMMIT"
-            exit 1
-          }
+          case "$actual" in
+            "$AERON_COMMIT"*) echo "reference at $actual (pinned $AERON_COMMIT)" ;;
+            *)
+              echo "::error::the 1.53.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
+              exit 1
+              ;;
+          esac
 
       - name: Install the pinned Rust toolchain
         # `cargo` resolves to the channel in `rust-toolchain.toml`, so this is
