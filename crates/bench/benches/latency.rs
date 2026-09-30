@@ -448,11 +448,11 @@ impl Row {
     /// The row as it goes into `docs/benchmarks.md`.
     fn markdown(&self) -> String {
         let (client, driver, channel, length) = self.leading();
-        let length = format!("{length} B");
+        let label = format!("{length} B");
 
         match self {
             Self::Latency { summary, .. } => {
-                summary.markdown_row(&[client, driver, channel.name(), &length])
+                summary.markdown_row(&[client, driver, channel.name(), &label])
             }
             Self::Throughput {
                 messages,
@@ -460,7 +460,10 @@ impl Row {
                 attempts,
                 ..
             } => {
-                let megabytes = *messages as f64 * length.len() as f64 / (1024.0 * 1024.0);
+                // Bytes, not the label's width: `length` is the payload size the
+                // run used, and a column computed from the *text* of the size is
+                // a number that looks plausible and is not one.
+                let megabytes = *messages as f64 * length as f64 / (1024.0 * 1024.0);
                 let [rate, bandwidth, per_message] = [
                     *messages as f64 / seconds,
                     megabytes / seconds,
@@ -468,7 +471,8 @@ impl Row {
                 ];
 
                 format!(
-                    "| {client} | {driver} | {} | {length} | {rate:.0} | {bandwidth:.0} |                      {per_message:.2} | {messages} |",
+                    "| {client} | {driver} | {} | {label} | {rate:.0} | {bandwidth:.0} | \
+                     {per_message:.2} | {messages} |",
                     channel.name()
                 )
             }

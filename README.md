@@ -92,7 +92,8 @@ Principles:
     tests/       integration tests + interop suite (feature "interop")
     schemas/     SBE XML schemas forked from the reference tree (single
                  source of truth)
-    docs/        ADRs, roadmap, compatibility matrix, protocol notes
+    docs/        ADRs, roadmap, compatibility matrix, protocol notes,
+                 benchmarks
 
 ## Building
 
@@ -103,6 +104,13 @@ Interop tests need the reference C driver from the Aeron 1.53.2 checkout
 (`docs/reference.md` documents the expected sibling-directory layout):
 
     cargo test -p deepmsg-tests --features interop
+
+Benchmarks are snapshots rather than gates — `docs/benchmarks.md` holds the
+numbers, the machine they were taken on, and what they do not say:
+
+    cargo bench -p deepmsg-bench --bench micro
+    cargo build --release -p deepmsg-driver          # the harness measures release
+    cargo bench -p deepmsg-bench --bench latency -- --md
 
 ## Conventions
 
