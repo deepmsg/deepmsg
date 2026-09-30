@@ -100,8 +100,15 @@ fn a_reference_client_spies_on_our_driver() {
         .await_cnc(READY_TIMEOUT)
         .expect("this driver must publish a readable CnC file");
 
+    // A megabyte term, where 64 KiB would do for the frames: the probe reads
+    // the publication twice — once through its own subscriber, once through the
+    // spy — and the publication's cleaning runs behind its slowest reader,
+    // which a wire subscriber is not part of. The whole of what it publishes
+    // fits inside one term here, so neither reader can have the bytes the other
+    // has not read yet cleaned out from under it. See the same reasoning in
+    // `tests/integration/spy_subscription.rs`.
     let channel = format!(
-        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=1m",
         free_udp_port()
     );
 

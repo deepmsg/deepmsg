@@ -62,6 +62,13 @@ fn numbered(index: i64) -> Vec<u8> {
     payload
 }
 
+/// Read whatever a subscription has, checking nothing — for a reader whose
+/// progress is scaffolding rather than the thing under test (see
+/// [`publish_and_read`]).
+fn consume(client: &mut Client, subscription: i64) {
+    client.poll_subscription(subscription, 10, |_message| {});
+}
+
 /// Read everything a subscription has, checking the numbers as they come.
 fn drain(client: &mut Client, subscription: i64, received: &mut i64) {
     client.poll_subscription(subscription, 10, |message| {
@@ -74,17 +81,44 @@ fn drain(client: &mut Client, subscription: i64, received: &mut i64) {
     });
 }
 
-/// Offer until the window permits it, poll both readers, and stop when both
-/// have everything.
+/// Offer until the window permits it, poll every reader named, and stop when
+/// the ones in `required` have everything.
 ///
-/// Both readers have to be polled, and that is not tidiness: the publication's
-/// limit is taken over the positions its readers report, so a reader this test
-/// forgot to advance would hold the producer back and the *other* reader would
-/// never see the last message.
-fn publish_and_read(client: &mut Client, publication: i64, readers: &[i64], what: &str) {
+/// Every reader named has to be polled — the publication's limit follows the
+/// positions it is told about, so one this test forgot to advance would hold
+/// the producer back and the *others* would never see the last message.
+///
+/// What is **not** required is that they all finish, and that is a fact about
+/// the driver rather than a weaker assertion. What joins a network
+/// publication's set of readers is a spy
+/// (`aeron_driver_conductor.c:4904-4911`); a wire subscriber is not in it, so
+/// the limit and the cleaning run behind the slowest *spy*
+/// (`aeron_network_publication.c:960-980`, `:985`). A spy reads the log buffer
+/// in memory and a subscriber reads the same bytes off a socket, so a spy that
+/// races ahead carries the cleaning past what the wire reader has not read yet.
+/// Requiring both to finish is requiring them to stay within a term of each
+/// other — which a fast machine does and a loaded one does not, and which is how
+/// this test first failed: on CI, with the spy at 200 messages and the
+/// subscriber at 91.
+///
+/// The polled-but-not-required readers are still load-bearing for the *stream*:
+/// with `ssc` off they are what makes the publication connected at all.
+///
+/// Measured rather than reasoned about: with a **64 KiB** term and a wire
+/// reader held back on purpose until the spy is done, that reader is left stuck
+/// at 31 of 200 messages for as long as it is given — its unread bytes were
+/// cleaned. With the megabyte term the two tests below use, the same reader
+/// catches up immediately.
+fn publish_and_read(
+    client: &mut Client,
+    publication: i64,
+    required: &[i64],
+    also_polled: &[i64],
+    what: &str,
+) {
     let deadline = Instant::now() + DEADLINE;
     let mut offered = 0_i64;
-    let mut received: Vec<i64> = vec![0; readers.len()];
+    let mut received: Vec<i64> = vec![0; required.len()];
 
     while received.iter().any(|count| *count < MESSAGES) {
         assert!(
@@ -102,8 +136,12 @@ fn publish_and_read(client: &mut Client, publication: i64, readers: &[i64], what
 
         client.poll();
 
-        for (index, subscription) in readers.iter().enumerate() {
+        for (index, subscription) in required.iter().enumerate() {
             drain(client, *subscription, &mut received[index]);
+        }
+
+        for subscription in also_polled {
+            consume(client, *subscription);
         }
     }
 
@@ -343,8 +381,17 @@ fn a_spy_reads_the_publication_it_names() {
         .expect("the driver publishes its CnC file");
     let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
 
+    // A **megabyte** term, where the other tests here use 64 KiB, and it is
+    // what makes this test independent of the machine it runs on. Everything
+    // it publishes — 200 messages, 211 KiB — fits inside one term, so the
+    // cleaning, which runs behind the slowest reader, cannot reach anything
+    // the wire subscriber has not read. With a 64 KiB term it can: a spy reads
+    // the publication's buffer in memory and a subscriber reads the same bytes
+    // off a socket, and on a loaded machine the spy gets more than a term
+    // ahead — which is how this test first failed, on CI, with the spy at 200
+    // messages and the subscriber at 91. See [`publish_and_read`].
     let channel = format!(
-        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=1m",
         free_port(1)
     );
 
@@ -377,7 +424,8 @@ fn a_spy_reads_the_publication_it_names() {
     publish_and_read(
         &mut client,
         publication,
-        &[subscriber, spy],
+        &[spy],
+        &[subscriber],
         "a spy beside a subscriber",
     );
 
@@ -398,8 +446,9 @@ fn a_spy_that_arrives_first_is_given_the_publication_when_it_appears() {
         .expect("the driver publishes its CnC file");
     let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
 
+    // The same megabyte term, for the same reason.
     let channel = format!(
-        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=1m",
         free_port(2)
     );
 
@@ -420,7 +469,8 @@ fn a_spy_that_arrives_first_is_given_the_publication_when_it_appears() {
     publish_and_read(
         &mut client,
         publication,
-        &[subscriber, spy],
+        &[spy],
+        &[subscriber],
         "a spy that was already waiting",
     );
 
@@ -477,7 +527,13 @@ fn a_spy_counts_as_a_connection_when_the_setting_says_so() {
     // is being read is a *sequence*, so a probe that put one message in the
     // stream and did not count it would make every number afterwards wrong.
     // That the producer may publish at all is what the 200 messages prove.
-    publish_and_read(&mut client, publication, &[spy], "a spy as the only reader");
+    publish_and_read(
+        &mut client,
+        publication,
+        &[spy],
+        &[],
+        "a spy as the only reader",
+    );
 
     // And `snd-pos` follows, which is the other half of the fiction: nothing
     // has left the machine, but the stream has got as far as its reader, and
@@ -612,7 +668,13 @@ fn a_publication_forgets_a_spy_that_is_taken_away() {
 
     // The spy is the only reader, so this is the `ssc` path again — the
     // publication counts it, and the messages go into the buffer for it.
-    publish_and_read(&mut client, publication, &[mds], "a spy added as a source");
+    publish_and_read(
+        &mut client,
+        publication,
+        &[mds],
+        &[],
+        "a spy added as a source",
+    );
 
     // While the spy is there the producer's window reaches past what has been
     // sent: the limit is the furthest reader plus a term window, and a reader
