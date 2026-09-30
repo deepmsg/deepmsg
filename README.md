@@ -46,7 +46,13 @@ destinations reads each of them on its own socket. Response channels are served
 end to end: the `control-mode=response` subscription, the `SEND_RESPONSE` bit in
 the SETUP of a publication that carries `response-correlation-id=`, the
 RSP_SETUP an image sends back, and a response publication that sends only where
-it was asked to. Acceptance is against the reference on both sides
+it was asked to. An `aeron-spy:` subscription is served too: it reads a local
+network publication's log buffer without a socket of its own, and a client
+reaches one either by subscribing to it or by adding it as a source of a
+multi-destination subscription (`tests/integration/spy_subscription.rs`). The
+reference's own client reads through one on this driver, which is the
+acceptance that matters (`tests/interop/spy_reference.rs`).
+Acceptance is against the reference on both sides
 (`tests/interop/multi_destination.rs`, `tests/interop/response_channel_reference.rs`).
 Multicast, ATS and the name-resolver agent are still refused, and
 `docs/compat.md` lists every divergence with the test that pins it.
