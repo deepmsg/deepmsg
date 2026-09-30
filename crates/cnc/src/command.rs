@@ -1032,6 +1032,85 @@ pub fn decode_remove_subscription(payload: &[u8]) -> Option<RemoveSubscription> 
     })
 }
 
+/// `AERON_COMMAND_REJECT_IMAGE`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:42`).
+pub const REJECT_IMAGE_TYPE_ID: i32 = 0x10;
+
+/// A `REJECT_IMAGE` payload before its reason text: 16 bytes of correlated
+/// header, the image's correlation id, the position the rejecting client had
+/// reached, and a 4-byte reason length — 36 bytes
+/// (`aeron_control_protocol.h:220-227`).
+///
+/// The struct sits inside the header's `#pragma pack(4)` region
+/// (`aeron_control_protocol.h:63-261`), which is what keeps `reason_text` at
+/// **36** rather than the 40 an eight-byte alignment would give it. A decoder
+/// that assumed the natural alignment would read the first four bytes of the
+/// caller's words as a length.
+pub const REJECT_IMAGE_HEADER_LENGTH: usize = CORRELATED_COMMAND_LENGTH + 8 + 8 + 4;
+
+/// The most reason text `REJECT_IMAGE` may carry, `AERON_ERROR_MAX_TEXT_LENGTH`
+/// (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:225`).
+///
+/// The reference refuses a longer one with `"Invalidation reason_text must be
+/// 1023 bytes or less"` (`aeron_driver_conductor.c:6360-6364`), and it refuses
+/// on the **declared** length before it looks at the bytes. This bound is
+/// checked the same way and is deliberately not a limit on the payload: a
+/// record that declares more text than it carries is refused for the other
+/// reason.
+pub const MAX_REASON_TEXT_LENGTH: usize = 1023;
+
+/// `REJECT_IMAGE` as it arrives.
+///
+/// The command has **two** targets, and the second is easy to miss: a client
+/// rejects a network image, but if no image is found under that correlation id
+/// the driver goes looking among its **IPC publications** and rejects one of
+/// those instead (`aeron_driver_conductor.c:6374-6398`). So
+/// `image_correlation_id` is a *registration id* of whichever kind of resource
+/// the client was handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RejectImage<'t> {
+    /// Who is asking.
+    pub correlated: Correlated,
+    /// The id from the `ON_AVAILABLE_IMAGE` (or the IPC publication's
+    /// registration id) that is being rejected — not a session id.
+    pub image_correlation_id: i64,
+    /// Where the rejecting client had read to. It travels into the
+    /// invalidation so the stream ends where its reader stopped rather than
+    /// where the driver happened to be.
+    pub position: i64,
+    /// The caller's own words, carried into the error frame. Not NUL-terminated
+    /// on the wire.
+    pub reason: &'t [u8],
+}
+
+/// Decode `REJECT_IMAGE`.
+///
+/// Refuses a reason that runs past the payload rather than clamping it, for the
+/// reason the other decoders do: the text is published to every reader of the
+/// stream, and a silently truncated one would say something the caller did not.
+pub fn decode_reject_image(payload: &[u8]) -> Option<RejectImage<'_>> {
+    let correlated = decode_correlated(payload)?;
+    let image_correlation_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
+    let position = le_i64(payload, CORRELATED_COMMAND_LENGTH + 8)?;
+
+    let length_offset = CORRELATED_COMMAND_LENGTH + 16;
+    let reason_length = usize::try_from(le_i32(payload, length_offset)?).ok()?;
+
+    if reason_length > MAX_REASON_TEXT_LENGTH {
+        return None;
+    }
+
+    let start = length_offset + 4;
+    let reason = payload.get(start..start.checked_add(reason_length)?)?;
+
+    Some(RejectImage {
+        correlated,
+        image_correlation_id,
+        position,
+        reason,
+    })
+}
+
 /// `AERON_COMMAND_ADD_DESTINATION`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:32`).
 pub const ADD_DESTINATION_TYPE_ID: i32 = 0x07;
@@ -2260,5 +2339,86 @@ mod response_tests {
             ),
             "aeron_control_protocol.h:32-42"
         );
+    }
+
+    #[test]
+    fn a_reject_image_header_is_thirty_six_bytes() {
+        // The number the pack(4) region produces, asserted rather than
+        // commented: the struct's fields would be 40 bytes apart under natural
+        // eight-byte alignment, and a decoder that used that offset would read
+        // the first four bytes of the caller's reason as its length.
+        assert_eq!(36, REJECT_IMAGE_HEADER_LENGTH);
+        assert_eq!(
+            CORRELATED_COMMAND_LENGTH + 8 + 8 + 4,
+            REJECT_IMAGE_HEADER_LENGTH
+        );
+    }
+
+    #[test]
+    fn decodes_a_reject_image_command_with_its_reason() {
+        let reason = b"the reader asked for this";
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH + reason.len()];
+
+        payload[0..8].copy_from_slice(&7i64.to_le_bytes());
+        payload[8..16].copy_from_slice(&9i64.to_le_bytes());
+        payload[16..24].copy_from_slice(&11i64.to_le_bytes());
+        payload[24..32].copy_from_slice(&2048i64.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)] // the reason is 25 bytes
+        payload[32..36].copy_from_slice(&(reason.len() as i32).to_le_bytes());
+        payload[36..].copy_from_slice(reason);
+
+        let command = decode_reject_image(&payload).expect("should decode");
+
+        assert_eq!(7, command.correlated.client_id);
+        assert_eq!(9, command.correlated.correlation_id);
+        assert_eq!(11, command.image_correlation_id);
+        assert_eq!(2048, command.position);
+        assert_eq!(reason, command.reason);
+    }
+
+    #[test]
+    fn a_reject_image_with_no_reason_is_fine() {
+        // The reason is optional in practice: the reference's own bound is an
+        // upper one, and a length of zero is a legal command.
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+        payload[16..24].copy_from_slice(&11i64.to_le_bytes());
+
+        let command = decode_reject_image(&payload).expect("should decode");
+
+        assert_eq!(11, command.image_correlation_id);
+        assert!(command.reason.is_empty());
+    }
+
+    #[test]
+    fn refuses_a_reason_longer_than_the_reference_allows() {
+        // `AERON_ERROR_MAX_TEXT_LENGTH + 1`. The reference refuses this on the
+        // declared length before it reads a byte of the text
+        // (`aeron_driver_conductor.c:6360-6364`), so the payload here is header
+        // only and the refusal must not be for want of bytes.
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
+        payload[32..36].copy_from_slice(&1024i32.to_le_bytes());
+
+        assert!(decode_reject_image(&payload).is_none());
+    }
+
+    #[test]
+    fn refuses_a_reason_that_runs_past_the_payload() {
+        // A declared length the record does not carry. The reference would walk
+        // off the end of the record here; this refuses, and the two refusals
+        // are kept apart so the reason is never guessed.
+        let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH + 4];
+        payload[32..36].copy_from_slice(&10i32.to_le_bytes());
+
+        assert!(decode_reject_image(&payload).is_none());
+    }
+
+    #[test]
+    fn refuses_a_truncated_reject_image() {
+        for length in [0, 8, REJECT_IMAGE_HEADER_LENGTH - 1] {
+            assert!(
+                decode_reject_image(&vec![0u8; length]).is_none(),
+                "a {length}-byte payload is not a REJECT_IMAGE"
+            );
+        }
     }
 }
