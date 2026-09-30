@@ -473,6 +473,15 @@ pub struct Conductor {
     /// pass holds the CnC file's other windows while it runs, so these wait
     /// for it, the way broadcast failures do.
     pending_log_errors: Vec<(i32, String)>,
+    /// Readers a publication put aside, woke or closed, waiting for the pass
+    /// that can send a client a message about them
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// The machine runs on the **sender**, because what it moves is the
+    /// publication's own set of readers; what it produces is three client
+    /// messages, which are the conductor's. The queue is that hand-off.
+    pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
 }
 
 impl Conductor {
@@ -682,6 +691,7 @@ impl Conductor {
             unknown: 0,
             last_unhandled: None,
             pending_log_errors: Vec::new(),
+            pending_untethered: Vec::new(),
         };
 
         Ok(conductor)
@@ -757,7 +767,7 @@ impl Conductor {
     /// sequence), and for the same reason: the create has to happen on the
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
-        let mut work = self.poll_sender_events();
+        let mut work = self.poll_sender_events() + self.flush_untethered();
 
         if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
             return work;
@@ -1059,6 +1069,99 @@ impl Conductor {
         true
     }
 
+    /// Send what a publication's tether cycle decided to the readers it
+    /// decided it about
+    /// (`aeron_network_publication_check_untethered_subscriptions`'s three
+    /// outcomes, `aeron_network_publication.c:1151-1208`).
+    ///
+    /// The three are not symmetric, and the asymmetry is the reference's: a
+    /// reader put aside is told its image is gone; a reader woken is told the
+    /// image is there again, at `snd-pos`; and a reader that was **not**
+    /// rejoining is told nothing at all — its counter goes back and its
+    /// subscription keeps whatever images it has left.
+    ///
+    /// The channel on the unavailable message is the IPC **constant**, not the
+    /// channel the client spied with (`:1156`). Both publication-side machines
+    /// send it that way — the reader is holding a mapping of a log buffer
+    /// rather than a description of a channel — and it is the same constant an
+    /// image that is being linked carries.
+    fn flush_untethered(&mut self) -> usize {
+        if self.pending_untethered.is_empty() {
+            return 0;
+        }
+
+        let pending = std::mem::take(&mut self.pending_untethered);
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let mut work = 0;
+
+        for (registration_id, events) in &pending {
+            // A publication that has gone since the machine ran is one whose
+            // readers were told so by the removal itself; what is left here is
+            // a message about a buffer nobody holds.
+            let Some(publication) = self.network_publications.find(*registration_id) else {
+                continue;
+            };
+
+            for event in events {
+                work += 1;
+
+                match *event {
+                    crate::subscribable::UntetheredEvent::Unavailable {
+                        subscription_registration_id,
+                        ..
+                    } => {
+                        transmit.unavailable_image(
+                            *registration_id,
+                            subscription_registration_id,
+                            publication.stream_id,
+                            crate::ipc_subscriptions::IPC_CHANNEL,
+                        );
+                    }
+                    crate::subscribable::UntetheredEvent::Available {
+                        subscription_registration_id,
+                        counter_id,
+                        ..
+                    } => {
+                        // The same message a reader that has just linked gets,
+                        // down to the source identity: a woken reader cannot
+                        // tell the difference, which is the point of waking it
+                        // this way rather than inventing a second message.
+                        transmit.available_image(&ImageBuffersReady {
+                            correlation_id: *registration_id,
+                            session_id: publication.session_id,
+                            stream_id: publication.stream_id,
+                            subscriber_registration_id: subscription_registration_id,
+                            subscriber_position_id: counter_id,
+                            log_file: publication.path.as_os_str().as_encoded_bytes(),
+                            source_identity: crate::ipc_subscriptions::IPC_CHANNEL,
+                        });
+                    }
+                    crate::subscribable::UntetheredEvent::Closed { counter_id } => {
+                        let _ = self
+                            .counters
+                            .free(&counter_regions, counter_id, self.now_ms);
+                    }
+                }
+            }
+        }
+
+        work
+    }
+
     /// Tell every spy reading a publication that it is gone, and give their
     /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
     ///
@@ -1287,6 +1390,12 @@ impl Conductor {
             work += 1;
 
             match event {
+                crate::sender::SenderEvent::Untethered {
+                    registration_id,
+                    events,
+                } => {
+                    self.pending_untethered.push((registration_id, events));
+                }
                 crate::sender::SenderEvent::Fault {
                     error_code,
                     description,

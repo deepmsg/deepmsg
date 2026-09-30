@@ -638,3 +638,151 @@ fn a_publication_forgets_a_spy_that_is_taken_away() {
 
     let _ = own.stop();
 }
+
+/// A14: three spies on one publication, one reading and two not.
+///
+/// This is the shape P1-4 §13.4 recorded as unreachable — "three subscriptions
+/// on one publication, one reading and two not" needs a reader that can hold
+/// the producer back *without* being a socket, and a spy is the only thing that
+/// is. A laggard is what the tether cycle exists for: a publication whose limit
+/// is computed from its slowest reader cannot move at all while one reader has
+/// stopped, so the machine puts it aside, and the two ways it can end are the
+/// two this test watches.
+///
+/// The three are the reference's (`aeron_network_publication.c:1120-1236`):
+/// a reader that is behind and quiet is told its image has gone; one that is
+/// **not** rejoining is then closed, its counter given back, and it is never
+/// heard from again; one that **is** rejoining rests instead, and is woken at
+/// `snd-pos` — where the stream has got to, which is the only place an image it
+/// is handed can be read from.
+///
+/// The timeouts are compressed to milliseconds. `resting` is much the longest
+/// so that the resting window is wide enough to be observed rather than caught
+/// in passing.
+#[test]
+fn a_publication_puts_its_laggards_aside_and_wakes_the_one_that_rejoins() {
+    let Some(mut own) = OwnDriver::start_with(
+        "spy-untethered",
+        &[
+            "-Daeron.spies.simulate.connection=true",
+            "-Daeron.untethered.window.limit.timeout=200ms",
+            "-Daeron.untethered.linger.timeout=200ms",
+            "-Daeron.untethered.resting.timeout=2s",
+        ],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let cnc = own
+        .await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        free_port(9)
+    );
+
+    // `tether=false` on all three, and it is not decoration: a **tethered**
+    // reader is one that has asked to keep its place whatever it costs, and the
+    // machine never puts one aside (`aeron_network_publication.c:1132-1135`).
+    // The whole scenario needs readers that can be put aside.
+    let spy = format!("aeron-spy:{channel}|tether=false");
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+
+    // Three spies on one channel: the one that reads, the one that stops, and
+    // the one that stops but says it will be back.
+    let reader = client
+        .add_subscription(&spy, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a spy");
+    let laggard = client
+        .add_subscription(&spy, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a spy");
+    let rejoiner = client
+        .add_subscription(&format!("{spy}|rejoin=true"), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a spy that is rejoining");
+
+    for subscription in [reader, laggard, rejoiner] {
+        await_images(&mut client, subscription, 1, "every spy is linked");
+    }
+
+    // Only the first is polled. The other two sit at the position they linked
+    // at, which is what makes them laggards — and what holds the producer back
+    // until the machine puts them aside, so a run that reads all the messages
+    // is itself evidence that the machine ran.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut offered = 0_i64;
+    let mut received = 0_i64;
+
+    while received < MESSAGES {
+        assert!(
+            Instant::now() < deadline,
+            "the reader got {received} of {MESSAGES} with {offered} offered — a laggard that is \
+             never put aside holds the producer back for ever"
+        );
+
+        while offered < MESSAGES {
+            if let Some(Appended::Ok { .. }) = client.offer(publication, &numbered(offered)) {
+                offered += 1;
+            } else {
+                break;
+            }
+        }
+
+        client.poll();
+        drain(&mut client, reader, &mut received);
+    }
+
+    // The one that was not coming back: told its image has gone, and that is
+    // the end of it. It cannot read again, so the image never returns.
+    await_images(
+        &mut client,
+        laggard,
+        0,
+        "the laggard is told its image has gone",
+    );
+    await_images(
+        &mut client,
+        rejoiner,
+        0,
+        "and so is the one that is rejoining",
+    );
+
+    // And the one that was: woken where the stream is — which is the assertion
+    // that it went all the way round. Its image was linked at position zero and
+    // it has read nothing since, so a position that is not zero can only have
+    // come from the machine seeding it.
+    await_images(&mut client, rejoiner, 1, "the rejoining spy is woken");
+
+    let sent = counter_value(&cnc, "snd-pos").unwrap_or(0);
+    assert!(
+        sent > 0,
+        "the stream has to have moved for the wake to mean anything"
+    );
+    assert_eq!(
+        sent,
+        client
+            .subscription(rejoiner)
+            .expect("the subscription")
+            .images()[0]
+            .position(),
+        "a woken reader starts where the stream is, not where it stalled"
+    );
+
+    // And the reader that kept up was never put aside: it still holds its
+    // image, and it read everything.
+    assert_eq!(
+        1,
+        client
+            .subscription(reader)
+            .expect("the subscription")
+            .images()
+            .len()
+    );
+
+    let _ = own.stop();
+}

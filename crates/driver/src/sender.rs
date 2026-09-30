@@ -52,7 +52,7 @@ use crate::protocol::{
     ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame,
     RttmFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
-use crate::subscribable::TetherablePosition;
+use crate::subscribable::{TetherablePosition, UntetheredEvent};
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
@@ -211,6 +211,20 @@ pub enum SenderEvent {
         /// The registration id the publication names, whether or not it names
         /// an image on this driver.
         response_correlation_id: i64,
+    },
+    /// A publication's readers moved through the tether cycle
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// The machine runs on the sender — what it moves is the publication's own
+    /// set of readers — and what it produces is three *client* messages, which
+    /// only the conductor can send. So the outcome travels here, in the order
+    /// the readers are held.
+    Untethered {
+        /// Which publication.
+        registration_id: i64,
+        /// What moved.
+        events: Vec<UntetheredEvent>,
     },
     /// Something for the conductor to record: a socket that refused a send, a
     /// frame that could not be believed.
@@ -597,6 +611,7 @@ impl SenderThread {
             &self.counters,
             &regions,
         );
+        self.check_untethered_subscriptions(&regions, now_ns);
 
         let system = System::new(&self.counters, &regions);
 
@@ -741,6 +756,34 @@ impl SenderThread {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Run every publication's tether cycle and hand what moved to the
+    /// conductor (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// It is done here rather than inside a publication's `send` because it
+    /// needs the counter manager mutably — a closed reader's counter is
+    /// written back as `NULL` in the set — and the send pass holds it shared.
+    ///
+    /// The reference runs the same machine from the conductor, on its timer
+    /// tier (`:1277`). See
+    /// [`NetworkPublication::check_untethered_subscriptions`] for why it
+    /// cannot be done that way here and what the difference amounts to.
+    fn check_untethered_subscriptions(&mut self, regions: &CounterRegions<'_>, now_ns: i64) {
+        let counters = &mut self.counters;
+        let channel = &self.events;
+
+        for publication in &mut self.publications {
+            let events = publication.check_untethered_subscriptions(counters, regions, now_ns);
+
+            if !events.is_empty() {
+                let _ = channel.send(SenderEvent::Untethered {
+                    registration_id: publication.registration_id,
+                    events,
+                });
             }
         }
     }
