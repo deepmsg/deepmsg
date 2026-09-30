@@ -35,9 +35,22 @@ name: interop
 # So the trigger is `workflow_dispatch`. Run it with
 #
 #     gh workflow run interop.yml
+#     gh workflow run interop.yml --ref <branch>
+#     gh workflow run interop.yml -f classes=io.aeron.ChannelValidationTest
 #
 # or from the Actions tab, optionally narrowed with the inputs below — checking
 # one class after a change is a few minutes, not an hour.
+#
+# **Two things about dispatching a workflow that are easy to trip on**, and both
+# bite exactly when someone is trying to use this to check a branch:
+#
+#   * `workflow_dispatch` only exists once the file is on the **default
+#     branch**. Until this lands on `main` there is no button and no
+#     `gh workflow run` — the run has to come from a push.
+#   * a dispatch runs the workflow **as it exists on the ref it is given**, and
+#     the default is the default branch. So checking a branch means
+#     `--ref <branch>`; without it this reports on `main` and looks like it
+#     answered a question it never asked.
 #
 # **When the repair plan's slices have landed, this becomes a PR gate again**:
 # add back
@@ -161,8 +174,10 @@ jobs:
       # and **not one XML file is written**: the whole run is lost, not just the
       # class. Per class, the damage is bounded and the outcome is recorded.
       #
-      # 120s per class. Ordinary classes finish in under twenty seconds; the
-      # slowest observed was 65.
+      # The `timeout` input is the per-class bound, 120s by default. Ordinary
+      # classes finish in under twenty seconds; the slowest observed on a
+      # developer machine was 65, and the ones that do not finish are the five
+      # that hang.
       - name: Run the OSS system tests
         working-directory: ../aeron
         # The dispatch inputs arrive as environment rather than interpolated
