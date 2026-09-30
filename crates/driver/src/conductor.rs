@@ -5811,7 +5811,11 @@ mod tests {
             i16::from_le_bytes(payload[40..42].try_into().expect("two bytes")),
             "the loopback source is sent as an ordinary IPv4 address"
         );
-        assert_eq!([127, 0, 0, 1], payload[44..48]);
+        assert_eq!(
+            [1, 0, 0, 127],
+            payload[44..48],
+            "the reference's own bytes: `INADDR_LOOPBACK` written without an `htonl`"
+        );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
             i32::from_le_bytes(payload[60..64].try_into().expect("four bytes"))

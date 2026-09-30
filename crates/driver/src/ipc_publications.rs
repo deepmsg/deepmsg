@@ -788,11 +788,29 @@ impl IpcPublications {
             stream_id,
             receiver_id: NULL_VALUE,
             group_tag: NULL_VALUE,
-            // …and its source is a freshly zeroed loopback `sockaddr_in` with a
-            // zero port (`:231-236`), which the client reads back as an
-            // ordinary IPv4 address rather than as an absence.
+            // …and its source is a freshly zeroed `sockaddr_in` with a zero
+            // port whose address is `INADDR_LOOPBACK` (`:231-236`).
+            //
+            // Those octets are **reversed**, and that is not a typo here: the
+            // reference assigns the host-order constant straight into
+            // `sin_addr.s_addr` — `s_addr = INADDR_LOOPBACK`, with no `htonl` —
+            // so what is memcpy'd out at `aeron_driver_conductor.c:2303` is the
+            // little-endian image of `0x7f000001`, which is `1.0.0.127`. Its
+            // network path is not affected, because a `sockaddr_in` filled in
+            // by the kernel holds the octets in order.
+            //
+            // The reference's own Java client reads those four bytes as the
+            // octets and hands the application `1.0.0.127`
+            // (`PublicationErrorFrameFlyweight.sourceAddress`,
+            // `aeron-client/src/main/java/io/aeron/command/PublicationErrorFrameFlyweight.java:286-317`,
+            // which is a `getBytes` and an `Inet4Address.getByAddress`). A
+            // driver that sent the sane address would put different bytes on
+            // the ring for the same event, which is the one thing this project
+            // is for — the interop test
+            // `tests/interop/our_client_rejects_on_the_reference_driver.rs`
+            // compares the two drivers' bytes for exactly this field.
             source: Some(std::net::SocketAddr::from((
-                std::net::Ipv4Addr::LOCALHOST,
+                std::net::Ipv4Addr::new(1, 0, 0, 127),
                 0,
             ))),
             error_code: ERROR_CODE_IMAGE_REJECTED,

@@ -38,9 +38,10 @@ use std::time::{Duration, Instant};
 use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID,
     ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication,
-    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand,
+    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand, REJECT_IMAGE_TYPE_ID,
     REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
+    encode_reject_image,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
@@ -50,6 +51,7 @@ use crate::counter::{Counter, CounterEvent};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::publication::Publication;
+use crate::publication_error::PublicationErrorEvent;
 use crate::subscription::Subscription;
 
 /// How long to wait between polls while a command is outstanding.
@@ -298,6 +300,11 @@ pub struct Client {
     /// Counter announcements read off the broadcast and not yet drained:
     /// every counter that appeared or went away, whoever owns it.
     counter_events: Vec<CounterEvent>,
+    /// Publications the driver reported as failed and nobody has drained yet.
+    /// Unlike the counter events these are about resources this client owns,
+    /// which is why they are kept rather than dropped: a publisher that never
+    /// looks loses the only notice it gets.
+    publication_errors: Vec<PublicationErrorEvent>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
@@ -369,6 +376,7 @@ impl Client {
             publications: Vec::new(),
             counters: Vec::new(),
             counter_events: Vec::new(),
+            publication_errors: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
@@ -499,6 +507,18 @@ impl Client {
     /// method is named for the drain it performs.
     pub fn counter_events(&mut self) -> Vec<CounterEvent> {
         std::mem::take(&mut self.counter_events)
+    }
+
+    /// Publications the driver has reported as failed, and nothing else — the
+    /// events that have arrived since the last call.
+    ///
+    /// Each names a publication this client holds, so a caller can match one
+    /// against its own list by
+    /// [`PublicationErrorEvent::registration_id`]. The queue is **not** cleared
+    /// when the driver goes: an error nobody has read is news that outlives the
+    /// connection, where a released publication does not.
+    pub fn publication_errors(&mut self) -> Vec<PublicationErrorEvent> {
+        std::mem::take(&mut self.publication_errors)
     }
 
     /// Run one duty cycle: refresh the heartbeat, then take at most one
@@ -936,6 +956,54 @@ impl Client {
         Ok(correlation_id)
     }
 
+    /// Reject an image this client is reading, and wait for the driver to
+    /// acknowledge the command.
+    ///
+    /// `image_registration_id` is the **publication's** registration id, which
+    /// is what [`crate::image::Image`] carries and what an `ON_AVAILABLE_IMAGE`
+    /// named; `position` is how far this reader had got, which only travels so
+    /// that the far end's frame says where the stream was cut off.
+    ///
+    /// What this starts is a chain that ends somewhere else: the driver refuses
+    /// the image, its receiver sends an `ERR` frame to the publisher, and the
+    /// **publisher's** client is handed an
+    /// [`PublicationErrorEvent`](crate::publication_error::PublicationErrorEvent)
+    /// with code 13. The acknowledgement this waits for says only that the
+    /// driver acted on the command — the reference's own clients do not wait at
+    /// all, which is why a caller that wants the outcome wants the other
+    /// client's queue.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused it
+    /// — an id that names no image and no IPC publication is answered with
+    /// `GENERIC_ERROR` — or no reply arrived within `timeout`.
+    pub fn reject_image(
+        &mut self,
+        image_registration_id: i64,
+        position: i64,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let payload = encode_reject_image(
+            self.client_id,
+            correlation_id,
+            image_registration_id,
+            position,
+            reason.as_bytes(),
+        );
+
+        self.send(REJECT_IMAGE_TYPE_ID, &payload, correlation_id, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(())
+    }
+
     /// Offer a payload on a publication.
     ///
     /// Returns `None` if there is no such publication. Otherwise the typed
@@ -1302,6 +1370,51 @@ impl Client {
                 {
                     subscription.remove_image(publication_registration_id);
                 }
+            }
+            // Not an answer to a command: the driver is telling a client that
+            // one of its publications has failed. The to-clients ring is a
+            // **broadcast**, so every client decodes this and only the one
+            // holding that publication is owed anything — which is the
+            // reference's match (`ClientConductor.onPublicationError`,
+            // `aeron-client/src/main/java/io/aeron/ClientConductor.java:312-326`:
+            // it walks its own publications and fires the handler only for the
+            // one whose `originalRegistrationId` matches). A client that
+            // skipped that would report another client's failure and, worse,
+            // tell its `reject_image` caller the rejection had come home.
+            //
+            // The publication is not closed either: a rejected image comes back
+            // after a liveness timeout, so what to do about it is the
+            // application's.
+            Response::PublicationError {
+                registration_id,
+                destination_registration_id,
+                session_id,
+                stream_id,
+                receiver_id,
+                group_tag,
+                source,
+                error_code,
+                message,
+            } => {
+                if !self
+                    .publications
+                    .iter()
+                    .any(|publication| publication.registration_id() == registration_id)
+                {
+                    return;
+                }
+
+                self.publication_errors.push(PublicationErrorEvent {
+                    registration_id,
+                    destination_registration_id,
+                    session_id,
+                    stream_id,
+                    receiver_id,
+                    group_tag,
+                    source,
+                    error_code,
+                    message: message.to_vec(),
+                });
             }
             Response::Error {
                 offending_command_correlation_id,

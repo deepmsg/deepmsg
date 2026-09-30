@@ -84,6 +84,21 @@ path = "integration/dir_liveness.rs"
 name = "driver_process_contract"
 path = "integration/driver_process_contract.rs"
 
+# Rejecting an image, end to end through two clients and a real driver: the
+# subscriber refuses the image it is reading and the *publisher's* client is
+# the one told. Needs our own driver binary, so it runs in CI.
+[[test]]
+name = "reject_image"
+path = "integration/reject_image.rs"
+
+# Our client's REJECT_IMAGE against the reference driver: whether the record
+# this build writes is one the reference reads, and whether its
+# ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.
+[[test]]
+name = "our_client_rejects_on_the_reference_driver"
+path = "interop/our_client_rejects_on_the_reference_driver.rs"
+required-features = ["interop"]
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"

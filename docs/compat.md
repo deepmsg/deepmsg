@@ -343,8 +343,8 @@ can be falsified.
 
 ## The client's view of the ring, and of a message
 
-Four places where this build answers a question the reference answers
-differently, all on the client's side. Each names the test that covers it.
+Places where this build answers a question the reference answers differently,
+all on the client's side. Each names the test that covers it.
 
 - **A lap is counted, not fatal.** When the driver writes more events than the
   to-clients ring holds while a client is not reading, the events the client has
@@ -376,6 +376,37 @@ differently, all on the client's side. Each names the test that covers it.
   takes the stronger rule because a subscriber cannot tell the reference's
   behaviour there from a stream that loses messages. Covered by
   `crates/client/src/fragment_assembler.rs::two_sessions_are_assembled_apart`.
+- **`rejectImage` writes its correlation header, and waits.** The C client
+  claims a command record and fills in everything after the header, leaving the
+  client id and the correlation id as whatever the ring held there, and returns
+  `0` rather than an id (`aeron-client/src/main/c/aeron_client_conductor.c:3627-3654`)
+  — so its driver answers a correlation nobody sent and its caller has nothing
+  to match. The Java client writes both and returns the correlation id
+  (`DriverProxy.rejectImage`, `aeron-client/src/main/java/io/aeron/DriverProxy.java:510-532`),
+  and this build follows it: `Client::reject_image` waits for the driver's
+  `ON_OPERATION_SUCCEEDED`, so a rejection the driver refused — an id that names
+  no image and no IPC publication — comes back as a `CommandError` instead of
+  silence. The record is otherwise the C client's, including the NUL past the
+  reason, because its arithmetic is the one that is never shorter than the
+  driver's minimum. Covered by
+  `crates/cnc/src/command.rs::a_reject_image_is_the_c_clients_bytes_and_not_the_java_ones`
+  and `tests/integration/reject_image.rs`.
+One thing in this area is **not** a divergence and is written down anyway,
+because the correct value is one edit away: the source address of a publication
+error from an **IPC** rejection is byte-reversed. The reference assigns
+`INADDR_LOOPBACK` straight into `sin_addr.s_addr`, with no `htonl`
+(`aeron-driver/src/main/c/aeron_ipc_publication.c:231-236`), so the four bytes
+it copies out at `aeron_driver_conductor.c:2303` are the little-endian image of
+`0x7f000001` — `1.0.0.127` to a reader, which is exactly what the reference's
+own Java client reports (`PublicationErrorFrameFlyweight.sourceAddress`,
+`aeron-client/src/main/java/io/aeron/command/PublicationErrorFrameFlyweight.java:286-317`).
+Its **network** path is not affected: a `sockaddr_in` the kernel filled in holds
+the octets in order. This build writes the reference's bytes and not the
+correct ones, because the bytes are the contract. Held there by
+`tests/interop/our_client_rejects_on_the_reference_driver.rs`, which is the test
+that found it — it compares the two drivers' responses for one event, and the
+only field that differed was this one.
+
 - **A delivered message is copied.** `Message::payload` points into the
   assembler's buffer, so every message is copied once; the reference hands out
   a pointer into the term for a message that arrived in one frame

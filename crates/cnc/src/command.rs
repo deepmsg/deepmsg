@@ -841,6 +841,41 @@ pub enum Response<'a> {
         /// The subscription's channel, raw bytes, not NUL-terminated.
         channel: &'a [u8],
     },
+    /// A publication this client holds has failed — a receiver refused its
+    /// image, or the publication was revoked.
+    ///
+    /// **Not an answer to a command**, so it carries no correlation id: it is
+    /// matched by the publication's registration id instead, which the client
+    /// already knows (`aeron_driver_conductor.c:2263-2323`). Both ways in come
+    /// out here — a client that rejected an image, and a driver whose own
+    /// publication heard the `ERR` frame — which is why there is one message
+    /// and not two.
+    PublicationError {
+        /// The publication's registration id.
+        registration_id: i64,
+        /// The destination the error came from, or [`layout::NULL_VALUE`] when there
+        /// was none to name.
+        destination_registration_id: i64,
+        /// The stream's session.
+        session_id: i32,
+        /// And its stream id.
+        stream_id: i32,
+        /// Who refused it, or [`layout::NULL_VALUE`].
+        receiver_id: i64,
+        /// The group tag, or [`layout::NULL_VALUE`] when the frame carried none. A
+        /// reader must not believe this field unless it was told to: the driver
+        /// writes [`layout::NULL_VALUE`] into it when the flag is clear
+        /// (`aeron_network_publication.c:880`), which is the only reason it is
+        /// safe to read at all.
+        group_tag: i64,
+        /// Where the error came from. [`None`] for the reference's
+        /// `address_type` of zero.
+        source: Option<std::net::SocketAddr>,
+        /// Why.
+        error_code: i32,
+        /// The words, borrowed from the payload. Not NUL-terminated.
+        message: &'a [u8],
+    },
     /// A response this build does not model. Counted by the caller, never fatal
     /// — ADR-0003's rule, and a deliberate divergence from the reference, which
     /// reports it to the error handler and whose default handler exits.
@@ -1345,6 +1380,54 @@ pub fn decode_reject_image(payload: &[u8]) -> Result<RejectImage<'_>, RejectImag
     })
 }
 
+/// Encode `REJECT_IMAGE` for the driver.
+///
+/// The **C** client's bytes (`aeron_client_conductor_reject_image`,
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3627-3654`):
+/// `sizeof(aeron_reject_image_command_t)` plus the reason plus **one** NUL, with
+/// the declared length left as the reason's own. So the record is four bytes
+/// longer than `offsetof(reason_text)` plus the reason, and those four are the
+/// struct's tail padding.
+///
+/// The reference has two clients and they disagree about that arithmetic. Its
+/// Java one computes `MINIMUM_SIZE + reason.length()`
+/// (`RejectImageFlyweight.computeLength`), which for an empty reason is **36**
+/// — a record its own C driver calls malformed before any handler sees it
+/// (`aeron_driver_conductor.c:3177-3180`). This is the C one's, which is never
+/// short.
+///
+/// The correlated header **is** written, which the C client does not do: it
+/// claims a record and fills in everything after the header, leaving the client
+/// id and correlation id as whatever the ring held. The Java client writes both
+/// and returns the correlation id (`DriverProxy.rejectImage`) — which is what a
+/// caller needs to match the driver's answer — so this follows the Java one
+/// there and the C one for the length.
+pub fn encode_reject_image(
+    client_id: i64,
+    correlation_id: i64,
+    image_correlation_id: i64,
+    position: i64,
+    reason: &[u8],
+) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)] // a reason this build was handed
+    let declared = reason.len() as i32;
+
+    // One past the reason is the NUL the C client writes; the four bytes of
+    // padding behind it are zero here and uninitialized there, which is a
+    // difference in the bytes the *ring* holds and not in what anyone reads.
+    let mut out = vec![0u8; REJECT_IMAGE_MINIMUM_LENGTH + reason.len() + 1];
+
+    out[0..8].copy_from_slice(&client_id.to_le_bytes());
+    out[8..16].copy_from_slice(&correlation_id.to_le_bytes());
+    out[16..24].copy_from_slice(&image_correlation_id.to_le_bytes());
+    out[24..32].copy_from_slice(&position.to_le_bytes());
+    out[32..36].copy_from_slice(&declared.to_le_bytes());
+    out[REJECT_IMAGE_HEADER_LENGTH..REJECT_IMAGE_HEADER_LENGTH + reason.len()]
+        .copy_from_slice(reason);
+
+    out
+}
+
 /// `AERON_COMMAND_ADD_DESTINATION`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:32`).
 pub const ADD_DESTINATION_TYPE_ID: i32 = 0x07;
@@ -1630,7 +1713,100 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
                 _ => Response::Other { type_id },
             }
         }
+        ON_PUBLICATION_ERROR_TYPE_ID => decode_publication_error(payload),
         _ => Response::Other { type_id },
+    }
+}
+
+/// Decode `ON_PUBLICATION_ERROR`
+/// (`aeron_publication_error_values_t`, `aeron-client/src/main/c/aeronc.h:73-88`).
+///
+/// The address is the one field that is not a plain copy: the driver narrows a
+/// `sockaddr_storage` into sixteen bytes and says which family it was with a
+/// type beside it (`aeron_driver_conductor.c:2297-2315`), so a reader that
+/// ignored the type would read four bytes of IPv4 as the head of an IPv6
+/// address. A type this build does not know is [`None`] rather than an error —
+/// the same rule as an unmodelled response, and the address is the least of
+/// what the message says.
+fn decode_publication_error(payload: &[u8]) -> Response<'_> {
+    let (
+        Some(registration_id),
+        Some(destination_registration_id),
+        Some(session_id),
+        Some(stream_id),
+        Some(receiver_id),
+        Some(group_tag),
+        Some(address_type),
+        Some(source_port),
+        Some(error_code),
+        Some(message_length),
+    ) = (
+        le_i64(payload, 0),
+        le_i64(payload, 8),
+        le_i32(payload, 16),
+        le_i32(payload, 20),
+        le_i64(payload, 24),
+        le_i64(payload, 32),
+        le_i16(payload, 40),
+        le_u16(payload, 42),
+        le_i32(payload, 60),
+        le_i32(payload, 64),
+    )
+    else {
+        return Response::Other {
+            type_id: ON_PUBLICATION_ERROR_TYPE_ID,
+        };
+    };
+
+    if message_length < 0 {
+        return Response::Other {
+            type_id: ON_PUBLICATION_ERROR_TYPE_ID,
+        };
+    }
+
+    let start = PUBLICATION_ERROR_HEADER_LENGTH.min(payload.len());
+    let end = start
+        .saturating_add(message_length as usize)
+        .min(payload.len());
+
+    Response::PublicationError {
+        registration_id,
+        destination_registration_id,
+        session_id,
+        stream_id,
+        receiver_id,
+        group_tag,
+        source: source_address(address_type, source_port, payload),
+        error_code,
+        message: &payload[start..end],
+    }
+}
+
+/// The fifteen bytes of address a publication error carries, as an address.
+///
+/// The port arrives in host order — the driver converts it with `ntohs` on the
+/// way out (`aeron_driver_conductor.c:2302`) — which is the opposite of what the
+/// wire does everywhere else and the reason this is one function rather than a
+/// literal.
+fn source_address(address_type: i16, port: u16, payload: &[u8]) -> Option<std::net::SocketAddr> {
+    let address = payload.get(44..60)?;
+
+    match address_type {
+        ADDRESS_TYPE_IPV4 => {
+            let octets: [u8; 4] = address.get(..4)?.try_into().ok()?;
+            Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::from(octets),
+                port,
+            )))
+        }
+        ADDRESS_TYPE_IPV6 => {
+            let octets: [u8; 16] = address.try_into().ok()?;
+            Some(std::net::SocketAddr::from((
+                std::net::Ipv6Addr::from(octets),
+                port,
+            )))
+        }
+        _ => None,
     }
 }
 
@@ -1865,6 +2041,16 @@ const ON_AVAILABLE_IMAGE_ID_FOR_MALFORMED: i32 = ON_AVAILABLE_IMAGE_TYPE_ID;
 /// the two strings (`AERON_ALIGN(x, sizeof(int32_t))`).
 const fn align_up_four(value: usize) -> usize {
     (value + 3) & !3
+}
+
+fn le_i16(payload: &[u8], offset: usize) -> Option<i16> {
+    let bytes = payload.get(offset..offset + 2)?;
+    Some(i16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn le_u16(payload: &[u8], offset: usize) -> Option<u16> {
+    let bytes = payload.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn le_i32(payload: &[u8], offset: usize) -> Option<i32> {
@@ -2723,6 +2909,169 @@ mod response_tests {
                 "a {length}-byte payload is not a REJECT_IMAGE"
             );
         }
+    }
+
+    #[test]
+    fn a_reject_image_this_client_sends_is_one_this_driver_reads() {
+        // The round trip that matters: the encoder and the decoder are two
+        // halves of one contract, and a client whose own bytes its own driver
+        // refuses is a bug no interop test would attribute correctly.
+        let reason = b"Needs to be closed";
+
+        let encoded = encode_reject_image(7, 9, 11, 2048, reason);
+        let decoded = decode_reject_image(&encoded).expect("the driver accepts it");
+
+        assert_eq!(7, decoded.correlated.client_id);
+        assert_eq!(9, decoded.correlated.correlation_id);
+        assert_eq!(11, decoded.image_correlation_id);
+        assert_eq!(2048, decoded.position);
+        assert_eq!(reason, decoded.reason);
+    }
+
+    #[test]
+    fn a_reject_image_is_the_c_clients_bytes_and_not_the_java_ones() {
+        // `sizeof` + the reason + one NUL (`aeron_client_conductor.c:3630`),
+        // against the Java client's `MINIMUM_SIZE` + the reason. The difference
+        // shows where it costs something: with no reason at all the Java form
+        // is 36 bytes, which the driver's own dispatch refuses before any
+        // handler runs.
+        let reason = b"Needs to be closed";
+        let encoded = encode_reject_image(7, 9, 11, 2048, reason);
+
+        assert_eq!(40 + reason.len() + 1, encoded.len());
+        assert_eq!(
+            i32::try_from(reason.len()).expect("a short reason"),
+            i32::from_le_bytes(encoded[32..36].try_into().expect("four bytes"))
+        );
+        assert_eq!(reason, &encoded[36..36 + reason.len()]);
+        assert_eq!(
+            0,
+            encoded[36 + reason.len()],
+            "the NUL the C client writes past the reason"
+        );
+
+        // And the empty reason, which is the case the two forms disagree about.
+        let empty = encode_reject_image(7, 9, 11, 2048, b"");
+        assert_eq!(41, empty.len());
+        assert!(
+            40 <= empty.len(),
+            "a record shorter than `sizeof` is malformed, and this is not one"
+        );
+        assert!(decode_reject_image(&empty).is_ok());
+    }
+
+    #[test]
+    fn decodes_a_publication_error_with_its_ipv4_source() {
+        let message = b"Needs to be closed";
+
+        let mut payload = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH + message.len()];
+        payload[0..8].copy_from_slice(&42i64.to_le_bytes());
+        payload[8..16].copy_from_slice(&(-1i64).to_le_bytes());
+        payload[16..20].copy_from_slice(&1001i32.to_le_bytes());
+        payload[20..24].copy_from_slice(&7i32.to_le_bytes());
+        payload[24..32].copy_from_slice(&13i64.to_le_bytes());
+        payload[32..40].copy_from_slice(&(-1i64).to_le_bytes());
+        payload[40..42].copy_from_slice(&ADDRESS_TYPE_IPV4.to_le_bytes());
+        payload[42..44].copy_from_slice(&40456u16.to_le_bytes());
+        payload[44..48].copy_from_slice(&[127, 0, 0, 1]);
+        payload[60..64].copy_from_slice(&ERROR_CODE_IMAGE_REJECTED.to_le_bytes());
+        payload[64..68].copy_from_slice(
+            &i32::try_from(message.len())
+                .expect("a short message")
+                .to_le_bytes(),
+        );
+        payload[PUBLICATION_ERROR_HEADER_LENGTH..].copy_from_slice(message);
+
+        let Response::PublicationError {
+            registration_id,
+            destination_registration_id,
+            session_id,
+            stream_id,
+            receiver_id,
+            group_tag,
+            source,
+            error_code,
+            message: decoded,
+        } = decode_response(ON_PUBLICATION_ERROR_TYPE_ID, &payload)
+        else {
+            panic!("a publication error");
+        };
+
+        assert_eq!(42, registration_id);
+        assert_eq!(-1, destination_registration_id);
+        assert_eq!(1001, session_id);
+        assert_eq!(7, stream_id);
+        assert_eq!(13, receiver_id);
+        assert_eq!(-1, group_tag);
+        assert_eq!(ERROR_CODE_IMAGE_REJECTED, error_code);
+        assert_eq!(message, decoded);
+        assert_eq!(
+            Some("127.0.0.1:40456".parse().expect("an address")),
+            source,
+            "the four bytes of IPv4 and the port beside them, from host order"
+        );
+    }
+
+    #[test]
+    fn a_publication_errors_address_is_what_its_type_says_it_is() {
+        // The type is the only thing that says how many of the sixteen bytes
+        // are an address, so a reader that ignored it reads the head of an IPv6
+        // address as an IPv4 one — and a type this build does not know is no
+        // address rather than a guess (`aeron_driver_conductor.c:2312-2315`).
+        let mut payload = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH];
+        payload[44..60]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        payload[42..44].copy_from_slice(&40456u16.to_le_bytes());
+
+        payload[40..42].copy_from_slice(&ADDRESS_TYPE_IPV6.to_le_bytes());
+        let Response::PublicationError { source, .. } =
+            decode_response(ON_PUBLICATION_ERROR_TYPE_ID, &payload)
+        else {
+            panic!("a publication error");
+        };
+        assert_eq!(
+            Some("[2001:db8::1]:40456".parse().expect("an address")),
+            source
+        );
+
+        payload[40..42].copy_from_slice(&0i16.to_le_bytes());
+        let Response::PublicationError { source, .. } =
+            decode_response(ON_PUBLICATION_ERROR_TYPE_ID, &payload)
+        else {
+            panic!("a publication error");
+        };
+        assert_eq!(None, source, "no family, no address");
+    }
+
+    #[test]
+    fn refuses_a_truncated_publication_error() {
+        for length in [0, 24, PUBLICATION_ERROR_HEADER_LENGTH - 1] {
+            assert_eq!(
+                Response::Other {
+                    type_id: ON_PUBLICATION_ERROR_TYPE_ID
+                },
+                decode_response(ON_PUBLICATION_ERROR_TYPE_ID, &vec![0u8; length]),
+                "a {length}-byte payload is not a publication error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_publication_error_shorter_than_it_claims_carries_what_arrived() {
+        // The declared length runs past the record. The message is cut to the
+        // payload rather than read beyond it, which is the same choice
+        // `ON_ERROR` makes and for the same reason: what arrived is what the
+        // client is told.
+        let mut payload = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH + 4];
+        payload[64..68].copy_from_slice(&100i32.to_le_bytes());
+
+        let Response::PublicationError { message, .. } =
+            decode_response(ON_PUBLICATION_ERROR_TYPE_ID, &payload)
+        else {
+            panic!("a publication error");
+        };
+
+        assert_eq!(vec![0u8; 4], message);
     }
 
     #[test]
