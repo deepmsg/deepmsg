@@ -27,10 +27,11 @@ name: interop
 #
 # It runs **on demand**, not on pull requests. Running it on every PR was the
 # first attempt and it was wrong for a reason that has nothing to do with this
-# job's correctness: it takes most of an hour — a reference checkout, a Gradle
-# build, and seventy-two test classes each in their own JVM — so it held up the
-# acceptance of every *other* branch. A gate that long has to be something you
-# choose to pay for, not something you pay for by opening a pull request.
+# job's correctness: it takes **21 minutes** — measured, not estimated, on the
+# run that first completed the set: a reference checkout, a Gradle build, and
+# seventy-two test classes each in its own JVM. So it held up the acceptance of
+# every *other* branch, and a gate that long has to be something you choose to
+# pay for rather than something you pay for by opening a pull request.
 #
 # So the trigger is `workflow_dispatch`. Run it with
 #
@@ -64,6 +65,14 @@ name: interop
 # Until then it is expected to be **red**: a red run here is a list of known
 # gaps, not a broken build, and the job summary says which gap each failure
 # belongs to.
+#
+# That was checked against a run rather than assumed. The first complete one —
+# 21 minutes, every infrastructure step green including the checkout — reported
+# 72 classes, 374 tests, 165 failures and five classes that never finished, and
+# it agreed with the developer-machine baseline (`deepmsg-g0-2-baseline.md`)
+# **class for class**: the same 28 green, the same 39 with failures, the same
+# five that hang. So a red run is reproducible, and a green one would mean
+# something.
 
 on:
   workflow_dispatch:
