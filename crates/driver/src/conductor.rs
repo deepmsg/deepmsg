@@ -1026,7 +1026,7 @@ impl Conductor {
     /// Let go of a network publication: stop sending it, give its counters
     /// back, and count one less reader on its endpoint
     /// (`aeron_network_publication_close`,
-    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-360`).
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-354`).
     ///
     /// The IPC path does the same for its own publications
     /// ([`IpcPublications::release_links`]); this is the half that was missing,
@@ -2043,7 +2043,7 @@ impl Conductor {
                 // local read of a publication to a multi-destination
                 // subscription, which is the third way a spy link is made
                 // (`aeron_driver_conductor_execute_add_receive_spy_destination`,
-                // `:5704-5806`, and its removal at `:6024-6068`).
+                // `:5704-5806`, and its removal at `:6024-6065`).
                 if is_spy_channel(request.channel) {
                     let now = Now {
                         ms: now_ms,
@@ -2099,7 +2099,7 @@ impl Conductor {
                 // The network branch. A destination is added to the
                 // **subscription** the client named — that is what its
                 // registration id is — and through it to the endpoint that
-                // subscription reads on (`aeron_driver_conductor.c:5903-5919`).
+                // subscription reads on (`aeron_driver_conductor.c:5879-5910`).
                 let Some(link) = subscriptions.find_mds(request.registration_id) else {
                     transmit.error(
                         request.correlation_id,
@@ -3150,7 +3150,7 @@ mod tests {
     /// timeout, and this is not a command this driver will get to later. The
     /// other two are **served**: a spy destination is a local read added to a
     /// multi-destination subscription (`:5704-5806`) and a network one is a
-    /// socket added to any network subscription (`:5903-5919`), and both reach
+    /// socket added to any network subscription (`:5879-5910`), and both reach
     /// the subscription first. The registration id here names no subscription,
     /// so what this covers is the triage — each prefix reaching its own branch,
     /// with each branch's own answer for a subscription that is not there.
@@ -3169,7 +3169,7 @@ mod tests {
                 "aeron:ipc destinations are not served by this driver",
             ),
             // A spy names a subscription it cannot find, which is the
-            // reference's own unknown-subscription error (`:6006-6014`).
+            // reference's own unknown-subscription error (`:6053-6062`).
             (
                 "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
                 "unknown subscription",

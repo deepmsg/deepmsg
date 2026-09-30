@@ -696,7 +696,7 @@ impl NetworkPublications {
         // A link that fails is answered as an error on the publication's own
         // correlation id, which is what the reference's command state machine
         // does with the failure this returns (`:4220-4224` then the ERROR arm
-        // of `:3236-3240`). It is a reader the client will never hear about,
+        // of `:3305-3318`). It is a reader the client will never hear about,
         // and the alternative — silence — is a spy that waits for ever.
         let failed = subscriptions.link_spy_subscriptions(
             self.publications.last().expect("just pushed"),

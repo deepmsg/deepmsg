@@ -457,15 +457,16 @@ pub fn is_spy_channel(channel: &[u8]) -> bool {
 
 /// Resolve the channel a spy names, with the `aeron-spy:` prefix taken off
 /// (`aeron_driver_conductor_on_add_spy_subscription`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4937-4942`, and its
-/// destination twin at `:5816-5821`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4939-4942`, and its
+/// destination twin at `:5821-5824`).
 ///
 /// A spy is not a channel of its own: what follows the prefix is the UDP
 /// channel the publication it reads sends on, parsed exactly as that
 /// publication parsed it. Everything the match rule compares — the canonical
-/// form and the channel tag — is read off this parse, which is why a spy that
-/// spells its endpoint differently from the publisher still matches it and one
-/// that names a different endpoint does not (`:92-108`).
+/// form and the channel tag — is read off this parse (`:92-108`); a spy whose
+/// URI carries parameters the publisher's never mentioned is still reading the
+/// same channel, because the canonical form quotes the two sides and nothing
+/// else.
 ///
 /// The address is resolved here, where the reference hands the text to its
 /// native resource agent and resolves it off the conductor's thread. Both
@@ -1169,7 +1170,7 @@ mod tests {
 
     /// A spy names the channel it reads, with the prefix taken off — and the
     /// two channels it can then be compared with are the publisher's
-    /// (`:4937-4942`, `:92-108`).
+    /// (`:4939-4942`, `:92-108`).
     #[test]
     fn a_spy_names_the_channel_after_its_prefix() {
         let spy = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123")

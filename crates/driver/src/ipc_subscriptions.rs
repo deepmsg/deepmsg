@@ -82,7 +82,7 @@ pub enum SubscriptionTarget {
     /// A **network publication's** log buffer, read locally without a socket:
     /// what a spy reads (`aeron_driver_conductor_link_subscribable` called
     /// with a network publication's subscribable,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4902-4921`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921`).
     ///
     /// It is the same kind of thing to a link as the other two — a log buffer
     /// in this process and a counter the client advances — and it is *not* an
@@ -135,7 +135,7 @@ pub enum SetupStatus {
 }
 
 /// One subscription (`aeron_subscription_link_t`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.h:120-162`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.h:102-131`).
 ///
 /// The reference's struct is wider than this and most of the difference is
 /// network: a spy channel, a setup status and the group consideration are all
@@ -147,7 +147,7 @@ pub enum SetupStatus {
 /// The endpoint was left out until something needed it. `ADD_RCV_DESTINATION`
 /// is what needs it: a client adds a source to **a subscription**, and what a
 /// destination is added to is that subscription's receive endpoint
-/// (`aeron_driver_conductor.c:5903-5919`).
+/// (`aeron_driver_conductor.c:5879-5910`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionLink {
     /// The client's correlation id for the `ADD_SUBSCRIPTION`.
@@ -186,7 +186,7 @@ pub struct SubscriptionLink {
     pub endpoint_id: Option<u64>,
     /// The channel a **spy** subscription reads, or [`None`] for every other
     /// kind (`aeron_subscription_link_t`'s `spy_channel`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.h:120-162`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.h:102-131`).
     ///
     /// It is the field that separates the two endpoints-less kinds: an IPC
     /// subscription has no channel of its own beyond the string the client
@@ -298,7 +298,7 @@ impl SubscriptionLink {
         // The session clause is the reference's
         // `is_wildcard_or_session_id_match` (`:74-79`), the same one the image
         // rule uses — a spy link is never a response one
-        // (`:4883` sets `is_response` false), so the two shapes agree.
+        // (`:4886` sets `is_response` false), so the two shapes agree.
         let session_matches =
             (self.session_id.is_none() && !self.is_response) || self.session_id == Some(session_id);
 
@@ -334,10 +334,10 @@ pub enum AddSubscriptionError {
     /// The receiver thread has stopped.
     Receiver,
     /// An `ADD_RCV_DESTINATION` named a subscription no network link carries
-    /// (`:6006-6014`).
+    /// (`:6053-6062`).
     UnknownSubscription,
     /// An `ADD_RCV_DESTINATION` named a subscription whose channel does not
-    /// allow manual control, and so may not have sources added to it (`:6016-6020`).
+    /// allow manual control, and so may not have sources added to it (`:5608-5611`).
     NotManualControl,
 }
 
@@ -436,7 +436,7 @@ impl IpcSubscriptions {
     /// A destination is added to **a subscription**, not to a channel or an
     /// endpoint: the client holds the subscription's registration id, and the
     /// endpoint is what that subscription happens to read through
-    /// (`:5903-5919`).
+    /// (`:5879-5910`).
     ///
     /// The endpoint clause is the reference's — it walks
     /// `network_subscriptions` and nothing else — and it earns its place
@@ -545,14 +545,14 @@ impl IpcSubscriptions {
     /// Serve an `ADD_SUBSCRIPTION` for a spy channel
     /// (`aeron_driver_conductor_on_add_spy_subscription`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4926-4966`, and the
-    /// executor the parse ends in, `:4827-4925`).
+    /// executor the parse ends in, `:4827-4924`).
     ///
     /// This is the one kind of subscription that is **not a socket**. What it
     /// reads is a publication's log buffer, in this process, which the
     /// publisher is already writing into — so there is no endpoint to make, no
     /// session to elicit and no channel status to report: the reply carries
     /// [`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`], which is the reference
-    /// saying exactly that (`:4888-4889`).
+    /// saying exactly that (`:4892-4894`).
     ///
     /// # Errors
     ///
@@ -573,7 +573,7 @@ impl IpcSubscriptions {
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
         // The prefix comes off first and the rest is an ordinary UDP channel
-        // (`:4937-4942`): the reference parses the stripped bytes and keeps the
+        // (`:4939-4942`): the reference parses the stripped bytes and keeps the
         // result as the link's `spy_channel`, which is what the match rule
         // compares against a publication's endpoint channel.
         let spy_channel = crate::udp_channel::resolve_spy_channel(request.channel)
@@ -709,7 +709,7 @@ impl IpcSubscriptions {
     /// been spied from the start.
     ///
     /// The link is stored under the **subscription's** registration id, not the
-    /// destination's (`:5741`), which is what makes the pair one thing: a
+    /// destination's (`:5763`), which is what makes the pair one thing: a
     /// `REMOVE_SUBSCRIPTION` for that id takes the spied images with it, and
     /// the destination is removed by naming the channel it was added with.
     ///
@@ -759,7 +759,7 @@ impl IpcSubscriptions {
         }
 
         // The subscription's stream, the destination's session — the reference
-        // reads each off the thing that owns it (`:5738-5744`), and the channel
+        // reads each off the thing that owns it (`:5759-5763`), and the channel
         // it records is the **destination's**, which is what the reader's
         // counter is labelled with and what a removal names.
         let link = SubscriptionLink {
@@ -780,7 +780,7 @@ impl IpcSubscriptions {
         };
 
         // An acknowledgement, not a subscription ready: the client asked for a
-        // destination and that is what it is told about (`:5746`).
+        // destination and that is what it is told about (`:5774`).
         events.operation_succeeded(request.correlation_id);
 
         self.links.push(link);
@@ -804,7 +804,7 @@ impl IpcSubscriptions {
     }
 
     /// Serve a `REMOVE_RCV_DESTINATION` whose channel is a spy
-    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6068`).
+    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6065`).
     ///
     /// The link is found by its registration id **and** the channel it was
     /// added with, which is what tells two spy destinations on one subscription
@@ -1637,7 +1637,7 @@ fn link_subscribable(
 
 /// Give a **spy** subscription a reader position in a network publication
 /// (`aeron_driver_conductor_link_subscribable` called from the two spy scans,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4902-4921` and
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921` and
 /// `:4201-4226`).
 ///
 /// The same five steps as [`link_subscribable`], with one missing and one
@@ -1657,7 +1657,7 @@ fn link_subscribable(
 ///
 /// What the client is told is an ordinary image message whose source identity
 /// is the **IPC constant** and whose log file is the publication's own
-/// (`:4914-4920`): a spy reads a log buffer in this process, and the constant
+/// (`:4913-4914`): a spy reads a log buffer in this process, and the constant
 /// is how the reference says so.
 fn link_spy_publication(
     link: &mut SubscriptionLink,
@@ -1700,7 +1700,7 @@ fn link_spy_publication(
 
 /// The first two steps of a link: the reader's counter, with the join position
 /// in its label, owned by the client and referenced by what it reads
-/// (`aeron_driver_conductor_link_subscribable`, `:3560-3578`).
+/// (`aeron_driver_conductor_link_subscribable`, `:3561-3578`).
 ///
 /// # Errors
 ///
@@ -1741,7 +1741,7 @@ fn allocate_reader_position(
 }
 
 /// The last three steps: the entry that makes the link a reader, the seed, and
-/// the message (`aeron_driver_conductor_link_subscribable`, `:3580-3605`).
+/// the message (`aeron_driver_conductor_link_subscribable`, `:3582-3605`).
 ///
 /// # Errors
 ///
