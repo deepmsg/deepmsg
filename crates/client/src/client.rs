@@ -1204,9 +1204,15 @@ impl Client {
         // directory, or after this client was reaped. Writing `now` into it
         // would keep a stranger alive and keep this client looking healthy
         // while it is not (`aeron_client_conductor.c:1338-1390`).
-        let still_ours = counters.get(counter_id).is_some_and(|counter| {
-            counter.type_id == CLIENT_HEARTBEAT_TYPE_ID && counter.registration_id == self.client_id
-        });
+        //
+        // Read **by id**, in constant time, as the reference does
+        // (`aeron_counter_heartbeat_timestamp_is_active`, `:1234-1249`). Asking
+        // the same question by scanning the catalogue costs the whole catalogue
+        // — every counter in the file, each one built into a descriptor with
+        // its label — and this is on the poll path, which is the loop every
+        // client runs: a scan here measured 6.6 us per poll, against 25 ns for
+        // the message poll beside it.
+        let still_ours = counters.is_active(counter_id, CLIENT_HEARTBEAT_TYPE_ID, self.client_id);
 
         if !still_ours {
             self.terminate(ClientError::HeartbeatCounterClosed);
