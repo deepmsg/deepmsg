@@ -121,7 +121,7 @@ impl SubscribableHooks for SpyHooks<'_> {
 
     fn position_removed(&mut self, _position: &TetherablePosition, working_before: usize) {
         // One working position before the removal means this was the last
-        // reader (`:1367-1370`, which asks the same question of the set).
+        // reader (`:1368-1370`, which asks the same question of the set).
         if 1 == working_before {
             *self.has_spies = false;
         }
