@@ -1,0 +1,292 @@
+name: interop
+
+# The reference's own system tests, run against **this build's media driver**.
+#
+# The reference selects an external driver with one system property and hands it
+# a configuration as environment variables (`CTestMediaDriver.java:218-260`,
+# `:332`), so the only thing replaced is the binary. Nothing on the Java side is
+# a stand-in: `TestMediaDriver`, `SystemTestWatcher` and the 72 test classes are
+# the reference's own, which is what makes the result mean something.
+#
+# Three things this job is not:
+#
+#   1. **It does not replace `check`.** The Rust gates, the interop targets'
+#      compile-and-lint, and the workspace tests all stay where they are — they
+#      need no reference checkout and are minutes faster than this.
+#   2. **A green run here is a weaker signal than it looks.** 58 of the 82 OSS
+#      test classes ask for `ThreadingMode.SHARED`, which this driver does not
+#      have; the harness sends `AERON_THREADING_MODE` and the driver ignores it,
+#      so everything below runs under `DEDICATED`. A test that passes because it
+#      never actually shared a thread is not evidence about `SHARED`. See G4-1.
+#   3. **It does not run the whole system-test task.** `archive`, `cluster` and
+#      `security` are out of scope (the archive is C-less by design), and so are
+#      the four classes the reference itself partitions out by tag — `slow`,
+#      `logging`, `topology` and `bindings` have their own Gradle tasks.
+#
+# # Why this is manual, and when it stops being manual
+#
+# It runs **on demand**, not on pull requests. Running it on every PR was the
+# first attempt and it was wrong for a reason that has nothing to do with this
+# job's correctness: it takes **21 minutes** — measured, not estimated, on the
+# run that first completed the set: a reference checkout, a Gradle build, and
+# seventy-two test classes each in its own JVM. So it held up the acceptance of
+# every *other* branch, and a gate that long has to be something you choose to
+# pay for rather than something you pay for by opening a pull request.
+#
+# So the trigger is `workflow_dispatch`. Run it with
+#
+#     gh workflow run interop.yml
+#     gh workflow run interop.yml --ref <branch>
+#     gh workflow run interop.yml -f classes=io.aeron.ChannelValidationTest
+#
+# or from the Actions tab, optionally narrowed with the inputs below — checking
+# one class after a change is a few minutes, not an hour.
+#
+# **Two things about dispatching a workflow that are easy to trip on**, and both
+# bite exactly when someone is trying to use this to check a branch:
+#
+#   * `workflow_dispatch` only exists once the file is on the **default
+#     branch**. Until this lands on `main` there is no button and no
+#     `gh workflow run` — the run has to come from a push.
+#   * a dispatch runs the workflow **as it exists on the ref it is given**, and
+#     the default is the default branch. So checking a branch means
+#     `--ref <branch>`; without it this reports on `main` and looks like it
+#     answered a question it never asked.
+#
+# **When the repair plan's slices have landed, this becomes a PR gate again**:
+# add back
+#
+#     on:
+#       pull_request:
+#
+# and nothing else needs to change. That is the point of keeping the workflow
+# in the tree rather than in a scratch directory — the file is the work.
+#
+# Until then it is expected to be **red**: a red run here is a list of known
+# gaps, not a broken build, and the job summary says which gap each failure
+# belongs to.
+#
+# That was checked against a run rather than assumed. The first complete one —
+# 21 minutes, every infrastructure step green including the checkout — reported
+# 72 classes, 374 tests, 165 failures and five classes that never finished, and
+# it agreed with the developer-machine baseline (`deepmsg-g0-2-baseline.md`)
+# **class for class**: the same 28 green, the same 39 with failures, the same
+# five that hang. So a red run is reproducible, and a green one would mean
+# something.
+
+on:
+  workflow_dispatch:
+    inputs:
+      classes:
+        description: 'Comma-separated test classes to run. Empty runs all 72.'
+        required: false
+        default: ''
+      timeout:
+        description: 'Seconds allowed per class before it is killed.'
+        required: false
+        default: '120'
+
+env:
+  CARGO_TERM_COLOR: always
+  # The exact reference commit the byte contracts were read from
+  # (`docs/reference.md`). Every cache key below is derived from it, so bumping
+  # it invalidates the reference build in one place.
+  AERON_COMMIT: 664f58e705
+
+jobs:
+  system-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A plain clone rather than `actions/checkout`, for a reason that is not
+      # stylistic: that action **refuses any path outside the workspace**
+      # ("Repository path ... is not under ..."), and this repository's whole
+      # reference arrangement is a *sibling* directory — `docs/reference.md`
+      # documents it, and `tests/src/driver.rs` hard-codes `../../aeron/...`
+      # from the `tests/` crate. Checking the reference out *inside* the
+      # workspace would work for this job and break the moment the Rust interop
+      # suite is added here, because that one looks for a sibling.
+      #
+      # The pinned commit `664f58e705f850dfb926f6293707b204ba804726` **is** the
+      # `1.53.2` release tag, so a shallow clone of the tag is the whole of it —
+      # 30 MB and a few seconds instead of the full history. The assertion below
+      # is what keeps that equivalence honest: if the tag ever moved, or a typo
+      # landed in `AERON_COMMIT`, this fails here instead of producing a run
+      # against a tree the byte contracts were not read from.
+      #
+      # The comparison is a **prefix** one, and that is not a loosening: the
+      # constant is a ten-character abbreviation and `rev-parse HEAD` prints all
+      # forty, so an equality test fails on the correct commit. It did, the first
+      # time this ran — the clone was right and the assertion was wrong. A full
+      # SHA in the constant still compares exactly, because equality is a prefix.
+      - name: Check out the reference at the pinned commit
+        working-directory: ${{ github.workspace }}/..
+        run: |
+          git clone --quiet --depth 1 --branch 1.53.2 \
+            https://github.com/aeron-io/aeron.git aeron
+          actual=$(git -C aeron rev-parse HEAD)
+          case "$actual" in
+            "$AERON_COMMIT"*) echo "reference at $actual (pinned $AERON_COMMIT)" ;;
+            *)
+              echo "::error::the 1.53.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
+              exit 1
+              ;;
+          esac
+
+      - name: Install the pinned Rust toolchain
+        # `cargo` resolves to the channel in `rust-toolchain.toml`, so this is
+        # the same one `check` uses.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --no-self-update
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache the reference build
+        id: reference-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ../aeron/*/build
+          # Keyed on the reference commit, so a bump rebuilds it. The second
+          # component is a manual salt: change it to force a rebuild when the
+          # caches are suspected rather than the code.
+          key: aeron-${{ env.AERON_COMMIT }}-v1
+
+      # Printed rather than assumed. Without this a cache that silently stopped
+      # matching degrades into "every pull request rebuilds the reference" and
+      # nobody notices — the job just gets slower.
+      - name: Report whether the cache matched
+        run: |
+          echo "reference cache: ${{ steps.reference-cache.outputs.cache-hit == 'true' && 'HIT' || 'MISS' }}"
+          echo "### Reference build cache: ${{ steps.reference-cache.outputs.cache-hit == 'true' && 'hit' || 'miss' }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build this driver
+        run: cargo build -p deepmsg-driver
+
+      # One Gradle invocation per test class, and the reason is a finding rather
+      # than a preference: at least one OSS test waits for behaviour this driver
+      # does not have in a loop with no timeout at all —
+      #
+      #     while (null == (counter = client.getCounter(correlationId))) Thread.yield();
+      #     (CounterTest.java:640, waiting for a static counter)
+      #
+      # — and `Thread.yield()` swallows the interrupt, so the reference's own
+      # `InterruptingTestCallback` cannot break it either. In a single run one
+      # such class spins the worker forever, the results task never executes,
+      # and **not one XML file is written**: the whole run is lost, not just the
+      # class. Per class, the damage is bounded and the outcome is recorded.
+      #
+      # The `timeout` input is the per-class bound, 120s by default. Ordinary
+      # classes finish in under twenty seconds; the slowest observed on a
+      # developer machine was 65, and the ones that do not finish are the five
+      # that hang.
+      - name: Run the OSS system tests
+        working-directory: ../aeron
+        # The dispatch inputs arrive as environment rather than interpolated
+        # into the script. `${{ inputs.x }}` is textual substitution before the
+        # shell ever sees the line, so a value containing a quote or a `;`
+        # would be code; through `env` it is data.
+        env:
+          CHOSEN_CLASSES: ${{ inputs.classes }}
+          PER_CLASS_TIMEOUT: ${{ inputs.timeout }}
+        run: |
+          set -u
+          cat > /tmp/classes.py <<'PY'
+          # The OSS set: the reference's own `io/aeron/` and `io/aeron/driver/`,
+          # minus what the default `test` task would never run anyway.
+          import pathlib, re
+
+          TAGS = ("SlowTest", "LoggingTest", "TopologyTest", "BindingsTest")
+          root = pathlib.Path("aeron-system-tests/src/test/java")
+
+          for path in sorted(list(root.glob("io/aeron/*.java")) + list(root.glob("io/aeron/driver/*.java"))):
+              text = path.read_text()
+              if not re.search(r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory)", text):
+                  continue  # a helper or an abstract base
+              if "DriverLoggingSystemTest" in path.name:
+                  continue  # excluded by build.gradle:1145, run by its own task
+              head = text[: text.index("class ") + 80]
+              if any(re.search(r"@" + t + r"\b", head) for t in TAGS):
+                  continue  # a class-level tag: excludeTags 'any()' drops it
+              methods = re.findall(r"((?:@\w+(?:\([^)]*\))?\s*)+)\s+void\s+\w+", text)
+              tested = [m for m in methods if "@Test" in m]
+              if tested and all(any("@" + t in m for t in TAGS) for m in tested):
+                  continue  # every test tagged: same exclusion
+              print(str(path.relative_to(root))[:-5].replace("/", "."))
+          PY
+          # A run may name the classes it wants, which is what makes this
+          # useful by hand: the whole set is an hour, one class is minutes.
+          if [ -n "$CHOSEN_CLASSES" ]; then
+            printf '%s\n' "$CHOSEN_CLASSES" | tr ',' '\n' | tr -d ' ' | grep -v '^$' > /tmp/classes.txt
+            echo "hand-picked: $(tr '\n' ' ' < /tmp/classes.txt)"
+          else
+            python3 /tmp/classes.py > /tmp/classes.txt
+          fi
+          echo "running $(wc -l < /tmp/classes.txt) classes"
+
+          per_class="$PER_CLASS_TIMEOUT"
+
+          mkdir -p /tmp/results /tmp/logs
+          : > /tmp/status.tsv
+          while read -r cls; do
+            rm -rf aeron-system-tests/build/test-results/test
+            # `|| rc=$?` rather than a bare call followed by `rc=$?`: `run:`
+            # blocks execute under `bash -e`, so a bare failing `gradlew` ends
+            # the step right there — which is the opposite of the point, since
+            # a failing test class is the expected outcome, not an error.
+            rc=0
+            timeout "$per_class" ./gradlew --quiet :aeron-system-tests:test \
+              --tests "$cls" \
+              -Daeron.test.system.aeronmd.path="$GITHUB_WORKSPACE/target/debug/deepmsg-driver" \
+              > "/tmp/logs/$cls.log" 2>&1 || rc=$?
+            cp -n aeron-system-tests/build/test-results/test/TEST-*.xml /tmp/results/ 2>/dev/null || true
+            case $rc in
+              0)   echo -e "$cls\tok" ;;
+              124) echo -e "$cls\tTIMEOUT after ${per_class}s" ;;
+              *)   echo -e "$cls\tfailed" ;;
+            esac | tee -a /tmp/status.tsv
+            # A hung class leaves its driver behind; kill only the ones this
+            # script started, identified by the directory they were given.
+            for pid in $(pgrep -x deepmsg-driver || true); do
+              tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                | grep -q "^AERON_DIR=/dev/shm/aeron-" && kill -9 "$pid" || true
+            done
+          done < /tmp/classes.txt
+
+          # The outcome the job is graded on, said once and explicitly. The
+          # loop above swallows each class's exit code on purpose, so without
+          # this the step would end green however badly the classes did — a
+          # gate that reports its findings and then passes is a gate nobody
+          # reads.
+          total=$(wc -l < /tmp/status.tsv)
+          passed=$(grep -c $'\tok$' /tmp/status.tsv || true)
+          hung=$(grep -c 'TIMEOUT' /tmp/status.tsv || true)
+          echo "::notice::$passed of $total classes passed, $hung did not finish in ${per_class}s"
+          if [ "$passed" != "$total" ]; then
+            echo "::error::$((total - passed)) of $total OSS system-test classes did not pass. \
+          This is expected until the repair plan's slices land — the job summary says which gap \
+          each failure belongs to."
+            exit 1
+          fi
+
+      - name: Summarise
+        if: always()
+        run: python3 .github/scripts/interop-summary.py /tmp/results /tmp/status.tsv >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-test-results
+          path: |
+            /tmp/results
+            /tmp/status.tsv
+            /tmp/logs
+          if-no-files-found: warn
