@@ -58,6 +58,15 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a driver is given to stop once the command has been written.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The budget the harness gives a driver before it kills it
+/// (`CTestMediaDriver.java:593` is a `waitFor(10, SECONDS)`).
+///
+/// Not a limit this test may approach: it is the number the driver has to stay
+/// **well** inside, because those ten seconds are paid by every test in the
+/// suite. Two is loose enough not to be flaky on a loaded machine and tight
+/// enough that a driver needing the fallback cannot pass.
+const EXIT_BUDGET: Duration = Duration::from_secs(2);
+
 /// The variables the harness can send **that this driver reads**, each with a
 /// non-default value it accepts.
 ///
@@ -516,4 +525,22 @@ fn the_harness_shaped_terminate_command_stops_the_driver() {
         "the driver ran its own shutdown path rather than being killed"
     );
     assert_eq!(0, fixture.stderr_len());
+}
+
+#[test]
+fn the_driver_stops_well_inside_the_harness_budget() {
+    let Some(mut fixture) = Fixture::start("terminate-budget", READ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _ = fixture.await_cnc();
+    let elapsed = fixture.terminate();
+
+    assert!(
+        elapsed < EXIT_BUDGET,
+        "the driver took {elapsed:?} to stop after the command; the harness waits 10s and then \
+         kills it (CTestMediaDriver.java:593-599), which it pays for once per test"
+    );
+    assert_eq!(Some(0), fixture.exit().code(), "and it exits cleanly");
 }
