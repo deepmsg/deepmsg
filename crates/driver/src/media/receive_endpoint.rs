@@ -296,6 +296,76 @@ pub struct ReceiveChannelEndpoint {
     pub socket_sndbuf: usize,
 }
 
+/// Write the address the endpoint is bound to into its channel-status label
+/// (`aeron_driver_conductor.c:2157-2165`, asking
+/// `aeron_receive_channel_endpoint_bind_addr_and_port`, `:316-329`).
+///
+/// The address is the **first destination's**, because the endpoint's socket is
+/// a destination's socket — that is what the reference's accessor answers with,
+/// and for a channel that starts with no destination it answers with nothing at
+/// all. The label is then written anyway, with an empty address, so it ends in
+/// a space: that is the reference's own output for the case, and matching it is
+/// the whole point of writing the label rather than leaving the one the counter
+/// was allocated with.
+///
+/// The socket is asked rather than the channel believed: a destination is
+/// allowed to name port zero, and the kernel's answer is the only true one —
+/// the same rule the send side's `publish_local_sockaddr` follows.
+///
+/// # Errors
+///
+/// [`ReceiveEndpointError::NoCounter`] when the label cannot be written, which
+/// is the counter having vanished from under the allocator.
+fn publish_bound_address(
+    channel_status_counter_id: i32,
+    channel: &[u8],
+    destinations: &[ReceiveDestination],
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+) -> Result<(), ReceiveEndpointError> {
+    let address = match destinations.first() {
+        Some(destination) => crate::udp_channel::format_source_identity(
+            destination
+                .transport
+                .local_address()
+                .map_err(ReceiveEndpointError::Socket)?,
+        )
+        .map_err(|error| ReceiveEndpointError::Socket(io::Error::other(error)))?,
+        None => String::new(),
+    };
+
+    // `"%s: %.*s %.*s"` — the name, the channel, the address
+    // (`aeron_position.c:229-244`), replacing the label the counter was
+    // allocated with. The channel is bytes rather than text, as it is there: it
+    // is whatever the client sent, and this end never decodes it.
+    let mut label = format!("{}: ", counter_position::RECEIVE_CHANNEL_STATUS_NAME).into_bytes();
+    label.extend_from_slice(channel);
+    label.push(b' ');
+    label.extend_from_slice(address.as_bytes());
+
+    counters
+        .update_label(regions, channel_status_counter_id, &label)
+        .ok_or(ReceiveEndpointError::NoCounter)?;
+
+    Ok(())
+}
+
+/// Release the counters a failed create had already allocated, so a refusal
+/// leaves nothing behind.
+fn release_counters(
+    destinations: &[ReceiveDestination],
+    channel_status_counter_id: i32,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    now_ms: i64,
+) {
+    for destination in destinations {
+        counters.free(regions, destination.local_sockaddr_counter_id, now_ms);
+    }
+
+    counters.free(regions, channel_status_counter_id, now_ms);
+}
+
 impl ReceiveChannelEndpoint {
     /// Create the endpoint: allocate its channel-status counter and open the
     /// socket bound to the channel's endpoint parameter
@@ -362,6 +432,23 @@ impl ReceiveChannelEndpoint {
             }
         };
 
+        if let Err(error) = publish_bound_address(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &destinations,
+            counters,
+            regions,
+        ) {
+            release_counters(
+                &destinations,
+                channel_status_counter_id,
+                counters,
+                regions,
+                now_ms,
+            );
+            return Err(error);
+        }
+
         Ok(Self {
             destinations,
             channel,
@@ -425,6 +512,23 @@ impl ReceiveChannelEndpoint {
                 }
             }
         };
+
+        if let Err(error) = publish_bound_address(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &destinations,
+            counters,
+            regions,
+        ) {
+            release_counters(
+                &destinations,
+                channel_status_counter_id,
+                counters,
+                regions,
+                now_ms,
+            );
+            return Err(error);
+        }
 
         Ok(Self {
             destinations,
