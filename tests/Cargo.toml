@@ -161,6 +161,13 @@ name = "udp_padding_frame"
 path = "interop/udp_padding_frame.rs"
 required-features = ["interop"]
 
+# The reference's own C client, compiled from `fixtures/spy_probe.c`, reading a
+# local publication through `aeron-spy:` — no shipped sample uses the scheme.
+[[test]]
+name = "spy_reference"
+path = "interop/spy_reference.rs"
+required-features = ["interop"]
+
 # A4 (receiving): a reference `BasicPublisher`, its messages read by our client
 # through a subscription whose only address is a receive destination.
 [[test]]

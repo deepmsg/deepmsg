@@ -615,6 +615,15 @@ impl IpcSubscriptions {
         // Then every publication it already matches (`:4900-4921`), and — the
         // other half of the same question — every publication that appears
         // after it ([`Self::link_spy_subscriptions`]).
+        //
+        // The reference asks `is_accepting_subscriptions` of each candidate
+        // before linking it (`aeron_network_publication.h:290-297`), which is
+        // about its three-state life: an ACTIVE publication takes readers, and
+        // a DRAINING one only while it still has some and its producer is
+        // ahead of its sender. A network publication here has no draining
+        // state — a removal takes it out of the collection in one step — so a
+        // publication that is there is one that is taking readers, and the
+        // question has no third answer to give.
         let link = self.links.last_mut().expect("just pushed");
 
         for publication in publications.publications() {
