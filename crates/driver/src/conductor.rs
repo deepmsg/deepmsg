@@ -2100,7 +2100,7 @@ impl Conductor {
                 // **subscription** the client named — that is what its
                 // registration id is — and through it to the endpoint that
                 // subscription reads on (`aeron_driver_conductor.c:5903-5919`).
-                let Some(link) = subscriptions.find(request.registration_id) else {
+                let Some(link) = subscriptions.find_mds(request.registration_id) else {
                     transmit.error(
                         request.correlation_id,
                         ERROR_CODE_UNKNOWN_SUBSCRIPTION,

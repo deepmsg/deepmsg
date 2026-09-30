@@ -430,16 +430,25 @@ impl IpcSubscriptions {
 
     /// The subscription a client holds by the id it was answered with, which is
     /// what `ADD_RCV_DESTINATION` names
-    /// (`aeron_driver_conductor_find_subscription_by_registration_id`).
+    /// (`aeron_driver_conductor_find_mds_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5581-5615`).
     ///
     /// A destination is added to **a subscription**, not to a channel or an
     /// endpoint: the client holds the subscription's registration id, and the
     /// endpoint is what that subscription happens to read through
-    /// (`aeron_driver_conductor.c:5903-5919`).
-    pub fn find(&self, registration_id: i64) -> Option<&SubscriptionLink> {
+    /// (`:5903-5919`).
+    ///
+    /// The endpoint clause is the reference's — it walks
+    /// `network_subscriptions` and nothing else — and it earns its place
+    /// because a registration id can name more than one link: a spy added as a
+    /// receive destination is stored under its subscription's id and has no
+    /// endpoint at all. A destination is a socket or a local read *inside* a
+    /// subscription that listens, so the link a destination names is always
+    /// one with an endpoint.
+    pub fn find_mds(&self, registration_id: i64) -> Option<&SubscriptionLink> {
         self.links
             .iter()
-            .find(|link| link.registration_id == registration_id)
+            .find(|link| link.registration_id == registration_id && link.endpoint_id.is_some())
     }
 
     /// How many publications this subscription reads.
@@ -733,9 +742,7 @@ impl IpcSubscriptions {
         // The subscription the destination is added to, and the one thing it
         // has to be: a network subscription on a channel that allows manual
         // control (`aeron_driver_conductor_find_mds_subscription`, `:5990-6021`).
-        let Some(mds) = self.links.iter().find(|link| {
-            link.registration_id == request.registration_id && link.endpoint_id.is_some()
-        }) else {
+        let Some(mds) = self.find_mds(request.registration_id) else {
             return Err(AddSubscriptionError::UnknownSubscription);
         };
 
