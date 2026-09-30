@@ -1033,7 +1033,13 @@ impl ReceiverThread {
 
         match header.frame_type {
             frame_type::PAD | frame_type::DATA => {
-                let Some(frame) = crate::protocol::DataFrame::read(packet) else {
+                // Both kinds a term holds, through the reader that admits both:
+                // a padding frame carries no payload anyone will read, and it
+                // is still a frame the image has to write into its term —
+                // `DataFrame::read` refuses it, and a receiver that used that
+                // one dropped every padding datagram, leaving the term's tail
+                // unwritten and its gap scanner asking for it forever.
+                let Some(frame) = crate::protocol::DataFrame::read_in_a_term(packet) else {
                     return;
                 };
 

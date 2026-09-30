@@ -52,6 +52,13 @@ path = "integration/client_round_trip.rs"
 
 # The wait a client owes a driver that is still creating its file — the window
 # that made a client started alongside a driver fail deterministically.
+# A UDP stream that crosses a term boundary, where the term's tail is a padding
+# frame sent as its header alone. Runs in CI: it needs our own driver, not the
+# reference's.
+[[test]]
+name = "udp_term_boundary"
+path = "integration/udp_term_boundary.rs"
+
 [[test]]
 name = "connect_window"
 path = "integration/connect_window.rs"
@@ -139,6 +146,13 @@ required-features = ["interop"]
 [[test]]
 name = "destination_probe"
 path = "interop/destination_probe.rs"
+required-features = ["interop"]
+
+# A padding frame that arrives as its own datagram: the reference's Ping and
+# Pong, on a 64 KiB term, stop at the boundary when the receiver drops it.
+[[test]]
+name = "udp_padding_frame"
+path = "interop/udp_padding_frame.rs"
 required-features = ["interop"]
 
 # A4 (receiving): a reference `BasicPublisher`, its messages read by our client

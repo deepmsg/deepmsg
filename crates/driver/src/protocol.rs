@@ -501,6 +501,42 @@ impl DataFrame {
     pub fn read(buffer: &[u8]) -> Option<Self> {
         header_of(buffer, frame_type::DATA)?;
 
+        Self::fields(buffer)
+    }
+
+    /// Read the data header a **term** holds at `buffer`: DATA **or** PAD.
+    ///
+    /// A term holds those two and nothing else (`0 == (frame_type & 0xFFFE)`,
+    /// `aeron_publication_image.c:685-688`), and they are one layout —
+    /// `AERON_HDR_TYPE_PAD` is a data header with a zero payload
+    /// (`aeron_udp_protocol.h:172`). [`DataFrame::read`] refuses a PAD on
+    /// purpose, for a caller that asked for a *frame*; a receiver has admitted
+    /// the type already (its dispatch matches both) and needs the fields, so it
+    /// reads them through here.
+    ///
+    /// This is not a convenience. A datagram carrying a padding frame is a
+    /// datagram a receiver has to insert like any other: the padding is what
+    /// fills a term's tail to the boundary, and a receiver that drops it leaves
+    /// that tail unwritten — which its gap scanner then reads as a hole that no
+    /// retransmission fills, because the sender retransmits exactly the frame
+    /// being dropped. The result is a NAK storm and both ends stopped at the
+    /// term boundary; it takes a stream that leaves a partial frame at the end
+    /// of a term to reach it at all.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the buffer is shorter than [`DataFrame::LENGTH`] or the header
+    /// is neither type.
+    pub fn read_in_a_term(buffer: &[u8]) -> Option<Self> {
+        if !FrameHeader::read(buffer)?.is_data() {
+            return None;
+        }
+
+        Self::fields(buffer)
+    }
+
+    /// The five fields every data header carries, whatever its kind.
+    fn fields(buffer: &[u8]) -> Option<Self> {
         Some(Self {
             term_offset: read_i32(buffer, 8)?,
             session_id: read_i32(buffer, 12)?,
@@ -1846,6 +1882,33 @@ mod tests {
         assert_eq!(SetupFrame::read(&data), None);
         assert_eq!(ErrorFrame::read(&data), None);
         assert_eq!(RttmFrame::read(&data), None);
+    }
+
+    #[test]
+    fn the_reader_a_term_uses_admits_both_kinds_a_term_holds() {
+        // A padding frame is a term's tail, sent as its header alone: the
+        // datagram is 32 bytes and the frame it describes is 544
+        // (`aeron_udp_protocol.h:237` does not compare the two). A receiver
+        // that read it with `DataFrame::read` dropped it, and with it the last
+        // 544 bytes of every term a message did not fill exactly.
+        let padding = packet(frame_type::PAD, 544, DataFrame::LENGTH);
+
+        let read = DataFrame::read_in_a_term(&padding).expect("a padding frame is a term frame");
+        assert_eq!(
+            frame_type::PAD,
+            FrameHeader::read(&padding).expect("a header").frame_type
+        );
+        assert_eq!(read.term_offset, 0);
+        assert_eq!(read.stream_id, 0);
+
+        let data = packet(frame_type::DATA, 32, DataFrame::LENGTH);
+        assert!(DataFrame::read_in_a_term(&data).is_some());
+
+        // And it is not a licence to read anything else, nor a frame that is
+        // too short to hold the fields.
+        let nak = packet(frame_type::NAK, NakFrame::LENGTH as i32, DataFrame::LENGTH);
+        assert_eq!(DataFrame::read_in_a_term(&nak), None);
+        assert_eq!(DataFrame::read_in_a_term(&padding[..16]), None);
     }
 
     #[test]
