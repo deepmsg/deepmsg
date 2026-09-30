@@ -75,6 +75,15 @@ path = "integration/connect_window.rs"
 name = "dir_liveness"
 path = "integration/dir_liveness.rs"
 
+# G0-1: the process contract the reference's own system tests assume —
+# environment-variable configuration, an unknown name that must not stop the
+# driver, an empty stderr on a clean run, and a `TERMINATE_DRIVER` written by a
+# process that never registered. Needs our own driver binary, not the
+# reference's, so it runs in CI.
+[[test]]
+name = "driver_process_contract"
+path = "integration/driver_process_contract.rs"
+
 [[test]]
 name = "c_driver_basic"
 path = "interop/c_driver_basic.rs"
