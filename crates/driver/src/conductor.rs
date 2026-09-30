@@ -88,8 +88,8 @@ use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
-    IPC_PREFIX, SPY_PREFIX, UdpChannel, UdpChannelError, is_spy_channel,
-    validate_destination_prefix, validate_send_destination_uri,
+    IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
+    validate_send_destination_uri,
 };
 
 /// At most one command per duty cycle
@@ -2018,10 +2018,10 @@ impl Conductor {
             // kind of destination, `aeron-spy:` another, and everything else is
             // a network one.
             //
-            // The two this build does not serve are refused **by name** — a
-            // client told nothing waits out its timeout, and these are not
-            // commands this driver is going to get to later. Both refusals are
-            // recorded in `docs/compat.md`.
+            // `aeron:ipc` is the one this build refuses **by name** — a client
+            // told nothing waits out its timeout, and this is not a command
+            // this driver is going to get to later. The refusal is recorded in
+            // `docs/compat.md`.
             if Command::AddReceiveDestination == command
                 || Command::RemoveReceiveDestination == command
             {
@@ -2039,12 +2039,60 @@ impl Conductor {
                     continue;
                 }
 
-                if request.channel.starts_with(SPY_PREFIX.as_bytes()) {
-                    transmit.error(
-                        request.correlation_id,
-                        ERROR_CODE_NOT_SUPPORTED,
-                        b"aeron-spy: destinations are not served by this driver",
-                    );
+                // A spy destination is a **source**, not a socket: it adds a
+                // local read of a publication to a multi-destination
+                // subscription, which is the third way a spy link is made
+                // (`aeron_driver_conductor_execute_add_receive_spy_destination`,
+                // `:5704-5806`, and its removal at `:6024-6068`).
+                if is_spy_channel(request.channel) {
+                    let now = Now {
+                        ms: now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: liveness_timeout_ns,
+                    };
+
+                    if Command::AddReceiveDestination == command {
+                        let added = subscriptions.add_spy_destination(
+                            &request,
+                            config,
+                            counters,
+                            &counter_regions,
+                            receive_endpoints,
+                            network_publications,
+                            now,
+                            &mut transmit,
+                        );
+
+                        if let Err(error) = added {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlation_id,
+                                error.error_code(),
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    } else if subscriptions.remove_spy_destination(
+                        request.registration_id,
+                        request.channel,
+                        counters,
+                        &counter_regions,
+                        now_ms,
+                        &mut transmit,
+                    ) {
+                        transmit.operation_succeeded(request.correlation_id);
+                    } else {
+                        *subscription_failures += 1;
+                        let unknown = format!(
+                            "unknown subscription client_id={} registration_id={}",
+                            request.client_id, request.registration_id,
+                        );
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            unknown.as_bytes(),
+                        );
+                    }
+
                     continue;
                 }
 
@@ -3096,19 +3144,21 @@ mod tests {
     }
 
     /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
-    /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel. Both
-    /// kinds this build does not serve are refused **by name** rather than left
-    /// unanswered, because a client told nothing waits out its timeout and
-    /// neither of these is a command this driver will get to later.
+    /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel.
     ///
-    /// The network branch is **served**: `ADD_RCV_DESTINATION` names a
-    /// subscription, and a destination is added to that subscription's receive
-    /// endpoint. The registration id here names no subscription, so the answer
-    /// is the reference's, and that is what this covers — the branch being
-    /// reached rather than refused. What a destination does once it is attached
-    /// is `media::receive_endpoint`'s tests.
+    /// Only the first is refused by name — a client told nothing waits out its
+    /// timeout, and this is not a command this driver will get to later. The
+    /// other two are **served**: a spy destination is a local read added to a
+    /// multi-destination subscription (`:5704-5806`) and a network one is a
+    /// socket added to any network subscription (`:5903-5919`), and both reach
+    /// the subscription first. The registration id here names no subscription,
+    /// so what this covers is the triage — each prefix reaching its own branch,
+    /// with each branch's own answer for a subscription that is not there.
+    /// What a destination does once it is attached is `media::receive_endpoint`'s
+    /// tests, and a spy destination against a real subscription is
+    /// `tests/integration/spy_subscription.rs`.
     #[test]
-    fn a_receive_destination_is_refused_by_the_prefix_it_names() {
+    fn a_receive_destination_is_triaged_by_the_prefix_it_names() {
         use deepmsg_cnc::command::{
             ADD_RECEIVE_DESTINATION_TYPE_ID, DestinationCommand, ON_ERROR_TYPE_ID,
         };
@@ -3118,13 +3168,12 @@ mod tests {
                 "aeron:ipc",
                 "aeron:ipc destinations are not served by this driver",
             ),
+            // A spy names a subscription it cannot find, which is the
+            // reference's own unknown-subscription error (`:6006-6014`).
             (
                 "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
-                "aeron-spy: destinations are not served by this driver",
+                "unknown subscription",
             ),
-            // The network branch is served now: what it does with a
-            // subscription that does not exist is the reference's own
-            // unknown-subscription error (`:5903-5919` reaches the link first).
             ("aeron:udp?endpoint=127.0.0.1:40456", "unknown subscription"),
         ];
 

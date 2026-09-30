@@ -167,6 +167,108 @@ fn assert_the_spy_has_no_socket(
     );
 }
 
+/// Poll until a subscription holds `expected` images, or give up.
+fn await_images(client: &mut Client, subscription: i64, expected: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let held = client
+            .subscription(subscription)
+            .expect("the subscription")
+            .images()
+            .len();
+
+        if held == expected {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the subscription holds {held} images, not {expected}"
+        );
+
+        client.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_spy_can_be_added_to_a_subscription_as_a_source() {
+    let Some(mut own) = OwnDriver::start("spy-as-a-source") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let published_channel = format!("aeron:udp?endpoint=127.0.0.1:{}", free_port(3));
+
+    let publication = client
+        .add_publication(&published_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+
+    // The third way a spy link is made: a destination on a subscription. It
+    // has to be a `control-mode=manual` channel, which is the only kind a
+    // source may be added to.
+    let mds_channel = format!(
+        "aeron:udp?control=127.0.0.1:{}|control-mode=manual",
+        free_port(4)
+    );
+    let mds = client
+        .add_subscription(&mds_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a multi-destination subscription");
+
+    await_images(&mut client, mds, 0, "it starts with no source");
+
+    // The spy is a *source*, and the answer is an acknowledgement of the
+    // destination rather than a subscription — the subscription already exists.
+    let destination = client
+        .add_rcv_destination(
+            mds,
+            &format!("aeron-spy:{published_channel}"),
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a spy is served as a receive destination");
+
+    assert!(destination > 0, "the destination has a registration id");
+
+    // And the subscription is given the publication's own buffer, under the
+    // *subscription's* registration id — which is what makes the pair one
+    // thing rather than two.
+    await_images(
+        &mut client,
+        mds,
+        1,
+        "the spy gives the subscription an image",
+    );
+
+    let images = client.subscription(mds).expect("the subscription").images();
+    assert_eq!(
+        publication,
+        images[0].registration_id(),
+        "the image is the publication's log buffer, not something built from datagrams"
+    );
+
+    // Taking the source out again announces the image it was holding, which is
+    // the one place a spy removal differs from a subscription removal.
+    client
+        .remove_rcv_destination(
+            mds,
+            &format!("aeron-spy:{published_channel}"),
+            DEFAULT_TIMEOUT,
+        )
+        .expect("the source comes back out");
+
+    await_images(&mut client, mds, 0, "the image goes with the source");
+
+    // And the subscription itself is still there: only the source was removed.
+    assert!(client.subscription(mds).is_some());
+
+    let _ = own.stop();
+}
+
 #[test]
 fn a_spy_reads_the_publication_it_names() {
     let Some(mut own) = OwnDriver::start("spy-reads-publication") else {

@@ -322,8 +322,8 @@ can be falsified.
 
 | Divergence | Why, and where it shows |
 |---|---|
-| **`aeron:ipc` is refused as a receive destination** (`NOT_SUPPORTED`) rather than made into an IPC link | The reference builds one, keyed by the destination's registration id (`aeron_driver_conductor.c:5617`). Nothing shipped asks for it: `ReplayMerge` refuses to merge over IPC (`aeron-archive/.../client/ReplayMerge.java:124-129`). Refused by name rather than left unanswered, so a client is not left waiting out a timeout. `crates/driver/src/conductor.rs::a_receive_destination_is_refused_by_the_prefix_it_names`. |
-| **`aeron-spy:` is refused as a destination** — `NOT_SUPPORTED` on a receive destination, `INVALID_CHANNEL` on a send one | A spy names a publication's own log buffer rather than a place to put datagrams (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`), and there is no local-spy link here to make of it. `crates/driver/src/udp_channel.rs::a_spy_is_refused_as_a_destination`, `crates/driver/src/conductor.rs::a_receive_destination_is_refused_by_the_prefix_it_names`. |
+| **`aeron:ipc` is refused as a receive destination** (`NOT_SUPPORTED`) rather than made into an IPC link | The reference builds one, keyed by the destination's registration id (`aeron_driver_conductor.c:5617`). Nothing shipped asks for it: `ReplayMerge` refuses to merge over IPC (`aeron-archive/.../client/ReplayMerge.java:124-129`). Refused by name rather than left unanswered, so a client is not left waiting out a timeout. `crates/driver/src/conductor.rs::a_receive_destination_is_triaged_by_the_prefix_it_names`. |
+| **`aeron-spy:` is refused as a *send* destination only** — `INVALID_CHANNEL` | A spy names a publication's own log buffer rather than a place to put datagrams (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`). As a **receive** destination it is served, and has been since the spy link landed: it adds a local read of a publication to a `control-mode=manual` subscription (`aeron_driver_conductor_execute_add_receive_spy_destination`, `:5704-5806`). `crates/driver/src/udp_channel.rs::a_spy_is_refused_as_a_destination`, and the served half in `tests/integration/spy_subscription.rs::a_spy_can_be_added_to_a_subscription_as_a_source`. |
 | **`REMOVE_DESTINATION_BY_ID` that names no publication answers nothing** | The reference calls that handler without taking its result (`aeron_driver_conductor.c:3188-3200`), so the `-1` for a publication it cannot find (`:5562-5578`) never reaches the `result < 0` that would send an `ON_ERROR` (`:3222-3225`). Every other command in the family is answered. The silence is reproduced rather than improved on, so a client that named one waits out its own deadline. `crates/driver/src/conductor.rs::a_remove_destination_by_id_that_finds_nothing_answers_nothing`, and on the caller's side `tests/integration/client_round_trip.rs::removing_a_destination_by_id_waits_for_an_answer_that_never_comes`. |
 | **A gap's NAK delay is fixed** | The reference picks a *feedback* generator per image — a multicast-tuned one when the image has group semantics, a unicast one otherwise, or a static one when the channel names `nak-delay=` — and re-arms it from the RTT measurements its RTTMs carry (`aeron_publication_image.c:85-115`). This build uses unicast's fixed delays for every image and never adjusts them. Timing, not bytes; `crates/driver/src/loss_detector.rs`'s tests pin the delays used. |
 
@@ -399,10 +399,12 @@ being unknown:
   anything else is accepted and has no effect. Acting on it means the sender's
   idle strategy, which this build does not have.
 - `aeron.spies.simulate.connection` (`aeronmd.h:178`) is read and reaches a
-  publication's parameters, but what acts on it is the *spy* machinery
-  (`aeron_network_publication.c:618`, `:761`), which this build does not have:
-  a subscription to a local network publication reads an image like any other
-  remote reader, so a publication never has a spy to count.
+  publication's parameters, and an `aeron-spy:` subscription is served — but
+  what the setting decides is whether a publication **counts** its spies
+  (`aeron_network_publication.c:618`, `:761`), and this build's network
+  publications do not count them yet: a spy reads a local publication's log
+  buffer, while the publication's limits are still computed from its receivers
+  alone.
 
 `aeron.threading.mode` is the one setting of the reference's that this build
 does not read at all: its four values choose between dedicated, shared,

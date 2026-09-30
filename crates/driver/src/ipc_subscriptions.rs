@@ -39,8 +39,8 @@
 //! of them may have parameters the other never heard of.
 
 use deepmsg_cnc::command::{
-    AddSubscriptionCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
-    ImageBuffersReady,
+    AddSubscriptionCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, DestinationCommandReceived,
+    ERROR_CODE_GENERIC_ERROR, ImageBuffersReady,
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -333,6 +333,12 @@ pub enum AddSubscriptionError {
     },
     /// The receiver thread has stopped.
     Receiver,
+    /// An `ADD_RCV_DESTINATION` named a subscription no network link carries
+    /// (`:6006-6014`).
+    UnknownSubscription,
+    /// An `ADD_RCV_DESTINATION` named a subscription whose channel does not
+    /// allow manual control, and so may not have sources added to it (`:6016-6020`).
+    NotManualControl,
 }
 
 impl AddSubscriptionError {
@@ -350,6 +356,8 @@ impl AddSubscriptionError {
                 | UriError::MissingValue { .. },
             )) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
+            Self::UnknownSubscription => deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+            Self::NotManualControl => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::Channel(error) => error.error_code(),
             Self::Params(_)
             | Self::NoClientRecord
@@ -372,6 +380,8 @@ impl std::fmt::Display for AddSubscriptionError {
             Self::Channel(error) => write!(f, "{error}"),
             Self::Endpoint { message } => f.write_str(message),
             Self::Receiver => f.write_str("the receiver thread has stopped"),
+            Self::UnknownSubscription => f.write_str("unknown subscription"),
+            Self::NotManualControl => f.write_str("channel does not allow manual control"),
         }
     }
 }
@@ -667,6 +677,165 @@ impl IpcSubscriptions {
         failures
     }
 
+    /// Serve an `ADD_RCV_DESTINATION` whose channel is a spy
+    /// (`aeron_driver_conductor_execute_add_receive_spy_destination`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5704-5806`).
+    ///
+    /// This is the third way a spy link is made, and it is a *destination*
+    /// rather than a subscription: a client takes a channel it already
+    /// subscribes to with `control-mode=manual` — a multi-destination
+    /// subscription, which is the only kind that may have sources added to it —
+    /// and names a spy as one of its sources. What comes back is an
+    /// acknowledgement of the destination, and what the subscription then gets
+    /// is an image for every publication the spy names, exactly as if it had
+    /// been spied from the start.
+    ///
+    /// The link is stored under the **subscription's** registration id, not the
+    /// destination's (`:5741`), which is what makes the pair one thing: a
+    /// `REMOVE_SUBSCRIPTION` for that id takes the spied images with it, and
+    /// the destination is removed by naming the channel it was added with.
+    ///
+    /// # Errors
+    ///
+    /// [`AddSubscriptionError::UnknownSubscription`] for a registration id no
+    /// network subscription carries,
+    /// [`AddSubscriptionError::NotManualControl`] for one whose channel may not
+    /// have sources added to it, and the channel's own errors for the URI.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn add_spy_destination(
+        &mut self,
+        request: &DestinationCommandReceived<'_>,
+        config: &DriverConfig,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        endpoints: &ReceiveChannelEndpoints,
+        publications: &NetworkPublications,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), AddSubscriptionError> {
+        let spy_channel = crate::udp_channel::resolve_spy_channel(request.channel)
+            .map_err(Box::new)
+            .map_err(AddSubscriptionError::Channel)?;
+
+        let inner = &request.channel[crate::udp_channel::SPY_PREFIX.len()..];
+        let uri = ChannelUri::parse(inner)?;
+        let params = SubscriptionParams::resolve(&uri, config)?;
+
+        // The subscription the destination is added to, and the one thing it
+        // has to be: a network subscription on a channel that allows manual
+        // control (`aeron_driver_conductor_find_mds_subscription`, `:5990-6021`).
+        let Some(mds) = self.links.iter().find(|link| {
+            link.registration_id == request.registration_id && link.endpoint_id.is_some()
+        }) else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        let Some(endpoint_id) = mds.endpoint_id else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        let is_manual = endpoints
+            .get(endpoint_id)
+            .is_some_and(|entry| entry.channel.control_mode == ControlMode::Manual);
+
+        if !is_manual {
+            return Err(AddSubscriptionError::NotManualControl);
+        }
+
+        // The subscription's stream, the destination's session — the reference
+        // reads each off the thing that owns it (`:5738-5744`), and the channel
+        // it records is the **destination's**, which is what the reader's
+        // counter is labelled with and what a removal names.
+        let link = SubscriptionLink {
+            registration_id: mds.registration_id,
+            client_id: request.client_id,
+            stream_id: mds.stream_id,
+            session_id: params.session_id,
+            channel: request.channel.to_vec(),
+            is_tether: params.is_tether,
+            is_rejoin: params.is_rejoin,
+            is_response: false,
+            setup_status: SetupStatus::Pending,
+            is_reliable: params.is_reliable,
+            is_sparse: params.is_sparse,
+            endpoint_id: None,
+            spy_channel: Some(spy_channel),
+            subscribables: Vec::new(),
+        };
+
+        // An acknowledgement, not a subscription ready: the client asked for a
+        // destination and that is what it is told about (`:5746`).
+        events.operation_succeeded(request.correlation_id);
+
+        self.links.push(link);
+
+        let link = self.links.last_mut().expect("just pushed");
+
+        for publication in publications.publications() {
+            if !link.spy_matches(
+                &publication.endpoint_channel,
+                publication.stream_id,
+                publication.session_id,
+            ) {
+                continue;
+            }
+
+            link_spy_publication(link, publication, counters, regions, now, events)
+                .map_err(|()| AddSubscriptionError::Link)?;
+        }
+
+        Ok(())
+    }
+
+    /// Serve a `REMOVE_RCV_DESTINATION` whose channel is a spy
+    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6068`).
+    ///
+    /// The link is found by its registration id **and** the channel it was
+    /// added with, which is what tells two spy destinations on one subscription
+    /// apart — an id alone would name either.
+    ///
+    /// Every image it was holding is announced as unavailable before the link
+    /// goes, which is the one place a spy removal differs from a subscription
+    /// removal: a subscription removal is silent in C and in Java alike, while
+    /// this path is the client taking one source out of several and being told
+    /// which images that source was.
+    ///
+    /// # Returns
+    ///
+    /// `false` when no such link is there, which the reference answers with an
+    /// error naming the subscription.
+    pub fn remove_spy_destination(
+        &mut self,
+        registration_id: i64,
+        channel: &[u8],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+        events: &mut impl ClientEvents,
+    ) -> bool {
+        let Some(index) = self.links.iter().position(|link| {
+            link.registration_id == registration_id
+                && link.spy_channel.is_some()
+                && link.channel == channel
+        }) else {
+            return false;
+        };
+
+        let link = self.links.swap_remove(index);
+
+        for entry in &link.subscribables {
+            events.unavailable_image(
+                entry.target.registration_id(),
+                link.registration_id,
+                link.stream_id,
+                &link.channel,
+            );
+            counters.free(regions, entry.counter_id, now_ms);
+        }
+
+        true
+    }
+
     /// Give a publication to every subscription that was waiting for it
     /// (`aeron_driver_conductor_link_ipc_subscriptions`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:3693-3727`).
@@ -822,6 +991,14 @@ impl IpcSubscriptions {
     /// registration id can remove it even though it does not own it. That is
     /// reproduced rather than tightened — a driver that refused would be one
     /// where a legitimate removal failed.
+    ///
+    /// **Every** link carrying that id goes, not the first one found. The
+    /// reference walks all three of its arrays and removes each match
+    /// (`:5204-5251`), and a registration id can name more than one link: a spy
+    /// added as a receive destination is stored under the subscription's id
+    /// ([`Self::add_spy_destination`]), and removing the subscription has to
+    /// take it too — otherwise the subscription is gone and something is still
+    /// reading a publication on its behalf.
     pub fn remove(
         &mut self,
         registration_id: i64,
@@ -830,19 +1007,22 @@ impl IpcSubscriptions {
         publications: &mut IpcPublications,
         now_ms: i64,
     ) -> bool {
-        let Some(index) = self
-            .links
-            .iter()
-            .position(|link| link.registration_id == registration_id)
-        else {
-            return false;
-        };
+        let mut found = false;
+        let mut index = self.links.len();
 
-        let link = self.links.swap_remove(index);
+        while index > 0 {
+            index -= 1;
 
-        unlink_all(link, counters, regions, publications, None, now_ms);
+            if self.links[index].registration_id != registration_id {
+                continue;
+            }
 
-        true
+            let link = self.links.swap_remove(index);
+            unlink_all(link, counters, regions, publications, None, now_ms);
+            found = true;
+        }
+
+        found
     }
 
     /// Give up every subscription a client owned, without telling it anything:
