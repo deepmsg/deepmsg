@@ -23,14 +23,46 @@ name: interop
 #      the four classes the reference itself partitions out by tag — `slow`,
 #      `logging`, `topology` and `bindings` have their own Gradle tasks.
 #
-# It runs on pull requests and is expected to be **red until the repair plan's
-# slices land**: a red here is a list of known gaps, not a broken build. The job
-# summary says which gap each failure belongs to.
+# # Why this is manual, and when it stops being manual
+#
+# It runs **on demand**, not on pull requests. Running it on every PR was the
+# first attempt and it was wrong for a reason that has nothing to do with this
+# job's correctness: it takes most of an hour — a reference checkout, a Gradle
+# build, and seventy-two test classes each in their own JVM — so it held up the
+# acceptance of every *other* branch. A gate that long has to be something you
+# choose to pay for, not something you pay for by opening a pull request.
+#
+# So the trigger is `workflow_dispatch`. Run it with
+#
+#     gh workflow run interop.yml
+#
+# or from the Actions tab, optionally narrowed with the inputs below — checking
+# one class after a change is a few minutes, not an hour.
+#
+# **When the repair plan's slices have landed, this becomes a PR gate again**:
+# add back
+#
+#     on:
+#       pull_request:
+#
+# and nothing else needs to change. That is the point of keeping the workflow
+# in the tree rather than in a scratch directory — the file is the work.
+#
+# Until then it is expected to be **red**: a red run here is a list of known
+# gaps, not a broken build, and the job summary says which gap each failure
+# belongs to.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      classes:
+        description: 'Comma-separated test classes to run. Empty runs all 72.'
+        required: false
+        default: ''
+      timeout:
+        description: 'Seconds allowed per class before it is killed.'
+        required: false
+        default: '120'
 
 env:
   CARGO_TERM_COLOR: always
@@ -133,6 +165,13 @@ jobs:
       # slowest observed was 65.
       - name: Run the OSS system tests
         working-directory: ../aeron
+        # The dispatch inputs arrive as environment rather than interpolated
+        # into the script. `${{ inputs.x }}` is textual substitution before the
+        # shell ever sees the line, so a value containing a quote or a `;`
+        # would be code; through `env` it is data.
+        env:
+          CHOSEN_CLASSES: ${{ inputs.classes }}
+          PER_CLASS_TIMEOUT: ${{ inputs.timeout }}
         run: |
           set -u
           cat > /tmp/classes.py <<'PY'
@@ -158,8 +197,17 @@ jobs:
                   continue  # every test tagged: same exclusion
               print(str(path.relative_to(root))[:-5].replace("/", "."))
           PY
-          python3 /tmp/classes.py > /tmp/classes.txt
+          # A run may name the classes it wants, which is what makes this
+          # useful by hand: the whole set is an hour, one class is minutes.
+          if [ -n "$CHOSEN_CLASSES" ]; then
+            printf '%s\n' "$CHOSEN_CLASSES" | tr ',' '\n' | tr -d ' ' | grep -v '^$' > /tmp/classes.txt
+            echo "hand-picked: $(tr '\n' ' ' < /tmp/classes.txt)"
+          else
+            python3 /tmp/classes.py > /tmp/classes.txt
+          fi
           echo "running $(wc -l < /tmp/classes.txt) classes"
+
+          per_class="$PER_CLASS_TIMEOUT"
 
           mkdir -p /tmp/results /tmp/logs
           : > /tmp/status.tsv
@@ -170,14 +218,14 @@ jobs:
             # the step right there — which is the opposite of the point, since
             # a failing test class is the expected outcome, not an error.
             rc=0
-            timeout 120 ./gradlew --quiet :aeron-system-tests:test \
+            timeout "$per_class" ./gradlew --quiet :aeron-system-tests:test \
               --tests "$cls" \
               -Daeron.test.system.aeronmd.path="$GITHUB_WORKSPACE/target/debug/deepmsg-driver" \
               > "/tmp/logs/$cls.log" 2>&1 || rc=$?
             cp -n aeron-system-tests/build/test-results/test/TEST-*.xml /tmp/results/ 2>/dev/null || true
             case $rc in
               0)   echo -e "$cls\tok" ;;
-              124) echo -e "$cls\tTIMEOUT after 120s" ;;
+              124) echo -e "$cls\tTIMEOUT after ${per_class}s" ;;
               *)   echo -e "$cls\tfailed" ;;
             esac | tee -a /tmp/status.tsv
             # A hung class leaves its driver behind; kill only the ones this
@@ -196,7 +244,7 @@ jobs:
           total=$(wc -l < /tmp/status.tsv)
           passed=$(grep -c $'\tok$' /tmp/status.tsv || true)
           hung=$(grep -c 'TIMEOUT' /tmp/status.tsv || true)
-          echo "::notice::$passed of $total classes passed, $hung did not finish in 120s"
+          echo "::notice::$passed of $total classes passed, $hung did not finish in ${per_class}s"
           if [ "$passed" != "$total" ]; then
             echo "::error::$((total - passed)) of $total OSS system-test classes did not pass. \
           This is expected until the repair plan's slices land — the job summary says which gap \
