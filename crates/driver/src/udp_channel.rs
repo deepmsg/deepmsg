@@ -426,14 +426,20 @@ pub const INVALID_DESTINATION_KEYS: [&str; 5] = [
     "response-correlation-id",
 ];
 
-/// Refuse a spy channel as a destination
+/// Refuse a spy channel as a **send** destination
 /// (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`).
+///
+/// This is the send half only. A **receive** destination that names a spy is
+/// served — it is the third way a spy link is made, beside the two a
+/// subscription makes (`aeron_driver_conductor_execute_add_receive_spy_destination`,
+/// `:5704-5806`) — and the triage between the two is the caller's
+/// ([`crate::conductor`]).
 ///
 /// # Errors
 ///
 /// [`UdpChannelError::InvalidChannel`], in the reference's words.
 pub fn validate_destination_prefix(channel: &[u8], direction: &str) -> Result<(), UdpChannelError> {
-    if channel.len() >= SPY_PREFIX.len() && channel.starts_with(SPY_PREFIX.as_bytes()) {
+    if is_spy_channel(channel) {
         return Err(UdpChannelError::InvalidChannel(format!(
             "Aeron spies are invalid as {direction} destinations: {}",
             String::from_utf8_lossy(channel)
@@ -441,6 +447,47 @@ pub fn validate_destination_prefix(channel: &[u8], direction: &str) -> Result<()
     }
 
     Ok(())
+}
+
+/// Whether a client's channel is a spy channel (`AERON_SPY_PREFIX`,
+/// `aeron-client/src/main/c/uri/aeron_uri.h:36`).
+pub fn is_spy_channel(channel: &[u8]) -> bool {
+    channel.starts_with(SPY_PREFIX.as_bytes())
+}
+
+/// Resolve the channel a spy names, with the `aeron-spy:` prefix taken off
+/// (`aeron_driver_conductor_on_add_spy_subscription`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4937-4942`, and its
+/// destination twin at `:5816-5821`).
+///
+/// A spy is not a channel of its own: what follows the prefix is the UDP
+/// channel the publication it reads sends on, parsed exactly as that
+/// publication parsed it. Everything the match rule compares — the canonical
+/// form and the channel tag — is read off this parse, which is why a spy that
+/// spells its endpoint differently from the publisher still matches it and one
+/// that names a different endpoint does not (`:92-108`).
+///
+/// The address is resolved here, where the reference hands the text to its
+/// native resource agent and resolves it off the conductor's thread. Both
+/// arrive at the same channel; the difference is when, not what
+/// (`docs/compat.md` carries the same deviation for every other channel).
+///
+/// # Errors
+///
+/// [`UdpChannelError::InvalidChannel`] when the prefix is not there — a caller
+/// that has already triaged on [`is_spy_channel`] cannot see this one — and
+/// whatever [`UdpChannel::resolve`] raises for the channel that follows it.
+pub fn resolve_spy_channel(channel: &[u8]) -> Result<UdpChannel, UdpChannelError> {
+    let inner = channel.strip_prefix(SPY_PREFIX.as_bytes()).ok_or_else(|| {
+        UdpChannelError::InvalidChannel(format!(
+            "not a spy channel: {}",
+            String::from_utf8_lossy(channel)
+        ))
+    })?;
+
+    let uri = ChannelUri::parse(inner)?;
+
+    UdpChannel::resolve(inner, &uri)
 }
 
 /// A destination URI a send endpoint can be given, resolved to where it points
@@ -1117,6 +1164,36 @@ mod tests {
             validate_destination_prefix(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123", "send"),
             Err(UdpChannelError::InvalidChannel(message))
                 if message.starts_with("Aeron spies are invalid as send destinations:")
+        ));
+    }
+
+    /// A spy names the channel it reads, with the prefix taken off — and the
+    /// two channels it can then be compared with are the publisher's
+    /// (`:4937-4942`, `:92-108`).
+    #[test]
+    fn a_spy_names_the_channel_after_its_prefix() {
+        let spy = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123")
+            .expect("a spy channel");
+        let plain = resolve("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert_eq!(plain.canonical_form, spy.canonical_form);
+        assert_eq!(plain.remote_data, spy.remote_data);
+        assert_eq!(INVALID_TAG, spy.tag_id);
+
+        // The tag is read off the inner channel too, and it is one of the two
+        // things the match rule compares.
+        let tagged = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:1|tags=17,3")
+            .expect("a spy channel");
+        assert_eq!(17, tagged.tag_id);
+        assert_eq!(resolve("aeron:udp?endpoint=127.0.0.1:1|tags=17,3"), tagged);
+
+        // And a channel without the prefix is not a spy, which is a different
+        // answer from a channel whose inner URI is malformed.
+        assert!(is_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:1"));
+        assert!(!is_spy_channel(b"aeron:udp?endpoint=127.0.0.1:1"));
+        assert!(matches!(
+            resolve_spy_channel(b"aeron:udp?endpoint=127.0.0.1:1"),
+            Err(UdpChannelError::InvalidChannel(message)) if message.starts_with("not a spy channel:")
         ));
     }
 
