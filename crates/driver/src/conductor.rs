@@ -55,15 +55,16 @@ use deepmsg_cnc::command::{
     ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
     ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
     ON_ERROR_TYPE_ID, ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
-    ON_PUBLICATION_ERROR_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
-    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, PublicationError,
-    REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError, decode_add_counter, decode_add_publication,
-    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
-    decode_destination_command, decode_get_next_available_session_id, decode_reject_image,
-    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
-    encode_client_timeout, encode_counter_update, encode_error, encode_next_available_session_id,
-    encode_operation_succeeded, encode_publication_error, encode_subscription_ready,
-    encode_unavailable_image,
+    ON_PUBLICATION_ERROR_TYPE_ID, ON_STATIC_COUNTER_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady,
+    PublicationError, REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError, decode_add_counter,
+    decode_add_publication, decode_add_static_counter, decode_add_subscription, decode_correlated,
+    decode_destination_by_id_command, decode_destination_command,
+    decode_get_next_available_session_id, decode_reject_image, decode_remove_counter,
+    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
+    encode_counter_update, encode_error, encode_next_available_session_id,
+    encode_operation_succeeded, encode_publication_error, encode_static_counter,
+    encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -2215,6 +2216,124 @@ impl Conductor {
                 // rather than trusting the cursor: the cursor is where it would
                 // look next, and a client may have published under an id it
                 // made up in the meantime.
+                // A counter the **driver** owns, at a client's request.
+                //
+                // The one thing that makes it static is the owner id: the
+                // reference allocates it with `AERON_NULL_VALUE` and does *not*
+                // put it in the client's list of counters
+                // (`aeron_driver_conductor.c:6300-6312`), which is the whole of
+                // why a client that dies does not take it with it. Pushing a
+                // `CounterLink` here would look harmless and would free a
+                // counter the driver is meant to keep — `Clients::reap` walks
+                // that list for exactly that purpose.
+                Command::AddStaticCounter => match decode_add_static_counter(payload) {
+                    Some(command) => {
+                        let client_id = command.correlated.client_id;
+                        let correlation_id = command.correlated.correlation_id;
+
+                        // Registering the client is this command's first act,
+                        // the same as `ADD_COUNTER`'s (`:6259`).
+                        let Some(_record) = clients.get_or_add(
+                            client_id,
+                            now_ms,
+                            liveness_timeout_ns,
+                            counters,
+                            &counter_regions,
+                            &mut transmit,
+                        ) else {
+                            *counter_failures += 1;
+                            transmit.error(
+                                correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                b"failed to add client",
+                            );
+                            return;
+                        };
+
+                        // An id and a type id that already name a counter: the
+                        // answer depends on who owns it (`:6265-6281`). One with
+                        // an owner is somebody's, and a static counter may not be
+                        // put in its place; one without is a static counter
+                        // already, and this call is a client asking for the one
+                        // it has.
+                        let existing = counter_regions
+                            .reader()
+                            .find_by_type_and_registration(command.type_id, command.registration_id);
+
+                        let counter_id = match existing {
+                            Some(counter_id) => {
+                                let owner_id = counter_regions
+                                    .reader()
+                                    .get(counter_id)
+                                    .map_or(layout::NULL_VALUE, |descriptor| descriptor.owner_id);
+
+                                if layout::NULL_VALUE != owner_id {
+                                    *counter_failures += 1;
+                                    transmit.error(
+                                        correlation_id,
+                                        ERROR_CODE_GENERIC_ERROR,
+                                        format!(
+                                            "cannot add static counter, because a non-static counter exists \
+                                             (counterId={counter_id}) for typeId={} and registrationId={}",
+                                            command.type_id, command.registration_id
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    return;
+                                }
+
+                                counter_id
+                            }
+                            None => {
+                                let Some(counter_id) = counters.allocate(
+                                    &counter_regions,
+                                    command.type_id,
+                                    command.key,
+                                    command.label,
+                                    now_ms,
+                                ) else {
+                                    *counter_failures += 1;
+                                    // The reference returns `-1` here with no
+                                    // `AERON_SET_ERR` of its own
+                                    // (`aeron_driver_conductor.c:6300-6304`),
+                                    // so its client is answered with whatever
+                                    // the thread's error slot last held — a
+                                    // value it does not define and this build
+                                    // cannot reproduce. The code is the generic
+                                    // one and the words are this build's, which
+                                    // is the divergence `docs/compat.md` already
+                                    // records for every `ON_ERROR` that is not
+                                    // one of the two quoted ones.
+                                    transmit.error(
+                                        correlation_id,
+                                        ERROR_CODE_GENERIC_ERROR,
+                                        b"failed to allocate static counter",
+                                    );
+                                    return;
+                                };
+
+                                let _ = counters.set_registration_id(
+                                    &counter_regions,
+                                    counter_id,
+                                    command.registration_id,
+                                );
+                                let _ = counters.set_owner_id(
+                                    &counter_regions,
+                                    counter_id,
+                                    layout::NULL_VALUE,
+                                );
+
+                                counter_id
+                            }
+                        };
+
+                        transmit.send(
+                            ON_STATIC_COUNTER_TYPE_ID,
+                            &encode_static_counter(correlation_id, counter_id),
+                        );
+                    }
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
+                },
                 Command::GetNextAvailableSessionId => {
                     match decode_get_next_available_session_id(payload) {
                         Some(request) => {
@@ -2982,9 +3101,9 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 mod tests {
     use super::*;
     use deepmsg_cnc::command::{
-        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
-        ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ON_ERROR_TYPE_ID,
-        ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, ON_PUBLICATION_READY_TYPE_ID,
+        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
+        ADD_SUBSCRIPTION_TYPE_ID, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED,
+        ON_ERROR_TYPE_ID, ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, ON_PUBLICATION_READY_TYPE_ID,
     };
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
     use deepmsg_core::logbuffer::{descriptor, frame};
@@ -3415,26 +3534,28 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x0F` is ADD_STATIC_COUNTER:
-        // still unimplemented, which is what a test wants from a stand-in — a
-        // command whose handling cannot start happening. (`0x07` was the
-        // stand-in until ADD_DESTINATION was implemented, `0x10` until
-        // REJECT_IMAGE was, and `0x12` until GET_NEXT_AVAILABLE_SESSION_ID —
-        // which is exactly the way a stand-in like this stops being one, and
-        // leaves this the last of the eighteen the protocol defines.)
-        send(&conductor, 0x0F, b"first");
-        send(&conductor, 0x0F, b"second");
+        // pass read without any byte arithmetic.
+        //
+        // A type id the protocol does not define, and there is no other kind
+        // left to use: this test wants a command whose handling cannot start
+        // happening, and as of `ADD_STATIC_COUNTER` every one of the eighteen
+        // the protocol defines is served. The stand-in has run out — `0x07` was
+        // one until ADD_DESTINATION, `0x10` until REJECT_IMAGE, `0x12` until
+        // GET_NEXT_AVAILABLE_SESSION_ID, `0x0F` until this one — so what is
+        // counted below is `unknown_commands` and not `unhandled_commands`.
+        send(&conductor, 0x7F, b"first");
+        send(&conductor, 0x7F, b"second");
 
         conductor.do_work();
-        assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
+        assert_eq!(1, conductor.unknown_commands(), "one command per pass");
 
         // And the ring is not stuck: the next pass finds the other one.
         conductor.do_work();
-        assert_eq!(2, conductor.unhandled_commands());
+        assert_eq!(2, conductor.unknown_commands());
 
         // A third pass finds nothing, and the second pass left the ring empty.
         conductor.do_work();
-        assert_eq!(2, conductor.unhandled_commands());
+        assert_eq!(2, conductor.unknown_commands());
 
         let ring = conductor.cnc.to_driver_ring().expect("producer view");
         let consumed =
@@ -3589,46 +3710,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_command_is_counted_and_named() {
-        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
-
-        send(&conductor, 0x0F, &[0u8; 24]); // ADD_STATIC_COUNTER
-        conductor.do_work();
-
-        assert_eq!(1, conductor.unhandled_commands());
-        assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
-        assert!(conductor.is_running(), "and nothing else happened");
-    }
-
-    #[test]
-    fn a_static_counter_request_is_recognised_and_not_served() {
-        // ADD_STATIC_COUNTER is the one unimplemented command whose absence is
-        // a recorded divergence rather than an unbuilt transport feature: the
-        // reference's driver allocates the counter
-        // (`aeron_driver_conductor.c:3153-3166`, the handler at `:6255`) and
-        // answers `ON_STATIC_COUNTER`, which its client pairs with the ready
-        // handler (`aeron_client_conductor.c:1147`). deepmsg recognises the
-        // command — it is in the protocol's table — but serves nothing, so a
-        // client that asks for one waits for a reply that never comes
-        // (docs/compat.md, "The counter a client asks for").
-        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
-
-        send(&conductor, 0x0F, &[0u8; 16]);
-        conductor.do_work();
-
-        assert_eq!(1, conductor.unhandled_commands());
-        assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
-
-        // Counted, not recorded: the protocol defines this command, so it is
-        // no error to receive one — merely a thing this driver cannot do.
-        let mut errors = Vec::new();
-        let log = conductor.cnc.error_log().expect("the error log");
-        assert_eq!(0, log.read(i64::MIN, &mut errors).entries);
-    }
-
-    #[test]
     fn a_type_id_the_protocol_does_not_define_is_counted_separately() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
@@ -3710,14 +3791,14 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x0F, b"channel");
+        send(&conductor, 0x7F, b"channel");
         conductor.do_work();
-        assert_eq!(1, conductor.unhandled_commands());
+        assert_eq!(1, conductor.unknown_commands());
 
         conductor.do_work();
         assert_eq!(
             1,
-            conductor.unhandled_commands(),
+            conductor.unknown_commands(),
             "the second pass finds an empty ring"
         );
 
@@ -5777,6 +5858,229 @@ mod tests {
         assert_eq!(
             Some(0),
             conductor.publications().publications()[0].end_of_stream_position()
+        );
+    }
+
+    /// `ADD_STATIC_COUNTER`'s wire form, built by the **client's** encoder so
+    /// that the two directions of the protocol are checked against each other
+    /// — the same reason `add_counter_payload` exists.
+    fn add_static_counter_payload(
+        client_id: i64,
+        correlation_id: i64,
+        registration_id: i64,
+        type_id: i32,
+        key: &[u8],
+        label: &[u8],
+    ) -> Vec<u8> {
+        deepmsg_cnc::command::encode_add_static_counter(
+            client_id,
+            correlation_id,
+            registration_id,
+            type_id,
+            key,
+            label,
+        )
+    }
+
+    /// The `counter_id` an `ON_STATIC_COUNTER` carried, and the heartbeat
+    /// counter the driver announced for the client on the way past.
+    fn static_counter_from(events: &[(i32, Vec<u8>)], correlation_id: i64) -> i32 {
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_STATIC_COUNTER_TYPE_ID)
+            .map(|(_, payload)| payload)
+            .expect("the driver answers with a static counter");
+
+        assert_eq!(
+            correlation_id.to_le_bytes(),
+            payload[0..8],
+            "on the correlation id of the request, with no correlated head"
+        );
+
+        i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn a_static_counter_belongs_to_the_driver_and_not_to_the_client() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let counter_id = static_counter_from(&events, 50);
+
+        let regions = counter_regions(&conductor);
+        let descriptor = regions
+            .reader()
+            .get(counter_id)
+            .expect("the counter exists");
+
+        assert_eq!(99, descriptor.type_id);
+        assert_eq!(42, descriptor.registration_id, "the id it is found by");
+        assert_eq!(
+            NULL_VALUE, descriptor.owner_id,
+            "which is the whole of what makes it static: an owner id of nothing"
+        );
+        assert_eq!("a static counter", descriptor.label);
+
+        // And the client is told about it the *other* way. `ADD_COUNTER`
+        // announces its counter with `ON_COUNTER_READY`, which is a message
+        // about a counter the client now owns; this one is answered with
+        // `ON_STATIC_COUNTER` and no announcement, which is the difference that
+        // matters — there is nothing for this client to give back, and nothing
+        // will be taken away from it.
+        assert!(
+            !events.iter().any(|(type_id, payload)| {
+                *type_id == ON_COUNTER_READY_TYPE_ID
+                    && i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+                        == counter_id
+            }),
+            "a static counter is not announced as one of the client's"
+        );
+    }
+
+    #[test]
+    fn a_static_counter_outlives_the_client_that_asked_for_it() {
+        // The trap this slice exists to avoid, and the reason it is a test of
+        // its own: a static counter is not in the client's list of counters, so
+        // the tier that reaps a dead client does not take it. Pushing a
+        // `CounterLink` for one would look harmless and would free a counter
+        // the driver is meant to keep.
+        let temp = TempDir::new();
+        let config = DriverConfig {
+            aeron_dir: temp.0.clone(),
+            ipc_term_buffer_length: 64 * 1024,
+            client_liveness_timeout_ns: 100_000_000,
+            timer_interval_ns: 10_000_000,
+            ..DriverConfig::default()
+        };
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let counter_id = static_counter_from(&events, 50);
+
+        // The client's heartbeat, which the driver announced on the way past:
+        // its correlation id is the client id, which is the one id no command
+        // can ever carry again.
+        let heartbeat_counter_id = events
+            .iter()
+            .find(|(type_id, payload)| {
+                *type_id == ON_COUNTER_READY_TYPE_ID && payload[0..8] == 7i64.to_le_bytes()
+            })
+            .map(|(_, payload)| i32::from_le_bytes(payload[8..12].try_into().expect("four bytes")))
+            .expect("the client's heartbeat was announced");
+
+        // Stop saying it is alive, and let the driver decide.
+        set_counter(&conductor, heartbeat_counter_id, 0);
+
+        for _ in 0..4 {
+            conductor.timeout_check_deadline_ns = 0;
+            conductor.do_work();
+        }
+
+        let events = drain(&cnc, &mut receiver);
+
+        // A positive observation in the negative control: the client really was
+        // reaped, so the counter's survival is not the survival of everything.
+        assert!(
+            events.iter().any(|(type_id, payload)| *type_id
+                == deepmsg_cnc::command::ON_CLIENT_TIMEOUT_TYPE_ID
+                && payload[0..8] == 7i64.to_le_bytes()),
+            "the client timed out"
+        );
+        assert!(
+            !events.iter().any(|(type_id, payload)| {
+                *type_id == ON_UNAVAILABLE_COUNTER_TYPE_ID && payload[0..8] == 42i64.to_le_bytes()
+            }),
+            "and its static counter was not announced as going with it"
+        );
+
+        let regions = counter_regions(&conductor);
+        let descriptor = regions
+            .reader()
+            .get(counter_id)
+            .unwrap_or_else(|| panic!("counter {counter_id} is still the driver's"));
+
+        assert_eq!(NULL_VALUE, descriptor.owner_id);
+        assert_eq!(42, descriptor.registration_id);
+    }
+
+    #[test]
+    fn a_static_counter_is_found_again_by_its_type_and_registration_id() {
+        // How two processes agree on one counter: the second ask names the same
+        // pair and is answered with what the first one made, rather than with a
+        // second counter nobody would find.
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        let payload = add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter");
+
+        send(&conductor, ADD_STATIC_COUNTER_TYPE_ID, &payload);
+        conductor.do_work();
+        let first = static_counter_from(&drain(&cnc, &mut receiver), 50);
+
+        send(&conductor, ADD_STATIC_COUNTER_TYPE_ID, &payload);
+        conductor.do_work();
+        let second = static_counter_from(&drain(&cnc, &mut receiver), 50);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_static_counter_may_not_take_a_live_counters_place() {
+        // A pair that already names a counter **somebody owns** is refused
+        // rather than handed over: a static counter has no owner, so taking a
+        // live counter's id would leave two clients believing different things
+        // about one slot (`aeron_driver_conductor.c:6270-6281`).
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::ADD_COUNTER_TYPE_ID,
+            &add_counter_payload(7, 42, 99, b"stat", b"a counter a client owns"),
+        );
+        conductor.do_work();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(50i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert!(
+            String::from_utf8_lossy(&payload[16..]).contains("cannot add static counter"),
+            "the reference's words: {}",
+            String::from_utf8_lossy(&payload[16..])
         );
     }
 

@@ -59,6 +59,74 @@ pub enum CounterEvent {
     },
 }
 
+/// A counter the **driver** owns, allocated at this client's request.
+///
+/// It is a separate type from [`Counter`] because the difference is not
+/// cosmetic and is not the caller's to remember: a static counter is not in the
+/// driver's list for this client, so nothing announces it as unavailable when
+/// this client goes, nothing frees it, and a `REMOVE_COUNTER` for it would free
+/// something the client does not own. The reference marks it with a resource
+/// *type* and matches on that type when a removal arrives
+/// (`aeron_client_conductor_resource_type_match`,
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`), and its
+/// `close` for one is a no-op (`:1283-1287`). Here the type is the match:
+/// [`Client::remove_counter`](crate::client::Client::remove_counter) takes a
+/// [`Counter`], so there is no way to hand it one of these.
+///
+/// What is left is what a reader of somebody else's counter needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticCounter {
+    /// The id it was allocated under, which is what its `key` searches on
+    /// together with its type id.
+    registration_id: i64,
+    /// The slot in the values region.
+    counter_id: i32,
+}
+
+impl StaticCounter {
+    /// Bind the ids an `ON_STATIC_COUNTER` named.
+    pub(crate) const fn new(registration_id: i64, counter_id: i32) -> Self {
+        Self {
+            registration_id,
+            counter_id,
+        }
+    }
+
+    /// The registration id the counter was asked for under.
+    pub const fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+
+    /// The counter's id — the slot in the values region, and the only thing
+    /// another process needs to read the same counter.
+    pub const fn counter_id(&self) -> i32 {
+        self.counter_id
+    }
+
+    /// The counter's value, as the file has it right now.
+    pub fn value(&self, counters: &CountersReader<'_>) -> Option<i64> {
+        counters.value(self.counter_id)
+    }
+
+    /// Set the counter's value.
+    ///
+    /// A static counter is usually *read* by clients and written by whoever
+    /// asked for it — a driver or another service — but nothing in the format
+    /// says so, and the reference does not check either.
+    pub fn set_value(&self, counters: &CountersReader<'_, ReadWrite>, value: i64) -> bool {
+        counters.set_value(self.counter_id, value).is_some()
+    }
+
+    /// The counter's descriptor — type, key, label, owner — as the file has it
+    /// right now.
+    ///
+    /// `owner_id` reads [`deepmsg_cnc::layout::NULL_VALUE`] for one of these,
+    /// which is the whole of what "static" means on the wire.
+    pub fn descriptor(&self, counters: &CountersReader<'_>) -> Option<CounterDescriptor> {
+        counters.get(self.counter_id)
+    }
+}
+
 /// A counter allocated by the driver on this client's behalf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Counter {

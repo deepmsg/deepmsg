@@ -841,6 +841,23 @@ pub enum Response<'a> {
         /// The subscription's channel, raw bytes, not NUL-terminated.
         channel: &'a [u8],
     },
+    /// `ADD_STATIC_COUNTER` was answered: the counter exists, and it belongs to
+    /// the driver rather than to this client
+    /// (`aeron_driver_conductor_on_static_counter`,
+    /// `aeron_driver_conductor.c:6313`).
+    ///
+    /// The client is told which counter it is and nothing else — there is no
+    /// registration id here, because the client already knows the one it asked
+    /// under. What it must *not* do is treat it like a counter of its own: it is
+    /// not in the driver's list for this client, so it is not announced as
+    /// unavailable when the client goes, and a `REMOVE_COUNTER` for it would
+    /// free something the client does not own.
+    StaticCounter {
+        /// Echoes the `correlation_id` of the request.
+        correlation_id: i64,
+        /// The counter's id, for `CountersReader`.
+        counter_id: i32,
+    },
     /// `GET_NEXT_AVAILABLE_SESSION_ID` was answered: this is the id to publish
     /// under on that stream
     /// (`aeron_driver_conductor_response_next_available_session_id`,
@@ -1445,6 +1462,132 @@ pub fn encode_reject_image(
     out
 }
 
+/// `AERON_COMMAND_ADD_STATIC_COUNTER`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:41`).
+pub const ADD_STATIC_COUNTER_TYPE_ID: i32 = 0x0F;
+
+/// `AERON_RESPONSE_ON_STATIC_COUNTER` (`aeron_control_protocol.h:56`).
+pub const ON_STATIC_COUNTER_TYPE_ID: i32 = 0x0F0B;
+
+/// The fixed head of `ADD_STATIC_COUNTER`: the correlated head, the
+/// registration id the counter is keyed by, and its type id — 28 bytes
+/// (`aeron_static_counter_command_t`, `aeron_control_protocol.h:192-198`).
+///
+/// The key and the label are **appended** to the record rather than held in the
+/// struct (`:6300-6312`), which is the one way this command differs from
+/// [`ADD_COUNTER`](ADD_COUNTER_TYPE_ID) and the reason its decoder cannot share
+/// that one.
+pub const STATIC_COUNTER_HEADER_LENGTH: usize = CORRELATED_COMMAND_LENGTH + 8 + 4;
+
+/// The response's payload: the correlation id and the counter id
+/// (`aeron_static_counter_response_t`, `aeron_control_protocol.h:200-205`).
+///
+/// Twelve bytes, and **no correlated head** — the same shape as every other
+/// counter response, which is why a client matching on the client id would
+/// match nothing.
+pub const STATIC_COUNTER_RESPONSE_LENGTH: usize = 8 + 4;
+
+/// `ADD_STATIC_COUNTER`, decoded.
+///
+/// A *static* counter is one the driver owns rather than the client: it is
+/// allocated with an owner id of [`layout::NULL_VALUE`]
+/// (`aeron_driver_conductor.c:6308-6309`) and is therefore not in the client's
+/// list of counters — so a client that dies does not take it with it, and
+/// nothing announces it as unavailable. That is the whole of what "static"
+/// means, and it is why the client cannot remove one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddStaticCounter<'a> {
+    /// Who is asking.
+    pub correlated: Correlated,
+    /// The id the counter is found by, together with its type id — the pair
+    /// `aeron_counters_reader_find_by_type_id_and_registration_id` searches on.
+    pub registration_id: i64,
+    /// What kind of counter it is.
+    pub type_id: i32,
+    /// The key, as it lies in the record.
+    pub key: &'a [u8],
+    /// And the label.
+    pub label: &'a [u8],
+}
+
+/// Decode `ADD_STATIC_COUNTER`.
+///
+/// The key runs from [`STATIC_COUNTER_HEADER_LENGTH`] for as many bytes as its
+/// own length says, and the label starts after the key **padded to four** —
+/// the same alignment [`decode_add_counter`] handles, one offset along.
+pub fn decode_add_static_counter(payload: &[u8]) -> Option<AddStaticCounter<'_>> {
+    let correlated = decode_correlated(payload)?;
+    let registration_id = le_i64(payload, CORRELATED_COMMAND_LENGTH)?;
+    let type_id = le_i32(payload, CORRELATED_COMMAND_LENGTH + 8)?;
+
+    let key_length = usize::try_from(le_i32(payload, STATIC_COUNTER_HEADER_LENGTH)?).ok()?;
+    let key_start = STATIC_COUNTER_HEADER_LENGTH + 4;
+    let key = payload.get(key_start..key_start.checked_add(key_length)?)?;
+
+    let label_length_offset = key_start.checked_add(layout::align_up(key_length, 4))?;
+    let label_length = usize::try_from(le_i32(payload, label_length_offset)?).ok()?;
+    let label_start = label_length_offset.checked_add(4)?;
+    let label = payload.get(label_start..label_start.checked_add(label_length)?)?;
+
+    Some(AddStaticCounter {
+        correlated,
+        registration_id,
+        type_id,
+        key,
+        label,
+    })
+}
+
+/// Encode `ADD_STATIC_COUNTER`.
+///
+/// The reference's own sender is `aeron_counter_command_t`'s twin on the client
+/// side; this builds the record the decoder above reads, with the key padded
+/// and the label following it.
+pub fn encode_add_static_counter(
+    client_id: i64,
+    correlation_id: i64,
+    registration_id: i64,
+    type_id: i32,
+    key: &[u8],
+    label: &[u8],
+) -> Vec<u8> {
+    let key_padded = layout::align_up(key.len(), 4);
+    let mut out = vec![0u8; STATIC_COUNTER_HEADER_LENGTH + 4 + key_padded + 4 + label.len()];
+
+    out[0..8].copy_from_slice(&client_id.to_le_bytes());
+    out[8..16].copy_from_slice(&correlation_id.to_le_bytes());
+    out[16..24].copy_from_slice(&registration_id.to_le_bytes());
+    out[24..28].copy_from_slice(&type_id.to_le_bytes());
+
+    #[allow(clippy::cast_possible_truncation)] // a key this build was handed
+    let key_length = key.len() as i32;
+    out[STATIC_COUNTER_HEADER_LENGTH..STATIC_COUNTER_HEADER_LENGTH + 4]
+        .copy_from_slice(&key_length.to_le_bytes());
+
+    let key_start = STATIC_COUNTER_HEADER_LENGTH + 4;
+    out[key_start..key_start + key.len()].copy_from_slice(key);
+
+    let label_length_offset = key_start + key_padded;
+    #[allow(clippy::cast_possible_truncation)] // a label this build was handed
+    let label_length = label.len() as i32;
+    out[label_length_offset..label_length_offset + 4].copy_from_slice(&label_length.to_le_bytes());
+    out[label_length_offset + 4..].copy_from_slice(label);
+
+    out
+}
+
+/// Encode `ON_STATIC_COUNTER`.
+pub fn encode_static_counter(
+    correlation_id: i64,
+    counter_id: i32,
+) -> [u8; STATIC_COUNTER_RESPONSE_LENGTH] {
+    let mut out = [0u8; STATIC_COUNTER_RESPONSE_LENGTH];
+    out[0..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..12].copy_from_slice(&counter_id.to_le_bytes());
+
+    out
+}
+
 /// `AERON_COMMAND_GET_NEXT_AVAILABLE_SESSION_ID`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:44`).
 pub const GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID: i32 = 0x12;
@@ -1812,6 +1955,13 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
             }
         }
         ON_PUBLICATION_ERROR_TYPE_ID => decode_publication_error(payload),
+        ON_STATIC_COUNTER_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(counter_id)) => Response::StaticCounter {
+                correlation_id,
+                counter_id,
+            },
+            _ => Response::Other { type_id },
+        },
         ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
             (Some(correlation_id), Some(next_session_id)) => Response::NextAvailableSessionId {
                 correlation_id,
@@ -3247,6 +3397,99 @@ mod response_tests {
                 },
                 decode_response(ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, &vec![0u8; length]),
                 "a {length}-byte payload is not a session id answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_counter_request_round_trips_with_its_key_and_label() {
+        let key = b"stat";
+        let label = b"a static counter";
+
+        let payload = encode_add_static_counter(7, 9, 42, 99, key, label);
+
+        // `sizeof` is 28, then the key with its own length, then the label with
+        // its own — the key padded to four and the label not, which is the same
+        // asymmetry `ADD_COUNTER` has.
+        assert_eq!(28, STATIC_COUNTER_HEADER_LENGTH);
+        assert_eq!(28 + 4 + 4 + 4 + label.len(), payload.len());
+
+        let decoded = decode_add_static_counter(&payload).expect("should decode");
+
+        assert_eq!(7, decoded.correlated.client_id);
+        assert_eq!(9, decoded.correlated.correlation_id);
+        assert_eq!(42, decoded.registration_id);
+        assert_eq!(99, decoded.type_id);
+        assert_eq!(key, decoded.key);
+        assert_eq!(label, decoded.label);
+    }
+
+    #[test]
+    fn a_static_counter_key_is_padded_and_its_label_is_not() {
+        // The one place this can go wrong silently: a key whose length is not a
+        // multiple of four pushes the label's own length four bytes along, and
+        // a decoder that read it where an unpadded key would leave it reads the
+        // key's tail as a length.
+        let payload = encode_add_static_counter(7, 9, 42, 99, b"abc", b"lab");
+
+        let decoded = decode_add_static_counter(&payload).expect("should decode");
+
+        assert_eq!(b"abc", decoded.key);
+        assert_eq!(b"lab", decoded.label);
+        assert_eq!(
+            3,
+            i32::from_le_bytes(
+                payload[STATIC_COUNTER_HEADER_LENGTH + 4 + 4..STATIC_COUNTER_HEADER_LENGTH + 4 + 8]
+                    .try_into()
+                    .expect("four bytes")
+            ),
+            "the label's length sits after the key's four-byte padding, \
+             and reads 3 rather than the 1 byte of padding it is not"
+        );
+    }
+
+    #[test]
+    fn refuses_a_truncated_static_counter_request() {
+        let full = encode_add_static_counter(7, 9, 42, 99, b"stat", b"a static counter");
+
+        for length in [0, STATIC_COUNTER_HEADER_LENGTH - 1, full.len() - 1] {
+            assert!(
+                decode_add_static_counter(&full[..length]).is_none(),
+                "a {length}-byte payload is not a static counter request"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_counter_answer_is_twelve_bytes_with_no_correlated_head() {
+        let encoded = encode_static_counter(9, 1234);
+
+        assert_eq!(12, encoded.len());
+        assert_eq!(12, STATIC_COUNTER_RESPONSE_LENGTH);
+        assert_eq!(9i64.to_le_bytes(), encoded[0..8]);
+        assert_eq!(1234i32.to_le_bytes(), encoded[8..12]);
+
+        let Response::StaticCounter {
+            correlation_id,
+            counter_id,
+        } = decode_response(ON_STATIC_COUNTER_TYPE_ID, &encoded)
+        else {
+            panic!("a static counter answer");
+        };
+
+        assert_eq!(9, correlation_id);
+        assert_eq!(1234, counter_id);
+    }
+
+    #[test]
+    fn refuses_a_truncated_static_counter_answer() {
+        for length in [0, 8, STATIC_COUNTER_RESPONSE_LENGTH - 1] {
+            assert_eq!(
+                Response::Other {
+                    type_id: ON_STATIC_COUNTER_TYPE_ID
+                },
+                decode_response(ON_STATIC_COUNTER_TYPE_ID, &vec![0u8; length]),
+                "a {length}-byte payload is not a static counter answer"
             );
         }
     }

@@ -37,18 +37,18 @@ use std::time::{Duration, Instant};
 
 use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID,
-    ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication,
-    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand,
-    GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID,
-    REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
-    REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
-    encode_reject_image,
+    ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
+    AddCounter, AddPublication, AddSubscription, Correlated, DestinationByIdCommand,
+    DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId,
+    REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID,
+    REMOVE_DESTINATION_TYPE_ID, REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response,
+    decode_response, encode_add_static_counter, encode_reject_image,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
-use crate::counter::{Counter, CounterEvent};
+use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::publication::Publication;
@@ -273,6 +273,8 @@ enum Ready {
     Counter { counter_id: i32 },
     /// The driver answered what session id to publish under.
     NextSessionId { next_session_id: i32 },
+    /// The driver allocated a counter it owns, at this client's request.
+    StaticCounter { counter_id: i32 },
     /// The command's work is done, and there is nothing to hand back — a
     /// removal's acknowledgement.
     OperationSucceeded,
@@ -303,6 +305,11 @@ pub struct Client {
     /// Counter announcements read off the broadcast and not yet drained:
     /// every counter that appeared or went away, whoever owns it.
     counter_events: Vec<CounterEvent>,
+    /// The counters this client asked the driver to allocate **for the
+    /// driver** — kept apart from `counters` on purpose, because everything
+    /// that walks `counters` is about counters this client owns and can give
+    /// back, and none of it is true of these.
+    static_counters: Vec<StaticCounter>,
     /// Publications the driver reported as failed and nobody has drained yet.
     /// Unlike the counter events these are about resources this client owns,
     /// which is why they are kept rather than dropped: a publisher that never
@@ -379,6 +386,7 @@ impl Client {
             publications: Vec::new(),
             counters: Vec::new(),
             counter_events: Vec::new(),
+            static_counters: Vec::new(),
             publication_errors: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
@@ -959,6 +967,68 @@ impl Client {
         Ok(correlation_id)
     }
 
+    /// Ask the driver to allocate a counter it will keep, and wait for it.
+    ///
+    /// The counter belongs to the **driver**, not to this client: it is
+    /// allocated with an owner id of `NULL_VALUE` and is not added to the list
+    /// this client's counters are in, so it survives this client and is never
+    /// announced as unavailable (`aeron_driver_conductor.c:6300-6312`). That is
+    /// what makes it useful — a value two processes want to watch without
+    /// either of them owning it — and it is why the handle that comes back is a
+    /// [`StaticCounter`] rather than a [`Counter`]: there is no removal to make.
+    ///
+    /// Asking twice for the same `(type_id, registration_id)` answers with the
+    /// counter that already exists, which is how two processes agree on one.
+    /// An id and type id that already name a counter **somebody owns** is
+    /// refused instead, because a static counter may not take a live counter's
+    /// place.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, the driver refused it
+    /// — the owner conflict above, or no room for the counter — or no answer
+    /// arrived within `timeout`.
+    pub fn add_static_counter(
+        &mut self,
+        type_id: i32,
+        registration_id: i64,
+        key: &[u8],
+        label: &[u8],
+        timeout: Duration,
+    ) -> Result<StaticCounter, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let payload = encode_add_static_counter(
+            self.client_id,
+            correlation_id,
+            registration_id,
+            type_id,
+            key,
+            label,
+        );
+
+        self.send(
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let Ready::StaticCounter { counter_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        let counter = StaticCounter::new(registration_id, counter_id);
+        self.static_counters.push(counter);
+
+        Ok(counter)
+    }
+
+    /// The counters this client asked the driver for, which the driver owns.
+    pub fn static_counters(&self) -> &[StaticCounter] {
+        &self.static_counters
+    }
+
     /// Ask the driver what session id to publish under on `stream_id`, and
     /// wait for the answer.
     ///
@@ -1478,6 +1548,18 @@ impl Client {
                     error_code,
                     message: message.to_vec(),
                 });
+            }
+            // A counter the driver owns rather than this client. It is
+            // completed like any other reply — the client asked for it — but
+            // what it hands back is deliberately *not* a `Counter`: this
+            // client does not own it, nothing will announce it as unavailable
+            // when this client goes, and there is no `REMOVE_COUNTER` that
+            // could take it away again.
+            Response::StaticCounter {
+                correlation_id,
+                counter_id,
+            } => {
+                self.complete(correlation_id, Ok(Ready::StaticCounter { counter_id }));
             }
             // The answer to `GET_NEXT_AVAILABLE_SESSION_ID`, matched by its
             // correlation id like any other reply. The driver broadcasts it to

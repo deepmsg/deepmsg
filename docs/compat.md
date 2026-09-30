@@ -97,16 +97,24 @@ naming the test that covers it.
   `crates/driver/src/conductor.rs::counter_announcements_arrive_as_events_for_the_watchers`
   and `::another_clients_counters_arrive_as_events_too`, and by the interop
   test above, whose events arrive from the reference's driver.
-- **No static counters.** `ADD_STATIC_COUNTER` (`0x0F`,
-  `aeron-client/src/main/c/command/aeron_control_protocol.h:41`) is in the
-  command table but has no handler: the reference's driver allocates the
-  counter (`aeron-driver/src/main/c/aeron_driver_conductor.c:3153-3166`) and
-  answers `ON_STATIC_COUNTER` (`0x0F0B`,
-  `aeron_control_protocol.h:56`), which its client pairs with the ready
-  handler (`aeron_client_conductor.c:1147`). deepmsg counts the command as
-  unhandled and stays silent, so a client asking for one waits until its
-  deadline. Covered by
-  `crates/driver/src/conductor.rs::a_static_counter_request_is_recognised_and_not_served`.
+- **A static counter is a type, not a flag.** `ADD_STATIC_COUNTER` (`0x0F`,
+  `aeron-client/src/main/c/command/aeron_control_protocol.h:41`) is served the
+  reference's way — allocated with an owner id of `NULL_VALUE`, answered with
+  `ON_STATIC_COUNTER` (`0x0F0B`, `:56`), reused when the same type id and
+  registration id are asked for again
+  (`aeron-driver/src/main/c/aeron_driver_conductor.c:6255-6316`) — but what a
+  *client* gets back is a different type. The reference tracks one as an
+  `AERON_CLIENT_MANAGED_RESOURCE_TYPE_STATIC_COUNTER` and matches that type
+  when a removal arrives
+  (`aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`), and its close
+  for one is a no-op (`:1283-1287`); here `Client::add_static_counter` returns a
+  `StaticCounter` and `Client::remove_counter` takes a `Counter`, so the removal
+  that must never happen cannot be written. Same outcome, no runtime match.
+  Covered by `crates/driver/src/conductor.rs::a_static_counter_belongs_to_the_driver_and_not_to_the_client`
+  (which checks the counter is never announced as one of the client's) and
+  `::a_static_counter_outlives_the_client_that_asked_for_it` (which kills the
+  client and finds the counter still there).
+
 
 ## Driver liveness and the directory
 
