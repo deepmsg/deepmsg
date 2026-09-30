@@ -88,8 +88,8 @@ use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
-    IPC_PREFIX, SPY_PREFIX, UdpChannel, UdpChannelError, validate_destination_prefix,
-    validate_send_destination_uri,
+    IPC_PREFIX, SPY_PREFIX, UdpChannel, UdpChannelError, is_spy_channel,
+    validate_destination_prefix, validate_send_destination_uri,
 };
 
 /// At most one command per duty cycle
@@ -802,6 +802,7 @@ impl Conductor {
             &mut self.counters,
             &counter_regions,
             &mut self.clients,
+            &mut self.subscriptions,
             self.sender.proxy(),
             self.receiver.proxy(),
             now,
@@ -1038,6 +1039,8 @@ impl Conductor {
 
         let _ = self.sender.proxy().remove_publication(registration_id);
 
+        self.release_spies_of(registration_id);
+
         if let Some(region) = self.cnc.counter_regions() {
             for counter_id in [
                 record.counters.pub_pos,
@@ -1054,6 +1057,42 @@ impl Conductor {
         self.send_endpoints.detach_publication(record.endpoint_id);
 
         true
+    }
+
+    /// Tell every spy reading a publication that it is gone, and give their
+    /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
+    ///
+    /// The message goes out **before** the counters come back, which is the
+    /// reference's order and the only one that works: the message names the
+    /// channel the spy read with, and a client told about an image it no longer
+    /// has is a client that stops advancing the position the publication's
+    /// limit is computed from.
+    ///
+    /// Nothing is sent when there is no spy — the common case — because there
+    /// is nothing to send it about; the link walk that finds that out is the
+    /// same walk that would send.
+    fn release_spies_of(&mut self, registration_id: i64) -> usize {
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        self.subscriptions.unlink_spies_of(
+            registration_id,
+            &mut self.counters,
+            &counter_regions,
+            self.now_ms,
+            &mut transmit,
+        )
     }
 
     /// Whatever a client left behind: the network publications it was holding
@@ -1722,31 +1761,50 @@ impl Conductor {
                         };
 
                         // As with publications: what the URI names decides
-                        // which half serves it, and nothing else.
-                        let subscription_result = match ChannelUri::parse(request.channel) {
-                            Ok(uri) if uri.transport() == Transport::Udp => subscriptions
-                                .add_network_subscription(
-                                    &request,
-                                    config,
-                                    counters,
-                                    &counter_regions,
-                                    clients,
-                                    receive_endpoints,
-                                    images,
-                                    receiver.proxy(),
-                                    now,
-                                    &mut transmit,
-                                ),
-                            _ => subscriptions.add_subscription(
+                        // which half serves it, and nothing else. A spy is
+                        // triaged **before** the transport test, because the
+                        // prefix is not a transport — what follows it is an
+                        // ordinary UDP channel, parsed as such
+                        // (`aeron_driver_conductor_on_add_spy_subscription`,
+                        // `aeron_driver_conductor.c:4926-4966`, whose own
+                        // dispatch is a string comparison on the prefix).
+                        let subscription_result = if is_spy_channel(request.channel) {
+                            subscriptions.add_spy_subscription(
                                 &request,
                                 config,
                                 counters,
                                 &counter_regions,
                                 clients,
-                                publications,
+                                network_publications,
                                 now,
                                 &mut transmit,
-                            ),
+                            )
+                        } else {
+                            match ChannelUri::parse(request.channel) {
+                                Ok(uri) if uri.transport() == Transport::Udp => subscriptions
+                                    .add_network_subscription(
+                                        &request,
+                                        config,
+                                        counters,
+                                        &counter_regions,
+                                        clients,
+                                        receive_endpoints,
+                                        images,
+                                        receiver.proxy(),
+                                        now,
+                                        &mut transmit,
+                                    ),
+                                _ => subscriptions.add_subscription(
+                                    &request,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    publications,
+                                    now,
+                                    &mut transmit,
+                                ),
+                            }
                         };
 
                         if let Err(error) = subscription_result {
@@ -1913,6 +1971,18 @@ impl Conductor {
         for registration_id in pending_publication_releases {
             if let Some(record) = network_publications.remove(registration_id) {
                 let _ = sender.proxy().remove_publication(registration_id);
+
+                // The spies first, and for the same reason the other release
+                // path gives: a client told its image is gone stops advancing
+                // the position this publication's limit was computed from,
+                // which is the state the publication is about to leave.
+                subscriptions.unlink_spies_of(
+                    registration_id,
+                    counters,
+                    &counter_regions,
+                    now_ms,
+                    &mut transmit,
+                );
 
                 for counter_id in [
                     record.counters.pub_pos,

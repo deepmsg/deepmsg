@@ -133,6 +133,16 @@ pub struct NetworkPublicationRecord {
     pub endpoint_id: u64,
     /// The channel as the client sent it.
     pub channel: Vec<u8>,
+    /// The channel the **endpoint** was created from, which is not always the
+    /// one above — see [`PendingNetworkPublication::endpoint_channel`].
+    ///
+    /// The spy match rule compares two things off it, the canonical form and
+    /// the channel tag (`aeron_driver_conductor_spy_subscription_link_matches`,
+    /// `aeron_driver_conductor.c:92-108`, which reads
+    /// `publication->endpoint->conductor_fields.udp_channel`). A publication
+    /// may point at an endpoint that a *different* channel made, and it is
+    /// that channel a spy has to agree with.
+    pub endpoint_channel: UdpChannel,
     /// Where its log buffer is. A second client given this publication maps the
     /// *same* file, so the reply to its `ADD_PUBLICATION` has to name it
     /// (`aeron_driver_conductor.c:4195-4196`, which answers with
@@ -471,6 +481,7 @@ impl NetworkPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         sender: &SenderProxy,
         receiver: &ReceiverProxy,
         now: Now,
@@ -497,6 +508,7 @@ impl NetworkPublications {
                         counters,
                         regions,
                         clients,
+                        subscriptions,
                         sender,
                         receiver,
                         now,
@@ -545,6 +557,7 @@ impl NetworkPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         sender: &SenderProxy,
         receiver: &ReceiverProxy,
         now: Now,
@@ -642,6 +655,7 @@ impl NetworkPublications {
             stream_id: pending.stream_id,
             endpoint_id: pending.endpoint_id,
             channel: pending.channel.clone(),
+            endpoint_channel: pending.endpoint_channel.clone(),
             path: pending.path.clone(),
             is_exclusive: pending.is_exclusive,
             params: pending.params,
@@ -672,6 +686,34 @@ impl NetworkPublications {
         };
 
         events.publication_ready(&ready, pending.is_exclusive);
+
+        // Every spy that was waiting for this stream, between the reply and the
+        // image's answer, which is where the reference does it
+        // (`:4201-4226`) — and after the reply for the same reason: a client
+        // that has been answered is one that may offer, and the spies read the
+        // buffer it is about to offer into.
+        //
+        // A link that fails is answered as an error on the publication's own
+        // correlation id, which is what the reference's command state machine
+        // does with the failure this returns (`:4220-4224` then the ERROR arm
+        // of `:3236-3240`). It is a reader the client will never hear about,
+        // and the alternative — silence — is a spy that waits for ever.
+        let failed = subscriptions.link_spy_subscriptions(
+            self.publications.last().expect("just pushed"),
+            counters,
+            regions,
+            now,
+            events,
+        );
+
+        if failed > 0 {
+            events.error(
+                pending.registration_id,
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!("failed to link {failed} spy subscription(s) to the publication")
+                    .as_bytes(),
+            );
+        }
 
         // And then the image is told which session to answer with, which is the
         // last thing the reference's link does (`:4227-4232`) — after the client

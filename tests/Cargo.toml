@@ -59,6 +59,12 @@ path = "integration/client_round_trip.rs"
 name = "udp_term_boundary"
 path = "integration/udp_term_boundary.rs"
 
+# A subscription that reads a local publication's log buffer without a socket.
+# Runs in CI: it needs our own driver, not the reference's.
+[[test]]
+name = "spy_subscription"
+path = "integration/spy_subscription.rs"
+
 [[test]]
 name = "connect_window"
 path = "integration/connect_window.rs"
