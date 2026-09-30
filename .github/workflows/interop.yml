@@ -45,12 +45,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A plain clone rather than `actions/checkout`, for a reason that is not
+      # stylistic: that action **refuses any path outside the workspace**
+      # ("Repository path ... is not under ..."), and this repository's whole
+      # reference arrangement is a *sibling* directory — `docs/reference.md`
+      # documents it, and `tests/src/driver.rs` hard-codes `../../aeron/...`
+      # from the `tests/` crate. Checking the reference out *inside* the
+      # workspace would work for this job and break the moment the Rust interop
+      # suite is added here, because that one looks for a sibling.
+      #
+      # The pinned commit `664f58e705f850dfb926f6293707b204ba804726` **is** the
+      # `1.53.2` release tag, so a shallow clone of the tag is the whole of it —
+      # 30 MB and a few seconds instead of the full history. The assertion below
+      # is what keeps that equivalence honest: if the tag ever moved, or a typo
+      # landed in `AERON_COMMIT`, this fails here instead of producing a run
+      # against a tree the byte contracts were not read from.
       - name: Check out the reference at the pinned commit
-        uses: actions/checkout@v4
-        with:
-          repository: aeron-io/aeron
-          ref: ${{ env.AERON_COMMIT }}
-          path: ../aeron
+        working-directory: ${{ github.workspace }}/..
+        run: |
+          git clone --quiet --depth 1 --branch 1.53.2 \
+            https://github.com/aeron-io/aeron.git aeron
+          actual=$(git -C aeron rev-parse HEAD)
+          echo "reference at $actual"
+          test "$actual" = "$AERON_COMMIT" || {
+            echo "::error::the 1.53.2 tag is $actual, not the pinned $AERON_COMMIT"
+            exit 1
+          }
 
       - name: Install the pinned Rust toolchain
         # `cargo` resolves to the channel in `rust-toolchain.toml`, so this is
