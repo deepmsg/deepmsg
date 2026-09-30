@@ -165,11 +165,15 @@ jobs:
           : > /tmp/status.tsv
           while read -r cls; do
             rm -rf aeron-system-tests/build/test-results/test
+            # `|| rc=$?` rather than a bare call followed by `rc=$?`: `run:`
+            # blocks execute under `bash -e`, so a bare failing `gradlew` ends
+            # the step right there — which is the opposite of the point, since
+            # a failing test class is the expected outcome, not an error.
+            rc=0
             timeout 120 ./gradlew --quiet :aeron-system-tests:test \
               --tests "$cls" \
               -Daeron.test.system.aeronmd.path="$GITHUB_WORKSPACE/target/debug/deepmsg-driver" \
-              > "/tmp/logs/$cls.log" 2>&1
-            rc=$?
+              > "/tmp/logs/$cls.log" 2>&1 || rc=$?
             cp -n aeron-system-tests/build/test-results/test/TEST-*.xml /tmp/results/ 2>/dev/null || true
             case $rc in
               0)   echo -e "$cls\tok" ;;
@@ -183,6 +187,22 @@ jobs:
                 | grep -q "^AERON_DIR=/dev/shm/aeron-" && kill -9 "$pid" || true
             done
           done < /tmp/classes.txt
+
+          # The outcome the job is graded on, said once and explicitly. The
+          # loop above swallows each class's exit code on purpose, so without
+          # this the step would end green however badly the classes did — a
+          # gate that reports its findings and then passes is a gate nobody
+          # reads.
+          total=$(wc -l < /tmp/status.tsv)
+          passed=$(grep -c $'\tok$' /tmp/status.tsv || true)
+          hung=$(grep -c 'TIMEOUT' /tmp/status.tsv || true)
+          echo "::notice::$passed of $total classes passed, $hung did not finish in 120s"
+          if [ "$passed" != "$total" ]; then
+            echo "::error::$((total - passed)) of $total OSS system-test classes did not pass. \
+          This is expected until the repair plan's slices land — the job summary says which gap \
+          each failure belongs to."
+            exit 1
+          fi
 
       - name: Summarise
         if: always()
