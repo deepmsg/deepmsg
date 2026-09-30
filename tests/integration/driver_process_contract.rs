@@ -488,3 +488,32 @@ fn a_signalled_driver_is_clean_too() {
     assert_eq!(Some(15), fixture.exit().code(), "SIGTERM is recorded");
     assert_eq!(0, fixture.stderr_len());
 }
+
+#[test]
+fn the_harness_shaped_terminate_command_stops_the_driver() {
+    let Some(mut fixture) = Fixture::start("terminate-shape", READ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _ = fixture.await_cnc();
+    publish_and_read(&fixture);
+
+    assert!(
+        fixture.exit.is_none(),
+        "the driver is still running before the command is written"
+    );
+
+    fixture.terminate();
+
+    // Zero, and that is the assertion that carries the weight: the harness's
+    // fallback is `destroyForcibly`, whose exit value records the signal, not
+    // this driver's clean path. A driver that had to be killed would not be
+    // zero here.
+    assert_eq!(
+        Some(0),
+        fixture.exit().code(),
+        "the driver ran its own shutdown path rather than being killed"
+    );
+    assert_eq!(0, fixture.stderr_len());
+}
