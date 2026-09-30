@@ -31,9 +31,14 @@ test:
 interop:
     cargo test -p deepmsg-tests --features interop
 
-# Run benchmarks.
+# Run the micro-benchmarks (criterion).
 bench:
-    cargo bench -p deepmsg-bench
+    cargo bench -p deepmsg-bench --bench micro
+
+# Measure a live round trip through a driver. Needs the release driver:
+# `cargo build --release -p deepmsg-driver`. Extra arguments go after `--`.
+bench-latency *args:
+    cargo bench -p deepmsg-bench --bench latency -- {{args}}
 
 # Regenerate SBE codecs from schemas/ (once ADR-0004 lands a generator).
 gen:
