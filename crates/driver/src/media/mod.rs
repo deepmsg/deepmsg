@@ -22,19 +22,21 @@
 //!   driver goes through [`udp_transport`], which is the only module above
 //!   [`crate::sys`] that touches one.
 //!
-//! # What P1-4 carries
+//! # What this build carries
 //!
 //! A single file descriptor per transport — the unicast case. The reference's
-//! dual-fd shape (a separate `recv_fd` for multicast, `:141-163`) arrives with
-//! multicast in P1-5, as do the interceptors and the transport-level
-//! timestamps. The poller is the linear one: the reference switches to
-//! `epoll`/`poll` above five transports
+//! dual-fd shape (a separate `recv_fd` for multicast, `:141-163`), the
+//! interceptors and the transport-level timestamps all belong to multicast,
+//! which is refused here (`docs/compat.md`). The poller is the linear one: the
+//! reference switches to `epoll`/`poll` above five transports
 //! (`aeron_udp_transport_poller.c:183-196`, `aeron_udp_transport_poller.h:22`),
-//! which is P1-5 too.
+//! a threshold this build's channels do not reach on any machine it is tested
+//! on, so the switch is left out rather than written and unproven.
 
 use std::io;
 use std::net::SocketAddr;
 
+pub mod destination_tracker;
 pub mod dispatcher;
 pub mod loss_generator;
 pub mod receive_endpoint;

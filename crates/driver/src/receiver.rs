@@ -36,11 +36,13 @@ use crate::idle::Backoff;
 
 use crate::media::dispatcher::Interest;
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
+use crate::media::receive_endpoint::ReceiveDestination;
 use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
 use crate::publication_image::PublicationImage;
 use crate::subscribable::TetherablePosition;
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
+use crate::udp_channel::UdpChannel;
 
 /// How many datagrams one poll may read
 /// (`AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX`,
@@ -50,7 +52,7 @@ const RECEIVE_SLOTS: usize = 16;
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
 /// `aeron-driver/src/main/c/aeron_driver_receiver.c:47` — 100 ms).
-pub const PENDING_SETUP_TIMEOUT_NS: i64 = 100_000_000;
+pub const PENDING_SETUP_TIMEOUT_NS: i64 = 1_000_000_000;
 
 /// What the conductor asks the receiver to do.
 pub enum ReceiverCommand {
@@ -75,6 +77,21 @@ pub enum ReceiverCommand {
         /// The stream.
         stream_id: i32,
         /// The session it named.
+        session_id: i32,
+    },
+    /// Ask the far end to describe a stream again
+    /// (`aeron_driver_receiver_on_request_setup`, `:412-427`).
+    ///
+    /// The reference does this only when the channel named a control address —
+    /// that is where the request goes, and a channel that named none has
+    /// nowhere to send one — and only for a session it already knows, which is
+    /// why the session is not optional here.
+    RequestSetup {
+        /// Which endpoint reads it.
+        endpoint_id: u64,
+        /// The stream.
+        stream_id: i32,
+        /// The session.
         session_id: i32,
     },
     /// A subscription went away.
@@ -110,6 +127,44 @@ pub enum ReceiverCommand {
         /// The reader's counter.
         counter_id: i32,
     },
+    /// Tell an image which session to answer a response channel with, or — with
+    /// [`RESPONSE_NULL_SESSION_ID`](crate::publication_image::RESPONSE_NULL_SESSION_ID)
+    /// — that it owes nobody one
+    /// (`aeron_publication_image_set_response_session_id`,
+    /// `aeron_publication_image.h:352-356`).
+    ///
+    /// It is a command rather than something the conductor writes because the
+    /// image belongs to this thread, and it is one command for both directions
+    /// because the reference's "clear it" is its "set it" with the sentinel
+    /// (`aeron_publication_image_remove_response_session_id`, `:1389-1392`).
+    SetResponseSessionId {
+        /// Which image.
+        registration_id: i64,
+        /// The session, or the sentinel.
+        response_session_id: i64,
+    },
+    /// Attach a destination a client added
+    /// (`aeron_driver_receiver_on_add_destination`, `:442-497`).
+    ///
+    /// The destination arrives **built** — its socket open, the counter holding
+    /// its address allocated — because the conductor is what has a counter
+    /// manager (`aeron_driver_conductor.c:5903-5919`). This is the same shape as
+    /// [`ReceiverCommand::AddEndpoint`], and for the same reason.
+    AddDestination {
+        /// Which endpoint reads from it.
+        endpoint_id: u64,
+        /// The destination itself.
+        destination: Box<ReceiveDestination>,
+    },
+    /// Take a destination off (`aeron_driver_receiver_on_remove_destination`).
+    RemoveDestination {
+        /// Which endpoint read from it.
+        endpoint_id: u64,
+        /// Which destination, by the channel it was added with — the reference
+        /// compares two by `aeron_udp_channel_equals`
+        /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+        channel: Box<UdpChannel>,
+    },
     /// Stop the thread.
     Stop,
 }
@@ -137,6 +192,13 @@ pub enum ReceiverEvent {
         term_length: i32,
         /// The sender's MTU.
         mtu: i32,
+        /// The header flags of that `SETUP`. They ride beside
+        /// [`SetupFrame`](crate::protocol::SetupFrame) rather than inside it
+        /// because they belong to the frame *header*: the body the frame
+        /// carries is the same whatever the sender asked for, and the one bit
+        /// the driver acts on — whether a response channel is wanted back — is
+        /// the header's to say.
+        setup_flags: u8,
         /// Where a control frame goes: the source of the `SETUP`, or the
         /// channel's control address.
         control_address: std::net::SocketAddr,
@@ -185,6 +247,38 @@ impl ReceiverProxy {
             .map_err(|_| stopped())
     }
 
+    /// Hand the receiver a destination to start reading from.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_destination(
+        &self,
+        endpoint_id: u64,
+        destination: Box<ReceiveDestination>,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::AddDestination {
+                endpoint_id,
+                destination,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the receiver to stop reading from a destination.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination(&self, endpoint_id: u64, channel: Box<UdpChannel>) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RemoveDestination {
+                endpoint_id,
+                channel,
+            })
+            .map_err(|_| stopped())
+    }
+
     /// Tell the receiver a subscription arrived.
     ///
     /// # Errors
@@ -209,6 +303,26 @@ impl ReceiverProxy {
         };
 
         self.commands.send(command).map_err(|_| stopped())
+    }
+
+    /// Ask the receiver to elicit a setup for a session it reads.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn request_setup(
+        &self,
+        endpoint_id: u64,
+        stream_id: i32,
+        session_id: i32,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RequestSetup {
+                endpoint_id,
+                stream_id,
+                session_id,
+            })
+            .map_err(|_| stopped())
     }
 
     /// Tell the receiver a subscription went away.
@@ -270,6 +384,25 @@ impl ReceiverProxy {
             .send(ReceiverCommand::RemoveSubscriber {
                 registration_id,
                 counter_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell an image which session to answer a response channel with, or that
+    /// it owes nobody one.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn set_response_session_id(
+        &self,
+        registration_id: i64,
+        response_session_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::SetResponseSessionId {
+                registration_id,
+                response_session_id,
             })
             .map_err(|_| stopped())
     }
@@ -390,8 +523,16 @@ struct PendingSetup {
     endpoint_id: u64,
     stream_id: i32,
     session_id: i32,
-    /// Where the eliciting status message goes.
-    control_address: std::net::SocketAddr,
+    /// Where the eliciting status message goes, or [`None`] when it goes to
+    /// wherever the packets came from.
+    ///
+    /// This is also what makes an entry **periodic**
+    /// (`aeron_driver_receiver_add_pending_setup`, `:653-687`: `is_periodic` is
+    /// false, and set true only when a control address was given). A periodic
+    /// entry is asked again every [`PENDING_SETUP_TIMEOUT_NS`]; one that is not
+    /// periodic is **given up on** after that long, and the session's interest
+    /// is dropped so that the next frame from it asks again.
+    control_address: Option<std::net::SocketAddr>,
     /// When it was last sent.
     time_of_status_message_ns: i64,
 }
@@ -456,6 +597,89 @@ impl ReceiverThread {
                     ReceiverCommand::AddEndpoint { id, endpoint } => {
                         self.endpoints.push((id, endpoint));
                     }
+                    ReceiverCommand::AddDestination {
+                        endpoint_id,
+                        destination,
+                    } => {
+                        // A destination whose channel named a `control=` is one
+                        // the sender does not know about: the receiver has to
+                        // ask, and has to keep asking until it is answered
+                        // (`aeron_driver_receiver.c:475-486`, which adds a
+                        // periodic pending setup for exactly these).
+                        //
+                        // Session and stream are zero, as they are there: the
+                        // ask is not about a stream yet. What it is for is the
+                        // answer — a `SETUP` describing whatever the far end
+                        // publishes — and that is what brings the stream into
+                        // being.
+                        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+                        let setup = destination.setup_address().map(|address| PendingSetup {
+                            endpoint_id,
+                            stream_id: 0,
+                            session_id: 0,
+                            control_address: Some(address),
+                            time_of_status_message_ns: now_ns,
+                        });
+                        let setup_address = destination.setup_address();
+
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            endpoint.add_destination(*destination);
+
+                            // The periodic entry asks a second from now and keeps
+                            // asking; this is the *first* ask, so that a source
+                            // with nothing to wait for hears it at once
+                            // (`aeron_receive_channel_endpoint.c:1145-1147`,
+                            // which sends one beside adding the entry).
+                            //
+                            // It goes to the same address the entry does: for a
+                            // channel that is not multicast and did name a
+                            // control, `current_control_addr` and `local_control`
+                            // are the same value (`media/aeron_receive_destination.c:117-124`).
+                            if let Some(address) = setup_address {
+                                let index = endpoint.destination_count() - 1;
+                                let _ = endpoint.send_sm_from(
+                                    index,
+                                    address,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    ReceiveChannelEndpoint::send_setup_flag(),
+                                );
+                            }
+                        }
+
+                        if let Some(setup) = setup {
+                            self.pending_setups.push(setup);
+                        }
+
+                        // And every image already running on that endpoint hears
+                        // from it too (`aeron_driver_receiver.c:483-486`): a
+                        // stream that is already up has to send its status
+                        // messages and NAKs to the new source as well.
+                        for image in self.images.iter_mut() {
+                            if image.endpoint_id == endpoint_id {
+                                image.add_destination(setup_address, now_ns);
+                            }
+                        }
+                    }
+                    ReceiverCommand::RemoveDestination {
+                        endpoint_id,
+                        channel,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            // The counter the destination held is not freed
+                            // here: the conductor allocated it, and giving a
+                            // counter back is the conductor's to do — the
+                            // receiver only stops reading.
+                            let _ = endpoint.remove_destination(&channel);
+                        }
+                    }
                     ReceiverCommand::AddSubscription {
                         endpoint_id,
                         stream_id,
@@ -475,6 +699,44 @@ impl ReceiverThread {
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             endpoint.add_subscription_by_session(stream_id, session_id);
+
+                            // And then the ask, which is the whole reason a
+                            // session-addressed subscription exists here: a
+                            // response subscription names no session until the
+                            // far end's `RSP_SETUP` says which one it is, and
+                            // *this* is where that session is finally asked
+                            // for by name (`aeron_driver_receiver.c:401-409`).
+                            //
+                            // Unlike the ask beside a destination
+                            // (`:475-486`), this one carries a real stream and
+                            // session, and that is not a detail: the far end
+                            // finds its publication by
+                            // `(stream_id << 32) | session_id`, so an ask with
+                            // no session in it reaches no publication at all —
+                            // it reaches only the destination tracker.
+                            //
+                            // A channel with no control address has nowhere to
+                            // send it, so the guard is the channel's
+                            // (`:418-426`).
+                            if endpoint.channel.has_explicit_control {
+                                endpoint.elicit_setup_to_destinations(stream_id, session_id);
+                            }
+                        }
+                    }
+                    ReceiverCommand::RequestSetup {
+                        endpoint_id,
+                        stream_id,
+                        session_id,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            // A channel that named no control address has
+                            // nowhere to send the request (`:418-426`), so the
+                            // guard is the channel's, not the caller's.
+                            if endpoint.channel.has_explicit_control {
+                                endpoint.elicit_setup_to_destinations(stream_id, session_id);
+                            }
                         }
                     }
                     ReceiverCommand::RemoveSubscription {
@@ -575,6 +837,18 @@ impl ReceiverThread {
                             image.remove_subscriber(counter_id);
                         }
                     }
+                    ReceiverCommand::SetResponseSessionId {
+                        registration_id,
+                        response_session_id,
+                    } => {
+                        if let Some(image) = self
+                            .images
+                            .iter_mut()
+                            .find(|image| image.registration_id == registration_id)
+                        {
+                            image.set_response_session_id(response_session_id);
+                        }
+                    }
                     ReceiverCommand::Stop => stop = true,
                 }
             }
@@ -603,6 +877,7 @@ impl ReceiverThread {
             &mut self.images,
             &mut self.buffers,
             &mut self.datagrams,
+            &mut self.pending_setups,
             &system,
             &self.counters,
             &regions,
@@ -653,6 +928,7 @@ impl ReceiverThread {
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
+        pending_setups: &mut Vec<PendingSetup>,
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -664,48 +940,65 @@ impl ReceiverThread {
         let mut work = 0;
 
         for (endpoint_id, endpoint) in endpoints.iter_mut() {
-            let received = match endpoint.receive(buffers, datagrams) {
-                Ok(received) => received,
-                Err(error) => {
-                    let _ = events.send(ReceiverEvent::Fault {
-                        error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
-                        description: format!("could not receive on a channel: {error}"),
-                    });
-                    continue;
-                }
-            };
-
-            if received == 0 {
-                continue;
-            }
-
-            let batch = *datagrams;
-            let mut bytes_received = 0i64;
-
-            for (slot, datagram) in batch.as_slice().iter().enumerate() {
-                bytes_received += i64::try_from(datagram.length).unwrap_or(0);
-                work += 1;
-
-                let Some(source) = datagram.source else {
-                    continue;
+            // Every destination, not just the first: a multi-destination channel
+            // has one socket per destination and a datagram that arrives on any
+            // of them is a datagram this endpoint has to read
+            // (`aeron_driver_receiver_do_work`, `:130-260`). With one
+            // destination — which is every channel until a client adds another —
+            // this is the single poll it always was.
+            //
+            // Which destination a datagram arrived on is *not* passed on yet.
+            // Its only reader is the reply path — an answer has to leave through
+            // the socket it arrived on, not through the first one — and that
+            // arrives with the commands that create a second destination. The
+            // compiler objected to the parameter existing before then, correctly:
+            // a parameter nothing reads is not a fact about the wire.
+            for destination_index in 0..endpoint.destination_count() {
+                let received = match endpoint.receive_from(destination_index, buffers, datagrams) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        let _ = events.send(ReceiverEvent::Fault {
+                            error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                            description: format!("could not receive on a channel: {error}"),
+                        });
+                        continue;
+                    }
                 };
 
-                let packet = &buffers[slot][..datagram.length];
-                Self::dispatch(
-                    *endpoint_id,
-                    endpoint,
-                    images,
-                    packet,
-                    source,
-                    system,
-                    counters,
-                    regions,
-                    events,
-                    now_ns,
-                );
-            }
+                if received == 0 {
+                    continue;
+                }
 
-            system.add(system_counters::id::BYTES_RECEIVED, bytes_received);
+                let batch = *datagrams;
+                let mut bytes_received = 0i64;
+
+                for (slot, datagram) in batch.as_slice().iter().enumerate() {
+                    bytes_received += i64::try_from(datagram.length).unwrap_or(0);
+                    work += 1;
+
+                    let Some(source) = datagram.source else {
+                        continue;
+                    };
+
+                    let packet = &buffers[slot][..datagram.length];
+                    Self::dispatch(
+                        *endpoint_id,
+                        destination_index,
+                        endpoint,
+                        images,
+                        pending_setups,
+                        packet,
+                        source,
+                        system,
+                        counters,
+                        regions,
+                        events,
+                        now_ns,
+                    );
+                }
+
+                system.add(system_counters::id::BYTES_RECEIVED, bytes_received);
+            }
         }
 
         work
@@ -714,10 +1007,13 @@ impl ReceiverThread {
     /// One datagram, to the dispatcher
     /// (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         endpoint_id: u64,
+        destination_index: usize,
         endpoint: &mut ReceiveChannelEndpoint,
         images: &mut [PublicationImage],
+        pending_setups: &mut Vec<PendingSetup>,
         packet: &[u8],
         source: std::net::SocketAddr,
         system: &System<'_>,
@@ -737,7 +1033,13 @@ impl ReceiverThread {
 
         match header.frame_type {
             frame_type::PAD | frame_type::DATA => {
-                let Some(frame) = crate::protocol::DataFrame::read(packet) else {
+                // Both kinds a term holds, through the reader that admits both:
+                // a padding frame carries no payload anyone will read, and it
+                // is still a frame the image has to write into its term —
+                // `DataFrame::read` refuses it, and a receiver that used that
+                // one dropped every padding datagram, leaving the term's tail
+                // unwritten and its gap scanner asking for it forever.
+                let Some(frame) = crate::protocol::DataFrame::read_in_a_term(packet) else {
                     return;
                 };
 
@@ -767,7 +1069,8 @@ impl ReceiverThread {
                         // (`elicit_setup_from_source`, `:616-659`).
                         if endpoint.elicit_setup(frame.stream_id, frame.session_id)
                             && endpoint
-                                .send_sm(
+                                .send_sm_from(
+                                    destination_index,
                                     endpoint.control_address(source),
                                     frame.stream_id,
                                     frame.session_id,
@@ -780,6 +1083,25 @@ impl ReceiverThread {
                         {
                             system.increment(system_counters::id::STATUS_MESSAGES_SENT);
                         }
+
+                        // And remember that we asked — **without** a control
+                        // address, which is what makes this entry non-periodic
+                        // (`aeron_driver_receiver_add_pending_setup`, `:653-687`:
+                        // this path is given a `NULL` there).
+                        //
+                        // That is the whole point of recording it: a session
+                        // that never answers is given up on after a second, its
+                        // interest is dropped, and the next frame from it asks
+                        // again. `elicit_setup` alone answers yes once per
+                        // session for ever, so before this a sender that missed
+                        // the first request was never asked a second time.
+                        pending_setups.push(PendingSetup {
+                            endpoint_id,
+                            stream_id: frame.stream_id,
+                            session_id: frame.session_id,
+                            control_address: None,
+                            time_of_status_message_ns: now_ns,
+                        });
                     }
                     Interest::None => {}
                 }
@@ -788,6 +1110,7 @@ impl ReceiverThread {
                 let Some(setup) = SetupFrame::read(packet) else {
                     return;
                 };
+                let setup_flags = header.flags;
 
                 if !endpoint
                     .dispatcher_mut()
@@ -808,6 +1131,7 @@ impl ReceiverThread {
                     term_offset: setup.term_offset,
                     term_length: setup.term_length,
                     mtu: setup.mtu,
+                    setup_flags,
                     control_address,
                     source,
                 });
@@ -878,32 +1202,38 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
-                let Some(control_address) = image.control_address else {
-                    continue;
-                };
+                // A NAK goes to every connection this image hears from, like a
+                // status message: each receiver has its own view of what is
+                // missing, and one of them having it is not the others having
+                // it. With one connection this is the message it always was.
+                for connection in &image.connections {
+                    let Some(control_address) = connection.control_address else {
+                        continue;
+                    };
 
-                if endpoint
-                    .send_nak(
-                        control_address,
-                        image.stream_id,
-                        image.session_id,
-                        gap.term_id,
-                        gap.term_offset,
-                        i32::try_from(gap.length).unwrap_or(i32::MAX),
-                    )
-                    .is_ok()
-                {
-                    system.increment(system_counters::id::NAK_MESSAGES_SENT);
-                    // …and the same count under the image that asked for it:
-                    // the system counter says the driver is retransmitting,
-                    // this one says for which stream
-                    // (`aeron_publication_image.c:1052`).
-                    let _ = system_counters::increment(
-                        counters,
-                        regions,
-                        image.counters().rcv_naks_sent,
-                    );
-                    work += 1;
+                    if endpoint
+                        .send_nak(
+                            control_address,
+                            image.stream_id,
+                            image.session_id,
+                            gap.term_id,
+                            gap.term_offset,
+                            i32::try_from(gap.length).unwrap_or(i32::MAX),
+                        )
+                        .is_ok()
+                    {
+                        system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                        // …and the same count under the image that asked for
+                        // it: the system counter says the driver is
+                        // retransmitting, this one says for which stream
+                        // (`aeron_publication_image.c:1052`).
+                        let _ = system_counters::increment(
+                            counters,
+                            regions,
+                            image.counters().rcv_naks_sent,
+                        );
+                        work += 1;
+                    }
                 }
             }
 
@@ -921,7 +1251,7 @@ impl ReceiverThread {
     /// Ask again for the `SETUP` of a session that has not answered
     /// (`aeron_driver_receiver.c:211-252`).
     fn send_pending_setups(
-        pending_setups: &mut [PendingSetup],
+        pending_setups: &mut Vec<PendingSetup>,
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
         system: &System<'_>,
         now_ns: i64,
@@ -941,11 +1271,24 @@ impl ReceiverThread {
                 .iter_mut()
                 .find(|(id, _)| *id == pending.endpoint_id)
             else {
+                // The endpoint is gone, so there is nothing left to ask and
+                // nothing left to tell. The entry goes with it.
+                pending_setups.swap_remove(index);
+                continue;
+            };
+
+            let Some(control_address) = pending.control_address else {
+                // Not periodic: a session that has not answered in a second is
+                // given up on (`:215-227`), and dropping the interest is what
+                // lets the next frame from it ask again.
+                endpoint.remove_pending_setup(pending.stream_id, pending.session_id);
+                pending_setups.swap_remove(index);
+                work += 1;
                 continue;
             };
 
             let sent = endpoint.send_sm(
-                pending.control_address,
+                control_address,
                 pending.stream_id,
                 pending.session_id,
                 0,
@@ -987,16 +1330,6 @@ impl ReceiverThread {
         }
 
         work
-    }
-
-    /// Remember a pending setup, so it is asked for again if nothing answers.
-    ///
-    /// The receiver is the one that noticed the session missing, so it records
-    /// it where the eliciting status message is sent from — one hop fewer than
-    /// sending the note back to the conductor and returning it as a command.
-    #[allow(dead_code)] // called by the dispatch path once the loss seam lands
-    pub fn push_pending_setup(&mut self, setup: PendingSetup) {
-        self.pending_setups.push(setup);
     }
 
     /// The cycle-time counters, which are 30 and 31

@@ -49,17 +49,18 @@
 //! client rather than a feature this build has not reached.
 
 use deepmsg_cnc::command::{
-    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_MALFORMED_COMMAND,
-    ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE, ERROR_CODE_STORAGE_SPACE,
-    ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER, ERROR_CODE_UNKNOWN_PUBLICATION,
-    ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady, ON_AVAILABLE_IMAGE_TYPE_ID,
-    ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID, ON_ERROR_TYPE_ID,
-    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
-    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, REMOVE_PUBLICATION_FLAG_REVOKE,
-    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
-    decode_remove_counter, decode_remove_publication, decode_remove_subscription,
-    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
-    encode_subscription_ready, encode_unavailable_image,
+    ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
+    ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
+    ERROR_CODE_STORAGE_SPACE, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER,
+    ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
+    ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
+    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
+    ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady,
+    REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter, decode_add_publication,
+    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
+    decode_destination_command, decode_remove_counter, decode_remove_publication,
+    decode_remove_subscription, encode_client_timeout, encode_counter_update, encode_error,
+    encode_operation_succeeded, encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -77,6 +78,7 @@ use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::media::receive_endpoint::ReceiveDestination;
 use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
@@ -85,6 +87,10 @@ use crate::receiver::{Receiver, ReceiverEvent};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
+use crate::udp_channel::{
+    IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
+    validate_send_destination_uri,
+};
 
 /// At most one command per duty cycle
 /// (`aeron-driver/src/main/c/aeron_driver_context.h:53`).
@@ -467,6 +473,15 @@ pub struct Conductor {
     /// pass holds the CnC file's other windows while it runs, so these wait
     /// for it, the way broadcast failures do.
     pending_log_errors: Vec<(i32, String)>,
+    /// Readers a publication put aside, woke or closed, waiting for the pass
+    /// that can send a client a message about them
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// The machine runs on the **sender**, because what it moves is the
+    /// publication's own set of readers; what it produces is three client
+    /// messages, which are the conductor's. The queue is that hand-off.
+    pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
 }
 
 impl Conductor {
@@ -676,6 +691,7 @@ impl Conductor {
             unknown: 0,
             last_unhandled: None,
             pending_log_errors: Vec::new(),
+            pending_untethered: Vec::new(),
         };
 
         Ok(conductor)
@@ -751,7 +767,9 @@ impl Conductor {
     /// sequence), and for the same reason: the create has to happen on the
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
-        let mut work = self.poll_sender_events();
+        // The order matters and is left to right: the events are taken off the
+        // sender first, and what was taken is what the flush sends.
+        let mut work = self.poll_sender_events() + self.flush_untethered();
 
         if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
             return work;
@@ -796,7 +814,9 @@ impl Conductor {
             &mut self.counters,
             &counter_regions,
             &mut self.clients,
+            &mut self.subscriptions,
             self.sender.proxy(),
+            self.receiver.proxy(),
             now,
             &mut transmit,
         );
@@ -832,6 +852,7 @@ impl Conductor {
                     term_offset,
                     term_length,
                     mtu,
+                    setup_flags,
                     control_address,
                     source,
                 } => {
@@ -895,6 +916,7 @@ impl Conductor {
                         endpoint_id,
                         &channel,
                         &setup,
+                        setup_flags,
                         source,
                         control_address,
                         &self.config,
@@ -1016,7 +1038,7 @@ impl Conductor {
     /// Let go of a network publication: stop sending it, give its counters
     /// back, and count one less reader on its endpoint
     /// (`aeron_network_publication_close`,
-    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-360`).
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-354`).
     ///
     /// The IPC path does the same for its own publications
     /// ([`IpcPublications::release_links`]); this is the half that was missing,
@@ -1028,6 +1050,8 @@ impl Conductor {
         };
 
         let _ = self.sender.proxy().remove_publication(registration_id);
+
+        self.release_spies_of(registration_id);
 
         if let Some(region) = self.cnc.counter_regions() {
             for counter_id in [
@@ -1045,6 +1069,135 @@ impl Conductor {
         self.send_endpoints.detach_publication(record.endpoint_id);
 
         true
+    }
+
+    /// Send what a publication's tether cycle decided to the readers it
+    /// decided it about
+    /// (`aeron_network_publication_check_untethered_subscriptions`'s three
+    /// outcomes, `aeron_network_publication.c:1151-1208`).
+    ///
+    /// The three are not symmetric, and the asymmetry is the reference's: a
+    /// reader put aside is told its image is gone; a reader woken is told the
+    /// image is there again, at `snd-pos`; and a reader that was **not**
+    /// rejoining is told nothing at all — its counter goes back and its
+    /// subscription keeps whatever images it has left.
+    ///
+    /// The channel on the unavailable message is the IPC **constant**, not the
+    /// channel the client spied with (`:1156`). Both publication-side machines
+    /// send it that way — the reader is holding a mapping of a log buffer
+    /// rather than a description of a channel — and it is the same constant an
+    /// image that is being linked carries.
+    fn flush_untethered(&mut self) -> usize {
+        if self.pending_untethered.is_empty() {
+            return 0;
+        }
+
+        let pending = std::mem::take(&mut self.pending_untethered);
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        let mut work = 0;
+
+        for (registration_id, events) in &pending {
+            // A publication that has gone since the machine ran is one whose
+            // readers were told so by the removal itself; what is left here is
+            // a message about a buffer nobody holds.
+            let Some(publication) = self.network_publications.find(*registration_id) else {
+                continue;
+            };
+
+            for event in events {
+                work += 1;
+
+                match *event {
+                    crate::subscribable::UntetheredEvent::Unavailable {
+                        subscription_registration_id,
+                        ..
+                    } => {
+                        transmit.unavailable_image(
+                            *registration_id,
+                            subscription_registration_id,
+                            publication.stream_id,
+                            crate::ipc_subscriptions::IPC_CHANNEL,
+                        );
+                    }
+                    crate::subscribable::UntetheredEvent::Available {
+                        subscription_registration_id,
+                        counter_id,
+                        ..
+                    } => {
+                        // The same message a reader that has just linked gets,
+                        // down to the source identity: a woken reader cannot
+                        // tell the difference, which is the point of waking it
+                        // this way rather than inventing a second message.
+                        transmit.available_image(&ImageBuffersReady {
+                            correlation_id: *registration_id,
+                            session_id: publication.session_id,
+                            stream_id: publication.stream_id,
+                            subscriber_registration_id: subscription_registration_id,
+                            subscriber_position_id: counter_id,
+                            log_file: publication.path.as_os_str().as_encoded_bytes(),
+                            source_identity: crate::ipc_subscriptions::IPC_CHANNEL,
+                        });
+                    }
+                    crate::subscribable::UntetheredEvent::Closed { counter_id } => {
+                        let _ = self
+                            .counters
+                            .free(&counter_regions, counter_id, self.now_ms);
+                    }
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Tell every spy reading a publication that it is gone, and give their
+    /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
+    ///
+    /// The message goes out **before** the counters come back, which is the
+    /// reference's order and the only one that works: the message names the
+    /// channel the spy read with, and a client told about an image it no longer
+    /// has is a client that stops advancing the position the publication's
+    /// limit is computed from.
+    ///
+    /// Nothing is sent when there is no spy — the common case — because there
+    /// is nothing to send it about; the link walk that finds that out is the
+    /// same walk that would send.
+    fn release_spies_of(&mut self, registration_id: i64) -> usize {
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        self.subscriptions.unlink_spies_of(
+            registration_id,
+            &mut self.counters,
+            &counter_regions,
+            self.now_ms,
+            &mut transmit,
+        )
     }
 
     /// Whatever a client left behind: the network publications it was holding
@@ -1239,11 +1392,52 @@ impl Conductor {
             work += 1;
 
             match event {
+                crate::sender::SenderEvent::Untethered {
+                    registration_id,
+                    events,
+                } => {
+                    self.pending_untethered.push((registration_id, events));
+                }
                 crate::sender::SenderEvent::Fault {
                     error_code,
                     description,
                 } => {
                     self.pending_log_errors.push((error_code, description));
+                }
+                crate::sender::SenderEvent::ResponseSetup {
+                    response_correlation_id,
+                    response_session_id,
+                } => {
+                    if let Some((error_code, description)) = self.subscriptions.on_response_setup(
+                        response_correlation_id,
+                        response_session_id,
+                        self.receiver.proxy(),
+                    ) {
+                        self.pending_log_errors.push((error_code, description));
+                    }
+                }
+                crate::sender::SenderEvent::ResponseConnected {
+                    response_correlation_id,
+                } => {
+                    // The image that owed this publication a response setup has
+                    // now been answered — the publication has a live receiver,
+                    // which is the end of the handshake — so it stops saying
+                    // the session (`aeron_driver_conductor.c:7117-7131`).
+                    //
+                    // The reference sweeps every image and clears each match
+                    // rather than stopping at the first, and clears whether or
+                    // not the image's `SETUP` asked for a response channel: the
+                    // lookup is by registration id alone. That is kept as it is,
+                    // including its sharp edge — a *request* publication reports
+                    // its subscription's registration id here, which is a
+                    // different id space from an image's, so an id that names
+                    // both would clear the wrong image's session.
+                    if self.images.find(response_correlation_id).is_some() {
+                        let _ = self.receiver.proxy().set_response_session_id(
+                            response_correlation_id,
+                            crate::publication_image::RESPONSE_NULL_SESSION_ID,
+                        );
+                    }
                 }
                 crate::sender::SenderEvent::EndpointRemoved { .. }
                 | crate::sender::SenderEvent::PublicationRemoved { .. } => {
@@ -1454,6 +1648,11 @@ impl Conductor {
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
         let mut pending_publication_releases: Vec<i64> = Vec::new();
+        // The destination commands, for the same reason: the *sender* is what
+        // puts a destination on a tracker, and the drain's closure cannot reach
+        // it. The payloads are kept verbatim, so that what is decoded below is
+        // what the client wrote.
+        let mut pending_destination_commands: Vec<(i32, Vec<u8>)> = Vec::new();
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -1530,6 +1729,9 @@ impl Conductor {
                                         clients,
                                         send_endpoints,
                                         sender.proxy(),
+                                        subscriptions,
+                                        images,
+                                        receiver.proxy(),
                                         now,
                                         &mut transmit,
                                     )
@@ -1637,6 +1839,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                sender.proxy(),
                                 now_ms,
                             );
 
@@ -1670,31 +1873,51 @@ impl Conductor {
                         };
 
                         // As with publications: what the URI names decides
-                        // which half serves it, and nothing else.
-                        let subscription_result = match ChannelUri::parse(request.channel) {
-                            Ok(uri) if uri.transport() == Transport::Udp => subscriptions
-                                .add_network_subscription(
-                                    &request,
-                                    config,
-                                    counters,
-                                    &counter_regions,
-                                    clients,
-                                    receive_endpoints,
-                                    images,
-                                    receiver.proxy(),
-                                    now,
-                                    &mut transmit,
-                                ),
-                            _ => subscriptions.add_subscription(
+                        // which half serves it, and nothing else. A spy is
+                        // triaged **before** the transport test, because the
+                        // prefix is not a transport — what follows it is an
+                        // ordinary UDP channel, parsed as such
+                        // (`aeron_driver_conductor_on_add_spy_subscription`,
+                        // `aeron_driver_conductor.c:4926-4966`, whose own
+                        // dispatch is a string comparison on the prefix).
+                        let subscription_result = if is_spy_channel(request.channel) {
+                            subscriptions.add_spy_subscription(
                                 &request,
                                 config,
                                 counters,
                                 &counter_regions,
                                 clients,
-                                publications,
+                                network_publications,
+                                sender.proxy(),
                                 now,
                                 &mut transmit,
-                            ),
+                            )
+                        } else {
+                            match ChannelUri::parse(request.channel) {
+                                Ok(uri) if uri.transport() == Transport::Udp => subscriptions
+                                    .add_network_subscription(
+                                        &request,
+                                        config,
+                                        counters,
+                                        &counter_regions,
+                                        clients,
+                                        receive_endpoints,
+                                        images,
+                                        receiver.proxy(),
+                                        now,
+                                        &mut transmit,
+                                    ),
+                                _ => subscriptions.add_subscription(
+                                    &request,
+                                    config,
+                                    counters,
+                                    &counter_regions,
+                                    clients,
+                                    publications,
+                                    now,
+                                    &mut transmit,
+                                ),
+                            }
                         };
 
                         if let Err(error) = subscription_result {
@@ -1825,6 +2048,13 @@ impl Conductor {
                     }
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
+                Command::AddDestination
+                | Command::RemoveDestination
+                | Command::RemoveDestinationById
+                | Command::AddReceiveDestination
+                | Command::RemoveReceiveDestination => {
+                    pending_destination_commands.push((type_id, payload.to_vec()));
+                }
                 command => {
                     if let Command::Unknown(unknown_type_id) = command {
                         *unknown += 1;
@@ -1855,6 +2085,18 @@ impl Conductor {
             if let Some(record) = network_publications.remove(registration_id) {
                 let _ = sender.proxy().remove_publication(registration_id);
 
+                // The spies first, and for the same reason the other release
+                // path gives: a client told its image is gone stops advancing
+                // the position this publication's limit was computed from,
+                // which is the state the publication is about to leave.
+                subscriptions.unlink_spies_of(
+                    registration_id,
+                    counters,
+                    &counter_regions,
+                    now_ms,
+                    &mut transmit,
+                );
+
                 for counter_id in [
                     record.counters.pub_pos,
                     record.counters.pub_lmt,
@@ -1869,6 +2111,310 @@ impl Conductor {
                 send_endpoints.detach_publication(record.endpoint_id);
                 released += 1;
             }
+        }
+
+        // The destination commands.
+        //
+        // `REMOVE_DESTINATION_BY_ID` first, because it is the one command in the
+        // family whose failures the reference answers **nothing** to: it calls
+        // its handler without taking the result (`:3188-3200`), so the error for
+        // a publication it cannot find (`:5562-5578`) never reaches the
+        // `result < 0` that would send an `ON_ERROR` (`:3222-3225`). The client
+        // waits and times out. The silence is reproduced rather than improved
+        // on, so a lookup that finds nothing here answers nothing either, and
+        // `docs/compat.md` carries the line for it.
+        for (type_id, payload) in pending_destination_commands {
+            let command = Command::from_type_id(type_id);
+
+            // A receive destination is triaged by the prefix of the channel it
+            // names (`aeron_driver_conductor.c:3051-3065`): `aeron:ipc` is one
+            // kind of destination, `aeron-spy:` another, and everything else is
+            // a network one.
+            //
+            // `aeron:ipc` is the one this build refuses **by name** — a client
+            // told nothing waits out its timeout, and this is not a command
+            // this driver is going to get to later. The refusal is recorded in
+            // `docs/compat.md`.
+            if Command::AddReceiveDestination == command
+                || Command::RemoveReceiveDestination == command
+            {
+                let Some(request) = decode_destination_command(&payload) else {
+                    malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    continue;
+                };
+
+                if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_NOT_SUPPORTED,
+                        b"aeron:ipc destinations are not served by this driver",
+                    );
+                    continue;
+                }
+
+                // A spy destination is a **source**, not a socket: it adds a
+                // local read of a publication to a multi-destination
+                // subscription, which is the third way a spy link is made
+                // (`aeron_driver_conductor_execute_add_receive_spy_destination`,
+                // `:5704-5806`, and its removal at `:6024-6065`).
+                if is_spy_channel(request.channel) {
+                    let now = Now {
+                        ms: now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: liveness_timeout_ns,
+                    };
+
+                    if Command::AddReceiveDestination == command {
+                        let added = subscriptions.add_spy_destination(
+                            &request,
+                            config,
+                            counters,
+                            &counter_regions,
+                            receive_endpoints,
+                            network_publications,
+                            sender.proxy(),
+                            now,
+                            &mut transmit,
+                        );
+
+                        if let Err(error) = added {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlation_id,
+                                error.error_code(),
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    } else if subscriptions.remove_spy_destination(
+                        request.registration_id,
+                        request.channel,
+                        counters,
+                        &counter_regions,
+                        sender.proxy(),
+                        now_ms,
+                        &mut transmit,
+                    ) {
+                        transmit.operation_succeeded(request.correlation_id);
+                    } else {
+                        *subscription_failures += 1;
+                        let unknown = format!(
+                            "unknown subscription client_id={} registration_id={}",
+                            request.client_id, request.registration_id,
+                        );
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            unknown.as_bytes(),
+                        );
+                    }
+
+                    continue;
+                }
+
+                // The network branch. A destination is added to the
+                // **subscription** the client named — that is what its
+                // registration id is — and through it to the endpoint that
+                // subscription reads on (`aeron_driver_conductor.c:5879-5910`).
+                let Some(link) = subscriptions.find_mds(request.registration_id) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                        b"unknown subscription",
+                    );
+                    continue;
+                };
+
+                let Some(endpoint_id) = link.endpoint_id else {
+                    // An IPC subscription has no socket, so there is nothing to
+                    // add a destination to. The triage above catches an
+                    // `aeron:ipc` destination before this; a link with no
+                    // endpoint here is an IPC subscription named by a network
+                    // destination, which names a channel it does not have.
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_NOT_SUPPORTED,
+                        b"an IPC subscription has no destination",
+                    );
+                    continue;
+                };
+
+                let Ok(uri) = ChannelUri::parse(request.channel) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_INVALID_CHANNEL,
+                        b"incorrect URI format for destination",
+                    );
+                    continue;
+                };
+
+                let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                    transmit.error(
+                        request.correlation_id,
+                        ERROR_CODE_INVALID_CHANNEL,
+                        b"incorrect URI format for destination",
+                    );
+                    continue;
+                };
+
+                if Command::AddReceiveDestination == command {
+                    let Some(entry) = receive_endpoints.get(endpoint_id) else {
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            b"the subscription's endpoint is gone",
+                        );
+                        continue;
+                    };
+                    let channel_status_counter_id = entry.channel_status_counter_id;
+
+                    let params = ReceiveChannelEndpoints::transport_params(config, &channel);
+                    let destination = match ReceiveDestination::open(
+                        channel,
+                        &params,
+                        counters,
+                        &counter_regions,
+                        request.registration_id,
+                        channel_status_counter_id,
+                        now_ms,
+                    ) {
+                        Ok(destination) => destination,
+                        Err(error) => {
+                            transmit.error(
+                                request.correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                error.to_string().as_bytes(),
+                            );
+                            continue;
+                        }
+                    };
+
+                    let _ = receiver
+                        .proxy()
+                        .add_destination(endpoint_id, Box::new(destination));
+                } else {
+                    let _ = receiver
+                        .proxy()
+                        .remove_destination(endpoint_id, Box::new(channel));
+                }
+
+                transmit.operation_succeeded(request.correlation_id);
+                continue;
+            }
+
+            if Command::RemoveDestinationById == command {
+                let Some(request) = decode_destination_by_id_command(&payload) else {
+                    malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    continue;
+                };
+
+                let Some(record) = network_publications.find(request.resource_registration_id)
+                else {
+                    continue;
+                };
+
+                let _ = sender.proxy().remove_destination_by_id(
+                    record.endpoint_id,
+                    request.destination_registration_id,
+                );
+
+                transmit.operation_succeeded(request.correlation_id);
+                continue;
+            }
+
+            let Some(request) = decode_destination_command(&payload) else {
+                malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                continue;
+            };
+
+            let Some(record) = network_publications.find(request.registration_id) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_UNKNOWN_PUBLICATION,
+                    format!(
+                        "unknown publication registration_id={}",
+                        request.registration_id
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            };
+
+            if let Err(error) = validate_destination_prefix(request.channel, "send") {
+                transmit.error(
+                    request.correlation_id,
+                    error.error_code(),
+                    error.to_string().as_bytes(),
+                );
+                continue;
+            }
+
+            // A destination whose name does not resolve is **kept** and the
+            // command still succeeds: the reference sets the address to
+            // `AF_UNSPEC` and falls through on purpose (`:5337-5343`), which is
+            // `None` here. The consequence is in `docs/compat.md`'s
+            // name-resolution row: this build has no re-resolution, so that
+            // destination never recovers.
+            let address = match validate_send_destination_uri(request.channel) {
+                Ok(address) => Some(address),
+                Err(UdpChannelError::Resolution(_)) => None,
+                Err(error) => {
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        error.to_string().as_bytes(),
+                    );
+                    continue;
+                }
+            };
+
+            let Ok(uri) = ChannelUri::parse(request.channel) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_INVALID_CHANNEL,
+                    b"incorrect URI format for destination",
+                );
+                continue;
+            };
+
+            let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                transmit.error(
+                    request.correlation_id,
+                    ERROR_CODE_INVALID_CHANNEL,
+                    b"incorrect URI format for destination",
+                );
+                continue;
+            };
+
+            let registration_id = request.correlation_id;
+            let outcome = if Command::AddDestination == command {
+                sender.proxy().add_destination(
+                    record.endpoint_id,
+                    Box::new(channel),
+                    address,
+                    registration_id,
+                )
+            } else {
+                // A removal names a destination by its channel, and the channel
+                // that identifies one is the one it was added with — so the
+                // address is what the tracker matches on (`:311-350`).
+                address.map_or(Ok(()), |address| {
+                    sender
+                        .proxy()
+                        .remove_destination(record.endpoint_id, address)
+                })
+            };
+
+            if outcome.is_err() {
+                // The sender has gone; the client is answered anyway, because
+                // the reference answers before the sender applies anything
+                // (`:5366-5367`) and a client that is told nothing hangs.
+                transmit.record_fault(
+                    ERROR_CODE_GENERIC_ERROR,
+                    format!("destination command for publication {registration_id}"),
+                );
+            }
+
+            transmit.operation_succeeded(request.correlation_id);
         }
 
         drained + released
@@ -2007,6 +2553,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            self.sender.proxy(),
         );
 
         self.release_orphaned_network_publications() + reaped
@@ -2645,12 +3192,13 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x07` is ADD_DESTINATION:
-        // still unimplemented (the network transport is P1-4), which is what a
-        // test wants from a stand-in — a command whose handling cannot start
-        // happening.
-        send(&conductor, 0x07, b"first");
-        send(&conductor, 0x07, b"second");
+        // pass read without any byte arithmetic. `0x10` is REJECT_IMAGE: still
+        // unimplemented, which is what a test wants from a stand-in — a command
+        // whose handling cannot start happening. (`0x07` used to be the
+        // stand-in until ADD_DESTINATION was implemented, which is exactly the
+        // way a stand-in like this stops being one.)
+        send(&conductor, 0x10, b"first");
+        send(&conductor, 0x10, b"second");
 
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
@@ -2673,16 +3221,158 @@ mod tests {
         );
     }
 
+    /// `ADD_DESTINATION` reaches a handler now, and what it answers is the
+    /// reference's own unknown-publication error (`:5411-5420`).
+    ///
+    /// The publication named does not exist, which is the point: the command
+    /// was decoded, looked up and answered, where before it was counted and
+    /// named. A test that only asserted the counter would pass on a handler
+    /// that answered nothing.
+    #[test]
+    fn an_add_destination_is_answered_rather_than_left_unhandled() {
+        use deepmsg_cnc::command::{ADD_DESTINATION_TYPE_ID, DestinationCommand, ON_ERROR_TYPE_ID};
+
+        let (temp, mut conductor) = running(TerminationPolicy::Deny);
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        let command = DestinationCommand {
+            client_id: 7,
+            correlation_id: 9,
+            registration_id: 4242,
+            channel: "aeron:udp?endpoint=127.0.0.1:40456",
+        };
+        let mut payload = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut payload));
+
+        send(&conductor, ADD_DESTINATION_TYPE_ID, &payload);
+        conductor.do_work();
+
+        assert_eq!(0, conductor.unhandled_commands(), "it is handled now");
+
+        let responses = drain(&cnc, &mut receiver);
+        assert_eq!(1, responses.len(), "one answer, and it is an error");
+        assert_eq!(ON_ERROR_TYPE_ID, responses[0].0);
+        assert_eq!(
+            9i64.to_le_bytes(),
+            responses[0].1[..8],
+            "answered against the command that asked"
+        );
+    }
+
+    /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
+    /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel.
+    ///
+    /// Only the first is refused by name — a client told nothing waits out its
+    /// timeout, and this is not a command this driver will get to later. The
+    /// other two are **served**: a spy destination is a local read added to a
+    /// multi-destination subscription (`:5704-5806`) and a network one is a
+    /// socket added to any network subscription (`:5879-5910`), and both reach
+    /// the subscription first. The registration id here names no subscription,
+    /// so what this covers is the triage — each prefix reaching its own branch,
+    /// with each branch's own answer for a subscription that is not there.
+    /// What a destination does once it is attached is `media::receive_endpoint`'s
+    /// tests, and a spy destination against a real subscription is
+    /// `tests/integration/spy_subscription.rs`.
+    #[test]
+    fn a_receive_destination_is_triaged_by_the_prefix_it_names() {
+        use deepmsg_cnc::command::{
+            ADD_RECEIVE_DESTINATION_TYPE_ID, DestinationCommand, ON_ERROR_TYPE_ID,
+        };
+
+        let channels = [
+            (
+                "aeron:ipc",
+                "aeron:ipc destinations are not served by this driver",
+            ),
+            // A spy names a subscription it cannot find, which is the
+            // reference's own unknown-subscription error (`:6053-6062`).
+            (
+                "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
+                "unknown subscription",
+            ),
+            ("aeron:udp?endpoint=127.0.0.1:40456", "unknown subscription"),
+        ];
+
+        for (channel, expected) in channels {
+            let (temp, mut conductor) = running(TerminationPolicy::Deny);
+            let (cnc, mut receiver) = events_reader(&temp.0);
+
+            let command = DestinationCommand {
+                client_id: 7,
+                correlation_id: 9,
+                registration_id: 4242,
+                channel,
+            };
+            let mut payload = vec![0u8; command.encoded_length()];
+            assert!(command.encode_into(&mut payload));
+
+            send(&conductor, ADD_RECEIVE_DESTINATION_TYPE_ID, &payload);
+            conductor.do_work();
+
+            assert_eq!(0, conductor.unhandled_commands(), "{channel}");
+
+            let responses = drain(&cnc, &mut receiver);
+            assert_eq!(1, responses.len(), "{channel}: one answer, and an error");
+            assert_eq!(ON_ERROR_TYPE_ID, responses[0].0, "{channel}");
+            assert_eq!(
+                9i64.to_le_bytes(),
+                responses[0].1[..8],
+                "{channel}: answered against the command that asked"
+            );
+            assert!(
+                responses[0]
+                    .1
+                    .windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{channel}: the refusal names what it refused"
+            );
+        }
+    }
+
+    /// `REMOVE_DESTINATION_BY_ID` is the one command in the family whose
+    /// failures the reference answers **nothing** to: it calls its handler
+    /// without taking the result (`:3188-3200`), so the error for a publication
+    /// it cannot find never reaches the `result < 0` that would send an
+    /// `ON_ERROR` (`:3222-3225`). This build reproduces that rather than
+    /// improving on it — `docs/compat.md` carries the line — so a client that
+    /// names a publication the driver does not have waits, and times out.
+    #[test]
+    fn a_remove_destination_by_id_that_finds_nothing_answers_nothing() {
+        use deepmsg_cnc::command::{DestinationByIdCommand, REMOVE_DESTINATION_BY_ID_TYPE_ID};
+
+        let (temp, mut conductor) = running(TerminationPolicy::Deny);
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        let command = DestinationByIdCommand {
+            client_id: 7,
+            correlation_id: 9,
+            resource_registration_id: 4242,
+            destination_registration_id: 43,
+        };
+        let mut payload = vec![0u8; DestinationByIdCommand::ENCODED_LENGTH];
+        assert!(command.encode_into(&mut payload));
+
+        send(&conductor, REMOVE_DESTINATION_BY_ID_TYPE_ID, &payload);
+        conductor.do_work();
+
+        assert_eq!(0, conductor.unhandled_commands(), "it is handled now");
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "not even the error — the reference sends none, and the client waits"
+        );
+        assert!(conductor.is_running(), "and nothing else happened");
+    }
+
     #[test]
     fn an_unimplemented_command_is_counted_and_named() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x07, b"aeron:ipc|1"); // ADD_DESTINATION
+        send(&conductor, 0x10, b"aeron:ipc|1"); // REJECT_IMAGE
         conductor.do_work();
 
         assert_eq!(1, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddDestination), conductor.last_unhandled());
+        assert_eq!(Some(Command::RejectImage), conductor.last_unhandled());
         assert!(conductor.is_running(), "and nothing else happened");
     }
 
@@ -2795,7 +3485,7 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x07, b"channel");
+        send(&conductor, 0x10, b"channel");
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands());
 

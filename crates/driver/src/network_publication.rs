@@ -40,8 +40,9 @@
 //! through two modules to save it, which this slice does not spend.
 
 use std::io;
+use std::net::SocketAddr;
 
-use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
@@ -55,7 +56,9 @@ use crate::protocol::{
 };
 use crate::publication_params::PublicationParams;
 use crate::retransmit_handler::{Faults, NakOutcome, Resend, RetransmitHandler};
-use crate::subscribable::Subscribable;
+use crate::subscribable::{
+    Subscribable, SubscribableHooks, TetherState, TetherablePosition, UntetheredEvent,
+};
 use crate::system_counters::{self, System};
 
 /// How long a publication keeps saying `SETUP` while nothing has answered
@@ -96,6 +99,35 @@ pub struct PublicationCounters {
 struct ReceiverLiveness {
     receiver_id: i64,
     last_sm_ns: i64,
+}
+
+/// What a publication does to its own state when a spy comes or goes
+/// (`aeron_network_publication_add_subscriber_hook`, `:1353-1362`, and
+/// `aeron_network_publication_remove_subscriber_hook`, `:1364-1378`).
+///
+/// The reference's two hooks do two things each: they maintain `has_spies`,
+/// and — when `ssc` — they rewrite the log buffer's connected byte. Only the
+/// first is here, because the second needs the counter regions and the
+/// subscribable set at once, and the set is what is borrowed while a hook
+/// runs. The caller does it immediately after, which is the same moment on the
+/// same thread.
+struct SpyHooks<'a> {
+    /// The publication's flag, which the two hooks are the only writers of.
+    has_spies: &'a mut bool,
+}
+
+impl SubscribableHooks for SpyHooks<'_> {
+    fn position_added(&mut self, _position: &TetherablePosition) {
+        *self.has_spies = true;
+    }
+
+    fn position_removed(&mut self, _position: &TetherablePosition, working_before: usize) {
+        // One working position before the removal means this was the last
+        // reader (`:1368-1370`, which asks the same question of the set).
+        if 1 == working_before {
+            *self.has_spies = false;
+        }
+    }
 }
 
 /// A publication that sends over UDP.
@@ -139,6 +171,38 @@ pub struct NetworkPublication {
     /// The subscribers reading this publication *locally* — for a network
     /// publication, the spies. A remote reader reads its own driver's image.
     pub subscribers: Subscribable,
+    /// Whether a spy counts as a connection here — the `ssc` parameter, which
+    /// the driver's `aeron.spies.simulate.connection` or the channel's `ssc=`
+    /// may set (`aeron_network_publication.c:289`).
+    ///
+    /// False by default, and that default is the whole difference between a
+    /// stream whose only reader is a spy being *live* and being *stalled*: a
+    /// unicast publication with no receiver has a limit of `snd-pos`, and
+    /// `snd-pos` only moves when a receiver's status message opens the window.
+    /// A spy is not a receiver, so without this the producer cannot publish
+    /// the message the spy is waiting to read.
+    pub spies_simulate_connection: bool,
+    /// Whether any spy is reading, kept by the two hooks rather than counted
+    /// (`aeron_network_publication.c:1353-1362`, `:1364-1378`).
+    ///
+    /// It is the flag the idle branch reads, beside `max_spy_position` — the
+    /// two are the reference's pair, and the branch asks both because a
+    /// position is only meaningful once one has been reported.
+    pub has_spies: bool,
+    /// The largest position any spy has reported
+    /// (`conductor_fields.max_spy_position`, `aeron_network_publication.c:963-979`).
+    ///
+    /// Seeded at `snd-pos` on every update, so it is never behind what has
+    /// already been sent — which is what makes it safe for the idle branch to
+    /// move `snd-pos` forward to it.
+    pub max_spy_position: i64,
+    /// How long a reader may stall this publication's limit before it stops
+    /// counting (`untethered_window_limit_timeout_ns`, `:1138`).
+    pub untethered_window_limit_timeout_ns: i64,
+    /// The same for the lingering half of the tether cycle (`:1140`).
+    pub untethered_linger_timeout_ns: i64,
+    /// And the resting half (`:1139`).
+    pub untethered_resting_timeout_ns: i64,
     /// When a `SETUP` was last sent.
     pub time_of_last_setup_ns: i64,
     /// When data or a heartbeat was last sent.
@@ -151,6 +215,32 @@ pub struct NetworkPublication {
     pub clean_position: i64,
     /// Whether a receiver asked for a `SETUP` and has not had one answered.
     pub is_setup_elicited: bool,
+    /// The registration id of the subscription this publication answers, or
+    /// [`layout::NULL_VALUE`] when it is not a response publication
+    /// (`aeron_network_publication.c:317`).
+    ///
+    /// It is the whole of the tie between a response setup frame and the
+    /// subscription waiting for it: the frame names the *publication*, and this
+    /// is the only thing that says which subscription that publication was
+    /// made for (`aeron_send_channel_endpoint.c:738-748`).
+    pub response_correlation_id: i64,
+    /// Whether this publication *is* the response half — the one a responder
+    /// creates with `control-mode=response` (`aeron_network_publication.c:316`).
+    ///
+    /// It is the opposite end of the same idea: a publication that is not a
+    /// response one but names a subscription asks for a response channel (the
+    /// `SEND_RESPONSE` bit in its `SETUP`), and a publication that *is* one
+    /// never asks — it is the answer.
+    pub is_response: bool,
+    /// The one address a response publication may send to, learned from the
+    /// frame that asked for the channel
+    /// (`endpoint_address`, `aeron_network_publication.h:243-274`).
+    ///
+    /// `None` is the reference's `AF_UNSPEC`, and it is not "send nowhere
+    /// special" — it is **send nothing**. A response publication's peer is the
+    /// one that asked, and until one has, there is nobody entitled to its data
+    /// (`aeron_network_publication.c:355-378`).
+    endpoint_address: Option<SocketAddr>,
     /// When the receivers go quiet, this is when they are declared gone.
     pub status_message_deadline_ns: i64,
     /// How long that is (`connection_timeout_ns`).
@@ -271,8 +361,12 @@ impl NetworkPublication {
                 // Group semantics, a response channel, a rejoin and a reliable
                 // stream are multicast or response-channel ideas: a unicast
                 // publication writes them false (`:226-229`).
-                group: 0u8,
-                is_response: false,
+                //
+                // `group` is not among the ones this build always answers false
+                // to — it is the endpoint channel's group semantics, the same
+                // value the setup frame's `GROUP` flag carries (`:136`, `:224`).
+                group: u8::from(retransmit_handler.has_group_semantics()),
+                is_response: params.is_response,
                 rejoin: false,
                 reliable: false,
                 sparse: params.is_sparse,
@@ -307,6 +401,16 @@ impl NetworkPublication {
             retransmit_handler,
             signal_eos: params.signal_eos,
             subscribers: Subscribable::new(registration_id),
+            spies_simulate_connection: params.spies_simulate_connection,
+            // Nothing reads this publication yet, and no reader has said how
+            // far it has got (`aeron_network_publication.c:293`, `:249`-style:
+            // the reference's `conductor_fields.max_spy_position` starts at
+            // zero like every other position).
+            has_spies: false,
+            max_spy_position: 0,
+            untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
+            untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
+            untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
             // The first `SETUP` is due at once. The reference seeds this a
             // timeout and a nanosecond *before* now, so that
             // `now_ns > time_of_last_setup_ns + SETUP_TIMEOUT_NS` already holds
@@ -323,6 +427,9 @@ impl NetworkPublication {
             // publication is re-started, `:313`).
             clean_position: 0,
             is_setup_elicited: false,
+            response_correlation_id: params.response_correlation_id,
+            is_response: params.is_response,
+            endpoint_address: None,
             status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
             connection_timeout_ns: CONNECTION_TIMEOUT_NS,
             receivers: Vec::new(),
@@ -434,19 +541,39 @@ impl NetworkPublication {
             bytes_sent = self.heartbeat_message_check(
                 endpoint,
                 system,
+                counters,
+                regions,
                 now_ns,
                 active_term_id,
                 term_offset,
             )?;
 
-            // `:616-638`: an idle pass is the flow control's chance to move the
-            // limit — the `max` strategy does nothing with it, and the
-            // strategies that do (a multicast sender waiting for receivers)
-            // arrive in P1-5.
+            // `:612-636`: an idle pass is where a publication with **only
+            // spies** moves at all, and it moves because there is nothing to
+            // send. `snd-pos` says what has left the machine, and with no
+            // receiver nothing ever does — so for an `ssc` stream the spies
+            // stand in for the wire and `snd-pos` is taken up to the furthest
+            // of them. The flow control is asked from there rather than from
+            // `snd-pos`, which is what makes `snd-lmt` follow.
             let snd_lmt = counters.value(regions, self.counters.snd_lmt).unwrap_or(0);
-            let new_limit =
+
+            let new_limit = if self.spies_simulate_connection
+                && self.has_spies
+                && !self.has_receivers()
+            {
+                let new_snd_pos = self.max_spy_position.max(snd_pos);
+                let _ = counters.set_value(regions, self.counters.snd_pos, new_snd_pos);
+
                 self.flow_control
-                    .on_idle(now_ns, snd_lmt, snd_pos, self.is_end_of_stream);
+                    .on_idle(now_ns, new_snd_pos, new_snd_pos, self.is_end_of_stream)
+            } else {
+                // Otherwise the limit is the flow control's to move — the
+                // `max` strategy does nothing with it, and the strategies that
+                // do (a multicast sender waiting for receivers) belong to
+                // multicast, refused here and recorded in `docs/compat.md`.
+                self.flow_control
+                    .on_idle(now_ns, snd_lmt, snd_pos, self.is_end_of_stream)
+            };
 
             if new_limit != snd_lmt {
                 let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
@@ -496,17 +623,28 @@ impl NetworkPublication {
         };
 
         let mut buffer = [0u8; SetupFrame::LENGTH];
-        let flags = if self.retransmit_handler.has_group_semantics() {
+        // `:392-400`. A publication that is not itself a response channel but
+        // was made to answer one says so here, and that bit is the whole of how
+        // the far end learns it must answer with a `RSP_SETUP`: a responder's
+        // own publication never sets it, so the request is never echoed.
+        let send_response_flag =
+            if !self.is_response && self.response_correlation_id != layout::NULL_VALUE {
+                header_flags::SETUP_SEND_RESPONSE
+            } else {
+                0
+            };
+        let group_flag = if self.retransmit_handler.has_group_semantics() {
             header_flags::SETUP_GROUP
         } else {
             0
         };
+        let flags = send_response_flag | group_flag;
 
         if frame.write_with_flags(&mut buffer, flags).is_none() {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -533,10 +671,13 @@ impl NetworkPublication {
     /// A heartbeat is a **zero-length DATA frame** with both the begin and end
     /// flags: it carries no payload, and it is what tells a receiver the stream
     /// is alive and where it stands.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn heartbeat_message_check(
         &mut self,
         endpoint: &mut SendChannelEndpoint,
         system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
         now_ns: i64,
         active_term_id: i32,
         term_offset: i32,
@@ -588,7 +729,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -718,7 +859,7 @@ impl NetworkPublication {
             .collect();
 
         let sent = if frames > 0 {
-            endpoint.send(&slices)?
+            self.do_send(endpoint, &slices, counters, regions, now_ns)?
         } else {
             0
         };
@@ -776,7 +917,7 @@ impl NetworkPublication {
 
         for resend in due {
             if self
-                .resend(endpoint, resend, system, counters, regions)
+                .resend(endpoint, resend, system, counters, regions, now_ns)
                 .is_err()
             {
                 break;
@@ -804,6 +945,7 @@ impl NetworkPublication {
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
+        now_ns: i64,
     ) -> io::Result<usize> {
         let sender_position = counters.value(regions, self.counters.snd_pos).unwrap_or(0);
         let resend_position = Position::new(
@@ -858,7 +1000,13 @@ impl NetworkPublication {
                 break;
             }
 
-            let sent = endpoint.send(&[&scratch[..available]])?;
+            let sent = self.do_send(
+                endpoint,
+                &[&scratch[..available]],
+                counters,
+                regions,
+                now_ns,
+            )?;
 
             if sent < 1 {
                 system.increment(system_counters::id::SHORT_SENDS);
@@ -931,12 +1079,61 @@ impl NetworkPublication {
     /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
     /// with yet — the hook and the address it needs arrive with the strategy
     /// that reads them, and `dispatch` does not carry a source address today.
-    pub fn trigger_send_setup_frame(&mut self) {
+    /// `address` is where the message that elicited this came from, and for a
+    /// response publication it is the **only** place this publication may ever
+    /// send: the peer that asked for the channel is the one that elicited, and
+    /// it is learned here or not at all
+    /// (`aeron_network_publication_trigger_send_setup_frame`,
+    /// `aeron_network_publication.h:243-274`).
+    /// `elicited_from` is where the message came from. It is optional only
+    /// because this build's transport can be asked not to report a source;
+    /// a datagram off a socket always has one, and a response publication
+    /// learns its peer from nothing else.
+    pub fn trigger_send_setup_frame(&mut self, elicited_from: Option<SocketAddr>) {
         if self.is_end_of_stream {
             return;
         }
 
         self.is_setup_elicited = true;
+
+        if self.is_response {
+            if let Some(address) = elicited_from {
+                self.endpoint_address = Some(address);
+            }
+        }
+    }
+
+    /// Hand one batch to the transport, or refuse to
+    /// (`aeron_network_publication_do_send`, `:355-378`).
+    ///
+    /// Every frame a publication sends goes through here, which is the whole
+    /// point: a response publication's restriction is not a rule about its data
+    /// frames, it is a rule about *this publication*, and the reference reaches
+    /// it from the setup, the heartbeat, the data path, the retransmit path and
+    /// the RTTM answer alike.
+    ///
+    /// A response publication that has learned no address sends nothing at all
+    /// — not to the endpoint's address, which is a different peer entirely.
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    fn do_send(
+        &self,
+        endpoint: &mut SendChannelEndpoint,
+        buffers: &[&[u8]],
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> io::Result<usize> {
+        if self.is_response {
+            return match self.endpoint_address {
+                Some(address) => endpoint.send_to(address, buffers),
+                None => Ok(0),
+            };
+        }
+
+        endpoint.send(buffers, counters, regions, now_ns)
     }
 
     /// A status message arrived (`aeron_network_publication_on_status_message`,
@@ -953,11 +1150,13 @@ impl NetworkPublication {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
-    ) {
+    ) -> Option<i64> {
         // `status-messages-received` is counted at the endpoint, before this —
         // and whether or not a publication answered to the message
         // (`media/aeron_send_channel_endpoint.c:625`).
         self.status_message_deadline_ns = now_ns + self.connection_timeout_ns;
+
+        let had_receivers = self.has_receivers();
 
         if flags & header_flags::SM_EOS != 0 {
             self.remove_receiver(frame.receiver_id);
@@ -983,6 +1182,20 @@ impl NetworkPublication {
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
+
+        // A publication that has just acquired its **first** live receiver
+        // reports the fact (`:805-812`), and the correlation id it reports is
+        // its own `response-correlation-id` — for the publication a response
+        // channel was asked for, that is the registration id of the *image*
+        // which owes it a response setup, and the conductor is what can reach
+        // that image (`aeron_driver_conductor_on_response_connected`,
+        // `aeron_driver_conductor.c:7117-7131`).
+        //
+        // It is reported whether or not this publication is on a response
+        // channel, as the reference reports it: what makes it meaningful is the
+        // conductor's lookup by registration id, which an id that names no
+        // image simply misses.
+        (!had_receivers && self.has_receivers()).then_some(self.response_correlation_id)
     }
 
     /// A measurement request, answered when it asked to be
@@ -1000,12 +1213,16 @@ impl NetworkPublication {
     /// A publication that never answers leaves a peer on a congestion control
     /// that measures round trips — `cubic` — with nothing to measure, whatever
     /// flow control this end runs.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     pub fn on_rttm(
         &mut self,
         frame: &RttmFrame,
         flags: u8,
         endpoint: &mut SendChannelEndpoint,
         system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
     ) -> io::Result<usize> {
         if flags & header_flags::RTTM_REPLY == 0 {
             return Ok(0);
@@ -1024,7 +1241,7 @@ impl NetworkPublication {
             return Ok(0);
         }
 
-        let sent = endpoint.send(&[&buffer])?;
+        let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
 
         if sent < 1 {
             system.increment(system_counters::id::SHORT_SENDS);
@@ -1101,26 +1318,209 @@ impl NetworkPublication {
         let _ = mtu;
 
         if let NakOutcome::Send(resend) = outcome {
-            let _ = self.resend(endpoint, resend, system, counters, regions);
+            let _ = self.resend(endpoint, resend, system, counters, regions, now_ns);
         }
 
         outcome
     }
 
     /// Whether this publication counts a reader at all
-    /// (`aeron_network_publication_has_subscribers`, `:755-767`).
+    /// (`aeron_network_publication_has_subscribers`, `:755-766`).
+    ///
+    /// Two ways to have one, and they are not the same kind of thing: a
+    /// **receiver** is a remote reader that has said it is there, and a
+    /// **spy** is a local one reading this buffer. The second counts only when
+    /// `ssc` asked it to — which is what the setting is for, and why a stream
+    /// no one has subscribed to over the wire can still be live.
+    ///
+    /// The reference's receiver clause also asks the flow control whether it
+    /// *requires* receivers (`has_required_receivers`), which is true for
+    /// every strategy but a multicast one. This build serves unicast only, so
+    /// the question has one answer here.
     pub fn has_subscribers(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> bool {
-        if self.has_receivers() {
-            return true;
-        }
-
-        // `spies_simulate_connection` is the `ssc` parameter; this build has no
-        // spies yet, so a local reader never counts as a connection here. The
-        // parameter is read from the metadata the publication was created with
-        // once spies arrive in P1-5.
         let _ = (counters, regions);
 
-        false
+        self.has_receivers()
+            || (self.spies_simulate_connection && self.subscribers.has_working_positions())
+    }
+
+    /// Give this publication a local reader
+    /// (`aeron_driver_subscribable_add_position`, `:3497-3523`, reached from
+    /// the conductor's `link_subscribable`).
+    ///
+    /// The hook runs before the position counts, as it does there — which is
+    /// why the reference's add hook writes `true` for the connected status
+    /// rather than asking: at that moment a publication with one spy still
+    /// looks like one with none.
+    ///
+    /// # Returns
+    ///
+    /// Whether the connected status has to be rewritten. The caller does that,
+    /// because the write needs the counter regions and this does not have them.
+    pub fn add_spy(&mut self, position: TetherablePosition) -> bool {
+        let mut hooks = SpyHooks {
+            has_spies: &mut self.has_spies,
+        };
+        self.subscribers.add_position(position, &mut hooks);
+
+        self.spies_simulate_connection
+    }
+
+    /// Take a local reader away (`aeron_driver_subscribable_remove_position`,
+    /// `:3525-3545`).
+    ///
+    /// The reference's remove hook asks `has_subscribers` for the status to
+    /// write, and that expression is **true by construction** where it runs:
+    /// the hook is called with the position still in the set, and the position
+    /// being removed counts as a working one either way — it was active, or
+    /// its `inactive_count` has already come down. So the status it writes is
+    /// `true`, and what settles it afterwards is the next pass of
+    /// [`Self::update_pub_pos_and_lmt`] — the same pass that would have settled
+    /// it in the reference.
+    ///
+    /// # Returns
+    ///
+    /// Whether the connected status has to be rewritten.
+    pub fn remove_spy(&mut self, counter_id: i32) -> bool {
+        let mut hooks = SpyHooks {
+            has_spies: &mut self.has_spies,
+        };
+        let _ = self.subscribers.remove_position(counter_id, &mut hooks);
+
+        self.spies_simulate_connection
+    }
+
+    /// Whether a reader has stopped reading, and what to do about it
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// The same three states as an IPC publication's readers, judged against
+    /// the same shape of limit, and differing in two things — which is the
+    /// whole of what a reader comparing the two C functions has to hold in
+    /// mind:
+    ///
+    /// * the limit is measured from **`snd-pos`**: a reader is behind when it
+    ///   has not got past `snd-pos - term_window + term_window/4` (`:1123-1125`).
+    ///   An IPC publication measures from its *fastest* reader instead, because
+    ///   there is no sender to say how far the stream has got;
+    /// * a woken reader is seeded at **`snd-pos`** (`:1206`), which is the same
+    ///   number its image can read from — an IPC reader is seeded at the
+    ///   publication's join position.
+    ///
+    /// A tethered reader is never put aside, and neither is one that is merely
+    /// slow: the limit moves with the stream, so a reader that keeps up is
+    /// never behind it.
+    ///
+    /// The reference runs this from the **conductor**, on its timer tier
+    /// (`aeron_network_publication_on_time_event`, `:1277`, reached from
+    /// `aeron_driver_conductor_on_check_managed_resources`). It runs here, on
+    /// the sender's own pass, for the reason ⑯'s link does: what it moves is
+    /// the publication's own set of readers, and that lives on this thread. The
+    /// difference is how soon a deadline is noticed — at the first pass after
+    /// it rather than at the next timer tick — and not which transitions happen.
+    ///
+    /// Returns what the conductor has to say about each reader it moved, in
+    /// the order the readers are held.
+    pub fn check_untethered_subscriptions(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> Vec<UntetheredEvent> {
+        let mut events = Vec::new();
+
+        let sender_position = counters.value(regions, self.counters.snd_pos).unwrap_or(0);
+        let window_length = i64::from(self.term_window_length);
+        let untethered_window_limit = (sender_position - window_length) + (window_length / 4);
+
+        // Copied out for the same reason the IPC publication's copy is: a
+        // woken reader is seeded and re-stated while the set is being walked.
+        let positions = self.subscribers.positions().to_vec();
+
+        for position in positions {
+            if position.is_tether {
+                // A tethered reader keeps its claim on the stream whatever it
+                // does; only its timestamp moves.
+                let _ = self
+                    .subscribers
+                    .set_state(position.counter_id, position.state, now_ns);
+                continue;
+            }
+
+            let current = counters.value(regions, position.counter_id).unwrap_or(0);
+
+            match position.state {
+                TetherState::Active => {
+                    if current > untethered_window_limit {
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+                    } else if now_ns
+                        > position.time_of_last_update_ns + self.untethered_window_limit_timeout_ns
+                    {
+                        events.push(UntetheredEvent::Unavailable {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                        });
+
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Linger,
+                            now_ns,
+                        );
+                    }
+                }
+                TetherState::Linger => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_linger_timeout_ns
+                    {
+                        if position.is_rejoin {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Resting,
+                                now_ns,
+                            );
+                        } else {
+                            let _ = self.subscribers.set_state(
+                                position.counter_id,
+                                TetherState::Closed,
+                                now_ns,
+                            );
+                            // The counter is the conductor's to give back, so
+                            // the reader stays in the set with no id rather
+                            // than leaving it: an id that is still there would
+                            // be given back twice.
+                            let _ = self.subscribers.clear_counter_id(position.counter_id);
+
+                            events.push(UntetheredEvent::Closed {
+                                counter_id: position.counter_id,
+                            });
+                        }
+                    }
+                }
+                TetherState::Resting => {
+                    if now_ns > position.time_of_last_update_ns + self.untethered_resting_timeout_ns
+                    {
+                        let _ = counters.set_value(regions, position.counter_id, sender_position);
+                        let _ = self.subscribers.set_state(
+                            position.counter_id,
+                            TetherState::Active,
+                            now_ns,
+                        );
+
+                        events.push(UntetheredEvent::Available {
+                            subscription_registration_id: position.subscription_registration_id,
+                            counter_id: position.counter_id,
+                            join_position: sender_position,
+                        });
+                    }
+                }
+                TetherState::Closed => {}
+            }
+        }
+
+        events
     }
 
     /// Write the log buffer's connected byte, which is what a client's
@@ -1207,6 +1607,22 @@ impl NetworkPublication {
         let _ = counters.set_value(regions, self.counters.pub_pos, producer_position);
 
         if self.has_subscribers(counters, regions) {
+            // The furthest any local reader has got, which only the `ssc` idle
+            // branch below reads (`:961-980`): it is seeded at `snd-pos` and
+            // never falls, so moving `snd-pos` up to it can never move it
+            // backwards. Nothing here but the spies — a remote reader's
+            // position arrives as a status message and is not in this set.
+            if !self.subscribers.is_empty() {
+                let max_consumer = self
+                    .subscribers
+                    .max_active_position(counters, regions)
+                    .unwrap_or(snd_pos);
+
+                if max_consumer > self.max_spy_position {
+                    self.max_spy_position = max_consumer;
+                }
+            }
+
             let min_consumer = self
                 .subscribers
                 .min_active_position(counters, regions)
@@ -1346,6 +1762,7 @@ mod tests {
     use crate::sys::AddressFamily;
     use crate::sys::socket::{DatagramSocket, Datagrams};
     use crate::udp_channel::UdpChannel;
+    use deepmsg_cnc::layout::NULL_COUNTER_ID;
     use deepmsg_core::buffer::AtomicBuffer;
     use deepmsg_core::logbuffer::frame::{FLAG_UNFRAGMENTED, Frame, TYPE_DATA};
 
@@ -1493,6 +1910,7 @@ mod tests {
             max_resend: 0,
             entity_tag: -1,
             response_correlation_id: -1,
+            is_response: false,
             session_id: Some(42),
             linger_timeout_ns: 5_000_000_000,
             untethered_window_limit_timeout_ns: 5_000_000_000,
@@ -2117,5 +2535,339 @@ mod tests {
             1,
         )
         .expect("an endpoint")
+    }
+
+    /// The descriptor's `group` byte, read straight out of the log file
+    /// (`GROUP_OFFSET`, `aeron_logbuffer_descriptor.h:74`).
+    ///
+    /// The descriptor sits at the **end** of the file, after the terms
+    /// (`metadata_offset = length - METADATA_LENGTH`,
+    /// `crates/core/src/logbuffer/logfile.rs:90`) — not at the start, which is
+    /// where the terms are.
+    fn group_byte(path: &std::path::Path) -> u8 {
+        use deepmsg_core::logbuffer::descriptor;
+
+        let length = std::fs::metadata(path).expect("the log file").len() as usize;
+        let offset = length - descriptor::METADATA_LENGTH + descriptor::GROUP_OFFSET;
+
+        let mapping =
+            deepmsg_core::pal::MappedFile::open_readonly(path).expect("map the log buffer");
+        let region = mapping.region(offset, 1).expect("the descriptor byte");
+
+        region.load_u8(0).expect("readable")
+    }
+
+    /// The log buffer's `group` byte is the **endpoint channel's** group
+    /// semantics — the same value the setup frame's `GROUP` flag carries
+    /// (`aeron_network_publication_create` computes it at `:136` and writes it
+    /// into the descriptor at `:224`).
+    ///
+    /// A reader of the log buffer uses that byte to tell a multicast or
+    /// multi-destination stream from a unicast one, so a publication that left
+    /// it at zero while putting `GROUP` on the wire would be describing itself
+    /// two different ways. This build did exactly that: the flag was read from
+    /// the handler, which was built with a hardcoded `false`.
+    #[test]
+    fn the_log_buffer_says_whether_the_channel_has_group_semantics() {
+        for (has_group_semantics, expected) in [(false, 0u8), (true, 1u8)] {
+            let dir = TempDir::new();
+            let log = dir.log_buffer(TERM_LENGTH);
+
+            let listener = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            listener
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            listener.set_nonblocking().expect("non-blocking");
+            let bound = listener.local_address().expect("a bound address");
+
+            let uri = format!("aeron:udp?endpoint={bound}");
+            let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+            let _channel = UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel");
+
+            let _publication = NetworkPublication::create(
+                7,
+                9,
+                42,
+                1001,
+                1,
+                uri.as_bytes(),
+                log,
+                &params(TERM_LENGTH, MTU, 32 * 1024),
+                false,
+                PublicationCounters {
+                    pub_pos: 0,
+                    pub_lmt: 1,
+                    snd_pos: 2,
+                    snd_lmt: 3,
+                    snd_bpe: 4,
+                    snd_naks_received: 5,
+                },
+                4,
+                MaxStrategy::default(),
+                RetransmitHandler::new(0, 5_000_000, has_group_semantics, 1),
+                4096,
+                crate::sys::SocketBufferLengths {
+                    rcvbuf: 0,
+                    sndbuf: 0,
+                },
+                0,
+                0,
+                0,
+            )
+            .expect("a publication");
+
+            assert_eq!(
+                expected,
+                group_byte(&dir.0.join("publication.logbuffer")),
+                "group semantics {has_group_semantics}"
+            );
+        }
+    }
+
+    /// The position the stream has got to in the three tether tests below.
+    ///
+    /// Big enough to be well past the window limit a reader has to clear: the
+    /// window is a term of 32 KiB, so the limit is `200_000 - 32_768 + 8_192`
+    /// and a reader parked at zero is behind it by more than three quarters of
+    /// a window — which is what "has stopped reading" means here.
+    const SENT_POSITION: i64 = 200_000;
+
+    /// Give the publication a reader sitting at `position`, and answer its
+    /// counter id.
+    fn add_reader(
+        publication: &mut NetworkPublication,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        subscription_registration_id: i64,
+        position: i64,
+        is_tether: bool,
+        is_rejoin: bool,
+    ) -> i32 {
+        let counter_id = counters
+            .allocate(regions, 4, &[], b"sub-pos", 0)
+            .expect("a counter");
+        let _ = counters.set_value(regions, counter_id, position);
+        let _ = publication.add_spy(TetherablePosition {
+            counter_id,
+            subscription_registration_id,
+            time_of_last_update_ns: 0,
+            state: TetherState::Active,
+            is_tether,
+            is_rejoin,
+        });
+
+        counter_id
+    }
+
+    /// A publication whose stream has been sent to [`SENT_POSITION`].
+    ///
+    /// What it has *not* done is leave the counters open: the regions borrow
+    /// the fixture, so a test that wants a manager opens them itself.
+    fn fixture_at_sent_position() -> Fixture {
+        let mut fixture = fixture();
+
+        {
+            let (counters, regions) = fixture.counters.open();
+            let _ = counters.set_value(
+                &regions,
+                fixture.publication.counters.snd_pos,
+                SENT_POSITION,
+            );
+        }
+
+        fixture
+    }
+
+    #[test]
+    fn a_spy_that_stops_reading_is_put_aside_and_woken_at_the_send_position() {
+        let mut fixture = fixture_at_sent_position();
+        let (mut manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        // Two readers, both parked at zero: one is tethered, so it is never put
+        // aside however slow it is, and the other is rejoining.
+        let tethered = add_reader(publication, &mut manager, &regions, 7, 0, true, false);
+        let rejoining = add_reader(publication, &mut manager, &regions, 8, 0, false, true);
+
+        let window = publication.untethered_window_limit_timeout_ns;
+
+        // Behind the limit and quiet for longer than the window timeout: the
+        // one that is not tethered is told its image has gone.
+        let events = publication.check_untethered_subscriptions(&mut manager, &regions, window + 1);
+        assert_eq!(
+            vec![UntetheredEvent::Unavailable {
+                subscription_registration_id: 8,
+                counter_id: rejoining,
+            }],
+            events,
+            "only the untethered reader is put aside"
+        );
+
+        // A rejoining reader waits in linger rather than closing.
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            window + publication.untethered_linger_timeout_ns + 2,
+        );
+        assert!(
+            events.is_empty(),
+            "a rejoining reader waits rather than closing"
+        );
+        assert_eq!(
+            Some(TetherState::Resting),
+            publication
+                .subscribers
+                .find_by_counter(rejoining)
+                .map(|position| position.state)
+        );
+
+        // And the resting timeout wakes it where the *stream* is, not where it
+        // stalled — an image it can read from, which is the whole point.
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            window
+                + publication.untethered_linger_timeout_ns
+                + publication.untethered_resting_timeout_ns
+                + 3,
+        );
+        assert_eq!(
+            vec![UntetheredEvent::Available {
+                subscription_registration_id: 8,
+                counter_id: rejoining,
+                join_position: SENT_POSITION,
+            }],
+            events
+        );
+        assert_eq!(
+            Some(SENT_POSITION),
+            manager.value(&regions, rejoining),
+            "the counter is seeded where the stream is, not left where it stalled"
+        );
+        assert_eq!(
+            Some(TetherState::Active),
+            publication
+                .subscribers
+                .find_by_counter(rejoining)
+                .map(|position| position.state)
+        );
+        assert_eq!(
+            Some(TetherState::Active),
+            publication
+                .subscribers
+                .find_by_counter(tethered)
+                .map(|position| position.state),
+            "and the tethered reader was never moved"
+        );
+    }
+
+    #[test]
+    fn a_spy_that_is_not_rejoining_is_closed_and_keeps_its_place_in_the_set() {
+        let mut fixture = fixture_at_sent_position();
+        let (mut manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        let leaving = add_reader(publication, &mut manager, &regions, 9, 0, false, false);
+        let window = publication.untethered_window_limit_timeout_ns;
+
+        let events = publication.check_untethered_subscriptions(&mut manager, &regions, window + 1);
+        assert_eq!(
+            vec![UntetheredEvent::Unavailable {
+                subscription_registration_id: 9,
+                counter_id: leaving,
+            }],
+            events
+        );
+
+        // Linger runs out and this one is not coming back: it is closed, and
+        // the counter is named for the conductor to give back.
+        let events = publication.check_untethered_subscriptions(
+            &mut manager,
+            &regions,
+            window + publication.untethered_linger_timeout_ns + 2,
+        );
+        assert_eq!(
+            vec![UntetheredEvent::Closed {
+                counter_id: leaving
+            }],
+            events
+        );
+
+        // The reader stays in the set with no counter, which is what stops the
+        // same id being given back twice — and it is never moved again.
+        assert_eq!(
+            Some(NULL_COUNTER_ID),
+            publication
+                .subscribers
+                .positions()
+                .first()
+                .map(|position| position.counter_id)
+        );
+        assert_eq!(
+            Some(TetherState::Closed),
+            publication
+                .subscribers
+                .find_by_counter(NULL_COUNTER_ID)
+                .map(|position| position.state)
+        );
+        assert!(
+            publication
+                .check_untethered_subscriptions(&mut manager, &regions, timeouts_never())
+                .is_empty(),
+            "a closed reader is not a reader anything happens to"
+        );
+    }
+
+    /// A time far past every timeout, for the "and nothing more happens" half
+    /// of a test.
+    fn timeouts_never() -> i64 {
+        i64::MAX / 2
+    }
+
+    #[test]
+    fn a_spy_that_keeps_up_is_never_put_aside() {
+        let mut fixture = fixture_at_sent_position();
+        let (mut manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        // Both readers are at the stream's position, which is past the limit a
+        // reader has to clear to count as keeping up.
+        let keeping_up = add_reader(
+            publication,
+            &mut manager,
+            &regions,
+            10,
+            SENT_POSITION,
+            false,
+            false,
+        );
+        let behind_but_reading = add_reader(
+            publication,
+            &mut manager,
+            &regions,
+            11,
+            SENT_POSITION - i64::from(publication.term_window_length) / 2,
+            false,
+            false,
+        );
+
+        // Far past every timeout: the one that is moving is not put aside for
+        // being quiet, because it is not behind.
+        let events =
+            publication.check_untethered_subscriptions(&mut manager, &regions, timeouts_never());
+        assert!(
+            events.is_empty(),
+            "a reader past the window limit is never behind it"
+        );
+
+        for counter_id in [keeping_up, behind_but_reading] {
+            assert_eq!(
+                Some(TetherState::Active),
+                publication
+                    .subscribers
+                    .find_by_counter(counter_id)
+                    .map(|position| position.state)
+            );
+        }
     }
 }

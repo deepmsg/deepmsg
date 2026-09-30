@@ -159,13 +159,14 @@ impl<'a, Access> CountersReader<'a, Access> {
 
     /// One counter's record, by id.
     ///
-    /// `None` when the id is out of range or its slot is not a live counter —
-    /// which is what makes this the reader for "is the counter I cached still
-    /// *mine*": the reference asks the same question of the record at the id
-    /// (`aeron_counter_heartbeat_timestamp_is_active`,
-    /// `aeron-client/src/main/c/aeron_client_conductor.c:1338-1360`, which
-    /// checks the type, the registration and the state of the slot the client
-    /// remembers).
+    /// **This scans the whole catalogue** — it is [`CountersReader::for_each`]
+    /// with a filter, and it builds a [`CounterDescriptor`] for every counter
+    /// on the way, label and all. A caller that asks this question in a loop is
+    /// asking the wrong one: [`CountersReader::is_active`] answers the same
+    /// question about a counter a caller already has the id of, in constant
+    /// time.
+    ///
+    /// `None` when the id is out of range or its slot is not a live counter.
     pub fn get(&self, counter_id: i32) -> Option<CounterDescriptor> {
         let mut found = None;
 
@@ -176,6 +177,49 @@ impl<'a, Access> CountersReader<'a, Access> {
         });
 
         found
+    }
+
+    /// Whether the counter at `counter_id` is still an allocated counter of
+    /// this `type_id` with this `registration_id`.
+    ///
+    /// The question a client asks about a counter it cached an id for, and the
+    /// one the reference asks in constant time
+    /// (`aeron_counter_heartbeat_timestamp_is_active`,
+    /// `aeron-client/src/main/c/aeron_client_conductor.c:1234-1249`): the state
+    /// of the slot the id names, its type, and its registration, and nothing
+    /// else. It has to be asked again on every use, because the driver reuses
+    /// ids — an id that was ours can be somebody else's counter by now.
+    ///
+    /// Read with an acquire on the state, which is the order the writer
+    /// publishes in (`aeron_counters_manager.c:117-121`): a slot that is not
+    /// yet allocated has no type or registration to believe.
+    ///
+    /// `false` for an id outside the region, a slot that is unused or
+    /// reclaimed, and a counter whose type or registration has changed.
+    #[must_use]
+    pub fn is_active(&self, counter_id: i32, type_id: i32, registration_id: i64) -> bool {
+        if counter_id < 0 || counter_id > self.max_counter_id {
+            return false;
+        }
+
+        let metadata_offset = counter_id as usize * layout::COUNTER_METADATA_LENGTH;
+        let value_offset = counter_id as usize * layout::COUNTER_VALUE_LENGTH;
+
+        if self
+            .metadata
+            .load_i32_acquire(metadata_offset + layout::COUNTER_STATE_OFFSET)
+            != Some(layout::COUNTER_STATE_ALLOCATED)
+        {
+            return false;
+        }
+
+        self.metadata
+            .load_i32_relaxed(metadata_offset + layout::COUNTER_TYPE_ID_OFFSET)
+            == Some(type_id)
+            && self
+                .values
+                .load_i64_acquire(value_offset + layout::COUNTER_REGISTRATION_ID_OFFSET)
+                == Some(registration_id)
     }
 
     /// The current value of one counter, by id.
@@ -346,6 +390,13 @@ mod tests {
         CountersReader::new(metadata.buffer(), values.buffer())
     }
 
+    /// Write a counter's registration id, which is what ties it to its owner.
+    fn set_registration(values: &mut Region, id: i32, registration_id: i64) {
+        let offset =
+            id as usize * layout::COUNTER_VALUE_LENGTH + layout::COUNTER_REGISTRATION_ID_OFFSET;
+        values.put_i64(offset, registration_id);
+    }
+
     /// Write a value record at `id`, through the same arithmetic the reader
     /// uses — spelled with a runtime `id` so it stays a real computation.
     fn set_value(values: &mut Region, id: i32, value: i64) {
@@ -493,5 +544,126 @@ mod tests {
         assert_eq!(None, reader.find_by_type_id(999));
         assert_eq!(None, reader.value(-1));
         assert_eq!(None, reader.value(99), "past max_counter_id");
+    }
+
+    #[test]
+    fn a_counter_is_active_while_it_is_the_one_the_caller_means() {
+        let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(4 * layout::COUNTER_VALUE_LENGTH);
+
+        // The client heartbeat counter as the driver allocates it: type 11, the
+        // client's id as its registration (`clients.rs::get_or_add`).
+        allocate(
+            &mut metadata,
+            1,
+            CLIENT_HEARTBEAT_TYPE_ID,
+            "client-heartbeat: id=7",
+        );
+        set_registration(&mut values, 1, 7);
+
+        let reader = reader_pair(&metadata, &values);
+
+        assert!(reader.is_active(1, CLIENT_HEARTBEAT_TYPE_ID, 7));
+        assert!(
+            !reader.is_active(1, CLIENT_HEARTBEAT_TYPE_ID, 8),
+            "another client's id is not this client's counter"
+        );
+        assert!(
+            !reader.is_active(1, 34, 7),
+            "a counter of another type is not the heartbeat"
+        );
+        assert!(
+            !reader.is_active(0, CLIENT_HEARTBEAT_TYPE_ID, 7),
+            "a slot nobody allocated is nobody's counter"
+        );
+        assert!(!reader.is_active(-1, CLIENT_HEARTBEAT_TYPE_ID, 7));
+        assert!(
+            !reader.is_active(99, CLIENT_HEARTBEAT_TYPE_ID, 7),
+            "past max_counter_id"
+        );
+    }
+
+    #[test]
+    fn a_reclaimed_counter_is_not_active_however_its_id_is_asked_about() {
+        let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(4 * layout::COUNTER_VALUE_LENGTH);
+
+        allocate(
+            &mut metadata,
+            1,
+            CLIENT_HEARTBEAT_TYPE_ID,
+            "client-heartbeat: id=7",
+        );
+        set_registration(&mut values, 1, 7);
+        metadata.put_i32(
+            layout::COUNTER_METADATA_LENGTH + layout::COUNTER_STATE_OFFSET,
+            layout::COUNTER_STATE_RECLAIMED,
+        );
+
+        let reader = reader_pair(&metadata, &values);
+
+        // The id and the registration are still in the file — a reclaimed slot
+        // keeps its bytes — and this is exactly the case the check exists for:
+        // the driver hands the id to somebody else.
+        assert!(!reader.is_active(1, CLIENT_HEARTBEAT_TYPE_ID, 7));
+    }
+
+    #[test]
+    fn asking_by_id_agrees_with_the_scan_it_replaces() {
+        let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(4 * layout::COUNTER_VALUE_LENGTH);
+
+        // Contiguous, because that is the state the two views agree in — see
+        // the test below for where they do not.
+        allocate(&mut metadata, 0, 34, "aeron version");
+        set_value(&mut values, 0, 79_106);
+        allocate(
+            &mut metadata,
+            1,
+            CLIENT_HEARTBEAT_TYPE_ID,
+            "client-heartbeat: id=7",
+        );
+        set_registration(&mut values, 1, 7);
+
+        let reader = reader_pair(&metadata, &values);
+
+        for counter_id in -1..=3 {
+            let by_scan = reader.get(counter_id).is_some_and(|counter| {
+                counter.type_id == CLIENT_HEARTBEAT_TYPE_ID && counter.registration_id == 7
+            });
+
+            assert_eq!(
+                by_scan,
+                reader.is_active(counter_id, CLIENT_HEARTBEAT_TYPE_ID, 7),
+                "counter {counter_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_stops_the_scan_and_not_the_question() {
+        let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(4 * layout::COUNTER_VALUE_LENGTH);
+
+        // Slot 1 is never allocated, and 2 is — which cannot happen in a real
+        // file, where allocation is a watermark. It is here because the two
+        // readers disagree about it and the disagreement is the reference's
+        // own: enumeration stops at the first unused record
+        // (`aeron_counters_manager.c:284-321`), while the by-id check reads the
+        // slot the caller names (`aeron_client_conductor.c:1234-1249`). A
+        // client's heartbeat check has an id already and must not be at the
+        // mercy of a gap below it.
+        allocate(
+            &mut metadata,
+            2,
+            CLIENT_HEARTBEAT_TYPE_ID,
+            "client-heartbeat: id=7",
+        );
+        set_registration(&mut values, 2, 7);
+
+        let reader = reader_pair(&metadata, &values);
+
+        assert!(reader.get(2).is_none(), "the scan stops at the gap");
+        assert!(reader.is_active(2, CLIENT_HEARTBEAT_TYPE_ID, 7));
     }
 }

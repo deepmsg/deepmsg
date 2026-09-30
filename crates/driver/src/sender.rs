@@ -38,21 +38,24 @@
 //! allocation stays on the conductor, where the ownership rules are.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender as Channel};
 use std::thread::JoinHandle;
 
-use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
+use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
 use crate::idle::Backoff;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
-    ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RttmFrame,
-    StatusMessageFrame, frame_type, header_flags, is_frame_valid,
+    ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame,
+    RttmFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
+use crate::subscribable::{TetherablePosition, UntetheredEvent};
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
+use crate::udp_channel::UdpChannel;
 use deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH;
 
 /// How many datagrams one poll may read
@@ -79,13 +82,91 @@ pub enum SenderCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Give a publication a local reader
+    /// (`aeron_driver_subscribable_add_position`,
+    /// `aeron_driver_conductor.c:3497-3523`).
+    ///
+    /// The conductor cannot do this itself: what a reader joins is the
+    /// publication's own subscribable set, and a network publication is the
+    /// sender's. A publication that has gone in the meantime is skipped — the
+    /// link is the conductor's record either way, and the reader is a position
+    /// nothing will ever compute a limit from.
+    AddSubscriber {
+        /// Which publication.
+        registration_id: i64,
+        /// The reader, whose counter the conductor has **already** seeded:
+        /// the sender reads positions to compute the producer's limit, and a
+        /// reader that appeared at zero would hold the producer back to a
+        /// place it never was.
+        position: TetherablePosition,
+    },
+    /// Take one away (`aeron_driver_subscribable_remove_position`, `:3525-3545`).
+    ///
+    /// The counter goes back to the conductor's hands after this, which is why
+    /// the message is sent before the free and not after: a set that still
+    /// holds a freed id reads whatever took its place.
+    RemoveSubscriber {
+        /// Which publication.
+        registration_id: i64,
+        /// Which reader.
+        counter_id: i32,
+    },
     /// Close an endpoint's socket and give the endpoint up.
     RemoveEndpoint {
         /// Which one.
         id: u64,
     },
+    /// Put a destination on an endpoint's tracker
+    /// (`aeron_driver_sender_on_add_destination`,
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:350-363`).
+    ///
+    /// The conductor answers the *client* before this runs — the reference does
+    /// (`aeron_driver_conductor.c:5366-5367`) — so this is the sender catching
+    /// up, not a step anyone is waiting on.
+    AddDestination {
+        /// The endpoint whose tracker it goes on.
+        endpoint_id: u64,
+        /// The destination's channel, as the client named it. Boxed for the
+        /// same reason [`SenderCommand::AddEndpoint`]'s endpoint is: a channel
+        /// is much larger than the rest of these commands, and one variant
+        /// would otherwise set the size of every one.
+        channel: Box<UdpChannel>,
+        /// Where it resolved to; [`None`] is an address that did not resolve,
+        /// which is kept and skipped rather than refused (`:5337-5343`).
+        address: Option<SocketAddr>,
+        /// The id the client removes it by.
+        registration_id: i64,
+    },
+    /// Take a destination off an endpoint's tracker by the address it was added
+    /// with (`aeron_driver_sender_on_remove_destination`, `:365-385`).
+    RemoveDestination {
+        /// The endpoint whose tracker it comes off.
+        endpoint_id: u64,
+        /// Which destination.
+        address: SocketAddr,
+    },
+    /// The same, by the id the client was given.
+    RemoveDestinationById {
+        /// The endpoint whose tracker it comes off.
+        endpoint_id: u64,
+        /// Which destination.
+        registration_id: i64,
+    },
     /// Stop the thread.
     Stop,
+}
+
+impl SenderCommand {
+    /// The endpoint a destination command names, or [`None`] for the commands
+    /// that are not about destinations.
+    const fn destination_endpoint_id(&self) -> Option<u64> {
+        match self {
+            Self::AddDestination { endpoint_id, .. }
+            | Self::RemoveDestination { endpoint_id, .. }
+            | Self::RemoveDestinationById { endpoint_id, .. } => Some(*endpoint_id),
+            _ => None,
+        }
+    }
 }
 
 /// What the sender tells the conductor.
@@ -101,6 +182,49 @@ pub enum SenderEvent {
     PublicationRemoved {
         /// Which publication.
         registration_id: i64,
+    },
+    /// A responder answered a publication that asked for a response channel
+    /// (`aeron_driver_conductor_proxy_on_response_setup`,
+    /// `aeron_driver_conductor_proxy.c:157-172`).
+    ///
+    /// The frame named the publication; the correlation id is read off the
+    /// publication itself, which is what ties the answer to the subscription
+    /// waiting for it — the frame carries no correlation id of its own
+    /// (`aeron_send_channel_endpoint.c:738-748`).
+    ResponseSetup {
+        /// The registration id of the subscription the publication was made
+        /// for.
+        response_correlation_id: i64,
+        /// The session that subscription should now read.
+        response_session_id: i32,
+    },
+    /// A publication heard from a live receiver for the first time
+    /// (`aeron_driver_conductor_proxy_on_response_connected`,
+    /// `aeron_driver_conductor_proxy.c:160-170`).
+    ///
+    /// The handshake a response channel runs is one-way until this: the image
+    /// keeps saying the response session on every status-message period, and
+    /// this is how it is told to stop. What is reported is the publication's
+    /// own `response-correlation-id`, which for the publication that asked for
+    /// a response channel is the registration id of the image that owes it.
+    ResponseConnected {
+        /// The registration id the publication names, whether or not it names
+        /// an image on this driver.
+        response_correlation_id: i64,
+    },
+    /// A publication's readers moved through the tether cycle
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// The machine runs on the sender — what it moves is the publication's own
+    /// set of readers — and what it produces is three *client* messages, which
+    /// only the conductor can send. So the outcome travels here, in the order
+    /// the readers are held.
+    Untethered {
+        /// Which publication.
+        registration_id: i64,
+        /// What moved.
+        events: Vec<UntetheredEvent>,
     },
     /// Something for the conductor to record: a socket that refused a send, a
     /// frame that could not be believed.
@@ -119,6 +243,24 @@ pub struct SenderProxy {
 }
 
 impl SenderProxy {
+    /// A proxy whose thread is **not there**: everything a caller hands it is
+    /// dropped, and every method answers as if the sender had stopped.
+    ///
+    /// It exists for the parts of the driver the conductor exercises on their
+    /// own — a client being reaped, a subscription being removed — where what
+    /// is under test is the conductor's own bookkeeping and not what the
+    /// sender does with it. Those callers already ignore the failure, because
+    /// a sender that has stopped is not a reason to leak a counter.
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let (commands, _) = mpsc::channel();
+
+        Self {
+            commands,
+            events: mpsc::channel().1,
+        }
+    }
+
     /// Ask the sender to take an endpoint.
     ///
     /// # Errors
@@ -160,6 +302,92 @@ impl SenderProxy {
     pub fn remove_endpoint(&self, id: u64) -> io::Result<()> {
         self.commands
             .send(SenderCommand::RemoveEndpoint { id })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to put a destination on an endpoint's tracker.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_destination(
+        &self,
+        endpoint_id: u64,
+        channel: Box<UdpChannel>,
+        address: Option<SocketAddr>,
+        registration_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::AddDestination {
+                endpoint_id,
+                channel,
+                address,
+                registration_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to take a destination off an endpoint's tracker.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination(&self, endpoint_id: u64, address: SocketAddr) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveDestination {
+                endpoint_id,
+                address,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// The same, by the id the client was given.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_destination_by_id(
+        &self,
+        endpoint_id: u64,
+        registration_id: i64,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveDestinationById {
+                endpoint_id,
+                registration_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to make a publication count a local reader.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_subscriber(
+        &self,
+        registration_id: i64,
+        position: TetherablePosition,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::AddSubscriber {
+                registration_id,
+                position,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to stop counting one.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_subscriber(&self, registration_id: i64, counter_id: i32) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveSubscriber {
+                registration_id,
+                counter_id,
+            })
             .map_err(|_| stopped())
     }
 
@@ -267,6 +495,18 @@ struct SenderThread {
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
+    /// Destination changes waiting for a pass that has the counters.
+    ///
+    /// The command loop has none — they arrive with [`SenderThread::do_work`] —
+    /// and a tracker writes `mdc-num-dest` whenever its table changes. The
+    /// reference applies these at the top of its send pass for the same reason
+    /// (`aeron_driver_sender.c:196-200`).
+    pending_destinations: Vec<SenderCommand>,
+    /// Reader changes waiting for a pass that has the counters, for the same
+    /// reason and with the same shape as the destinations above: what a reader
+    /// joins is a publication's position set, and computing anything from it
+    /// needs the counter regions.
+    pending_subscribers: Vec<SenderCommand>,
     last_cycle_ns: i64,
     idle: Backoff,
 }
@@ -288,6 +528,8 @@ impl SenderThread {
             publications: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
+            pending_destinations: Vec::new(),
+            pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
             idle: Backoff::new(),
         }
@@ -316,6 +558,15 @@ impl SenderThread {
                     SenderCommand::RemoveEndpoint { id } => {
                         self.endpoints.retain(|(endpoint_id, _)| *endpoint_id != id);
                         let _ = self.events.send(SenderEvent::EndpointRemoved { id });
+                    }
+                    command @ (SenderCommand::AddDestination { .. }
+                    | SenderCommand::RemoveDestination { .. }
+                    | SenderCommand::RemoveDestinationById { .. }) => {
+                        self.pending_destinations.push(command);
+                    }
+                    command @ (SenderCommand::AddSubscriber { .. }
+                    | SenderCommand::RemoveSubscriber { .. }) => {
+                        self.pending_subscribers.push(command);
                     }
                     SenderCommand::Stop => stop = true,
                 }
@@ -346,6 +597,22 @@ impl SenderThread {
         let Some(regions) = cnc.counter_regions() else {
             return 0;
         };
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+        Self::apply_destinations(
+            &mut self.endpoints,
+            &mut self.pending_destinations,
+            &self.counters,
+            &regions,
+            now_ns,
+        );
+        Self::apply_subscribers(
+            &mut self.publications,
+            &mut self.pending_subscribers,
+            &self.counters,
+            &regions,
+        );
+        self.check_untethered_subscriptions(&regions, now_ns);
+
         let system = System::new(&self.counters, &regions);
 
         let mut work = Self::receive_control_frames(
@@ -375,6 +642,150 @@ impl SenderThread {
             &mut self.last_cycle_ns,
         );
         work
+    }
+
+    /// Apply the destination changes the conductor asked for
+    /// (`aeron_driver_sender_do_send`, `:196-200`).
+    ///
+    /// An endpoint that has gone away, or one whose channel is not
+    /// multi-destination, is skipped: the client has already been answered, and
+    /// a destination is not a thing to fail a pass over.
+    fn apply_destinations(
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        pending: &mut Vec<SenderCommand>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) {
+        for command in std::mem::take(pending) {
+            let Some(endpoint_id) = command.destination_endpoint_id() else {
+                continue;
+            };
+
+            let Some((_, endpoint)) = endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+            else {
+                continue;
+            };
+
+            let Some(tracker) = endpoint.destination_tracker_mut() else {
+                continue;
+            };
+
+            match command {
+                SenderCommand::AddDestination {
+                    channel,
+                    address,
+                    registration_id,
+                    ..
+                } => {
+                    tracker.manual_add(
+                        counters,
+                        regions,
+                        now_ns,
+                        *channel,
+                        address,
+                        registration_id,
+                    );
+                }
+                SenderCommand::RemoveDestination { address, .. } => {
+                    tracker.remove(counters, regions, &address);
+                }
+                SenderCommand::RemoveDestinationById {
+                    registration_id, ..
+                } => {
+                    tracker.remove_by_id(counters, regions, registration_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply the reader changes the conductor asked for.
+    ///
+    /// A publication that is not there is skipped, and so is a reader whose
+    /// publication never existed: the conductor has already answered the
+    /// client and holds the link itself, so what is lost is a limit computed
+    /// without a reader that is on its way out anyway.
+    ///
+    /// The connected status is rewritten here rather than in the hook, and
+    /// only when `ssc` is set — which is what the reference's two hooks do
+    /// (`aeron_network_publication.c:1353-1378`) and the only thing about a
+    /// spy that a *client* can see.
+    fn apply_subscribers(
+        publications: &mut [NetworkPublication],
+        pending: &mut Vec<SenderCommand>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) {
+        for command in std::mem::take(pending) {
+            match command {
+                SenderCommand::AddSubscriber {
+                    registration_id,
+                    position,
+                } => {
+                    let Some(publication) = publications
+                        .iter_mut()
+                        .find(|publication| publication.registration_id == registration_id)
+                    else {
+                        continue;
+                    };
+
+                    // Both hooks write `true` — the add one literally, and the
+                    // remove one's `has_subscribers` is a constant where it
+                    // runs (see [`NetworkPublication::remove_spy`]). What
+                    // settles the status afterwards is the next pass of
+                    // `update_pub_pos_and_lmt`, the same pass that would settle
+                    // it in the reference.
+                    if publication.add_spy(position) {
+                        publication.update_connected_status(counters, regions, true);
+                    }
+                }
+                SenderCommand::RemoveSubscriber {
+                    registration_id,
+                    counter_id,
+                } => {
+                    let Some(publication) = publications
+                        .iter_mut()
+                        .find(|publication| publication.registration_id == registration_id)
+                    else {
+                        continue;
+                    };
+
+                    if publication.remove_spy(counter_id) {
+                        publication.update_connected_status(counters, regions, true);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run every publication's tether cycle and hand what moved to the
+    /// conductor (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`).
+    ///
+    /// It is done here rather than inside a publication's `send` because it
+    /// needs the counter manager mutably — a closed reader's counter is
+    /// written back as `NULL` in the set — and the send pass holds it shared.
+    ///
+    /// The reference runs the same machine from the conductor, on its timer
+    /// tier (`:1277`). See
+    /// [`NetworkPublication::check_untethered_subscriptions`] for why it
+    /// cannot be done that way here and what the difference amounts to.
+    fn check_untethered_subscriptions(&mut self, regions: &CounterRegions<'_>, now_ns: i64) {
+        let counters = &mut self.counters;
+        let channel = &self.events;
+
+        for publication in &mut self.publications {
+            let events = publication.check_untethered_subscriptions(counters, regions, now_ns);
+
+            if !events.is_empty() {
+                let _ = channel.send(SenderEvent::Untethered {
+                    registration_id: publication.registration_id,
+                    events,
+                });
+            }
+        }
     }
 
     /// Read everything the endpoints' sockets hold and hand each frame to the
@@ -429,7 +840,10 @@ impl SenderThread {
                     regions,
                     publications,
                     endpoints,
+                    index,
+                    datagram.source,
                     &buffers[slot][..datagram.length],
+                    events,
                 );
             }
 
@@ -445,12 +859,16 @@ impl SenderThread {
     /// An associated function rather than a method so that the borrow of the
     /// datagram buffers and the borrow of the publication list are visibly
     /// disjoint.
+    #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut [NetworkPublication],
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        endpoint_index: usize,
+        source: Option<SocketAddr>,
         bytes: &[u8],
+        events: &Channel<SenderEvent>,
     ) {
         let system = System::new(counters, regions);
 
@@ -490,38 +908,71 @@ impl SenderThread {
                 // depend on our recognising what it said (`:625`).
                 system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
 
+                let is_send_setup = header.flags & header_flags::SM_SEND_SETUP != 0;
+
+                // A position the publication cannot place is one it must not act
+                // on (`aeron_network_publication_is_valid_status_message`,
+                // `aeron_network_publication.c:841-856`) — and one the
+                // *destinations* must not act on either. The reference refuses
+                // it before the tracker ever sees it
+                // (`aeron_send_channel_endpoint.c:627-634`), so a message that
+                // is not believed cannot keep a destination alive or bring one
+                // into being.
+                //
+                // `SEND_SETUP` is not a position report — it is a receiver
+                // saying it has no image and wants the stream described
+                // (`:649-656`) — so it is exempt from that check, which is what
+                // the reference's guard says too.
+                if !is_send_setup {
+                    if let Some(index) = index {
+                        let snd_pos = counters
+                            .value(regions, publications[index].counters.snd_pos)
+                            .unwrap_or(0);
+
+                        if !publications[index].is_valid_status_message(&frame, snd_pos) {
+                            system.increment(system_counters::id::STATUS_MESSAGES_REJECTED);
+                            return;
+                        }
+                    }
+                }
+
+                // What was not refused reaches the endpoint's destinations, and
+                // reaches them whether or not a publication here answers to the
+                // frame: on a dynamic channel a status message from somewhere
+                // unknown *creates* a destination, which is the only way such a
+                // channel learns one (`:636-645`).
+                if let Some(address) = source {
+                    if let Some(tracker) = endpoints[endpoint_index].1.destination_tracker_mut() {
+                        tracker.on_status_message(
+                            counters,
+                            regions,
+                            frame.receiver_id,
+                            &address,
+                            now_ns,
+                        );
+                    }
+                }
+
                 let Some(index) = index else {
                     return;
                 };
 
-                // `SEND_SETUP` is not a position report — it is a receiver
-                // saying it has no image and wants the stream described
-                // (`aeron_send_channel_endpoint.c:649-656`) — so it is not put
-                // through the position check below.
-                if header.flags & header_flags::SM_SEND_SETUP != 0 {
-                    publications[index].trigger_send_setup_frame();
+                if is_send_setup {
+                    publications[index].trigger_send_setup_frame(source);
                     return;
                 }
 
-                // A position the publication cannot place is one it must not act
-                // on (`aeron_network_publication_is_valid_status_message`,
-                // `aeron_network_publication.c:841-856`).
-                let snd_pos = counters
-                    .value(regions, publications[index].counters.snd_pos)
-                    .unwrap_or(0);
-
-                if !publications[index].is_valid_status_message(&frame, snd_pos) {
-                    system.increment(system_counters::id::STATUS_MESSAGES_REJECTED);
-                    return;
-                }
-
-                publications[index].on_status_message(
+                if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
                     header.flags,
                     counters,
                     regions,
                     now_ns,
-                );
+                ) {
+                    let _ = events.send(SenderEvent::ResponseConnected {
+                        response_correlation_id,
+                    });
+                }
             }
             frame_type::NAK => {
                 let Some(frame) = NakFrame::read(bytes) else {
@@ -599,7 +1050,42 @@ impl SenderThread {
                     let (_, endpoint) = &mut endpoints[position];
                     let publication = &mut publications[index];
 
-                    let _ = publication.on_rttm(&frame, header.flags, endpoint, &system);
+                    let _ = publication.on_rttm(
+                        &frame,
+                        header.flags,
+                        endpoint,
+                        &system,
+                        counters,
+                        regions,
+                        now_ns,
+                    );
+                }
+            }
+            frame_type::RSP_SETUP => {
+                // A responder answering a publication that asked for a
+                // response channel. The reference does three things and no
+                // more (`aeron_send_channel_endpoint.c:730-751`): find the
+                // publication the frame names, read *its* correlation id, and
+                // report that to the conductor. An unresolvable frame, or one
+                // whose publication never asked for a response, is silence —
+                // there is no counter and no error, because a publication the
+                // far end knows about and this endpoint does not is not a
+                // fault, it is a stale frame.
+                let Some(frame) = RspSetupFrame::read(bytes) else {
+                    return;
+                };
+
+                if let Some(publication) =
+                    find_publication(publications, frame.stream_id, frame.session_id)
+                {
+                    let response_correlation_id = publication.response_correlation_id;
+
+                    if response_correlation_id != layout::NULL_VALUE {
+                        let _ = events.send(SenderEvent::ResponseSetup {
+                            response_correlation_id,
+                            response_session_id: frame.response_session_id,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -992,6 +1478,7 @@ mod tests {
                 max_resend: 0,
                 entity_tag: -1,
                 response_correlation_id: -1,
+                is_response: false,
                 session_id: Some(42),
                 linger_timeout_ns: 5_000_000_000,
                 untethered_window_limit_timeout_ns: 5_000_000_000,

@@ -267,6 +267,10 @@ pub fn allocate_subscription_position(
 pub const SEND_CHANNEL_STATUS_NAME: &str = "snd-channel";
 /// The receive endpoint's name.
 pub const RECEIVE_CHANNEL_STATUS_NAME: &str = "rcv-channel";
+/// The name a multi-destination send endpoint's destination count carries
+/// (`AERON_COUNTER_CHANNEL_MDC_NUM_DESTINATIONS_NAME`,
+/// `aeron-client/src/main/c/aeron_counters.h:117`).
+pub const MDC_NUM_DESTINATIONS_NAME: &str = "mdc-num-dest";
 
 /// The type ids the channel-status counters carry
 /// (`aeron-client/src/main/c/aeron_counters.h:86-90`).
@@ -275,6 +279,10 @@ pub mod channel_type_id {
     pub const SEND_CHANNEL_STATUS: i32 = 6;
     /// `AERON_COUNTER_RECEIVE_CHANNEL_STATUS_TYPE_ID`, label `"rcv-channel"`.
     pub const RECEIVE_CHANNEL_STATUS: i32 = 7;
+    /// `AERON_COUNTER_CHANNEL_NUM_DESTINATIONS_TYPE_ID`, label
+    /// `"mdc-num-dest"` — how many destinations a multi-destination send
+    /// endpoint currently has (`aeron_counters.h:118`).
+    pub const MDC_NUM_DESTINATIONS: i32 = 18;
 }
 
 /// What a channel-status counter holds
@@ -327,6 +335,110 @@ impl ChannelStatusKey<'_> {
 
         out
     }
+}
+
+/// The names a local-address counter carries
+/// (`aeron-client/src/main/c/aeron_counters.h:107-108`).
+///
+/// Each names the endpoint or destination whose *actual* bound address it
+/// holds, which is what a client reads to answer "which port did `:0` become".
+pub const SEND_LOCAL_SOCKADDR_NAME: &str = "snd-local-sockaddr";
+/// The receive side's.
+pub const RECEIVE_LOCAL_SOCKADDR_NAME: &str = "rcv-local-sockaddr";
+
+/// `AERON_COUNTER_LOCAL_SOCKADDR_TYPE_ID` (`aeron_counters.h:109`).
+pub const LOCAL_SOCKADDR_TYPE_ID: i32 = 14;
+
+/// The key a local-address counter carries
+/// (`aeron_local_sockaddr_key_layout_t`,
+/// `aeron-client/src/main/c/concurrent/aeron_counters_manager.h:62-68`): the
+/// channel-status counter this address belongs to, the length of the address,
+/// and the address itself.
+///
+/// The channel-status id is in the key because a counter is found by it: a
+/// client that knows which channel it is asking about reads the status counter
+/// and then the address beside it.
+pub struct LocalSockaddrKey<'a> {
+    /// The `snd-channel` or `rcv-channel` counter of the endpoint this address
+    /// belongs to.
+    pub channel_status_id: i32,
+    /// The bound address as text.
+    pub local_sockaddr: &'a str,
+}
+
+impl LocalSockaddrKey<'_> {
+    /// The key's width, and the one the counter manager is told about.
+    pub const LENGTH: usize = StreamPositionKey::LENGTH;
+
+    /// Where the address starts, after the two `int32`s.
+    const ADDRESS_OFFSET: usize = 8;
+
+    /// How much of an address the key can hold.
+    pub const ADDRESS_LENGTH_MAX: usize = Self::LENGTH - Self::ADDRESS_OFFSET;
+
+    /// The key as the bytes a reader would find.
+    pub fn encode(&self) -> [u8; LocalSockaddrKey::LENGTH] {
+        let mut out = [0u8; Self::LENGTH];
+        let length = self.local_sockaddr.len().min(Self::ADDRESS_LENGTH_MAX);
+
+        out[..4].copy_from_slice(&self.channel_status_id.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)] // bounded by ADDRESS_LENGTH_MAX
+        out[4..8].copy_from_slice(&(length as i32).to_le_bytes());
+        out[Self::ADDRESS_OFFSET..Self::ADDRESS_OFFSET + length]
+            .copy_from_slice(&self.local_sockaddr.as_bytes()[..length]);
+
+        out
+    }
+}
+
+/// Allocate the counter that says where an endpoint or destination is actually
+/// bound (`aeron_counter_local_sockaddr_indicator_allocate`,
+/// `aeron-driver/src/main/c/aeron_position.c:276-309`).
+///
+/// Its **value** is the endpoint's state rather than a position — the caller
+/// writes `ACTIVE` once the socket is up — and its label names both the channel
+/// status it belongs to and the address, so that a reader of `AeronStat` can
+/// see which is which.
+///
+/// The address is the reason this exists. A destination may name port zero
+/// (a multi-destination one does), and then the counter's **key** is the only
+/// place the port the kernel chose can be read from — which is what
+/// `ReplayMerge` does when it has to resolve a replay port
+/// (`LocalSocketAddressStatus.findAddress`).
+///
+/// # Errors
+///
+/// `None` when the counter manager has no room; nothing is left behind.
+pub fn allocate_local_sockaddr_counter(
+    manager: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    name: &str,
+    registration_id: i64,
+    channel_status_counter_id: i32,
+    local_sockaddr: &str,
+    now_ms: i64,
+) -> Option<i32> {
+    let key = LocalSockaddrKey {
+        channel_status_id: channel_status_counter_id,
+        local_sockaddr,
+    }
+    .encode();
+
+    // `"%s: %d %s"` — the name, the channel status, and the address
+    // (`aeron_position.c:295-297`).
+    let label = format!("{name}: {channel_status_counter_id} {local_sockaddr}");
+
+    let counter_id = manager.allocate(
+        regions,
+        LOCAL_SOCKADDR_TYPE_ID,
+        &key,
+        label.as_bytes(),
+        now_ms,
+    )?;
+
+    manager
+        .set_registration_id(regions, counter_id, registration_id)
+        .map(|()| counter_id)
 }
 
 /// Allocate a channel-status counter for an endpoint
@@ -400,6 +512,77 @@ mod tests {
 
             (manager, regions)
         }
+    }
+
+    /// The key a client finds a local address by
+    /// (`aeron_local_sockaddr_key_layout_t`, `aeron_counters_manager.h:62-68`).
+    #[test]
+    fn the_local_address_key_holds_the_channel_status_and_the_address() {
+        let key = LocalSockaddrKey {
+            channel_status_id: 42,
+            local_sockaddr: "127.0.0.1:40456",
+        }
+        .encode();
+
+        assert_eq!(112, key.len());
+        assert_eq!(
+            42i32.to_le_bytes(),
+            key[..4],
+            "the channel status this address belongs to"
+        );
+        assert_eq!(15i32.to_le_bytes(), key[4..8], "the address's length");
+        assert_eq!(b"127.0.0.1:40456", &key[8..23]);
+        assert!(
+            key[23..].iter().all(|byte| 0 == *byte),
+            "everything past the address is zero"
+        );
+    }
+
+    /// The counter itself: type 14, the address in its label beside the channel
+    /// status it belongs to (`aeron_position.c:295-297`), and the client that
+    /// asked as its registration id.
+    #[test]
+    fn a_local_address_counter_names_the_channel_status_and_the_address() {
+        let mut fixture = Fixture::new();
+
+        let counter_id = {
+            let (mut counters, regions) = fixture.open();
+
+            allocate_local_sockaddr_counter(
+                &mut counters,
+                &regions,
+                RECEIVE_LOCAL_SOCKADDR_NAME,
+                7,
+                42,
+                "127.0.0.1:40456",
+                1_000,
+            )
+            .expect("a counter")
+        };
+
+        let reader = deepmsg_cnc::counters::CountersReader::new(
+            fixture.metadata.writable(),
+            fixture.values.writable(),
+        );
+        let mut found = None;
+        reader.for_each(|descriptor| {
+            if descriptor.counter_id == counter_id {
+                found = Some((
+                    descriptor.type_id,
+                    descriptor.registration_id,
+                    descriptor.label.clone(),
+                ));
+            }
+        });
+
+        assert_eq!(
+            Some((
+                LOCAL_SOCKADDR_TYPE_ID,
+                7,
+                "rcv-local-sockaddr: 42 127.0.0.1:40456".to_owned()
+            )),
+            found
+        );
     }
 
     #[test]

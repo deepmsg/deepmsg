@@ -10,6 +10,12 @@ reference tooling, never by prose.
 | P2 | archive | record one stream + replay + a catalog the reference Java `ArchiveTool` reads byte-identically | `aeron-archive/src/main/java/`, `aeron-archive/src/main/c/` |
 | P3 | cluster (placeholder) | out of scope for now; premium (Standby) deferred, seams preserved | `aeron-cluster/src/main/java/` |
 
+P1's latency baseline is measured, not asserted: `docs/benchmarks.md` records
+the three configurations (our client, the reference's own instrument on our
+driver, and both on the reference's) with the machine they were taken on. A
+number from a shared machine is not a gate, so the harness compiles in CI and
+does not run there.
+
 Cross-cutting gates that apply from day one:
 
 - `cargo clippy --workspace --all-targets -- -D warnings` stays clean.

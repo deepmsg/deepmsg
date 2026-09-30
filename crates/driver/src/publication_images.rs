@@ -29,6 +29,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::ipc_subscriptions::SubscriptionLink;
+
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::{AddError, Now};
@@ -65,6 +67,25 @@ pub struct PublicationImageRecord {
     pub time_of_last_state_change_ns: i64,
     /// How many subscriptions read it.
     pub refcount: i32,
+    /// The header flags of the `SETUP` that started it
+    /// (`aeron_publication_image.h:73`, where the image carries the sender's
+    /// byte across from the frame).
+    ///
+    /// Kept on the record rather than only on the receiver's image because the
+    /// one reader is the conductor, which never touches the image itself: a
+    /// response publication names an image by registration id and has to be
+    /// told whether that image's sender asked for a response channel at all
+    /// ([`Self::has_send_response_setup`], `find_response_publication_image`).
+    pub setup_flags: u8,
+}
+
+impl PublicationImageRecord {
+    /// Whether the `SETUP` that started this image asked for a response
+    /// channel (`aeron_publication_image_has_send_response_setup`,
+    /// `aeron_publication_image.h:346-349`).
+    pub const fn has_send_response_setup(&self) -> bool {
+        self.setup_flags & crate::protocol::header_flags::SETUP_SEND_RESPONSE != 0
+    }
 }
 
 /// An image whose log buffer is being created.
@@ -79,6 +100,9 @@ struct PendingImage {
     /// The `SETUP` that started it, which is where the stream's first position,
     /// term length and MTU come from.
     setup: SetupFrame,
+    /// The header flags of that `SETUP`, which the frame's own body does not
+    /// carry ([`PublicationImage::setup_flags`]).
+    setup_flags: u8,
     /// Where the packets came from.
     source: SocketAddr,
     /// Where a control frame goes.
@@ -88,6 +112,25 @@ struct PendingImage {
     /// The untethered timeouts the channel named, which the image's readers
     /// inherit (`untethered-window-limit-timeout` and its two siblings).
     untethered: crate::publication_params::SubscriptionParams,
+    /// Whether this image is one of a group, which lands in the log buffer's
+    /// `group` byte (`aeron_driver_conductor_treat_image_as_multicast`,
+    /// `aeron_driver_conductor.c:674-680`).
+    group_semantics: bool,
+}
+
+/// Whether an image is one of a group
+/// (`aeron_driver_conductor_treat_image_as_multicast`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:674-680`): the channel's
+/// own group semantics, **or** the `SETUP`'s `GROUP` flag.
+///
+/// The two are one question because both name a channel that may have several
+/// receivers at once, which is what the log buffer's `group` byte is about — so
+/// a channel whose URI does not say it is one is still a group if the far end
+/// says so. The reference's third arm, a `group=` parameter forced true, is not
+/// parsed in this build.
+fn image_group_semantics(uri: &crate::channel_uri::ChannelUri<'_>, setup_flags: u8) -> bool {
+    crate::udp_channel::UdpChannel::uri_has_group_semantics(uri)
+        || setup_flags & crate::protocol::header_flags::SETUP_GROUP != 0
 }
 
 /// The images a driver owns.
@@ -133,14 +176,18 @@ impl PublicationImages {
         self.pending.len()
     }
 
-    /// The images on one stream and session, which is what a subscription is
-    /// matched against (`find_matching_subscription_link`, and its mirror).
-    pub fn matching(&self, stream_id: i32, session_id: Option<i32>) -> Vec<i64> {
+    /// The images a subscription joins as it is created
+    /// (`aeron_driver_conductor.c:5121-5143`).
+    ///
+    /// The rule is [`SubscriptionLink::matches_image`], which the live
+    /// image-to-subscription path asks too — the two have to agree, because an
+    /// image a subscription is linked to at creation is one it reads for as
+    /// long as the image exists.
+    pub fn matching(&self, link: &SubscriptionLink) -> Vec<i64> {
         self.images
             .iter()
             .filter(|image| {
-                image.stream_id == stream_id
-                    && session_id.is_none_or(|session_id| image.session_id == session_id)
+                link.matches_image(image.endpoint_id, image.stream_id, image.session_id)
             })
             .map(|image| image.registration_id)
             .collect()
@@ -164,6 +211,7 @@ impl PublicationImages {
         endpoint_id: u64,
         channel: &[u8],
         setup: &SetupFrame,
+        setup_flags: u8,
         source: SocketAddr,
         control_address: SocketAddr,
         config: &crate::config::DriverConfig,
@@ -185,12 +233,18 @@ impl PublicationImages {
         // `SETUP`, so the timeouts its readers are held to come from the
         // *channel* rather than from each subscription
         // (`aeron_driver_uri_subscription_params` on the channel's URI).
-        let untethered = match crate::channel_uri::ChannelUri::parse(channel) {
-            Ok(uri) => crate::publication_params::SubscriptionParams::resolve(&uri, config)
-                .unwrap_or_else(|_| {
-                    crate::publication_params::SubscriptionParams::defaults(config)
-                }),
-            Err(_) => crate::publication_params::SubscriptionParams::defaults(config),
+        let (untethered, group_semantics) = match crate::channel_uri::ChannelUri::parse(channel) {
+            Ok(uri) => (
+                crate::publication_params::SubscriptionParams::resolve(&uri, config)
+                    .unwrap_or_else(|_| {
+                        crate::publication_params::SubscriptionParams::defaults(config)
+                    }),
+                image_group_semantics(&uri, setup_flags),
+            ),
+            Err(_) => (
+                crate::publication_params::SubscriptionParams::defaults(config),
+                false,
+            ),
         };
 
         let counters_pair = allocate_counters(
@@ -242,10 +296,12 @@ impl PublicationImages {
             counters: counters_pair,
             path,
             setup: *setup,
+            setup_flags,
             source,
             control_address,
             invalidation: None,
             untethered,
+            group_semantics,
         });
 
         Ok(())
@@ -344,6 +400,7 @@ impl PublicationImages {
             config.status_message_timeout_ns,
             config.layout.page_size,
             pending.untethered,
+            pending.group_semantics,
             now.ns,
         );
 
@@ -371,6 +428,7 @@ impl PublicationImages {
             state: ImageState::Active,
             time_of_last_state_change_ns: now.ns,
             refcount: 0,
+            setup_flags: pending.setup_flags,
         });
 
         Some(pending.registration_id)
@@ -568,4 +626,37 @@ pub fn os_defaults() -> sys::SocketBufferLengths {
         rcvbuf: 0,
         sndbuf: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::protocol::header_flags;
+
+    fn uri(text: &str) -> crate::channel_uri::ChannelUri<'_> {
+        crate::channel_uri::ChannelUri::parse(text.as_bytes()).expect("a URI")
+    }
+
+    /// Both halves of the predicate, and each on its own: a channel that says
+    /// it is a group, a channel that does not but whose `SETUP` does, and one
+    /// that is neither. A hardcoded answer satisfies at most two of the three.
+    #[test]
+    fn an_image_is_a_group_when_either_the_channel_or_the_setup_says_so() {
+        let multi_destination = uri("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual");
+        let plain = uri("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert!(
+            image_group_semantics(&multi_destination, 0),
+            "a multi-destination channel is a group on its own"
+        );
+        assert!(
+            image_group_semantics(&plain, header_flags::SETUP_GROUP),
+            "and a channel that is not one is still a group if the far end says so"
+        );
+        assert!(
+            !image_group_semantics(&plain, 0),
+            "but neither saying it is not a group"
+        );
+    }
 }

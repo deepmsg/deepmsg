@@ -251,3 +251,116 @@ impl ReceiveChannelEndpoints {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::channel_uri::ChannelUri;
+    use crate::config::DriverConfig;
+    use crate::media::TransportParams;
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
+
+    struct Fixture {
+        metadata: Region,
+        values: Region,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            const VALUES_LENGTH: usize = 64 * 1024;
+            Self {
+                metadata: Region(vec![0u8; VALUES_LENGTH * 4]),
+                values: Region(vec![0u8; VALUES_LENGTH]),
+            }
+        }
+
+        fn open(&mut self) -> (CounterManager, CounterRegions<'_>) {
+            let regions = CounterRegions::new(
+                AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned"),
+                AtomicBuffer::from_slice_mut(&mut self.values.0).expect("aligned"),
+            )
+            .expect("four-to-one");
+            let manager = CounterManager::new(64 * 1024, 1_000).expect("room");
+
+            (manager, regions)
+        }
+    }
+
+    fn channel(uri: &str) -> UdpChannel {
+        let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+        UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
+    }
+
+    /// The label the counter with this id carries, read the way a client reads
+    /// it — through the counter region's own reader.
+    fn label(regions: &CounterRegions<'_>, id: i32) -> String {
+        let mut found = None;
+        regions.reader().for_each(|entry| {
+            if entry.counter_id == id {
+                found = Some(entry.clone());
+            }
+        });
+
+        found.expect("a counter").label
+    }
+
+    #[test]
+    fn the_label_names_the_address_the_endpoint_is_bound_to() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let (_, id, _) = ReceiveChannelEndpoints::default()
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                &TransportParams::default(),
+                &DriverConfig::default(),
+                &mut counters,
+                &regions,
+                77,
+                1,
+            )
+            .expect("an endpoint");
+
+        // The reference writes the name, the channel, and the address the
+        // socket was **actually** bound to (`aeron_position.c:229-244`, called
+        // from `aeron_driver_conductor.c:2157-2165`). The channel named a port,
+        // so the address is that port — and a reader that gets the whole label
+        // knows which socket it is looking at.
+        assert_eq!(
+            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40123 127.0.0.1:40123",
+            label(&regions, id)
+        );
+    }
+
+    #[test]
+    fn a_manual_endpoint_with_no_destination_yet_has_no_address_to_name() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let (_, id, _) = ReceiveChannelEndpoints::default()
+            .get_or_add(
+                channel("aeron:udp?control-mode=manual"),
+                &TransportParams::default(),
+                &DriverConfig::default(),
+                &mut counters,
+                &regions,
+                77,
+                1,
+            )
+            .expect("an endpoint");
+
+        // A manual channel starts with no destination, so there is no socket
+        // and no address — and the reference writes the label anyway
+        // (`aeron_receive_channel_endpoint_bind_addr_and_port` answers with an
+        // empty string, `:316-329`), so it ends in a space. That trailing space
+        // is the reference's own output, not a typo in this test.
+        assert_eq!(
+            "rcv-channel: aeron:udp?control-mode=manual ",
+            label(&regions, id)
+        );
+    }
+}

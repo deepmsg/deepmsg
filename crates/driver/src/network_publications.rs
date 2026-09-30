@@ -33,23 +33,29 @@
 use std::io;
 use std::path::PathBuf;
 
+use crate::ipc_subscriptions::IpcSubscriptions;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
-use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_cnc::{CounterManager, CounterRegions, layout};
+
+use deepmsg_core::logbuffer::descriptor;
 
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
 use crate::config::DriverConfig;
-use crate::flowcontrol::MaxStrategy;
 use crate::ipc_publication::ShareMismatch;
 use crate::ipc_publications::{AddError, Now, SessionIds};
 use crate::media::TransportParams;
 use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
 use crate::network_publication::{NetworkPublication, PublicationCounters};
-use crate::publication_params::{PublicationParams, PublicationParamsError};
+use crate::publication_images::PublicationImages;
+use crate::publication_params::{
+    PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError,
+};
+use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -64,12 +70,33 @@ struct PendingNetworkPublication {
     is_exclusive: bool,
     /// The channel as the client sent it.
     channel: Vec<u8>,
+    /// The channel of the **endpoint** this publication will send through.
+    ///
+    /// Not always the same channel as the one above, and it is this one that
+    /// decides the flow control, the group flag and the log buffer's `group`
+    /// byte (`aeron_network_publication_create` reads
+    /// `endpoint->conductor_fields.udp_channel`, `:136`; the strategy selector
+    /// is handed the same one, `aeron_driver_conductor.c:4492-4496`). A second
+    /// publication can share an endpoint whose agreement check looks at
+    /// timestamp offsets, MTU and buffer lengths and at neither `control-mode`
+    /// nor `fc=` (`validate_channel_against_send_channel_endpoint`,
+    /// `:1907-1953`), and the canonical form two channels have to match carries
+    /// only the two addresses (`aeron_uri_udp_canonicalise`,
+    /// `aeron_udp_channel.c:148-208`) — so the endpoint keeps the channel it was
+    /// created from, and that is the channel read.
+    endpoint_channel: UdpChannel,
     /// The parameters the URI resolved to.
     params: PublicationParams,
     /// The endpoint the publication will send through.
     endpoint_id: u64,
     /// The channel-status counter the reply carries.
     channel_status_counter_id: i32,
+    /// The image this publication answers, when it is a response publication
+    /// and one was found. Carried from the resolve step to the create step
+    /// because what the image has to be told is the *publication's* session id,
+    /// which does not exist until the create runs
+    /// (`aeron_driver_conductor.c:4227-4232`).
+    response_publication_image: Option<i64>,
     /// The counters allocated for this publication.
     counters: PublicationCounters,
     /// `so-sndbuf` the channel named, which the log buffer's metadata records.
@@ -106,6 +133,21 @@ pub struct NetworkPublicationRecord {
     pub endpoint_id: u64,
     /// The channel as the client sent it.
     pub channel: Vec<u8>,
+    /// The channel the **endpoint** was created from, which is not always the
+    /// one above — see [`PendingNetworkPublication::endpoint_channel`].
+    ///
+    /// The spy match rule compares two things off it, the canonical form and
+    /// the channel tag (`aeron_driver_conductor_spy_subscription_link_matches`,
+    /// `aeron_driver_conductor.c:92-108`, which reads
+    /// `publication->endpoint->conductor_fields.udp_channel`). A publication
+    /// may point at an endpoint that a *different* channel made, and it is
+    /// that channel a spy has to agree with.
+    pub endpoint_channel: UdpChannel,
+    /// Where its log buffer is. A second client given this publication maps the
+    /// *same* file, so the reply to its `ADD_PUBLICATION` has to name it
+    /// (`aeron_driver_conductor.c:4195-4196`, which answers with
+    /// `publication->log_file_name` on both the shared and the new path).
+    pub path: PathBuf,
     /// Whether the producer asked for a single-producer publication.
     pub is_exclusive: bool,
     /// The parameters it was created with, which a sharing publication has to
@@ -117,6 +159,17 @@ pub struct NetworkPublicationRecord {
     pub channel_status_counter_id: i32,
     /// How many clients hold a link to it (`publication_links`).
     pub refcount: i32,
+}
+
+impl NetworkPublicationRecord {
+    /// The log buffer's path, as the client's reply carries it.
+    ///
+    /// The bytes and not a `Path`: the reply is the reference's
+    /// `aeron_publication_buffers_ready_t`, whose tail is the file name as the
+    /// driver wrote it (`aeron_driver_conductor.c:2417`).
+    pub fn path_bytes(&self) -> Vec<u8> {
+        self.path.as_os_str().as_encoded_bytes().to_vec()
+    }
 }
 
 /// The network publications a driver owns.
@@ -188,6 +241,9 @@ impl NetworkPublications {
         clients: &mut Clients,
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
+        subscriptions: &IpcSubscriptions,
+        images: &PublicationImages,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
@@ -199,9 +255,10 @@ impl NetworkPublications {
 
         let channel = UdpChannel::resolve(request.channel, &uri)
             .map_err(|error| AddError::Channel(Box::new(error)))?;
-        let params = PublicationParams::resolve(&uri, config)?;
+        let mut params = PublicationParams::resolve(&uri, config)?;
 
         validate_for_publication(&channel)?;
+        validate_response_subscription(&channel, &params, subscriptions)?;
 
         // The client is registered before anything else happens for this
         // command, exactly as the IPC path does it.
@@ -219,6 +276,11 @@ impl NetworkPublications {
         // RESOLVE_PUBLICATION (`:4263-4381`): the endpoint first, because a
         // second publication on the same channel shares it.
         let endpoint_params = transport_params(config, &channel);
+
+        // `get_or_add` consumes the channel, and the fallback below needs one
+        // even though it should never be reached: the registry always holds an
+        // entry for an id it just handed out.
+        let named_channel = channel.clone();
 
         let outcome = endpoints
             .get_or_add(
@@ -253,6 +315,15 @@ impl NetworkPublications {
             }
         }
 
+        // The endpoint's channel, which is what the decisions below are made
+        // from — see the field's note for why it is not this publication's.
+        // `get_or_add` has already registered the entry either way, so the
+        // fallback is a wrong strategy rather than a panic if that ever stops
+        // being true.
+        let endpoint_channel = endpoints
+            .get(endpoint_id)
+            .map_or_else(|| named_channel.clone(), |entry| entry.channel.clone());
+
         // A publication that already exists on this endpoint and stream may be
         // shared (`:4287-4320`).
         //
@@ -267,6 +338,13 @@ impl NetworkPublications {
             if let Some(index) = self.find_shareable(endpoint_id, request.stream_id) {
                 publication_matches(&self.publications[index], &params).map_err(AddError::Share)?;
 
+                // The image comes after the agreement and not before it
+                // (`:4350-4370`): a second publication that disagrees with the
+                // one it would share is refused for *that*, whatever it named
+                // for a correlation id.
+                let response_image =
+                    find_response_publication_image(images, &named_channel, &params)?;
+
                 self.link(
                     index,
                     request,
@@ -276,6 +354,18 @@ impl NetworkPublications {
                     clients,
                     events,
                 );
+
+                // And what the image is owed is said after the link, because it
+                // is the *publication's* session the image has to be told, and
+                // the publication it answered with is the one that already
+                // existed (`:4227-4232`, which is the last thing the reference's
+                // link does).
+                if let Some(image) = response_image {
+                    let _ = receiver.set_response_session_id(
+                        image,
+                        i64::from(self.publications[index].session_id),
+                    );
+                }
 
                 return Ok(());
             }
@@ -305,6 +395,28 @@ impl NetworkPublications {
                     .map(|publication| (publication.stream_id, publication.session_id)),
             ),
         };
+
+        // A response publication whose correlation id is the prototype names no
+        // image, and still gets the smallest term there is (`:4314-4317`): the
+        // prototype is what a client sends before it has been told a session
+        // id, so what it makes is a throwaway and there is nothing to reserve a
+        // term for.
+        if params.is_response && params.response_correlation_id == PROTOTYPE_CORRELATION_ID {
+            params.term_length = descriptor::TERM_MIN_LENGTH;
+        }
+
+        // The reference finds the image in `create_publication`, one state
+        // further on (`:4416`), because there it has had to wait for the log
+        // buffer to land before it can do anything at all. This is the third
+        // deliberate reorder: the resolve half is synchronous here, so the
+        // image is looked for *before* the buffer is asked for. Everything the
+        // reference orders around the buffer keeps its order — the image comes
+        // after the session clash check and after the prototype clamp, and
+        // before the counters are allocated — and the buffer itself is the only
+        // thing that moves, which it does to the side that wastes less: a
+        // publication that will be refused does not map one.
+        let response_publication_image =
+            find_response_publication_image(images, &named_channel, &params)?;
 
         // The six counters a network publication's client reads
         // (`:4508-4531`).
@@ -342,6 +454,7 @@ impl NetworkPublications {
             stream_id: request.stream_id,
             is_exclusive,
             channel: request.channel.to_vec(),
+            endpoint_channel,
             params,
             endpoint_id,
             channel_status_counter_id,
@@ -350,6 +463,7 @@ impl NetworkPublications {
             channel_rcvbuf: endpoint_params.socket_rcvbuf,
             session_id,
             path,
+            response_publication_image,
         });
 
         Ok(())
@@ -367,7 +481,9 @@ impl NetworkPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         sender: &SenderProxy,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) -> usize {
@@ -392,7 +508,9 @@ impl NetworkPublications {
                         counters,
                         regions,
                         clients,
+                        subscriptions,
                         sender,
+                        receiver,
                         now,
                         events,
                     );
@@ -439,19 +557,26 @@ impl NetworkPublications {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
+        subscriptions: &mut IpcSubscriptions,
         sender: &SenderProxy,
+        receiver: &ReceiverProxy,
         now: Now,
         events: &mut impl ClientEvents,
     ) {
-        // `fc=` names the flow-control strategy; the unicast default is `max`
-        // (`aeron_flow_control_strategy_supplier_load`, `aeron_flow_control.c:74-79`).
+        // The flow-control strategy comes from the **endpoint's** channel, and a
+        // unicast one never reads `fc=` at all — see
+        // [`crate::flowcontrol::strategy_for_channel`], which is the selector
+        // `aeron_default_multicast_flow_control_strategy_supplier`
+        // (`aeron_flow_control.c:400-475`) in Rust.
         let fc = ChannelUri::parse(&pending.channel)
             .ok()
             .and_then(|uri| uri.value("fc").map(str::to_owned));
 
-        let flow_control = match MaxStrategy::from_options(
-            crate::flowcontrol::UNICAST_RRWM_DEFAULT,
+        let flow_control = match crate::flowcontrol::strategy_for_channel(
+            pending.endpoint_channel.is_multi_destination(),
             fc.as_deref(),
+            crate::flowcontrol::UNICAST_RRWM_DEFAULT,
+            crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
         ) {
             Ok(strategy) => strategy,
             Err(error) => {
@@ -467,10 +592,15 @@ impl NetworkPublications {
         // The retransmit handler's delay is the driver's unicast delay — zero
         // when nothing configured it, which is what makes a NAK answered at
         // once (`aeron_network_publication_create`, `:145-160`).
+        //
+        // Group semantics come from the endpoint's channel too (`:136`), and
+        // they are not only the setup frame's `GROUP` flag: the handler holds a
+        // section per receiver when a channel has them, and the log buffer's
+        // `group` byte is written from the same value (`:224`).
         let retransmit_handler = RetransmitHandler::new(
             config.retransmit_unicast_delay_ns,
             config.retransmit_unicast_linger_ns,
-            false,
+            pending.endpoint_channel.has_group_semantics(),
             usize::try_from(pending.params.max_resend.max(0))
                 .unwrap_or(1)
                 .max(1),
@@ -525,6 +655,8 @@ impl NetworkPublications {
             stream_id: pending.stream_id,
             endpoint_id: pending.endpoint_id,
             channel: pending.channel.clone(),
+            endpoint_channel: pending.endpoint_channel.clone(),
+            path: pending.path.clone(),
             is_exclusive: pending.is_exclusive,
             params: pending.params,
             counters: pending.counters,
@@ -554,6 +686,43 @@ impl NetworkPublications {
         };
 
         events.publication_ready(&ready, pending.is_exclusive);
+
+        // Every spy that was waiting for this stream, between the reply and the
+        // image's answer, which is where the reference does it
+        // (`:4201-4226`) — and after the reply for the same reason: a client
+        // that has been answered is one that may offer, and the spies read the
+        // buffer it is about to offer into.
+        //
+        // A link that fails is answered as an error on the publication's own
+        // correlation id, which is what the reference's command state machine
+        // does with the failure this returns (`:4220-4224` then the ERROR arm
+        // of `:3305-3318`). It is a reader the client will never hear about,
+        // and the alternative — silence — is a spy that waits for ever.
+        let failed = subscriptions.link_spy_subscriptions(
+            self.publications.last().expect("just pushed"),
+            counters,
+            regions,
+            sender,
+            now,
+            events,
+        );
+
+        if failed > 0 {
+            events.error(
+                pending.registration_id,
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!("failed to link {failed} spy subscription(s) to the publication")
+                    .as_bytes(),
+            );
+        }
+
+        // And then the image is told which session to answer with, which is the
+        // last thing the reference's link does (`:4227-4232`) — after the client
+        // has been answered, because a client that has been answered is one
+        // that may offer, and the image's answer is not on that path.
+        if let Some(image) = pending.response_publication_image {
+            let _ = receiver.set_response_session_id(image, i64::from(pending.session_id));
+        }
     }
 
     /// A publication a second `ADD_PUBLICATION` might share: same endpoint,
@@ -604,6 +773,13 @@ impl NetworkPublications {
         let publication = &mut self.publications[index];
         publication.refcount += 1;
 
+        // The *same* log buffer, so the same file name in the reply: a second
+        // client is handed a link onto the publication that exists, not a
+        // publication of its own, and a client that is told no file name has
+        // nothing to map and cannot offer at all
+        // (`aeron_driver_conductor.c:4195-4196`, which answers with the
+        // publication's `log_file_name` on this path too).
+        let log_file = publication.path_bytes();
         let ready = PublicationBuffersReady {
             correlation_id: request.correlation_id,
             registration_id: publication.registration_id,
@@ -611,7 +787,7 @@ impl NetworkPublications {
             stream_id: publication.stream_id,
             position_limit_counter_id: publication.counters.pub_lmt,
             channel_status_indicator_id: publication.channel_status_counter_id,
-            log_file: &[],
+            log_file: &log_file,
         };
 
         let publication_registration_id = publication.registration_id;
@@ -851,6 +1027,115 @@ fn validate_for_publication(channel: &UdpChannel) -> Result<(), AddError> {
     }
 
     Ok(())
+}
+
+/// `aeron_driver_conductor_validate_response_subscription`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:631-656`).
+///
+/// A publication that is not on a response channel but names a
+/// `response-correlation-id` is claiming to answer a subscription, and the claim
+/// has to be about a subscription **on this driver**: the id is a registration
+/// id, which never crosses the wire, so a publication naming one nobody holds
+/// is one that could never be answered.
+///
+/// A publication that *is* on a response channel is exempt, and not because it
+/// is trusted more: its correlation id names a local *image*, and
+/// [`crate::network_publications`]' response counterpart —
+/// `find_response_publication_image` — is what checks it, later, when the image
+/// it names has to exist.
+///
+/// # Errors
+///
+/// [`AddError::ResponseSubscription`] for an id no network subscription holds.
+fn validate_response_subscription(
+    channel: &UdpChannel,
+    params: &PublicationParams,
+    subscriptions: &IpcSubscriptions,
+) -> Result<(), AddError> {
+    if channel.control_mode == ControlMode::Response
+        || params.response_correlation_id == layout::NULL_VALUE
+    {
+        return Ok(());
+    }
+
+    if subscriptions.has_network(params.response_correlation_id) {
+        return Ok(());
+    }
+
+    Err(AddError::ResponseSubscription {
+        correlation_id: params.response_correlation_id,
+    })
+}
+
+/// `aeron_driver_conductor_find_response_publication_image`
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1787-1833`).
+///
+/// A publication on a `control-mode=response` channel is the *answering* half
+/// of a response channel: the client publishing into it is the one a request
+/// was addressed to, and what it names — `response-correlation-id` — is the
+/// registration id of the **image** that request arrived on. That id is a
+/// registration id and never crosses the wire, so an id this driver holds no
+/// image for is an answer to nobody.
+///
+/// Three ways to be refused, and all three are refused before anything is
+/// created:
+///
+/// * no correlation id at all — a response channel that names no image is not
+///   one;
+/// * an id that names nothing on this driver;
+/// * an id that names a real image whose `SETUP` never asked for a response
+///   channel, which is an image that is answering nothing.
+///
+/// The prototype value ([`PROTOTYPE_CORRELATION_ID`]) is a fourth case and not
+/// a refusal: it is what a client sends when it has no image yet, and it means
+/// "none", so the caller clamps the term length for it instead
+/// (`:4314-4317`).
+///
+/// # Errors
+///
+/// [`AddError::NoResponseCorrelationId`], [`AddError::ImageNotFound`] and
+/// [`AddError::ImageDidNotRequestResponseChannel`], in the order the reference
+/// tries them.
+/// # Returns
+///
+/// The registration id of the image, when there is one. `None` is a channel
+/// that is not a response channel at all and the prototype case, which the
+/// caller treats differently: the first has nothing to look for and the second
+/// has nothing to find.
+fn find_response_publication_image(
+    images: &PublicationImages,
+    channel: &UdpChannel,
+    params: &PublicationParams,
+) -> Result<Option<i64>, AddError> {
+    if channel.control_mode != ControlMode::Response {
+        return Ok(None);
+    }
+
+    if params.response_correlation_id == layout::NULL_VALUE {
+        return Err(AddError::NoResponseCorrelationId);
+    }
+
+    if params.response_correlation_id == PROTOTYPE_CORRELATION_ID {
+        return Ok(None);
+    }
+
+    let Some(image) = images
+        .images()
+        .iter()
+        .find(|image| image.registration_id == params.response_correlation_id)
+    else {
+        return Err(AddError::ImageNotFound {
+            correlation_id: params.response_correlation_id,
+        });
+    };
+
+    if !image.has_send_response_setup() {
+        return Err(AddError::ImageDidNotRequestResponseChannel {
+            correlation_id: params.response_correlation_id,
+        });
+    }
+
+    Ok(Some(image.registration_id))
 }
 
 /// The socket buffer lengths an endpoint is opened with, from the driver's

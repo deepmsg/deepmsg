@@ -111,6 +111,40 @@ pub enum AddError {
         /// The reference's message.
         message: String,
     },
+    /// A publication named a `response-correlation-id` that no network
+    /// subscription on this driver carries
+    /// (`aeron_driver_conductor.c:631-656`).
+    ///
+    /// The id is a **registration id**, which never crosses the wire: a
+    /// publication that names one nobody holds is one that could never be
+    /// answered.
+    ResponseSubscription {
+        /// The id it named.
+        correlation_id: i64,
+    },
+    /// A `control-mode=response` publication that named no correlation id
+    /// (`aeron_driver_conductor.c:1796-1800`).
+    ///
+    /// A response channel is one this driver has to *find* an image for, and
+    /// the correlation id is the whole of how it is named.
+    NoResponseCorrelationId,
+    /// A publication's `response-correlation-id` names an image whose `SETUP`
+    /// never asked for a response channel
+    /// (`aeron_driver_conductor.c:1812-1818`).
+    ///
+    /// The image exists, so the id is not a typo — it is an image whose sender
+    /// wanted an ordinary channel, and answering it would be answering a
+    /// channel nobody is listening on.
+    ImageDidNotRequestResponseChannel {
+        /// The id it named.
+        correlation_id: i64,
+    },
+    /// A publication's `response-correlation-id` names no image on this driver
+    /// (`aeron_driver_conductor.c:1823-1826`).
+    ImageNotFound {
+        /// The id it named.
+        correlation_id: i64,
+    },
     /// A publication's counters could not be allocated.
     NoCounterRecord,
     /// The native resource agent is not there to create the log buffer — its
@@ -137,6 +171,20 @@ impl std::fmt::Display for AddError {
             Self::Channel(error) => write!(f, "{error}"),
             Self::InvalidChannel(message) => f.write_str(message),
             Self::Endpoint { message, .. } => f.write_str(message),
+            Self::ResponseSubscription { correlation_id } => write!(
+                f,
+                "unable to find response subscription for response-correlation-id={correlation_id}"
+            ),
+            Self::NoResponseCorrelationId => f.write_str(
+                "control-mode=response was specified, but no response-correlation-id set",
+            ),
+            Self::ImageDidNotRequestResponseChannel { correlation_id } => write!(
+                f,
+                "image.correlationId={correlation_id} did not request a response channel"
+            ),
+            Self::ImageNotFound { correlation_id } => {
+                write!(f, "image.correlationId={correlation_id} not found")
+            }
             Self::NoCounterRecord => f.write_str("could not allocate the publication's counters"),
             Self::AgentStopped => f.write_str("the native resource agent has stopped"),
         }
@@ -185,6 +233,10 @@ impl AddError {
             Self::Params(_)
             | Self::NoClientRecord
             | Self::Share(_)
+            | Self::ResponseSubscription { .. }
+            | Self::NoResponseCorrelationId
+            | Self::ImageDidNotRequestResponseChannel { .. }
+            | Self::ImageNotFound { .. }
             | Self::NoCounterRecord
             | Self::AgentStopped => ERROR_CODE_GENERIC_ERROR,
         }

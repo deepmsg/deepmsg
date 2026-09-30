@@ -56,10 +56,11 @@ mode, the resolver's name, the duty-cycle thresholds
 (`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
 reference's own text changes with its settings. deepmsg appends `DEDICATED` to
 the conductor's, the sender's and the receiver's cycle-time counters, matching
-the reference's word for a driver whose three agents are threads of their own —
-which is what P1-4 made this one. The name-resolver pair (32 and 33) is still
-left unsuffixed: resolution is synchronous here (P1-5 adds the agent), so a
-threshold label would name a thread that does not exist.
+the reference's word for a driver whose agents are threads of their own — which
+is what this build's three are. The name-resolver pair (32 and 33) is left
+unsuffixed: resolution is synchronous here and there is no resolver agent to
+time (the row on that is under the UDP data plane), so a threshold label would
+name a thread that does not exist.
 
 The consequence for testing: a golden comparison of the two catalogues
 compares each label up to its first colon, and
@@ -274,17 +275,71 @@ be falsified.
 
 | Divergence | Why, and where it shows |
 |---|---|
-| **Multicast, response channels, ATS and the timestamp-offset parameters are refused** (`NOT_SUPPORTED`) rather than served | P1-5 carries multicast (the `min` flow-control admission gate, `group`/`gtag`, setup-catchup windows on a group), response channels and ATS. The reference serves every one of them; a driver that *ignored* them would serve a different channel. `crates/driver/src/udp_channel.rs::a_multicast_endpoint_is_refused_rather_than_served_as_unicast`, `::the_unsupported_parameters_are_named_rather_than_dropped`. |
+| **Multicast, ATS and the timestamp-offset parameters are refused** (`NOT_SUPPORTED`) rather than served | The reference serves all three, and a driver that *ignored* them would serve a different channel: a multicast group that receives nothing, a timestamped image without timestamps, an ATS endpoint without encryption. Multicast would also need the `min` flow-control admission gate, `group`/`gtag` and setup-catchup windows on a group. Response channels were on this list and are served now — see the destination-plane section below. `crates/driver/src/udp_channel.rs::a_multicast_endpoint_is_refused_rather_than_served_as_unicast`, `::the_unsupported_parameters_are_named_rather_than_dropped`. |
 | **`recvmmsg` is called without a timeout** | The reference passes a zero `timespec`, which the kernel reads as "return after the first datagram" — one syscall per datagram of a burst. This passes `NULL` on a non-blocking socket, which returns everything queued. Same datagrams, fewer syscalls (`aeron_udp_channel_transport.c:560`, `:577`). |
 | **A frame is copied into a scratch buffer before it is sent** | The reference hands `sendmmsg` an iovec pointing into the mapped term. `deepmsg_core::buffer` refuses to mint a `&[u8]` over memory another thread is writing — a false immutability promise is licence for the optimiser to hoist loads — and a syscall taking `&[u8]` is exactly that borrow. `crates/driver/src/network_publication.rs`'s module note. |
 | **A subscription's join position is the image's `rcv-pos`** | The reference takes the slowest *reader* when an image has several (`aeron_publication_image.h:376-396`), which needs the reader set — and that lives on the receiver thread that owns the image. `rcv-pos` is the position a reader may start at without seeing a hole, and for the one-reader case the two are the same number. `crates/driver/src/publication_images.rs::join_position`. |
-| **Name resolution is synchronous** (`getaddrinfo` in the resolve step), so the RES/`csv` table gossip and the resolver's cycle-time counters are absent | P1-5 carries the resolver agent. A literal address or a loopback name covers every interop case. `crates/driver/src/udp_channel.rs::a_host_is_resolved_by_the_system_when_it_is_not_a_literal`. |
+| **Name resolution is synchronous** (`getaddrinfo` in the resolve step), so the RES/`csv` table gossip, the resolver's cycle-time counters **and the reference's re-resolution** are all absent | The resolver agent is a slice of its own (`aeron.driver.reresolution.check.interval` is 1 s, `aeron_driver_context.h:206`; the loop is `aeron_destination_tracker.c:402-445` and `aeron_send_channel_endpoint.c:754-774`). A literal address re-resolves to itself, so a literal channel loses nothing, and a name covers every interop case. What the absence costs is a *changed* name and an unresolved one: the reference keeps an addressless destination and re-resolves it until it answers (`aeron_driver_conductor.c:5339-5345`), while here it stays addressless for the channel's life. `crates/driver/src/udp_channel.rs::a_host_is_resolved_by_the_system_when_it_is_not_a_literal`. |
 | **A channel-status counter's key is zero-filled past the channel** | The reference `memcpy`s the channel into an uninitialized struct, so the key's tail is whatever was on its stack (`aeron_position.c:220-222`). The bytes here are the same for the same channel every time, which is what a key is for. |
 | **Loss injection is configured by this build's own property, and a datagram it withholds is reported as sent** | Two differences in one seam. The reference's debug loss surface is eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}` variables (`media/aeron_debug_channel_endpoint_configuration.h:22-29`) read by an installer the driver context never calls — only a C++ test does (`aeron-driver/src/test/c/media/aeron_test_loss_generators_test.cpp:467`, `media/aeron_debug_channel_endpoint_configuration.c:126-172`) — so a driver started as a process has no way in, and every interop test here starts one. This build reads `deepmsg.debug.send.data.loss.drop.every` instead: a count, not a rate, over outgoing datagrams, on the send endpoint's data slot only. The second difference is what a withheld call reports: the reference answers `0` (`media/aeron_send_channel_endpoint.c:391-403`), so its sender never advances `snd-pos` and the frames go out on a later pass — no gap, nothing retransmitted. Here the withheld datagram counts as handed over, which is the only way a gap, a NAK and a retransmission become observable on a wire that does not lose anything. Covered by `tests/interop/udp_transport.rs::a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it`; the generator itself is `crates/driver/src/media/loss_generator.rs`. |
 | **Two native resource agents, not one** | `IpcPublications` and `PublicationsImages` each own one, because each maps its own log buffers. Invisible to a client (both are threads that map files); unifying them is a cleanup, not a contract. |
 
 The first row is the one a client can see from outside, and it is the reason
 the refusal exists: `NOT_SUPPORTED` is an answer, silence is not.
+
+## Destinations and the response channel (P1-5)
+
+A publication on a **multi-destination** channel sends to every destination it
+holds, and which destinations those are is a property of the channel's control
+mode, not of whether one has been added
+(`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`):
+a **manual** channel holds exactly the ones a client added and a destination
+never times out; a **dynamic** one also learns them from the status messages
+that arrive and drops one that has gone quiet. A subscription on the same shape
+reads from each destination it was given, one socket each — the multi-destination
+*receiver* — and both sides record the address their socket really bound in a
+`rcv-local-sockaddr` / `snd-local-sockaddr` counter, which is the only way a
+client learns the port a channel that named port zero was given
+(`aeron_counter_local_sockaddr_indicator_allocate`, `aeron_position.c:276-306`).
+
+An `aeron-spy:` subscription is served: it reads a **local** network
+publication's log buffer with no socket of its own, and the client is sent an
+ordinary image whose log file is that publication's own and whose source
+identity is the IPC constant (`aeron_driver_conductor.c:4904-4916`), so a
+client that reads images reads this one unchanged. A publication **counts**
+such a reader when `aeron.spies.simulate.connection` is set — the `ssc`
+parameter, by the driver's setting or the channel's — which is what lets a
+stream whose only reader is a spy be live: `snd-pos` follows the furthest spy
+and the producer's window opens from it
+(`aeron_network_publication.c:612-636`, `:947-1009`). Acceptance is our client
+on our driver and the reference's own client on our driver
+(`tests/integration/spy_subscription.rs`, `tests/interop/spy_reference.rs`).
+
+A **response channel** is served end to end: the `control-mode=response`
+subscription, the `SEND_RESPONSE` bit a publication with a
+`response-correlation-id=` puts in its SETUP, the RSP_SETUP an image sends back
+once a response publication is created against it, and a response publication
+that sends **only** to the address its SM came from. The frames are
+`docs/protocol/wire-frames.md`'s.
+
+Acceptance is two-sided and against the reference: the reference's own
+`BasicPublisher` reaching a client of ours through a receive destination, and
+two of the reference's own subscribers reached by our publication's
+destinations (`tests/interop/multi_destination.rs`); and the reference's own
+`response_client` and `response_server` running the whole handshake against a
+driver this build wrote
+(`tests/interop/response_channel_reference.rs`, `tests/interop/response_channel.rs`).
+
+What follows is what this build does *differently*, and each row names where it
+can be falsified.
+
+| Divergence | Why, and where it shows |
+|---|---|
+| **`aeron:ipc` is refused as a receive destination** (`NOT_SUPPORTED`) rather than made into an IPC link | The reference builds one, keyed by the destination's registration id (`aeron_driver_conductor.c:5617`). Nothing shipped asks for it: `ReplayMerge` refuses to merge over IPC (`aeron-archive/.../client/ReplayMerge.java:124-129`). Refused by name rather than left unanswered, so a client is not left waiting out a timeout. `crates/driver/src/conductor.rs::a_receive_destination_is_triaged_by_the_prefix_it_names`. |
+| **`aeron-spy:` is refused as a *send* destination only** — `INVALID_CHANNEL` | A spy names a publication's own log buffer rather than a place to put datagrams (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`). As a **receive** destination it is served, and has been since the spy link landed: it adds a local read of a publication to a `control-mode=manual` subscription (`aeron_driver_conductor_execute_add_receive_spy_destination`, `:5704-5806`). `crates/driver/src/udp_channel.rs::a_spy_is_refused_as_a_destination`, and the served half in `tests/integration/spy_subscription.rs::a_spy_can_be_added_to_a_subscription_as_a_source`. |
+| **`REMOVE_DESTINATION_BY_ID` that names no publication answers nothing** | The reference calls that handler without taking its result (`aeron_driver_conductor.c:3188-3200`), so the `-1` for a publication it cannot find (`:5562-5578`) never reaches the `result < 0` that would send an `ON_ERROR` (`:3222-3225`). Every other command in the family is answered. The silence is reproduced rather than improved on, so a client that named one waits out its own deadline. `crates/driver/src/conductor.rs::a_remove_destination_by_id_that_finds_nothing_answers_nothing`, and on the caller's side `tests/integration/client_round_trip.rs::removing_a_destination_by_id_waits_for_an_answer_that_never_comes`. |
+| **A publication's tether cycle is noticed on the sender's pass, not the conductor's timer** | The reference runs `aeron_network_publication_check_untethered_subscriptions` from the conductor, on the same tier as everything else that runs on a timer (`aeron_network_publication.c:1277`, reached from `:1692`). Here it runs where the readers are — the publication's own set belongs to the sender — so a reader that has stopped is put aside at the first send pass after its deadline rather than at the next tick. The deadlines are absolute, so the same transitions happen in the same order; what differs is how long after a deadline a client hears about it (microseconds against up to `aeron.timer.interval`). `tests/integration/spy_subscription.rs::a_publication_puts_its_laggards_aside_and_wakes_the_one_that_rejoins`. |
+| **A gap's NAK delay is fixed** | The reference picks a *feedback* generator per image — a multicast-tuned one when the image has group semantics, a unicast one otherwise, or a static one when the channel names `nak-delay=` — and re-arms it from the RTT measurements its RTTMs carry (`aeron_publication_image.c:85-115`). This build uses unicast's fixed delays for every image and never adjusts them. Timing, not bytes; `crates/driver/src/loss_detector.rs`'s tests pin the delays used. |
 
 ## The client's view of the ring, and of a message
 
@@ -348,20 +403,15 @@ The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
 
-Two settings are **read and not acted on**, which is not the same thing as
-being unknown, and both name the slice that will act on them:
+One setting is **read and not acted on**, which is not the same thing as
+being unknown:
 
 - `aeron.send.to.status.poll.ratio` (`aeronmd.h:257`, the reference's
   sender idle-strategy duty-cycle ratio, `aeron_driver_sender.c:96`). This
   build's sender polls its control sockets on every pass, which is the
   strongest setting of the same knob; a value below `1` is refused and
   anything else is accepted and has no effect. Acting on it means the sender's
-  idle strategy, which is P1-5's.
-- `aeron.spies.simulate.connection` (`aeronmd.h:178`) is read and reaches a
-  publication's parameters, but what acts on it is the *spy* machinery
-  (`aeron_network_publication.c:618`, `:761`), which this build does not have:
-  a subscription to a local network publication reads an image like any other
-  remote reader, so a publication never has a spy to count.
+  idle strategy, which this build does not have.
 
 `aeron.threading.mode` is the one setting of the reference's that this build
 does not read at all: its four values choose between dedicated, shared,

@@ -36,9 +36,26 @@ The acceptance is two-sided and runs against the reference: our driver's
 publication reaching the reference's own `BasicSubscriber`, and the reference's
 own `BasicPublisher` reaching our client through our driver
 (`tests/interop/udp_transport.rs`). Loss detection, retransmission and the
-`max` flow control are in; multicast, response channels and the name-resolver
-agent are P1-5, and `docs/compat.md` lists every divergence with the test that
-pins it.
+`max` flow control are in.
+
+P1-5: the driver fans out, and it answers. A publication on a
+multi-destination channel sends to every destination it holds — the ones a
+client added on a `control-mode=manual` channel, and on a `dynamic` one also
+the ones a status message reveals — and a subscription with receive
+destinations reads each of them on its own socket. Response channels are served
+end to end: the `control-mode=response` subscription, the `SEND_RESPONSE` bit in
+the SETUP of a publication that carries `response-correlation-id=`, the
+RSP_SETUP an image sends back, and a response publication that sends only where
+it was asked to. An `aeron-spy:` subscription is served too: it reads a local
+network publication's log buffer without a socket of its own, and a client
+reaches one either by subscribing to it or by adding it as a source of a
+multi-destination subscription (`tests/integration/spy_subscription.rs`). The
+reference's own client reads through one on this driver, which is the
+acceptance that matters (`tests/interop/spy_reference.rs`).
+Acceptance is against the reference on both sides
+(`tests/interop/multi_destination.rs`, `tests/interop/response_channel_reference.rs`).
+Multicast, ATS and the name-resolver agent are still refused, and
+`docs/compat.md` lists every divergence with the test that pins it.
 
 Premium features (Cluster Standby and friends) are explicitly out of scope for
 now; the seams they need (cluster schemas, reserved counter ids, the
@@ -81,7 +98,8 @@ Principles:
     tests/       integration tests + interop suite (feature "interop")
     schemas/     SBE XML schemas forked from the reference tree (single
                  source of truth)
-    docs/        ADRs, roadmap, compatibility matrix, protocol notes
+    docs/        ADRs, roadmap, compatibility matrix, protocol notes,
+                 benchmarks
 
 ## Building
 
@@ -92,6 +110,13 @@ Interop tests need the reference C driver from the Aeron 1.53.2 checkout
 (`docs/reference.md` documents the expected sibling-directory layout):
 
     cargo test -p deepmsg-tests --features interop
+
+Benchmarks are snapshots rather than gates — `docs/benchmarks.md` holds the
+numbers, the machine they were taken on, and what they do not say:
+
+    cargo bench -p deepmsg-bench --bench micro
+    cargo build --release -p deepmsg-driver          # the harness measures release
+    cargo bench -p deepmsg-bench --bench latency -- --md
 
 ## Conventions
 

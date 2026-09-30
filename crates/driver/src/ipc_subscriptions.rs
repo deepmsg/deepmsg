@@ -39,8 +39,8 @@
 //! of them may have parameters the other never heard of.
 
 use deepmsg_cnc::command::{
-    AddSubscriptionCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
-    ImageBuffersReady,
+    AddSubscriptionCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, DestinationCommandReceived,
+    ERROR_CODE_GENERIC_ERROR, ImageBuffersReady,
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -48,13 +48,15 @@ use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
 use crate::config::DriverConfig;
 use crate::ipc_publications::{AddError, IpcPublications};
+use crate::network_publications::{NetworkPublicationRecord, NetworkPublications};
 use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
 use crate::receive_endpoints::ReceiveChannelEndpoints;
 use crate::receiver::ReceiverProxy;
+use crate::sender::SenderProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 use crate::{ipc_publication::IpcPublication, position as counter_position};
 
 /// The channel an IPC image reports as its source
@@ -78,13 +80,25 @@ pub enum SubscriptionTarget {
     IpcPublication(i64),
     /// A network image's log buffer, built from datagrams.
     Image(i64),
+    /// A **network publication's** log buffer, read locally without a socket:
+    /// what a spy reads (`aeron_driver_conductor_link_subscribable` called
+    /// with a network publication's subscribable,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921`).
+    ///
+    /// It is the same kind of thing to a link as the other two — a log buffer
+    /// in this process and a counter the client advances — and it is *not* an
+    /// image: an image is built from datagrams and belongs to the receiver,
+    /// while this is the buffer the producer is writing into right now.
+    NetworkPublication(i64),
 }
 
 impl SubscriptionTarget {
     /// The registration id of whatever this points at.
     pub const fn registration_id(self) -> i64 {
         match self {
-            Self::IpcPublication(registration_id) | Self::Image(registration_id) => registration_id,
+            Self::IpcPublication(registration_id)
+            | Self::Image(registration_id)
+            | Self::NetworkPublication(registration_id) => registration_id,
         }
     }
 
@@ -104,15 +118,37 @@ pub struct SubscriptionLinkEntry {
     pub counter_id: i32,
 }
 
+/// How far a network subscription's setup has got
+/// (`aeron_subscription_link_setup_status_t`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.h:94-100`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStatus {
+    /// Nothing has answered yet. Every subscription starts here; for an IPC one
+    /// and for every network mode but response, it is also where it ends,
+    /// because nothing consults it.
+    Pending,
+    /// A RSP_SETUP named this subscription's session.
+    Complete,
+    /// A RSP_SETUP arrived with a session the subscription's own `session-id=`
+    /// contradicts. It will never be read, and later response setups for the
+    /// same correlation id are ignored (`aeron_driver_conductor.c:7069-7070`).
+    Error,
+}
+
 /// One subscription (`aeron_subscription_link_t`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.h:120-162`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.h:102-131`).
 ///
 /// The reference's struct is wider than this and most of the difference is
-/// network: an endpoint, a spy channel, a setup status and the group
-/// consideration are all about a transport that has to be *built* before it can
-/// be read from. An IPC subscription has nothing to set up — the log buffer it
-/// reads already exists — which is why this is the flags, the identity and the
-/// readers.
+/// network: a spy channel, a setup status and the group consideration are all
+/// about a transport that has to be *built* before it can be read from. An IPC
+/// subscription has nothing to set up — the log buffer it reads already exists
+/// — which is why this is the flags, the identity, the readers and, for a
+/// network subscription, [`SubscriptionLink::endpoint_id`].
+///
+/// The endpoint was left out until something needed it. `ADD_RCV_DESTINATION`
+/// is what needs it: a client adds a source to **a subscription**, and what a
+/// destination is added to is that subscription's receive endpoint
+/// (`aeron_driver_conductor.c:5879-5910`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionLink {
     /// The client's correlation id for the `ADD_SUBSCRIPTION`.
@@ -132,11 +168,36 @@ pub struct SubscriptionLink {
     pub is_rejoin: bool,
     /// Whether it is a response channel.
     pub is_response: bool,
+    /// How far its setup has got
+    /// (`AERON_SUBSCRIPTION_LINK_SETUP_STATUS_*`,
+    /// `aeron_driver_conductor.h:94-100`).
+    ///
+    /// Only a response subscription ever leaves [`SetupStatus::Pending`]: the
+    /// reference sets it for every network subscription but reads it in one
+    /// place, [`IpcSubscriptions::on_response_setup`], where `Complete` means
+    /// the setup that just arrived is a second one.
+    pub setup_status: SetupStatus,
     /// Whether the channel is reliable. No effect on IPC, recorded because the
     /// link is where the reference records it.
     pub is_reliable: bool,
     /// Whether its log buffers are sparse. No effect on IPC, likewise.
     pub is_sparse: bool,
+    /// The receive endpoint this subscription reads through, or [`None`] for an
+    /// IPC one — which has no socket, and so no destinations to add to it.
+    pub endpoint_id: Option<u64>,
+    /// The channel a **spy** subscription reads, or [`None`] for every other
+    /// kind (`aeron_subscription_link_t`'s `spy_channel`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.h:102-131`).
+    ///
+    /// It is the field that separates the two endpoints-less kinds: an IPC
+    /// subscription has no channel of its own beyond the string the client
+    /// wrote, while a spy has one it must *match against* — the channel the
+    /// publication it wants sends on. [`SubscriptionLink::channel`] stays what
+    /// the client wrote, prefix and all, because that is what the reference
+    /// puts in the reader's counter label
+    /// (`aeron_driver_init_subscription_channel`, `:780-788`, which copies the
+    /// command's own bytes).
+    pub spy_channel: Option<UdpChannel>,
     /// What it reads: one entry per publication it was matched with.
     pub subscribables: Vec<SubscriptionLinkEntry>,
 }
@@ -155,6 +216,30 @@ impl SubscriptionLink {
         self.reads(image_registration_id)
     }
 
+    /// Whether this subscription reads an image on `endpoint_id` for
+    /// `(stream_id, session_id)`
+    /// (`aeron_driver_conductor_network_subscription_link_matches_allowing_wildcard`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:81-90`, whose two
+    /// clauses are the endpoint and
+    /// [`is_wildcard_or_session_id_match`](Self::matches_image)).
+    ///
+    /// The endpoint clause is the one a reader does not expect: an image is a
+    /// session read through **one** receive endpoint, so a subscription on
+    /// another channel shares neither its socket nor its session however much
+    /// the stream and session numbers agree. A subscription with no endpoint
+    /// at all is an IPC one, and no image is ever its.
+    ///
+    /// The session clause is the reference's `:75-79`, and the `is_response`
+    /// in it is load-bearing: a response subscription that named no session is
+    /// **not** a wildcard looking for whatever appears. It is waiting for a
+    /// RSP_SETUP to name its session, and until one does it reads nothing.
+    pub fn matches_image(&self, endpoint_id: u64, stream_id: i32, session_id: i32) -> bool {
+        self.endpoint_id == Some(endpoint_id)
+            && self.stream_id == stream_id
+            && ((self.session_id.is_none() && !self.is_response)
+                || self.session_id == Some(session_id))
+    }
+
     /// Whether this subscription reads that publication
     /// (`aeron_driver_conductor_subscription_link_matches_ipc_publication`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:110-117`).
@@ -168,6 +253,60 @@ impl SubscriptionLink {
         self.stream_id == publication.stream_id
             && ((self.session_id.is_none() && !self.is_response)
                 || self.session_id == Some(publication.session_id))
+    }
+
+    /// Whether this **spy** subscription reads that network publication
+    /// (`aeron_driver_conductor_spy_subscription_link_matches`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:92-108`).
+    ///
+    /// Two clauses, and the first is the same stream rule every other match in
+    /// this module uses. What is different is what stands in for it when the
+    /// stream agrees:
+    ///
+    /// * the two channels name the same **tag** — `tags=`, and only when both
+    ///   are a real tag, because [`INVALID_TAG`] is not a value two channels
+    ///   can share — **or**
+    /// * the session matches and the two channels have the same canonical form,
+    ///   byte for byte.
+    ///
+    /// The canonical form is compared rather than the channel string for the
+    /// reason it exists at all: it is the two sides of the channel and nothing
+    /// else — the local and remote addresses, each quoted as the parameter the
+    /// URI wrote or as the address it resolved to — so two clients that named
+    /// the same endpoint with different *other* parameters named the same
+    /// channel (`aeron_uri_udp_canonicalise`,
+    /// `media/aeron_udp_channel.c:148-208`). What it does **not** do is treat
+    /// two spellings of one address as one: a channel that wrote a host name
+    /// and one that wrote the address it resolves to are two canonical forms,
+    /// which is why the tag branch exists at all.
+    ///
+    /// The tag branch is what reaches across that: a tagged channel is
+    /// addressed by its tag, and two channels carrying the same one are the
+    /// same channel however differently they are spelled.
+    pub fn spy_matches(
+        &self,
+        publication_channel: &UdpChannel,
+        stream_id: i32,
+        session_id: i32,
+    ) -> bool {
+        let Some(spy_channel) = self.spy_channel.as_ref() else {
+            return false;
+        };
+
+        let is_same_channel_tag =
+            INVALID_TAG != spy_channel.tag_id && spy_channel.tag_id == publication_channel.tag_id;
+
+        // The session clause is the reference's
+        // `is_wildcard_or_session_id_match` (`:74-79`), the same one the image
+        // rule uses — a spy link is never a response one
+        // (`:4886` sets `is_response` false), so the two shapes agree.
+        let session_matches =
+            (self.session_id.is_none() && !self.is_response) || self.session_id == Some(session_id);
+
+        self.stream_id == stream_id
+            && (is_same_channel_tag
+                || (session_matches
+                    && publication_channel.canonical_form == spy_channel.canonical_form))
     }
 }
 
@@ -195,6 +334,12 @@ pub enum AddSubscriptionError {
     },
     /// The receiver thread has stopped.
     Receiver,
+    /// An `ADD_RCV_DESTINATION` named a subscription no network link carries
+    /// (`:6053-6062`).
+    UnknownSubscription,
+    /// An `ADD_RCV_DESTINATION` named a subscription whose channel does not
+    /// allow manual control, and so may not have sources added to it (`:5608-5611`).
+    NotManualControl,
 }
 
 impl AddSubscriptionError {
@@ -212,6 +357,8 @@ impl AddSubscriptionError {
                 | UriError::MissingValue { .. },
             )) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
+            Self::UnknownSubscription => deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+            Self::NotManualControl => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::Channel(error) => error.error_code(),
             Self::Params(_)
             | Self::NoClientRecord
@@ -234,6 +381,8 @@ impl std::fmt::Display for AddSubscriptionError {
             Self::Channel(error) => write!(f, "{error}"),
             Self::Endpoint { message } => f.write_str(message),
             Self::Receiver => f.write_str("the receiver thread has stopped"),
+            Self::UnknownSubscription => f.write_str("unknown subscription"),
+            Self::NotManualControl => f.write_str("channel does not allow manual control"),
         }
     }
 }
@@ -278,6 +427,29 @@ impl IpcSubscriptions {
     /// The subscriptions, in the order they were added.
     pub fn links(&self) -> &[SubscriptionLink] {
         &self.links
+    }
+
+    /// The subscription a client holds by the id it was answered with, which is
+    /// what `ADD_RCV_DESTINATION` names
+    /// (`aeron_driver_conductor_find_mds_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5581-5615`).
+    ///
+    /// A destination is added to **a subscription**, not to a channel or an
+    /// endpoint: the client holds the subscription's registration id, and the
+    /// endpoint is what that subscription happens to read through
+    /// (`:5879-5910`).
+    ///
+    /// The endpoint clause is the reference's — it walks
+    /// `network_subscriptions` and nothing else — and it earns its place
+    /// because a registration id can name more than one link: a spy added as a
+    /// receive destination is stored under its subscription's id and has no
+    /// endpoint at all. A destination is a socket or a local read *inside* a
+    /// subscription that listens, so the link a destination names is always
+    /// one with an endpoint.
+    pub fn find_mds(&self, registration_id: i64) -> Option<&SubscriptionLink> {
+        self.links
+            .iter()
+            .find(|link| link.registration_id == registration_id && link.endpoint_id.is_some())
     }
 
     /// How many publications this subscription reads.
@@ -336,8 +508,11 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
+            endpoint_id: None,
+            spy_channel: None,
             subscribables: Vec::new(),
         };
 
@@ -366,6 +541,330 @@ impl IpcSubscriptions {
         }
 
         Ok(())
+    }
+
+    /// Serve an `ADD_SUBSCRIPTION` for a spy channel
+    /// (`aeron_driver_conductor_on_add_spy_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4926-4966`, and the
+    /// executor the parse ends in, `:4827-4924`).
+    ///
+    /// This is the one kind of subscription that is **not a socket**. What it
+    /// reads is a publication's log buffer, in this process, which the
+    /// publisher is already writing into — so there is no endpoint to make, no
+    /// session to elicit and no channel status to report: the reply carries
+    /// [`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`], which is the reference
+    /// saying exactly that (`:4892-4894`).
+    ///
+    /// # Errors
+    ///
+    /// [`AddSubscriptionError::Channel`] for a channel that does not follow the
+    /// prefix, [`AddSubscriptionError::Params`] for its parameters, and
+    /// [`AddSubscriptionError::NoClientRecord`] for a client that cannot be
+    /// registered.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn add_spy_subscription(
+        &mut self,
+        request: &AddSubscriptionCommand<'_>,
+        config: &DriverConfig,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        clients: &mut Clients,
+        publications: &NetworkPublications,
+        sender: &SenderProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), AddSubscriptionError> {
+        // The prefix comes off first and the rest is an ordinary UDP channel
+        // (`:4939-4942`): the reference parses the stripped bytes and keeps the
+        // result as the link's `spy_channel`, which is what the match rule
+        // compares against a publication's endpoint channel.
+        let spy_channel = crate::udp_channel::resolve_spy_channel(request.channel)
+            .map_err(Box::new)
+            .map_err(AddSubscriptionError::Channel)?;
+
+        let inner = &request.channel[crate::udp_channel::SPY_PREFIX.len()..];
+        let uri = ChannelUri::parse(inner)?;
+        let params = SubscriptionParams::resolve(&uri, config)?;
+
+        let Some(_client) = clients.get_or_add(
+            request.client_id,
+            now.ms,
+            now.client_liveness_timeout_ns,
+            counters,
+            regions,
+            events,
+        ) else {
+            return Err(AddSubscriptionError::NoClientRecord);
+        };
+
+        let link = SubscriptionLink {
+            registration_id: request.correlation_id,
+            client_id: request.client_id,
+            stream_id: request.stream_id,
+            session_id: params.session_id,
+            channel: request.channel.to_vec(),
+            is_tether: params.is_tether,
+            is_rejoin: params.is_rejoin,
+            is_response: false,
+            setup_status: SetupStatus::Pending,
+            is_reliable: params.is_reliable,
+            is_sparse: params.is_sparse,
+            endpoint_id: None,
+            spy_channel: Some(spy_channel),
+            subscribables: Vec::new(),
+        };
+
+        // The reply first, without a channel status — a spy has no socket to
+        // report one for, and `NOT_ALLOCATED` is how the client is told.
+        events.subscription_ready(
+            request.correlation_id,
+            CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
+        );
+
+        self.links.push(link);
+
+        // Then every publication it already matches (`:4900-4921`), and — the
+        // other half of the same question — every publication that appears
+        // after it ([`Self::link_spy_subscriptions`]).
+        //
+        // The reference asks `is_accepting_subscriptions` of each candidate
+        // before linking it (`aeron_network_publication.h:290-297`), which is
+        // about its three-state life: an ACTIVE publication takes readers, and
+        // a DRAINING one only while it still has some and its producer is
+        // ahead of its sender. A network publication here has no draining
+        // state — a removal takes it out of the collection in one step — so a
+        // publication that is there is one that is taking readers, and the
+        // question has no third answer to give.
+        let link = self.links.last_mut().expect("just pushed");
+
+        for publication in publications.publications() {
+            if !link.spy_matches(
+                &publication.endpoint_channel,
+                publication.stream_id,
+                publication.session_id,
+            ) {
+                continue;
+            }
+
+            link_spy_publication(link, publication, counters, regions, sender, now, events)
+                .map_err(|()| AddSubscriptionError::Link)?;
+        }
+
+        Ok(())
+    }
+
+    /// Give a network publication to every spy subscription that was waiting
+    /// for it (`aeron_driver_conductor.c:4201-4226`, run from the create).
+    ///
+    /// The reverse of the scan [`Self::add_spy_subscription`] makes, and it has
+    /// to exist for the same reason the IPC one does: a client is allowed to
+    /// spy on a stream nobody publishes yet, so neither order may be the one
+    /// that works.
+    ///
+    /// Nothing here fails the pass. The reference returns an error from its
+    /// create when a link does, but the publication exists and its client has
+    /// been answered either way; a spy that could not be linked is a reader
+    /// that will not be told about the buffer, which is what the caller's
+    /// error log is for.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn link_spy_subscriptions(
+        &mut self,
+        publication: &NetworkPublicationRecord,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        sender: &SenderProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> usize {
+        let mut failures = 0;
+
+        for link in &mut self.links {
+            if link.spy_channel.is_none()
+                || !link.spy_matches(
+                    &publication.endpoint_channel,
+                    publication.stream_id,
+                    publication.session_id,
+                )
+                || link.reads(publication.registration_id)
+            {
+                continue;
+            }
+
+            if link_spy_publication(link, publication, counters, regions, sender, now, events)
+                .is_err()
+            {
+                failures += 1;
+            }
+        }
+
+        failures
+    }
+
+    /// Serve an `ADD_RCV_DESTINATION` whose channel is a spy
+    /// (`aeron_driver_conductor_execute_add_receive_spy_destination`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5704-5806`).
+    ///
+    /// This is the third way a spy link is made, and it is a *destination*
+    /// rather than a subscription: a client takes a channel it already
+    /// subscribes to with `control-mode=manual` — a multi-destination
+    /// subscription, which is the only kind that may have sources added to it —
+    /// and names a spy as one of its sources. What comes back is an
+    /// acknowledgement of the destination, and what the subscription then gets
+    /// is an image for every publication the spy names, exactly as if it had
+    /// been spied from the start.
+    ///
+    /// The link is stored under the **subscription's** registration id, not the
+    /// destination's (`:5763`), which is what makes the pair one thing: a
+    /// `REMOVE_SUBSCRIPTION` for that id takes the spied images with it, and
+    /// the destination is removed by naming the channel it was added with.
+    ///
+    /// # Errors
+    ///
+    /// [`AddSubscriptionError::UnknownSubscription`] for a registration id no
+    /// network subscription carries,
+    /// [`AddSubscriptionError::NotManualControl`] for one whose channel may not
+    /// have sources added to it, and the channel's own errors for the URI.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn add_spy_destination(
+        &mut self,
+        request: &DestinationCommandReceived<'_>,
+        config: &DriverConfig,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        endpoints: &ReceiveChannelEndpoints,
+        publications: &NetworkPublications,
+        sender: &SenderProxy,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), AddSubscriptionError> {
+        let spy_channel = crate::udp_channel::resolve_spy_channel(request.channel)
+            .map_err(Box::new)
+            .map_err(AddSubscriptionError::Channel)?;
+
+        let inner = &request.channel[crate::udp_channel::SPY_PREFIX.len()..];
+        let uri = ChannelUri::parse(inner)?;
+        let params = SubscriptionParams::resolve(&uri, config)?;
+
+        // The subscription the destination is added to, and the one thing it
+        // has to be: a network subscription on a channel that allows manual
+        // control (`aeron_driver_conductor_find_mds_subscription`, `:5990-6021`).
+        let Some(mds) = self.find_mds(request.registration_id) else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        let Some(endpoint_id) = mds.endpoint_id else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        let is_manual = endpoints
+            .get(endpoint_id)
+            .is_some_and(|entry| entry.channel.control_mode == ControlMode::Manual);
+
+        if !is_manual {
+            return Err(AddSubscriptionError::NotManualControl);
+        }
+
+        // The subscription's stream, the destination's session — the reference
+        // reads each off the thing that owns it (`:5759-5763`), and the channel
+        // it records is the **destination's**, which is what the reader's
+        // counter is labelled with and what a removal names.
+        let link = SubscriptionLink {
+            registration_id: mds.registration_id,
+            client_id: request.client_id,
+            stream_id: mds.stream_id,
+            session_id: params.session_id,
+            channel: request.channel.to_vec(),
+            is_tether: params.is_tether,
+            is_rejoin: params.is_rejoin,
+            is_response: false,
+            setup_status: SetupStatus::Pending,
+            is_reliable: params.is_reliable,
+            is_sparse: params.is_sparse,
+            endpoint_id: None,
+            spy_channel: Some(spy_channel),
+            subscribables: Vec::new(),
+        };
+
+        // An acknowledgement, not a subscription ready: the client asked for a
+        // destination and that is what it is told about (`:5774`).
+        events.operation_succeeded(request.correlation_id);
+
+        self.links.push(link);
+
+        let link = self.links.last_mut().expect("just pushed");
+
+        for publication in publications.publications() {
+            if !link.spy_matches(
+                &publication.endpoint_channel,
+                publication.stream_id,
+                publication.session_id,
+            ) {
+                continue;
+            }
+
+            link_spy_publication(link, publication, counters, regions, sender, now, events)
+                .map_err(|()| AddSubscriptionError::Link)?;
+        }
+
+        Ok(())
+    }
+
+    /// Serve a `REMOVE_RCV_DESTINATION` whose channel is a spy
+    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6065`).
+    ///
+    /// The link is found by its registration id **and** the channel it was
+    /// added with, which is what tells two spy destinations on one subscription
+    /// apart — an id alone would name either.
+    ///
+    /// Every image it was holding is announced as unavailable before the link
+    /// goes, which is the one place a spy removal differs from a subscription
+    /// removal: a subscription removal is silent in C and in Java alike, while
+    /// this path is the client taking one source out of several and being told
+    /// which images that source was.
+    ///
+    /// # Returns
+    ///
+    /// `false` when no such link is there, which the reference answers with an
+    /// error naming the subscription.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn remove_spy_destination(
+        &mut self,
+        registration_id: i64,
+        channel: &[u8],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        sender: &SenderProxy,
+        now_ms: i64,
+        events: &mut impl ClientEvents,
+    ) -> bool {
+        let Some(index) = self.links.iter().position(|link| {
+            link.registration_id == registration_id
+                && link.spy_channel.is_some()
+                && link.channel == channel
+        }) else {
+            return false;
+        };
+
+        let link = self.links.swap_remove(index);
+
+        for entry in &link.subscribables {
+            // The publication is told before the counter goes back, for the
+            // same reason the message is sent before it: a set holding a freed
+            // counter id reads whatever takes its place.
+            if let SubscriptionTarget::NetworkPublication(publication) = entry.target {
+                let _ = sender.remove_subscriber(publication, entry.counter_id);
+            }
+
+            events.unavailable_image(
+                entry.target.registration_id(),
+                link.registration_id,
+                link.stream_id,
+                &link.channel,
+            );
+            counters.free(regions, entry.counter_id, now_ms);
+        }
+
+        true
     }
 
     /// Give a publication to every subscription that was waiting for it
@@ -413,6 +912,67 @@ impl IpcSubscriptions {
             .collect()
     }
 
+    /// A network publication is going away: tell every spy that reads it, and
+    /// give up their readers
+    /// (`aeron_driver_conductor_cleanup_spies`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1502-1519`).
+    ///
+    /// The reference splits this in three. It sends the message here, drops the
+    /// entries from each link in `aeron_network_publication_entry_delete`
+    /// (`:1481-1489`), and frees the counters in the publication's own close —
+    /// which walks the subscribable set it is about to destroy
+    /// (`aeron_network_publication.c:340-343`).
+    ///
+    /// This build's spy link keeps no such set: a spy's counter is the whole of
+    /// what the conductor linked, so all three happen here. What a client sees
+    /// is the same either way — one `ON_UNAVAILABLE_IMAGE` per spy, naming the
+    /// channel it spied with, before anything is freed.
+    ///
+    /// # Returns
+    ///
+    /// How many spies were told.
+    pub fn unlink_spies_of(
+        &mut self,
+        publication_registration_id: i64,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+        events: &mut impl ClientEvents,
+    ) -> usize {
+        let mut told = 0;
+
+        for link in &mut self.links {
+            let mut reading = false;
+
+            link.subscribables.retain(|entry| {
+                let is_this_publication = matches!(
+                    entry.target,
+                    SubscriptionTarget::NetworkPublication(registration_id)
+                        if registration_id == publication_registration_id
+                );
+
+                if is_this_publication {
+                    reading = true;
+                    counters.free(regions, entry.counter_id, now_ms);
+                }
+
+                !is_this_publication
+            });
+
+            if reading {
+                events.unavailable_image(
+                    publication_registration_id,
+                    link.registration_id,
+                    link.stream_id,
+                    &link.channel,
+                );
+                told += 1;
+            }
+        }
+
+        told
+    }
+
     /// Forget a publication that no longer exists: drop the entries that point
     /// at it, without freeing anything — its own close owns the counters
     /// (`aeron_driver_conductor_unlink_subscribable`, `:3662-3677`).
@@ -421,6 +981,20 @@ impl IpcSubscriptions {
             link.subscribables
                 .retain(|entry| entry.target.registration_id() != publication_registration_id);
         }
+    }
+
+    /// Whether a **network** subscription with this registration id exists
+    /// (`aeron_driver_conductor.c:641-648`, which walks
+    /// `network_subscriptions`).
+    ///
+    /// The distinction is the reference's and it matters here: a publication
+    /// naming a `response-correlation-id` is naming a subscription a responder
+    /// will send to over UDP, and an IPC subscription has no endpoint to send
+    /// anything to. A link with no endpoint is an IPC one.
+    pub fn has_network(&self, registration_id: i64) -> bool {
+        self.links
+            .iter()
+            .any(|link| link.endpoint_id.is_some() && link.registration_id == registration_id)
     }
 
     /// Whether a subscription with this registration id exists, which is what
@@ -448,27 +1022,47 @@ impl IpcSubscriptions {
     /// registration id can remove it even though it does not own it. That is
     /// reproduced rather than tightened — a driver that refused would be one
     /// where a legitimate removal failed.
+    ///
+    /// **Every** link carrying that id goes, not the first one found. The
+    /// reference walks all three of its arrays and removes each match
+    /// (`:5204-5251`), and a registration id can name more than one link: a spy
+    /// added as a receive destination is stored under the subscription's id
+    /// ([`Self::add_spy_destination`]), and removing the subscription has to
+    /// take it too — otherwise the subscription is gone and something is still
+    /// reading a publication on its behalf.
     pub fn remove(
         &mut self,
         registration_id: i64,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        sender: &SenderProxy,
         now_ms: i64,
     ) -> bool {
-        let Some(index) = self
-            .links
-            .iter()
-            .position(|link| link.registration_id == registration_id)
-        else {
-            return false;
-        };
+        let mut found = false;
+        let mut index = self.links.len();
 
-        let link = self.links.swap_remove(index);
+        while index > 0 {
+            index -= 1;
 
-        unlink_all(link, counters, regions, publications, None, now_ms);
+            if self.links[index].registration_id != registration_id {
+                continue;
+            }
 
-        true
+            let link = self.links.swap_remove(index);
+            unlink_all(
+                link,
+                counters,
+                regions,
+                publications,
+                None,
+                Some(sender),
+                now_ms,
+            );
+            found = true;
+        }
+
+        found
     }
 
     /// Give up every subscription a client owned, without telling it anything:
@@ -480,6 +1074,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        sender: &SenderProxy,
         now_ms: i64,
     ) -> usize {
         let mut removed = 0;
@@ -493,7 +1088,15 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
-            unlink_all(link, counters, regions, publications, None, now_ms);
+            unlink_all(
+                link,
+                counters,
+                regions,
+                publications,
+                None,
+                Some(sender),
+                now_ms,
+            );
             removed += 1;
         }
 
@@ -513,6 +1116,97 @@ impl IpcSubscriptions {
 }
 
 impl IpcSubscriptions {
+    /// A responder answered a publication that asked for a response channel
+    /// (`aeron_driver_conductor_on_response_setup`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:7060-7115`).
+    ///
+    /// This is where a response subscription stops being one. Until a
+    /// RSP_SETUP arrives it reads nothing — it is not registered with the
+    /// receiver at all — and what the frame carries is the **session** it
+    /// should read, which is the one thing it could not know. So the
+    /// subscription is given that session, told it is no longer a response
+    /// channel, and registered like any other reader; from here on the
+    /// difference is gone.
+    ///
+    /// # Returns
+    ///
+    /// The error to record, when the subscription named a session that the
+    /// response publication contradicts. Nothing else here is an error: a
+    /// correlation id no subscription carries is a frame for another driver's
+    /// client, and the reference walks past it.
+    pub fn on_response_setup(
+        &mut self,
+        response_correlation_id: i64,
+        response_session_id: i32,
+        receiver: &ReceiverProxy,
+    ) -> Option<(i32, String)> {
+        for index in 0..self.links.len() {
+            let link = &mut self.links[index];
+
+            if link.registration_id != response_correlation_id
+                || link.setup_status == SetupStatus::Error
+            {
+                continue;
+            }
+
+            if link.setup_status == SetupStatus::Complete {
+                // A second response setup for a subscription that is already
+                // reading. The answer is to ask the far end to describe itself
+                // again (`aeron_driver_receiver.c:412-427`), which is what
+                // re-opens a publication that has met a receiver before
+                // (`aeron_network_publication.c:586-589`).
+                if let (Some(endpoint_id), Some(session_id)) = (link.endpoint_id, link.session_id) {
+                    let _ = receiver.request_setup(endpoint_id, link.stream_id, session_id);
+                }
+
+                continue;
+            }
+
+            if let Some(named) = link.session_id {
+                if named != response_session_id {
+                    // The subscription said which session it would read and
+                    // the response publication says otherwise. The reference
+                    // drops the named session as well as poisoning the link,
+                    // and **returns** rather than continuing — so a later
+                    // link with the same correlation id is not examined
+                    // (`:7094-7098`).
+                    link.session_id = None;
+                    link.setup_status = SetupStatus::Error;
+
+                    return Some((
+                        deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                        format!(
+                            "failed to setup response subscription (registrationId={}, channel={}), \
+                             because it contains `session-id` parameter that does not match \
+                             `session-id={}` of the response publication",
+                            link.registration_id,
+                            String::from_utf8_lossy(&link.channel),
+                            response_session_id
+                        ),
+                    ));
+                }
+            }
+
+            link.session_id = Some(response_session_id);
+            link.is_response = false;
+            link.setup_status = SetupStatus::Complete;
+
+            if let Some(endpoint_id) = link.endpoint_id {
+                // The same call the subscription's own creation makes, and the
+                // one it deliberately did not make then. The reference pairs it
+                // with `decref_to_response_stream`; this build keeps no
+                // response refcount to give back (see `add_network_subscription`).
+                let _ = receiver.add_subscription(
+                    endpoint_id,
+                    link.stream_id,
+                    Some(response_session_id),
+                );
+            }
+        }
+
+        None
+    }
+
     /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
     /// (`aeron_driver_conductor_on_add_network_subscription`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5156-5280`).
@@ -568,6 +1262,10 @@ impl IpcSubscriptions {
         // socket cannot be bound is a subscription that cannot be served —
         // which is a different answer from one that has nothing to read yet.
         let endpoint_params = ReceiveChannelEndpoints::transport_params(config, &channel);
+        // Read before the channel moves into the endpoint: the mode decides
+        // what the receiver is told below, and the endpoint takes ownership.
+        let is_response_channel = channel.control_mode == ControlMode::Response;
+
         let (endpoint_id, channel_status_counter_id, new_endpoint) = endpoints
             .get_or_add(
                 channel,
@@ -588,9 +1286,26 @@ impl IpcSubscriptions {
                 .map_err(|_| AddSubscriptionError::Receiver)?;
         }
 
-        receiver
-            .add_subscription(endpoint_id, request.stream_id, params.session_id)
-            .map_err(|_| AddSubscriptionError::Receiver)?;
+        // `aeron_driver_conductor.c:5072-5092`: a response subscription is
+        // **not** registered with the receiver — the reference calls
+        // `incref_to_response_stream` where every other mode calls
+        // `add_network_subscription_to_receiver`. There is no session to read
+        // until a RSP_SETUP names one, and registering one would have the
+        // receiver eliciting a setup for a session the far end has not
+        // published yet.
+        //
+        // The reference's response refcount (`response_stream_id_to_refcnt_map`,
+        // `aeron_receive_channel_endpoint.c:746-779`) is what holds the
+        // endpoint open in the meantime; this build keeps no such count because
+        // it releases no endpoint when its last subscription leaves
+        // (`receive_endpoints.rs::detach_subscription` has no caller), and a
+        // count nothing consults is not a fact about the wire. It arrives with
+        // the endpoint lifecycle.
+        if !is_response_channel {
+            receiver
+                .add_subscription(endpoint_id, request.stream_id, params.session_id)
+                .map_err(|_| AddSubscriptionError::Receiver)?;
+        }
 
         endpoints.attach_subscription(endpoint_id);
 
@@ -603,8 +1318,11 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
+            endpoint_id: Some(endpoint_id),
+            spy_channel: None,
             subscribables: Vec::new(),
         };
 
@@ -615,9 +1333,11 @@ impl IpcSubscriptions {
 
         self.links.push(link);
 
-        // Then every image that already matches.
-        let matching = images.matching(request.stream_id, params.session_id);
+        // Then every image that already matches (`aeron_driver_conductor.c:5121-5143`,
+        // whose guard is the link's own endpoint as much as its stream and
+        // session).
         let index = self.links.len() - 1;
+        let matching = images.matching(&self.links[index]);
 
         for image_registration_id in matching {
             let _ = self.link_image(
@@ -768,14 +1488,14 @@ impl IpcSubscriptions {
         let mut linked = 0;
 
         for index in 0..self.links.len() {
-            let (stream_id, session_id) = {
-                let link = &self.links[index];
-                (link.stream_id, link.session_id)
-            };
+            // The same rule the create-time match uses
+            // ([`SubscriptionLink::matches_image`]), and the two have to agree:
+            // an image that links to a subscription here is the image it reads
+            // for as long as it exists.
+            let link = &self.links[index];
 
             let matches = images.find(image_registration_id).is_some_and(|image| {
-                image.stream_id == stream_id
-                    && (session_id.is_none() || session_id == Some(image.session_id))
+                link.matches_image(image.endpoint_id, image.stream_id, image.session_id)
             });
 
             if !matches {
@@ -843,24 +1563,37 @@ fn unlink_all(
     regions: &CounterRegions<'_>,
     publications: &mut IpcPublications,
     receiver: Option<&ReceiverProxy>,
+    sender: Option<&SenderProxy>,
     now_ms: i64,
 ) {
     for entry in &link.subscribables {
-        if entry.target.is_image() {
+        match entry.target {
             // An image's readers are removed by the receiver, which owns the
             // image; the counter goes back here either way, and the reader
             // waits at a position nothing feeds any more, which is what a
             // removal means.
-            if let Some(receiver) = receiver {
-                let _ =
-                    receiver.remove_subscriber(entry.target.registration_id(), entry.counter_id);
+            SubscriptionTarget::Image(registration_id) => {
+                if let Some(receiver) = receiver {
+                    let _ = receiver.remove_subscriber(registration_id, entry.counter_id);
+                }
             }
-        } else if let Some(publication) = publications
-            .publications_mut()
-            .iter_mut()
-            .find(|publication| publication.registration_id == entry.target.registration_id())
-        {
-            publication.remove_subscriber(entry.counter_id);
+            // A network publication's readers are the sender's, so the
+            // position comes out of its set before the counter goes back — a
+            // set that still held the id would read whatever took its place.
+            SubscriptionTarget::NetworkPublication(registration_id) => {
+                if let Some(sender) = sender {
+                    let _ = sender.remove_subscriber(registration_id, entry.counter_id);
+                }
+            }
+            SubscriptionTarget::IpcPublication(registration_id) => {
+                if let Some(publication) = publications
+                    .publications_mut()
+                    .iter_mut()
+                    .find(|publication| publication.registration_id == registration_id)
+                {
+                    publication.remove_subscriber(entry.counter_id);
+                }
+            }
         }
 
         counters.free(regions, entry.counter_id, now_ms);
@@ -900,60 +1633,211 @@ fn link_subscribable(
 ) -> Result<(), ()> {
     let joining_position = publication.join_position(counters, regions);
 
-    let Some(counter_id) = counter_position::allocate_subscription_position(
-        counters,
-        regions,
-        link.client_id,
-        link.registration_id,
+    let Some(counter_id) = allocate_reader_position(
+        link,
+        publication.registration_id,
         publication.session_id,
         publication.stream_id,
-        &link.channel,
         joining_position,
-        now.ms,
+        counters,
+        regions,
+        now,
     ) else {
         return Err(());
     };
 
-    let linked = counters
-        .set_reference_id(regions, counter_id, publication.registration_id)
-        .is_some()
-        && publication.add_subscriber(TetherablePosition {
+    if !publication.add_subscriber(TetherablePosition {
+        counter_id,
+        subscription_registration_id: link.registration_id,
+        time_of_last_update_ns: now.ns,
+        state: TetherState::Active,
+        is_tether: link.is_tether,
+        is_rejoin: link.is_rejoin,
+    }) {
+        counters.free(regions, counter_id, now.ms);
+        return Err(());
+    }
+
+    publish_reader(
+        link,
+        SubscriptionTarget::IpcPublication(publication.registration_id),
+        counter_id,
+        publication.session_id,
+        publication.stream_id,
+        joining_position,
+        publication.path_bytes().to_vec(),
+        counters,
+        regions,
+        events,
+    )
+}
+
+/// Give a **spy** subscription a reader position in a network publication
+/// (`aeron_driver_conductor_link_subscribable` called from the two spy scans,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921` and
+/// `:4201-4226`).
+///
+/// The same five steps as [`link_subscribable`], with one missing and one
+/// different:
+///
+/// * there is **no publication-side attach**. A spy's position does not join
+///   the network publication's subscribable set here: that half of a link
+///   belongs to the publication, and a network publication is the sender's.
+///   The spy's position becomes something the publication counts when the
+///   sender is told about it.
+/// * the join position is `snd-pos` rather than the producer's
+///   (`aeron_network_publication_join_position`,
+///   `aeron_network_publication.h:238-241`, which reads the sender's own
+///   position). A spy starts where the *stream* has got to, not where the
+///   producer has, which is why one that arrives late does not read the buffer
+///   from the beginning.
+///
+/// What the client is told is an ordinary image message whose source identity
+/// is the **IPC constant** and whose log file is the publication's own
+/// (`:4913-4914`): a spy reads a log buffer in this process, and the constant
+/// is how the reference says so.
+fn link_spy_publication(
+    link: &mut SubscriptionLink,
+    publication: &NetworkPublicationRecord,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    sender: &SenderProxy,
+    now: crate::ipc_publications::Now,
+    events: &mut impl ClientEvents,
+) -> Result<(), ()> {
+    let joining_position = counters
+        .value(regions, publication.counters.snd_pos)
+        .unwrap_or(0);
+
+    let Some(counter_id) = allocate_reader_position(
+        link,
+        publication.registration_id,
+        publication.session_id,
+        publication.stream_id,
+        joining_position,
+        counters,
+        regions,
+        now,
+    ) else {
+        return Err(());
+    };
+
+    publish_reader(
+        link,
+        SubscriptionTarget::NetworkPublication(publication.registration_id),
+        counter_id,
+        publication.session_id,
+        publication.stream_id,
+        joining_position,
+        publication.path_bytes().to_vec(),
+        counters,
+        regions,
+        events,
+    )?;
+
+    // And only now does the **publication** hear about it, which is the
+    // reader count this whole path exists for: from here the publication
+    // counts the spy, its limits are computed with it, and `ssc` can make it
+    // look connected. The counter is already seeded (in `publish_reader`),
+    // because the sender reads it the moment the position is in the set — the
+    // reference has the two in the other order only because one thread does
+    // both.
+    let _ = sender.add_subscriber(
+        publication.registration_id,
+        TetherablePosition {
             counter_id,
             subscription_registration_id: link.registration_id,
             time_of_last_update_ns: now.ns,
             state: TetherState::Active,
             is_tether: link.is_tether,
             is_rejoin: link.is_rejoin,
-        });
+        },
+    );
 
-    if !linked {
+    Ok(())
+}
+
+/// The first two steps of a link: the reader's counter, with the join position
+/// in its label, owned by the client and referenced by what it reads
+/// (`aeron_driver_conductor_link_subscribable`, `:3561-3578`).
+///
+/// # Errors
+///
+/// `None` when there is no counter left or the reference id will not take — in
+/// which case the counter has already been given back.
+#[allow(clippy::too_many_arguments)] // the four ids the counter is labelled with and the two views
+fn allocate_reader_position(
+    link: &SubscriptionLink,
+    reference_id: i64,
+    session_id: i32,
+    stream_id: i32,
+    joining_position: i64,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    now: crate::ipc_publications::Now,
+) -> Option<i32> {
+    let counter_id = counter_position::allocate_subscription_position(
+        counters,
+        regions,
+        link.client_id,
+        link.registration_id,
+        session_id,
+        stream_id,
+        &link.channel,
+        joining_position,
+        now.ms,
+    )?;
+
+    if counters
+        .set_reference_id(regions, counter_id, reference_id)
+        .is_none()
+    {
         counters.free(regions, counter_id, now.ms);
-        return Err(());
+        return None;
     }
 
-    link.subscribables.push(SubscriptionLinkEntry {
-        target: SubscriptionTarget::IpcPublication(publication.registration_id),
-        counter_id,
-    });
+    Some(counter_id)
+}
+
+/// The last three steps: the entry that makes the link a reader, the seed, and
+/// the message (`aeron_driver_conductor_link_subscribable`, `:3582-3605`).
+///
+/// # Errors
+///
+/// `Err(())` when the counter will not take the join position. The reader is
+/// attached by then, and undoing that would be worse than leaving it: the
+/// publication already counts it and the limit will hold the producer back to
+/// a position the client never read.
+#[allow(clippy::too_many_arguments)] // what the message carries and what it is made from
+fn publish_reader(
+    link: &mut SubscriptionLink,
+    target: SubscriptionTarget,
+    counter_id: i32,
+    session_id: i32,
+    stream_id: i32,
+    joining_position: i64,
+    log_file: Vec<u8>,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    events: &mut impl ClientEvents,
+) -> Result<(), ()> {
+    link.subscribables
+        .push(SubscriptionLinkEntry { target, counter_id });
 
     if counters
         .set_value(regions, counter_id, joining_position)
         .is_none()
     {
-        // The reader is attached and its counter cannot be seeded: undoing
-        // that here would be worse than leaving it, because the publication
-        // already counts it and the limit will hold the producer back to a
-        // position the client never read.
         return Err(());
     }
 
     events.available_image(&ImageBuffersReady {
-        correlation_id: publication.registration_id,
-        session_id: publication.session_id,
-        stream_id: publication.stream_id,
+        correlation_id: target.registration_id(),
+        session_id,
+        stream_id,
         subscriber_registration_id: link.registration_id,
         subscriber_position_id: counter_id,
-        log_file: publication.path_bytes(),
+        log_file: &log_file,
         source_identity: IPC_CHANNEL,
     });
 
@@ -992,6 +1876,7 @@ mod tests {
             max_resend: 0,
             entity_tag: -1,
             response_correlation_id: -1,
+            is_response: false,
             session_id: Some(session_id),
             linger_timeout_ns: 5_000_000_000,
             untethered_window_limit_timeout_ns: 5_000_000_000,
@@ -1040,10 +1925,109 @@ mod tests {
             is_tether: true,
             is_rejoin: false,
             is_response,
+            setup_status: SetupStatus::Pending,
             is_reliable: true,
             is_sparse: true,
+            endpoint_id: None,
+            spy_channel: None,
             subscribables: Vec::new(),
         }
+    }
+
+    /// A link that spies on `spy_uri`, with the channel as the client wrote it
+    /// — prefix and all, because that is what the counter label carries.
+    fn spy_link(stream_id: i32, session_id: Option<i32>, spy_uri: &str) -> SubscriptionLink {
+        let full = format!("aeron-spy:{spy_uri}");
+
+        SubscriptionLink {
+            channel: full.as_bytes().to_vec(),
+            spy_channel: Some(
+                crate::udp_channel::resolve_spy_channel(full.as_bytes()).expect("a spy channel"),
+            ),
+            ..link(stream_id, session_id, false)
+        }
+    }
+
+    /// The channel a publication's endpoint was created from.
+    fn publication_channel(uri: &str) -> UdpChannel {
+        let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+        UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
+    }
+
+    #[test]
+    fn a_spy_matches_the_channel_it_spells_the_same_way() {
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
+        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert!(spy.spy_matches(&channel, 1001, 100));
+
+        // Another stream is another publication, whatever the channel says.
+        assert!(!spy.spy_matches(&channel, 1002, 100));
+
+        // And a named session is looked for, not merely allowed: the wildcard
+        // is the link that named none (`:74-79`).
+        let named = spy_link(1001, Some(100), "aeron:udp?endpoint=127.0.0.1:40123");
+        assert!(named.spy_matches(&channel, 1001, 100));
+        assert!(!named.spy_matches(&channel, 1001, 101));
+    }
+
+    #[test]
+    fn a_spy_matches_a_channel_that_names_the_same_sides_and_other_parameters() {
+        // The reason the rule compares canonical forms rather than the strings
+        // clients wrote: the form is the two sides and nothing else, so a spy
+        // whose URI carries parameters the publisher's never mentioned is
+        // reading the same channel (`media/aeron_udp_channel.c:148-208`).
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123|mtu=1408");
+        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert!(spy.spy_matches(&channel, 1001, 100));
+
+        // What it does **not** do is see through two spellings of one address:
+        // a name and the address it resolves to are two channels here, and a
+        // spy that wrote the name reads nothing.
+        let by_name = spy_link(1001, None, "aeron:udp?endpoint=localhost:40123");
+        assert!(!by_name.spy_matches(&channel, 1001, 100));
+
+        // And a different endpoint is a different channel, and no session
+        // makes it the same one.
+        let elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:40124");
+        assert!(!spy.spy_matches(&elsewhere, 1001, 100));
+    }
+
+    #[test]
+    fn a_channel_tag_matches_a_spy_that_the_canonical_form_would_not() {
+        // `tags=` is the other way two channels are the same channel, and it is
+        // the one that reaches across different endpoints (`:96-98`).
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123|tags=17,3");
+        let tagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:49999|tags=17,1");
+        let untagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:49999");
+
+        assert!(spy.spy_matches(&tagged_elsewhere, 1001, 100));
+        assert!(
+            !spy.spy_matches(&untagged_elsewhere, 1001, 100),
+            "one tag is not a shared tag"
+        );
+
+        // And the stream is still necessary: a tag does not cross streams.
+        assert!(!spy.spy_matches(&tagged_elsewhere, 1002, 100));
+
+        // An untagged spy never matches by tag, whatever the publication says —
+        // `AERON_URI_INVALID_TAG` is the absence of a tag, not a value two
+        // channels can share (`:94-95`).
+        let untagged = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
+        assert!(!untagged.spy_matches(&tagged_elsewhere, 1001, 100));
+    }
+
+    #[test]
+    fn a_subscription_that_is_not_a_spy_matches_no_publication() {
+        let ipc = link(1001, None, false);
+
+        assert!(ipc.spy_channel.is_none());
+        assert!(!ipc.spy_matches(
+            &publication_channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            1001,
+            100
+        ));
     }
 
     #[test]
@@ -1081,6 +2065,47 @@ mod tests {
 
         let named = link(1001, Some(100), true);
         assert!(named.matches(&publication(100, 1001, false)));
+    }
+
+    #[test]
+    fn a_subscription_reads_an_image_on_its_own_endpoint_and_no_other() {
+        // `aeron_driver_conductor.c:87`: the endpoint is the first clause, and
+        // it is the one a reader would leave out. Two channels can name the
+        // same stream and be read on the same session, and an image is still
+        // only ever read through the endpoint that holds its socket.
+        let mut subscriber = link(1001, None, false);
+        subscriber.endpoint_id = Some(3);
+
+        assert!(subscriber.matches_image(3, 1001, 100));
+        assert!(
+            !subscriber.matches_image(4, 1001, 100),
+            "another endpoint: another socket, another session"
+        );
+
+        // An IPC subscription has no endpoint, and no image is ever its.
+        let ipc = link(1001, None, false);
+        assert!(ipc.endpoint_id.is_none());
+        assert!(!ipc.matches_image(3, 1001, 100));
+    }
+
+    #[test]
+    fn a_response_subscription_reads_no_image_until_a_session_is_named() {
+        // The same asymmetry as `matches`, and it is what makes the two agree:
+        // a response subscription that named no session is waiting for a
+        // RSP_SETUP, not looking for whatever appears
+        // (`aeron_driver_conductor.c:75-79`).
+        let mut response = link(1001, None, true);
+        response.endpoint_id = Some(3);
+
+        assert!(!response.matches_image(3, 1001, 100));
+
+        // Once the setup completes, the reference clears `is_response` and pins
+        // the session (`:7100-7105`), and the rule reads it like any other.
+        let mut completed = link(1001, Some(100), false);
+        completed.endpoint_id = Some(3);
+
+        assert!(completed.matches_image(3, 1001, 100));
+        assert!(!completed.matches_image(3, 1001, 101), "a named session");
     }
 
     #[test]

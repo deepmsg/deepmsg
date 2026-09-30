@@ -59,6 +59,21 @@ pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
 /// `aeron-driver/src/main/c/aeron_publication_image.h:35`).
 pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
 
+/// The value [`PublicationImage::response_session_id`] holds when this image
+/// owes nobody a response setup
+/// (`AERON_PUBLICATION_RESPONSE_NULL_RESPONSE_SESSION_ID`,
+/// `aeron-driver/src/main/c/aeron_publication_image.c:28`).
+///
+/// It is deliberately **not** a valid session id and deliberately not zero: a
+/// session id is an `i32`, and the sentinel is far outside that range, which is
+/// the whole of how "is there one?" is answered
+/// (`aeron_publication_image_check_and_get_response_session_id`, `:59-66`
+/// casts to `i32` and asks whether the cast was lossless).
+/// Written through `u64` because the reference writes the same bit pattern as
+/// `INT64_C(0xF000000000000000)`, which C makes negative — the value here is
+/// that same negative number, not the unsigned one.
+pub const RESPONSE_NULL_SESSION_ID: i64 = 0xF000_0000_0000_0000u64 as i64;
+
 /// The three outcomes of the untethered state machine. They live with the
 /// positions they are about ([`crate::subscribable::UntetheredEvent`]) because
 /// a publication's own readers reach them too, not just an image's.
@@ -94,6 +109,47 @@ pub struct ImageCounters {
 }
 
 /// An image: a stream rebuilt from datagrams.
+/// One place this image hears from
+/// (`aeron_publication_image_connection_t`, `aeron_publication_image.h:37-49`).
+///
+/// The reference keys these by **receive destination** and keeps the control
+/// address beside it (`:555-576`). This build has no receive destinations yet —
+/// they arrive with multi-destination channels — so a connection is found by
+/// the source its packets come from, which for the single implicit-unicast
+/// source of a P1-4 channel is the same thing.
+///
+/// Every field is here because the shape is what the multi-destination work
+/// needs; with one connection, `is_eos` and `eos_position` have exactly one
+/// entry to describe and the image's own `eos_position` is that entry's.
+#[derive(Clone, Copy, Debug)]
+pub struct Connection {
+    /// Where status messages and NAKs for this connection go (`control_addr`),
+    /// taken from the channel's control address or from the first packet that
+    /// arrived (`aeron_publication_image_connection_set_control_address`,
+    /// `:30-37`).
+    pub control_address: Option<SocketAddr>,
+    /// When anything was last seen on this connection
+    /// (`time_of_last_activity_ns`), which is what liveness is measured
+    /// against.
+    pub time_of_last_activity_ns: i64,
+    /// When a **frame** was last seen on it (`time_of_last_frame_ns`).
+    pub time_of_last_frame_ns: i64,
+    /// Whether this connection has said the stream is over.
+    ///
+    /// **Not yet written.** The reference sets this and the position beside it
+    /// in `aeron_publication_image_all_eos` (`:594-612`), which is called from
+    /// the packet path because it needs to know *which* connection ended.
+    /// [`PublicationImage::on_heartbeat`] is where the end of the stream is
+    /// seen here and it is not given the source, so with one connection the
+    /// image's own `eos_position` is what is used and these two describe a
+    /// shape that nothing fills yet. They are filled when multiple connections
+    /// make "which one ended" a question worth asking.
+    pub is_eos: bool,
+    /// Where the stream ended, as this connection said
+    /// (`connection->eos_position`) — not yet written, see [`Connection::is_eos`].
+    pub eos_position: i64,
+}
+
 pub struct PublicationImage {
     /// The conductor's registration id for this image, which is what
     /// `ON_AVAILABLE_IMAGE` names and what a public `AeronStat` shows.
@@ -123,10 +179,14 @@ pub struct PublicationImage {
     pub counters: ImageCounters,
     /// Who is reading, and how far (`subscribable`).
     pub subscribers: Subscribable,
-    /// Where status messages and NAKs go: the source of the packets this image
-    /// was built from, or the channel's control address when it named one
-    /// (`aeron_publication_image_connection_set_control_address`, `:30-37`).
-    pub control_address: Option<SocketAddr>,
+    /// Where this image hears from, one entry per source
+    /// (`connections`, `aeron_publication_image.h:76-84`).
+    ///
+    /// Status messages and NAKs go to **each** of these, not to one address
+    /// (`:901-925`), which is what lets an image with several receivers answer
+    /// all of them. With one source there is one entry, and the behaviour is
+    /// what it was.
+    pub connections: Vec<Connection>,
     /// When a packet was last seen, which is what decides draining.
     pub time_of_last_packet_ns: i64,
     /// Whether a subscription has ever been linked to this image.
@@ -201,6 +261,26 @@ pub struct PublicationImage {
     pub state: ImageState,
     /// When the state last changed, for the linger timeout.
     pub time_of_last_state_change_ns: i64,
+    /// The session this image owes a `RSP_SETUP` to, or
+    /// [`RESPONSE_NULL_SESSION_ID`] when it owes one to nobody.
+    ///
+    /// Written by the conductor, once a response publication has named this
+    /// image and linked to it (`aeron_driver_conductor.c:4227-4232`), and
+    /// cleared once the publication has heard from a live receiver of its own
+    /// (`aeron_driver_conductor_on_response_connected`, `:7117-7131`). Until
+    /// then the image says the session on every status-message period, because
+    /// the publisher cannot ask again and has nothing else to learn it from.
+    response_session_id: i64,
+    /// Whether the conductor has asked for the next status message to be sent
+    /// now rather than when it is due
+    /// (`aeron_publication_image_request_next_sm_deadline_reset`,
+    /// `aeron_publication_image.h:363-373`).
+    ///
+    /// A response setup rides the status-message timer — an image has no other
+    /// timer — so a conductor that has just set a session id would otherwise
+    /// wait out the remainder of the period before the frame the publisher is
+    /// blocked on goes anywhere.
+    is_next_sm_deadline_reset_requested: bool,
 }
 
 /// Where a stream starts, and the term geometry that says so, from the `SETUP`
@@ -250,6 +330,7 @@ impl PublicationImage {
         sm_timeout_ns: i64,
         page_size: usize,
         untethered: SubscriptionParams,
+        group_semantics: bool,
         now_ns: i64,
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
@@ -299,8 +380,18 @@ impl PublicationImage {
                     untethered_window_limit_timeout_ns: 0,
                     untethered_linger_timeout_ns: 0,
                     untethered_resting_timeout_ns: 0,
-                    group: 0,
-                    is_response: false,
+                    // The two the channel and the `SETUP` decide, rather than
+                    // the image: whether this stream is one of a group, and
+                    // whether this subscription exists to carry the answers to
+                    // a request (`aeron_publication_image.c:277-278`, which
+                    // reads `treat_as_multicast` and `params.is_response`).
+                    //
+                    // Both are read off the *channel*'s URI and the frame that
+                    // opened the stream — not off the subscription that happens
+                    // to be reading, which is why a second reader of the same
+                    // stream sees the same two bytes.
+                    group: u8::from(group_semantics),
+                    is_response: untethered.is_response,
                     rejoin: false,
                     reliable: true,
                     sparse: false,
@@ -328,7 +419,13 @@ impl PublicationImage {
             log,
             counters,
             subscribers: Subscribable::new(registration_id),
-            control_address: Some(control_address),
+            connections: vec![Connection {
+                control_address: Some(control_address),
+                time_of_last_activity_ns: now_ns,
+                time_of_last_frame_ns: now_ns,
+                is_eos: false,
+                eos_position: 0,
+            }],
             time_of_last_packet_ns: now_ns,
             has_been_linked: false,
             is_end_of_stream: false,
@@ -357,7 +454,40 @@ impl PublicationImage {
             untethered_resting_timeout_ns: untethered.untethered_resting_timeout_ns,
             state: ImageState::Active,
             time_of_last_state_change_ns: now_ns,
+            response_session_id: RESPONSE_NULL_SESSION_ID,
+            is_next_sm_deadline_reset_requested: false,
         }
+    }
+
+    /// Tell this image to say `response_session_id` to the publication that
+    /// asked for a response channel
+    /// (`aeron_publication_image_set_response_session_id`,
+    /// `aeron_publication_image.h:352-356`).
+    ///
+    /// The two together — the session and the request that the timer be brought
+    /// forward — are one act in the reference's caller
+    /// (`aeron_driver_conductor.c:4227-4232`), and they are one act here too:
+    /// an image told a session it will not say for another period has been told
+    /// nothing the publisher can use.
+    pub fn set_response_session_id(&mut self, response_session_id: i64) {
+        self.response_session_id = response_session_id;
+        self.is_next_sm_deadline_reset_requested = true;
+    }
+
+    /// Stop owing a response setup
+    /// (`aeron_publication_image_remove_response_session_id`, `:1389-1392`).
+    pub fn remove_response_session_id(&mut self) {
+        self.set_response_session_id(RESPONSE_NULL_SESSION_ID);
+    }
+
+    /// The session to say in a response setup, when there is one
+    /// (`aeron_publication_image_check_and_get_response_session_id`, `:59-66`).
+    ///
+    /// "There is one" is a question about the *range*: a session id is an
+    /// `i32`, so a value that does not survive the narrowing is the sentinel
+    /// rather than a session.
+    fn response_session_id_to_send(&self) -> Option<i32> {
+        i32::try_from(self.response_session_id).ok()
     }
 
     /// Give up the log buffer, for a caller that is about to unmap and unlink
@@ -608,13 +738,74 @@ impl PublicationImage {
         self.eos_position
     }
 
-    /// Remember where this connection answers
-    /// (`aeron_publication_image_track_connection`, `:555-600`): the source of
-    /// the packets, which is the implicit-unicast control address.
-    fn track_connection(&mut self, source: SocketAddr, now_ns: i64) {
-        if self.control_address.is_none() {
-            self.control_address = Some(source);
+    /// Remember that this source is still there
+    /// (`aeron_publication_image_track_connection`, `:557-592`).
+    ///
+    /// The reference finds the connection by **destination** and adds one if
+    /// the destination is new; here it is found by the source its packets come
+    /// from, and a source that is new gets a connection of its own. A
+    /// connection with no control address yet takes this source as one, which
+    /// is how an implicit-unicast image learns where to answer.
+    /// A destination this image now also hears from
+    /// (`aeron_publication_image_add_destination`, `:229-236`).
+    ///
+    /// When a client adds a destination to a subscription, every image already
+    /// running on that subscription's endpoint gets a connection for it
+    /// (`aeron_driver_receiver.c:483-486`) — so that the status messages and
+    /// NAKs about this stream go to the new source as well as to the ones that
+    /// were already there.
+    ///
+    /// An address the image already hears from is not added twice. One that is
+    /// [`None`] is a connection with no control address yet, which the first
+    /// packet to arrive on it will supply.
+    pub fn add_destination(&mut self, control_address: Option<SocketAddr>, now_ns: i64) {
+        if let Some(address) = control_address {
+            if self
+                .connections
+                .iter()
+                .any(|connection| connection.control_address == Some(address))
+            {
+                return;
+            }
         }
+
+        self.connections.push(Connection {
+            control_address,
+            time_of_last_activity_ns: now_ns,
+            time_of_last_frame_ns: now_ns,
+            is_eos: false,
+            eos_position: 0,
+        });
+    }
+
+    fn track_connection(&mut self, source: SocketAddr, now_ns: i64) {
+        let index = match self
+            .connections
+            .iter()
+            .position(|connection| connection.control_address == Some(source))
+        {
+            Some(index) => index,
+            None => {
+                self.connections.push(Connection {
+                    control_address: None,
+                    time_of_last_activity_ns: now_ns,
+                    time_of_last_frame_ns: now_ns,
+                    is_eos: false,
+                    eos_position: 0,
+                });
+
+                self.connections.len() - 1
+            }
+        };
+
+        let connection = &mut self.connections[index];
+
+        if connection.control_address.is_none() {
+            connection.control_address = Some(source);
+        }
+
+        connection.time_of_last_activity_ns = now_ns;
+        connection.time_of_last_frame_ns = now_ns;
 
         self.time_of_last_packet_ns = now_ns;
     }
@@ -780,6 +971,15 @@ impl PublicationImage {
         system: &System<'_>,
         now_ns: i64,
     ) -> std::io::Result<usize> {
+        // A requested reset is applied before the deadline is read, which is
+        // the whole of what makes it a request rather than a second timer
+        // (`:868-874`). The deadline goes to `now_ns - 1` and not to `now_ns`,
+        // because the test below is strict.
+        if self.is_next_sm_deadline_reset_requested {
+            self.is_next_sm_deadline_reset_requested = false;
+            self.next_sm_deadline_ns = now_ns - 1;
+        }
+
         let has_timed_out = self.next_sm_deadline_ns < now_ns;
 
         if self.invalidation_reason.is_some() {
@@ -790,12 +990,41 @@ impl PublicationImage {
             return Ok(0);
         }
 
-        let Some(control_address) = self.control_address else {
+        if self.connections.is_empty() {
             return Ok(0);
-        };
+        }
 
         if self.sm_change_number == self.last_sm_change_number && !has_timed_out {
             return Ok(0);
+        }
+
+        // The response setup goes first, and on the same timer as the status
+        // message (`:899-923`): it is the answer to a `SETUP` that asked for a
+        // response channel, and the publisher is waiting on it before it can
+        // complete the handshake, so it is not something to be deferred until
+        // the ordinary message is due.
+        //
+        // The connections it goes to are the ones an ordinary status message
+        // would go to, which here is every connection with somewhere to answer
+        // — this build never drops a connection, so it applies no liveness test
+        // to either loop (`aeron_publication_image_connection_is_alive` has no
+        // counterpart here yet).
+        if has_timed_out {
+            if let Some(response_session_id) = self.response_session_id_to_send() {
+                for connection in &self.connections {
+                    let Some(control_address) = connection.control_address else {
+                        continue;
+                    };
+
+                    endpoint.send_response_setup(
+                        0,
+                        control_address,
+                        self.stream_id,
+                        self.session_id,
+                        response_session_id,
+                    )?;
+                }
+            }
         }
 
         let term_id = Position::from_raw(self.next_sm_position)
@@ -809,15 +1038,28 @@ impl PublicationImage {
             0
         };
 
-        let sent = endpoint.send_sm(
-            control_address,
-            self.stream_id,
-            self.session_id,
-            term_id,
-            term_offset,
-            self.next_sm_receiver_window_length,
-            flags,
-        )?;
+        // One status message per connection that is still there
+        // (`aeron_publication_image_send_pending_status_message`, `:901-925`):
+        // each receiver is told the position and window it needs to hear, and
+        // a connection with nowhere to answer is skipped rather than guessed
+        // at.
+        let mut sent = 0usize;
+
+        for connection in &self.connections {
+            let Some(control_address) = connection.control_address else {
+                continue;
+            };
+
+            sent += endpoint.send_sm(
+                control_address,
+                self.stream_id,
+                self.session_id,
+                term_id,
+                term_offset,
+                self.next_sm_receiver_window_length,
+                flags,
+            )?;
+        }
 
         if sent > 0 {
             system.increment(system_counters::id::STATUS_MESSAGES_SENT);
@@ -1226,6 +1468,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with(false, false)
+        }
+
+        /// The same, with the two bytes the channel and the `SETUP` decide set
+        /// rather than absent (`aeron_publication_image.c:277-278`).
+        fn with(group_semantics: bool, is_response: bool) -> Self {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir =
@@ -1274,6 +1522,11 @@ mod tests {
             let channel = crate::udp_channel::UdpChannel::resolve(uri.as_bytes(), &parsed)
                 .expect("a channel");
 
+            let mut untethered = crate::publication_params::SubscriptionParams::defaults(
+                &crate::config::DriverConfig::default(),
+            );
+            untethered.is_response = is_response;
+
             let image = PublicationImage::create(
                 7,
                 1,
@@ -1290,9 +1543,8 @@ mod tests {
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 4096,
-                crate::publication_params::SubscriptionParams::defaults(
-                    &crate::config::DriverConfig::default(),
-                ),
+                untethered,
+                group_semantics,
                 0,
             );
 
@@ -1305,10 +1557,92 @@ mod tests {
         }
     }
 
+    /// The two metadata bytes that belong to the channel and the `SETUP`
+    /// rather than to the image: whether this stream is one of a group, and
+    /// whether this subscription exists to carry the answers to a request
+    /// (`aeron_publication_image.c:277-278`, which writes `treat_as_multicast`
+    /// and `params.is_response`).
+    ///
+    /// Read back off the file rather than off the image, because the file is
+    /// the contract: it is what a reader that maps the image sees, and the only
+    /// place a tool that reads bytes can learn either fact. The pair is the
+    /// judgement — one fixture that is neither, one that is both — so a
+    /// hardcoded answer satisfies neither half.
+    #[test]
+    fn an_image_says_whether_it_is_a_group_and_whether_it_answers_a_request() {
+        for (group_semantics, is_response) in [(false, false), (true, true)] {
+            let fixture = Fixture::with(group_semantics, is_response);
+            let bytes =
+                std::fs::read(fixture._dir.0.join("image.logbuffer")).expect("the log buffer");
+
+            // The metadata block sits at the **end** of a log buffer, not the
+            // front (`LogFile::create`: the length less the block), so the
+            // offsets below are relative to it.
+            let block =
+                &bytes[deepmsg_core::logbuffer::logfile::LogFile::log_length(TERM_LENGTH, 4096)
+                    .expect("a length")
+                    - descriptor::METADATA_LENGTH..];
+
+            // The anchor, so that a zero below cannot be "this is not the block
+            // the image wrote": the registration id the fixture passes is 7.
+            assert_eq!(
+                7,
+                i64::from_le_bytes(
+                    block[descriptor::CORRELATION_ID_OFFSET..descriptor::CORRELATION_ID_OFFSET + 8]
+                        .try_into()
+                        .expect("eight bytes")
+                ),
+                "the block being read has to be the one this image wrote"
+            );
+
+            assert_eq!(
+                u8::from(group_semantics),
+                block[descriptor::GROUP_OFFSET],
+                "group_semantics={group_semantics} has to reach the metadata"
+            );
+            assert_eq!(
+                u8::from(is_response),
+                block[descriptor::IS_RESPONSE_OFFSET],
+                "is_response={is_response} has to reach the metadata"
+            );
+        }
+    }
+
     /// A data packet carrying one frame, **padded to the aligned frame
     /// length** — which is what a sender puts on the wire and what
     /// `validate_packet` requires: the frames in a datagram are aligned, so a
     /// packet's length is always a multiple of the frame alignment.
+    /// A destination a client adds joins every image already running on that
+    /// endpoint (`aeron_driver_receiver.c:483-486`), so a stream that is already
+    /// up sends its status messages and NAKs to the new source as well.
+    ///
+    /// An address the image already hears from is not a second connection; one
+    /// with no address yet is a connection the first packet to arrive on it will
+    /// place.
+    #[test]
+    fn an_image_takes_a_destination_once() {
+        let mut fixture = Fixture::new();
+        let before = fixture.image.connections.len();
+        let address: SocketAddr = "127.0.0.1:40124".parse().expect("an address");
+
+        fixture.image.add_destination(Some(address), 1_000);
+        assert_eq!(before + 1, fixture.image.connections.len());
+
+        fixture.image.add_destination(Some(address), 2_000);
+        assert_eq!(
+            before + 1,
+            fixture.image.connections.len(),
+            "the same address is not a second connection"
+        );
+
+        fixture.image.add_destination(None, 3_000);
+        assert_eq!(
+            before + 2,
+            fixture.image.connections.len(),
+            "one with no address yet is still a connection"
+        );
+    }
+
     fn packet(term_id: i32, term_offset: i32, payload: &[u8]) -> Vec<u8> {
         let frame = crate::protocol::DataFrame {
             term_offset,

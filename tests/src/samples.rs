@@ -42,6 +42,26 @@ pub struct Sample {
 
 impl Sample {
     pub fn start(binary: &Path, name: &str, dir: &Path, args: &[&str]) -> Self {
+        Self::spawn(binary, name, dir, args, Stdio::inherit())
+    }
+
+    /// Start a sample with **nothing on stdin**.
+    ///
+    /// The reference's C++ samples ask `Execute again? (y/n)` when they finish
+    /// and read the answer (`aeron-client/src/main/cpp_wrapper/util/StringUtil.h:172-185`),
+    /// so a sample started with a terminal waits for a person and one started
+    /// with nothing reads EOF, answers "no" and exits — which is what a caller
+    /// that runs a sample to completion wants. A test run from a terminal is
+    /// the case that makes the difference visible.
+    ///
+    /// Not the default, because [`Sample::terminate`] is how several tests end
+    /// a *running* sample, and a sample that exits on its own as soon as its
+    /// first pass is over is not one those tests can ask anything of.
+    pub fn start_silent(binary: &Path, name: &str, dir: &Path, args: &[&str]) -> Self {
+        Self::spawn(binary, name, dir, args, Stdio::null())
+    }
+
+    fn spawn(binary: &Path, name: &str, dir: &Path, args: &[&str], stdin: Stdio) -> Self {
         let output = dir.with_extension(format!("{name}.out"));
         let log = std::fs::File::create(&output).expect("the sample's log file");
         let log_err = log.try_clone().expect("a second handle");
@@ -53,6 +73,7 @@ impl Sample {
             .arg("-p")
             .arg(dir)
             .args(args)
+            .stdin(stdin)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()

@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::protocol::{NakFrame, RttmFrame, StatusMessageFrame};
+use crate::protocol::{NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame};
 use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, system_counters};
 
@@ -81,11 +81,203 @@ impl std::fmt::Display for ReceiveEndpointError {
 impl std::error::Error for ReceiveEndpointError {}
 
 /// A receive channel endpoint and its socket.
-pub struct ReceiveChannelEndpoint {
-    /// The channel it was created for.
+impl ReceiveDestination {
+    /// A destination with a socket of its own
+    /// (`aeron_receive_destination_create`,
+    /// `media/aeron_receive_destination.c:30-139`).
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveEndpointError::Socket`] when the socket cannot be opened or
+    /// bound, [`ReceiveEndpointError::NoCounter`] when the manager has no room
+    /// for the counter that holds its address.
+    pub fn open(
+        channel: UdpChannel,
+        params: &TransportParams,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        registration_id: i64,
+        channel_status_counter_id: i32,
+        now_ms: i64,
+    ) -> Result<Self, ReceiveEndpointError> {
+        let transport = super::udp_transport::UdpTransport::open(channel.remote_data, None, params)
+            .map_err(ReceiveEndpointError::Socket)?;
+
+        Self::attach(
+            channel,
+            Box::new(transport),
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        )
+    }
+
+    /// The same around a transport a caller built — the tests' seam, and the
+    /// shape the conductor hands a destination over in.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveEndpointError::NoCounter`] when the manager has no room, or the
+    /// socket has no address to report.
+    fn attach(
+        channel: UdpChannel,
+        transport: Box<dyn Transport>,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        registration_id: i64,
+        channel_status_counter_id: i32,
+        now_ms: i64,
+    ) -> Result<Self, ReceiveEndpointError> {
+        let local_sockaddr_counter_id = destination_local_sockaddr_counter(
+            &*transport,
+            counters,
+            regions,
+            registration_id,
+            channel_status_counter_id,
+            now_ms,
+        )
+        .ok_or(ReceiveEndpointError::NoCounter)?;
+
+        let has_explicit_control = channel.has_explicit_control;
+
+        Ok(Self {
+            channel,
+            transport,
+            local_sockaddr_counter_id,
+            has_explicit_control,
+        })
+    }
+
+    /// The address this destination is actually bound to, as a counter a client
+    /// can find by the channel status it belongs to
+    /// (`rcv-local-sockaddr`, type 14).
+    pub const fn local_sockaddr_counter_id(&self) -> i32 {
+        self.local_sockaddr_counter_id
+    }
+
+    /// Whether the receiver has to ask this destination to describe its stream
+    /// (`has_explicit_control`).
+    pub const fn has_explicit_control(&self) -> bool {
+        self.has_explicit_control
+    }
+
+    /// Where the ask goes: the channel's own control address
+    /// (`udp_channel->local_control`,
+    /// `media/aeron_receive_channel_endpoint.c:1138-1139`).
+    ///
+    /// [`None`] for a destination that has nothing to ask.
+    pub fn setup_address(&self) -> Option<SocketAddr> {
+        self.has_explicit_control
+            .then_some(self.channel.local_control)
+    }
+
+    /// The channel this destination is for, which is what identifies it: the
+    /// reference compares two by `aeron_udp_channel_equals` when one is removed
+    /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+    pub const fn channel(&self) -> &UdpChannel {
+        &self.channel
+    }
+}
+
+/// Allocate the counter that says where a destination is **actually** bound
+/// (`aeron_receive_destination.c:88-105`).
+///
+/// The address comes from the kernel, not from the channel: a destination is
+/// allowed to name port zero — a multi-destination one does — and then this
+/// counter's key is the only place the port that was chosen can be read from.
+/// That is what `ReplayMerge` reads when it has to resolve a replay port
+/// (`LocalSocketAddressStatus.findAddress`).
+///
+/// The value is the endpoint's state, as the channel status's is: the counter
+/// being there is the news, and the reader reads the key.
+///
+/// # Errors
+///
+/// `None` when the socket has no address to report or the manager has no room.
+/// Nothing is left behind.
+fn destination_local_sockaddr_counter(
+    transport: &dyn Transport,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    registration_id: i64,
+    channel_status_counter_id: i32,
+    now_ms: i64,
+) -> Option<i32> {
+    let local_sockaddr =
+        crate::udp_channel::format_source_identity(transport.local_address().ok()?).ok()?;
+
+    let counter_id = counter_position::allocate_local_sockaddr_counter(
+        counters,
+        regions,
+        counter_position::RECEIVE_LOCAL_SOCKADDR_NAME,
+        registration_id,
+        channel_status_counter_id,
+        &local_sockaddr,
+        now_ms,
+    )?;
+
+    if counters
+        .set_value(
+            regions,
+            counter_id,
+            counter_position::channel_status::ACTIVE,
+        )
+        .is_none()
+    {
+        counters.free(regions, counter_id, now_ms);
+        return None;
+    }
+
+    Some(counter_id)
+}
+
+/// One place a receive endpoint reads from
+/// (`aeron_receive_destination_t`, `media/aeron_receive_destination.h:26-44`).
+///
+/// The reference gives every destination **its own socket** (`transport`,
+/// `:34`) and its own channel, and a receive endpoint holds a list of them. A
+/// unicast channel has exactly one — the endpoint it named — and a
+/// multi-destination channel starts with none and gains them as clients add
+/// them (`aeron_driver_conductor.c:2099-2114`).
+///
+/// The reference's entry also carries the control address it answers through,
+/// whether the channel named one, and when something was last heard from it.
+/// None of those are here yet: nothing in this build reads them, and a field
+/// nothing writes is not a fact about the wire. They arrive with the
+/// destinations that can differ from one another.
+pub struct ReceiveDestination {
+    /// The channel this destination is for.
     pub channel: UdpChannel,
     /// The socket it reads from and answers through.
     transport: Box<dyn Transport>,
+    /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
+    /// bound, which is not what the channel said when it named port zero.
+    local_sockaddr_counter_id: i32,
+    /// Whether the destination's channel named a `control=`
+    /// (`has_explicit_control`).
+    ///
+    /// This is what decides whether the receiver **opens the conversation**:
+    /// a destination with an explicit control address is one the sender does
+    /// not know about, so the receiver has to ask (`aeron_driver_receiver.c:475-486`,
+    /// which adds a periodic pending setup for exactly these and no others).
+    /// A destination the sender already knows — an implicit-unicast one — is
+    /// asked for nothing.
+    has_explicit_control: bool,
+}
+
+pub struct ReceiveChannelEndpoint {
+    /// The channel it was created for.
+    pub channel: UdpChannel,
+    /// Where this endpoint reads from, one entry per destination
+    /// (`destinations`, `aeron_receive_destination.h:26-44`).
+    ///
+    /// A unicast channel has one — the endpoint it named — and every path below
+    /// uses it. A multi-destination channel starts with none and gains them as
+    /// clients add them (`aeron_driver_conductor.c:2099-2114`), which is why the
+    /// callers handle the empty case rather than assuming a destination.
+    destinations: Vec<ReceiveDestination>,
     /// The `rcv-channel` counter, whose value is its state.
     channel_status_counter_id: i32,
     /// Which receiver this endpoint is, to a publisher that has several
@@ -102,6 +294,76 @@ pub struct ReceiveChannelEndpoint {
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
+}
+
+/// Write the address the endpoint is bound to into its channel-status label
+/// (`aeron_driver_conductor.c:2157-2165`, asking
+/// `aeron_receive_channel_endpoint_bind_addr_and_port`, `:316-329`).
+///
+/// The address is the **first destination's**, because the endpoint's socket is
+/// a destination's socket — that is what the reference's accessor answers with,
+/// and for a channel that starts with no destination it answers with nothing at
+/// all. The label is then written anyway, with an empty address, so it ends in
+/// a space: that is the reference's own output for the case, and matching it is
+/// the whole point of writing the label rather than leaving the one the counter
+/// was allocated with.
+///
+/// The socket is asked rather than the channel believed: a destination is
+/// allowed to name port zero, and the kernel's answer is the only true one —
+/// the same rule the send side's `publish_local_sockaddr` follows.
+///
+/// # Errors
+///
+/// [`ReceiveEndpointError::NoCounter`] when the label cannot be written, which
+/// is the counter having vanished from under the allocator.
+fn publish_bound_address(
+    channel_status_counter_id: i32,
+    channel: &[u8],
+    destinations: &[ReceiveDestination],
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+) -> Result<(), ReceiveEndpointError> {
+    let address = match destinations.first() {
+        Some(destination) => crate::udp_channel::format_source_identity(
+            destination
+                .transport
+                .local_address()
+                .map_err(ReceiveEndpointError::Socket)?,
+        )
+        .map_err(|error| ReceiveEndpointError::Socket(io::Error::other(error)))?,
+        None => String::new(),
+    };
+
+    // `"%s: %.*s %.*s"` — the name, the channel, the address
+    // (`aeron_position.c:229-244`), replacing the label the counter was
+    // allocated with. The channel is bytes rather than text, as it is there: it
+    // is whatever the client sent, and this end never decodes it.
+    let mut label = format!("{}: ", counter_position::RECEIVE_CHANNEL_STATUS_NAME).into_bytes();
+    label.extend_from_slice(channel);
+    label.push(b' ');
+    label.extend_from_slice(address.as_bytes());
+
+    counters
+        .update_label(regions, channel_status_counter_id, &label)
+        .ok_or(ReceiveEndpointError::NoCounter)?;
+
+    Ok(())
+}
+
+/// Release the counters a failed create had already allocated, so a refusal
+/// leaves nothing behind.
+fn release_counters(
+    destinations: &[ReceiveDestination],
+    channel_status_counter_id: i32,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    now_ms: i64,
+) {
+    for destination in destinations {
+        counters.free(regions, destination.local_sockaddr_counter_id, now_ms);
+    }
+
+    counters.free(regions, channel_status_counter_id, now_ms);
 }
 
 impl ReceiveChannelEndpoint {
@@ -136,20 +398,60 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
-        // The receive side binds the *endpoint* — where a subscription
-        // listens — and is never connected: it answers whoever writes to it.
-        let transport =
-            match super::udp_transport::UdpTransport::open(channel.remote_data, None, params) {
-                Ok(transport) => transport,
+        // The endpoint's first destination opens the socket, because the
+        // socket *is* a destination's: the receive side binds the endpoint —
+        // where a subscription listens — and is never connected, because it
+        // answers whoever writes to it (`aeron_receive_destination.c:30-139`).
+        //
+        // **Except on a manual channel, which starts with none at all.** The
+        // reference creates this one only `if (AERON_UDP_CHANNEL_CONTROL_MODE_MANUAL
+        // != channel->control_mode)` (`aeron_driver_conductor.c:2099-2114`): a
+        // manual channel's sources are the ones a client names with
+        // `ADD_RCV_DESTINATION`, and until one is named there is nowhere to
+        // listen. Every other channel is told where to listen by its own
+        // channel, so it starts with that one.
+        let destinations = if ControlMode::Manual == channel.control_mode {
+            Vec::new()
+        } else {
+            match ReceiveDestination::open(
+                channel.clone(),
+                params,
+                counters,
+                regions,
+                registration_id,
+                channel_status_counter_id,
+                now_ms,
+            ) {
+                Ok(destination) => vec![destination],
                 Err(error) => {
+                    // The counters were allocated for an endpoint that will not
+                    // exist.
                     counters.free(regions, channel_status_counter_id, now_ms);
-                    return Err(ReceiveEndpointError::Socket(error));
+                    return Err(error);
                 }
-            };
+            }
+        };
+
+        if let Err(error) = publish_bound_address(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &destinations,
+            counters,
+            regions,
+        ) {
+            release_counters(
+                &destinations,
+                channel_status_counter_id,
+                counters,
+                regions,
+                now_ms,
+            );
+            return Err(error);
+        }
 
         Ok(Self {
+            destinations,
             channel,
-            transport: Box::new(transport),
             channel_status_counter_id,
             receiver_id,
             dispatcher: DataPacketDispatcher::new(stream_session_limit),
@@ -188,9 +490,49 @@ impl ReceiveChannelEndpoint {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
+        // The same rule as [`Self::create`]: a manual channel starts with no
+        // destinations, and a transport a caller supplied for one is not
+        // attached to anything.
+        let destinations = if ControlMode::Manual == channel.control_mode {
+            Vec::new()
+        } else {
+            match ReceiveDestination::attach(
+                channel.clone(),
+                transport,
+                counters,
+                regions,
+                registration_id,
+                channel_status_counter_id,
+                now_ms,
+            ) {
+                Ok(destination) => vec![destination],
+                Err(error) => {
+                    counters.free(regions, channel_status_counter_id, now_ms);
+                    return Err(error);
+                }
+            }
+        };
+
+        if let Err(error) = publish_bound_address(
+            channel_status_counter_id,
+            &channel.original_uri,
+            &destinations,
+            counters,
+            regions,
+        ) {
+            release_counters(
+                &destinations,
+                channel_status_counter_id,
+                counters,
+                regions,
+                now_ms,
+            );
+            return Err(error);
+        }
+
         Ok(Self {
+            destinations,
             channel,
-            transport,
             channel_status_counter_id,
             receiver_id,
             dispatcher: DataPacketDispatcher::new(stream_session_limit),
@@ -352,12 +694,62 @@ impl ReceiveChannelEndpoint {
     /// # Errors
     ///
     /// The transport's error; an empty socket is `Ok(0)`.
-    pub fn receive(
+    pub fn receive_from(
         &mut self,
+        index: usize,
         buffers: &mut [Vec<u8>],
         datagrams: &mut crate::sys::socket::Datagrams,
     ) -> io::Result<usize> {
-        self.transport.receive(buffers, datagrams)
+        match self.destinations.get_mut(index) {
+            Some(destination) => destination.transport.receive(buffers, datagrams),
+            // A destination that is not there has nothing to read, which is a
+            // state rather than a failure — the reference polls each of them and
+            // polls none when there are none.
+            None => Ok(0),
+        }
+    }
+
+    /// Attach a destination a client added
+    /// (`aeron_receive_channel_endpoint_add_destination`).
+    ///
+    /// The destination arrives **built** — its socket open, the counter holding
+    /// its address allocated — because the conductor is what has a counter
+    /// manager (`aeron_driver_conductor.c:5903-5919`: it creates the destination
+    /// and hands it to the receiver, exactly as it hands over an endpoint).
+    /// This is the receiver's half: the endpoint holds it, and the next pass
+    /// reads from it.
+    pub fn add_destination(&mut self, destination: ReceiveDestination) {
+        self.destinations.push(destination);
+    }
+
+    /// Take a destination off, answering with it when there was one.
+    ///
+    /// A destination is identified by its channel, which is how the reference
+    /// compares two (`media/aeron_receive_channel_endpoint.c:877-905`). The
+    /// counters it holds are the caller's to give back, because the caller
+    /// allocated them.
+    pub fn remove_destination(&mut self, channel: &UdpChannel) -> Option<ReceiveDestination> {
+        let index = self
+            .destinations
+            .iter()
+            .position(|destination| destination.channel.canonical_form == channel.canonical_form)?;
+
+        Some(self.destinations.swap_remove(index))
+    }
+
+    /// The destinations, in the order they were added.
+    pub fn destinations(&self) -> &[ReceiveDestination] {
+        &self.destinations
+    }
+
+    /// How many places this endpoint reads from.
+    ///
+    /// A unicast channel has one; a multi-destination channel has as many as
+    /// clients have added. The receiver polls every one of them
+    /// (`aeron_driver_receiver_do_work`, `:130-260`, which polls the transport
+    /// poller — every transport in it).
+    pub fn destination_count(&self) -> usize {
+        self.destinations.len()
     }
 
     /// The address this endpoint's socket is bound to, which is the channel's
@@ -367,7 +759,13 @@ impl ReceiveChannelEndpoint {
     ///
     /// The error from `getsockname(2)`.
     pub fn local_address(&self) -> io::Result<SocketAddr> {
-        self.transport.local_address()
+        match self.destination() {
+            Some(destination) => destination.transport.local_address(),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "a channel with no destinations is bound to nothing",
+            )),
+        }
     }
 
     /// Where a status message about `source` should go
@@ -398,6 +796,41 @@ impl ReceiveChannelEndpoint {
         receiver_window: i32,
         flags: u8,
     ) -> io::Result<usize> {
+        self.send_sm_from(
+            0,
+            destination,
+            stream_id,
+            session_id,
+            consumption_term_id,
+            consumption_term_offset,
+            receiver_window,
+            flags,
+        )
+    }
+
+    /// The same, through the destination at `index`.
+    ///
+    /// A datagram arrives on **one** destination's socket, and an answer has to
+    /// leave through that one — a status message that went out of another
+    /// destination's socket would be a receiver reporting a position to a sender
+    /// that never asked it (`aeron_receive_channel_endpoint_send_sm`, which
+    /// takes the destination it is answering).
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    #[allow(clippy::too_many_arguments)] // the status message's fields
+    pub fn send_sm_from(
+        &mut self,
+        index: usize,
+        destination: SocketAddr,
+        stream_id: i32,
+        session_id: i32,
+        consumption_term_id: i32,
+        consumption_term_offset: i32,
+        receiver_window: i32,
+        flags: u8,
+    ) -> io::Result<usize> {
         let frame = StatusMessageFrame {
             session_id,
             stream_id,
@@ -412,7 +845,52 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destinations.get_mut(index) {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
+    }
+
+    /// Send a `RSP_SETUP`
+    /// (`aeron_receive_channel_endpoint_send_response_setup`, `:432-466`).
+    ///
+    /// This is the answer an image owes a publication whose `SETUP` carried
+    /// [`header_flags::SETUP_SEND_RESPONSE`](crate::protocol::header_flags::SETUP_SEND_RESPONSE):
+    /// the publisher asked for a response channel and cannot know the session
+    /// the answers will arrive on, because it is *this image's*. The frame
+    /// carries no correlation id — a registration id never crosses the wire —
+    /// so the session is the whole of what it says
+    /// (`aeron_udp_protocol.h:158-165`).
+    ///
+    /// It leaves through the destination the request arrived on, the same one a
+    /// status message would ([`Self::send_sm_from`]).
+    ///
+    /// # Errors
+    ///
+    /// The socket's error.
+    pub fn send_response_setup(
+        &mut self,
+        index: usize,
+        destination: SocketAddr,
+        stream_id: i32,
+        session_id: i32,
+        response_session_id: i32,
+    ) -> io::Result<usize> {
+        let frame = RspSetupFrame {
+            session_id,
+            stream_id,
+            response_session_id,
+        };
+
+        let mut buffer = [0u8; RspSetupFrame::LENGTH];
+        if frame.write(&mut buffer).is_none() {
+            return Ok(0);
+        }
+
+        match self.destinations.get_mut(index) {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
     }
 
     /// Send a NAK (`aeron_receive_channel_endpoint_send_nak`, `:340-375`).
@@ -442,7 +920,10 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destination_mut() {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
     }
 
     /// Send an RTTM (`aeron_receive_channel_endpoint_send_rttm`, `:377-430`).
@@ -473,7 +954,25 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        self.transport.send(Some(destination), &[&buffer])
+        match self.destination_mut() {
+            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            None => Ok(0),
+        }
+    }
+
+    /// The destination this endpoint reads from, or answers through.
+    ///
+    /// A unicast channel has exactly one, so every path here uses it. The
+    /// reference chooses by the destination a source belongs to, which needs the
+    /// per-destination control addresses that arrive with the multi-destination
+    /// work.
+    fn destination(&self) -> Option<&ReceiveDestination> {
+        self.destinations.first()
+    }
+
+    /// The same, mutably — reading is what needs it.
+    fn destination_mut(&mut self) -> Option<&mut ReceiveDestination> {
+        self.destinations.first_mut()
     }
 
     /// The state of one session, for the receiver's pending-setup sweep.
@@ -491,9 +990,67 @@ impl ReceiveChannelEndpoint {
     /// Ask the source of a packet for a `SETUP`
     /// (`elicit_setup_from_source`, `:616-659`) and answer whether the status
     /// message should be sent.
+    /// Give up on a session that never answered
+    /// (`aeron_receive_channel_endpoint_on_remove_pending_setup`, `RCE:1127-1177`
+    /// reaching the dispatcher): its interest is dropped, so the next frame
+    /// from it asks for a `SETUP` again.
+    ///
+    /// This is what a **non-periodic** pending setup does when it expires — the
+    /// one a data frame elicited. A periodic one, which a destination with a
+    /// control address creates, is asked again instead.
+    pub fn remove_pending_setup(&mut self, stream_id: i32, session_id: i32) {
+        self.dispatcher.remove_pending_setup(stream_id, session_id);
+    }
+
     pub fn elicit_setup(&mut self, stream_id: i32, session_id: i32) -> bool {
         self.dispatcher
             .elicit_setup_from_source(stream_id, session_id)
+    }
+
+    /// Ask **every** destination for the stream
+    /// (`aeron_receive_channel_endpoint_elicit_setup`,
+    /// `media/aeron_receive_channel_endpoint.c:259-289`).
+    ///
+    /// Unconditional, and that is the reference's shape: the endpoint-level ask
+    /// is not a decision, it is the whole act, and it goes to every destination
+    /// the endpoint has. What decides *whether* to ask is the caller's, and the
+    /// guard there is the channel's — a channel that named no control address
+    /// has nowhere to send it (`aeron_driver_receiver.c:418-426`).
+    ///
+    /// It is a separate method from [`Self::elicit_setup`] because that one
+    /// answers a different question: it is the *data*-driven path
+    /// (`aeron_data_packet_dispatcher_elicit_setup_from_source`, `:616-659`),
+    /// which is asked once per session and decides whether an ask is owed at
+    /// all. This one is the ask.
+    ///
+    /// Returns how many destinations it reached, which is what the reference's
+    /// `work_count` counts.
+    pub fn elicit_setup_to_destinations(&mut self, stream_id: i32, session_id: i32) -> usize {
+        let mut reached = 0;
+
+        for index in 0..self.destinations.len() {
+            let Some(address) = self.destinations[index].setup_address() else {
+                continue;
+            };
+
+            if self
+                .send_sm_from(
+                    index,
+                    address,
+                    stream_id,
+                    session_id,
+                    0,
+                    0,
+                    0,
+                    Self::send_setup_flag(),
+                )
+                .is_ok()
+            {
+                reached += 1;
+            }
+        }
+
+        reached
     }
 
     /// A status message's flags for the two cases this module sends.
@@ -523,5 +1080,222 @@ impl std::fmt::Debug for ReceiveChannelEndpoint {
             .field("streams", &self.dispatcher.stream_count())
             .field("subscriptions", &self.subscription_count())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    const VALUES_LENGTH: usize = 64 * 1024;
+
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
+
+    struct Fixture {
+        metadata: Region,
+        values: Region,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                metadata: Region(vec![0u8; VALUES_LENGTH * 4]),
+                values: Region(vec![0u8; VALUES_LENGTH]),
+            }
+        }
+
+        fn open(&mut self) -> (CounterManager, CounterRegions<'_>) {
+            let regions = CounterRegions::new(
+                AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned"),
+                AtomicBuffer::from_slice_mut(&mut self.values.0).expect("aligned"),
+            )
+            .expect("four-to-one");
+            let manager = CounterManager::new(VALUES_LENGTH, 1_000).expect("room");
+
+            (manager, regions)
+        }
+    }
+
+    /// A transport that is somewhere and moves nothing.
+    struct Stub(SocketAddr);
+
+    impl Transport for Stub {
+        fn send(&mut self, _address: Option<SocketAddr>, _buffers: &[&[u8]]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn receive(
+            &mut self,
+            _buffers: &mut [Vec<u8>],
+            _datagrams: &mut crate::sys::socket::Datagrams,
+        ) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn local_address(&self) -> io::Result<SocketAddr> {
+            Ok(self.0)
+        }
+
+        fn receive_buffer_size(&self) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn channel(uri: &str) -> UdpChannel {
+        let parsed = crate::channel_uri::ChannelUri::parse(uri.as_bytes()).expect("a URI");
+        UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
+    }
+
+    fn stub(port: u16) -> Box<dyn Transport> {
+        Box::new(Stub(SocketAddr::from(([127, 0, 0, 1], port))))
+    }
+
+    /// Every destination brings its own address counter, and two destinations
+    /// do not share one (`rcv-local-sockaddr`, type 14).
+    #[test]
+    fn a_destination_brings_its_own_socket_and_its_own_address_counter() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let first = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            stub(40123),
+            &mut counters,
+            &regions,
+            7,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        let second = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            stub(40124),
+            &mut counters,
+            &regions,
+            8,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert_ne!(
+            first.local_sockaddr_counter_id(),
+            second.local_sockaddr_counter_id()
+        );
+        assert_eq!(
+            0,
+            first.local_sockaddr_counter_id(),
+            "the first counter a fresh manager hands out"
+        );
+    }
+
+    /// Only a destination whose channel named a `control=` has anything to ask
+    /// (`aeron_driver_receiver.c:475-486`).
+    ///
+    /// This is the condition the receiver pushes a periodic pending setup on: a
+    /// sender that does not know the receiver exists will never describe its
+    /// stream, so the receiver has to say so — and keep saying so, which is what
+    /// makes the entry periodic. A destination the sender already knows is asked
+    /// for nothing.
+    #[test]
+    fn only_a_destination_with_a_control_address_has_something_to_ask() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let with_control = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            stub(40123),
+            &mut counters,
+            &regions,
+            7,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert!(
+            with_control.has_explicit_control(),
+            "the channel named a control address"
+        );
+        assert_eq!(
+            Some("127.0.0.1:40124".parse().expect("an address")),
+            with_control.setup_address(),
+            "and the ask goes to it"
+        );
+
+        let without = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            stub(40125),
+            &mut counters,
+            &regions,
+            8,
+            0,
+            1_000,
+        )
+        .expect("a destination");
+
+        assert!(!without.has_explicit_control());
+        assert_eq!(None, without.setup_address(), "nothing to ask");
+    }
+
+    /// An endpoint holds what it is given and reads from all of them: one on
+    /// creation, and as many more as clients add.
+    #[test]
+    fn an_endpoint_holds_the_destinations_it_is_given() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            stub(40123),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        assert_eq!(
+            0,
+            endpoint.destination_count(),
+            "a manual channel starts with none: its sources are the ones a client names"
+        );
+
+        let added = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            stub(40124),
+            &mut counters,
+            &regions,
+            8,
+            endpoint.channel_status_counter_id(),
+            1_000,
+        )
+        .expect("a destination");
+
+        endpoint.add_destination(added);
+        assert_eq!(1, endpoint.destination_count());
+
+        let removed = endpoint
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
+            .expect("the destination that was added");
+
+        assert_eq!(
+            channel("aeron:udp?endpoint=127.0.0.1:40124").canonical_form,
+            removed.channel().canonical_form,
+            "and it is the one that was added"
+        );
+        assert_eq!(0, endpoint.destination_count());
+        assert!(
+            endpoint
+                .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40999"))
+                .is_none(),
+            "a channel no destination has removes nothing"
+        );
     }
 }

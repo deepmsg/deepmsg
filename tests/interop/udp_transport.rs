@@ -979,6 +979,88 @@ fn two_of_our_clients_talk_over_udp_and_both_channels_report_active() {
     );
 }
 
+/// A second `ADD_PUBLICATION` on a channel that already has one is *the same*
+/// publication, and the answer it gets has to say where that publication's log
+/// buffer is.
+///
+/// The reference answers both of its paths with `publication->log_file_name`
+/// (`aeron_driver_conductor.c:4195-4196` is the shared one — the link path,
+/// reached by a second caller rather than by a new publication). Answering with
+/// nothing is not a smaller thing to say: `ON_PUBLICATION_READY`'s tail *is* the
+/// name, so a client given an empty one has no buffer to map and cannot offer
+/// at all — the sharing works and the caller it was done for cannot use it.
+///
+/// The delivery half is what makes the first half evidence. "It was answered"
+/// is satisfied by an answer naming any file at all, including one no
+/// publication is writing into, and the client maps whatever it is told: bytes
+/// offered through the publication the second call returned, arriving at a
+/// subscriber, are satisfied only by the buffer the two share.
+#[test]
+fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
+    let Some(mut own) = OwnDriver::start("udp-shared-publication") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    let port = free_udp_port(12);
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+
+    let mut subscriber = Client::connect(own.aeron_dir()).expect("connect the subscriber");
+    let subscription_id = subscriber
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP subscription");
+
+    let mut publisher = Client::connect(own.aeron_dir()).expect("connect the publisher");
+    let first = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the UDP publication");
+
+    // The same command on the same channel: one publication, two registration
+    // ids. This is the call that is answered with no file name at all unless
+    // the link path carries one.
+    let second = publisher
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a second caller on the same channel is given the publication that exists");
+
+    // Both callers name the *publication*, which is the id the reply carries
+    // (`aeron_client_conductor.c:464` builds the client's publication on
+    // `response->registration_id`, not on its own correlation id), so a shared
+    // publication is one object to both of them.
+    assert_eq!(
+        first, second,
+        "the second caller is given the publication that already exists"
+    );
+
+    let payload = b"offered through the second add";
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut received = Vec::new();
+
+    while Instant::now() < deadline && received.is_empty() {
+        publisher.poll();
+        subscriber.poll();
+
+        let _ = publisher.offer(second, payload);
+
+        received = drain_messages(
+            &mut subscriber,
+            subscription_id,
+            Duration::from_millis(50),
+            1,
+        );
+    }
+
+    let _ = own.stop();
+
+    assert_eq!(
+        vec![payload.to_vec()],
+        received,
+        "the second registration writes into the same log buffer as the first"
+    );
+}
+
 /// P1-4's untethered subscriptions, end to end: a reader that stops reading is
 /// put aside, and then either woken or closed.
 ///
@@ -1752,9 +1834,10 @@ fn reference_message_number(payload: &[u8]) -> Option<i64> {
 /// One unicast endpoint holds one binder, so "a subscriber that joins late" is
 /// reached the only way this channel shape allows: the driver holding the
 /// endpoint goes away, and a driver that has never seen this stream takes it.
-/// That is also the pair of shapes P1-5 exists for — an MDC receiver arriving
-/// after the stream started, and `ReplayMerge` crossing from replay to live —
-/// so the case met here is the same case, met earlier.
+/// That is also the shape a multi-destination receiver has to meet on a manual
+/// channel — arriving after the stream started — and the shape `ReplayMerge`
+/// meets when it crosses from replay to live, so the case met here is the same
+/// case, met earlier.
 #[test]
 fn a_late_subscriber_meets_a_reference_publisher_where_the_stream_is() {
     /// Enough messages to carry the stream past several of the smallest terms,

@@ -30,7 +30,7 @@ Every frame begins with eight bytes (`aeron_udp_protocol.h:27-34`):
 | 5 | `flags` | `u8` — bits whose meaning depends on the type. |
 | 6 | `type` | `i16` — see the table below. |
 
-## The five families this build speaks
+## The frames this build speaks
 
 | Frame | Type | Length | Fields after the header |
 |---|---|---|---|
@@ -40,8 +40,9 @@ Every frame begins with eight bytes (`aeron_udp_protocol.h:27-34`):
 | **ERR** | `0x04` | 40 + text | `session_id`, `stream_id`, `receiver_id` (`i64`), `group_tag` (`i64`), `error_code` `i32`, `error_length` `i32`, then `error_length` bytes of text |
 | **SETUP** | `0x05` | 40 | `term_offset`, `session_id`, `stream_id`, `initial_term_id`, `active_term_id`, `term_length`, `mtu`, `ttl` — all `i32` |
 | **RTTM** | `0x06` | 40 | `session_id`, `stream_id`, `echo_timestamp` (`i64`), `reception_delta` (`i64`), `receiver_id` (`i64`) |
+| **RSP_SETUP** | `0x0B` | 20 | `session_id`, `stream_id`, `response_session_id` — all `i32` |
 
-Three of these are worth a note each, because the obvious reading is wrong:
+Four of these are worth a note each, because the obvious reading is wrong:
 
 - **A heartbeat is a DATA frame whose `frame_length` is 0.** The packet is a
   whole data header (32 bytes) and the length says it carries nothing
@@ -52,9 +53,21 @@ Three of these are worth a note each, because the obvious reading is wrong:
   text starts at offset 40.
 - **RTTM's `reception_delta` is an `i64`** (`:114`) — an `i32` there would read
   any delta over two seconds as negative.
+- **RSP_SETUP carries no correlation id.** Its `session_id` and `stream_id` are
+  the *sender's own*, and they are how the far end finds the publication being
+  answered; the correlation id never crosses the wire, each side reads it out of
+  the publication it already holds (`aeron_send_channel_endpoint.c:738-748`).
+  The `response_session_id` is the session the far end's subscription should
+  adopt for the stream it is about to read
+  (`aeron_driver_conductor.c:7100-7105`). Its flags byte is always zero and no
+  bit of it is read (`aeron_receive_channel_endpoint.c:446`), so unlike the
+  others it has no `write_with_flags`; and like a NAK it is only ever a
+  datagram rather than a frame in a term, which is why its 20 bytes need not be
+  a multiple of 32.
 
-`RES` (`0x07`, name resolution) and `RSP_SETUP` (`0x0B`, response channels) are
-defined in the reference and not served here: P1-5 carries both.
+`RES` (`0x07`, name resolution) is defined in the reference and is **not** served
+here; RSP_SETUP (`0x0B`, response channels) now is, and
+`tests/interop/response_channel.rs` reads and writes it byte for byte.
 
 ## Flags
 
@@ -105,6 +118,41 @@ The sequence the interop tests exercise, in order:
    the loss detector's delay (`aeron_loss_detector.h:96-126`);
 6. a **zero-length DATA heartbeat** every 100 ms of silence, and an end-of-stream
    one when the stream ends.
+
+## What a response channel adds
+
+A response channel is two channels with one direction each: a
+`control-mode=response` subscription, and a publication that names that
+subscription's registration id as its `response-correlation-id=`. Its URI is
+normally `control=` with **no** `endpoint=` (the reference's own samples use
+`samples_configuration.h:34`), which is what keeps the two directions off each
+other's port: the receiving destination binds an ephemeral port and the sending
+endpoint binds `control`.
+
+No frame type is new beyond RSP_SETUP; what is new is the order, and it is
+short:
+
+1. a response **subscription** builds no image from the SETUP it receives. It is
+   registered with the receiver as a *response* stream rather than as interest
+   in one (`aeron_driver_conductor.c:5072-5092`), so a SETUP that lands on it is
+   answered the way traffic for a stream nobody reads is — with an SM carrying
+   `SEND_SETUP` — rather than turned into an image;
+2. a publication that carries `response-correlation-id=` says so in its SETUP
+   with the `SEND_RESPONSE` bit, and the image built from that SETUP records it
+   (`aeron_publication_image.h:346-349`). That record is what lets a **response
+   publication** be created against the image
+   (`aeron_driver_conductor.c:1787-1833`), and creating one is what gives the
+   image a session id to answer with: an **RSP_SETUP** back down the control
+   path;
+3. the RSP_SETUP stops as soon as a status message from that publication
+   arrives: the first live SM is what tells the image the pair is up
+   (`aeron_driver_conductor.c:7117-7131`);
+4. from then on DATA flows, and only to the address that SM came from
+   (`aeron_network_publication.h:243-274`).
+
+`tests/interop/response_channel.rs` walks the whole thing with hand-built
+frames, and `tests/interop/response_channel_reference.rs` runs the reference's
+own `response_client` and `response_server` against this driver.
 
 ## Where the golden tests live
 

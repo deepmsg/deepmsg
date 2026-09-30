@@ -10,12 +10,25 @@ publish = false
 [dependencies]
 deepmsg-core = { path = "../core" }
 deepmsg-client = { path = "../client" }
+# The instrument the latency numbers come out of, and the shape of them: both
+# are what this crate *is*, not a test-only convenience.
+hdrhistogram = "7.5.4"
 
-# Criterion and hdrhistogram land here with P0 (kept out until then so the
-# skeleton builds without network access).
+[dev-dependencies]
+criterion = "0.8.2"
+# Starting a driver, and starting the reference's own tools, is the same work
+# the interop suite already does — `tests/src/driver.rs` and `samples.rs` — and
+# a second copy of it here would drift from the one every other suite uses.
+deepmsg-tests = { path = "../../tests" }
 
 [[bench]]
 name = "micro"
+harness = false
+
+# The live harness parses its own arguments instead of criterion's: it starts a
+# driver, so it is not a `bench_function` and cannot be one.
+[[bench]]
+name = "latency"
 harness = false
 
 [lints]

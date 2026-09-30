@@ -52,6 +52,19 @@ path = "integration/client_round_trip.rs"
 
 # The wait a client owes a driver that is still creating its file — the window
 # that made a client started alongside a driver fail deterministically.
+# A UDP stream that crosses a term boundary, where the term's tail is a padding
+# frame sent as its header alone. Runs in CI: it needs our own driver, not the
+# reference's.
+[[test]]
+name = "udp_term_boundary"
+path = "integration/udp_term_boundary.rs"
+
+# A subscription that reads a local publication's log buffer without a socket.
+# Runs in CI: it needs our own driver, not the reference's.
+[[test]]
+name = "spy_subscription"
+path = "integration/spy_subscription.rs"
+
 [[test]]
 name = "connect_window"
 path = "integration/connect_window.rs"
@@ -132,6 +145,49 @@ required-features = ["interop"]
 [[test]]
 name = "udp_counters"
 path = "interop/udp_counters.rs"
+required-features = ["interop"]
+
+# The reference's own C client, compiled from `fixtures/destination_probe.c`,
+# asking this driver to add a destination — nothing shipped exercises that API.
+[[test]]
+name = "destination_probe"
+path = "interop/destination_probe.rs"
+required-features = ["interop"]
+
+# A padding frame that arrives as its own datagram: the reference's Ping and
+# Pong, on a 64 KiB term, stop at the boundary when the receiver drops it.
+[[test]]
+name = "udp_padding_frame"
+path = "interop/udp_padding_frame.rs"
+required-features = ["interop"]
+
+# The reference's own C client, compiled from `fixtures/spy_probe.c`, reading a
+# local publication through `aeron-spy:` — no shipped sample uses the scheme.
+[[test]]
+name = "spy_reference"
+path = "interop/spy_reference.rs"
+required-features = ["interop"]
+
+# A4 (receiving): a reference `BasicPublisher`, its messages read by our client
+# through a subscription whose only address is a receive destination.
+[[test]]
+name = "multi_destination"
+path = "interop/multi_destination.rs"
+required-features = ["interop"]
+
+# A7: a response subscription is served, and is not a reader — the same SETUP
+# forms an image at an ordinary subscription and none at a response one.
+[[test]]
+name = "response_channel"
+path = "interop/response_channel.rs"
+required-features = ["interop"]
+
+# A8: the reference's own `response_client` and `response_server`, run
+# against a driver this build wrote. The only arrangement in which the nine-step
+# handshake is decided by two programs that share no code with it.
+[[test]]
+name = "response_channel_reference"
+path = "interop/response_channel_reference.rs"
 required-features = ["interop"]
 
 [lints]
