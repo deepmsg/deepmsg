@@ -42,6 +42,13 @@ const LENGTH: usize = 1024;
 /// How long the whole exchange may take before the test is a failure.
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long a driver counter must hold still before it is read as a fact.
+///
+/// A counter is a moving value while the pass that owns it is running, and a
+/// read taken mid-flight is a *sample*, not an answer. This is how long
+/// [`await_settled_snd_pos`] waits.
+const SETTLE: Duration = Duration::from_millis(100);
+
 /// A UDP port to name in the channel.
 ///
 /// Derived from the process id, as the other UDP tests do, so that two tests
@@ -225,6 +232,38 @@ fn await_limits(cnc: &deepmsg_cnc::CncFile, expected: impl Fn(i64, i64) -> bool,
             "{what}: `pub-lmt` is {limit} and `snd-pos` is {sent}"
         );
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `snd-pos`, once it has stopped moving.
+///
+/// The producer's sent position is not readable at a moment: it climbs as the
+/// driver's send passes run, and it is still climbing when it first becomes
+/// non-zero — measured at 199776 against a resting 211392. Waiting for it to
+/// hold still is what turns a sample into an answer, and it is also what lets a
+/// caller compare it against something and mean it.
+fn await_settled_snd_pos(cnc: &deepmsg_cnc::CncFile) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sent = counter_value(cnc, "snd-pos").unwrap_or(0);
+    let mut unchanged_since = Instant::now();
+
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = counter_value(cnc, "snd-pos").unwrap_or(0);
+
+        if now != sent {
+            sent = now;
+            unchanged_since = Instant::now();
+        } else if sent > 0 && unchanged_since.elapsed() >= SETTLE {
+            return sent;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "`snd-pos` never settled: it reached {sent}. An `ssc` publication with only \
+             spies takes it up to them, so a value stuck at zero means the spies were \
+             never counted as receivers at all"
+        );
     }
 }
 
@@ -538,24 +577,28 @@ fn a_spy_counts_as_a_connection_when_the_setting_says_so() {
     // And `snd-pos` follows, which is the other half of the fiction: nothing
     // has left the machine, but the stream has got as far as its reader, and
     // the counter that says what was sent says so.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let sent = loop {
-        let sent = counter_value(&cnc, "snd-pos").unwrap_or(0);
+    //
+    // Compared against the reader's own position rather than against a number
+    // derived from the message count, and that is the whole of this test's
+    // history. `MESSAGES * LENGTH` is wrong twice over — a message occupies
+    // `ALIGN(HEADER_LENGTH + LENGTH, 8)` = 1056 bytes of the log, not its
+    // 1024-byte payload, and the 64 KiB term rotates three times on the way, so
+    // the resting position is `3 * 65536 + 14 * 1056` = 211392. Read that way
+    // the assertion also sampled a counter that was still climbing, so it
+    // passed only when the sample happened to land under the bound: it failed
+    // about one run in ten, and the value it was checking was right every time.
+    //
+    // The two halves are what the counters can actually be asked. `pub-lmt` is
+    // ahead — that is the fiction, and it is asserted above — and `snd-pos`
+    // comes up to the reader and stops there. Settling first is what lets the
+    // equality catch the other direction too, a producer that believed it had
+    // sent bytes nobody read; an equality *wait* would step straight over it.
+    let sent = await_settled_snd_pos(&cnc);
 
-        if sent > 0 {
-            break sent;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "`snd-pos` never moved: an `ssc` publication with only spies takes it up to them"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-
-    assert!(
-        sent <= MESSAGES * LENGTH as i64,
-        "`snd-pos` is where the readers are, and no further: {sent}"
+    assert_eq!(
+        counter_value(&cnc, "sub-pos"),
+        Some(sent),
+        "`snd-pos` is where the readers are, and no further"
     );
 
     let _ = own.stop();
