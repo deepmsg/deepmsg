@@ -97,7 +97,29 @@ impl LossDetector {
         }
     }
 
-    /// A detector with the delays a `nak-delay=` parameter named
+    /// A detector with the delays a channel named, or the driver's own.
+    ///
+    /// `nak-delay=` is the one thing a subscription can say about how its gaps
+    /// are asked for, and what it buys is exactly this: a **static** delay in
+    /// place of the adaptive one. The retry is the delay times the driver's
+    /// ratio (`aeron_publication_image_create_static_delay_generator_state`,
+    /// `aeron_publication_image.c:112-117`, which multiplies by
+    /// `context->nak_unicast_retry_delay_ratio`), and the multiplication
+    /// saturates rather than wrapping — a delay near `i64::MAX` is a nonsense a
+    /// client typed, not one that should become a *retry before the first
+    /// ask*.
+    pub fn for_channel(registration_id: i64, nak_delay_ns: Option<i64>) -> Self {
+        match nak_delay_ns {
+            Some(delay_ns) => Self::with_delays(
+                registration_id,
+                delay_ns,
+                delay_ns.saturating_mul(NAK_UNICAST_RETRY_RATIO),
+            ),
+            None => Self::new(registration_id),
+        }
+    }
+
+    /// A detector with the delays given outright
     /// (`aeron_publication_image_create_static_delay_generator_state`): the
     /// retry is the delay times the driver's ratio.
     pub const fn with_delays(registration_id: i64, delay_ns: i64, retry_ns: i64) -> Self {
@@ -112,6 +134,17 @@ impl LossDetector {
     }
 
     /// The hole being asked for, if any.
+    /// The two delays this detector asks at — the first ask, and the retry.
+    ///
+    /// Test-only, like [`crate::image`]'s `Fragment::new`: the pair is worth
+    /// reading only to check that a channel's own `nak-delay` reached the image,
+    /// which is the one step between a parameter being parsed and a parameter
+    /// doing anything.
+    #[cfg(test)]
+    pub(crate) const fn delays(&self) -> (i64, i64) {
+        (self.delay_ns, self.retry_ns)
+    }
+
     pub const fn active_gap(&self) -> Option<Gap> {
         self.active
     }
@@ -510,5 +543,34 @@ mod tests {
 
         assert_eq!(5_000, detector.delay_ns);
         assert_eq!(50_000, detector.retry_ns);
+    }
+
+    #[test]
+    fn a_channels_nak_delay_becomes_a_static_detector_at_the_ratio() {
+        // The parameter's whole effect, and the argument order that is easy to
+        // get backwards: the *first* delay is what the channel named, and the
+        // retry is that times the driver's ratio.
+        let named = LossDetector::for_channel(7, Some(5_000));
+
+        assert_eq!(5_000, named.delay_ns, "the delay the channel named");
+        assert_eq!(
+            5_000 * NAK_UNICAST_RETRY_RATIO,
+            named.retry_ns,
+            "and the retry is that times the ratio"
+        );
+
+        // A channel that named nothing keeps the driver's own.
+        let default = LossDetector::for_channel(7, None);
+        assert_eq!(NAK_UNICAST_DELAY_NS, default.delay_ns);
+        assert_eq!(
+            NAK_UNICAST_DELAY_NS * NAK_UNICAST_RETRY_RATIO,
+            default.retry_ns
+        );
+
+        // And a delay big enough to overflow the multiplication saturates
+        // instead: a retry *before* the first ask is not a thing.
+        let absurd = LossDetector::for_channel(7, Some(i64::MAX));
+        assert_eq!(i64::MAX, absurd.delay_ns);
+        assert_eq!(i64::MAX, absurd.retry_ns);
     }
 }

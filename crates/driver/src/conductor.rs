@@ -6084,6 +6084,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_channel_parameter_this_driver_cannot_serve_is_answered_rather_than_ignored() {
+        // G1-4's whole point, at the client's end: `cc=` and `nak-delay=` used
+        // to reach the parser's generic list and change nothing, so a client
+        // that named one got a subscription behaving like a different one.
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // A strategy this build does not carry: refused, by name, on the
+        // correlation id that asked — where the reference's supplier fails with
+        // no error set at all and the client is told nothing.
+        let port = {
+            use crate::sys::AddressFamily;
+            use crate::sys::socket::DatagramSocket;
+
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(
+                7,
+                11,
+                1001,
+                &format!("aeron:udp?endpoint=127.0.0.1:{port}|cc=cubic"),
+            ),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered rather than left waiting");
+
+        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
+        assert!(
+            String::from_utf8_lossy(&payload[16..]).contains("cc=cubic"),
+            "and told which parameter: {}",
+            String::from_utf8_lossy(&payload[16..])
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "no subscription was created"
+        );
+
+        // And the half that *is* served: a named `nak-delay` is read, and the
+        // subscription is created with it.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(
+                7,
+                12,
+                1001,
+                &format!("aeron:udp?endpoint=127.0.0.1:{port}|nak-delay=2ms"),
+            ),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "a channel this build can serve is served"
+        );
+    }
+
     /// `GET_NEXT_AVAILABLE_SESSION_ID`'s wire form: the correlated head and a
     /// stream id (`aeron_control_protocol.h:247-253`).
     fn next_session_id_payload(client_id: i64, correlation_id: i64, stream_id: i32) -> Vec<u8> {

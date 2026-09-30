@@ -453,7 +453,11 @@ impl PublicationImage {
             initial_window_length: window,
             max_receiver_window_length: window,
             liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS,
-            loss_detector: LossDetector::new(registration_id),
+            // The channel's own delays, when it named one. `nak-delay=` is the
+            // whole of what a subscription may say about how its gaps are asked
+            // for (`aeron_publication_image.c:100-118`), and until this line
+            // the parameter was parsed by nobody and changed nothing.
+            loss_detector: LossDetector::for_channel(registration_id, untethered.nak_delay_ns),
             untethered_window_limit_timeout_ns: untethered.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: untethered.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: untethered.untethered_resting_timeout_ns,
@@ -1524,6 +1528,17 @@ mod tests {
         /// The same, with the two bytes the channel and the `SETUP` decide set
         /// rather than absent (`aeron_publication_image.c:277-278`).
         fn with(group_semantics: bool, is_response: bool) -> Self {
+            Self::with_nak_delay(group_semantics, is_response, None)
+        }
+
+        /// The same, with the channel naming a `nak-delay` — the one parameter
+        /// a subscription can say about its own gap timer
+        /// (`aeron_publication_image.c:100-118`).
+        fn with_nak_delay(
+            group_semantics: bool,
+            is_response: bool,
+            nak_delay_ns: Option<i64>,
+        ) -> Self {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir =
@@ -1576,6 +1591,7 @@ mod tests {
                 &crate::config::DriverConfig::default(),
             );
             untethered.is_response = is_response;
+            untethered.nak_delay_ns = nak_delay_ns;
 
             let image = PublicationImage::create(
                 7,
@@ -1605,6 +1621,33 @@ mod tests {
                 holder,
             }
         }
+    }
+
+    #[test]
+    fn an_image_asks_for_gaps_at_the_delay_its_channel_named() {
+        // The step between the parameter being *read* and the parameter doing
+        // anything: a `nak-delay` that reaches the subscription and stops there
+        // changes no behaviour at all, which is exactly the state this slice
+        // exists to end. Everything up to here is tested elsewhere — the
+        // parser, and the detector's own arithmetic — and neither notices if
+        // this line is missing.
+        let named = Fixture::with_nak_delay(false, false, Some(2_000_000));
+        assert_eq!(
+            (2_000_000, 200_000_000),
+            named.image.loss_detector.delays(),
+            "the channel's delay, and its retry at the driver's ratio"
+        );
+
+        let silent = Fixture::with_nak_delay(false, false, None);
+        assert_eq!(
+            (
+                crate::loss_detector::NAK_UNICAST_DELAY_NS,
+                crate::loss_detector::NAK_UNICAST_DELAY_NS
+                    * crate::loss_detector::NAK_UNICAST_RETRY_RATIO
+            ),
+            silent.image.loss_detector.delays(),
+            "and a channel that named nothing keeps the driver's own"
+        );
     }
 
     /// The two metadata bytes that belong to the channel and the `SETUP`
