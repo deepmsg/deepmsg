@@ -54,14 +54,16 @@ use deepmsg_cnc::command::{
     ERROR_CODE_STORAGE_SPACE, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER,
     ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
     ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
-    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_PUBLICATION_ERROR_TYPE_ID,
-    ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID,
-    PublicationBuffersReady, PublicationError, REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError,
-    decode_add_counter, decode_add_publication, decode_add_subscription, decode_correlated,
-    decode_destination_by_id_command, decode_destination_command, decode_reject_image,
+    ON_ERROR_TYPE_ID, ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
+    ON_PUBLICATION_ERROR_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, ON_UNAVAILABLE_COUNTER_TYPE_ID,
+    ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady, PublicationError,
+    REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError, decode_add_counter, decode_add_publication,
+    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
+    decode_destination_command, decode_get_next_available_session_id, decode_reject_image,
     decode_remove_counter, decode_remove_publication, decode_remove_subscription,
-    encode_client_timeout, encode_counter_update, encode_error, encode_operation_succeeded,
-    encode_publication_error, encode_subscription_ready, encode_unavailable_image,
+    encode_client_timeout, encode_counter_update, encode_error, encode_next_available_session_id,
+    encode_operation_succeeded, encode_publication_error, encode_subscription_ready,
+    encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -2205,6 +2207,60 @@ impl Conductor {
                         }
                     }
                 },
+                // A client asking what session id to publish under.
+                //
+                // The driver's answer is a **hint**, and the only thing it
+                // guarantees is that no publication it holds already uses it on
+                // that stream — which is why the handler walks its own lists
+                // rather than trusting the cursor: the cursor is where it would
+                // look next, and a client may have published under an id it
+                // made up in the meantime.
+                Command::GetNextAvailableSessionId => {
+                    match decode_get_next_available_session_id(payload) {
+                        Some(request) => {
+                            let stream_id = request.stream_id;
+
+                            // `outer: while (true)` (`aeron_driver_conductor.c:6422-6450`).
+                            //
+                            // It terminates, and the argument is worth having
+                            // because the loop has no counter: every turn moves
+                            // the cursor one id on, so the turns ask for
+                            // *different* ids, and the only ones refused are
+                            // those a publication **on this stream** already
+                            // holds. There are finitely many of those and 2^32
+                            // ids, so an id nobody holds arrives within
+                            // `held + 1` turns.
+                            let next_session_id = loop {
+                                let candidate = publications.next_session_id();
+
+                                let taken = publications.publications().iter().any(
+                                    |publication| {
+                                        publication.stream_id == stream_id
+                                            && publication.session_id == candidate
+                                    },
+                                ) || network_publications.publications().iter().any(
+                                    |publication| {
+                                        publication.stream_id == stream_id
+                                            && publication.session_id == candidate
+                                    },
+                                );
+
+                                if !taken {
+                                    break candidate;
+                                }
+                            };
+
+                            transmit.send(
+                                ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+                                &encode_next_available_session_id(
+                                    request.correlated.correlation_id,
+                                    next_session_id,
+                                ),
+                            );
+                        }
+                        None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
+                    }
+                }
                 Command::AddDestination
                 | Command::RemoveDestination
                 | Command::RemoveDestinationById
@@ -3359,14 +3415,15 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x12` is
-        // GET_NEXT_AVAILABLE_SESSION_ID: still unimplemented, which is what a
-        // test wants from a stand-in — a command whose handling cannot start
-        // happening. (`0x07` was the stand-in until ADD_DESTINATION was
-        // implemented, and `0x10` until REJECT_IMAGE was, which is exactly the
-        // way a stand-in like this stops being one.)
-        send(&conductor, 0x12, b"first");
-        send(&conductor, 0x12, b"second");
+        // pass read without any byte arithmetic. `0x0F` is ADD_STATIC_COUNTER:
+        // still unimplemented, which is what a test wants from a stand-in — a
+        // command whose handling cannot start happening. (`0x07` was the
+        // stand-in until ADD_DESTINATION was implemented, `0x10` until
+        // REJECT_IMAGE was, and `0x12` until GET_NEXT_AVAILABLE_SESSION_ID —
+        // which is exactly the way a stand-in like this stops being one, and
+        // leaves this the last of the eighteen the protocol defines.)
+        send(&conductor, 0x0F, b"first");
+        send(&conductor, 0x0F, b"second");
 
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
@@ -3535,15 +3592,12 @@ mod tests {
     fn an_unimplemented_command_is_counted_and_named() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x12, &[0u8; 24]); // GET_NEXT_AVAILABLE_SESSION_ID
+        send(&conductor, 0x0F, &[0u8; 24]); // ADD_STATIC_COUNTER
         conductor.do_work();
 
         assert_eq!(1, conductor.unhandled_commands());
         assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(
-            Some(Command::GetNextAvailableSessionId),
-            conductor.last_unhandled()
-        );
+        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
         assert!(conductor.is_running(), "and nothing else happened");
     }
 
@@ -3656,7 +3710,7 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x12, b"channel");
+        send(&conductor, 0x0F, b"channel");
         conductor.do_work();
         assert_eq!(1, conductor.unhandled_commands());
 
@@ -5723,6 +5777,195 @@ mod tests {
         assert_eq!(
             Some(0),
             conductor.publications().publications()[0].end_of_stream_position()
+        );
+    }
+
+    /// `GET_NEXT_AVAILABLE_SESSION_ID`'s wire form: the correlated head and a
+    /// stream id (`aeron_control_protocol.h:247-253`).
+    fn next_session_id_payload(client_id: i64, correlation_id: i64, stream_id: i32) -> Vec<u8> {
+        let command = deepmsg_cnc::command::GetNextAvailableSessionId {
+            correlated: deepmsg_cnc::command::Correlated {
+                client_id,
+                correlation_id,
+            },
+            stream_id,
+        };
+
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        out
+    }
+
+    /// Ask for a session id and read the answer off the ring.
+    fn ask_for_a_session_id(
+        conductor: &mut Conductor,
+        cnc: &CncFile,
+        receiver: &mut ToClientsReceiver,
+        pending: &mut Vec<(i32, Vec<u8>)>,
+        stream_id: i32,
+    ) -> i32 {
+        send(
+            conductor,
+            deepmsg_cnc::command::GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+            &next_session_id_payload(7, 8, stream_id),
+        );
+
+        let payload = await_event(
+            conductor,
+            cnc,
+            receiver,
+            pending,
+            ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+        );
+
+        i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn the_session_id_answering_skips_one_a_publication_already_holds() {
+        let (_temp, mut conductor, cnc, mut receiver, mut pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // The cursor is a random id the driver drew at startup, so a clash is
+        // not something a test can wait for — it is something the test has to
+        // *make*. What makes it possible is that the URI may name its own
+        // session, so a publication can be put exactly where the cursor is.
+        let cursor = conductor.publications().session_ids().cursor();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1002, &format!("aeron:ipc?session-id={cursor}")),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(
+            cursor,
+            conductor
+                .publications()
+                .publications()
+                .iter()
+                .find(|publication| publication.registration_id == 43)
+                .expect("the publication that named its session")
+                .session_id
+        );
+
+        // Naming a session is not an allocation, so it must not have moved the
+        // cursor onto it (`aeron_driver_conductor.c:1071-1075`, whose advance is
+        // for speculated ids only) — otherwise the id below would be skipped by
+        // accident and this test would prove nothing.
+        assert_eq!(
+            cursor,
+            conductor.publications().session_ids().cursor(),
+            "a URI that named its own session did not move the cursor"
+        );
+
+        // The clash, and it has to be asked **first**: every ask moves the
+        // cursor, so an ask about anything else beforehand would leave this one
+        // testing nothing — which is what an earlier version of this test did.
+        send(
+            &conductor,
+            deepmsg_cnc::command::GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+            &next_session_id_payload(7, 8, 1002),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the driver answers");
+
+        assert_eq!(
+            8i64.to_le_bytes(),
+            payload[0..8],
+            "on its own correlation id"
+        );
+        assert_eq!(
+            cursor.wrapping_add(1),
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes")),
+            "the id the publication holds is skipped, not answered with"
+        );
+
+        // The cursor moved past what was handed out, so the next ask does not
+        // repeat the last answer — which is all the driver promises, and why
+        // the reference advances *before* it checks for a clash
+        // (`aeron_driver_conductor.c:6425-6426`).
+        assert_eq!(
+            cursor.wrapping_add(2),
+            conductor.publications().session_ids().cursor()
+        );
+
+        // And somebody else's stream holds nothing, so there the cursor's own
+        // id is free: a session id is only unique per stream.
+        assert_eq!(
+            cursor.wrapping_add(2),
+            ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 9999),
+            "another stream does not hold it"
+        );
+    }
+
+    #[test]
+    fn the_session_id_answering_skips_a_network_publication_too() {
+        // The reference walks **both** lists, IPC first and then network
+        // (`aeron_driver_conductor.c:6429-6444`), and the second walk is the one
+        // easy to leave out: a driver that only checked its IPC publications
+        // would hand a client a session id a network publication on that stream
+        // already holds — and the client would then be refused by the create's
+        // own clash check, having done exactly what it was told.
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let first = ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 1002);
+
+        let socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        let endpoint = socket.local_address().expect("an address");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(
+                7,
+                42,
+                1002,
+                &format!(
+                    "aeron:udp?endpoint={endpoint}|session-id={}",
+                    first.wrapping_add(1)
+                ),
+            ),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        let second = ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 1002);
+
+        assert_eq!(
+            first.wrapping_add(2),
+            second,
+            "the id the network publication holds is skipped as well"
         );
     }
 

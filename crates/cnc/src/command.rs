@@ -841,6 +841,23 @@ pub enum Response<'a> {
         /// The subscription's channel, raw bytes, not NUL-terminated.
         channel: &'a [u8],
     },
+    /// `GET_NEXT_AVAILABLE_SESSION_ID` was answered: this is the id to publish
+    /// under on that stream
+    /// (`aeron_driver_conductor_response_next_available_session_id`,
+    /// `aeron_driver_conductor.c:2526-2538`).
+    ///
+    /// The id is a *hint* and not a reservation: the driver moved its cursor
+    /// past it as it answered, so a client that asks twice gets two different
+    /// ids, and two clients asking at once get two different ids — but nothing
+    /// stops a client that asked for one from publishing under it later, or
+    /// from publishing under one it made up. What the driver guarantees is that
+    /// no publication **it already holds** has that session id on that stream.
+    NextAvailableSessionId {
+        /// Echoes the `correlation_id` of the request.
+        correlation_id: i64,
+        /// The id.
+        next_session_id: i32,
+    },
     /// A publication this client holds has failed — a receiver refused its
     /// image, or the publication was revoked.
     ///
@@ -1428,6 +1445,87 @@ pub fn encode_reject_image(
     out
 }
 
+/// `AERON_COMMAND_GET_NEXT_AVAILABLE_SESSION_ID`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:44`).
+pub const GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID: i32 = 0x12;
+
+/// `AERON_RESPONSE_ON_NEXT_AVAILABLE_SESSION_ID`
+/// (`aeron_control_protocol.h:58`).
+pub const ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID: i32 = 0x0F0D;
+
+/// The command's payload: the correlated head and a stream id
+/// (`aeron_get_next_available_session_id_command_t`, `aeron_control_protocol.h:247-253`).
+///
+/// Twenty bytes, and the Java client's flyweight says the same
+/// (`GetNextAvailableSessionIdMessageFlyweight.LENGTH`,
+/// `aeron-client/src/main/java/io/aeron/command/GetNextAvailableSessionIdMessageFlyweight.java:47`).
+pub const GET_NEXT_AVAILABLE_SESSION_ID_LENGTH: usize = CORRELATED_COMMAND_LENGTH + 4;
+
+/// The response's payload: the correlation id and the answer
+/// (`aeron_next_available_session_id_response_t`, `aeron_control_protocol.h:254-259`).
+///
+/// Twelve bytes under the header's `#pragma pack(4)`: an eight-byte id and a
+/// four-byte session id need no padding between them.
+pub const NEXT_AVAILABLE_SESSION_ID_LENGTH: usize = 8 + 4;
+
+/// `GET_NEXT_AVAILABLE_SESSION_ID`, both ways.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetNextAvailableSessionId {
+    /// Who is asking.
+    pub correlated: Correlated,
+    /// The stream an id is wanted for. A session id is only unique **per
+    /// stream**, so this is what the answer has to avoid colliding on.
+    pub stream_id: i32,
+}
+
+impl GetNextAvailableSessionId {
+    /// How many bytes this command occupies in a record payload.
+    pub const fn encoded_length(&self) -> usize {
+        GET_NEXT_AVAILABLE_SESSION_ID_LENGTH
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`Self::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != self.encoded_length() {
+            return false;
+        }
+
+        out[0..8].copy_from_slice(&self.correlated.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlated.correlation_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.stream_id.to_le_bytes());
+
+        true
+    }
+}
+
+/// Decode `GET_NEXT_AVAILABLE_SESSION_ID`.
+///
+/// No refusal beyond the record's own length: the stream id is used as it
+/// arrives, and a stream nothing publishes on is answered from the cursor like
+/// any other.
+pub fn decode_get_next_available_session_id(payload: &[u8]) -> Option<GetNextAvailableSessionId> {
+    let correlated = decode_correlated(payload)?;
+    let stream_id = le_i32(payload, CORRELATED_COMMAND_LENGTH)?;
+
+    Some(GetNextAvailableSessionId {
+        correlated,
+        stream_id,
+    })
+}
+
+/// Encode `ON_NEXT_AVAILABLE_SESSION_ID`.
+pub fn encode_next_available_session_id(
+    correlation_id: i64,
+    next_session_id: i32,
+) -> [u8; NEXT_AVAILABLE_SESSION_ID_LENGTH] {
+    let mut out = [0u8; NEXT_AVAILABLE_SESSION_ID_LENGTH];
+    out[0..8].copy_from_slice(&correlation_id.to_le_bytes());
+    out[8..12].copy_from_slice(&next_session_id.to_le_bytes());
+
+    out
+}
+
 /// `AERON_COMMAND_ADD_DESTINATION`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:32`).
 pub const ADD_DESTINATION_TYPE_ID: i32 = 0x07;
@@ -1714,6 +1812,13 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
             }
         }
         ON_PUBLICATION_ERROR_TYPE_ID => decode_publication_error(payload),
+        ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID => match (le_i64(payload, 0), le_i32(payload, 8)) {
+            (Some(correlation_id), Some(next_session_id)) => Response::NextAvailableSessionId {
+                correlation_id,
+                next_session_id,
+            },
+            _ => Response::Other { type_id },
+        },
         _ => Response::Other { type_id },
     }
 }
@@ -3072,6 +3177,78 @@ mod response_tests {
         };
 
         assert_eq!(vec![0u8; 4], message);
+    }
+
+    #[test]
+    fn a_session_id_request_is_twenty_bytes_and_round_trips() {
+        let command = GetNextAvailableSessionId {
+            correlated: Correlated {
+                client_id: 7,
+                correlation_id: 9,
+            },
+            stream_id: 1001,
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut payload));
+
+        assert_eq!(20, payload.len(), "the correlated head and a stream id");
+        assert_eq!(20, GET_NEXT_AVAILABLE_SESSION_ID_LENGTH);
+
+        let decoded = decode_get_next_available_session_id(&payload).expect("should decode");
+
+        assert_eq!(7, decoded.correlated.client_id);
+        assert_eq!(9, decoded.correlated.correlation_id);
+        assert_eq!(1001, decoded.stream_id);
+        assert_eq!(command, decoded);
+    }
+
+    #[test]
+    fn refuses_a_truncated_session_id_request() {
+        for length in [0, 16, GET_NEXT_AVAILABLE_SESSION_ID_LENGTH - 1] {
+            assert!(
+                decode_get_next_available_session_id(&vec![0u8; length]).is_none(),
+                "a {length}-byte payload is not a session id request"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_id_answer_is_twelve_bytes_of_id_and_stream() {
+        // `aeron_next_available_session_id_response_t`
+        // (`aeron_control_protocol.h:254-259`): an eight-byte correlation id and
+        // a four-byte session id, with no padding between them even inside the
+        // header's `pack(4)` — which is what makes this twelve and not sixteen.
+        let encoded = encode_next_available_session_id(9, -1234);
+
+        assert_eq!(12, encoded.len());
+        assert_eq!(12, NEXT_AVAILABLE_SESSION_ID_LENGTH);
+        assert_eq!(9i64.to_le_bytes(), encoded[0..8]);
+        assert_eq!((-1234i32).to_le_bytes(), encoded[8..12]);
+
+        let Response::NextAvailableSessionId {
+            correlation_id,
+            next_session_id,
+        } = decode_response(ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, &encoded)
+        else {
+            panic!("a session id answer");
+        };
+
+        assert_eq!(9, correlation_id);
+        assert_eq!(-1234, next_session_id);
+    }
+
+    #[test]
+    fn refuses_a_truncated_session_id_answer() {
+        for length in [0, 8, NEXT_AVAILABLE_SESSION_ID_LENGTH - 1] {
+            assert_eq!(
+                Response::Other {
+                    type_id: ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID
+                },
+                decode_response(ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, &vec![0u8; length]),
+                "a {length}-byte payload is not a session id answer"
+            );
+        }
     }
 
     #[test]

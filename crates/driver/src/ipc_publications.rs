@@ -419,6 +419,24 @@ impl IpcPublications {
         self.session_ids
     }
 
+    /// Hand out the next session id and move the cursor past it
+    /// (`aeron_driver_conductor_next_session_id` followed by
+    /// `aeron_driver_conductor_update_next_session_id`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1062-1075`).
+    ///
+    /// The two are one act here because a caller that read the cursor and
+    /// forgot to move it would hand the same id out twice — which is what the
+    /// reference's `GET_NEXT_AVAILABLE_SESSION_ID` handler is careful not to
+    /// do, and the reason it advances *before* it checks whether the id
+    /// collides. An id that collides is skipped by asking again, not by
+    /// rewinding.
+    pub fn next_session_id(&mut self) -> i32 {
+        let next = self.session_ids.cursor();
+        self.session_ids.advance(next);
+
+        next
+    }
+
     /// Serve an `ADD_PUBLICATION` or `ADD_EXCLUSIVE_PUBLICATION`.
     ///
     /// Nothing is sent from here unless the publication already exists: a new

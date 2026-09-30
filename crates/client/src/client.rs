@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID,
     ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication,
-    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand, REJECT_IMAGE_TYPE_ID,
+    AddSubscription, Correlated, DestinationByIdCommand, DestinationCommand,
+    GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID,
     REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
     encode_reject_image,
@@ -270,6 +271,8 @@ enum Ready {
     },
     /// A counter exists, and its slot in the values region is the handle.
     Counter { counter_id: i32 },
+    /// The driver answered what session id to publish under.
+    NextSessionId { next_session_id: i32 },
     /// The command's work is done, and there is nothing to hand back — a
     /// removal's acknowledgement.
     OperationSucceeded,
@@ -956,6 +959,66 @@ impl Client {
         Ok(correlation_id)
     }
 
+    /// Ask the driver what session id to publish under on `stream_id`, and
+    /// wait for the answer.
+    ///
+    /// The reference's clients block on this the same way
+    /// (`ClientConductor.nextSessionId`, `ClientConductor.java:501-527`, which
+    /// waits for the response before returning it), and so does this one.
+    ///
+    /// The id is a **hint**, not a reservation. The driver moves its cursor
+    /// past whatever it answers, so two callers — and two calls — get different
+    /// ids; but nothing reserves what it hands out, so an id can go unused for
+    /// ever and a client may publish under one it made up. What is guaranteed
+    /// is narrower and is the whole point: no publication the driver **already
+    /// holds** uses that session id on that stream, which is what makes the
+    /// answer worth asking for when a client is about to create one.
+    ///
+    /// A client can do that itself — the id space is 2^32 and a collision needs
+    /// the same stream — which is why the reference falls back to a random id
+    /// when the driver is too old to serve the command
+    /// (`ClientConductor.java:523-526`). Asking is how a *cluster* gets its
+    /// session ids to line up across nodes, and how a client avoids retrying a
+    /// create that clashed.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, or no answer arrived
+    /// within `timeout`.
+    pub fn next_session_id(
+        &mut self,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i32, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = GetNextAvailableSessionId {
+            correlated: Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            stream_id,
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(
+            GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let Ready::NextSessionId { next_session_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(next_session_id)
+    }
+
     /// Reject an image this client is reading, and wait for the driver to
     /// acknowledge the command.
     ///
@@ -1415,6 +1478,16 @@ impl Client {
                     error_code,
                     message: message.to_vec(),
                 });
+            }
+            // The answer to `GET_NEXT_AVAILABLE_SESSION_ID`, matched by its
+            // correlation id like any other reply. The driver broadcasts it to
+            // every client, so this client's own `next_session_id` call is the
+            // only thing that finds a pending entry for it.
+            Response::NextAvailableSessionId {
+                correlation_id,
+                next_session_id,
+            } => {
+                self.complete(correlation_id, Ok(Ready::NextSessionId { next_session_id }));
             }
             Response::Error {
                 offending_command_correlation_id,

@@ -91,6 +91,13 @@ path = "integration/driver_process_contract.rs"
 name = "reject_image"
 path = "integration/reject_image.rs"
 
+# GET_NEXT_AVAILABLE_SESSION_ID, end to end: the driver must not answer with a
+# session id a publication on that stream already holds. Needs our own driver
+# binary, so it runs in CI.
+[[test]]
+name = "next_session_id"
+path = "integration/next_session_id.rs"
+
 # Our client's REJECT_IMAGE against the reference driver: whether the record
 # this build writes is one the reference reads, and whether its
 # ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.
