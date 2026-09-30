@@ -349,8 +349,17 @@ pub enum Mode {
 pub enum Peer {
     /// This build's client.
     Ours,
-    /// The reference's own `Ping` and `Pong`.
+    /// The reference's own `Ping` and `Pong`, C++ samples over the C client.
     Reference,
+    /// The reference's `Ping` and `Pong` from its **Java** build.
+    ///
+    /// A different instrument, not a different build of the same one: the Java
+    /// samples take their settings from `aeron.sample.*` system properties
+    /// rather than a command line (`SampleConfiguration.java:28-45`), and the
+    /// client underneath them is the Java client. It is here as a reference
+    /// baseline of its own — the Java pair, on the Java driver — and not as a
+    /// combination with anything of ours.
+    ReferenceJava,
     /// Both, side by side in one table.
     Both,
 }
@@ -362,10 +371,16 @@ impl Peer {
         matches!(self, Self::Ours | Self::Both)
     }
 
-    /// Whether it runs the reference's.
+    /// Whether it runs the reference's C/C++ instrument.
     #[must_use]
     pub const fn measures_reference(self) -> bool {
         matches!(self, Self::Reference | Self::Both)
+    }
+
+    /// Whether it runs the reference's Java instrument.
+    #[must_use]
+    pub const fn measures_reference_java(self) -> bool {
+        matches!(self, Self::ReferenceJava)
     }
 }
 
@@ -374,8 +389,10 @@ impl Peer {
 pub enum WhichDriver {
     /// `deepmsg-driver`, this build's.
     Own,
-    /// The reference's `aeronmd`.
+    /// The reference's `aeronmd`, which is the C driver.
     Reference,
+    /// The reference's Java media driver (`io.aeron.driver.MediaDriver`).
+    ReferenceJava,
 }
 
 /// A whole run's arguments.
@@ -446,10 +463,14 @@ usage: cargo bench -p deepmsg-bench --bench latency -- [options]
   --warmup N              unmeasured round trips first (default: 2000)
   --mode ping-pong|throughput
                           a timed round trip, or a counted one-way stream
-  --peer ours|reference|both
+  --peer ours|reference|reference-java|both
                           who measures: this build's client, the reference's own
-                          Ping and Pong, or both in one table (default: ours)
-  --driver own|reference  which driver they run against (default: own)
+                          Ping and Pong (C++), its Java Ping and Pong, or ours
+                          and the C++ one in one table (default: ours)
+  --driver own|reference|reference-java
+                          which driver they run against (default: own).
+                          The Java peer and the Java driver go together: the
+                          only Java combination this harness runs.
   --driver-binary PATH    the driver to start (default: target/release/deepmsg-driver)
   --md                    print the rows as markdown, for docs/benchmarks.md
   --echo DIR --ping URI --pong URI --ping-stream N --pong-stream N
@@ -498,6 +519,7 @@ usage: cargo bench -p deepmsg-bench --bench latency -- [options]
                     measure.peer = match value()?.as_str() {
                         "ours" => Peer::Ours,
                         "reference" => Peer::Reference,
+                        "reference-java" => Peer::ReferenceJava,
                         "both" => Peer::Both,
                         other => return Err(format!("unknown peer {other:?}")),
                     };
@@ -506,6 +528,7 @@ usage: cargo bench -p deepmsg-bench --bench latency -- [options]
                     measure.driver = match value()?.as_str() {
                         "own" => WhichDriver::Own,
                         "reference" => WhichDriver::Reference,
+                        "reference-java" => WhichDriver::ReferenceJava,
                         other => return Err(format!("unknown driver {other:?}")),
                     };
                 }
@@ -576,6 +599,21 @@ usage: cargo bench -p deepmsg-bench --bench latency -- [options]
 
         if measure.messages == 0 {
             return Err("--messages 0 would measure nothing".to_owned());
+        }
+
+        let java_pair = (
+            measure.peer.measures_reference_java(),
+            measure.driver == WhichDriver::ReferenceJava,
+        );
+
+        if java_pair.0 != java_pair.1 {
+            return Err(
+                "--peer reference-java and --driver reference-java go together: the Java pair is \
+                 the one Java combination this harness runs. A Java client against this build's \
+                 driver is a compatibility question no test here has answered, and against the C \
+                 driver it is a different experiment."
+                    .to_owned(),
+            );
         }
 
         Ok(Self::Measure(measure))

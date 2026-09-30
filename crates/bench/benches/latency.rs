@@ -154,6 +154,7 @@ fn run(args: &Args, driver: &mut Driver) -> Result<(), String> {
     for (index, pairing) in pairings(args).into_iter().enumerate() {
         let first = args.peer.measures_ours();
         let second = args.peer.measures_reference();
+        let third = args.peer.measures_reference_java();
 
         // Each row gets its own ports, so a row that is still tearing down
         // cannot collide with the next one's bind.
@@ -180,6 +181,22 @@ fn run(args: &Args, driver: &mut Driver) -> Result<(), String> {
             let scenario = pairing.at(index * 2 + 1);
             rows.push(
                 reference(args, &scenario, driver)
+                    .map_err(|error| format!("{}: {error}", scenario.label()))?,
+            );
+        }
+
+        if third {
+            if args.mode != Mode::PingPong {
+                return Err(
+                    "the reference's Java instrument measures round trips only: --mode \
+                     throughput has no Java row"
+                        .to_owned(),
+                );
+            }
+
+            let scenario = pairing.at(index * 2 + 1);
+            rows.push(
+                reference_java(args, &scenario, driver)
                     .map_err(|error| format!("{}: {error}", scenario.label()))?,
             );
         }
@@ -374,6 +391,321 @@ fn reference(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result<Row,
         channel: pairing.channel,
         length: pairing.length,
         summary: summary_from_hdr_table(&output)?,
+    })
+}
+
+/// The reference's Java pair: its `Ping` and `Pong` samples against its Java
+/// media driver.
+///
+/// A different *instrument*, not a different build of the same one. The samples
+/// read their settings from `aeron.sample.*` **system properties** rather than
+/// from a command line (`SampleConfiguration.java:28-45`), and the driver is
+/// started by class name — so both ends go through a generated script, which is
+/// also what keeps the arguments that pair them written once.
+///
+/// `aeron.sample.exclusive.publications` is set to `true` deliberately: the
+/// C++ `Ping` this table also holds publishes through an exclusive publication,
+/// and the Java sample's own default is a plain one. Setting it leaves the
+/// languages as the only difference between those two rows.
+fn reference_java(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result<Row, String> {
+    driver.await_cnc()?;
+
+    let scripts = JavaScripts::write(pairing, args, driver.aeron_dir(), &java_classpath()?)?;
+
+    let mut echo = scripts.start_pong()?;
+    let mut measure = scripts.start_ping()?;
+
+    let exited = measure.await_exit(PEER_TIMEOUT);
+
+    // Both are stopped whatever happened: a `Ping` that hung still leaves a
+    // `Pong` holding a port, and the next row needs one.
+    let output = measure.output();
+    echo.stop();
+
+    if exited.is_none() {
+        return Err(format!(
+            "the reference's Java Ping did not finish within {PEER_TIMEOUT:?}:\n{output}"
+        ));
+    }
+
+    Ok(Row::Latency {
+        client: "reference Ping/Pong (Java)",
+        driver: driver.name(),
+        channel: pairing.channel,
+        length: pairing.length,
+        summary: summary_from_hdr_table(&output)?,
+    })
+}
+
+/// The scripts the Java pair is launched through, and their output files.
+struct JavaScripts {
+    ping: PathBuf,
+    ping_output: PathBuf,
+    pong: PathBuf,
+    pong_output: PathBuf,
+}
+
+impl JavaScripts {
+    /// Write a wrapper per end into the temporary directory.
+    ///
+    /// Not into the aeron directory: that one is created by the driver's spawn,
+    /// and these have to exist before it does.
+    fn write(
+        pairing: &Pairing,
+        args: &Args,
+        aeron_dir: &Path,
+        classpath: &str,
+    ) -> Result<Self, String> {
+        let base = std::env::temp_dir().join(format!(
+            "deepmsg-bench-java-{}-{}-{}",
+            std::process::id(),
+            pairing.channel.name().replace(':', "-"),
+            pairing.length
+        ));
+
+        let stdin = base.with_extension("stdin");
+        std::fs::write(&stdin, "n\n").map_err(|error| error.to_string())?;
+
+        let ping = base.with_extension("ping.sh");
+        let pong = base.with_extension("pong.sh");
+
+        script(
+            &ping,
+            &format!(
+                "exec java {JVM_OPENS} -cp {classpath} {{properties}} io.aeron.samples.Ping < {}",
+                stdin.display()
+            ),
+            pairing,
+            args,
+            aeron_dir,
+        )?;
+        script(
+            &pong,
+            &format!("exec java {JVM_OPENS} -cp {classpath} {{properties}} io.aeron.samples.Pong"),
+            pairing,
+            args,
+            aeron_dir,
+        )?;
+
+        Ok(Self {
+            ping_output: base.with_extension("ping.out"),
+            pong_output: base.with_extension("pong.out"),
+            ping,
+            pong,
+        })
+    }
+
+    /// Start the echoing end, wait for the measuring one, read its table.
+    fn start_ping(&self) -> Result<JavaSample, String> {
+        spawn_script(&self.ping, &self.ping_output)
+    }
+
+    fn start_pong(&self) -> Result<JavaSample, String> {
+        spawn_script(&self.pong, &self.pong_output)
+    }
+}
+
+/// Write one wrapper script.
+fn script(
+    path: &Path,
+    body: &str,
+    pairing: &Pairing,
+    args: &Args,
+    aeron_dir: &Path,
+) -> Result<(), String> {
+    // Every setting the samples would otherwise take from their own defaults —
+    // ten million messages, ten thousand warm-up iterations — is written down,
+    // so a row means what the command line says it means.
+    let properties = format!(
+        "-Daeron.dir={} -Daeron.sample.embeddedMediaDriver=false \
+         -Daeron.sample.exclusive.publications=true \
+         -Daeron.sample.ping.channel='{}' -Daeron.sample.pong.channel='{}' \
+         -Daeron.sample.ping.streamId={} -Daeron.sample.pong.streamId={} \
+         -Daeron.sample.messageLength={} -Daeron.sample.messages={} \
+         -Daeron.sample.warmup.messages={} -Daeron.sample.warmup.iterations=1",
+        aeron_dir.display(),
+        pairing.ping_uri,
+        pairing.pong_uri,
+        pairing.ping_stream_id,
+        pairing.pong_stream_id,
+        pairing.length,
+        args.messages,
+        pairing.warmup,
+    );
+
+    let text = format!("#!/bin/sh\n{body}\n").replace("{properties}", &properties);
+    std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()))?;
+
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(path, permissions).map_err(|error| error.to_string())
+}
+
+/// The script the Java media driver is started through.
+///
+/// The property arguments go **before** the class name: a JVM takes `-D` before
+/// its main class, and the driver's spawner hands them to whatever it starts as
+/// plain arguments.
+fn java_driver_script(classpath: &str) -> Result<PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "deepmsg-bench-java-driver-{}.sh",
+        std::process::id()
+    ));
+    let text = format!(
+        "#!/bin/sh\nexec java {JVM_OPENS} -cp {classpath} \"$@\" io.aeron.driver.MediaDriver\n"
+    );
+
+    std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
+
+    let mut permissions = std::fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&path, permissions).map_err(|error| error.to_string())?;
+
+    Ok(path)
+}
+
+/// The module opens every Aeron Java program needs on a modern JDK.
+///
+/// `agrona` reads a `ByteBuffer`'s address through `jdk.internal.misc.Unsafe`,
+/// which a JDK has not opened to unnamed modules since 17 — the reference's own
+/// Gradle build passes exactly these to every task it runs
+/// (`build.gradle:225-226`), so a run without them is a run in a configuration
+/// the reference does not use either.
+const JVM_OPENS: &str = "--add-opens java.base/jdk.internal.misc=ALL-UNNAMED \
+                         --add-opens java.base/java.util.zip=ALL-UNNAMED";
+
+/// The classpath the reference's Java build needs.
+///
+/// Three jars from the checkout's own build output, and two from the Gradle
+/// cache the build resolved them from: `agrona`, which every Aeron Java program
+/// uses, and `HdrHistogram`, which is what the samples' percentile table comes
+/// from.
+fn java_classpath() -> Result<String, String> {
+    let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../aeron");
+    let mut jars = Vec::new();
+
+    for name in ["aeron-client", "aeron-driver", "aeron-samples"] {
+        jars.push(newest_jar(
+            &reference.join(name).join("build").join("libs"),
+            name,
+        )?);
+    }
+
+    jars.push(cached_jar("org.agrona", "agrona")?);
+    jars.push(cached_jar("org.hdrhistogram", "HdrHistogram")?);
+
+    Ok(jars
+        .iter()
+        .map(|jar| jar.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":"))
+}
+
+/// The one jar in a directory, or a message naming what was looked for.
+fn newest_jar(directory: &Path, name: &str) -> Result<PathBuf, String> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "jar")
+                && !path.to_string_lossy().contains("-sources")
+                && !path.to_string_lossy().contains("-javadoc")
+        })
+        .collect();
+    found.sort();
+
+    found
+        .pop()
+        .ok_or_else(|| format!("no {name} jar in {}", directory.display()))
+}
+
+/// A jar the reference's Java build resolved from its Gradle cache.
+///
+/// The path is `…/modules-2/files-2.1/<group>/<artifact>/<version>/<hash>/…`,
+/// so the two levels under the artifact are walked rather than guessed at.
+fn cached_jar(group: &str, artifact: &str) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
+    let artifact_dir = PathBuf::from(home)
+        .join(".gradle/caches/modules-2/files-2.1")
+        .join(group)
+        .join(artifact);
+
+    let versions = std::fs::read_dir(&artifact_dir)
+        .map_err(|error| format!("{}: {error}", artifact_dir.display()))?;
+
+    for version in versions.filter_map(Result::ok) {
+        let hashes = std::fs::read_dir(version.path()).map_err(|error| error.to_string())?;
+
+        for hash in hashes.filter_map(Result::ok) {
+            if let Ok(jar) = newest_jar(&hash.path(), artifact) {
+                return Ok(jar);
+            }
+        }
+    }
+
+    Err(format!(
+        "no {artifact} jar under {} — the reference's Java build resolves it there",
+        artifact_dir.display()
+    ))
+}
+
+/// A child process of a script, with its output in a file.
+struct JavaSample {
+    child: std::process::Child,
+    output: PathBuf,
+}
+
+impl JavaSample {
+    /// Wait for it to finish on its own.
+    fn await_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+
+            if Instant::now() >= deadline {
+                self.stop();
+                return None;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Everything it has written so far.
+    fn output(&self) -> String {
+        std::fs::read_to_string(&self.output).unwrap_or_default()
+    }
+
+    /// Stop it and reap it.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Start a script, with its output in a file.
+fn spawn_script(script: &Path, output: &Path) -> Result<JavaSample, String> {
+    let log = std::fs::File::create(output).map_err(|error| error.to_string())?;
+    let log_err = log.try_clone().map_err(|error| error.to_string())?;
+
+    let child = Command::new(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", script.display()))?;
+
+    Ok(JavaSample {
+        child,
+        output: output.to_path_buf(),
     })
 }
 
@@ -837,6 +1169,10 @@ impl Driver {
             WhichDriver::Reference => {
                 deepmsg_tests::driver::locate_verified().ok_or_else(missing_reference_driver)?
             }
+            // The Java driver is launched by class name, so what the spawner is
+            // given is a script that puts the property arguments where a JVM
+            // wants them — before the class name, not after it.
+            WhichDriver::ReferenceJava => java_driver_script(&java_classpath()?)?,
         };
 
         // The reference driver is not spawned by name on its own: it is the
@@ -857,6 +1193,7 @@ impl Driver {
         match self.which {
             WhichDriver::Own => "ours",
             WhichDriver::Reference => "reference",
+            WhichDriver::ReferenceJava => "reference (Java)",
         }
     }
 

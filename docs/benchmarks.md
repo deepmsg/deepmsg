@@ -45,6 +45,44 @@ table with rows produced by code that shares nothing with it.
     cargo bench -p deepmsg-bench --bench latency -- --peer reference --md
     cargo bench -p deepmsg-bench --bench latency -- --peer reference --driver reference --md
 
+### The reference's Java pair
+
+The same instrument written in the other language the reference ships: its Java
+`Ping` and `Pong` against its Java media driver (`io.aeron.driver.MediaDriver`).
+Both ends are the reference's, and neither is a combination with anything of
+ours — the Java client has never been run against this build's driver, and that
+is a compatibility question rather than a performance one.
+
+| client | driver | channel | length | p50 | p90 | p99 | p99.9 | max | n |
+|---|---|---|---|---|---|---|---|---|---|
+| reference `Ping`/`Pong` (Java) | reference (Java) | `aeron:ipc` | 32 B | 0.5 | 0.7 | 4.4 | 33.8 | 1253.4 | 50000 |
+| reference `Ping`/`Pong` (Java) | reference (Java) | `aeron:udp` | 32 B | 9.0 | 13.7 | 177.9 | 414.5 | 1488.9 | 50000 |
+| reference `Ping`/`Pong` (Java) | reference (Java) | `aeron:udp` | 1024 B | 13.5 | 47.3 | 319.2 | 433.4 | 1959.9 | 50000 |
+
+    cargo bench -p deepmsg-bench --bench latency -- \
+        --peer reference-java --driver reference-java --messages 50000 --warmup 5000 --md
+
+Three things to read it with:
+
+- **The medians are at parity with the C++ pair** on the same scenarios (0.5
+  against 0.3 µs on IPC; 9.0 against 9.2 and 13.5 against 18.9 on UDP), which is
+  what a mature implementation of the same protocol on a loopback socket looks
+  like. The **tails are not**: p99 is 178 µs against 37 µs on UDP at 32 bytes,
+  and the maximum is milliseconds rather than hundreds of microseconds. That is
+  the JVM (safepoints, GC, JIT) showing up in the percentiles the C++ rows do
+  not have it in.
+- **The warm-up is 5,000 messages, not the sample's own default** — that is ten
+  iterations of 10,000, so 100,000. The counts are kept equal to the other rows
+  on purpose, which means these rows carry more JIT compilation inside the
+  measurement than the Java sample would run with on its own. The medians are
+  past the worst of it; the tails are where the difference would show.
+- `aeron.sample.exclusive.publications=true` is set explicitly: the C++ `Ping`
+  publishes through an exclusive publication and the Java sample's own default
+  is a plain one, so setting it leaves the language as the only difference
+  between those two rows. `--add-opens java.base/jdk.internal.misc=ALL-UNNAMED`
+  is the other setting both ends need, and the reference's own Gradle passes it
+  to every task it runs (`build.gradle:225-226`).
+
 ## Throughput (one direction)
 
 One publisher, one counting process, and no reply: what arrived, and what it
