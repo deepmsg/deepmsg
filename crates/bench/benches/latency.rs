@@ -1,19 +1,26 @@
-//! The live harness: a round trip through a media driver, measured.
+//! The live harness: what a round trip through a media driver costs, measured.
 //!
 //! `harness = false`, and it parses its own arguments, because what it does is
 //! not a `bench_function`: it starts a **driver process**, and then a second
-//! process of itself to echo, and measures a message that goes out and comes
-//! back through both. criterion would time the setup, which is not the number
-//! anyone wants.
+//! process of itself at the other end, and measures messages that go between
+//! them. criterion would time the setup, which is not the number anyone wants.
+//!
+//! # Two instruments, one table
+//!
+//! Ours (`--peer ours`, the default) measures with this build's client. The
+//! reference's own `Ping` and `Pong` (`--peer reference`, or `both`) measure
+//! the same scenarios with code that shares nothing with this build, which is
+//! what makes the numbers comparable rather than merely reported. `--peer
+//! both` puts them in one table, and `--driver own|reference` chooses which
+//! driver both of them run against — four configurations in all, the same
+//! matrix `docs/benchmarks.md` records.
 //!
 //! # Why two processes
 //!
-//! The reference's own instrument is `Ping` and `Pong`
-//! (`aeron-samples/src/main/c/cping.c`, `cpong.c`): one process publishes and
-//! waits, another echoes, and the number is the round trip between them. An
-//! echo living inside the measuring process would remove a process switch and a
-//! scheduling hop from every sample, and the result would not be comparable
-//! with the reference's — so this harness spawns itself with `--echo` and
+//! The reference's instrument is two processes: one publishes and waits,
+//! another echoes. An echo living inside the measuring process would remove a
+//! process switch and a scheduling hop from every sample, and the result would
+//! not be comparable with the reference's — so this harness spawns itself and
 //! measures the real thing. The child is the same binary, so the two ends
 //! cannot drift apart.
 //!
@@ -22,38 +29,56 @@
 //! channel the subscriber binds the endpoint, so one endpoint cannot carry both
 //! directions without two binders fighting over one port.
 //!
-//! # What the number is
+//! # What the numbers are
 //!
-//! The caller writes `monotonic_nano_time()` into the first eight bytes of the
-//! message, the echo sends the payload back unchanged, and the caller reads the
-//! clock again on receipt. What is recorded is therefore the whole loop: the
-//! publisher's append, the driver's send path, the echo's poll and append, the
-//! driver's send path back, and the caller's poll — the same thing the
-//! reference measures, and the same way (`cping.c:109`, `:79-88`).
+//! **Ping-pong.** The caller writes `monotonic_nano_time()` into the first
+//! eight bytes of the message, the peer sends the payload back unchanged, and
+//! the caller reads the clock again on receipt. What is recorded is the whole
+//! loop — the publisher's append, the driver's send path, the peer's poll and
+//! append, the driver's send path back, and the caller's poll — the same thing
+//! the reference measures, and the same way (`cping.c:109`, `:79-88`).
+//!
+//! **Throughput.** One direction, no reply: the caller publishes `messages` as
+//! fast as the window allows, a second process counts what arrives, and the
+//! number is what got there. The attempts it took to publish that many is
+//! reported next to it, because "N per second" means something different when
+//! the publisher spent half its time being back-pressured.
 //!
 //! # Failing loudly
 //!
 //! A tool that measures air is worse than one that refuses to run: every
 //! precondition here (no driver binary, no CnC file, a stream that never
-//! connects, a size too small to carry a stamp, no reply to a stamp) ends in a
-//! non-zero exit and a sentence saying what was missing. The one thing it never
-//! does is print a table of zeros.
+//! connects, a size too small to carry a stamp, no reply to a stamp, a
+//! reference tool that is not built when one was asked for) ends in a non-zero
+//! exit and a sentence saying what was missing. The one thing it never does is
+//! print a table of zeros.
 
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child as Process, Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use deepmsg_bench::{Channel, MachineFingerprint, Scenario, Summary, histogram};
+use deepmsg_bench::{
+    Args, Channel, ChildArgs, Invocation, MachineFingerprint, Mode, Scenario, Summary, WhichDriver,
+    histogram, summary_from_hdr_table,
+};
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::clock::monotonic_nano_time;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::driver::{OWN_DRIVER_ENV, ReferenceDriver};
+use deepmsg_tests::samples::{self, Sample};
 
 /// The ping stream, the reference's own default (`samples_configuration.h:24`).
+///
+/// A row's own stream id is this plus twice its index, and for an IPC matrix
+/// that is not decoration: every IPC row's *channel* is the same string
+/// (`aeron:ipc`, where the port means nothing), so two rows sharing a stream
+/// would have the second publication link to the first row's subscription —
+/// which is gone, but whose reader position the driver still holds. The window
+/// then closes and stays closed. Two rounds of the same channel found this.
 const PING_STREAM_ID: i32 = 1002;
 
 /// The pong stream, likewise (`samples_configuration.h:25`).
@@ -69,6 +94,19 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// is slow.
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long the last message of a throughput run may take to arrive.
+///
+/// Longer than a round trip by orders of magnitude, because this covers the
+/// pipeline draining rather than one message: the publisher stops as soon as
+/// the driver has the last one, and what is being waited for is the subscriber
+/// having polled it.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the reference's own instrument may run before it is a failure.
+///
+/// `Ping` runs `-m` messages and exits; this bounds a run that hung instead.
+const PEER_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The number of messages one poll takes.
 ///
 /// One: the echo is a mirror, and a poll that took more would let it work
@@ -77,18 +115,18 @@ const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(1);
 const MESSAGE_LIMIT: usize = 1;
 
 fn main() -> ExitCode {
-    let args = match Args::parse(std::env::args().skip(1)) {
-        Ok(args) => args,
+    let invocation = match Invocation::parse(std::env::args().skip(1)) {
+        Ok(invocation) => invocation,
         Err(message) => {
-            eprintln!("{message}\n\n{}", Args::USAGE);
+            eprintln!("{message}\n\n{}", Invocation::USAGE);
             return ExitCode::FAILURE;
         }
     };
 
-    let result = if let Some(aeron_dir) = args.echo.as_deref() {
-        echo(&args, aeron_dir)
-    } else {
-        measure(&args)
+    let result = match &invocation {
+        Invocation::Echo(child) => echo(child),
+        Invocation::Sink(child) => sink(child),
+        Invocation::Measure(args) => measure(args),
     };
 
     match result {
@@ -100,115 +138,432 @@ fn main() -> ExitCode {
     }
 }
 
-/// The measuring side: start a driver, start the echo, measure round trips.
+/// The measuring side: start a driver, then measure every requested scenario.
 fn measure(args: &Args) -> Result<(), String> {
-    let binary = resolve_driver(args.driver_binary.as_deref())?;
-    let mut driver = ReferenceDriver::start_with(&binary, "bench-latency", &[])
-        .map_err(|error| format!("could not start {}: {error}", binary.display()))?;
-
-    // The driver is stopped however the run ends: a failed benchmark that
-    // leaves a driver process behind is a failed benchmark that also costs the
-    // next one its ports.
-    let outcome = run(args, &binary, &mut driver);
-    let _ = driver.stop();
+    let mut driver = Driver::start(args)?;
+    let outcome = run(args, &mut driver);
+    let _ = driver.process.stop();
 
     outcome
 }
 
 /// The measuring side's body, with the driver already started.
-fn run(args: &Args, binary: &Path, driver: &mut ReferenceDriver) -> Result<(), String> {
-    let scenario = Scenario {
-        channel: args.channel,
-        length: args.length,
-    };
+fn run(args: &Args, driver: &mut Driver) -> Result<(), String> {
+    let mut rows = Vec::new();
 
-    driver
-        .await_cnc(SETUP_TIMEOUT)
-        .map_err(|error| format!("the driver never published a usable CnC file: {error}"))?;
+    for (index, pairing) in pairings(args).into_iter().enumerate() {
+        let first = args.peer.measures_ours();
+        let second = args.peer.measures_reference();
 
-    let aeron_dir = driver.aeron_dir().to_path_buf();
-    let mut client = Client::connect(&aeron_dir)
-        .map_err(|error| format!("could not connect to {}: {error}", aeron_dir.display()))?;
+        // Each row gets its own ports, so a row that is still tearing down
+        // cannot collide with the next one's bind.
+        if first {
+            let scenario = pairing.at(index * 2);
+            let measured = if args.mode == Mode::PingPong {
+                ours(&scenario, driver)
+            } else {
+                ours_throughput(args, &scenario, driver)
+            };
 
-    let (ping_uri, pong_uri) = args.uris();
-    let publication = client
-        .add_publication(&ping_uri, PING_STREAM_ID, DEFAULT_TIMEOUT)
-        .map_err(|error| format!("no publication on {ping_uri}: {error}"))?;
-    let subscription = client
-        .add_subscription(&pong_uri, PONG_STREAM_ID, DEFAULT_TIMEOUT)
-        .map_err(|error| format!("no subscription on {pong_uri}: {error}"))?;
+            rows.push(measured.map_err(|error| format!("{}: {error}", scenario.label()))?);
+        }
 
-    let mut echo = Echo::start(&aeron_dir, &ping_uri, &pong_uri)?;
+        if second {
+            if args.mode != Mode::PingPong {
+                return Err(
+                    "the reference's own instrument measures round trips only: --mode \
+                     throughput has no reference row yet, so ask for --peer ours"
+                        .to_owned(),
+                );
+            }
 
-    // Both ends say they are up: the echo has an image to read, and this side
-    // has one to read back. Either alone leaves the first offer with nowhere to
-    // go, and the offers that follow would be counted as latency.
-    echo.await_ready(SETUP_TIMEOUT)?;
-    await_image(&mut client, subscription, SETUP_TIMEOUT).ok_or_else(|| {
-        format!("no image on {pong_uri} — the echo never published anything this side could read")
-    })?;
-
-    for _ in 0..args.warmup {
-        round_trip(&mut client, publication, subscription, &scenario)?;
+            let scenario = pairing.at(index * 2 + 1);
+            rows.push(
+                reference(args, &scenario, driver)
+                    .map_err(|error| format!("{}: {error}", scenario.label()))?,
+            );
+        }
     }
 
-    let mut samples = histogram();
-    let started = Instant::now();
-    for _ in 0..args.messages {
-        let elapsed_ns = round_trip(&mut client, publication, subscription, &scenario)?;
-        samples
-            .record(elapsed_ns)
-            .map_err(|error| format!("a sample fell outside the histogram's bounds: {error}"))?;
-    }
-    let wall = started.elapsed();
-
-    println!(
-        "{} round trip, {} B payload, {} measured (+{} warm-up), {:.0}/s wall clock",
-        scenario.channel.name(),
-        scenario.length,
-        args.messages,
-        args.warmup,
-        args.messages as f64 / wall.as_secs_f64(),
-    );
-    println!("  {}", Summary::of(&samples));
-    println!(
-        "  driver {} ({})",
-        binary.display(),
-        built_when(binary).unwrap_or_else(|| "build time unknown".to_owned())
-    );
-    println!("  {}", MachineFingerprint::capture());
-
-    echo.stop();
+    report(args, &rows, driver);
 
     Ok(())
 }
 
+/// Our own instrument, ping-pong.
+fn ours(pairing: &Pairing, driver: &mut Driver) -> Result<Row, String> {
+    driver.await_cnc()?;
+
+    let mut client = Client::connect(driver.aeron_dir())
+        .map_err(|error| format!("could not connect: {error}"))?;
+
+    let publication = client
+        .add_publication(&pairing.ping_uri, pairing.ping_stream_id, DEFAULT_TIMEOUT)
+        .map_err(|error| format!("no publication on {}: {error}", pairing.ping_uri))?;
+    let subscription = client
+        .add_subscription(&pairing.pong_uri, pairing.pong_stream_id, DEFAULT_TIMEOUT)
+        .map_err(|error| format!("no subscription on {}: {error}", pairing.pong_uri))?;
+
+    let mut echo = FarEnd::echo(driver.aeron_dir(), pairing)?;
+
+    // Both ends say they are up: the echo has an image to read, and this side
+    // has one to read back. Either alone leaves the first offer with nowhere to
+    // go, and the offers that follow would be counted as latency.
+    echo.await_line("echo ready", SETUP_TIMEOUT)?;
+    await_image(&mut client, subscription, SETUP_TIMEOUT).ok_or_else(|| {
+        format!(
+            "no image on {} — the echo never published anything this side could read",
+            pairing.pong_uri
+        )
+    })?;
+
+    for _ in 0..pairing.warmup {
+        round_trip(&mut client, publication, subscription, pairing)?;
+    }
+
+    let mut samples = histogram();
+    for _ in 0..pairing.messages {
+        let elapsed_ns = round_trip(&mut client, publication, subscription, pairing)?;
+        samples
+            .record(elapsed_ns)
+            .map_err(|error| format!("a sample fell outside the histogram's bounds: {error}"))?;
+    }
+
+    echo.stop();
+
+    Ok(Row::Latency {
+        client: "ours",
+        driver: driver.name(),
+        channel: pairing.channel,
+        length: pairing.length,
+        summary: Summary::of(&samples),
+    })
+}
+
+/// Our own instrument, throughput: publish as fast as the window allows while a
+/// second process counts what arrives.
+fn ours_throughput(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result<Row, String> {
+    driver.await_cnc()?;
+
+    let mut client = Client::connect(driver.aeron_dir())
+        .map_err(|error| format!("could not connect: {error}"))?;
+
+    let publication = client
+        .add_publication(&pairing.ping_uri, pairing.ping_stream_id, DEFAULT_TIMEOUT)
+        .map_err(|error| format!("no publication on {}: {error}", pairing.ping_uri))?;
+
+    let mut sink = FarEnd::sink(driver.aeron_dir(), pairing, args.messages)?;
+    sink.await_line("sink ready", SETUP_TIMEOUT)?;
+
+    let payload = pairing.payload(0);
+    let started = Instant::now();
+    let mut accepted = 0_u64;
+    let mut attempts = 0_u64;
+
+    while accepted < args.messages {
+        attempts += 1;
+
+        match client.offer(publication, &payload) {
+            Some(Appended::Ok { .. }) => accepted += 1,
+            // Everything else means "not now": the window is closed until the
+            // sink's status messages have been through, or the term rotated
+            // under this call. Polling is what lets this client's own side of
+            // that conversation happen.
+            Some(_) => {}
+            None => return Err("the publication is gone".to_owned()),
+        }
+
+        client.poll();
+
+        if started.elapsed() > DRAIN_TIMEOUT {
+            return Err(format!(
+                "the publication took only {accepted} of {} messages in {DRAIN_TIMEOUT:?}",
+                args.messages
+            ));
+        }
+    }
+
+    // What arrived, not what was handed over: the sink says it has all of them,
+    // and the time is from the first offer to that line.
+    let line = sink.await_line("received", DRAIN_TIMEOUT)?;
+    let seconds = started.elapsed().as_secs_f64();
+    let received = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|count| count.parse::<u64>().ok())
+        .ok_or_else(|| format!("the sink's report did not name a count: {line:?}"))?;
+
+    if received != args.messages {
+        return Err(format!(
+            "the sink received {received} of {} messages",
+            args.messages
+        ));
+    }
+
+    Ok(Row::Throughput {
+        client: "ours",
+        driver: driver.name(),
+        channel: pairing.channel,
+        length: pairing.length,
+        messages: received,
+        seconds,
+        attempts,
+    })
+}
+
+/// The reference's own instrument: `Ping` and `Pong`, on the same driver.
+fn reference(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result<Row, String> {
+    driver.await_cnc()?;
+
+    let pong = samples::locate("Pong").ok_or_else(|| missing_sample("Pong"))?;
+    let ping = samples::locate("Ping").ok_or_else(|| missing_sample("Ping"))?;
+    let dir = driver.aeron_dir();
+
+    let ping_stream_id = pairing.ping_stream_id.to_string();
+    let pong_stream_id = pairing.pong_stream_id.to_string();
+    let channels = [
+        "-c",
+        pairing.ping_uri.as_str(),
+        "-C",
+        pairing.pong_uri.as_str(),
+        "-s",
+        ping_stream_id.as_str(),
+        "-S",
+        pong_stream_id.as_str(),
+    ];
+
+    let mut echo = Sample::start(&pong, "bench-pong", dir, &channels);
+
+    let length = pairing.length.to_string();
+    let messages = args.messages.to_string();
+    let warmup = pairing.warmup.to_string();
+    let mut measure = Sample::start(
+        &ping,
+        "bench-ping",
+        dir,
+        &[
+            channels.as_slice(),
+            &[
+                "-L",
+                length.as_str(),
+                "-m",
+                messages.as_str(),
+                "-w",
+                warmup.as_str(),
+            ],
+        ]
+        .concat(),
+    );
+
+    let exited = measure.await_exit(PEER_TIMEOUT);
+
+    // Both are stopped whatever happened: a `Ping` that hung still leaves a
+    // `Pong` holding a port, and the next row needs one.
+    let output = measure.output();
+    echo.terminate(Duration::from_secs(5));
+
+    if exited.is_none() {
+        return Err(format!(
+            "the reference's Ping did not finish within {PEER_TIMEOUT:?}:\n{output}"
+        ));
+    }
+
+    Ok(Row::Latency {
+        client: "reference Ping/Pong",
+        driver: driver.name(),
+        channel: pairing.channel,
+        length: pairing.length,
+        summary: summary_from_hdr_table(&output)?,
+    })
+}
+
+/// Every scenario a run measures, before ports are assigned.
+fn pairings(args: &Args) -> Vec<Pairing> {
+    let mut pairings = Vec::new();
+
+    for channel in &args.channels {
+        for length in &args.lengths {
+            pairings.push(Pairing {
+                channel: *channel,
+                length: *length,
+                ping_uri: String::new(),
+                pong_uri: String::new(),
+                ping_stream_id: PING_STREAM_ID,
+                pong_stream_id: PONG_STREAM_ID,
+                messages: args.messages,
+                warmup: args.warmup,
+            });
+        }
+    }
+
+    pairings
+}
+
+/// One measurement, and who made it.
+///
+/// The two modes are two tables, not two shapes of one: a latency row is a
+/// distribution with percentiles, a throughput row is a rate with the attempts
+/// it took to reach it, and printing them as one table would leave every row
+/// half empty.
+enum Row {
+    Latency {
+        client: &'static str,
+        driver: &'static str,
+        channel: Channel,
+        length: usize,
+        summary: Summary,
+    },
+    Throughput {
+        client: &'static str,
+        driver: &'static str,
+        channel: Channel,
+        length: usize,
+        messages: u64,
+        seconds: f64,
+        attempts: u64,
+    },
+}
+
+impl Row {
+    /// The columns every row starts with.
+    fn leading(&self) -> (&'static str, &'static str, Channel, usize) {
+        match self {
+            Self::Latency {
+                client,
+                driver,
+                channel,
+                length,
+                ..
+            }
+            | Self::Throughput {
+                client,
+                driver,
+                channel,
+                length,
+                ..
+            } => (client, driver, *channel, *length),
+        }
+    }
+
+    /// The row as it goes into `docs/benchmarks.md`.
+    fn markdown(&self) -> String {
+        let (client, driver, channel, length) = self.leading();
+        let length = format!("{length} B");
+
+        match self {
+            Self::Latency { summary, .. } => {
+                summary.markdown_row(&[client, driver, channel.name(), &length])
+            }
+            Self::Throughput {
+                messages,
+                seconds,
+                attempts,
+                ..
+            } => {
+                let megabytes = *messages as f64 * length.len() as f64 / (1024.0 * 1024.0);
+                let [rate, bandwidth, per_message] = [
+                    *messages as f64 / seconds,
+                    megabytes / seconds,
+                    *attempts as f64 / *messages as f64,
+                ];
+
+                format!(
+                    "| {client} | {driver} | {} | {length} | {rate:.0} | {bandwidth:.0} |                      {per_message:.2} | {messages} |",
+                    channel.name()
+                )
+            }
+        }
+    }
+
+    /// The row as it reads to a person.
+    fn line(&self) -> String {
+        let (client, driver, channel, length) = self.leading();
+
+        match self {
+            Self::Latency { summary, .. } => format!(
+                "{client}, {driver} on {}, {length} B\n  {summary}",
+                channel.name()
+            ),
+            Self::Throughput {
+                messages,
+                seconds,
+                attempts,
+                ..
+            } => format!(
+                "{client}, {driver} on {}, {length} B\n  {:.0} msg/s, {:.0} MB/s, \
+                 {:.2} attempts per message, {messages} measured",
+                channel.name(),
+                *messages as f64 / seconds,
+                *messages as f64 * length as f64 / seconds / (1024.0 * 1024.0),
+                *attempts as f64 / *messages as f64,
+            ),
+        }
+    }
+
+    /// What the table's header is, for the mode these rows are.
+    fn markdown_header(rows: &[Row]) -> (&'static str, &'static str) {
+        if rows.iter().any(|row| matches!(row, Row::Throughput { .. })) {
+            (
+                "| client | driver | channel | length | messages/s | MB/s | attempts/msg | n |",
+                "|---|---|---|---|---|---|---|---|",
+            )
+        } else {
+            (
+                "| client | driver | channel | length | p50 | p90 | p99 | p99.9 | max | n |",
+                "|---|---|---|---|---|---|---|---|---|---|",
+            )
+        }
+    }
+}
+
+/// Print what was measured, in the shape the caller asked for.
+fn report(args: &Args, rows: &[Row], driver: &Driver) {
+    if args.markdown {
+        let (header, rule) = Row::markdown_header(rows);
+        println!("{header}");
+        println!("{rule}");
+    }
+
+    for row in rows {
+        if args.markdown {
+            println!("{}", row.markdown());
+        } else {
+            println!("{}", row.line());
+        }
+    }
+
+    // The driver binary is part of the record, not a detail: `cargo bench` is
+    // a release build, and the interop suite's driver is a debug one, so which
+    // binary produced these numbers is the difference between a measurement
+    // and a mistake.
+    println!();
+    println!(
+        "driver {} ({}, {})",
+        driver.binary.display(),
+        driver.name(),
+        built_when(&driver.binary).unwrap_or_else(|| "build time unknown".to_owned())
+    );
+    println!("{}", MachineFingerprint::capture());
+}
+
 /// The echoing side: publish back whatever arrives, unchanged.
 ///
-/// Run as a child of [`measure`] rather than as a binary of its own so that the
-/// two ends are one build, and so the arguments that pair them are written
-/// once. It spins rather than sleeping: a mirror that slept would add its sleep
-/// to every sample, and the sample is supposed to be the machine's, not the
-/// harness's.
-fn echo(args: &Args, aeron_dir: &Path) -> Result<(), String> {
-    let (ping_uri, pong_uri) = args.uris();
-    let mut client = Client::connect(aeron_dir)
-        .map_err(|error| format!("could not connect to {}: {error}", aeron_dir.display()))?;
+/// Run as a child of the measuring side rather than as a binary of its own so
+/// that the two ends are one build, and so the arguments that pair them are
+/// written once. It spins rather than sleeping: a mirror that slept would add
+/// its sleep to every sample, and the sample is supposed to be the machine's,
+/// not the harness's.
+fn echo(child: &ChildArgs) -> Result<(), String> {
+    let (mut client, subscription, publication) = connect(child)?;
 
-    let subscription = client
-        .add_subscription(&ping_uri, PING_STREAM_ID, DEFAULT_TIMEOUT)
-        .map_err(|error| format!("no subscription on {ping_uri}: {error}"))?;
-    let publication = client
-        .add_publication(&pong_uri, PONG_STREAM_ID, DEFAULT_TIMEOUT)
-        .map_err(|error| format!("no publication on {pong_uri}: {error}"))?;
+    await_image(&mut client, subscription, SETUP_TIMEOUT).ok_or_else(|| {
+        format!(
+            "no image on {} — nothing is publishing to echo",
+            child.ping_uri
+        )
+    })?;
 
-    await_image(&mut client, subscription, SETUP_TIMEOUT)
-        .ok_or_else(|| format!("no image on {ping_uri} — nothing is publishing to echo"))?;
-
-    println!("echo ready");
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
+    announce("echo ready")?;
 
     // Reused across messages, so a mirror does not allocate per round trip —
     // an allocator pause inside the loop would land in the sample as latency.
@@ -228,6 +583,60 @@ fn echo(args: &Args, aeron_dir: &Path) -> Result<(), String> {
             offer(&client, publication, &payload)?;
         }
     }
+}
+
+/// The counting side: publish nothing, report how much arrives.
+fn sink(child: &ChildArgs) -> Result<(), String> {
+    let count = child
+        .count
+        .ok_or_else(|| "--sink needs a --count".to_owned())?;
+    let (mut client, subscription, _) = connect(child)?;
+
+    await_image(&mut client, subscription, SETUP_TIMEOUT)
+        .ok_or_else(|| format!("no image on {} — nothing is publishing", child.ping_uri))?;
+
+    announce("sink ready")?;
+
+    let mut received = 0_u64;
+
+    while received < count {
+        client.poll();
+        client.poll_subscription(subscription, MESSAGE_LIMIT, |_| received += 1);
+    }
+
+    announce(&format!("received {received}"))?;
+
+    Ok(())
+}
+
+/// Connect a child to the driver, and create the two resources it needs.
+///
+/// Both modes create both a subscription and a publication even though a sink
+/// publishes nothing: the publication is what makes the *other* side's status
+/// messages have somewhere to come from, and a sink that did not create one
+/// would leave the publisher's window closed forever.
+fn connect(child: &ChildArgs) -> Result<(Client, i64, i64), String> {
+    let mut client = Client::connect(&child.aeron_dir).map_err(|error| {
+        format!(
+            "could not connect to {}: {error}",
+            child.aeron_dir.display()
+        )
+    })?;
+
+    let subscription = client
+        .add_subscription(&child.ping_uri, child.ping_stream_id, DEFAULT_TIMEOUT)
+        .map_err(|error| format!("no subscription on {}: {error}", child.ping_uri))?;
+    let publication = client
+        .add_publication(&child.pong_uri, child.pong_stream_id, DEFAULT_TIMEOUT)
+        .map_err(|error| format!("no publication on {}: {error}", child.pong_uri))?;
+
+    Ok((client, subscription, publication))
+}
+
+/// Say one line on stdout, and make sure it left.
+fn announce(line: &str) -> Result<(), String> {
+    println!("{line}");
+    std::io::stdout().flush().map_err(|error| error.to_string())
 }
 
 /// Offer until the driver's window allows it, or the round trip is a failure.
@@ -263,10 +672,10 @@ fn round_trip(
     client: &mut Client,
     publication: i64,
     subscription: i64,
-    scenario: &Scenario,
+    pairing: &Pairing,
 ) -> Result<u64, String> {
     let stamp = monotonic_nano_time();
-    let payload = scenario.payload(stamp);
+    let payload = pairing.payload(stamp);
 
     offer(client, publication, &payload)?;
 
@@ -315,84 +724,166 @@ fn await_image(client: &mut Client, subscription: i64, within: Duration) -> Opti
     None
 }
 
-/// A started echo, killed when it goes out of scope.
-struct Echo {
-    child: Child,
-    ready: mpsc::Receiver<String>,
+/// A process of this same binary, at the other end of the measurement.
+struct FarEnd {
+    process: Process,
+    lines: mpsc::Receiver<String>,
 }
 
-impl Echo {
-    /// Start the echo as a child of this process, reading its stdout.
+impl FarEnd {
+    /// Start the echoing peer.
+    fn echo(aeron_dir: &Path, pairing: &Pairing) -> Result<Self, String> {
+        Self::spawn(aeron_dir, pairing, "--echo", None)
+    }
+
+    /// Start the counting peer.
+    fn sink(aeron_dir: &Path, pairing: &Pairing, count: u64) -> Result<Self, String> {
+        Self::spawn(aeron_dir, pairing, "--sink", Some(count))
+    }
+
+    /// Start a peer and a thread that reads its lines.
     ///
     /// The two channel URIs are passed down rather than recomputed: they carry
     /// ports derived from the *parent's* process id, and a child that derived
     /// its own would listen somewhere else entirely.
-    fn start(aeron_dir: &Path, ping_uri: &str, pong_uri: &str) -> Result<Self, String> {
+    fn spawn(
+        aeron_dir: &Path,
+        pairing: &Pairing,
+        mode: &str,
+        count: Option<u64>,
+    ) -> Result<Self, String> {
         let exe = std::env::current_exe()
             .map_err(|error| format!("could not find this harness's own binary: {error}"))?;
 
-        let mut child = Command::new(exe)
-            .arg("--echo")
+        let mut command = Command::new(exe);
+        command
+            .arg(mode)
             .arg(aeron_dir)
             .arg("--ping")
-            .arg(ping_uri)
+            .arg(&pairing.ping_uri)
             .arg("--pong")
-            .arg(pong_uri)
+            .arg(&pairing.pong_uri)
+            .arg("--ping-stream")
+            .arg(pairing.ping_stream_id.to_string())
+            .arg("--pong-stream")
+            .arg(pairing.pong_stream_id.to_string());
+
+        if let Some(count) = count {
+            command.arg("--count").arg(count.to_string());
+        }
+
+        let mut process = command
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("could not start the echo: {error}"))?;
+            .map_err(|error| format!("could not start the {mode} peer: {error}"))?;
 
-        let stdout = child
+        let stdout = process
             .stdout
             .take()
-            .ok_or_else(|| "the echo has no stdout to read".to_owned())?;
+            .ok_or_else(|| format!("the {mode} peer has no stdout to read"))?;
+        let (sender, lines) = mpsc::channel();
 
-        let (sender, ready) = mpsc::channel();
-
-        // Reading blocks until the echo says something, so it cannot run on
-        // this thread — [`Echo::await_ready`]'s timeout is what bounds it.
+        // Reading blocks until the peer says something, so it cannot run on
+        // this thread — [`Peer::await_line`]'s timeout is what bounds it.
         std::thread::spawn(move || {
-            let mut lines = BufReader::new(stdout).lines();
-
-            if let Some(Ok(line)) = lines.next() {
-                let _ = sender.send(line);
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
             }
         });
 
-        Ok(Self { child, ready })
+        Ok(Self { process, lines })
     }
 
-    /// Wait for the echo to say it has an image to read.
-    fn await_ready(&mut self, within: Duration) -> Result<(), String> {
-        match self.ready.recv_timeout(within) {
-            Ok(line) if line == "echo ready" => Ok(()),
-            Ok(line) => Err(format!("the echo said {line:?} instead of being ready")),
-            Err(_) => Err(format!("the echo was not ready within {within:?}")),
+    /// Wait for a line beginning with `prefix`.
+    fn await_line(&mut self, prefix: &str, within: Duration) -> Result<String, String> {
+        match self.lines.recv_timeout(within) {
+            Ok(line) if line.starts_with(prefix) => Ok(line),
+            Ok(line) => Err(format!("the peer said {line:?}, not {prefix:?}")),
+            Err(_) => Err(format!("the peer never said {prefix:?} within {within:?}")),
         }
     }
 
-    /// Stop the echo and reap it.
+    /// Stop the peer and reap it.
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
     }
 }
 
-impl Drop for Echo {
+impl Drop for FarEnd {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-/// Where the driver binary is: the **release** one, because `cargo bench` is a
-/// release build, and a release client measured against a debug driver is a
-/// number about nothing.
+/// A driver this run started, and which build it is.
+struct Driver {
+    process: ReferenceDriver,
+    binary: PathBuf,
+    which: WhichDriver,
+}
+
+impl Driver {
+    /// Start the driver the caller asked for.
+    fn start(args: &Args) -> Result<Self, String> {
+        let binary = match args.driver {
+            WhichDriver::Own => resolve_own_driver(args.driver_binary.as_deref())?,
+            WhichDriver::Reference => {
+                deepmsg_tests::driver::locate_verified().ok_or_else(missing_reference_driver)?
+            }
+        };
+
+        // The reference driver is not spawned by name on its own: it is the
+        // same spawner either way, which is what keeps the two drivers'
+        // configuration from drifting apart.
+        let process = ReferenceDriver::start_with(&binary, "bench-latency", &[])
+            .map_err(|error| format!("could not start {}: {error}", binary.display()))?;
+
+        Ok(Self {
+            process,
+            binary,
+            which: args.driver,
+        })
+    }
+
+    /// The name the driver is reported under.
+    fn name(&self) -> &'static str {
+        match self.which {
+            WhichDriver::Own => "ours",
+            WhichDriver::Reference => "reference",
+        }
+    }
+
+    /// The aeron directory it owns.
+    fn aeron_dir(&self) -> &Path {
+        self.process.aeron_dir()
+    }
+
+    /// Wait for its CnC file.
+    fn await_cnc(&mut self) -> Result<(), String> {
+        self.process
+            .await_cnc(SETUP_TIMEOUT)
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "{} never published a usable CnC file: {error}",
+                    self.binary.display()
+                )
+            })
+    }
+}
+
+/// Where our own driver binary is: the **release** one, because `cargo bench`
+/// is a release build, and a release client measured against a debug driver is
+/// a number about nothing.
 ///
 /// The order is: what the caller named, then `DEEPMSG_DRIVER` (the name the
 /// interop suite uses for the same purpose), then this workspace's own release
 /// output. A debug binary is deliberately not a fallback — the interop suite's
 /// default is `target/debug`, and silently taking it here would mix profiles.
-fn resolve_driver(explicit: Option<&Path>) -> Result<PathBuf, String> {
+fn resolve_own_driver(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
@@ -417,7 +908,24 @@ fn resolve_driver(explicit: Option<&Path>) -> Result<PathBuf, String> {
     ))
 }
 
-/// How long ago the driver binary was built.
+/// What is missing when the reference's own instrument was asked for.
+fn missing_sample(name: &str) -> String {
+    format!(
+        "the reference's {name} was not found — it is built beside the reference driver \
+         ({}; see docs/reference.md), or named with DEEPMSG_REF_{}",
+        samples::SAMPLES_DIR,
+        name.to_uppercase()
+    )
+}
+
+/// What is missing when the reference driver was asked for.
+fn missing_reference_driver() -> String {
+    "no reference driver was found — the Aeron 1.53.2 checkout beside this one is \
+     expected to have a built `aeronmd` (see docs/reference.md)"
+        .to_owned()
+}
+
+/// How long ago a binary was built.
 ///
 /// Two runs whose numbers differ are usually two different builds, and a
 /// fingerprint that could not say *which* build it measured would leave that
@@ -429,117 +937,58 @@ fn built_when(binary: &Path) -> Option<String> {
     Some(format!("built {}s ago", age.as_secs()))
 }
 
-/// What the harness was asked to do.
-struct Args {
+/// One scenario, on two channels of its own.
+///
+/// The pair matters as much as the scenario: a round trip needs a channel in
+/// each direction, because a unicast subscriber binds the endpoint it is given
+/// and one port cannot be bound twice.
+struct Pairing {
     channel: Channel,
     length: usize,
+    ping_uri: String,
+    pong_uri: String,
+    ping_stream_id: i32,
+    pong_stream_id: i32,
     messages: u64,
     warmup: u64,
-    driver_binary: Option<PathBuf>,
-    /// Set only in the child: the aeron directory to connect the echo to.
-    echo: Option<PathBuf>,
-    /// Set only in the child: the pair of channels the parent chose.
-    echoed_uris: Option<(String, String)>,
 }
 
-impl Args {
-    /// The harness's own usage, kept next to the parser so they cannot drift.
-    const USAGE: &'static str = "\
-usage: cargo bench -p deepmsg-bench --bench latency -- [options]
-
-  --channel ipc|udp     transport to measure (default: ipc)
-  --length N            payload bytes (default: 32)
-  --messages N          measured round trips (default: 20000)
-  --warmup N            unmeasured round trips first (default: 2000)
-  --driver-binary PATH  driver to start (default: target/release/deepmsg-driver)
-  --echo DIR --ping URI --pong URI
-                        internal: run as the echo peer on these channels";
-
-    /// Parse the arguments, or say what was wrong with them.
-    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut parsed = Self {
-            channel: Channel::Ipc,
-            length: 32,
-            messages: 20_000,
-            warmup: 2_000,
-            driver_binary: None,
-            echo: None,
-            echoed_uris: None,
-        };
-        let mut ping = None;
-        let mut pong = None;
-
-        while let Some(arg) = args.next() {
-            let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
-
-            match arg.as_str() {
-                "--channel" => {
-                    parsed.channel = match value()?.as_str() {
-                        "ipc" => Channel::Ipc,
-                        "udp" => Channel::Udp,
-                        other => return Err(format!("unknown channel {other:?}")),
-                    };
-                }
-                "--length" => parsed.length = parse_number(&value()?, &arg)?,
-                "--messages" => parsed.messages = parse_number(&value()?, &arg)?,
-                "--warmup" => parsed.warmup = parse_number(&value()?, &arg)?,
-                "--driver-binary" => parsed.driver_binary = Some(PathBuf::from(value()?)),
-                "--echo" => parsed.echo = Some(PathBuf::from(value()?)),
-                "--ping" => ping = Some(value()?),
-                "--pong" => pong = Some(value()?),
-                // `cargo bench` appends its own flags to whatever the caller
-                // wrote after `--`, and `--bench` is one of them. It means
-                // "you are the benchmark", which this target already knows; a
-                // harness that failed on it could not be run through cargo at
-                // all.
-                "--bench" | "--test" => {}
-                other => return Err(format!("unknown argument {other:?}")),
-            }
-        }
-
-        parsed.echoed_uris = match (ping, pong) {
-            (Some(ping), Some(pong)) => Some((ping, pong)),
-            (None, None) => None,
-            _ => return Err("--ping and --pong go together".to_owned()),
-        };
-
-        if parsed.length < size_of::<i64>() {
-            return Err(format!(
-                "--length {} is too short to carry the round trip's own stamp ({} bytes)",
-                parsed.length,
-                size_of::<i64>()
-            ));
-        }
-
-        if parsed.messages == 0 {
-            return Err("--messages 0 would measure nothing".to_owned());
-        }
-
-        Ok(parsed)
-    }
-
-    /// The two channel URIs a run pairs, one per direction.
+impl Pairing {
+    /// The same scenario on a different pair of ports.
     ///
-    /// The ports are derived from this process's id rather than fixed, the same
-    /// way `tests/interop/udp_transport.rs` picks its own: two runs on one
-    /// machine collide only if something else chose exactly this pair, and
-    /// nothing has to be cleaned up between runs.
-    fn uris(&self) -> (String, String) {
-        if let Some((ping, pong)) = &self.echoed_uris {
-            return (ping.clone(), pong.clone());
-        }
-
+    /// Ports come from a range derived from this process's id rather than fixed
+    /// ones, the same way `tests/interop/udp_transport.rs` picks its own: two
+    /// runs on one machine collide only if something else chose exactly this
+    /// range, and nothing has to be cleaned up between runs.
+    fn at(&self, index: usize) -> Self {
         let base = 20_000 + (std::process::id() % 20_000) as u16;
+        let first = base.saturating_add((index * 2) as u16);
 
-        (
-            self.channel.uri(base),
-            self.channel.uri(base.saturating_add(1)),
-        )
+        Self {
+            channel: self.channel,
+            length: self.length,
+            ping_uri: self.channel.uri(first),
+            pong_uri: self.channel.uri(first.saturating_add(1)),
+            // Streams vary per row for the reason the constant's own note
+            // gives: an IPC row's channel is always `aeron:ipc`.
+            ping_stream_id: PING_STREAM_ID + (index * 2) as i32,
+            pong_stream_id: PONG_STREAM_ID + (index * 2) as i32,
+            messages: self.messages,
+            warmup: self.warmup,
+        }
     }
-}
 
-/// A number argument, or why it is not one.
-fn parse_number<T: std::str::FromStr>(text: &str, name: &str) -> Result<T, String> {
-    text.parse()
-        .map_err(|_| format!("{name} needs a number, got {text:?}"))
+    /// How a failure names this row.
+    fn label(&self) -> String {
+        format!("{} {} B", self.channel.name(), self.length)
+    }
+
+    /// A payload of this scenario's length, with `stamp` in its first bytes.
+    fn payload(&self, stamp: i64) -> Vec<u8> {
+        Scenario {
+            channel: self.channel,
+            length: self.length,
+        }
+        .payload(stamp)
+    }
 }

@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
@@ -330,6 +331,359 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     Some(first.to_owned())
 }
 
+/// What a run is asking for: a timed round trip, or a counted one-way stream.
+///
+/// The two are different measurements and are written down separately — a
+/// round trip is a distribution and a one-way stream is a rate — so which one
+/// is being asked for is the first thing a run says about itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// A message out and back, timed.
+    PingPong,
+    /// Messages in one direction, counted.
+    Throughput,
+}
+
+/// Who produces the numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// This build's client.
+    Ours,
+    /// The reference's own `Ping` and `Pong`.
+    Reference,
+    /// Both, side by side in one table.
+    Both,
+}
+
+impl Peer {
+    /// Whether this choice runs our own instrument.
+    #[must_use]
+    pub const fn measures_ours(self) -> bool {
+        matches!(self, Self::Ours | Self::Both)
+    }
+
+    /// Whether it runs the reference's.
+    #[must_use]
+    pub const fn measures_reference(self) -> bool {
+        matches!(self, Self::Reference | Self::Both)
+    }
+}
+
+/// Which driver both instruments measure against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhichDriver {
+    /// `deepmsg-driver`, this build's.
+    Own,
+    /// The reference's `aeronmd`.
+    Reference,
+}
+
+/// A whole run's arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Args {
+    /// The transports to measure.
+    pub channels: Vec<Channel>,
+    /// The payload sizes to measure, on every channel.
+    pub lengths: Vec<usize>,
+    /// Messages per scenario: round trips when timed, messages published when
+    /// counted.
+    pub messages: u64,
+    /// Unmeasured round trips before the timed ones.
+    pub warmup: u64,
+    /// Which measurement.
+    pub mode: Mode,
+    /// Who measures.
+    pub peer: Peer,
+    /// Which driver they measure against.
+    pub driver: WhichDriver,
+    /// A driver binary the caller named.
+    pub driver_binary: Option<PathBuf>,
+    /// Whether to print rows for `docs/benchmarks.md`.
+    pub markdown: bool,
+}
+
+/// One end of a measurement, as the child process sees it.
+///
+/// Run as a child of the measuring process rather than as a binary of its own,
+/// so the two ends are one build and the arguments that pair them are written
+/// once — and so a child can be handed the channels its parent chose instead of
+/// deriving its own, which would land on other ports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildArgs {
+    /// The aeron directory to connect to.
+    pub aeron_dir: PathBuf,
+    /// The channel this end subscribes to.
+    pub ping_uri: String,
+    /// The channel this end publishes on.
+    pub pong_uri: String,
+    /// The stream it subscribes to, which an IPC channel must vary per row.
+    pub ping_stream_id: i32,
+    /// The stream it publishes on, likewise.
+    pub pong_stream_id: i32,
+    /// How many messages a counting end waits for.
+    pub count: Option<u64>,
+}
+
+/// What an invocation of the harness is: a measurement, or one end of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invocation {
+    /// Measure.
+    Measure(Args),
+    /// Mirror whatever arrives.
+    Echo(ChildArgs),
+    /// Count what arrives, and say so.
+    Sink(ChildArgs),
+}
+
+impl Invocation {
+    /// The harness's own usage, kept next to the parser so they cannot drift.
+    pub const USAGE: &'static str = "\
+usage: cargo bench -p deepmsg-bench --bench latency -- [options]
+
+  --channel ipc|udp|all   transport to measure (default: all)
+  --length N|all          payload bytes (default: all: 32, 1024)
+  --messages N            round trips, or messages to publish (default: 20000)
+  --warmup N              unmeasured round trips first (default: 2000)
+  --mode ping-pong|throughput
+                          a timed round trip, or a counted one-way stream
+  --peer ours|reference|both
+                          who measures: this build's client, the reference's own
+                          Ping and Pong, or both in one table (default: ours)
+  --driver own|reference  which driver they run against (default: own)
+  --driver-binary PATH    the driver to start (default: target/release/deepmsg-driver)
+  --md                    print the rows as markdown, for docs/benchmarks.md
+  --echo DIR --ping URI --pong URI --ping-stream N --pong-stream N
+                          internal: run as the echoing end
+  --sink DIR --ping URI --pong URI --ping-stream N --pong-stream N --count N
+                          internal: run as the counting end";
+
+    /// Parse the arguments, or say what was wrong with them.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the argument that could not be read, or the
+    /// combination that does not make sense.
+    pub fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut measure = Args {
+            channels: Channel::ALL.to_vec(),
+            lengths: vec![32, 1024],
+            messages: 20_000,
+            warmup: 2_000,
+            mode: Mode::PingPong,
+            peer: Peer::Ours,
+            driver: WhichDriver::Own,
+            driver_binary: None,
+            markdown: false,
+        };
+        let (mut echo, mut sink) = (false, false);
+        let (mut aeron_dir, mut ping, mut pong, mut count) = (None, None, None, None);
+        let (mut ping_stream_id, mut pong_stream_id) = (None, None);
+
+        while let Some(arg) = args.next() {
+            let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
+
+            match arg.as_str() {
+                "--channel" => measure.channels = parse_channels(&value()?)?,
+                "--length" => measure.lengths = parse_lengths(&value()?)?,
+                "--messages" => measure.messages = parse_number(&value()?, &arg)?,
+                "--warmup" => measure.warmup = parse_number(&value()?, &arg)?,
+                "--mode" => {
+                    measure.mode = match value()?.as_str() {
+                        "ping-pong" => Mode::PingPong,
+                        "throughput" => Mode::Throughput,
+                        other => return Err(format!("unknown mode {other:?}")),
+                    };
+                }
+                "--peer" => {
+                    measure.peer = match value()?.as_str() {
+                        "ours" => Peer::Ours,
+                        "reference" => Peer::Reference,
+                        "both" => Peer::Both,
+                        other => return Err(format!("unknown peer {other:?}")),
+                    };
+                }
+                "--driver" => {
+                    measure.driver = match value()?.as_str() {
+                        "own" => WhichDriver::Own,
+                        "reference" => WhichDriver::Reference,
+                        other => return Err(format!("unknown driver {other:?}")),
+                    };
+                }
+                "--driver-binary" => measure.driver_binary = Some(PathBuf::from(value()?)),
+                "--md" => measure.markdown = true,
+                "--echo" => {
+                    echo = true;
+                    aeron_dir = Some(PathBuf::from(value()?));
+                }
+                "--sink" => {
+                    sink = true;
+                    aeron_dir = Some(PathBuf::from(value()?));
+                }
+                "--ping" => ping = Some(value()?),
+                "--pong" => pong = Some(value()?),
+                "--ping-stream" => ping_stream_id = Some(parse_number(&value()?, &arg)?),
+                "--pong-stream" => pong_stream_id = Some(parse_number(&value()?, &arg)?),
+                "--count" => count = Some(parse_number(&value()?, &arg)?),
+                // `cargo bench` appends its own flags to whatever the caller
+                // wrote after `--`, and `--bench` is one of them. It means
+                // "you are the benchmark", which this target already knows; a
+                // harness that failed on it could not be run through cargo at
+                // all.
+                "--bench" | "--test" => {}
+                other => return Err(format!("unknown argument {other:?}")),
+            }
+        }
+
+        if echo || sink {
+            let (Some(aeron_dir), Some(ping), Some(pong)) = (aeron_dir, ping, pong) else {
+                return Err("--echo and --sink need a directory, --ping and --pong".to_owned());
+            };
+            let (Some(ping_stream_id), Some(pong_stream_id)) = (ping_stream_id, pong_stream_id)
+            else {
+                return Err("--echo and --sink need --ping-stream and --pong-stream".to_owned());
+            };
+
+            if sink && count.is_none() {
+                return Err("--sink needs a --count".to_owned());
+            }
+
+            let child = ChildArgs {
+                aeron_dir,
+                ping_uri: ping,
+                pong_uri: pong,
+                ping_stream_id,
+                pong_stream_id,
+                count,
+            };
+
+            return Ok(if echo {
+                Self::Echo(child)
+            } else {
+                Self::Sink(child)
+            });
+        }
+
+        if measure
+            .lengths
+            .iter()
+            .any(|length| *length < size_of::<i64>())
+        {
+            return Err(format!(
+                "a payload shorter than {} bytes cannot carry the round trip's own stamp",
+                size_of::<i64>()
+            ));
+        }
+
+        if measure.messages == 0 {
+            return Err("--messages 0 would measure nothing".to_owned());
+        }
+
+        Ok(Self::Measure(measure))
+    }
+}
+
+/// The channels named on the command line.
+fn parse_channels(text: &str) -> Result<Vec<Channel>, String> {
+    match text {
+        "all" => Ok(Channel::ALL.to_vec()),
+        "ipc" => Ok(vec![Channel::Ipc]),
+        "udp" => Ok(vec![Channel::Udp]),
+        other => Err(format!("unknown channel {other:?}")),
+    }
+}
+
+/// The payload sizes named on the command line.
+fn parse_lengths(text: &str) -> Result<Vec<usize>, String> {
+    match text {
+        "all" => Ok(vec![32, 1024]),
+        other => Ok(vec![parse_number(other, "--length")?]),
+    }
+}
+
+/// A number argument, or why it is not one.
+fn parse_number<T: std::str::FromStr>(text: &str, name: &str) -> Result<T, String> {
+    text.parse()
+        .map_err(|_| format!("{name} needs a number, got {text:?}"))
+}
+
+/// The percentiles out of the table `hdr_percentiles_print` writes.
+///
+/// The reference's own instrument prints this table
+/// (`aeron-samples/src/main/c/cping.c:388`), and reading it is what makes one
+/// table's p99 comparable with the other's. Each row carries the value and the
+/// **cumulative count** of samples at or below it, so a quantile read out of
+/// the counts is the same number this crate's own histogram would report for
+/// the same samples — which is why the counts are used and not the percentile
+/// column, whose rows are at `1 - 2^-k` rather than at the round numbers a
+/// latency budget is written in.
+///
+/// The values are printed scaled by 1000 (`cping.c:388`), so they arrive in
+/// microseconds; they are scaled back, because every [`Summary`] holds
+/// nanoseconds.
+///
+/// # Errors
+///
+/// A message naming what was missing when the output holds no table — a `Ping`
+/// that failed to start prints `aeron_init:` and nothing else, and a zero
+/// reported for it would read as a very fast run.
+pub fn summary_from_hdr_table(output: &str) -> Result<Summary, String> {
+    let mut samples: Vec<(u64, u64)> = Vec::new();
+
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+
+        // value, percentile, cumulative count, 1/(1-percentile) — the classic
+        // layout, with the last column dropped on the final row.
+        let (Some(value), Some(count)) = (fields.first(), fields.get(2)) else {
+            continue;
+        };
+        let (Ok(value), Ok(count)) = (value.parse::<f64>(), count.parse::<u64>()) else {
+            continue;
+        };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        samples.push(((value * 1000.0) as u64, count));
+    }
+
+    let total = samples.last().map_or(0, |(_, count)| *count);
+    if total == 0 {
+        return Err(format!(
+            "the reference's output had no percentile table in it:\n{output}"
+        ));
+    }
+
+    // The lowest value whose cumulative count has reached the quantile — the
+    // definition of a percentile, applied to the counts the table gives.
+    let at = |quantile: f64| -> u64 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target = (total as f64 * quantile) as u64;
+
+        samples
+            .iter()
+            .find(|(_, count)| *count >= target)
+            .map_or(0, |(value, _)| *value)
+    };
+
+    // The table's counts are cumulative, so each row's own weight is what it
+    // adds to the row before it.
+    let mut mean = 0.0;
+    let mut previous = 0_u64;
+    for (value, count) in &samples {
+        mean += *value as f64 * count.saturating_sub(previous) as f64;
+        previous = *count;
+    }
+
+    Ok(Summary {
+        count: total,
+        mean: mean / total as f64,
+        p50: at(0.50),
+        p90: at(0.90),
+        p99: at(0.99),
+        p99_9: at(0.999),
+        max: samples.last().map_or(0, |(value, _)| *value),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +808,115 @@ mod tests {
         // other fields have fallbacks, so only this one is asserted on.
         assert!(!fingerprint.cpu.is_empty());
         assert!(fingerprint.to_string().contains("CPUs"));
+    }
+
+    #[test]
+    fn the_default_run_is_the_whole_matrix() {
+        let Ok(Invocation::Measure(args)) = Invocation::parse(std::iter::empty()) else {
+            panic!("no arguments should be a measurement");
+        };
+
+        assert_eq!(Channel::ALL.to_vec(), args.channels);
+        assert_eq!(vec![32, 1024], args.lengths);
+        assert_eq!(Mode::PingPong, args.mode);
+        assert!(args.peer.measures_ours() && !args.peer.measures_reference());
+    }
+
+    #[test]
+    fn a_payload_too_short_for_a_stamp_is_refused_before_anything_starts() {
+        let parsed = Invocation::parse(["--length", "4"].map(String::from).into_iter());
+
+        assert!(parsed.is_err(), "a 4-byte payload cannot carry the stamp");
+    }
+
+    #[test]
+    fn cargos_own_bench_flag_is_not_an_argument() {
+        // `cargo bench` appends `--bench` to whatever the caller wrote.
+        let parsed = Invocation::parse(["--bench"].map(String::from).into_iter());
+
+        assert!(parsed.is_ok(), "cargo's own flag must not be refused");
+    }
+
+    #[test]
+    fn a_child_invocation_carries_the_channels_it_was_given() {
+        let parsed = Invocation::parse(
+            [
+                "--echo",
+                "/tmp/dir",
+                "--ping",
+                "aeron:ipc",
+                "--pong",
+                "aeron:ipc",
+                "--ping-stream",
+                "1002",
+                "--pong-stream",
+                "1003",
+            ]
+            .map(String::from)
+            .into_iter(),
+        );
+
+        match parsed {
+            Ok(Invocation::Echo(child)) => {
+                assert_eq!(PathBuf::from("/tmp/dir"), child.aeron_dir);
+                assert_eq!("aeron:ipc", child.ping_uri);
+                assert_eq!(1002, child.ping_stream_id);
+            }
+            other => panic!("an --echo invocation should parse as an echo: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sink_without_a_count_is_refused() {
+        let parsed = Invocation::parse(
+            [
+                "--sink",
+                "/tmp/dir",
+                "--ping",
+                "aeron:ipc",
+                "--pong",
+                "aeron:ipc",
+                "--ping-stream",
+                "1002",
+                "--pong-stream",
+                "1003",
+            ]
+            .map(String::from)
+            .into_iter(),
+        );
+
+        assert!(parsed.is_err(), "a sink without a count would never stop");
+    }
+
+    #[test]
+    fn the_references_percentile_table_is_read_by_its_counts() {
+        // The shape `hdr_percentiles_print` writes, values in microseconds.
+        let table = "\
+       Value     Percentile TotalCount 1/(1-Percentile)
+
+       4.000 0.000000000000      1
+       5.000 0.500000000000    500  2.00
+       6.000 0.900000000000    900  10.00
+       7.000 0.990000000000    990  100.00
+       8.000 1.000000000000   1000
+";
+
+        let summary = summary_from_hdr_table(table).expect("a table");
+
+        assert_eq!(1000, summary.count);
+        // Back to nanoseconds, which is what every other row holds.
+        assert_eq!(5_000, summary.p50);
+        assert_eq!(6_000, summary.p90);
+        assert_eq!(7_000, summary.p99);
+        // With a thousand samples the 99.9th target is the 999th, which only
+        // the last row has reached — so p99.9 is the maximum here, and would
+        // not be for a table with more rows.
+        assert_eq!(8_000, summary.p99_9);
+        assert_eq!(8_000, summary.max);
+    }
+
+    #[test]
+    fn output_with_no_table_in_it_is_a_failure_rather_than_a_zero() {
+        assert!(summary_from_hdr_table("aeron_init: no such file").is_err());
     }
 }
