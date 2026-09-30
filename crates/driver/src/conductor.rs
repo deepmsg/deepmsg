@@ -767,6 +767,8 @@ impl Conductor {
     /// sequence), and for the same reason: the create has to happen on the
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
+        // The order matters and is left to right: the events are taken off the
+        // sender first, and what was taken is what the flush sends.
         let mut work = self.poll_sender_events() + self.flush_untethered();
 
         if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
