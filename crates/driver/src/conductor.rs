@@ -1728,6 +1728,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                sender.proxy(),
                                 now_ms,
                             );
 
@@ -1776,6 +1777,7 @@ impl Conductor {
                                 &counter_regions,
                                 clients,
                                 network_publications,
+                                sender.proxy(),
                                 now,
                                 &mut transmit,
                             )
@@ -2059,6 +2061,7 @@ impl Conductor {
                             &counter_regions,
                             receive_endpoints,
                             network_publications,
+                            sender.proxy(),
                             now,
                             &mut transmit,
                         );
@@ -2076,6 +2079,7 @@ impl Conductor {
                         request.channel,
                         counters,
                         &counter_regions,
+                        sender.proxy(),
                         now_ms,
                         &mut transmit,
                     ) {
@@ -2438,6 +2442,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            self.sender.proxy(),
         );
 
         self.release_orphaned_network_publications() + reaped

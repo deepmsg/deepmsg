@@ -41,6 +41,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::IpcPublications;
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::sender::SenderProxy;
 use crate::system_counters;
 
 /// Where a driver→client event goes.
@@ -376,6 +377,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        sender: &SenderProxy,
     ) -> usize {
         let mut reaped = 0;
         let mut index = self.records.len();
@@ -395,6 +397,7 @@ impl Clients {
                 events,
                 publications,
                 subscriptions,
+                sender,
             );
             self.records.swap_remove(index);
             reaped += 1;
@@ -420,6 +423,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        sender: &SenderProxy,
     ) {
         let record = &mut self.records[index];
 
@@ -434,7 +438,14 @@ impl Clients {
             manager.free(regions, link.counter_id, now_ms);
         }
 
-        subscriptions.remove_for_client(record.client_id, manager, regions, publications, now_ms);
+        subscriptions.remove_for_client(
+            record.client_id,
+            manager,
+            regions,
+            publications,
+            sender,
+            now_ms,
+        );
 
         manager.free(regions, record.heartbeat_counter_id, now_ms);
         record.client_id = -1;
@@ -718,7 +729,8 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
-                &mut subscriptions
+                &mut subscriptions,
+                &SenderProxy::disconnected()
             )
         );
         assert_eq!(
@@ -759,7 +771,8 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
-                &mut subscriptions
+                &mut subscriptions,
+                &SenderProxy::disconnected()
             ),
             "a zeroed heartbeat expires on the next tick, without a timeout"
         );
@@ -806,6 +819,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            &SenderProxy::disconnected(),
         );
 
         assert_eq!(
@@ -853,7 +867,8 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
-                &mut subscriptions
+                &mut subscriptions,
+                &SenderProxy::disconnected()
             )
         );
         assert!(clients.is_empty());
@@ -909,6 +924,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            &SenderProxy::disconnected(),
         );
         assert!(
             events

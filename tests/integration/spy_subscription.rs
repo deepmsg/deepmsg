@@ -128,6 +128,68 @@ fn labels(cnc: &deepmsg_cnc::CncFile, name: &str) -> Vec<String> {
     found
 }
 
+/// The value of the first counter whose name is `name`, while the driver runs.
+fn counter_value(cnc: &deepmsg_cnc::CncFile, name: &str) -> Option<i64> {
+    let counters = cnc.counters()?;
+    let mut value = None;
+
+    counters.for_each(|descriptor| {
+        if value.is_none() && descriptor.label.starts_with(&format!("{name}: ")) {
+            value = Some(descriptor.value);
+        }
+    });
+
+    value
+}
+
+/// Offer until one is taken or the deadline passes, answering whether any was.
+///
+/// Only the **refused** answer is usable: a caller told `true` has a message
+/// in the stream that it did not count, so this is asked only where the answer
+/// is expected to be `false`, and only about a publication that has not been
+/// read from.
+fn an_offer_is_taken(client: &mut Client, publication: i64, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+
+    loop {
+        if let Some(Appended::Ok { .. }) = client.offer(publication, &numbered(0)) {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait for the publication's two limits to stand in a particular relation.
+///
+/// `pub-lmt` is where a producer may write to and `snd-pos` is how far the
+/// stream has been *sent* — which, for a publication whose readers are all
+/// local, is as far as they have read. The relation between them is the whole
+/// of what "this publication counts its spies" means to a producer, and it is
+/// the one thing the counters can be asked while the driver runs.
+fn await_limits(cnc: &deepmsg_cnc::CncFile, expected: impl Fn(i64, i64) -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let limit = counter_value(cnc, "pub-lmt").unwrap_or(0);
+        let sent = counter_value(cnc, "snd-pos").unwrap_or(0);
+
+        if expected(limit, sent) {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "{what}: `pub-lmt` is {limit} and `snd-pos` is {sent}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// What the spy is, as opposed to what it read.
 ///
 /// Three claims, and each one is a way of being a socket:
@@ -363,6 +425,216 @@ fn a_spy_that_arrives_first_is_given_the_publication_when_it_appears() {
     );
 
     assert_the_spy_has_no_socket(&cnc, &client, spy, &channel);
+
+    let _ = own.stop();
+}
+
+/// A13-d: whether a publication **counts** the spy that reads it.
+///
+/// The two halves are the same arrangement with one setting between them. A
+/// unicast publication with no receiver has a limit of `snd-pos`, and `snd-pos`
+/// only moves when a receiver's status message opens the window — so a stream
+/// whose only reader is a spy is **stalled**, and the producer cannot publish
+/// the very message the spy is waiting to read. `aeron.spies.simulate.connection`
+/// is what says the spy stands in for the wire.
+///
+/// What a client sees of that is the log buffer's `is_connected` byte: an
+/// `offer` against it comes back `NotConnected` until the publication has a
+/// reader, and a spy is one exactly when the setting says so. So the two tests
+/// below differ in one flag and in the answer to "does this offer work at all",
+/// and both of them read the same 200 messages through the same spy when it
+/// does.
+#[test]
+fn a_spy_counts_as_a_connection_when_the_setting_says_so() {
+    let Some(mut own) =
+        OwnDriver::start_with("spy-ssc-on", &["-Daeron.spies.simulate.connection=true"])
+    else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let cnc = own
+        .await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        free_port(5)
+    );
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+
+    // The spy, and deliberately **no** ordinary subscriber: it is the only
+    // reader this stream will ever have.
+    let spy = client
+        .add_subscription(&format!("aeron-spy:{channel}"), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a spy subscription on the channel");
+
+    // No probe offer before this, and the reason is the message itself: what
+    // is being read is a *sequence*, so a probe that put one message in the
+    // stream and did not count it would make every number afterwards wrong.
+    // That the producer may publish at all is what the 200 messages prove.
+    publish_and_read(&mut client, publication, &[spy], "a spy as the only reader");
+
+    // And `snd-pos` follows, which is the other half of the fiction: nothing
+    // has left the machine, but the stream has got as far as its reader, and
+    // the counter that says what was sent says so.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let sent = loop {
+        let sent = counter_value(&cnc, "snd-pos").unwrap_or(0);
+
+        if sent > 0 {
+            break sent;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "`snd-pos` never moved: an `ssc` publication with only spies takes it up to them"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(
+        sent <= MESSAGES * LENGTH as i64,
+        "`snd-pos` is where the readers are, and no further: {sent}"
+    );
+
+    let _ = own.stop();
+}
+
+#[test]
+fn a_spy_is_not_a_connection_without_the_setting() {
+    let Some(mut own) = OwnDriver::start("spy-ssc-off") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let cnc = own
+        .await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        free_port(6)
+    );
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+
+    let spy = client
+        .add_subscription(&format!("aeron-spy:{channel}"), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a spy subscription on the channel");
+
+    // The link is made — the spy has an image for the publication's buffer —
+    // and the publication does not count it, because nobody asked it to.
+    assert!(
+        !an_offer_is_taken(&mut client, publication, Duration::from_secs(2)),
+        "without `ssc` a spy is not a reader, so there is no receiver, no window, and nothing \
+         to publish"
+    );
+
+    assert_eq!(
+        0,
+        counter_value(&cnc, "snd-pos").unwrap_or(0),
+        "nothing was sent, because nothing could be"
+    );
+    assert_eq!(
+        0,
+        counter_value(&cnc, "pub-pos").unwrap_or(0),
+        "and nothing was published"
+    );
+
+    // The spy still holds an image: what `ssc` decides is not whether the spy
+    // is linked, but whether the publication counts the link.
+    await_images(&mut client, spy, 1, "the link is made whatever `ssc` says");
+
+    let _ = own.stop();
+}
+
+/// The other half of the reader count: a spy that **leaves**.
+///
+/// A spy added as a source is the one kind that can be taken out again — a
+/// subscription removal goes through the same path, but no client can ask for
+/// one yet (`Client` has no `remove_subscription`), so this is where the
+/// removal is end to end.
+///
+/// What it pins is that the publication is *told*. A reader left in a
+/// publication's set after its counter has been given back is a limit computed
+/// from an id something else now owns — and, with `ssc`, a stream that stays
+/// connected for a reader that is gone. So the assertion is that the producer
+/// **stops**: the source is removed, the last reader with it, and the next
+/// offer is refused.
+#[test]
+fn a_publication_forgets_a_spy_that_is_taken_away() {
+    let Some(mut own) = OwnDriver::start_with(
+        "spy-ssc-source-removed",
+        &["-Daeron.spies.simulate.connection=true"],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let cnc = own
+        .await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{}|term-length=64k",
+        free_port(7)
+    );
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+
+    let mds = client
+        .add_subscription(
+            &format!(
+                "aeron:udp?control=127.0.0.1:{}|control-mode=manual",
+                free_port(8)
+            ),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a multi-destination subscription");
+
+    let source = format!("aeron-spy:{channel}");
+
+    client
+        .add_rcv_destination(mds, &source, DEFAULT_TIMEOUT)
+        .expect("a spy is served as a receive destination");
+
+    // The spy is the only reader, so this is the `ssc` path again — the
+    // publication counts it, and the messages go into the buffer for it.
+    publish_and_read(&mut client, publication, &[mds], "a spy added as a source");
+
+    // While the spy is there the producer's window reaches past what has been
+    // sent: the limit is the furthest reader plus a term window, and a reader
+    // does not have to be on the wire for that to hold.
+    await_limits(
+        &cnc,
+        |limit, sent| limit > sent,
+        "a spy with `ssc` opens the producer's window",
+    );
+
+    client
+        .remove_rcv_destination(mds, &source, DEFAULT_TIMEOUT)
+        .expect("the source comes back out");
+
+    // And when the last reader goes the limit collapses onto `snd-pos`, which
+    // is what a publication with no readers has. A publication that still
+    // counted the spy it was just told to forget would hold the window open.
+    await_limits(
+        &cnc,
+        |limit, sent| limit == sent,
+        "the publication forgets the spy it was told to drop",
+    );
 
     let _ = own.stop();
 }

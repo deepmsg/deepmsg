@@ -53,6 +53,7 @@ use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
 use crate::receive_endpoints::ReceiveChannelEndpoints;
 use crate::receiver::ReceiverProxy;
+use crate::sender::SenderProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
 use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
@@ -569,6 +570,7 @@ impl IpcSubscriptions {
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
         publications: &NetworkPublications,
+        sender: &SenderProxy,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
@@ -644,7 +646,7 @@ impl IpcSubscriptions {
                 continue;
             }
 
-            link_spy_publication(link, publication, counters, regions, now, events)
+            link_spy_publication(link, publication, counters, regions, sender, now, events)
                 .map_err(|()| AddSubscriptionError::Link)?;
         }
 
@@ -670,6 +672,7 @@ impl IpcSubscriptions {
         publication: &NetworkPublicationRecord,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
+        sender: &SenderProxy,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> usize {
@@ -687,7 +690,9 @@ impl IpcSubscriptions {
                 continue;
             }
 
-            if link_spy_publication(link, publication, counters, regions, now, events).is_err() {
+            if link_spy_publication(link, publication, counters, regions, sender, now, events)
+                .is_err()
+            {
                 failures += 1;
             }
         }
@@ -728,6 +733,7 @@ impl IpcSubscriptions {
         regions: &CounterRegions<'_>,
         endpoints: &ReceiveChannelEndpoints,
         publications: &NetworkPublications,
+        sender: &SenderProxy,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
@@ -796,7 +802,7 @@ impl IpcSubscriptions {
                 continue;
             }
 
-            link_spy_publication(link, publication, counters, regions, now, events)
+            link_spy_publication(link, publication, counters, regions, sender, now, events)
                 .map_err(|()| AddSubscriptionError::Link)?;
         }
 
@@ -820,12 +826,14 @@ impl IpcSubscriptions {
     ///
     /// `false` when no such link is there, which the reference answers with an
     /// error naming the subscription.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn remove_spy_destination(
         &mut self,
         registration_id: i64,
         channel: &[u8],
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
+        sender: &SenderProxy,
         now_ms: i64,
         events: &mut impl ClientEvents,
     ) -> bool {
@@ -840,6 +848,13 @@ impl IpcSubscriptions {
         let link = self.links.swap_remove(index);
 
         for entry in &link.subscribables {
+            // The publication is told before the counter goes back, for the
+            // same reason the message is sent before it: a set holding a freed
+            // counter id reads whatever takes its place.
+            if let SubscriptionTarget::NetworkPublication(publication) = entry.target {
+                let _ = sender.remove_subscriber(publication, entry.counter_id);
+            }
+
             events.unavailable_image(
                 entry.target.registration_id(),
                 link.registration_id,
@@ -1021,6 +1036,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        sender: &SenderProxy,
         now_ms: i64,
     ) -> bool {
         let mut found = false;
@@ -1034,7 +1050,15 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
-            unlink_all(link, counters, regions, publications, None, now_ms);
+            unlink_all(
+                link,
+                counters,
+                regions,
+                publications,
+                None,
+                Some(sender),
+                now_ms,
+            );
             found = true;
         }
 
@@ -1050,6 +1074,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        sender: &SenderProxy,
         now_ms: i64,
     ) -> usize {
         let mut removed = 0;
@@ -1063,7 +1088,15 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
-            unlink_all(link, counters, regions, publications, None, now_ms);
+            unlink_all(
+                link,
+                counters,
+                regions,
+                publications,
+                None,
+                Some(sender),
+                now_ms,
+            );
             removed += 1;
         }
 
@@ -1530,6 +1563,7 @@ fn unlink_all(
     regions: &CounterRegions<'_>,
     publications: &mut IpcPublications,
     receiver: Option<&ReceiverProxy>,
+    sender: Option<&SenderProxy>,
     now_ms: i64,
 ) {
     for entry in &link.subscribables {
@@ -1543,11 +1577,14 @@ fn unlink_all(
                     let _ = receiver.remove_subscriber(registration_id, entry.counter_id);
                 }
             }
-            // A network publication's readers are the sender's, and this build
-            // does not put a spy's position in that set yet: a spy's counter is
-            // the whole of the link on this side, so giving it back is the
-            // whole of the removal.
-            SubscriptionTarget::NetworkPublication(_) => {}
+            // A network publication's readers are the sender's, so the
+            // position comes out of its set before the counter goes back — a
+            // set that still held the id would read whatever took its place.
+            SubscriptionTarget::NetworkPublication(registration_id) => {
+                if let Some(sender) = sender {
+                    let _ = sender.remove_subscriber(registration_id, entry.counter_id);
+                }
+            }
             SubscriptionTarget::IpcPublication(registration_id) => {
                 if let Some(publication) = publications
                     .publications_mut()
@@ -1664,6 +1701,7 @@ fn link_spy_publication(
     publication: &NetworkPublicationRecord,
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
+    sender: &SenderProxy,
     now: crate::ipc_publications::Now,
     events: &mut impl ClientEvents,
 ) -> Result<(), ()> {
@@ -1695,7 +1733,28 @@ fn link_spy_publication(
         counters,
         regions,
         events,
-    )
+    )?;
+
+    // And only now does the **publication** hear about it, which is the
+    // reader count this whole path exists for: from here the publication
+    // counts the spy, its limits are computed with it, and `ssc` can make it
+    // look connected. The counter is already seeded (in `publish_reader`),
+    // because the sender reads it the moment the position is in the set — the
+    // reference has the two in the other order only because one thread does
+    // both.
+    let _ = sender.add_subscriber(
+        publication.registration_id,
+        TetherablePosition {
+            counter_id,
+            subscription_registration_id: link.registration_id,
+            time_of_last_update_ns: now.ns,
+            state: TetherState::Active,
+            is_tether: link.is_tether,
+            is_rejoin: link.is_rejoin,
+        },
+    );
+
+    Ok(())
 }
 
 /// The first two steps of a link: the reader's counter, with the join position

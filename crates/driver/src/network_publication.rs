@@ -56,7 +56,7 @@ use crate::protocol::{
 };
 use crate::publication_params::PublicationParams;
 use crate::retransmit_handler::{Faults, NakOutcome, Resend, RetransmitHandler};
-use crate::subscribable::Subscribable;
+use crate::subscribable::{Subscribable, SubscribableHooks, TetherablePosition};
 use crate::system_counters::{self, System};
 
 /// How long a publication keeps saying `SETUP` while nothing has answered
@@ -97,6 +97,35 @@ pub struct PublicationCounters {
 struct ReceiverLiveness {
     receiver_id: i64,
     last_sm_ns: i64,
+}
+
+/// What a publication does to its own state when a spy comes or goes
+/// (`aeron_network_publication_add_subscriber_hook`, `:1353-1362`, and
+/// `aeron_network_publication_remove_subscriber_hook`, `:1364-1378`).
+///
+/// The reference's two hooks do two things each: they maintain `has_spies`,
+/// and — when `ssc` — they rewrite the log buffer's connected byte. Only the
+/// first is here, because the second needs the counter regions and the
+/// subscribable set at once, and the set is what is borrowed while a hook
+/// runs. The caller does it immediately after, which is the same moment on the
+/// same thread.
+struct SpyHooks<'a> {
+    /// The publication's flag, which the two hooks are the only writers of.
+    has_spies: &'a mut bool,
+}
+
+impl SubscribableHooks for SpyHooks<'_> {
+    fn position_added(&mut self, _position: &TetherablePosition) {
+        *self.has_spies = true;
+    }
+
+    fn position_removed(&mut self, _position: &TetherablePosition, working_before: usize) {
+        // One working position before the removal means this was the last
+        // reader (`:1367-1370`, which asks the same question of the set).
+        if 1 == working_before {
+            *self.has_spies = false;
+        }
+    }
 }
 
 /// A publication that sends over UDP.
@@ -140,6 +169,31 @@ pub struct NetworkPublication {
     /// The subscribers reading this publication *locally* — for a network
     /// publication, the spies. A remote reader reads its own driver's image.
     pub subscribers: Subscribable,
+    /// Whether a spy counts as a connection here — the `ssc` parameter, which
+    /// the driver's `aeron.spies.simulate.connection` or the channel's `ssc=`
+    /// may set (`aeron_network_publication.c:289`).
+    ///
+    /// False by default, and that default is the whole difference between a
+    /// stream whose only reader is a spy being *live* and being *stalled*: a
+    /// unicast publication with no receiver has a limit of `snd-pos`, and
+    /// `snd-pos` only moves when a receiver's status message opens the window.
+    /// A spy is not a receiver, so without this the producer cannot publish
+    /// the message the spy is waiting to read.
+    pub spies_simulate_connection: bool,
+    /// Whether any spy is reading, kept by the two hooks rather than counted
+    /// (`aeron_network_publication.c:1353-1362`, `:1364-1378`).
+    ///
+    /// It is the flag the idle branch reads, beside `max_spy_position` — the
+    /// two are the reference's pair, and the branch asks both because a
+    /// position is only meaningful once one has been reported.
+    pub has_spies: bool,
+    /// The largest position any spy has reported
+    /// (`conductor_fields.max_spy_position`, `aeron_network_publication.c:963-979`).
+    ///
+    /// Seeded at `snd-pos` on every update, so it is never behind what has
+    /// already been sent — which is what makes it safe for the idle branch to
+    /// move `snd-pos` forward to it.
+    pub max_spy_position: i64,
     /// When a `SETUP` was last sent.
     pub time_of_last_setup_ns: i64,
     /// When data or a heartbeat was last sent.
@@ -338,6 +392,13 @@ impl NetworkPublication {
             retransmit_handler,
             signal_eos: params.signal_eos,
             subscribers: Subscribable::new(registration_id),
+            spies_simulate_connection: params.spies_simulate_connection,
+            // Nothing reads this publication yet, and no reader has said how
+            // far it has got (`aeron_network_publication.c:293`, `:249`-style:
+            // the reference's `conductor_fields.max_spy_position` starts at
+            // zero like every other position).
+            has_spies: false,
+            max_spy_position: 0,
             // The first `SETUP` is due at once. The reference seeds this a
             // timeout and a nanosecond *before* now, so that
             // `now_ns > time_of_last_setup_ns + SETUP_TIMEOUT_NS` already holds
@@ -475,15 +536,32 @@ impl NetworkPublication {
                 term_offset,
             )?;
 
-            // `:616-638`: an idle pass is the flow control's chance to move the
-            // limit — the `max` strategy does nothing with it, and the
-            // strategies that do (a multicast sender waiting for receivers)
-            // belong to multicast, refused here and recorded in
-            // `docs/compat.md`.
+            // `:612-636`: an idle pass is where a publication with **only
+            // spies** moves at all, and it moves because there is nothing to
+            // send. `snd-pos` says what has left the machine, and with no
+            // receiver nothing ever does — so for an `ssc` stream the spies
+            // stand in for the wire and `snd-pos` is taken up to the furthest
+            // of them. The flow control is asked from there rather than from
+            // `snd-pos`, which is what makes `snd-lmt` follow.
             let snd_lmt = counters.value(regions, self.counters.snd_lmt).unwrap_or(0);
-            let new_limit =
+
+            let new_limit = if self.spies_simulate_connection
+                && self.has_spies
+                && !self.has_receivers()
+            {
+                let new_snd_pos = self.max_spy_position.max(snd_pos);
+                let _ = counters.set_value(regions, self.counters.snd_pos, new_snd_pos);
+
                 self.flow_control
-                    .on_idle(now_ns, snd_lmt, snd_pos, self.is_end_of_stream);
+                    .on_idle(now_ns, new_snd_pos, new_snd_pos, self.is_end_of_stream)
+            } else {
+                // Otherwise the limit is the flow control's to move — the
+                // `max` strategy does nothing with it, and the strategies that
+                // do (a multicast sender waiting for receivers) belong to
+                // multicast, refused here and recorded in `docs/compat.md`.
+                self.flow_control
+                    .on_idle(now_ns, snd_lmt, snd_pos, self.is_end_of_stream)
+            };
 
             if new_limit != snd_lmt {
                 let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
@@ -1235,20 +1313,69 @@ impl NetworkPublication {
     }
 
     /// Whether this publication counts a reader at all
-    /// (`aeron_network_publication_has_subscribers`, `:755-767`).
+    /// (`aeron_network_publication_has_subscribers`, `:755-766`).
+    ///
+    /// Two ways to have one, and they are not the same kind of thing: a
+    /// **receiver** is a remote reader that has said it is there, and a
+    /// **spy** is a local one reading this buffer. The second counts only when
+    /// `ssc` asked it to — which is what the setting is for, and why a stream
+    /// no one has subscribed to over the wire can still be live.
+    ///
+    /// The reference's receiver clause also asks the flow control whether it
+    /// *requires* receivers (`has_required_receivers`), which is true for
+    /// every strategy but a multicast one. This build serves unicast only, so
+    /// the question has one answer here.
     pub fn has_subscribers(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> bool {
-        if self.has_receivers() {
-            return true;
-        }
-
-        // `spies_simulate_connection` is the `ssc` parameter; this build has no
-        // spy link, so a local reader never counts as a connection here. The
-        // parameter is read, reaches a publication's metadata, and nothing acts
-        // on it — `docs/compat.md` lists it among the settings read and not
-        // acted on.
         let _ = (counters, regions);
 
-        false
+        self.has_receivers()
+            || (self.spies_simulate_connection && self.subscribers.has_working_positions())
+    }
+
+    /// Give this publication a local reader
+    /// (`aeron_driver_subscribable_add_position`, `:3497-3523`, reached from
+    /// the conductor's `link_subscribable`).
+    ///
+    /// The hook runs before the position counts, as it does there — which is
+    /// why the reference's add hook writes `true` for the connected status
+    /// rather than asking: at that moment a publication with one spy still
+    /// looks like one with none.
+    ///
+    /// # Returns
+    ///
+    /// Whether the connected status has to be rewritten. The caller does that,
+    /// because the write needs the counter regions and this does not have them.
+    pub fn add_spy(&mut self, position: TetherablePosition) -> bool {
+        let mut hooks = SpyHooks {
+            has_spies: &mut self.has_spies,
+        };
+        self.subscribers.add_position(position, &mut hooks);
+
+        self.spies_simulate_connection
+    }
+
+    /// Take a local reader away (`aeron_driver_subscribable_remove_position`,
+    /// `:3525-3545`).
+    ///
+    /// The reference's remove hook asks `has_subscribers` for the status to
+    /// write, and that expression is **true by construction** where it runs:
+    /// the hook is called with the position still in the set, and the position
+    /// being removed counts as a working one either way — it was active, or
+    /// its `inactive_count` has already come down. So the status it writes is
+    /// `true`, and what settles it afterwards is the next pass of
+    /// [`Self::update_pub_pos_and_lmt`] — the same pass that would have settled
+    /// it in the reference.
+    ///
+    /// # Returns
+    ///
+    /// Whether the connected status has to be rewritten.
+    pub fn remove_spy(&mut self, counter_id: i32) -> bool {
+        let mut hooks = SpyHooks {
+            has_spies: &mut self.has_spies,
+        };
+        let _ = self.subscribers.remove_position(counter_id, &mut hooks);
+
+        self.spies_simulate_connection
     }
 
     /// Write the log buffer's connected byte, which is what a client's
@@ -1335,6 +1462,22 @@ impl NetworkPublication {
         let _ = counters.set_value(regions, self.counters.pub_pos, producer_position);
 
         if self.has_subscribers(counters, regions) {
+            // The furthest any local reader has got, which only the `ssc` idle
+            // branch below reads (`:961-980`): it is seeded at `snd-pos` and
+            // never falls, so moving `snd-pos` up to it can never move it
+            // backwards. Nothing here but the spies — a remote reader's
+            // position arrives as a status message and is not in this set.
+            if !self.subscribers.is_empty() {
+                let max_consumer = self
+                    .subscribers
+                    .max_active_position(counters, regions)
+                    .unwrap_or(snd_pos);
+
+                if max_consumer > self.max_spy_position {
+                    self.max_spy_position = max_consumer;
+                }
+            }
+
             let min_consumer = self
                 .subscribers
                 .min_active_position(counters, regions)

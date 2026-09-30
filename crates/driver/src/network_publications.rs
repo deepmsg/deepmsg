@@ -702,6 +702,7 @@ impl NetworkPublications {
             self.publications.last().expect("just pushed"),
             counters,
             regions,
+            sender,
             now,
             events,
         );

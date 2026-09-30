@@ -52,6 +52,7 @@ use crate::protocol::{
     ErrorFrame, FRAME_ALIGNMENT, FrameHeader, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame,
     RttmFrame, StatusMessageFrame, frame_type, header_flags, is_frame_valid,
 };
+use crate::subscribable::TetherablePosition;
 use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
@@ -80,6 +81,35 @@ pub enum SenderCommand {
     RemovePublication {
         /// Which one.
         registration_id: i64,
+    },
+    /// Give a publication a local reader
+    /// (`aeron_driver_subscribable_add_position`,
+    /// `aeron_driver_conductor.c:3497-3523`).
+    ///
+    /// The conductor cannot do this itself: what a reader joins is the
+    /// publication's own subscribable set, and a network publication is the
+    /// sender's. A publication that has gone in the meantime is skipped — the
+    /// link is the conductor's record either way, and the reader is a position
+    /// nothing will ever compute a limit from.
+    AddSubscriber {
+        /// Which publication.
+        registration_id: i64,
+        /// The reader, whose counter the conductor has **already** seeded:
+        /// the sender reads positions to compute the producer's limit, and a
+        /// reader that appeared at zero would hold the producer back to a
+        /// place it never was.
+        position: TetherablePosition,
+    },
+    /// Take one away (`aeron_driver_subscribable_remove_position`, `:3525-3545`).
+    ///
+    /// The counter goes back to the conductor's hands after this, which is why
+    /// the message is sent before the free and not after: a set that still
+    /// holds a freed id reads whatever took its place.
+    RemoveSubscriber {
+        /// Which publication.
+        registration_id: i64,
+        /// Which reader.
+        counter_id: i32,
     },
     /// Close an endpoint's socket and give the endpoint up.
     RemoveEndpoint {
@@ -199,6 +229,24 @@ pub struct SenderProxy {
 }
 
 impl SenderProxy {
+    /// A proxy whose thread is **not there**: everything a caller hands it is
+    /// dropped, and every method answers as if the sender had stopped.
+    ///
+    /// It exists for the parts of the driver the conductor exercises on their
+    /// own — a client being reaped, a subscription being removed — where what
+    /// is under test is the conductor's own bookkeeping and not what the
+    /// sender does with it. Those callers already ignore the failure, because
+    /// a sender that has stopped is not a reason to leak a counter.
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let (commands, _) = mpsc::channel();
+
+        Self {
+            commands,
+            events: mpsc::channel().1,
+        }
+    }
+
     /// Ask the sender to take an endpoint.
     ///
     /// # Errors
@@ -293,6 +341,38 @@ impl SenderProxy {
             .send(SenderCommand::RemoveDestinationById {
                 endpoint_id,
                 registration_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to make a publication count a local reader.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn add_subscriber(
+        &self,
+        registration_id: i64,
+        position: TetherablePosition,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::AddSubscriber {
+                registration_id,
+                position,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Ask the sender to stop counting one.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_subscriber(&self, registration_id: i64, counter_id: i32) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RemoveSubscriber {
+                registration_id,
+                counter_id,
             })
             .map_err(|_| stopped())
     }
@@ -408,6 +488,11 @@ struct SenderThread {
     /// reference applies these at the top of its send pass for the same reason
     /// (`aeron_driver_sender.c:196-200`).
     pending_destinations: Vec<SenderCommand>,
+    /// Reader changes waiting for a pass that has the counters, for the same
+    /// reason and with the same shape as the destinations above: what a reader
+    /// joins is a publication's position set, and computing anything from it
+    /// needs the counter regions.
+    pending_subscribers: Vec<SenderCommand>,
     last_cycle_ns: i64,
     idle: Backoff,
 }
@@ -430,6 +515,7 @@ impl SenderThread {
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
             pending_destinations: Vec::new(),
+            pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
             idle: Backoff::new(),
         }
@@ -463,6 +549,10 @@ impl SenderThread {
                     | SenderCommand::RemoveDestination { .. }
                     | SenderCommand::RemoveDestinationById { .. }) => {
                         self.pending_destinations.push(command);
+                    }
+                    command @ (SenderCommand::AddSubscriber { .. }
+                    | SenderCommand::RemoveSubscriber { .. }) => {
+                        self.pending_subscribers.push(command);
                     }
                     SenderCommand::Stop => stop = true,
                 }
@@ -500,6 +590,12 @@ impl SenderThread {
             &self.counters,
             &regions,
             now_ns,
+        );
+        Self::apply_subscribers(
+            &mut self.publications,
+            &mut self.pending_subscribers,
+            &self.counters,
+            &regions,
         );
 
         let system = System::new(&self.counters, &regions);
@@ -583,6 +679,66 @@ impl SenderThread {
                     registration_id, ..
                 } => {
                     tracker.remove_by_id(counters, regions, registration_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply the reader changes the conductor asked for.
+    ///
+    /// A publication that is not there is skipped, and so is a reader whose
+    /// publication never existed: the conductor has already answered the
+    /// client and holds the link itself, so what is lost is a limit computed
+    /// without a reader that is on its way out anyway.
+    ///
+    /// The connected status is rewritten here rather than in the hook, and
+    /// only when `ssc` is set — which is what the reference's two hooks do
+    /// (`aeron_network_publication.c:1353-1378`) and the only thing about a
+    /// spy that a *client* can see.
+    fn apply_subscribers(
+        publications: &mut [NetworkPublication],
+        pending: &mut Vec<SenderCommand>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) {
+        for command in std::mem::take(pending) {
+            match command {
+                SenderCommand::AddSubscriber {
+                    registration_id,
+                    position,
+                } => {
+                    let Some(publication) = publications
+                        .iter_mut()
+                        .find(|publication| publication.registration_id == registration_id)
+                    else {
+                        continue;
+                    };
+
+                    // Both hooks write `true` — the add one literally, and the
+                    // remove one's `has_subscribers` is a constant where it
+                    // runs (see [`NetworkPublication::remove_spy`]). What
+                    // settles the status afterwards is the next pass of
+                    // `update_pub_pos_and_lmt`, the same pass that would settle
+                    // it in the reference.
+                    if publication.add_spy(position) {
+                        publication.update_connected_status(counters, regions, true);
+                    }
+                }
+                SenderCommand::RemoveSubscriber {
+                    registration_id,
+                    counter_id,
+                } => {
+                    let Some(publication) = publications
+                        .iter_mut()
+                        .find(|publication| publication.registration_id == registration_id)
+                    else {
+                        continue;
+                    };
+
+                    if publication.remove_spy(counter_id) {
+                        publication.update_connected_status(counters, regions, true);
+                    }
                 }
                 _ => {}
             }

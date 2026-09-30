@@ -302,6 +302,19 @@ reads from each destination it was given, one socket each — the multi-destinat
 client learns the port a channel that named port zero was given
 (`aeron_counter_local_sockaddr_indicator_allocate`, `aeron_position.c:276-306`).
 
+An `aeron-spy:` subscription is served: it reads a **local** network
+publication's log buffer with no socket of its own, and the client is sent an
+ordinary image whose log file is that publication's own and whose source
+identity is the IPC constant (`aeron_driver_conductor.c:4904-4916`), so a
+client that reads images reads this one unchanged. A publication **counts**
+such a reader when `aeron.spies.simulate.connection` is set — the `ssc`
+parameter, by the driver's setting or the channel's — which is what lets a
+stream whose only reader is a spy be live: `snd-pos` follows the furthest spy
+and the producer's window opens from it
+(`aeron_network_publication.c:612-636`, `:947-1009`). Acceptance is our client
+on our driver and the reference's own client on our driver
+(`tests/integration/spy_subscription.rs`, `tests/interop/spy_reference.rs`).
+
 A **response channel** is served end to end: the `control-mode=response`
 subscription, the `SEND_RESPONSE` bit a publication with a
 `response-correlation-id=` puts in its SETUP, the RSP_SETUP an image sends back
@@ -389,7 +402,7 @@ The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
 
-Two settings are **read and not acted on**, which is not the same thing as
+One setting is **read and not acted on**, which is not the same thing as
 being unknown:
 
 - `aeron.send.to.status.poll.ratio` (`aeronmd.h:257`, the reference's
@@ -398,13 +411,6 @@ being unknown:
   strongest setting of the same knob; a value below `1` is refused and
   anything else is accepted and has no effect. Acting on it means the sender's
   idle strategy, which this build does not have.
-- `aeron.spies.simulate.connection` (`aeronmd.h:178`) is read and reaches a
-  publication's parameters, and an `aeron-spy:` subscription is served — but
-  what the setting decides is whether a publication **counts** its spies
-  (`aeron_network_publication.c:618`, `:761`), and this build's network
-  publications do not count them yet: a spy reads a local publication's log
-  buffer, while the publication's limits are still computed from its receivers
-  alone.
 
 `aeron.threading.mode` is the one setting of the reference's that this build
 does not read at all: its four values choose between dedicated, shared,
