@@ -2639,9 +2639,16 @@ impl Conductor {
             .error_log
             .record(&region, self.now_ms, error_code, description)
         {
-            // The reference prints a formatted date here; stderr is a
-            // diagnostic and not a contract, and the epoch time says the same
-            // thing (`aeron_distinct_error_log.c:183-191`).
+            // stderr, because the reference's recorder writes there itself —
+            // this is the one line the driver prints on a path that is not a
+            // start-up or shutdown failure, and it is faithful
+            // (`aeron_distinct_error_log.c:189`, `AERON_FPRINTF(stderr, ...)`).
+            // The reference formats a date; the epoch time says the same thing
+            // and the stream, which is the part that is observable, matches.
+            //
+            // The reference's own system tests would be red on this too if they
+            // could reach it, which is the point: it means an error log that
+            // cannot hold an entry is visible instead of silent.
             eprintln!("{} - unrecordable error {}", self.now_ms, description);
         }
     }

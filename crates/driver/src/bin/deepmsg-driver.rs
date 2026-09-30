@@ -18,6 +18,30 @@
 //! later check can undo. Step 2 before step 3 is the second one that cannot be
 //! swapped, and for the opposite reason: it is the only step whose failure
 //! mode is "the process is killed mid-delete".
+//!
+//! # Which stream a message goes to
+//!
+//! **stderr is a contract; stdout is not.** The reference's own system tests
+//! check it: every test that is not annotated `@IgnoreStdErr` asserts the
+//! driver process's stderr file is **zero bytes long**
+//! (`aeron-test-support/src/main/java/io/aeron/test/MediaDriverTestUtil.java:128-132`,
+//! reached from `:95-99`), and the C harness this driver is launched by is the
+//! reference's own (`CTestMediaDriver.java:332`). A diagnostic line on stderr
+//! therefore fails a test that has nothing to do with it.
+//!
+//! The reference keeps the rule by printing on the happy path **nothing at
+//! all**: `aeronmd`'s stderr writes are all failure branches
+//! (`aeron-driver/src/main/c/aeronmd.c:78,98,107,117,124,131,141,148,155,175,181`),
+//! and its one happy-path print — the configuration dump — goes to stdout
+//! (`aeron_driver.c:504-506`, gated on `AERON_PRINT_CONFIGURATION`, which the
+//! test harness sets unconditionally at `CTestMediaDriver.java:268`).
+//!
+//! So the split below is by *kind*, not by severity: an operator-facing
+//! diagnostic that fires on a normal run goes to stdout, and stderr is reserved
+//! for the paths where the driver is reporting that something failed. The one
+//! place that is arguable is the shutdown summary of commands nobody served:
+//! it is information, not a failure — the clients that sent them were answered
+//! with an error at the time — so it goes to stdout with the rest.
 
 use std::io;
 use std::process::ExitCode;
@@ -58,6 +82,20 @@ fn main() -> ExitCode {
 
     for notice in prepared.notices() {
         match notice {
+            // Deliberately stderr, against the rule above: this is the one
+            // diagnostic the reference itself writes there. It warns *before*
+            // it deletes, so a delete-on-start deployment warns too
+            // (`aeron-driver/src/main/c/aeron_driver.c:139-149`), and the
+            // reference's own warning goes to stderr
+            // (`aeron_log_func_stderr`, `:145`).
+            //
+            // It is unreachable from the reference's system tests, which is why
+            // it is safe to keep faithful: the harness never sets
+            // `AERON_DIR_WARN_IF_EXISTS` — not among the variables it derives
+            // from `MediaDriver.Context` (`CTestMediaDriver.java:218-260`) and
+            // not among the ones tests add through
+            // `getAdditionalEnvVarsMap` — so `warn_if_dirs_exist` keeps its
+            // `false` default and no notice is ever pushed.
             dir::Notice::DirectoryExists { path } => {
                 eprintln!("deepmsg-driver: WARNING: {} exists", path.display());
             }
@@ -106,7 +144,9 @@ fn main() -> ExitCode {
         }
     };
 
-    eprintln!(
+    // stdout, not stderr: this line is written on every healthy start, and the
+    // reference's own harness asserts stderr is empty (see the module docs).
+    println!(
         "deepmsg-driver: media driver running, aeron.dir={} (CnC version {}, pid {})",
         config.aeron_dir.display(),
         deepmsg_core::version::format_version(deepmsg_core::version::CNC_VERSION),
@@ -137,7 +177,9 @@ fn shutdown(conductor: &mut Conductor, prepared: dir::PreparedDir) -> ExitCode {
     let unhandled = conductor.unhandled_commands();
     let unknown = conductor.unknown_commands();
     if 0 != unhandled || 0 != unknown {
-        eprintln!(
+        // stdout: a summary of what was *not* done, which every client that
+        // asked was already told — not a failure of this process.
+        println!(
             "deepmsg-driver: {unhandled} commands were not implemented and {unknown} were not in the \
              protocol; {last:?} was the last, and the clients that sent one have timed out",
             last = conductor.last_unhandled(),
@@ -149,7 +191,13 @@ fn shutdown(conductor: &mut Conductor, prepared: dir::PreparedDir) -> ExitCode {
         // was stopped by (`aeronmd.c:39-42`), and returning 0 here would make a
         // signalled driver indistinguishable from one that was asked to stop.
         Some(signal) => {
-            eprintln!("deepmsg-driver: stopping on signal {signal}");
+            // stdout: how this process was asked to stop is not itself a
+            // failure. It is also why this line is the one that matters least —
+            // the harness's own path is TERMINATE_DRIVER, and its fallback is
+            // `destroyForcibly` (SIGKILL), which reaches no handler at all
+            // (`CTestMediaDriver.java:599`). It is here so that a driver stopped
+            // by hand does not look like one that failed.
+            println!("deepmsg-driver: stopping on signal {signal}");
             ExitCode::from(u8::try_from(signal).unwrap_or(1))
         }
         None => ExitCode::SUCCESS,
