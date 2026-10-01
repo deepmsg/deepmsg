@@ -973,7 +973,7 @@ impl SenderThread {
                 };
 
                 if is_send_setup {
-                    publications[index].trigger_send_setup_frame(source);
+                    publications[index].trigger_send_setup_frame(source, frame.group_tag(bytes));
                     return;
                 }
 
@@ -1304,7 +1304,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
-    use crate::flowcontrol::MaxStrategy;
+    use crate::flowcontrol::FlowControl;
     use crate::media::TransportParams;
     use crate::network_publication::{NetworkPublication, PublicationCounters};
     use crate::publication_params::PublicationParams;
@@ -1566,7 +1566,7 @@ mod tests {
                 false,
                 ids,
                 4,
-                MaxStrategy::default(),
+                FlowControl::default(),
                 RetransmitHandler::new(1_000, 5_000_000, false, 1),
                 4096,
                 crate::sys::SocketBufferLengths {

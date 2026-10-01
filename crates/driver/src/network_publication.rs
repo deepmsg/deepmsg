@@ -48,7 +48,7 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
 use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
 
-use crate::flowcontrol::{MaxStrategy, Strategy, receiver_window_length};
+use crate::flowcontrol::{FlowControl, Strategy, receiver_window_length};
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::protocol::{
     DataFrame, ErrorFrame, FrameHeader, NakFrame, RttmFrame, SetupFrame, StatusMessageFrame,
@@ -162,8 +162,9 @@ pub struct NetworkPublication {
     pub mtu_length: i32,
     /// How far ahead of the slowest local reader the producer may run.
     pub term_window_length: i32,
-    /// `max`, for a unicast channel.
-    pub flow_control: MaxStrategy,
+    /// What `fc=` chose for this publication, and `max` when it chose
+    /// nothing.
+    pub flow_control: FlowControl,
     /// The retransmissions this publication owes.
     pub retransmit_handler: RetransmitHandler,
     /// Whether the stream signals end of stream in its heartbeats.
@@ -304,7 +305,7 @@ impl NetworkPublication {
         is_exclusive: bool,
         counters: PublicationCounters,
         max_messages_per_send: usize,
-        flow_control: MaxStrategy,
+        flow_control: FlowControl,
         retransmit_handler: RetransmitHandler,
         page_size: usize,
         socket_buffers: crate::sys::SocketBufferLengths,
@@ -642,6 +643,16 @@ impl NetworkPublication {
 
         if frame.write_with_flags(&mut buffer, flags).is_none() {
             return Ok(0);
+        }
+
+        if self.is_setup_elicited {
+            // `:414-421`: only an elicited setup is reported, and it is
+            // reported *before* the frame goes out — a strategy that gates on
+            // the setup it sent reads the limit from this moment
+            // (`aeron_min_flow_control.c:283-303`).
+            let snd_lmt = counters.value(regions, self.counters.snd_lmt).unwrap_or(0);
+
+            self.flow_control.on_setup(now_ns, snd_lmt);
         }
 
         let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
@@ -1073,28 +1084,33 @@ impl NetworkPublication {
     /// good. Without it a receiver that has restarted, or a second one that
     /// arrives later, is never answered and builds no image.
     ///
-    /// The reference also hands the status message and its source address to
-    /// the flow control strategy here (`on_trigger_send_setup`, `.h:255-259`).
-    /// This build has one strategy, `max`, whose implementation of that hook is
-    /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
-    /// with yet — the hook and the address it needs arrive with the strategy
-    /// that reads them, and `dispatch` does not carry a source address today.
-    /// `address` is where the message that elicited this came from, and for a
-    /// response publication it is the **only** place this publication may ever
-    /// send: the peer that asked for the channel is the one that elicited, and
-    /// it is learned here or not at all
+    /// The reference hands the status message to the flow control strategy
+    /// here as well (`on_trigger_send_setup`, `.h:255-261`), and the only thing
+    /// any strategy reads out of it is the group tag
+    /// (`aeron_min_flow_control.c:394-422`) — which is why what this takes is
+    /// the tag and not the frame.
+    ///
+    /// `elicited_from` is where the message came from, and for a response
+    /// publication it is the **only** place this publication may ever send: the
+    /// peer that asked for the channel is the one that elicited, and it is
+    /// learned here or not at all
     /// (`aeron_network_publication_trigger_send_setup_frame`,
     /// `aeron_network_publication.h:243-274`).
-    /// `elicited_from` is where the message came from. It is optional only
-    /// because this build's transport can be asked not to report a source;
-    /// a datagram off a socket always has one, and a response publication
-    /// learns its peer from nothing else.
-    pub fn trigger_send_setup_frame(&mut self, elicited_from: Option<SocketAddr>) {
+    /// It is optional only because this build's transport can be asked not to
+    /// report a source; a datagram off a socket always has one, and a response
+    /// publication learns its peer from nothing else.
+    pub fn trigger_send_setup_frame(
+        &mut self,
+        elicited_from: Option<SocketAddr>,
+        group_tag: Option<i64>,
+    ) {
         if self.is_end_of_stream {
             return;
         }
 
         self.is_setup_elicited = true;
+
+        self.flow_control.on_trigger_send_setup(group_tag);
 
         if self.is_response {
             if let Some(address) = elicited_from {
@@ -1268,6 +1284,11 @@ impl NetworkPublication {
     ) -> bool {
         // `error-frames-received` is counted at the endpoint, before the
         // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
+        // The strategy is told first (`aeron_network_publication.c:869`): it
+        // keeps its own receivers, and a reader that refused the stream is one
+        // of them leaving rather than one that has gone quiet.
+        self.flow_control.on_error(frame.receiver_id);
+
         let was_live = self.remove_receiver(frame.receiver_id);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
@@ -1304,7 +1325,7 @@ impl NetworkPublication {
         let term_length = self.term_length as usize;
         let term_window = self.term_window_length as usize;
         let mtu = self.mtu_length as usize;
-        let flow_control = self.flow_control;
+        let flow_control = &self.flow_control;
 
         let outcome = self.retransmit_handler.on_nak(
             &mut PublicationFaults { system },
@@ -1342,13 +1363,16 @@ impl NetworkPublication {
     /// no one has subscribed to over the wire can still be live.
     ///
     /// The reference's receiver clause also asks the flow control whether it
-    /// *requires* receivers (`has_required_receivers`), which is true for
-    /// every strategy but a multicast one. This build serves unicast only, so
-    /// the question has one answer here.
+    /// *requires* receivers (`has_required_receivers`, `:760`), and that is the
+    /// gate a group-aware strategy is: it answers `false` until enough of them
+    /// have asked for the stream, so a publication on such a channel is not
+    /// connected while nobody is there to read it. The `and` binds to the
+    /// receiver clause alone — a local spy is not a receiver the strategy has
+    /// to have heard (`:755-761`).
     pub fn has_subscribers(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> bool {
         let _ = (counters, regions);
 
-        self.has_receivers()
+        (self.has_receivers() && self.flow_control.has_required_receivers())
             || (self.spies_simulate_connection && self.subscribers.has_working_positions())
     }
 
@@ -1971,7 +1995,7 @@ mod tests {
                 snd_naks_received: 5,
             },
             4,
-            MaxStrategy::default(),
+            FlowControl::default(),
             RetransmitHandler::new(0, 5_000_000, false, 1),
             4096,
             crate::sys::SocketBufferLengths {
@@ -2670,7 +2694,7 @@ mod tests {
                     snd_naks_received: 5,
                 },
                 4,
-                MaxStrategy::default(),
+                FlowControl::default(),
                 RetransmitHandler::new(0, 5_000_000, has_group_semantics, 1),
                 4096,
                 crate::sys::SocketBufferLengths {

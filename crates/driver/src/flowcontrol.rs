@@ -180,6 +180,127 @@ pub trait Strategy {
         term_buffer_length: usize,
         initial_window_length: usize,
     ) -> usize;
+
+    /// A `SETUP` frame that a status message asked for is about to go out
+    /// (`aeron_network_publication.c:414-421`).
+    ///
+    /// The reference answers a status message with a `SETUP` only when one has
+    /// been elicited, and it tells the strategy at that moment — which is how a
+    /// strategy that gates on receivers gets to see the sender limit the setup
+    /// was sent under (`aeron_min_flow_control.c:283-303`).
+    fn on_setup(&mut self, now_ns: i64, snd_lmt: SenderLimit);
+
+    /// A reader refused the stream (`aeron_network_publication.c:869`).
+    ///
+    /// What a `max` strategy has no use for: it keeps no receiver of its own.
+    /// The strategies that gate on receivers mark this one as gone, so that
+    /// the next pass drops it (`aeron_min_flow_control.c:305-324`).
+    fn on_error(&mut self, receiver_id: i64);
+
+    /// A status message asked for a `SETUP` frame
+    /// (`aeron_network_publication_trigger_send_setup_frame`,
+    /// `aeron_network_publication.h:243-267`).
+    ///
+    /// `group_tag` is what the asking status message carried, if it carried
+    /// one — which is the only thing a tagged strategy reads it for
+    /// (`aeron_min_flow_control.c:394-422`).
+    fn on_trigger_send_setup(&mut self, group_tag: Option<i64>);
+
+    /// Whether the receivers this strategy has seen are enough for the
+    /// publication to call itself connected
+    /// (`aeron_network_publication.c:760`).
+    ///
+    /// `true` for everything but a strategy that waits for a group, which is
+    /// what the reference's own default answers
+    /// (`aeron_flow_control_strategy_has_required_receivers_default`,
+    /// `aeron_flow_control.c:76-79`).
+    fn has_required_receivers(&self) -> bool;
+}
+
+/// The strategy a publication sends under — what `fc=` chooses
+/// (`aeron_flow_control_strategy_t`, `aeron_flow_control.h:46-100`).
+///
+/// One value rather than a `Box<dyn Strategy>`: a strategy holds its own
+/// receiver table, so it outlives any one call and cannot be built per use, and
+/// the publication asks it on every pass — an allocation and a virtual call on
+/// that path is what ADR-0003 rules out. The set is closed, so the enum is too.
+#[derive(Debug)]
+pub enum FlowControl {
+    /// `fc=max` — and the default for a channel that names nothing, unicast or
+    /// multicast (`aeron_driver_context.c:201`).
+    Max(MaxStrategy),
+}
+
+impl Default for FlowControl {
+    fn default() -> Self {
+        Self::Max(MaxStrategy::default())
+    }
+}
+
+impl Strategy for FlowControl {
+    fn on_sm(
+        &mut self,
+        consumption_position: i64,
+        receiver_window: i32,
+        snd_lmt: SenderLimit,
+    ) -> SenderLimit {
+        match self {
+            Self::Max(strategy) => strategy.on_sm(consumption_position, receiver_window, snd_lmt),
+        }
+    }
+
+    fn on_idle(
+        &mut self,
+        now_ns: i64,
+        snd_lmt: SenderLimit,
+        snd_pos: i64,
+        is_end_of_stream: bool,
+    ) -> SenderLimit {
+        match self {
+            Self::Max(strategy) => strategy.on_idle(now_ns, snd_lmt, snd_pos, is_end_of_stream),
+        }
+    }
+
+    fn max_retransmission_length(
+        &self,
+        term_offset: usize,
+        resend_length: usize,
+        term_buffer_length: usize,
+        initial_window_length: usize,
+    ) -> usize {
+        match self {
+            Self::Max(strategy) => strategy.max_retransmission_length(
+                term_offset,
+                resend_length,
+                term_buffer_length,
+                initial_window_length,
+            ),
+        }
+    }
+
+    fn on_setup(&mut self, now_ns: i64, snd_lmt: SenderLimit) {
+        match self {
+            Self::Max(strategy) => strategy.on_setup(now_ns, snd_lmt),
+        }
+    }
+
+    fn on_error(&mut self, receiver_id: i64) {
+        match self {
+            Self::Max(strategy) => strategy.on_error(receiver_id),
+        }
+    }
+
+    fn on_trigger_send_setup(&mut self, group_tag: Option<i64>) {
+        match self {
+            Self::Max(strategy) => strategy.on_trigger_send_setup(group_tag),
+        }
+    }
+
+    fn has_required_receivers(&self) -> bool {
+        match self {
+            Self::Max(strategy) => strategy.has_required_receivers(),
+        }
+    }
 }
 
 /// The `max` strategy: the sender may write to the far edge of every receiver's
@@ -338,6 +459,27 @@ impl Strategy for MaxStrategy {
         let estimated = receiver_window.saturating_mul(self.retransmit_receiver_window_multiple);
 
         resend_length.min(length_to_end_of_term.min(estimated))
+    }
+
+    /// `aeron_max_flow_control_strategy_on_setup` returns the limit it was
+    /// given (`aeron_flow_control.c:91-101`), and the supplier ignores the
+    /// answer (`aeron_network_publication.c:414-421`): a strategy with no
+    /// receiver table has nothing to record about a setup.
+    fn on_setup(&mut self, _now_ns: i64, _snd_lmt: SenderLimit) {}
+
+    /// `aeron_max_flow_control_strategy_on_error` is empty
+    /// (`aeron_flow_control.c:125-132`): a strategy that keeps no receivers has
+    /// none to mark as gone.
+    fn on_error(&mut self, _receiver_id: i64) {}
+
+    /// And so is `aeron_max_flow_control_strategy_on_trigger_send_setup`
+    /// (`:182-189`).
+    fn on_trigger_send_setup(&mut self, _group_tag: Option<i64>) {}
+
+    /// The default every supplier that does not install its own gets
+    /// (`aeron_flow_control.c:76-79`).
+    fn has_required_receivers(&self) -> bool {
+        true
     }
 }
 

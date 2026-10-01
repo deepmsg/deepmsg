@@ -587,7 +587,7 @@ impl NetworkPublications {
             crate::flowcontrol::UNICAST_RRWM_DEFAULT,
             crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
         ) {
-            Ok(strategy) => strategy,
+            Ok(strategy) => crate::flowcontrol::FlowControl::Max(strategy),
             Err(error) => {
                 events.error(
                     pending.registration_id,
