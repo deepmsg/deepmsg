@@ -186,6 +186,14 @@ and the reference's region read by this build's reader matching the tool's
 report verbatim
 (`::our_reader_reads_the_reference_error_log_and_matches_error_stat`).
 
+The description after the code is chosen by its sign, and that half arrived
+late: a **positive** code is an errno and is described by the OS's own
+`strerror` text, not by the protocol table (`aeron_error.c:361-373`). Until
+G3-8b nothing here recorded one, so the composition modelled only the table;
+the sender-MTU refusal below is the first site that does. Both drivers are
+driven through that fault and their entries compared, masked only for the
+session id, by `tests/interop/mtu_fault_entry.rs`.
+
 One recorded text diverges: a broadcast transmit failure. The reference
 appends it with `AERON_APPEND_ERR` (`aeron_driver_conductor.c:2240`), which
 resets neither the code nor the thread's error buffer — so the entry is the

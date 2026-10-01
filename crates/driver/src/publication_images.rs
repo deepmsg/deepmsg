@@ -263,7 +263,19 @@ impl PublicationImages {
             socket_rcvbuf,
             os_default_socket_rcvbuf,
         )
-        .map_err(AddError::InvalidChannel)?;
+        .map_err(|first_line| {
+            // `:6509`: `AERON_APPEND_ERR` adds a second site line, and it is
+            // the one that says *which* stream — the first line is about the
+            // numbers and would read the same for every stream on the
+            // endpoint. `aeron_err_update_entry` writes `[func, file:line] `,
+            // the message, and a newline (`util/aeron_error.c:337-349`).
+            AddError::SenderMtu(format!(
+                "{first_line}\
+                 [aeron_driver_conductor_execute_create_publication_image_validate, \
+                 aeron_driver_conductor.c:6509] stream_id={} session_id={}\n",
+                setup.stream_id, setup.session_id
+            ))
+        })?;
 
         // The channel's subscription parameters: an image is created by a
         // `SETUP`, so the timeouts its readers are held to come from the

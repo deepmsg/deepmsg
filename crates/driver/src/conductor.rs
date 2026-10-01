@@ -990,7 +990,7 @@ impl Conductor {
 
                     if let Err(error) = result {
                         self.pending_log_errors
-                            .push((error.error_code(), error.to_string()));
+                            .push((error.recorded_error_code(), error.to_string()));
                     }
                 }
                 ReceiverEvent::ImageDone { registration_id } => {

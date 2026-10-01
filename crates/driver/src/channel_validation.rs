@@ -161,10 +161,26 @@ pub fn validate_mtu_for_sndbuf(
 /// receiver that cannot both be right: a frame that does not fit the window is
 /// a frame that can never be acknowledged in time.
 ///
+/// # This one is *recorded*, and the other three are answered
+///
+/// Which is why it returns the reference's whole recorded line — code,
+/// description and site — where [`validate_mtu_for_sndbuf`] and its siblings
+/// return the message a client reads. Nobody answers a client here: the image
+/// is being built from a `SETUP`, and what happens instead is that the driver
+/// writes an entry to the distinct error log, whose first line is the
+/// composition `AERON_SET_ERR` leaves (`util/aeron_error.c:351-378`). The code
+/// is the errno it was handed, a positive `EINVAL`, so the description is the
+/// OS's text and not the protocol table's.
+///
+/// The caller appends its own line, which is what `AERON_APPEND_ERR` does at
+/// the reference's call site (`aeron_driver_conductor.c:6509`).
+///
 /// # Errors
 ///
-/// The reference's message, verbatim — it reaches the error log, and
-/// `ChannelValidationTest` matches on two of its words.
+/// The reference's composition, verbatim. Its shape was read off a live
+/// 1.53.2 driver — `tests/interop/` runs both drivers through this fault and
+/// compares — because the file names, the line numbers and the OS's wording
+/// are all things a careful reading gets almost right.
 pub fn validate_sender_mtu_length(
     sender_mtu_length: usize,
     window_max_length: usize,
@@ -172,30 +188,36 @@ pub fn validate_sender_mtu_length(
     os_default_socket_rcvbuf: usize,
 ) -> Result<(), String> {
     if sender_mtu_length < DATA_HEADER_LENGTH {
-        return Err(format!(
-            "mtuLength={sender_mtu_length} < DATA_HEADER_LENGTH={DATA_HEADER_LENGTH}"
+        return Err(refused(
+            992,
+            format!("mtuLength={sender_mtu_length} < DATA_HEADER_LENGTH={DATA_HEADER_LENGTH}"),
         ));
     }
 
     #[allow(clippy::cast_possible_truncation)] // 65504 fits every pointer width here
     let max_payload = MAX_UDP_PAYLOAD_LENGTH as usize;
     if sender_mtu_length > max_payload {
-        return Err(format!(
-            "mtuLength={sender_mtu_length} > MAX_UDP_PAYLOAD_LENGTH={max_payload}"
+        return Err(refused(
+            1002,
+            format!("mtuLength={sender_mtu_length} > MAX_UDP_PAYLOAD_LENGTH={max_payload}"),
         ));
     }
 
     #[allow(clippy::cast_sign_loss)] // 32
     let frame_alignment = FRAME_ALIGNMENT as usize;
     if sender_mtu_length % frame_alignment != 0 {
-        return Err(format!(
-            "mtuLength={sender_mtu_length} must be a multiple of FRAME_ALIGNMENT={FRAME_ALIGNMENT}"
+        return Err(refused(
+            1012,
+            format!(
+                "mtuLength={sender_mtu_length} must be a multiple of FRAME_ALIGNMENT={FRAME_ALIGNMENT}"
+            ),
         ));
     }
 
     if sender_mtu_length > window_max_length {
-        return Err(format!(
-            "mtuLength={sender_mtu_length} > initialWindowLength={window_max_length}"
+        return Err(refused(
+            1022,
+            format!("mtuLength={sender_mtu_length} > initialWindowLength={window_max_length}"),
         ));
     }
 
@@ -225,6 +247,47 @@ pub fn validate_sender_mtu_length(
     )
 }
 
+/// The file both functions of this pair raise in — the basename, because that
+/// is what the reference's `__FILE__` prints.
+const RECEIVE_ENDPOINT_FILE: &str = "aeron_receive_channel_endpoint.c";
+
+/// Compose one of `aeron_receiver_channel_endpoint_validate_sender_mtu_length`'s
+/// refusals: `EINVAL` (the errno every `AERON_SET_ERR` in that function is
+/// handed) at the line the macro sits on.
+fn refused(line: u32, message: String) -> String {
+    deepmsg_cnc::error_log::compose_description(
+        libc::EINVAL,
+        "aeron_receiver_channel_endpoint_validate_sender_mtu_length",
+        RECEIVE_ENDPOINT_FILE,
+        line,
+        &message,
+    )
+}
+
+/// The same, for `aeron_receive_channel_endpoint_validate_so_rcvbuf`, whose two
+/// arms are two sites (`:961` with a socket buffer, `:972` without).
+fn refused_so_rcvbuf(line: u32, subject: &str, value: usize, limit: usize, suffix: &str) -> String {
+    refused_by(
+        "aeron_receive_channel_endpoint_validate_so_rcvbuf",
+        line,
+        format!(
+            "{subject} greater than socket SO_RCVBUF, increase 'AERON_RCV_INITIAL_WINDOW_LENGTH' \
+             to match window: value={value}, SO_RCVBUF={limit}{suffix}"
+        ),
+    )
+}
+
+/// [`refused`], for a site in another function.
+fn refused_by(function: &str, line: u32, message: String) -> String {
+    deepmsg_cnc::error_log::compose_description(
+        libc::EINVAL,
+        function,
+        RECEIVE_ENDPOINT_FILE,
+        line,
+        &message,
+    )
+}
+
 /// `aeron_receive_channel_endpoint_validate_so_rcvbuf`
 /// (`media/aeron_receive_channel_endpoint.c:953-982`).
 ///
@@ -243,20 +306,17 @@ fn validate_so_rcvbuf(
     subject: &str,
     os_default_socket_rcvbuf: usize,
 ) -> Result<(), String> {
-    let (limit, suffix) = if socket_rcvbuf != 0 {
-        (socket_rcvbuf, "")
+    let (limit, suffix, line) = if socket_rcvbuf != 0 {
+        (socket_rcvbuf, "", 961)
     } else {
-        (os_default_socket_rcvbuf, " (OS Default)")
+        (os_default_socket_rcvbuf, " (OS Default)", 972)
     };
 
     if limit >= value {
         return Ok(());
     }
 
-    Err(format!(
-        "{subject} greater than socket SO_RCVBUF, increase 'AERON_RCV_INITIAL_WINDOW_LENGTH' \
-         to match window: value={value}, SO_RCVBUF={limit}{suffix}"
-    ))
+    Err(refused_so_rcvbuf(line, subject, value, limit, suffix))
 }
 
 /// `aeron_publication_params_validate_mtu` (`uri/aeron_driver_uri.c:555-568`).
@@ -412,12 +472,33 @@ mod tests {
         );
     }
 
+    /// The first line of a refusal from `validate_sender_mtu_length`, which is
+    /// what the reference's `AERON_SET_ERR` leaves in the thread's buffer: the
+    /// code it was handed, then the OS's text for that errno, then the site
+    /// and the message. Written out here rather than composed by the test, so
+    /// that a change to the composition fails this too.
+    fn mtu_refusal(line: u32, message: &str) -> String {
+        format!(
+            "(22) Invalid argument\n\
+             [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
+             aeron_receive_channel_endpoint.c:{line}] {message}\n"
+        )
+    }
+
     #[test]
     fn a_sender_mtu_that_does_not_fit_the_receiver_window_is_refused_by_name() {
-        // `ChannelValidationTest`'s case, and the two words it matches on.
+        // `ChannelValidationTest`'s case. Spelled out in full because this one
+        // is the line the interop suite compares against a live driver's own
+        // entry, byte for byte — the file name, the line number and the OS's
+        // wording are each something a careful reading gets almost right.
         let refused = validate_sender_mtu_length(1408, 1376, 131_072, 0).expect_err("too large");
 
-        assert_eq!("mtuLength=1408 > initialWindowLength=1376", refused);
+        assert_eq!(
+            "(22) Invalid argument\n\
+             [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
+             aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n",
+            refused
+        );
     }
 
     #[test]
@@ -425,26 +506,32 @@ mod tests {
         // Below the header, above the payload ceiling, unaligned, and the
         // window — in the order the reference tries them, so a value that
         // breaks two rules is refused by the first.
-        for (args, expected) in [
+        // Each rule has its own site, because each has its own `AERON_SET_ERR`
+        // — and the site is the macro's *own* line, not the statement's.
+        for (args, line, expected) in [
             (
                 (16, 131_072, 131_072, 0),
+                992,
                 "mtuLength=16 < DATA_HEADER_LENGTH=32",
             ),
             (
                 (65_536, 131_072, 131_072, 0),
+                1002,
                 "mtuLength=65536 > MAX_UDP_PAYLOAD_LENGTH=65504",
             ),
             (
                 (1409, 131_072, 131_072, 0),
+                1012,
                 "mtuLength=1409 must be a multiple of FRAME_ALIGNMENT=32",
             ),
             (
                 (1408, 1376, 131_072, 0),
+                1022,
                 "mtuLength=1408 > initialWindowLength=1376",
             ),
         ] {
             assert_eq!(
-                expected,
+                mtu_refusal(line, expected),
                 validate_sender_mtu_length(args.0, args.1, args.2, args.3).expect_err("refused")
             );
         }
@@ -464,20 +551,29 @@ mod tests {
         // The socket rule, which is about what the pipeline can hold rather
         // than about arithmetic — and which names what it measured, because a
         // reader has two buffers to look at.
+        // The site is `aeron_receive_channel_endpoint_validate_so_rcvbuf`'s,
+        // not the caller's: the reference raises from the helper.
         let window = validate_sender_mtu_length(1408, 131_072, 65_536, 0).expect_err("too large");
         assert_eq!(
-            "Max Window length greater than socket SO_RCVBUF, increase \
-             'AERON_RCV_INITIAL_WINDOW_LENGTH' to match window: value=131072, SO_RCVBUF=65536",
+            "(22) Invalid argument\n\
+             [aeron_receive_channel_endpoint_validate_so_rcvbuf, \
+             aeron_receive_channel_endpoint.c:961] Max Window length greater than socket SO_RCVBUF, \
+             increase 'AERON_RCV_INITIAL_WINDOW_LENGTH' to match window: \
+             value=131072, SO_RCVBUF=65536\n",
             window
         );
 
         // With no buffer of its own the same sentence carries the reference's
-        // suffix, which is the reader's only clue that the number is the
-        // kernel's rather than theirs.
+        // suffix — the reader's only clue that the number is the kernel's
+        // rather than theirs — and the site moves to the other arm.
         let by_default =
             validate_sender_mtu_length(1408, 131_072, 0, 65_536).expect_err("too large");
         assert!(
-            by_default.ends_with("SO_RCVBUF=65536 (OS Default)"),
+            by_default.contains("aeron_receive_channel_endpoint.c:972]"),
+            "{by_default}"
+        );
+        assert!(
+            by_default.ends_with("SO_RCVBUF=65536 (OS Default)\n"),
             "{by_default}"
         );
     }
@@ -496,10 +592,16 @@ mod tests {
         for mtu in [32, 1408, 4096] {
             for window in [0, 32, 1408, 4096, 131_072] {
                 for socket in [0, 32, 1408, 4096, 131_072] {
-                    if let Err(message) = validate_sender_mtu_length(mtu, window, socket, 131_072) {
+                    if let Err(recorded) = validate_sender_mtu_length(mtu, window, socket, 131_072)
+                    {
+                        // Read off the *message*, which is what follows the
+                        // site's `] ` — not off the start of the string, which
+                        // is now the composition's `(22) Invalid argument`.
+                        // Checking the prefix would have gone quietly vacuous
+                        // the moment the sites arrived.
                         assert!(
-                            !message.starts_with("Sender MTU "),
-                            "mtu={mtu} window={window} socket={socket}: {message}"
+                            !recorded.contains("] Sender MTU greater"),
+                            "mtu={mtu} window={window} socket={socket}: {recorded}"
                         );
                     }
                 }

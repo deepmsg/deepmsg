@@ -102,6 +102,15 @@ pub enum AddError {
     /// (`aeron_driver_conductor.c:569-608`). Its message is the reference's,
     /// error code and all.
     InvalidChannel(String),
+    /// A `SETUP` whose sender MTU this receiver cannot serve
+    /// (`aeron_receiver_channel_endpoint_validate_sender_mtu_length`,
+    /// `media/aeron_receive_channel_endpoint.c:984-1044`).
+    ///
+    /// The one fault here whose *recorded* code and whose *client* code are
+    /// both reachable and different — see [`Self::recorded_error_code`] — and
+    /// whose text is already the reference's composition rather than a bare
+    /// message, because no client is waiting for an answer to format it for.
+    SenderMtu(String),
     /// A send endpoint could not be created or shared. Carried as its code and
     /// its words because the underlying error is a syscall's, which is neither
     /// cloneable nor comparable — and those two things are all a caller of
@@ -170,7 +179,7 @@ impl std::fmt::Display for AddError {
             ),
             Self::Share(mismatch) => write!(f, "{mismatch}"),
             Self::Channel(error) => write!(f, "{error}"),
-            Self::InvalidChannel(message) => f.write_str(message),
+            Self::InvalidChannel(message) | Self::SenderMtu(message) => f.write_str(message),
             Self::Endpoint { message, .. } => f.write_str(message),
             Self::ResponseSubscription { correlation_id } => write!(
                 f,
@@ -239,7 +248,34 @@ impl AddError {
             | Self::ImageDidNotRequestResponseChannel { .. }
             | Self::ImageNotFound { .. }
             | Self::NoCounterRecord
+            // A positive `EINVAL` reaches a client as the generic code
+            // (`aeron_driver_conductor.c:2334-2338`) — which is what this
+            // would have been told, had anything been told.
+            | Self::SenderMtu(_)
             | Self::AgentStopped => ERROR_CODE_GENERIC_ERROR,
+        }
+    }
+
+    /// The code the **error log** records, which is not always
+    /// [`Self::error_code`].
+    ///
+    /// The reference has one value — whatever `AERON_SET_ERR` was handed — and
+    /// two consumers that transform it differently: `log_explicit_error` takes
+    /// it as it stands (`aeron_driver_conductor.c:1215`) while `on_error` sends
+    /// a positive one as the generic code (`:2334-2338`). A fault that is only
+    /// ever *recorded* therefore carries two different numbers, and the log
+    /// gets this one.
+    ///
+    /// Only the variants that can reach the conductor's fault list are answered
+    /// here — today that is the two below and `AgentStopped` — and the fallback
+    /// is [`Self::error_code`], which is the same number for a variant that is
+    /// only ever answered to a client. `AgentStopped` falls back on purpose:
+    /// the reference sets its code from the log-buffer agent's own result
+    /// (`:6579`), which this build does not carry.
+    pub const fn recorded_error_code(&self) -> i32 {
+        match self {
+            Self::SenderMtu(_) => libc::EINVAL,
+            _ => self.error_code(),
         }
     }
 }
@@ -1369,6 +1405,26 @@ pub fn publication_path(aeron_dir: &std::path::Path, registration_id: i64) -> Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_recorded_code_is_the_errno_and_not_the_clients() {
+        // The one failure whose two codes are both reachable and different.
+        // `AERON_SET_ERR` was handed a positive `EINVAL`, so the *log* gets 22
+        // — the value `log_explicit_error` records — while a client, had it
+        // been told, would have got the generic code `on_error` derives from a
+        // positive errno (`aeron_driver_conductor.c:1215`, `:2334-2338`).
+        let refused = AddError::SenderMtu("(22) Invalid argument\n".to_string());
+
+        assert_eq!(ERROR_CODE_GENERIC_ERROR, refused.error_code());
+        assert_eq!(libc::EINVAL, refused.recorded_error_code());
+
+        // And the fallback is the same number, for the variants that are only
+        // ever *answered* rather than recorded.
+        assert_eq!(
+            AddError::NoClientRecord.error_code(),
+            AddError::NoClientRecord.recorded_error_code()
+        );
+    }
 
     #[test]
     fn an_out_of_space_log_buffer_keeps_its_own_error_code() {

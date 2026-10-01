@@ -262,10 +262,19 @@ const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
 ///
 /// The line is the one the `AERON_SET_ERR` itself sits on — the macro's
 /// `__LINE__`, which the compiler resolves to the line bearing the macro
-/// name. The code appears as it was set, negated or not, and a non-positive
-/// code is described by [`error_code_description`] while a positive one would
-/// carry the OS's `strerror` text — which this build never records, so that
-/// half of the reference's behaviour is not modelled here.
+/// name. The code appears as it was set, negated or not, and **which
+/// description follows it is decided by its sign** (`aeron_err_set`,
+/// `aeron_error.c:361-373`): a code at or below zero is described by
+/// [`error_code_description`], and a positive one — an errno, which is what
+/// `AERON_SET_ERR(EINVAL, …)` hands over — by the OS's own `strerror` text,
+/// through [`deepmsg_core::pal::error_string`].
+///
+/// That second branch went unmodelled until a recording site needed it, on the
+/// argument that no site here set a positive code. The argument was true and
+/// expired: a receiver refusing a sender's MTU records `(22) Invalid argument`
+/// (`media/aeron_receive_channel_endpoint.c:1022`), and a composition that
+/// printed `unknown error code` after the 22 would be wrong in the one place a
+/// reader looks.
 ///
 /// The description ends in a newline and is capped at the reference's buffer:
 /// past byte 8186 the rest is replaced by the trailer `"...\n"` it `strcpy`s
@@ -279,7 +288,12 @@ pub fn compose_description(
 ) -> String {
     let mut composed = format!(
         "({error_code}) {}\n[{function}, {file}:{line}] {message}\n",
-        error_code_description(error_code.abs()),
+        match error_code {
+            // `AERON_SET_ERR`'s two branches, in its own order: the protocol
+            // table for a code the driver set, the OS's text for an errno.
+            1..=i32::MAX => deepmsg_core::pal::error_string(error_code),
+            _ => error_code_description(-error_code).to_string(),
+        },
     );
 
     if composed.len() > ERROR_MESSAGE_LIMIT {
@@ -460,15 +474,44 @@ mod tests {
             )
         );
 
-        // A code the table has no case for gets the reference's default
-        // (`aeron_error.c:307-309`) — and it is negative because a *positive*
-        // code takes the reference's other branch, `aeron_strerror_r`
-        // (`:357-366`), which this build does not model: no recording site
-        // here sets one, so a positive code is outside the range this
-        // composition claims rather than a behaviour to match.
+        // A *negative* code the table has no case for gets the reference's
+        // default (`aeron_error.c:307-309`).
         assert_eq!(
             "(-99) unknown error code\n[f, f.c:1] m\n",
             compose_description(-99, "f", "f.c", 1, "m")
+        );
+    }
+
+    #[test]
+    fn a_positive_code_is_described_by_the_os_and_not_by_the_table() {
+        // Read off a live 1.53.2 driver, which recorded this for a sender
+        // whose MTU did not fit the receiver's window: the receiving side
+        // raises `AERON_SET_ERR(EINVAL, …)`, and a **positive** code takes
+        // `aeron_err_set`'s other branch — `strerror_r`, not the protocol
+        // table (`aeron_error.c:361-373`). That is why the entry says
+        // `Invalid argument` and not the table's row for 22 (which there is
+        // not) and not the row for 1.
+        assert_eq!(
+            "(22) Invalid argument\n\
+             [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
+             aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n",
+            compose_description(
+                22,
+                "aeron_receiver_channel_endpoint_validate_sender_mtu_length",
+                "aeron_receive_channel_endpoint.c",
+                1022,
+                "mtuLength=1408 > initialWindowLength=1376",
+            )
+        );
+
+        // The same call the reference makes, and the two texts it can produce:
+        // an errno the OS knows, and one it does not — which is the
+        // reference's `<Unable to get error description>` rather than a
+        // failure (`aeron_error.c:34`, `:43`).
+        assert_eq!("Invalid argument", deepmsg_core::pal::error_string(22));
+        assert_eq!(
+            "<Unable to get error description>",
+            deepmsg_core::pal::error_string(9999)
         );
     }
 

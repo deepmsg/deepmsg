@@ -176,6 +176,12 @@ name = "counters_and_error_log"
 path = "interop/counters_and_error_log.rs"
 required-features = ["interop"]
 
+# G3-8b: the entry both drivers record for a sender MTU the window cannot carry.
+[[test]]
+name = "mtu_fault_entry"
+path = "interop/mtu_fault_entry.rs"
+required-features = ["interop"]
+
 # P1-4's acceptance: our driver and our client publish over UDP, and the
 # reference's own subscriber — behind the reference's own driver — receives
 # them. Two drivers, one wire.
