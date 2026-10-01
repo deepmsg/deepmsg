@@ -1947,6 +1947,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                Some(receiver.proxy()),
                                 sender.proxy(),
                                 now_ms,
                             );
@@ -2931,6 +2932,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            Some(self.receiver.proxy()),
             self.sender.proxy(),
         );
 

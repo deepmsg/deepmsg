@@ -1111,12 +1111,14 @@ impl IpcSubscriptions {
     /// ([`Self::add_spy_destination`]), and removing the subscription has to
     /// take it too — otherwise the subscription is gone and something is still
     /// reading a publication on its behalf.
+    #[allow(clippy::too_many_arguments)] // the collaborators a removal needs
     pub fn remove(
         &mut self,
         registration_id: i64,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
         now_ms: i64,
     ) -> bool {
@@ -1131,12 +1133,13 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
+            unlink_from_endpoint(&link, receiver);
             unlink_all(
                 link,
                 counters,
                 regions,
                 publications,
-                None,
+                receiver,
                 Some(sender),
                 now_ms,
             );
@@ -1149,12 +1152,14 @@ impl IpcSubscriptions {
     /// Give up every subscription a client owned, without telling it anything:
     /// it is gone, and a message to a client that is not there is a message
     /// nobody reads (`aeron_client_delete`, `:1234-1250`).
+    #[allow(clippy::too_many_arguments)] // the collaborators a removal needs
     pub fn remove_for_client(
         &mut self,
         client_id: i64,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
         now_ms: i64,
     ) -> usize {
@@ -1169,12 +1174,15 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
+            // `aeron_client_delete` takes the same two steps in the same order
+            // for a client's network subscriptions (`:1246-1258`).
+            unlink_from_endpoint(&link, receiver);
             unlink_all(
                 link,
                 counters,
                 regions,
                 publications,
-                None,
+                receiver,
                 Some(sender),
                 now_ms,
             );
@@ -1716,6 +1724,33 @@ fn validate_for_subscription(channel: &UdpChannel) -> Result<(), AddSubscription
     }
 
     Ok(())
+}
+
+/// The endpoint's own bookkeeping for a subscription that is going away
+/// (`aeron_driver_conductor_unlink_from_endpoint`, `:1179-1201`).
+///
+/// It runs **before** the subscribable unlink, and it is the half a network
+/// subscription cannot do without: the endpoint's reference count for the
+/// stream drops, and at zero the receiver is told the stream has no readers
+/// left (`aeron_receive_channel_endpoint_decref_to_stream`, `:720-744`) — so
+/// the dispatcher stops feeding it, and an image nobody reads stops sending
+/// status messages. Without this a removed subscription's image lives on, and
+/// a group strategy on the far side waits for a receiver that will never
+/// answer again (`aeron_min_flow_control.c:109-111`).
+///
+/// A link with no endpoint — an IPC one, and a spy's — has no count to drop,
+/// which is why this is an `Option` rather than a branch at every call site.
+fn unlink_from_endpoint(link: &SubscriptionLink, receiver: Option<&ReceiverProxy>) {
+    let (Some(receiver), Some(endpoint_id)) = (receiver, link.endpoint_id) else {
+        return;
+    };
+
+    // `:1187-1198` picks which of the endpoint's counts to drop — the session's
+    // when the subscription named one, the response stream's when it is a
+    // response channel, the stream's otherwise. What travels here is the
+    // subscription's own properties; the receiver decides, because the counts
+    // are its.
+    let _ = receiver.remove_subscription(endpoint_id, link.stream_id, link.session_id);
 }
 
 /// Detach every reader a link holds and give its counter back
