@@ -492,11 +492,28 @@ impl SendChannelEndpoints {
 
 /// Whether a new channel answers to an existing endpoint's tag
 /// (`aeron_udp_channel_matches_tag`,
-/// `aeron-driver/src/main/c/media/aeron_udp_channel.c:564-624`).
+/// `aeron-driver/src/main/c/media/aeron_udp_channel.c:564-620`).
 ///
-/// Both tags have to be named and equal, the control modes have to agree, and
-/// the addresses have to agree — a channel with no address at all matches
-/// anything, which is the reference's `aeron_udp_channel_is_wildcard` escape.
+/// Both tags have to be named and equal, the arriving channel's control mode
+/// has to **not disagree**, and the addresses have to agree — a channel whose
+/// addresses are the wildcard matches anything, which is
+/// [`is_wildcard`]'s escape.
+///
+/// The second rule is the one worth reading twice, because it is asymmetric
+/// and it is stated in terms of the *arriving* channel
+/// (`aeron_udp_channel_control_modes_match`, `media/aeron_udp_channel.h:104-107`):
+///
+/// ```c
+/// AERON_UDP_CHANNEL_CONTROL_MODE_NONE == channel->control_mode ||
+/// channel->control_mode == other->control_mode
+/// ```
+///
+/// So `aeron:udp?tags=N`, which names no control mode, joins an endpoint in
+/// *any* mode — the channel is letting the endpoint say how it is controlled.
+/// A channel that names a mode gets it compared, and is refused when the two
+/// differ (`shouldNotAllowNormalToControlModeDynamicChangeWithTags` and its
+/// siblings). Reading the rule as "the modes are equal" refuses the first case
+/// and is why this clause was wrong.
 ///
 /// # Errors
 ///
@@ -510,14 +527,18 @@ fn matches_tag(channel: &UdpChannel, existing: &UdpChannel) -> Result<bool, Endp
         return Ok(false);
     }
 
-    if channel.control_mode != existing.control_mode {
+    if channel.control_mode != crate::udp_channel::ControlMode::None
+        && channel.control_mode != existing.control_mode
+    {
         return Err(EndpointError::TagMismatch {
             tag: channel.tag_id,
         });
     }
 
-    // A channel with no address of its own matches whatever the endpoint is.
-    if !channel.has_explicit_endpoint && !channel.has_explicit_control {
+    // A channel whose addresses are the wildcard matches whatever the
+    // endpoint is (`aeron_udp_channel_endpoints_match_with_override`'s first
+    // two lines, `:41-45`).
+    if is_wildcard(channel) {
         return Ok(true);
     }
 
@@ -528,6 +549,20 @@ fn matches_tag(channel: &UdpChannel, existing: &UdpChannel) -> Result<bool, Endp
     }
 
     Ok(true)
+}
+
+/// `aeron_udp_channel_is_wildcard` (`media/aeron_udp_channel.h:98-102`): both
+/// of a channel's data addresses are the wildcard.
+///
+/// Read off the **resolved** addresses rather than off whether the URI named
+/// them, which is the distinction that matters: `endpoint=0.0.0.0:0` names an
+/// endpoint and is still the wildcard, and the reference compares the
+/// addresses because that is what it has.
+fn is_wildcard(channel: &UdpChannel) -> bool {
+    let wildcard =
+        |address: &std::net::SocketAddr| address.ip().is_unspecified() && address.port() == 0;
+
+    wildcard(&channel.remote_data) && wildcard(&channel.local_data)
 }
 
 /// The three checks a channel must pass before it may share an endpoint
@@ -771,6 +806,204 @@ mod tests {
             matches!(error, EndpointError::TagMismatch { tag: 5 }),
             "{error}"
         );
+    }
+
+    /// The three publications of `shouldAllowDynamicControlModeWithTags`,
+    /// which is the case that was red: a channel that names **no control mode**
+    /// joins an endpoint in any mode, because it is letting the endpoint say
+    /// how the channel is controlled (`aeron_udp_channel_control_modes_match`,
+    /// `media/aeron_udp_channel.h:104-107`).
+    ///
+    /// Each of the `control=` tests below binds its **own** port. A dynamic
+    /// endpoint binds the address `control=` names, and the tests in a binary
+    /// run in parallel — three of them sharing `23454` is `AddrInUse` two runs
+    /// in five, which is how the first version of this arrived.
+    #[test]
+    fn a_channel_that_names_no_control_mode_joins_one_that_does() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        let dynamic = "aeron:udp?control-mode=dynamic|control=localhost:23454|tags=200";
+        const BARE: &str = "aeron:udp?tags=200";
+
+        let first = endpoints
+            .get_or_add(
+                channel(dynamic),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                1,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+        let second = endpoints
+            .get_or_add(
+                channel(dynamic),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                2,
+                2,
+                2,
+            )
+            .expect("the same channel");
+        let third = endpoints
+            .get_or_add(
+                channel(BARE),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                3,
+                3,
+                3,
+            )
+            .expect("a channel that named no control mode");
+
+        assert_eq!(first.id(), second.id());
+        assert_eq!(
+            first.id(),
+            third.id(),
+            "naming no control mode is not naming a different one"
+        );
+        assert_eq!(1, endpoints.entries().len());
+    }
+
+    /// The other direction, which must stay refused: a channel that *does*
+    /// name a mode is compared against the endpoint's.
+    #[test]
+    fn a_channel_that_names_a_control_mode_is_compared_against_the_endpoints() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        endpoints
+            .get_or_add(
+                channel("aeron:udp?control=localhost:23464|endpoint=localhost:23465|tags=200"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                1,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+
+        let error = endpoints
+            .get_or_add(
+                channel("aeron:udp?control-mode=dynamic|control=localhost:23464|tags=200"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                2,
+                2,
+                2,
+            )
+            .expect_err("refused");
+
+        assert!(
+            matches!(error, EndpointError::TagMismatch { tag: 200 }),
+            "{error}"
+        );
+    }
+
+    /// And the address clause is a clause of its own: a channel that names no
+    /// control mode is still refused when it names a *different* address, so
+    /// the refusal above is not the mode check firing on everything.
+    #[test]
+    fn a_channel_that_names_no_control_mode_is_still_refused_on_a_different_address() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        endpoints
+            .get_or_add(
+                channel("aeron:udp?control-mode=dynamic|control=localhost:23474|tags=200"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                1,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+
+        let error = endpoints
+            .get_or_add(
+                channel("aeron:udp?endpoint=localhost:23475|tags=200"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                2,
+                2,
+                2,
+            )
+            .expect_err("refused");
+
+        assert!(
+            matches!(error, EndpointError::TagMismatch { tag: 200 }),
+            "{error}"
+        );
+    }
+
+    /// `is_wildcard` reads the **resolved** addresses, not whether the URI
+    /// named them: `endpoint=0.0.0.0:0` names one and is still the wildcard
+    /// (`media/aeron_udp_channel.h:98-102`).
+    #[test]
+    fn a_wildcard_address_is_the_wildcard_even_when_it_was_named() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        let first = endpoints
+            .get_or_add(
+                channel("aeron:udp?control-mode=dynamic|control=localhost:23484|tags=7"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                1,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+
+        let second = endpoints
+            .get_or_add(
+                channel("aeron:udp?endpoint=0.0.0.0:0|tags=7"),
+                &defaults(),
+                &config,
+                0,
+                &mut counters,
+                &regions,
+                2,
+                2,
+                2,
+            )
+            .expect("the wildcard matches anything");
+
+        assert_eq!(first.id(), second.id());
+        assert_eq!(1, endpoints.entries().len());
     }
 
     #[test]
