@@ -1256,38 +1256,57 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
-                // A NAK goes to every connection this image hears from, like a
-                // status message: each receiver has its own view of what is
-                // missing, and one of them having it is not the others having
-                // it. With one connection this is the message it always was.
-                for connection in &image.connections {
-                    let Some(control_address) = connection.control_address else {
-                        continue;
-                    };
+                if image.is_reliable() {
+                    // A NAK goes to every connection this image hears from, like
+                    // a status message: each receiver has its own view of what is
+                    // missing, and one of them having it is not the others having
+                    // it. With one connection this is the message it always was.
+                    for connection in &image.connections {
+                        let Some(control_address) = connection.control_address else {
+                            continue;
+                        };
 
-                    if endpoint
-                        .send_nak(
-                            control_address,
-                            image.stream_id,
-                            image.session_id,
-                            gap.term_id,
-                            gap.term_offset,
-                            i32::try_from(gap.length).unwrap_or(i32::MAX),
-                        )
-                        .is_ok()
-                    {
-                        system.increment(system_counters::id::NAK_MESSAGES_SENT);
-                        // …and the same count under the image that asked for
-                        // it: the system counter says the driver is
-                        // retransmitting, this one says for which stream
-                        // (`aeron_publication_image.c:1052`).
-                        let _ = system_counters::increment(
-                            counters,
-                            regions,
-                            image.counters().rcv_naks_sent,
-                        );
-                        work += 1;
+                        if endpoint
+                            .send_nak(
+                                control_address,
+                                image.stream_id,
+                                image.session_id,
+                                gap.term_id,
+                                gap.term_offset,
+                                i32::try_from(gap.length).unwrap_or(i32::MAX),
+                            )
+                            .is_ok()
+                        {
+                            system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                            // …and the same count under the image that asked for
+                            // it: the system counter says the driver is
+                            // retransmitting, this one says for which stream
+                            // (`aeron_publication_image.c:1052`).
+                            let _ = system_counters::increment(
+                                counters,
+                                regions,
+                                image.counters().rcv_naks_sent,
+                            );
+                            work += 1;
+                        }
                     }
+                } else {
+                    // An unreliable image does not ask: it covers the hole and
+                    // reads on, so whatever was in it is gone for good — which
+                    // is what the channel asked for
+                    // (`aeron_publication_image_send_pending_loss`,
+                    // `:1053-1066`). Nothing goes on the network, and the
+                    // counter is the only trace of it.
+                    //
+                    // `work` moves whether or not the fill was made, as the
+                    // reference's `work_count = 1` does: a gap that could not be
+                    // filled is one something else has landed in, and the next
+                    // scan will not find a gap at all.
+                    if image.fill_gap(gap) {
+                        system.increment(system_counters::id::LOSS_GAP_FILLS);
+                    }
+
+                    work += 1;
                 }
             }
 

@@ -65,6 +65,13 @@ path = "integration/udp_term_boundary.rs"
 name = "spy_subscription"
 path = "integration/spy_subscription.rs"
 
+# A `reliable=false` subscription on a lossy stream: it fills its holes instead
+# of asking for them, so the messages lost on the wire are lost. Runs in CI: the
+# loss comes from this driver's own seam, not from the reference's.
+[[test]]
+name = "unreliable_stream"
+path = "integration/unreliable_stream.rs"
+
 [[test]]
 name = "connect_window"
 path = "integration/connect_window.rs"
