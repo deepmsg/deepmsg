@@ -134,6 +134,23 @@ impl LogBuffer {
             .region(self.geometry.metadata_offset, descriptor::METADATA_LENGTH)
     }
 
+    /// Whether the driver says a subscriber is attached
+    /// (`LogBufferDescriptor.isConnected`, the metadata byte
+    /// `aeron_logbuffer_descriptor_t` carries at
+    /// [`descriptor::IS_CONNECTED_OFFSET`]).
+    ///
+    /// Read here rather than through an append view because the byte is the
+    /// driver's and **both** kinds of publication have it: an exclusive one has
+    /// no append view and a connected byte all the same.
+    ///
+    /// [`None`] when the metadata cannot be read, which a log this type opened
+    /// never is.
+    pub fn is_connected(&self) -> Option<bool> {
+        self.metadata()
+            .and_then(|meta| meta.load_i32(descriptor::IS_CONNECTED_OFFSET))
+            .map(|value| value != 0)
+    }
+
     /// One of the three terms.
     pub fn term(&self, partition: usize) -> Option<deepmsg_core::buffer::AtomicBuffer<'_>> {
         if partition >= descriptor::PARTITION_COUNT {

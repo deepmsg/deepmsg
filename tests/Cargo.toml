@@ -50,6 +50,12 @@ path = "integration/cnc_terminate.rs"
 # against a real driver of ours. Runs in CI.
 # The port a subscription listened on coming back when it goes — the receive
 # endpoint's lifecycle, from the outside. Runs in CI.
+# A destination added to a manual subscription connecting the far end's
+# publisher. Runs in CI.
+[[test]]
+name = "mds_added_destination"
+path = "integration/mds_added_destination.rs"
+
 [[test]]
 name = "receive_endpoint_lifecycle"
 path = "integration/receive_endpoint_lifecycle.rs"
