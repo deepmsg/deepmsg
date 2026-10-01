@@ -5183,14 +5183,20 @@ mod tests {
         );
         assert_eq!(1, conductor.publication_failures());
 
-        // A channel the reference serves and this build does not — a multicast
-        // group — is refused rather than left waiting, and with the code the
-        // protocol has for exactly that. (A unicast UDP channel used to be this
-        // test's example; P1-4 made it a channel this driver *does* serve.)
+        // A channel the reference serves and this build does not — one that
+        // asked for transport-level timestamps — is refused rather than left
+        // waiting, and with the code the protocol has for exactly that. (A
+        // unicast UDP channel used to be this test's example, then a multicast
+        // group; P1-4 and G3-1 made both channels this driver *does* serve.)
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=224.0.1.1:40123"),
+            &add_publication_payload(
+                7,
+                10,
+                1001,
+                "aeron:udp?endpoint=127.0.0.1:40123|media-rcv-ts-offset=0",
+            ),
         );
         let payload = await_event(
             &mut conductor,
