@@ -113,6 +113,48 @@ pub struct MappedFile {
     writable: bool,
 }
 
+/// The OS's own text for an errno — `aeron_strerror_r`
+/// (`aeron-client/src/main/c/util/aeron_error.c:38-47`).
+///
+/// Ported rather than spelled with `std::io::Error`'s `Display`, because what
+/// this feeds is a **byte contract**: the driver's error log holds the
+/// reference's composition, and the description after `(22) ` is whatever
+/// `strerror_r` puts in the buffer. `io::Error` renders
+/// `"Invalid argument (os error 22)"` — the same text with a suffix this would
+/// then have to strip, which is a dependency on a `Display` implementation
+/// rather than on the libc the reference calls.
+///
+/// It goes through `libc::strerror_r`, which the `libc` crate declares with the
+/// **XSI** signature while glibc's symbol is the GNU one. That is a real
+/// footgun, so it was measured rather than reasoned about: on this host the
+/// call returns 0 and fills the buffer with `Invalid argument`, which is what
+/// the reference's own `int result = strerror_r(…)` sees.
+///
+/// A code the OS has no text for leaves the buffer alone and returns non-zero,
+/// which is the reference's `<Unable to get error description>`
+/// (`aeron_error.c:34`). The 1024-byte buffer is the reference's
+/// (`aeron_error.c:359`).
+pub fn error_string(code: i32) -> String {
+    let mut buffer = [0 as libc::c_char; 1024];
+
+    // SAFETY: `buffer` is owned by this frame and `buffer.len()` is its real
+    // length, which is what `strerror_r` writes within. The XSI contract says
+    // the buffer is NUL-terminated on success — which is what makes the
+    // `CStr::from_ptr` below sound — and on failure it is left untouched,
+    // which is why that path does not read it.
+    let rc = unsafe { libc::strerror_r(code, buffer.as_mut_ptr(), buffer.len()) };
+
+    if 0 != rc {
+        return "<Unable to get error description>".to_string();
+    }
+
+    // SAFETY: the call succeeded, so the buffer holds a NUL-terminated string
+    // and it is alive for this borrow.
+    unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 // SAFETY: a mapping is process-wide memory, not thread-local state — every
 // thread of this process may address it, and the kernel does not care which one
 // faults on it. What the type tracks is `addr`, `len` and `writable`, all plain

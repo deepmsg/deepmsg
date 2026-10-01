@@ -46,6 +46,37 @@ use super::{Datagrams, Transport, TransportParams};
 /// publisher joins the group's **control** twin — `remote_control`, the group
 /// one apart, which is where NAKs come back — and then sends to the group
 /// itself down the other one.
+/// Why a transport could not be opened.
+///
+/// The bind is the one failure that carries more than an errno: the reference
+/// composes its line from the descriptor and the address
+/// (`aeron_bind`, `aeron_socket.c:88-95`) and the layers above append to it,
+/// so the two facts have to survive the trip.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The unicast bind, with what the first line of the composition needs.
+    Bind(crate::sys::socket::BindFailure),
+    /// Every other syscall, unchanged.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bind(failure) => write!(f, "{failure}"),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<io::Error> for OpenError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 #[derive(Debug)]
 pub struct UdpTransport {
     socket: DatagramSocket,
@@ -76,7 +107,7 @@ impl UdpTransport {
         multicast_interface: Option<SocketAddr>,
         connect: Option<SocketAddr>,
         params: &TransportParams,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, OpenError> {
         let family = AddressFamily::of(bind.ip());
         let socket = DatagramSocket::open(family)?;
         let is_multicast = bind.ip().is_multicast();
@@ -104,7 +135,9 @@ impl UdpTransport {
 
             // `:186-273`: the bind is the **wildcard** at the channel's port —
             // the group is joined, never bound.
-            receive.bind(SocketAddr::new(wildcard(family), bind.port()))?;
+            receive
+                .bind(SocketAddr::new(wildcard(family), bind.port()))
+                .map_err(OpenError::Bind)?;
 
             // `:275-293`: the join, on the receiving descriptor.
             receive.join_multicast_group(bind.ip(), interface.ip(), params.multicast_if_index)?;
@@ -118,8 +151,10 @@ impl UdpTransport {
                 socket.set_multicast_ttl(params.ttl)?;
             }
         } else {
-            // `:147-154`: a unicast transport binds and nothing else.
-            socket.bind(bind)?;
+            // `:147-154`: a unicast transport binds and nothing else — and
+            // this is the bind whose failure the reference composes from the
+            // descriptor and the address.
+            socket.bind(bind).map_err(OpenError::Bind)?;
         }
 
         if let Some(address) = connect {

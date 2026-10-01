@@ -172,6 +172,78 @@ struct Observation {
 /// The region is passed to every call rather than held, for the same reason
 /// the counters manager works that way: the conductor owns the CnC file, and
 /// a Rust value cannot borrow a window out of a mapping it also holds.
+/// The reference's per-thread error buffer, as a value.
+///
+/// `aeron_err_set` starts it, `aeron_err_append` adds a line to it
+/// (`util/aeron_error.c:337-378`), and the whole of it is what **both**
+/// consumers see: the `ON_ERROR` a client is handed and the entry the distinct
+/// error log records. They are one composition with two readers, which is why
+/// a client's `RegistrationException` message looks like a log entry.
+///
+/// The reference keeps one buffer per thread and reaches for it implicitly.
+/// This build has no thread-local, so the buffer travels with the error — and
+/// it has to travel, because the lines are appended by different layers
+/// between the syscall that failed and the conductor that reports it: a
+/// receive socket that cannot bind is composed of one `set` under `aeron_bind`
+/// and four `append`s on the way up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorReport {
+    code: i32,
+    text: String,
+}
+
+impl ErrorReport {
+    /// `AERON_SET_ERR`: the code, its description, and the first site.
+    pub fn set(code: i32, function: &str, file: &str, line: u32, message: &str) -> Self {
+        Self {
+            code,
+            text: compose_description(code, function, file, line, message),
+        }
+    }
+
+    /// `AERON_APPEND_ERR`: one more site line, leaving the code alone — which
+    /// is the reference's behaviour and the reason an appended line carries no
+    /// code of its own.
+    ///
+    /// The buffer's cap is [`compose_description`]'s, applied to what the
+    /// whole thing has become: past [`ERROR_MESSAGE_LIMIT`] the accumulation
+    /// ends in the reference's trailer. The reference bounds each `printf` by
+    /// what is left and then forces the trailer at a fixed offset, which for
+    /// anything short of the cap is the same text.
+    pub fn append(&mut self, function: &str, file: &str, line: u32, message: &str) {
+        use std::fmt::Write as _;
+
+        let _ = writeln!(self.text, "[{function}, {file}:{line}] {message}");
+
+        if self.text.len() > ERROR_MESSAGE_LIMIT {
+            let mut cut = ERROR_MESSAGE_LIMIT;
+            while !self.text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.text.truncate(cut);
+            self.text.push_str("...\n");
+        }
+    }
+
+    /// The code the reference would report: the errno `set` was handed, which
+    /// is what `log_explicit_error` records and what `on_error` transforms for
+    /// a client (`aeron_driver_conductor.c:1215`, `:2334-2338`).
+    pub const fn code(&self) -> i32 {
+        self.code
+    }
+
+    /// The whole composition, which is both what the log holds and what an
+    /// `ON_ERROR` carries.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Give up the text.
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DistinctErrorLog {
     /// Newest last. The reference keeps newest *first* (`:150` prepends into
@@ -262,10 +334,19 @@ const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
 ///
 /// The line is the one the `AERON_SET_ERR` itself sits on — the macro's
 /// `__LINE__`, which the compiler resolves to the line bearing the macro
-/// name. The code appears as it was set, negated or not, and a non-positive
-/// code is described by [`error_code_description`] while a positive one would
-/// carry the OS's `strerror` text — which this build never records, so that
-/// half of the reference's behaviour is not modelled here.
+/// name. The code appears as it was set, negated or not, and **which
+/// description follows it is decided by its sign** (`aeron_err_set`,
+/// `aeron_error.c:361-373`): a code at or below zero is described by
+/// [`error_code_description`], and a positive one — an errno, which is what
+/// `AERON_SET_ERR(EINVAL, …)` hands over — by the OS's own `strerror` text,
+/// through [`deepmsg_core::pal::error_string`].
+///
+/// That second branch went unmodelled until a recording site needed it, on the
+/// argument that no site here set a positive code. The argument was true and
+/// expired: a receiver refusing a sender's MTU records `(22) Invalid argument`
+/// (`media/aeron_receive_channel_endpoint.c:1022`), and a composition that
+/// printed `unknown error code` after the 22 would be wrong in the one place a
+/// reader looks.
 ///
 /// The description ends in a newline and is capped at the reference's buffer:
 /// past byte 8186 the rest is replaced by the trailer `"...\n"` it `strcpy`s
@@ -279,7 +360,12 @@ pub fn compose_description(
 ) -> String {
     let mut composed = format!(
         "({error_code}) {}\n[{function}, {file}:{line}] {message}\n",
-        error_code_description(error_code.abs()),
+        match error_code {
+            // `AERON_SET_ERR`'s two branches, in its own order: the protocol
+            // table for a code the driver set, the OS's text for an errno.
+            1..=i32::MAX => deepmsg_core::pal::error_string(error_code),
+            _ => error_code_description(-error_code).to_string(),
+        },
     );
 
     if composed.len() > ERROR_MESSAGE_LIMIT {
@@ -460,15 +546,84 @@ mod tests {
             )
         );
 
-        // A code the table has no case for gets the reference's default
-        // (`aeron_error.c:307-309`) — and it is negative because a *positive*
-        // code takes the reference's other branch, `aeron_strerror_r`
-        // (`:357-366`), which this build does not model: no recording site
-        // here sets one, so a positive code is outside the range this
-        // composition claims rather than a behaviour to match.
+        // A *negative* code the table has no case for gets the reference's
+        // default (`aeron_error.c:307-309`).
         assert_eq!(
             "(-99) unknown error code\n[f, f.c:1] m\n",
             compose_description(-99, "f", "f.c", 1, "m")
+        );
+    }
+
+    #[test]
+    fn a_positive_code_is_described_by_the_os_and_not_by_the_table() {
+        // Read off a live 1.53.2 driver, which recorded this for a sender
+        // whose MTU did not fit the receiver's window: the receiving side
+        // raises `AERON_SET_ERR(EINVAL, …)`, and a **positive** code takes
+        // `aeron_err_set`'s other branch — `strerror_r`, not the protocol
+        // table (`aeron_error.c:361-373`). That is why the entry says
+        // `Invalid argument` and not the table's row for 22 (which there is
+        // not) and not the row for 1.
+        assert_eq!(
+            "(22) Invalid argument\n\
+             [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
+             aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n",
+            compose_description(
+                22,
+                "aeron_receiver_channel_endpoint_validate_sender_mtu_length",
+                "aeron_receive_channel_endpoint.c",
+                1022,
+                "mtuLength=1408 > initialWindowLength=1376",
+            )
+        );
+
+        // The same call the reference makes, and the two texts it can produce:
+        // an errno the OS knows, and one it does not — which is the
+        // reference's `<Unable to get error description>` rather than a
+        // failure (`aeron_error.c:34`, `:43`).
+        assert_eq!("Invalid argument", deepmsg_core::pal::error_string(22));
+        assert_eq!(
+            "<Unable to get error description>",
+            deepmsg_core::pal::error_string(9999)
+        );
+    }
+
+    #[test]
+    fn an_appended_line_is_a_site_and_a_message_and_leaves_the_code_alone() {
+        // The shape `aeron_err_update_entry` writes (`:337-349`), and the two
+        // things it does *not* do: it never touches the code, and an empty
+        // message still gets its site line — the last line the reference
+        // writes for a subscription that could not bind has nothing after the
+        // `] `.
+        let mut report = ErrorReport::set(
+            98,
+            "aeron_bind",
+            "aeron_socket.c",
+            93,
+            "failed to bind(3, 127.0.0.1:9999)",
+        );
+
+        report.append(
+            "aeron_receive_destination_create",
+            "aeron_receive_destination.c",
+            78,
+            "uri = aeron:udp?endpoint=127.0.0.1:9999",
+        );
+        report.append(
+            "aeron_driver_conductor_execute_add_network_subscription",
+            "aeron_driver_conductor.c",
+            5043,
+            "",
+        );
+
+        assert_eq!(98, report.code(), "appending leaves the code where it was");
+        assert_eq!(
+            "(98) Address already in use\n\
+             [aeron_bind, aeron_socket.c:93] failed to bind(3, 127.0.0.1:9999)\n\
+             [aeron_receive_destination_create, aeron_receive_destination.c:78] \
+             uri = aeron:udp?endpoint=127.0.0.1:9999\n\
+             [aeron_driver_conductor_execute_add_network_subscription, \
+             aeron_driver_conductor.c:5043] \n",
+            report.text()
         );
     }
 

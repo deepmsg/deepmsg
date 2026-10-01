@@ -69,6 +69,15 @@ pub enum ReceiveEndpointError {
     NoCounter,
     /// The socket could not be opened or bound.
     Socket(io::Error),
+    /// The **bind** failed, with the composition so far.
+    ///
+    /// Apart from the rest because this is the one failure whose message the
+    /// reference builds out of facts from three different layers, each
+    /// appending its own line (`AERON_APPEND_ERR`): the syscall's descriptor
+    /// and address, the transport's affinity, this destination's channel. The
+    /// two layers above append the correlation id and the subscription, which
+    /// is why it travels as a value rather than being finished here.
+    Bind(deepmsg_cnc::error_log::ErrorReport),
 }
 
 impl std::fmt::Display for ReceiveEndpointError {
@@ -76,11 +85,51 @@ impl std::fmt::Display for ReceiveEndpointError {
         match self {
             Self::NoCounter => f.write_str("could not allocate the receive channel status counter"),
             Self::Socket(error) => write!(f, "{error}"),
+            Self::Bind(report) => f.write_str(report.text()),
         }
     }
 }
 
 impl std::error::Error for ReceiveEndpointError {}
+
+/// The first three lines of what the reference records when a receive
+/// destination cannot bind: `aeron_bind` set it, and two layers appended to it
+/// on the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:151`,
+/// `aeron_receive_destination.c:78`).
+///
+/// `affinity=1` is `AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER`
+/// (`media/aeron_udp_channel_transport_bindings.h:26-30` — the sender's is 0),
+/// which the reference passes as an enum and prints as its number.
+fn bind_report(
+    channel: &crate::udp_channel::UdpChannel,
+    failure: &crate::sys::socket::BindFailure,
+) -> deepmsg_cnc::error_log::ErrorReport {
+    let errno = failure.source.raw_os_error().unwrap_or(libc::EINVAL);
+
+    let mut report = deepmsg_cnc::error_log::ErrorReport::set(
+        errno,
+        "aeron_bind",
+        "aeron_socket.c",
+        93,
+        &format!("failed to bind({}, {})", failure.fd, failure.address),
+    );
+
+    report.append(
+        "aeron_udp_channel_transport_init",
+        "aeron_udp_channel_transport.c",
+        151,
+        "unicast bind, affinity=1",
+    );
+
+    report.append(
+        "aeron_receive_destination_create",
+        "aeron_receive_destination.c",
+        78,
+        &format!("uri = {}", String::from_utf8_lossy(&channel.original_uri)),
+    );
+
+    report
+}
 
 /// A receive channel endpoint and its socket.
 impl ReceiveDestination {
@@ -106,13 +155,20 @@ impl ReceiveDestination {
         // channel's `remote_data` — the group, for a group — the interface is
         // its `local_data`, and a destination **never** connects, which is why
         // a subscriber's transport has one descriptor.
-        let transport = super::udp_transport::UdpTransport::open(
+        let transport = match super::udp_transport::UdpTransport::open(
             channel.remote_data,
             Some(channel.local_data),
             None,
             params,
-        )
-        .map_err(ReceiveEndpointError::Socket)?;
+        ) {
+            Ok(transport) => transport,
+            Err(super::udp_transport::OpenError::Bind(failure)) => {
+                return Err(ReceiveEndpointError::Bind(bind_report(&channel, &failure)));
+            }
+            Err(super::udp_transport::OpenError::Io(error)) => {
+                return Err(ReceiveEndpointError::Socket(error));
+            }
+        };
 
         Self::attach(
             channel,

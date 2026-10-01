@@ -35,7 +35,7 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::MappedFile;
+pub use linux::{MappedFile, error_string};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(

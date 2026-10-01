@@ -973,6 +973,15 @@ impl Conductor {
                         is_group,
                         source,
                         control_address,
+                        // The window this receiver offers and the socket it
+                        // offers it through, both read off the *endpoint's*
+                        // channel (`aeron_driver_conductor.c:6496-6497`,
+                        // `:6506`).
+                        ReceiveChannelEndpoints::initial_window_length(
+                            &self.config,
+                            &entry.channel,
+                        ),
+                        entry.socket_rcvbuf,
                         &self.config,
                         &mut self.counters,
                         &regions,
@@ -981,7 +990,7 @@ impl Conductor {
 
                     if let Err(error) = result {
                         self.pending_log_errors
-                            .push((error.error_code(), error.to_string()));
+                            .push((error.recorded_error_code(), error.to_string()));
                     }
                 }
                 ReceiverEvent::ImageDone { registration_id } => {

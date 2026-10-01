@@ -186,6 +186,13 @@ impl SendChannelEndpoint {
                 // The counter was allocated for an endpoint that will not
                 // exist; leaving it behind would be a counter nobody owns.
                 counters.free(regions, channel_status_counter_id, now_ms);
+                // The send path keeps the plain error: its chain is composed
+                // of different functions (`aeron_send_channel_endpoint.c`),
+                // and this build does not build it.
+                let error = match error {
+                    super::udp_transport::OpenError::Bind(failure) => failure.source,
+                    super::udp_transport::OpenError::Io(error) => error,
+                };
                 return Err(SendEndpointError::Socket(error));
             }
         };
