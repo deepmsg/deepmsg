@@ -25,7 +25,7 @@
 use deepmsg_core::logbuffer::descriptor;
 
 use crate::channel_uri::{ChannelUri, Transport, UriError};
-use crate::config::DriverConfig;
+use crate::config::{DriverConfig, InferableBoolean};
 
 /// The parameter names this module reads
 /// (`aeron-client/src/main/c/uri/aeron_uri.h:53-85`).
@@ -82,6 +82,16 @@ pub mod key {
     pub const REJOIN: &str = "rejoin";
     /// `control-mode`: `response` makes a channel a response channel.
     pub const CONTROL_MODE: &str = "control-mode";
+    /// `group`: whether the channel is to be treated as one of a group
+    /// (`AERON_URI_GROUP_KEY`, `aeron-client/src/main/c/uri/aeron_uri.h:66`).
+    ///
+    /// It is a **subscription** parameter: a publisher is told whether its
+    /// channel has group semantics by the channel itself
+    /// (`aeron_network_publication.c:136`, `has_group_semantics`), while a
+    /// subscriber may be reading an implicitly-unicast source it knows several
+    /// others are reading too. `aeron_driver_uri.c:494-495` reads it in
+    /// `aeron_driver_uri_subscription_params` and nowhere else.
+    pub const GROUP: &str = "group";
 }
 
 /// `AERON_URI_PROTOTYPE_VALUE_CORRELATION_ID`
@@ -227,6 +237,15 @@ pub struct SubscriptionParams {
     /// subscription that must not be created, not an image that quietly
     /// behaves like a different one.
     pub congestion_control: CongestionControl,
+    /// What `group=` said, or the driver's own consideration when it said
+    /// nothing: whether this channel is to be treated as one of a group even
+    /// when the channel itself gives no sign of it.
+    ///
+    /// Read here and carried on the subscription **link**, which is where the
+    /// image looks for it (`subscription_link->group`,
+    /// `aeron_driver_conductor.c:6702-6703`) — the image is created from a
+    /// `SETUP`, long after the subscription that will read it.
+    pub group: InferableBoolean,
 }
 
 /// The congestion-control strategies a channel may name with `cc=`
@@ -284,6 +303,7 @@ impl SubscriptionParams {
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
             nak_delay_ns: None,
             congestion_control: CongestionControl::Static,
+            group: config.receiver_group_consideration,
         }
     }
 
@@ -308,7 +328,11 @@ impl SubscriptionParams {
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
             nak_delay_ns: None,
             congestion_control: CongestionControl::Static,
+            group: config.receiver_group_consideration,
         };
+
+        params.group =
+            InferableBoolean::parse(uri.value(key::GROUP), config.receiver_group_consideration);
 
         if let Some(reliable) = uri.bool(key::RELIABLE)? {
             params.is_reliable = reliable;
@@ -1088,6 +1112,47 @@ mod tests {
         assert!(params.spies_simulate_connection);
         assert_eq!(7, params.entity_tag);
         assert_eq!(1_000_000_000, params.untethered_resting_timeout_ns);
+    }
+
+    #[test]
+    fn a_subscriptions_group_is_what_the_uri_says_and_otherwise_the_drivers_own() {
+        use crate::config::InferableBoolean::{ForceFalse, ForceTrue, Infer};
+
+        assert_eq!(
+            Infer,
+            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123")
+                .expect("a subscription")
+                .group
+                .clone(),
+            "a channel that names nothing gets the driver's consideration, \
+             which is `infer` by default"
+        );
+
+        for (named, expected) in [
+            ("group=true", ForceTrue),
+            ("group=infer", Infer),
+            ("group=false", ForceFalse),
+            ("group=nonsense", ForceFalse),
+        ] {
+            let uri = format!("aeron:udp?endpoint=127.0.0.1:40123|{named}");
+            assert_eq!(
+                expected,
+                resolve_subscription(&uri).expect("a subscription").group,
+                "{named}"
+            );
+        }
+
+        // And the consideration moves the default with it, which is the whole
+        // reason it is a setting.
+        let parsed = ChannelUri::parse(b"aeron:udp?endpoint=127.0.0.1:40123").expect("a URI");
+        let mut config = config();
+        config.receiver_group_consideration = ForceTrue;
+        assert_eq!(
+            ForceTrue,
+            SubscriptionParams::resolve(&parsed, &config)
+                .expect("a subscription")
+                .group
+        );
     }
 
     #[test]

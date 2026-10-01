@@ -119,19 +119,36 @@ struct PendingImage {
     group_semantics: bool,
 }
 
-/// Whether an image is one of a group
+/// Whether an image is to be treated as one of a group
 /// (`aeron_driver_conductor_treat_image_as_multicast`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:674-680`): the channel's
-/// own group semantics, **or** the `SETUP`'s `GROUP` flag.
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:674-680`).
 ///
-/// The two are one question because both name a channel that may have several
-/// receivers at once, which is what the log buffer's `group` byte is about — so
-/// a channel whose URI does not say it is one is still a group if the far end
-/// says so. The reference's third arm, a `group=` parameter forced true, is not
-/// parsed in this build.
-fn image_group_semantics(uri: &crate::channel_uri::ChannelUri<'_>, setup_flags: u8) -> bool {
-    crate::udp_channel::UdpChannel::uri_has_group_semantics(uri)
-        || setup_flags & crate::protocol::header_flags::SETUP_GROUP != 0
+/// Three inputs, and the reference's expression is worth reading twice because
+/// it names only two of them:
+///
+/// ```text
+/// AERON_INFER == is_group ? (channel->is_multicast || is_group_from_flag)
+///                         : AERON_FORCE_TRUE == is_group
+/// ```
+///
+/// The `channel` there is the **receive endpoint's**, and the bit it reads is
+/// `is_multicast` — not `has_group_semantics`, which would also be true of a
+/// multi-destination channel. A multi-destination stream is still a group here
+/// because its *publisher* sets the `SETUP` flag
+/// (`aeron_network_publication.c:394`, whose `has_group_semantics` does include
+/// multi-destination), and the subscriber takes it from there.
+///
+/// `is_group` is the subscription's `group=`, which is why it comes in as an
+/// [`InferableBoolean`] rather than a bool: it is the one input that can
+/// overrule the other two, in either direction.
+fn image_group_semantics(
+    is_multicast: bool,
+    setup_flags: u8,
+    is_group: crate::config::InferableBoolean,
+) -> bool {
+    let from_flag = setup_flags & crate::protocol::header_flags::SETUP_GROUP != 0;
+
+    is_group.resolve(is_multicast || from_flag)
 }
 
 /// The images a driver owns.
@@ -213,6 +230,8 @@ impl PublicationImages {
         channel: &[u8],
         setup: &SetupFrame,
         setup_flags: u8,
+        is_multicast: bool,
+        is_group: crate::config::InferableBoolean,
         source: SocketAddr,
         control_address: SocketAddr,
         config: &crate::config::DriverConfig,
@@ -234,19 +253,15 @@ impl PublicationImages {
         // `SETUP`, so the timeouts its readers are held to come from the
         // *channel* rather than from each subscription
         // (`aeron_driver_uri_subscription_params` on the channel's URI).
-        let (untethered, group_semantics) = match crate::channel_uri::ChannelUri::parse(channel) {
-            Ok(uri) => (
-                crate::publication_params::SubscriptionParams::resolve(&uri, config)
-                    .unwrap_or_else(|_| {
-                        crate::publication_params::SubscriptionParams::defaults(config)
-                    }),
-                image_group_semantics(&uri, setup_flags),
-            ),
-            Err(_) => (
-                crate::publication_params::SubscriptionParams::defaults(config),
-                false,
-            ),
+        let untethered = match crate::channel_uri::ChannelUri::parse(channel) {
+            Ok(uri) => crate::publication_params::SubscriptionParams::resolve(&uri, config)
+                .unwrap_or_else(|_| {
+                    crate::publication_params::SubscriptionParams::defaults(config)
+                }),
+            Err(_) => crate::publication_params::SubscriptionParams::defaults(config),
         };
+
+        let group_semantics = image_group_semantics(is_multicast, setup_flags, is_group);
 
         let counters_pair = allocate_counters(
             counters,
@@ -406,6 +421,10 @@ impl PublicationImages {
             config.layout.page_size,
             pending.untethered,
             pending.group_semantics,
+            crate::loss_detector::MulticastBackoff::new(
+                config.nak_multicast_group_size,
+                config.nak_multicast_max_backoff_ns,
+            ),
             now.ns,
         );
 
@@ -639,29 +658,35 @@ mod tests {
 
     use crate::protocol::header_flags;
 
-    fn uri(text: &str) -> crate::channel_uri::ChannelUri<'_> {
-        crate::channel_uri::ChannelUri::parse(text.as_bytes()).expect("a URI")
-    }
-
-    /// Both halves of the predicate, and each on its own: a channel that says
-    /// it is a group, a channel that does not but whose `SETUP` does, and one
-    /// that is neither. A hardcoded answer satisfies at most two of the three.
+    /// Every input on its own, and the one that overrules the others: a
+    /// hardcoded answer satisfies at most some of these.
     #[test]
-    fn an_image_is_a_group_when_either_the_channel_or_the_setup_says_so() {
-        let multi_destination = uri("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual");
-        let plain = uri("aeron:udp?endpoint=127.0.0.1:40123");
+    fn an_image_is_a_group_when_the_channel_the_setup_or_the_subscription_says_so() {
+        use crate::config::InferableBoolean::{ForceFalse, ForceTrue, Infer};
 
         assert!(
-            image_group_semantics(&multi_destination, 0),
-            "a multi-destination channel is a group on its own"
+            image_group_semantics(true, 0, Infer),
+            "a multicast channel is a group on its own"
         );
         assert!(
-            image_group_semantics(&plain, header_flags::SETUP_GROUP),
+            image_group_semantics(false, header_flags::SETUP_GROUP, Infer),
             "and a channel that is not one is still a group if the far end says so"
         );
         assert!(
-            !image_group_semantics(&plain, 0),
+            !image_group_semantics(false, 0, Infer),
             "but neither saying it is not a group"
+        );
+
+        // `group=` overrules both directions, which is what makes it worth
+        // parsing at all: it is the only input that can say yes to a unicast
+        // channel and no to a multicast one.
+        assert!(
+            image_group_semantics(false, 0, ForceTrue),
+            "`group=true` on a channel that gives no other sign of it"
+        );
+        assert!(
+            !image_group_semantics(true, header_flags::SETUP_GROUP, ForceFalse),
+            "`group=false` even where the channel and the setup both say otherwise"
         );
     }
 }

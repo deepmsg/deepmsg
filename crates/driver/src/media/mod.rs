@@ -24,10 +24,11 @@
 //!
 //! # What this build carries
 //!
-//! A single file descriptor per transport — the unicast case. The reference's
-//! dual-fd shape (a separate `recv_fd` for multicast, `:141-163`), the
-//! interceptors and the transport-level timestamps all belong to multicast,
-//! which is refused here (`docs/compat.md`). The poller is the linear one: the
+//! One file descriptor per transport, or two where a multicast channel both
+//! joins and sends — the reference's `fd`/`recv_fd` pair (`:141-164`), which
+//! [`udp_transport::UdpTransport`] describes. The interceptors and the
+//! transport-level timestamps are still out, and are refused at the channel
+//! rather than ignored (`docs/compat.md`). The poller is the linear one: the
 //! reference switches to `epoll`/`poll` above five transports
 //! (`aeron_udp_transport_poller.c:183-196`, `aeron_udp_transport_poller.h:22`),
 //! a threshold this build's channels do not reach on any machine it is tested
@@ -57,7 +58,14 @@ pub struct TransportParams {
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, in bytes; zero leaves the kernel's default.
     pub socket_sndbuf: usize,
-    /// The `ttl=` parameter, for the sockets that honour it.
+    /// The channel's interface index, which the IPv6 multicast options take in
+    /// place of an address (`aeron_udp_channel_transport.c:213-227`, `:230-235`).
+    pub multicast_if_index: u32,
+    /// The `ttl=` parameter, for the sockets that honour it
+    /// (`0 != channel->multicast_ttl ? channel->multicast_ttl : context->multicast_ttl`,
+    /// `media/aeron_send_channel_endpoint.c:129`). Zero leaves the kernel's
+    /// own hop limit, because the reference and the channel agree on zero
+    /// meaning "not set".
     pub ttl: u8,
 }
 

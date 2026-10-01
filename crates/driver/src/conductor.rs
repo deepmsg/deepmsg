@@ -944,17 +944,23 @@ impl Conductor {
                     // it named no session or it named this one. A stream two
                     // clients both read is owned by the first of them, which is
                     // the same one-link answer the reference gives.
-                    let client_id = self
-                        .subscriptions
-                        .links()
-                        .iter()
-                        .find(|link| {
-                            link.stream_id == setup.stream_id
-                                && link
-                                    .session_id
-                                    .is_none_or(|session_id| session_id == setup.session_id)
-                        })
-                        .map_or(0, |link| link.client_id);
+                    //
+                    // The link is also where `group=` was left, for the same
+                    // reason the reference keeps it there: the `SETUP` that
+                    // creates this image arrives long after the subscription
+                    // that will read it (`aeron_driver_conductor.c:6702-6703`).
+                    // With no link there is nobody's `group=` to read, so the
+                    // driver's own consideration stands.
+                    let link = self.subscriptions.links().iter().find(|link| {
+                        link.stream_id == setup.stream_id
+                            && link
+                                .session_id
+                                .is_none_or(|session_id| session_id == setup.session_id)
+                    });
+
+                    let client_id = link.map_or(0, |link| link.client_id);
+                    let is_group =
+                        link.map_or(self.config.receiver_group_consideration, |link| link.group);
 
                     let result = self.images.begin_create(
                         registration_id,
@@ -963,6 +969,8 @@ impl Conductor {
                         &channel,
                         &setup,
                         setup_flags,
+                        entry.channel.is_multicast,
+                        is_group,
                         source,
                         control_address,
                         &self.config,
@@ -5183,14 +5191,20 @@ mod tests {
         );
         assert_eq!(1, conductor.publication_failures());
 
-        // A channel the reference serves and this build does not — a multicast
-        // group — is refused rather than left waiting, and with the code the
-        // protocol has for exactly that. (A unicast UDP channel used to be this
-        // test's example; P1-4 made it a channel this driver *does* serve.)
+        // A channel the reference serves and this build does not — one that
+        // asked for transport-level timestamps — is refused rather than left
+        // waiting, and with the code the protocol has for exactly that. (A
+        // unicast UDP channel used to be this test's example, then a multicast
+        // group; P1-4 and G3-1 made both channels this driver *does* serve.)
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 10, 1001, "aeron:udp?endpoint=224.0.1.1:40123"),
+            &add_publication_payload(
+                7,
+                10,
+                1001,
+                "aeron:udp?endpoint=127.0.0.1:40123|media-rcv-ts-offset=0",
+            ),
         );
         let payload = await_event(
             &mut conductor,

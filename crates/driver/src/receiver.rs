@@ -1125,7 +1125,7 @@ impl ReceiverThread {
                             && endpoint
                                 .send_sm_from(
                                     destination_index,
-                                    endpoint.control_address(source),
+                                    endpoint.control_address(destination_index, source),
                                     frame.stream_id,
                                     frame.session_id,
                                     0,
@@ -1173,7 +1173,7 @@ impl ReceiverThread {
                     return;
                 }
 
-                let control_address = endpoint.control_address(source);
+                let control_address = endpoint.control_address(destination_index, source);
                 let _ = endpoint_id;
 
                 let _ = events.send(ReceiverEvent::CreateImage {

@@ -46,7 +46,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
-use crate::config::DriverConfig;
+use crate::config::{DriverConfig, InferableBoolean};
 use crate::ipc_publications::{AddError, IpcPublications};
 use crate::network_publications::{NetworkPublicationRecord, NetworkPublications};
 use crate::publication_images::PublicationImages;
@@ -168,6 +168,16 @@ pub struct SubscriptionLink {
     pub is_rejoin: bool,
     /// Whether it is a response channel.
     pub is_response: bool,
+    /// What its `group=` said, or the driver's consideration when it said
+    /// nothing (`aeron_subscription_link_t`'s `group`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.h:113`).
+    ///
+    /// It is kept on the **link** and not on the channel because an image is
+    /// created from a `SETUP`, which arrives long after the subscription did —
+    /// and because the channel a `SETUP` names is the endpoint's, which for a
+    /// multi-destination subscription is not the one that carried the
+    /// parameter.
+    pub group: InferableBoolean,
     /// How far its setup has got
     /// (`AERON_SUBSCRIPTION_LINK_SETUP_STATUS_*`,
     /// `aeron_driver_conductor.h:94-100`).
@@ -524,6 +534,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            group: params.group,
             setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
@@ -622,6 +633,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: false,
+            group: params.group,
             setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
@@ -793,6 +805,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: false,
+            group: params.group,
             setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
@@ -1449,6 +1462,7 @@ impl IpcSubscriptions {
             is_tether: params.is_tether,
             is_rejoin: params.is_rejoin,
             is_response: params.is_response,
+            group: params.group,
             setup_status: SetupStatus::Pending,
             is_reliable: params.is_reliable,
             is_sparse: params.is_sparse,
@@ -2056,6 +2070,7 @@ mod tests {
             is_tether: true,
             is_rejoin: false,
             is_response,
+            group: InferableBoolean::Infer,
             setup_status: SetupStatus::Pending,
             is_reliable: true,
             is_sparse: true,

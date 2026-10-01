@@ -31,10 +31,26 @@
 //! publication and subscription *params* rather than channel ones and are read
 //! by [`crate::publication_params`]; what lives here is the transport: the
 //! addresses, the socket buffer sizes, the receiver window, the tag and the
-//! control mode. Multicast (`group`/`gtag`, a multicast endpoint) and the
-//! timestamp-offset parameters are **refused** rather than ignored — a driver
-//! that dropped them silently would serve a channel that behaves like a
-//! different one. Both refusals are recorded in `docs/compat.md`.
+//! control mode. The timestamp-offset parameters are **refused** rather than
+//! ignored — a driver that dropped them silently would serve a channel that
+//! behaves like a different one — and so are `group`/`gtag`, whose flow-control
+//! semantics are a later slice. Both refusals are recorded in `docs/compat.md`.
+//!
+//! # A multicast endpoint is a different shape
+//!
+//! When `endpoint=` names a group the four addresses stop meaning what they
+//! mean for unicast (`aeron_udp_channel.c:421-441`):
+//!
+//! * `remote_data` is the group, and `remote_control` is the group with its
+//!   **last byte incremented** (`aeron_multicast_control_address`, `:76-136`) —
+//!   which is why the reference refuses a group whose last byte is even;
+//! * `local_data` and `local_control` are both the *interface*, not a wildcard:
+//!   a multicast socket has to name the interface it sends on and joins on, so
+//!   the wildcard is a lookup here rather than an answer
+//!   (`aeron_find_multicast_interface`, `:138-144`);
+//! * the canonical form is built with the group's own address and **no** unique
+//!   suffix, whatever the URI's tag says, so two subscribers to one group share
+//!   one endpoint.
 //!
 //! `control-mode=response` is a channel like the others here: the reference
 //! resolves its addresses down the same path as every other mode
@@ -130,7 +146,11 @@ pub struct UdpChannel {
     /// The kernel's index for the interface, which the multicast options use
     /// and a unicast socket does not.
     pub interface_index: u32,
-    /// The multicast hop limit; zero for unicast.
+    /// The multicast hop limit, from `ttl=`; zero for a unicast channel and
+    /// for a multicast one that named none — which the endpoint then reads as
+    /// "use the driver's own default", because zero and "not set" are one
+    /// value here (`aeron_send_channel_endpoint.c:129`). The reference clamps
+    /// what it reads to 255 rather than refusing it.
     pub multicast_ttl: u8,
     /// Whether the URI named an endpoint at all — the difference between a
     /// channel that listens where it was told and one the kernel places.
@@ -139,8 +159,13 @@ pub struct UdpChannel {
     pub has_explicit_control: bool,
     /// What `control-mode=` said.
     pub control_mode: ControlMode,
-    /// Whether the endpoint is a multicast group. Always false here: this
-    /// build refuses those before it gets this far.
+    /// Whether the endpoint is a multicast group
+    /// (`aeron_is_addr_multicast(&endpoint_addr)`, `aeron_udp_channel.c:421`).
+    ///
+    /// It is read off the *endpoint*, not off the local side, and it is what
+    /// decides the shape of the addresses above: the group for `remote_data`,
+    /// the group with its last byte incremented for `remote_control`, and the
+    /// interface for both local sides.
     pub is_multicast: bool,
     /// `so-sndbuf=`, in bytes; zero means the driver's configured default.
     pub socket_sndbuf_length: usize,
@@ -221,26 +246,29 @@ impl UdpChannel {
     ///
     /// The two are one predicate in the reference because both name a channel
     /// that may have several receivers at once, which is what the setup frame's
-    /// `GROUP` flag and the log buffer's `group` byte are about. In this build
-    /// the multicast arm is unreachable — multicast channels are refused at
-    /// parse (`aeron_udp_channel.c` is not consulted for them here) — so the
-    /// multi-destination arm is the whole of it, and the `||` is kept so the
-    /// predicate reads as the reference's.
+    /// `GROUP` flag and the log buffer's `group` byte are about.
     pub const fn has_group_semantics(&self) -> bool {
         self.is_multicast || self.control_mode.is_multi_destination()
     }
 
-    /// [`UdpChannel::has_group_semantics`] for a channel that has been parsed
-    /// but not resolved into an address.
+    /// Where a control frame about data that arrived from `source` goes
+    /// (`aeron_receive_destination.c:120-129`, and the same three arms in
+    /// `aeron_data_packet_dispatcher.c:636-637`).
     ///
-    /// An image is created from a channel's *bytes* — the conductor hands
-    /// `PublicationImages::begin_create` the URI it was given — and one bit is
-    /// not worth resolving a second time, with the interface lookup and the
-    /// host resolution that implies. The multicast arm is out of reach in this
-    /// build either way (multicast channels are refused at parse), so the
-    /// control mode is the whole of it, exactly as it is for the method above.
-    pub(crate) fn uri_has_group_semantics(uri: &ChannelUri<'_>) -> bool {
-        read_control_mode(uri).is_ok_and(ControlMode::is_multi_destination)
+    /// The multicast arm is the one that is easy to miss and impossible to
+    /// work without: a group's control frames go to the group's **control
+    /// twin**, not back to the source address they came from. A subscriber
+    /// that answered the source would be answering a port the publisher never
+    /// listens on, and the publisher would wait for a status message that can
+    /// never arrive.
+    pub fn control_address(&self, source: SocketAddr) -> SocketAddr {
+        if self.is_multicast {
+            self.remote_control
+        } else if self.has_explicit_control {
+            self.local_control
+        } else {
+            source
+        }
     }
 
     /// Read a `aeron:udp` URI into the addresses an endpoint works with
@@ -295,12 +323,6 @@ impl UdpChannel {
             ),
         };
 
-        if is_multicast(endpoint_addr.ip()) {
-            return Err(UdpChannelError::Unsupported(format!(
-                "multicast channels are not served by this driver: endpoint={endpoint_addr}"
-            )));
-        }
-
         let tag_id = match channel_tag {
             Some(text) => parse_tag(text).ok_or_else(|| {
                 UdpChannelError::InvalidChannel(format!(
@@ -310,6 +332,39 @@ impl UdpChannel {
             None => INVALID_TAG,
         };
 
+        let interface = read_interface(uri.value("interface"))?;
+
+        // `:421-441`: a multicast endpoint is a group, so the two remote
+        // addresses are the group and its control twin, and both local sides
+        // are the *interface* — a socket that has to join and to send on a
+        // chosen interface cannot leave either to the kernel. Note what the
+        // branch does not do: an explicit `control=` is resolved above (and
+        // still fails if it will not resolve) and then **ignored**, and the
+        // tag stops mattering, because the canonical form below is built with
+        // neither a tag nor a unique suffix.
+        if is_multicast(endpoint_addr.ip()) {
+            let (local, interface_index) = interface.resolve_multicast(endpoint_addr.ip())?;
+
+            return Ok(Self {
+                original_uri: original_uri.to_vec(),
+                canonical_form: canonicalise(None, local, None, endpoint_addr, false, INVALID_TAG),
+                remote_data: endpoint_addr,
+                local_data: local,
+                remote_control: multicast_control_address(endpoint_addr)?,
+                local_control: local,
+                tag_id,
+                interface_index,
+                multicast_ttl: read_multicast_ttl(uri),
+                has_explicit_endpoint: endpoint.is_some(),
+                has_explicit_control: false,
+                control_mode,
+                is_multicast: true,
+                socket_sndbuf_length: read_size(uri, "so-sndbuf")?,
+                socket_rcvbuf_length: read_size(uri, "so-rcvbuf")?,
+                receiver_window_length: read_size(uri, "rcv-wnd")?,
+            });
+        }
+
         // `:376-381`: a channel nothing *identifies* gets a unique suffix in
         // its canonical form, so it is an endpoint of its own rather than one
         // shared with every other unaddressed channel.
@@ -317,7 +372,6 @@ impl UdpChannel {
             || (endpoint.is_some() && endpoint_addr.port() == 0)
             || explicit_control_addr.is_some_and(|addr| addr.port() == 0);
 
-        let interface = read_interface(uri.value("interface"))?;
         let (local, interface_index) = interface.resolve(endpoint_addr.ip())?;
 
         let (local_data, local_control, has_explicit_control, canonical_form) =
@@ -609,7 +663,6 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
 /// [`UdpChannelError::Unsupported`] for the first such parameter present.
 fn refuse_unsupported(uri: &ChannelUri<'_>) -> Result<(), UdpChannelError> {
     for key in [
-        "group",
         "gtag",
         "media-rcv-ts-offset",
         "channel-rcv-ts-offset",
@@ -634,6 +687,75 @@ fn is_multicast(address: IpAddr) -> bool {
         IpAddr::V4(address) => address.is_multicast(),
         IpAddr::V6(address) => address.is_multicast(),
     }
+}
+
+/// The control address of a multicast channel: the group with its last byte
+/// incremented, same family and same port
+/// (`aeron_multicast_control_address`, `aeron_udp_channel.c:76-136`).
+///
+/// The even-last-byte refusal is the reference's, and it is a real constraint
+/// rather than a typo: control and data are two groups one apart, so a group
+/// whose last byte is even would put its control group where some other
+/// channel's data group is.
+///
+/// # Errors
+///
+/// [`UdpChannelError::Resolution`] when the last byte is even. The reference
+/// answers `EINVAL` here and not an `AERON_ERROR_CODE_*`, so what a client
+/// sees is a generic error (`aeron_driver_conductor.c:2326-2358`).
+fn multicast_control_address(address: SocketAddr) -> Result<SocketAddr, UdpChannelError> {
+    let even =
+        || UdpChannelError::Resolution(format!("Multicast data address must be odd: {address}"));
+
+    let incremented = match address.ip() {
+        IpAddr::V4(group) => {
+            let mut octets = group.octets();
+            let last = octets[3];
+
+            if last & 1 == 0 {
+                return Err(even());
+            }
+
+            octets[3] = last + 1;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+
+        IpAddr::V6(group) => {
+            let mut octets = group.octets();
+            let last = octets[15];
+
+            if last & 1 == 0 {
+                return Err(even());
+            }
+
+            octets[15] = last + 1;
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    };
+
+    Ok(SocketAddr::new(incremented, address.port()))
+}
+
+/// `ttl=` as the multicast hop limit
+/// (`aeron_uri_multicast_ttl`, `aeron-client/src/main/c/uri/aeron_uri.c:323-334`).
+///
+/// Three things the reference's `strtoull(value, NULL, 0)` brings with it, all
+/// of them kept: the radix is the value's own (so `0x10` and `010` are hop
+/// limits 16 and 8), text with no digits at all is **zero** rather than an
+/// error, and a value above 255 is clamped rather than refused. A negative
+/// value is the fourth: `strtoull` wraps it, so `ttl=-1` clamps to 255.
+fn read_multicast_ttl(uri: &ChannelUri<'_>) -> u8 {
+    let Some(text) = uri.value("ttl") else {
+        return 0;
+    };
+
+    let value = if text.trim_start().starts_with('-') {
+        u32::MAX
+    } else {
+        parse_base_zero(text).unwrap_or(0)
+    };
+
+    u8::try_from(value.min(255)).unwrap_or(255)
 }
 
 /// Read the `interface=` parameter into what it names
@@ -743,19 +865,7 @@ impl InterfaceSpec {
             // No interface named: the wildcard, and the kernel picks.
             Self::Wildcard => Ok((wildcard_socket(family), 0)),
 
-            Self::Named { name, port } => {
-                let found = sys::interface_by_name(family, name).map_err(|error| {
-                    UdpChannelError::Resolution(format!("interface {name}: {error}"))
-                })?;
-
-                // `:660-690`: an interface that exists but holds no address in
-                // the family is refused, as is one that does not exist.
-                let interface = found.ok_or_else(|| {
-                    UdpChannelError::Resolution(format!("unknown interface {name}"))
-                })?;
-
-                Ok((SocketAddr::new(interface.address, *port), interface.index))
-            }
+            Self::Named { name, port } => Self::resolve_by_name(family, name, *port),
 
             Self::Address {
                 address,
@@ -768,19 +878,93 @@ impl InterfaceSpec {
                     return Ok((SocketAddr::new(*address, *port), 0));
                 }
 
-                let found = sys::interface_for_address(family, *address, *prefix_length).map_err(
-                    |error| UdpChannelError::Resolution(format!("interface {address}: {error}")),
-                )?;
-
-                let interface = found.ok_or_else(|| {
-                    UdpChannelError::Resolution(format!(
-                        "could not find matching interface='{address}'"
-                    ))
-                })?;
-
-                Ok((SocketAddr::new(interface.address, *port), interface.index))
+                Self::resolve_by_address(family, *address, *prefix_length, *port)
             }
         }
+    }
+
+    /// The same question for a **multicast** channel
+    /// (`aeron_find_multicast_interface`, `aeron_udp_channel.c:138-144`, which
+    /// is `aeron_find_interface` with the wildcard written out as the string
+    /// `0.0.0.0/0` — `[0::]/0` for the other family).
+    ///
+    /// The difference from [`Self::resolve`] is exactly the two shortcuts that
+    /// path takes and this one cannot: naming no interface, and naming the
+    /// wildcard outright, both answer the wildcard *without asking the kernel*.
+    /// A multicast socket needs an interface — it is what `IP_MULTICAST_IF`
+    /// sends on and what a join is against — so here even the wildcard is a
+    /// lookup, and the kernel's answer is the one `aeron_ip_lookup_func` picks:
+    /// loopback if it is up, otherwise the multicast-capable interface with the
+    /// longest netmask (`aeron_netutil.c:479-517`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve`], plus the empty host case: this host has no
+    /// interface to join on.
+    fn resolve_multicast(&self, remote: IpAddr) -> Result<(SocketAddr, u32), UdpChannelError> {
+        let family = AddressFamily::of(remote);
+
+        match self {
+            Self::Named { name, port } => Self::resolve_by_name(family, name, *port),
+
+            Self::Address {
+                address,
+                prefix_length,
+                port,
+            } => Self::resolve_by_address(family, *address, *prefix_length, *port),
+
+            Self::Wildcard => {
+                let wildcard = wildcard_socket(family);
+                Self::resolve_by_address(family, wildcard.ip(), 0, wildcard.port())
+            }
+        }
+    }
+
+    /// A named interface, `{name:port}` (`aeron_find_interface_by_name_and_family`,
+    /// `aeron_netutil.c:634-700`).
+    ///
+    /// # Errors
+    ///
+    /// [`UdpChannelError::Resolution`] when the interface does not exist, or
+    /// holds no address in the family.
+    fn resolve_by_name(
+        family: AddressFamily,
+        name: &str,
+        port: u16,
+    ) -> Result<(SocketAddr, u32), UdpChannelError> {
+        let found = sys::interface_by_name(family, name)
+            .map_err(|error| UdpChannelError::Resolution(format!("interface {name}: {error}")))?;
+
+        // `:658-690`: an interface that exists but holds no address in the
+        // family is refused, as is one that does not exist.
+        let interface = found
+            .ok_or_else(|| UdpChannelError::Resolution(format!("unknown interface {name}")))?;
+
+        Ok((SocketAddr::new(interface.address, port), interface.index))
+    }
+
+    /// An address, matched under its netmask
+    /// (`aeron_find_interface_by_address`, `aeron_netutil.c:702-732`).
+    ///
+    /// # Errors
+    ///
+    /// [`UdpChannelError::Resolution`] when no interface on this host matches.
+    fn resolve_by_address(
+        family: AddressFamily,
+        address: IpAddr,
+        prefix_length: u8,
+        port: u16,
+    ) -> Result<(SocketAddr, u32), UdpChannelError> {
+        let found =
+            sys::interface_for_address(family, address, prefix_length).map_err(|error| {
+                UdpChannelError::Resolution(format!("interface {address}: {error}"))
+            })?;
+
+        let interface = found.ok_or_else(|| {
+            UdpChannelError::Resolution(format!("could not find matching interface='{address}'"))
+        })?;
+
+        Ok((SocketAddr::new(interface.address, port), interface.index))
     }
 }
 
@@ -1326,20 +1510,203 @@ mod tests {
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            refuse("aeron:udp?endpoint=224.0.1.1:40123").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1").error_code()
         );
     }
 
     #[test]
-    fn a_multicast_endpoint_is_refused_rather_than_served_as_unicast() {
+    fn a_group_tag_is_still_refused_where_a_group_parameter_is_not() {
         assert!(matches!(
-            refuse("aeron:udp?endpoint=224.0.1.1:40123"),
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1"),
             UdpChannelError::Unsupported(_)
         ));
+
+        // `group=` is a *subscription* parameter and never reached this layer
+        // in the first place: it is read where a subscription is created, into
+        // the parameters an image is built from
+        // (`aeron_driver_uri.c:494-495`), so a channel that carries it resolves
+        // like any other.
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|group=true");
+        assert!(!named.is_multicast);
+        assert_eq!(ipv4("127.0.0.1:40123"), named.remote_data);
+    }
+
+    /// The interface this host would join a group on, asked of the kernel the
+    /// same way the channel asks: a wildcard lookup, not the wildcard itself.
+    fn interface_of_this_host(family: AddressFamily) -> sys::LocalInterface {
+        sys::interface_for_address(family, wildcard_socket(family).ip(), 0)
+            .expect("the interface list")
+            .expect("this host has an interface to join on")
+    }
+
+    #[test]
+    fn a_multicast_endpoint_is_the_group_and_its_control_twin() {
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+
+        assert!(channel.is_multicast);
+        assert!(channel.has_group_semantics());
+        assert_eq!(ipv4("224.0.1.1:40123"), channel.remote_data);
+        assert_eq!(
+            ipv4("224.0.1.2:40123"),
+            channel.remote_control,
+            "the control group is the data group with its last byte incremented"
+        );
+        assert_eq!(
+            channel.remote_control.port(),
+            channel.remote_data.port(),
+            "and the same port"
+        );
+    }
+
+    #[test]
+    fn a_multicast_channel_binds_the_interface_not_the_wildcard() {
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+        let interface = interface_of_this_host(AddressFamily::Inet);
+
+        assert_eq!(channel.local_data, channel.local_control);
+        assert_eq!(interface.address, channel.local_data.ip());
+        assert_eq!(interface.index, channel.interface_index);
+        assert!(!channel.local_data.ip().is_unspecified());
+        assert!(!channel.has_explicit_control);
+        assert_eq!(
+            format!("UDP-{}:0-224.0.1.1:40123", interface.address),
+            channel.canonical_form
+        );
+    }
+
+    #[test]
+    fn a_multicast_interface_is_looked_up_where_a_unicast_one_is_taken_as_written() {
+        // The same parameter, two answers, and the difference is the point.
+        // `aeron_find_unicast_interface` hands a wildcard address back as
+        // itself (`aeron_netutil.c:750-786`); `aeron_find_multicast_interface`
+        // goes straight to `aeron_find_interface` (`aeron_udp_channel.c:138-144`),
+        // and a multicast socket cannot send on or join through `0.0.0.0`, so
+        // there is no wildcard to hand back — the lookup has to answer.
+        assert!(
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=0.0.0.0")
+                .local_data
+                .ip()
+                .is_unspecified()
+        );
+
+        // Written without a prefix it is a **host** match — the reference
+        // reads no prefix as the family's full length (`aeron_netutil.c:187-192`)
+        // — so the lookup finds nothing and the channel is refused rather than
+        // silently bound.
         assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|group=true"),
-            UdpChannelError::Unsupported(_)
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|interface=0.0.0.0"),
+            UdpChannelError::Resolution(_)
         ));
+
+        // Written as the wildcard *net* it is what naming no interface also
+        // resolves to (`aeron_udp_channel.c:140`), and the kernel picks.
+        assert_eq!(
+            interface_of_this_host(AddressFamily::Inet).address,
+            resolve("aeron:udp?endpoint=224.0.1.1:40123|interface=0.0.0.0/0")
+                .local_data
+                .ip()
+        );
+    }
+
+    #[test]
+    fn a_multicast_six_group_is_incremented_at_the_end_of_its_sixteen_bytes() {
+        let channel = resolve("aeron:udp?endpoint=[ff02::1]:40123");
+
+        assert_eq!(
+            "[ff02::2]:40123".parse::<SocketAddr>().expect("an address"),
+            channel.remote_control
+        );
+        assert!(channel.is_multicast);
+    }
+
+    #[test]
+    fn a_group_whose_last_byte_is_even_is_refused() {
+        assert!(matches!(
+            refuse("aeron:udp?endpoint=224.0.1.2:40123"),
+            UdpChannelError::Resolution(_)
+        ));
+        assert!(matches!(
+            refuse("aeron:udp?endpoint=[ff02::2]:40123"),
+            UdpChannelError::Resolution(_)
+        ));
+
+        // The reference answers `EINVAL` rather than an `AERON_ERROR_CODE_*`,
+        // so what a client sees is a generic error.
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+            refuse("aeron:udp?endpoint=224.0.1.2:40123").error_code()
+        );
+    }
+
+    #[test]
+    fn a_group_is_the_same_endpoint_whatever_the_tag_says() {
+        let tagged = resolve("aeron:udp?endpoint=224.0.1.1:40123|tags=7");
+        let plain = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+
+        assert_eq!(7, tagged.tag_id, "the tag is still read");
+        assert_eq!(
+            plain.canonical_form, tagged.canonical_form,
+            "but the canonical form of a group takes no suffix (`:421-441`)"
+        );
+    }
+
+    #[test]
+    fn a_groups_control_frames_go_to_its_control_twin() {
+        let source = ipv4("127.0.0.1:5555");
+
+        assert_eq!(
+            ipv4("224.0.1.2:40123"),
+            resolve("aeron:udp?endpoint=224.0.1.1:40123").control_address(source),
+            "a group answers on its control twin, not to whoever wrote"
+        );
+        assert_eq!(
+            ipv4("127.0.0.1:40124"),
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124")
+                .control_address(source)
+        );
+        assert_eq!(
+            source,
+            resolve("aeron:udp?endpoint=127.0.0.1:40123").control_address(source)
+        );
+    }
+
+    #[test]
+    fn a_multicast_endpoint_with_a_control_address_ignores_it() {
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123|control=127.0.0.1:40124");
+
+        assert_eq!(ipv4("224.0.1.2:40123"), channel.remote_control);
+        assert!(!channel.has_explicit_control);
+        assert_eq!(channel.local_data, channel.local_control);
+    }
+
+    #[test]
+    fn the_hop_limit_is_read_the_way_strtoull_reads_it() {
+        let hop_limit = |uri: &str| resolve(uri).multicast_ttl;
+
+        assert_eq!(0, hop_limit("aeron:udp?endpoint=224.0.1.1:40123"));
+        assert_eq!(16, hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=0x10"));
+        assert_eq!(8, hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=010"));
+        assert_eq!(
+            255,
+            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=300"),
+            "clamped rather than refused"
+        );
+        assert_eq!(
+            0,
+            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=slow"),
+            "text with no digits at all is zero, not an error"
+        );
+        assert_eq!(
+            255,
+            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=-1"),
+            "a sign wraps in `strtoull` before it clamps"
+        );
+
+        assert_eq!(
+            0,
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|ttl=3").multicast_ttl,
+            "a unicast channel has no hop limit at all (`:389`, `:446`, `:472`)"
+        );
     }
 
     #[test]

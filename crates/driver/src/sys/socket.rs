@@ -90,10 +90,27 @@ impl Default for Datagrams {
     }
 }
 
+/// `IPV6_JOIN_GROUP` — one option number with `IPV6_ADD_MEMBERSHIP` on Linux,
+/// which is the name `libc` carries
+/// (`unix/linux_like/mod.rs:898`).
+const IPV6_JOIN_GROUP: libc::c_int = libc::IPV6_ADD_MEMBERSHIP;
+
+/// `IPV6_MULTICAST_ALL` (option 29 on Linux), which `libc` has no name for on
+/// glibc: the reference guards it with `#if defined(IPV6_MULTICAST_ALL)` for
+/// the same reason (`aeron_udp_channel_transport.c:190-205`) and treats
+/// `ENOPROTOOPT` as "this kernel is older than 4.20", which is what
+/// [`DatagramSocket::set_multicast_all_disabled`] does.
+///
+/// The option is what keeps a socket from hearing groups it never joined:
+/// without it, delivery goes to every socket bound to the port that has joined
+/// *any* group.
+const IPV6_MULTICAST_ALL: libc::c_int = 29;
+
 /// A UDP socket, owned for as long as this value lives.
 #[derive(Debug)]
 pub struct DatagramSocket {
     fd: libc::c_int,
+    family: AddressFamily,
 }
 
 impl DatagramSocket {
@@ -118,7 +135,7 @@ impl DatagramSocket {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { fd })
+        Ok(Self { fd, family })
     }
 
     /// Bind the socket to a local address
@@ -250,6 +267,133 @@ impl DatagramSocket {
         }
 
         Ok(())
+    }
+
+    /// `SO_REUSEPORT` (`aeron_udp_channel_transport.c:176-182`).
+    ///
+    /// The reference sets this beside `SO_REUSEADDR` and only on a multicast
+    /// socket, where several subscribers to one group share the port —
+    /// `SO_REUSEADDR` alone lets a second socket *bind*, and `SO_REUSEPORT` is
+    /// what makes the kernel spread the group's datagrams across all of them.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`.
+    pub fn set_reuse_port(&self) -> io::Result<()> {
+        self.set_option(libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
+    }
+
+    /// Join a multicast group on an interface
+    /// (`aeron_udp_channel_transport.c:213-227`, `:275-293`).
+    ///
+    /// The families name the interface differently, which is the kernel's
+    /// doing and not the reference's: IPv4 takes the interface's *address*,
+    /// IPv6 takes its *index*.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`; `EINVAL` for a group and an interface
+    /// in different families.
+    pub fn join_multicast_group(
+        &self,
+        group: IpAddr,
+        interface: IpAddr,
+        interface_index: u32,
+    ) -> io::Result<()> {
+        match (group, interface) {
+            (IpAddr::V4(group), IpAddr::V4(interface)) => {
+                let request = libc::ip_mreq {
+                    imr_multiaddr: in_addr(group),
+                    imr_interface: in_addr(interface),
+                };
+
+                self.set_option(libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP, &request)
+            }
+
+            (IpAddr::V6(group), _) => {
+                let request = libc::ipv6_mreq {
+                    ipv6mr_multiaddr: libc::in6_addr {
+                        s6_addr: group.octets(),
+                    },
+                    ipv6mr_interface: interface_index,
+                };
+
+                self.set_option(libc::IPPROTO_IPV6, IPV6_JOIN_GROUP, &request)
+            }
+
+            (IpAddr::V4(_), IpAddr::V6(_)) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+
+    /// `IP_MULTICAST_IF` / `IPV6_MULTICAST_IF`: the interface this socket's
+    /// multicast **sends** leave by (`aeron_udp_channel_transport.c:230-235`,
+    /// `:295-302`).
+    ///
+    /// Both families set it on the sending descriptor rather than on the one
+    /// that joins, which is why a multicast transport may hold two.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`.
+    pub fn set_multicast_interface(
+        &self,
+        interface: IpAddr,
+        interface_index: u32,
+    ) -> io::Result<()> {
+        match interface {
+            IpAddr::V4(interface) => {
+                self.set_option(libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &in_addr(interface))
+            }
+
+            IpAddr::V6(_) => self.set_option(
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MULTICAST_IF,
+                &interface_index,
+            ),
+        }
+    }
+
+    /// `IP_MULTICAST_TTL` / `IPV6_MULTICAST_HOPS`
+    /// (`aeron_udp_channel_transport.c:240-248`, `:304-312`).
+    ///
+    /// One byte, because that is what the reference hands the kernel
+    /// (`sizeof(params->ttl)`, `:308`) — the option reads an `int` or a
+    /// single octet and the reference chose the octet.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`.
+    pub fn set_multicast_ttl(&self, ttl: u8) -> io::Result<()> {
+        match self.family() {
+            AddressFamily::Inet => self.set_option(libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, &ttl),
+
+            AddressFamily::Inet6 => {
+                self.set_option(libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, &ttl)
+            }
+        }
+    }
+
+    /// Turn off delivery of groups this socket did not join
+    /// (`aeron_udp_channel_transport.c:190-205`, `:257-272`).
+    ///
+    /// Not an error when the kernel has never heard of the option: the
+    /// reference clears the error and carries on, and so does this.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`, except `ENOPROTOOPT`.
+    pub fn set_multicast_all_disabled(&self) -> io::Result<()> {
+        let disabled: libc::c_int = 0;
+
+        let (level, name) = match self.family() {
+            AddressFamily::Inet => (libc::IPPROTO_IP, libc::IP_MULTICAST_ALL),
+            AddressFamily::Inet6 => (libc::IPPROTO_IPV6, IPV6_MULTICAST_ALL),
+        };
+
+        match self.set_option(level, name, &disabled) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => Ok(()),
+            result => result,
+        }
     }
 
     /// Put the socket in non-blocking mode, which is how the data plane polls
@@ -549,25 +693,31 @@ impl DatagramSocket {
     /// wildcard address a caller binds does not tell the two families apart
     /// from the outside.
     fn family(&self) -> AddressFamily {
-        match self.local_address() {
-            Ok(SocketAddr::V6(_)) => AddressFamily::Inet6,
-            _ => AddressFamily::Inet,
-        }
+        self.family
     }
 
     /// A `SOL_SOCKET` option whose value is a byte count.
     fn set_byte_option(&self, name: libc::c_int, bytes: usize) -> io::Result<()> {
         let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
 
-        // SAFETY: a live descriptor, a `SOL_SOCKET` option name, and a live
-        // `c_int` with its length.
+        self.set_option(libc::SOL_SOCKET, name, &value)
+    }
+
+    /// `setsockopt(2)` for an option whose value is some plain-data struct.
+    ///
+    /// `T`'s size is what the kernel is told, which is how the reference writes
+    /// these: it passes a pointer and `sizeof` the thing pointed at, so an
+    /// option that wants one byte gets one byte.
+    fn set_option<T>(&self, level: libc::c_int, name: libc::c_int, value: &T) -> io::Result<()> {
+        // SAFETY: a live descriptor, an option name from the level given, and a
+        // live `T` with its own size — `setsockopt`'s documented shape.
         let result = unsafe {
             libc::setsockopt(
                 self.fd,
-                libc::SOL_SOCKET,
+                level,
                 name,
-                std::ptr::from_ref(&value).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                std::ptr::from_ref(value).cast(),
+                std::mem::size_of::<T>() as libc::socklen_t,
             )
         };
 
@@ -588,6 +738,15 @@ impl Drop for DatagramSocket {
 }
 
 /// A `SocketAddr` as the kernel's own address type.
+/// An IPv4 address as the kernel wants it in an option's payload: the four
+/// octets, which on a little-endian machine is the byte-swapped number
+/// (`in_addr.s_addr` is network order).
+fn in_addr(address: Ipv4Addr) -> libc::in_addr {
+    libc::in_addr {
+        s_addr: u32::from(address).to_be(),
+    }
+}
+
 fn to_sockaddr_storage(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     // SAFETY: `sockaddr_storage` is plain data and every field is a byte
     // array or an integer; zeroing it is how the reference builds one too

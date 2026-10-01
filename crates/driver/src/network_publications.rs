@@ -1153,7 +1153,12 @@ pub fn transport_params(config: &DriverConfig, channel: &UdpChannel) -> Transpor
         } else {
             usize::try_from(config.socket_so_sndbuf).unwrap_or(0)
         },
-        ttl: 0,
+        multicast_if_index: channel.interface_index,
+        ttl: if channel.multicast_ttl != 0 {
+            channel.multicast_ttl
+        } else {
+            config.socket_multicast_ttl
+        },
     }
 }
 

@@ -347,6 +347,7 @@ impl PublicationImage {
         page_size: usize,
         untethered: SubscriptionParams,
         group_semantics: bool,
+        multicast_backoff: crate::loss_detector::MulticastBackoff,
         now_ns: i64,
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
@@ -490,10 +491,18 @@ impl PublicationImage {
             // gap is fillable the moment it is seen and `nak-delay=` on the
             // same channel is never read (`:92-95`, which returns before the
             // two branches below it).
+            //
+            // And group semantics outrank it too, which is the same reading in
+            // the other direction: a group gets the randomised generator
+            // instead of a fixed pair (`:97-100`), so `nak-delay=` on a
+            // group's channel is a parameter the reference reads and then
+            // ignores.
             loss_detector: LossDetector::for_channel(
                 registration_id,
                 untethered.is_reliable,
+                group_semantics,
                 untethered.nak_delay_ns,
+                multicast_backoff,
             ),
             is_reliable: untethered.is_reliable,
             untethered_window_limit_timeout_ns: untethered.untethered_window_limit_timeout_ns,
@@ -1199,7 +1208,50 @@ impl PublicationImage {
         self.last_sm_change_number = self.sm_change_number;
         self.next_sm_deadline_ns = now_ns + self.sm_timeout_ns;
 
+        // A status message is also the moment the metadata is told how many
+        // senders are still there (`aeron_publication_image.c:987`), which is
+        // a *release* store in the reference because a client reads it from
+        // another process (`AERON_SET_RELEASE`).
+        self.publish_active_transport_count(now_ns);
+
         Ok(usize::from(sent > 0))
+    }
+
+    /// Write [`Self::active_transport_count`] into the log buffer's metadata,
+    /// which is where a client reads it.
+    pub fn publish_active_transport_count(&mut self, now_ns: i64) {
+        let count = self.active_transport_count(now_ns);
+
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, count);
+        }
+    }
+
+    /// How many senders have been heard from recently
+    /// (`aeron_update_active_transport_count`,
+    /// `aeron_publication_image.c:40-57`).
+    ///
+    /// It counts **connections**, and a connection is a destination — not an
+    /// interface, and not a source address. That matters most for a group: a
+    /// multicast channel builds exactly one destination
+    /// (`aeron_driver_conductor.c:2099-2132`), so a multicast image's count is
+    /// **zero or one** however many members are reading it, and it is one only
+    /// while frames are still arriving. What the number is for is the client's
+    /// answer to "is anybody publishing to me", which is why the test is the
+    /// image's own liveness timeout rather than "has it ever been seen".
+    pub fn active_transport_count(&self, now_ns: i64) -> i32 {
+        let active = self
+            .connections
+            .iter()
+            .filter(|connection| {
+                now_ns
+                    < connection
+                        .time_of_last_frame_ns
+                        .saturating_add(self.liveness_timeout_ns)
+            })
+            .count();
+
+        i32::try_from(active).unwrap_or(i32::MAX)
     }
 
     /// The untethered subscriptions' state machine
@@ -1715,6 +1767,10 @@ mod tests {
                 4096,
                 untethered,
                 group_semantics,
+                crate::loss_detector::MulticastBackoff::new(
+                    crate::config::NAK_MULTICAST_GROUP_SIZE_DEFAULT,
+                    crate::config::NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
+                ),
                 0,
             );
 
@@ -2066,6 +2122,94 @@ mod tests {
         fixture.image.add_subscriber(position);
 
         counter_id
+    }
+
+    #[test]
+    fn the_active_transport_count_is_the_connections_still_sending() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+        let system = System::new(&fixture.counters, &regions);
+
+        // The image is built with one connection, and the reference dates it
+        // at the moment it was added (`aeron_publication_image_add_destination`,
+        // `:1131-1142`), so the count starts at one rather than zero and falls
+        // to zero when that connection goes quiet.
+        let timeout = fixture.image.liveness_timeout_ns;
+        assert_eq!(1, fixture.image.active_transport_count(0));
+        assert_eq!(
+            1,
+            fixture.image.active_transport_count(timeout - 1),
+            "live up to the timeout"
+        );
+        assert_eq!(
+            0,
+            fixture.image.active_transport_count(timeout),
+            "and gone at it — the comparison is strict — which is the whole \
+             of the 0-or-1 a group shows"
+        );
+
+        // A frame refreshes it.
+        let sent = 1_000;
+        let bytes = packet(INITIAL_TERM_ID, 0, b"a frame");
+        fixture.image.insert_packet(
+            INITIAL_TERM_ID,
+            0,
+            &bytes,
+            "127.0.0.1:5555".parse().expect("an address"),
+            &system,
+            &fixture.counters,
+            &regions,
+            sent,
+        );
+
+        assert_eq!(1, fixture.image.active_transport_count(sent + timeout - 1));
+        assert_eq!(0, fixture.image.active_transport_count(sent + timeout));
+
+        // A second source on the same image is a second connection, which is
+        // the case the reference's own test asserts the number on
+        // (`aeron_publication_image_test.cpp:485`, `:497`, `:503`).
+        let offset = bytes.len() as i32;
+        fixture.image.insert_packet(
+            INITIAL_TERM_ID,
+            offset,
+            &packet(INITIAL_TERM_ID, offset, b"another frame"),
+            "127.0.0.1:5556".parse().expect("an address"),
+            &system,
+            &fixture.counters,
+            &regions,
+            sent,
+        );
+
+        assert_eq!(2, fixture.image.connections.len(), "two connections");
+        assert_eq!(2, fixture.image.active_transport_count(sent + 1));
+    }
+
+    #[test]
+    fn the_active_transport_count_is_written_where_a_client_reads_it() {
+        let mut fixture = Fixture::new();
+        let timeout = fixture.image.liveness_timeout_ns;
+
+        let read = |fixture: &Fixture| {
+            let metadata = fixture.image.log.metadata().expect("a metadata block");
+            metadata
+                .load_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
+                .expect("in range")
+        };
+
+        // The image is created with the field zeroed (`LogMetadataInit`), so
+        // the write is the only thing that moves it.
+        assert_eq!(0, read(&fixture), "zero until a status message goes out");
+
+        fixture.image.publish_active_transport_count(0);
+        assert_eq!(
+            1,
+            read(&fixture),
+            "the one connection the image was built with"
+        );
+
+        fixture.image.publish_active_transport_count(timeout + 1);
+        assert_eq!(0, read(&fixture), "and back to zero when it goes quiet");
     }
 
     #[test]
