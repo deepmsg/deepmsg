@@ -534,6 +534,13 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
+    /// Revoked publications whose release waits for the sender to say they
+    /// have finished saying `REVOKED`
+    /// ([`SenderEvent::PublicationDrained`](crate::sender::SenderEvent::PublicationDrained)).
+    awaiting_drain: std::collections::HashSet<i64>,
+    /// The ones the sender has finished with since the last pass, waiting to
+    /// be released by a pass that has the counter regions.
+    drained_publications: Vec<i64>,
     /// Publications a receiver refused, as the sender heard it: each owes its
     /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
     /// datagram they arrived in.
@@ -660,6 +667,7 @@ impl Conductor {
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.publication_linger_timeout_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -749,6 +757,8 @@ impl Conductor {
             pending_log_errors: Vec::new(),
             pending_untethered: Vec::new(),
             pending_publication_errors: Vec::new(),
+            awaiting_drain: std::collections::HashSet::new(),
+            drained_publications: Vec::new(),
         };
 
         Ok(conductor)
@@ -1512,6 +1522,13 @@ impl Conductor {
                 } => {
                     self.pending_untethered.push((registration_id, events));
                 }
+                crate::sender::SenderEvent::PublicationDrained { registration_id } => {
+                    // The publication has said `REVOKED` and is done with; the
+                    // release the client asked for can finish now.
+                    if self.awaiting_drain.remove(&registration_id) {
+                        self.drained_publications.push(registration_id);
+                    }
+                }
                 crate::sender::SenderEvent::Fault {
                     error_code,
                     description,
@@ -1767,7 +1784,8 @@ impl Conductor {
         // release itself needs the sender and the endpoint registry, which the
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
-        let mut pending_publication_releases: Vec<i64> = Vec::new();
+        let mut pending_publication_releases: Vec<i64> =
+            std::mem::take(&mut self.drained_publications);
         // The destination commands, for the same reason: the *sender* is what
         // puts a destination on a tracker, and the drain's closure cannot reach
         // it. The payloads are kept verbatim, so that what is decoded below is
@@ -1918,21 +1936,47 @@ impl Conductor {
 
                         match link {
                             Some(link) => {
+                                // A revoked **network** publication is the one
+                                // removal that does not finish here: the sender
+                                // owns it, and it has one more thing to say —
+                                // `REVOKED` — which takes at least a heartbeat
+                                // (`aeron_network_publication.c:1244-1280`, then
+                                // LINGER at `:1327-1340`). Its release waits for
+                                // the sender to report it drained.
+                                let mut is_draining = false;
+
                                 if request.flags & REMOVE_PUBLICATION_FLAG_REVOKE != 0 {
-                                    if let Some(publication) = publications
-                                        .publications_mut()
-                                        .iter_mut()
-                                        .find(|publication| {
-                                            publication.registration_id
-                                                == link.publication_registration_id
-                                        })
+                                    // The publication is in one of two places —
+                                    // the IPC registry here, the sender's own
+                                    // list otherwise — and the reference reaches
+                                    // it the same way in both: through the
+                                    // resource its link holds (`:4716-4719`).
+                                    let registration_id = link.publication_registration_id;
+
+                                    if network_publications.find(registration_id).is_some() {
+                                        let _ =
+                                            sender.proxy().revoke_publication(registration_id);
+
+                                        self.awaiting_drain.insert(registration_id);
+                                        is_draining = true;
+                                    } else if let Some(publication) =
+                                        publications.publications_mut().iter_mut().find(
+                                            |publication| {
+                                                publication.registration_id == registration_id
+                                            },
+                                        )
                                     {
                                         publication.set_revoked();
                                     }
                                 }
 
                                 publications.release_links(&[link], counters, &counter_regions);
-                                pending_publication_releases.push(link.publication_registration_id);
+
+                                if !is_draining {
+                                    pending_publication_releases
+                                        .push(link.publication_registration_id);
+                                }
+
                                 transmit.operation_succeeded(request.correlated.correlation_id);
                             }
                             None => {

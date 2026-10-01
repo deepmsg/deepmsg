@@ -262,6 +262,10 @@ pub struct NetworkPublication {
     track_sender_limits: bool,
     /// Whether the stream has ended (`is_end_of_stream`).
     pub is_end_of_stream: bool,
+    /// When a revoke was noticed, or [`None`] while the stream is running
+    /// (`conductor_fields.time_of_last_activity_ns` on the way into the
+    /// reference's LINGER state).
+    linger_since_ns: Option<i64>,
     /// A datagram-sized scratch buffer, allocated once, that frames are copied
     /// into on the way out — see the module note.
     scratch: Vec<u8>,
@@ -444,6 +448,7 @@ impl NetworkPublication {
             is_connected: false,
             track_sender_limits: false,
             is_end_of_stream: false,
+            linger_since_ns: None,
             scratch: vec![0u8; max_messages_per_send * params.mtu_length as usize],
         })
     }
@@ -764,6 +769,76 @@ impl NetworkPublication {
         // Bytes: this value is what a pass that sent no data reports, and the
         // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:457`).
         Ok(if sent < 1 { 0 } else { buffer.len() })
+    }
+
+    /// Cut the stream off and say so
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_EVENT_REVOKE`,
+    /// `aeron_network_publication.c:1075-1079`).
+    ///
+    /// One byte, on the log buffer every reader maps: the heartbeat that
+    /// carries `REVOKED`, the image that drains because of it and the readers
+    /// that are told are all downstream of this.
+    pub fn set_revoked(&self) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
+        }
+    }
+
+    /// What a revoked publication does on its next pass, and when it is
+    /// finished.
+    ///
+    /// Two of the reference's arms in one call
+    /// (`aeron_network_publication_check_managed_resources`, `:1240-1340`):
+    ///
+    /// * **ACTIVE → LINGER**, the first time the byte is seen. The limit stops
+    ///   where the producer did, the log says where the stream ended, this
+    ///   publication is no longer connected and — the part everything else is
+    ///   for — its heartbeats say `REVOKED` from here on. That is what a
+    ///   reader's image needs to drain, and it is why a publication cannot be
+    ///   released in the same pass as its revoke.
+    /// * **LINGER → DONE**, once nobody is left to tell: no receivers at all,
+    ///   or the linger window (`aeron.publication.linger.timeout`) gone by.
+    ///
+    /// Returns whether the publication is finished with, which is when the
+    /// conductor may finish releasing it.
+    pub fn notice_revoke(
+        &mut self,
+        now_ns: i64,
+        linger_timeout_ns: i64,
+        system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        let Some(since) = self.linger_since_ns else {
+            if !self.is_revoked() {
+                return false;
+            }
+
+            let revoked_position = self.producer_position().unwrap_or(0);
+
+            let _ = counters.set_value(regions, self.counters.pub_lmt, revoked_position);
+            self.set_end_of_stream(revoked_position);
+            self.is_end_of_stream = true;
+            self.linger_since_ns = Some(now_ns);
+
+            system.increment(system_counters::id::PUBLICATIONS_REVOKED);
+
+            return false;
+        };
+
+        if self.has_receivers() && now_ns <= since + linger_timeout_ns {
+            return false;
+        }
+
+        true
+    }
+
+    /// Write where the stream ended, which is how a reader that has not seen
+    /// the heartbeats yet still learns it is over.
+    fn set_end_of_stream(&self, position: i64) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_i64_release(descriptor::END_OF_STREAM_POSITION_OFFSET, position);
+        }
     }
 
     /// Whether the log buffer's metadata says the publication was revoked

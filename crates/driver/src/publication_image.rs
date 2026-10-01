@@ -830,6 +830,15 @@ impl PublicationImage {
         if let Some(metadata) = self.log.metadata() {
             let _ =
                 metadata.store_i64_release(descriptor::END_OF_STREAM_POSITION_OFFSET, eos_position);
+
+            // `:800`: the byte goes in the **image's** metadata, which is the
+            // file a client's `Image` maps — `Image.isPublicationRevoked`
+            // reads exactly this byte, and an image told the stream was
+            // revoked without it is an image whose reader cannot say why it
+            // went away.
+            if self.is_revoked {
+                let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
+            }
         }
     }
 
@@ -1403,6 +1412,17 @@ impl PublicationImage {
     ) -> bool {
         match self.state {
             ImageState::Active => {
+                // `:1307-1311`: a revoked publication takes the image out of
+                // ACTIVE at once. It is the one case that does not wait for the
+                // stream to go quiet — the sender has said the stream is over
+                // and a reader that keeps waiting is reading nothing.
+                if self.is_revoked {
+                    self.state = ImageState::Draining;
+                    self.time_of_last_state_change_ns = now_ns;
+                    self.is_sending_eos_sm = true;
+                    return true;
+                }
+
                 let quiet = now_ns > self.time_of_last_packet_ns + self.liveness_timeout_ns;
                 let drained = self.is_end_of_stream && self.is_drained(counters, regions);
 
@@ -1431,7 +1451,12 @@ impl PublicationImage {
             ImageState::Linger => {
                 let expired = now_ns > self.time_of_last_state_change_ns + self.liveness_timeout_ns;
 
-                if !self.has_subscribers() || expired {
+                // A revoked image lingers for nobody: this build tells the
+                // readers the image is gone when it reaches DONE rather than on
+                // the way into LINGER, so a revoked one has to get there
+                // without waiting out a liveness window that exists for
+                // senders that might come back. A revoked one will not.
+                if self.is_revoked || !self.has_subscribers() || expired {
                     self.state = ImageState::Done;
                     return true;
                 }
@@ -2594,6 +2619,33 @@ mod tests {
             "the last reader leaving is what the clause is for"
         );
         assert_eq!(ImageState::Draining, fixture.image.state);
+    }
+
+    /// A revoked image does not wait for anything: `ACTIVE → DRAINING` the
+    /// moment the flag is seen (`:1307-1311`), `DRAINING → LINGER` on the same
+    /// flag (`:1330-1349`), and out of `LINGER` without waiting out a liveness
+    /// window that exists for a sender that might come back — a revoked one
+    /// will not.
+    #[test]
+    fn a_revoked_image_walks_to_done_without_waiting() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+
+        fixture.image.is_revoked = true;
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Draining, fixture.image.state);
+        assert!(
+            fixture.image.is_sending_eos_sm,
+            "and it owes its readers an end-of-stream status message"
+        );
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Linger, fixture.image.state);
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Done, fixture.image.state);
     }
 
     /// A heartbeat proposes the position it arrived at, and nothing on top.
