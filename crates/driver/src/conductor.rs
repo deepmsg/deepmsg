@@ -2631,10 +2631,16 @@ impl Conductor {
                     let _ = receiver
                         .proxy()
                         .add_destination(endpoint_id, Box::new(destination));
+                    // The endpoint's destination list is on the receiver's
+                    // thread; the agreement check that reads it is here, so
+                    // the count is kept here too (`aeron_driver_conductor.c:2184`
+                    // asks `1 == endpoint->destinations.length`).
+                    receive_endpoints.attach_destination(endpoint_id);
                 } else {
                     let _ = receiver
                         .proxy()
                         .remove_destination(endpoint_id, Box::new(channel));
+                    receive_endpoints.detach_destination(endpoint_id);
                 }
 
                 transmit.operation_succeeded(request.correlation_id);

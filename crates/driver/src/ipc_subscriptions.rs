@@ -1410,11 +1410,18 @@ impl IpcSubscriptions {
         // what the receiver is told below, and the endpoint takes ownership.
         let is_response_channel = channel.control_mode == ControlMode::Response;
 
+        // `params->initial_window_length`, read before the channel moves into
+        // the endpoint: the endpoint's create compares the arriving channel's
+        // receive buffer against it (`aeron_driver_conductor.c:2116-2130`).
+        let initial_window_length =
+            ReceiveChannelEndpoints::initial_window_length(config, &channel);
+
         let (endpoint_id, channel_status_counter_id, new_endpoint) = endpoints
             .get_or_add(
                 channel,
                 &endpoint_params,
                 config,
+                initial_window_length,
                 counters,
                 regions,
                 request.correlation_id,
