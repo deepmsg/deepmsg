@@ -29,8 +29,8 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::position as counter_position;
 use crate::udp_channel::{ControlMode, UdpChannel};
-use crate::{position as counter_position, sys};
 
 use super::destination_tracker::{DESTINATION_TIMEOUT_NS, DestinationTracker};
 use super::loss_generator::LossGenerator;
@@ -113,7 +113,7 @@ pub struct SendChannelEndpoint {
     publications: Vec<PublicationDispatch>,
     /// `SO_RCVBUF` this endpoint asked for, zero meaning the driver's default
     /// — the value a later channel on the same canonical form has to agree
-    /// with (`aeron_driver_conductor.c:1948-1966`).
+    /// with (`aeron_driver_conductor.c:1936-1956`).
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
@@ -562,7 +562,7 @@ impl SendChannelEndpoint {
 
     /// The socket's receive buffer, as the kernel reports it — what the
     /// reference checks an agreed `so-rcvbuf` against
-    /// (`aeron_driver_conductor.c:1948-1966`).
+    /// (`aeron_driver_conductor.c:1936-1956`).
     ///
     /// # Errors
     ///
@@ -611,21 +611,6 @@ impl std::fmt::Display for SendEndpointError {
 
 impl std::error::Error for SendEndpointError {}
 
-/// The buffer parameter two channels on one endpoint have to agree on
-/// (`aeron_driver_conductor_validate_channel_against_send_channel_endpoint`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:1907-1953`).
-///
-/// A second channel that canonicalises to an existing endpoint is **shared**,
-/// so its buffer parameters have to describe the socket that exists: the
-/// reference refuses a mismatch (`:520-556`) rather than silently reusing a
-/// socket with the wrong buffers.
-///
-/// A parameter the new channel did not name is no disagreement — it is the
-/// existing socket's configuration, which is what the client agreed to by
-/// naming the same channel.
-///
-/// Returns the parameter that disagreed, with what was asked for and what
-/// exists, or `None` when both agree.
 /// Publish the address the socket was bound to, the two ways the reference
 /// publishes it (`aeron_send_channel_endpoint.c:158-228`): the channel status's
 /// label gains the address, and a counter of type 14 is allocated whose **key**
@@ -741,49 +726,6 @@ fn destination_tracker_for(
         DESTINATION_TIMEOUT_NS,
         counter_id,
     )))
-}
-
-pub fn buffer_mismatch(
-    channel: &UdpChannel,
-    socket_rcvbuf: usize,
-    socket_sndbuf: usize,
-    defaults: sys::SocketBufferLengths,
-) -> Option<(&'static str, u64, u64)> {
-    let existing_rcvbuf = if socket_rcvbuf != 0 {
-        socket_rcvbuf
-    } else {
-        #[allow(clippy::cast_sign_loss)] // a buffer length is not negative
-        {
-            defaults.rcvbuf as usize
-        }
-    };
-
-    let existing_sndbuf = if socket_sndbuf != 0 {
-        socket_sndbuf
-    } else {
-        #[allow(clippy::cast_sign_loss)]
-        {
-            defaults.sndbuf as usize
-        }
-    };
-
-    if channel.socket_rcvbuf_length != 0 && channel.socket_rcvbuf_length != existing_rcvbuf {
-        return Some((
-            "so-rcvbuf",
-            channel.socket_rcvbuf_length as u64,
-            existing_rcvbuf as u64,
-        ));
-    }
-
-    if channel.socket_sndbuf_length != 0 && channel.socket_sndbuf_length != existing_sndbuf {
-        return Some((
-            "so-sndbuf",
-            channel.socket_sndbuf_length as u64,
-            existing_sndbuf as u64,
-        ));
-    }
-
-    None
 }
 
 #[cfg(test)]

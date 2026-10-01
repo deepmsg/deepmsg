@@ -25,11 +25,12 @@
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::channel_validation;
 use crate::media::receive_endpoint::{
     EndpointStatus, ReceiveChannelEndpoint, ReceiveEndpointError,
 };
 use crate::sys;
-use crate::udp_channel::UdpChannel;
+use crate::udp_channel::{ControlMode, UdpChannel};
 
 /// One endpoint, as the conductor sees it.
 #[derive(Debug)]
@@ -48,6 +49,27 @@ pub struct ReceiveChannelEndpointEntry {
     pub image_refcount: i32,
     /// Whether the receiver thread has already let it go.
     pub receiver_released: bool,
+    /// The `SO_RCVBUF` the socket was opened with: the creating channel's own
+    /// number when it named one, the context's otherwise, and zero when
+    /// neither did (`aeron_udp_channel_socket_so_rcvbuf`,
+    /// `media/aeron_udp_channel.c:629-632`).
+    ///
+    /// The endpoint itself carries these too, but it has been *moved to the
+    /// receiver* by the time a second subscription arrives — and this is the
+    /// value the arriving channel is measured against, not its own.
+    pub socket_rcvbuf: usize,
+    /// The `SO_SNDBUF`, likewise.
+    pub socket_sndbuf: usize,
+    /// How many destinations the endpoint has (`destinations.length`,
+    /// `aeron_driver_conductor.c:2184`): one for a channel that named an
+    /// endpoint, none for a `control-mode=manual` one (`:2099-2114`), and it
+    /// grows as an MDS subscription adds them.
+    ///
+    /// Counted here because the agreement check is gated on it and the
+    /// endpoint that owns the list is on the receiver's thread. An endpoint
+    /// that has gained destinations is no longer the shape it was made in, so
+    /// a channel joining it is not asking for the socket that exists.
+    pub destination_count: usize,
 }
 
 /// Why a receive endpoint could not be had.
@@ -59,6 +81,13 @@ pub enum ReceiveEndpointErrorKind {
     /// process already holds the port, which for a subscriber is the ordinary
     /// case of two clients naming the same channel.
     Socket(std::io::Error),
+    /// A channel parameter the endpoint cannot honour
+    /// (`aeron_driver_conductor.c:2116-2223`).
+    ///
+    /// The message is the reference's own, verbatim, because it is what the
+    /// client's `RegistrationException` carries — the checks that produce it
+    /// are [`crate::channel_validation`]'s business.
+    ChannelValidation(String),
 }
 
 impl std::fmt::Display for ReceiveEndpointErrorKind {
@@ -66,6 +95,7 @@ impl std::fmt::Display for ReceiveEndpointErrorKind {
         match self {
             Self::NoCounter => f.write_str("could not allocate the receive channel status counter"),
             Self::Socket(error) => write!(f, "{error}"),
+            Self::ChannelValidation(message) => f.write_str(message),
         }
     }
 }
@@ -119,25 +149,69 @@ impl ReceiveChannelEndpoints {
 
     /// Create the endpoint for a channel, or find the one it shares.
     ///
+    /// `initial_window_length` is `params->initial_window_length`: the
+    /// subscription's `rcv-wnd=`, or the driver's own when it named none
+    /// (`aeron_driver_uri.c:466`, `:502`). It is what the receive side's one
+    /// *window* check measures, in place of the send side's MTU check.
+    ///
     /// # Errors
     ///
-    /// The socket's error, when one has to be opened and cannot be.
+    /// The socket's error, when one has to be opened and cannot be, and
+    /// [`ReceiveEndpointErrorKind::ChannelValidation`] for a parameter the
+    /// endpoint that exists cannot honour.
     #[allow(clippy::too_many_arguments)] // the collaborators a create needs
     pub fn get_or_add(
         &mut self,
         channel: UdpChannel,
         params: &crate::media::TransportParams,
         config: &crate::config::DriverConfig,
+        initial_window_length: usize,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
     ) -> Result<(u64, i32, Option<Box<ReceiveChannelEndpoint>>), ReceiveEndpointErrorKind> {
+        // The kernel's own receive buffer, the arm the window check falls to
+        // when the channel named no `so-rcvbuf` and the context has none
+        // either (`context->os_buffer_lengths`, `aeron_driver_context.c:1315-1320`,
+        // read at `aeron_driver_conductor.c:2119`).
+        let os_default_socket_rcvbuf = usize::try_from(Self::os_defaults().rcvbuf).unwrap_or(0);
+
         if let Some(id) = self.find(&channel) {
             let entry = self.get(id).expect("just found");
 
+            // `:2184`: the comparison is skipped for a `control-mode=manual`
+            // channel and for an endpoint that no longer has exactly one
+            // destination. A manual endpoint's destinations arrive one at a
+            // time from clients, so it has no single socket shape to agree
+            // with; and a channel that named none is asking for the socket
+            // that exists rather than making one.
+            if channel.control_mode != ControlMode::Manual && entry.destination_count == 1 {
+                validate_against_endpoint(
+                    &channel,
+                    entry,
+                    params.socket_rcvbuf,
+                    params.socket_sndbuf,
+                    initial_window_length,
+                    os_default_socket_rcvbuf,
+                )?;
+            }
+
             return Ok((id, entry.channel_status_counter_id, None));
         }
+
+        // `:2116-2130`: a window that does not fit the buffer the socket is
+        // about to be opened with is refused before the socket is made. The
+        // buffer is the arriving channel's own — at this point there is no
+        // endpoint to have one.
+        channel_validation::validate_initial_window_for_rcvbuf(
+            initial_window_length,
+            params.socket_rcvbuf,
+            os_default_socket_rcvbuf,
+            &channel.original_uri,
+            None,
+        )
+        .map_err(ReceiveEndpointErrorKind::ChannelValidation)?;
 
         let receiver_id = self.next_receiver_id;
         self.next_receiver_id += 1;
@@ -167,6 +241,14 @@ impl ReceiveChannelEndpoints {
 
         let channel_status_counter_id = endpoint.channel_status_counter_id();
 
+        // What the socket was opened with and how many destinations it
+        // started with, read off the endpoint before the receiver takes it —
+        // `aeron_receive_channel_endpoint_create` is given a destination for
+        // every channel but a manual one (`aeron_driver_conductor.c:2099-2114`).
+        let socket_rcvbuf = endpoint.socket_rcvbuf;
+        let socket_sndbuf = endpoint.socket_sndbuf;
+        let destination_count = endpoint.destination_count();
+
         self.entries.push(ReceiveChannelEndpointEntry {
             id,
             channel: endpoint.channel.clone(),
@@ -175,6 +257,9 @@ impl ReceiveChannelEndpoints {
             refcount: 0,
             image_refcount: 0,
             receiver_released: false,
+            socket_rcvbuf,
+            socket_sndbuf,
+            destination_count,
         });
 
         Ok((id, channel_status_counter_id, Some(Box::new(endpoint))))
@@ -214,6 +299,27 @@ impl ReceiveChannelEndpoints {
         }
     }
 
+    /// An MDS subscription added a destination to an endpoint
+    /// (`aeron_driver_conductor.c:5901-5940`).
+    pub fn attach_destination(&mut self, id: u64) {
+        if let Some(entry) = self.get_mut(id) {
+            entry.destination_count += 1;
+        }
+    }
+
+    /// A destination left an endpoint (`:6120-6160`).
+    ///
+    /// Saturating because a removal names a channel the endpoint may not
+    /// have — the reference searches its list and finds nothing
+    /// (`aeron_receive_channel_endpoint_remove_destination`) — and a count
+    /// that went under the truth would open the agreement check on an
+    /// endpoint it should be skipped for.
+    pub fn detach_destination(&mut self, id: u64) {
+        if let Some(entry) = self.get_mut(id) {
+            entry.destination_count = entry.destination_count.saturating_sub(1);
+        }
+    }
+
     /// Forget an endpoint both sides have let go.
     pub fn remove(&mut self, id: u64) -> Option<ReceiveChannelEndpointEntry> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
@@ -247,6 +353,27 @@ impl ReceiveChannelEndpoints {
         }
     }
 
+    /// The receiver window a subscription's channel resolves to: its own
+    /// `rcv-wnd=`, or the driver's when it named none
+    /// (`params.initial_window_length`, `uri/aeron_driver_uri.c:466`, `:502`).
+    ///
+    /// Read here rather than at the image because this is where a channel URI
+    /// is read at all — and because the agreement check below measures a
+    /// window against a receive buffer before any image exists.
+    pub fn initial_window_length(
+        config: &crate::config::DriverConfig,
+        channel: &UdpChannel,
+    ) -> usize {
+        if channel.receiver_window_length != 0 {
+            channel.receiver_window_length
+        } else {
+            #[allow(clippy::cast_sign_loss)] // a window length is not negative
+            {
+                config.receiver_window_length.max(0) as usize
+            }
+        }
+    }
+
     /// The kernel's default socket buffers, for a caller comparing a channel's
     /// parameters against them. Zeroes when the kernel cannot be asked.
     pub fn os_defaults() -> sys::SocketBufferLengths {
@@ -257,6 +384,65 @@ impl ReceiveChannelEndpoints {
     }
 }
 
+/// The checks a subscription must pass before it may share an endpoint
+/// (`aeron_driver_conductor.c:2184-2223`).
+///
+/// The receive side's three, and they are not the send side's three: where a
+/// publication measures its MTU against the send buffer, a subscription
+/// measures its **receiver window** against the receive buffer, and the order
+/// of the two buffer comparisons is reversed (`:2202`, `:2213`).
+///
+/// One asymmetry is the reference's and is reproduced deliberately: the window
+/// is measured against the *arriving* channel's receive buffer (`:2193`),
+/// not the endpoint's, so a channel that narrows its own `so-rcvbuf` without
+/// narrowing `rcv-wnd=` is refused even when the socket it is joining is
+/// wider.
+///
+/// # Errors
+///
+/// [`ReceiveEndpointErrorKind::ChannelValidation`] carrying the reference's
+/// own message — the client reads it, so it is not paraphrased.
+fn validate_against_endpoint(
+    channel: &UdpChannel,
+    entry: &ReceiveChannelEndpointEntry,
+    socket_rcvbuf: usize,
+    socket_sndbuf: usize,
+    initial_window_length: usize,
+    os_default_socket_rcvbuf: usize,
+) -> Result<(), ReceiveEndpointErrorKind> {
+    channel_validation::validate_initial_window_for_rcvbuf(
+        initial_window_length,
+        socket_rcvbuf,
+        os_default_socket_rcvbuf,
+        &channel.original_uri,
+        Some(&entry.channel.original_uri),
+    )
+    .map_err(ReceiveEndpointErrorKind::ChannelValidation)?;
+
+    // The buffers the socket already has, named against the ones this channel
+    // asks for. `socket_sndbuf`/`socket_rcvbuf` are the *arriving* channel's
+    // resolved lengths, not its raw `so-sndbuf=` — the reference passes
+    // `aeron_udp_channel_socket_so_*` here where the send side passes the raw
+    // URI value, so a channel that names nothing is compared at the context's
+    // length rather than being skipped. A channel on the same context is
+    // therefore still in agreement; one that named a different length is not.
+    for (param, named, adopted) in [
+        ("so-sndbuf", socket_sndbuf, entry.socket_sndbuf),
+        ("so-rcvbuf", socket_rcvbuf, entry.socket_rcvbuf),
+    ] {
+        channel_validation::validate_channel_buffer_length(
+            param,
+            named,
+            adopted,
+            &channel.original_uri,
+            &entry.channel.original_uri,
+        )
+        .map_err(ReceiveEndpointErrorKind::ChannelValidation)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +451,10 @@ mod tests {
     use crate::config::DriverConfig;
     use crate::media::TransportParams;
     use deepmsg_core::buffer::AtomicBuffer;
+
+    /// A receiver window no socket's receive buffer can be smaller than, for
+    /// the tests that are not about the window.
+    const SMALL_WINDOW: usize = 1024;
 
     #[repr(align(64))]
     struct Region(Vec<u8>);
@@ -300,6 +490,19 @@ mod tests {
         UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
     }
 
+    /// The transport parameters the driver would open this channel with:
+    /// the channel's own numbers where it named one, the context's otherwise.
+    /// This is also what an endpoint *adopts*, which is the value the second
+    /// channel is measured against.
+    fn params(uri: &str) -> TransportParams {
+        ReceiveChannelEndpoints::transport_params(&DriverConfig::default(), &channel(uri))
+    }
+
+    /// The window this channel resolves to, the way the conductor reads it.
+    fn window(uri: &str) -> usize {
+        ReceiveChannelEndpoints::initial_window_length(&DriverConfig::default(), &channel(uri))
+    }
+
     /// The label the counter with this id carries, read the way a client reads
     /// it — through the counter region's own reader.
     fn label(regions: &CounterRegions<'_>, id: i32) -> String {
@@ -323,6 +526,10 @@ mod tests {
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
+                // A window no receive buffer can be smaller than: this test is
+                // about the label, and the window check has its own tests in
+                // `channel_validation`.
+                SMALL_WINDOW,
                 &mut counters,
                 &regions,
                 77,
@@ -351,6 +558,7 @@ mod tests {
                 channel("aeron:udp?control-mode=manual"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
+                SMALL_WINDOW,
                 &mut counters,
                 &regions,
                 77,
@@ -367,5 +575,175 @@ mod tests {
             "rcv-channel: aeron:udp?control-mode=manual ",
             label(&regions, id)
         );
+    }
+
+    #[test]
+    fn a_shared_endpoint_refuses_a_buffer_parameter_it_does_not_have() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = ReceiveChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
+        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40123";
+
+        endpoints
+            .get_or_add(
+                channel(FIRST),
+                &params(FIRST),
+                &config,
+                window(FIRST),
+                &mut counters,
+                &regions,
+                7,
+                1,
+            )
+            .expect("an endpoint");
+
+        let error = endpoints
+            .get_or_add(
+                channel(SECOND),
+                &params(SECOND),
+                &config,
+                window(SECOND),
+                &mut counters,
+                &regions,
+                8,
+                2,
+            )
+            .expect_err("refused");
+
+        assert!(
+            matches!(
+                error,
+                ReceiveEndpointErrorKind::ChannelValidation(ref message) if message ==
+                    "so-rcvbuf=2097152 does not match existing value of 1048576: \
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m"
+            ),
+            "{error}"
+        );
+
+        // And the asymmetry with the send side, which is the reference's and
+        // not an accident of this port: a receive channel that names *no*
+        // buffer is compared at the **context's** length
+        // (`aeron_udp_channel_socket_so_rcvbuf`, passed at `:2213`), where a
+        // publication's is compared at the raw URI value and so is skipped
+        // when it named none. The driver's 128k is not the socket's 1m, so
+        // this is a refusal where the send side would have said nothing.
+        let error = endpoints
+            .get_or_add(
+                channel(SILENT),
+                &params(SILENT),
+                &config,
+                window(SILENT),
+                &mut counters,
+                &regions,
+                9,
+                3,
+            )
+            .expect_err("the context's 128k is not the socket's 1m");
+
+        assert!(
+            matches!(
+                error,
+                ReceiveEndpointErrorKind::ChannelValidation(ref message)
+                    if message.starts_with("so-rcvbuf=131072 does not match existing value of 1048576:")
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manual_channel_is_not_compared_with_the_endpoint_it_joins() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = ReceiveChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        // These two *do* canonicalise alike — `control-mode` is not part of
+        // the canonical form, the two addresses are — which is what makes the
+        // clause reachable at all. A manual channel's destinations arrive one
+        // at a time from clients, so it is asking to *join* a socket rather
+        // than to describe one, and the reference leaves it alone entirely.
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
+        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual|so-rcvbuf=2m";
+
+        let (id, _, _) = endpoints
+            .get_or_add(
+                channel(FIRST),
+                &params(FIRST),
+                &config,
+                window(FIRST),
+                &mut counters,
+                &regions,
+                7,
+                1,
+            )
+            .expect("an endpoint");
+
+        let (second, _, _) = endpoints
+            .get_or_add(
+                channel(MANUAL),
+                &params(MANUAL),
+                &config,
+                window(MANUAL),
+                &mut counters,
+                &regions,
+                8,
+                2,
+            )
+            .expect("a manual channel is not compared");
+
+        assert_eq!(id, second, "the clause is only reachable when they share");
+        assert_eq!(1, endpoints.entries().len());
+    }
+
+    #[test]
+    fn an_endpoint_that_has_gained_destinations_is_not_compared_with_them() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = ReceiveChannelEndpoints::new();
+        let config = DriverConfig::default();
+
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
+
+        let (id, _, _) = endpoints
+            .get_or_add(
+                channel(FIRST),
+                &params(FIRST),
+                &config,
+                window(FIRST),
+                &mut counters,
+                &regions,
+                7,
+                1,
+            )
+            .expect("an endpoint");
+
+        // `:2184`'s second clause. Nothing in this build can add a destination
+        // to an endpoint that is not manual — only an MDS subscription may,
+        // and an MDS subscription is manual — so the count is moved by hand to
+        // show that the clause is what decides, and not the luck of the count
+        // being one.
+        endpoints.attach_destination(id);
+
+        let (second, _, _) = endpoints
+            .get_or_add(
+                channel(SECOND),
+                &params(SECOND),
+                &config,
+                window(SECOND),
+                &mut counters,
+                &regions,
+                8,
+                2,
+            )
+            .expect("an endpoint with two destinations is not the shape it was made in");
+
+        assert_eq!(id, second, "the second channel joins the same endpoint");
+        assert_eq!(1, endpoints.entries().len());
     }
 }

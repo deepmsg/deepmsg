@@ -80,7 +80,7 @@ struct PendingNetworkPublication {
     /// publication can share an endpoint whose agreement check looks at
     /// timestamp offsets, MTU and buffer lengths and at neither `control-mode`
     /// nor `fc=` (`validate_channel_against_send_channel_endpoint`,
-    /// `:1907-1953`), and the canonical form two channels have to match carries
+    /// `:1913-1959`), and the canonical form two channels have to match carries
     /// only the two addresses (`aeron_uri_udp_canonicalise`,
     /// `aeron_udp_channel.c:148-208`) — so the endpoint keeps the channel it was
     /// created from, and that is the channel read.
@@ -282,10 +282,19 @@ impl NetworkPublications {
         // entry for an id it just handed out.
         let named_channel = channel.clone();
 
+        // `params->mtu_length`, which the MTU-against-`so-sndbuf` check
+        // measures a frame against (`:1925`). Never negative — the URI's
+        // parser refuses a length that is — but the cast goes through
+        // `try_from` rather than an `as` for the same reason everything else
+        // in this file does.
+        let mtu_length = usize::try_from(params.mtu_length).unwrap_or(0);
+
         let outcome = endpoints
             .get_or_add(
                 channel,
                 &endpoint_params,
+                config,
+                mtu_length,
                 counters,
                 regions,
                 request.correlation_id,
