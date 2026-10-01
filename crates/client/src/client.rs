@@ -36,13 +36,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use deepmsg_cnc::command::{
-    ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID,
-    ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
-    AddCounter, AddPublication, AddSubscription, Correlated, DestinationByIdCommand,
-    DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId,
-    REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID,
-    REMOVE_DESTINATION_TYPE_ID, REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response,
-    decode_response, encode_add_static_counter, encode_reject_image,
+    ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
+    ADD_PUBLICATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
+    ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription, Correlated,
+    DestinationByIdCommand, DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+    GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
+    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
+    encode_add_static_counter, encode_reject_image,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
@@ -51,7 +52,7 @@ use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver
 use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
-use crate::publication::Publication;
+use crate::publication::{ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
 use crate::subscription::Subscription;
 
@@ -269,6 +270,22 @@ enum Ready {
         channel_status_indicator_id: i32,
         log_file: PathBuf,
     },
+    /// The same, for a publication with one producer
+    /// (`ON_EXCLUSIVE_PUBLICATION_READY`, whose payload is the concurrent
+    /// one's — `aeron_driver_conductor_on_exclusive_publication_ready` sends
+    /// the same fields under a different id).
+    ///
+    /// A separate arm rather than a flag on the one above: the two are
+    /// different handles, and a client that could not tell them apart would
+    /// have to guess which `add_*` call it was answering.
+    ExclusivePublication {
+        registration_id: i64,
+        session_id: i32,
+        stream_id: i32,
+        position_limit_counter_id: i32,
+        channel_status_indicator_id: i32,
+        log_file: PathBuf,
+    },
     /// A counter exists, and its slot in the values region is the handle.
     Counter { counter_id: i32 },
     /// The driver answered what session id to publish under.
@@ -299,6 +316,7 @@ pub struct Client {
     pending: Vec<Pending>,
     subscriptions: Vec<Subscription>,
     publications: Vec<Publication>,
+    exclusive_publications: Vec<ExclusivePublication>,
     /// The counters this client asked for. The driver reclaims them with the
     /// client when it goes, so this list is the client's whole counter life.
     counters: Vec<Counter>,
@@ -384,6 +402,7 @@ impl Client {
             pending: Vec::new(),
             subscriptions: Vec::new(),
             publications: Vec::new(),
+            exclusive_publications: Vec::new(),
             counters: Vec::new(),
             counter_events: Vec::new(),
             static_counters: Vec::new(),
@@ -679,6 +698,105 @@ impl Client {
         self.publications.push(publication);
 
         Ok(registration_id)
+    }
+
+    /// Add a publication only this client will write to, and wait for the
+    /// driver to make it.
+    ///
+    /// `aeron_async_add_exclusive_publication` (`aeronc.c:473-497`). The
+    /// command is the concurrent one's under a different id, and so is the
+    /// reply — what differs is which handle comes back and, from then on, that
+    /// the append never claims.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] for a command that could not be sent or a driver that
+    /// refused it.
+    pub fn add_exclusive_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = AddPublication {
+            client_id: self.client_id,
+            correlation_id,
+            stream_id,
+            channel,
+        };
+
+        let mut payload = vec![0u8; command.encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(
+            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let ready = self.wait(correlation_id)?;
+        let Ready::ExclusivePublication {
+            registration_id,
+            session_id,
+            stream_id,
+            position_limit_counter_id,
+            channel_status_indicator_id,
+            log_file,
+        } = ready
+        else {
+            return Err(CommandError::Encoding);
+        };
+
+        let publication = ExclusivePublication::open(
+            &log_file,
+            registration_id,
+            session_id,
+            stream_id,
+            position_limit_counter_id,
+            channel_status_indicator_id,
+        )
+        .map_err(|source| CommandError::LogBuffer {
+            path: log_file,
+            source,
+        })?;
+
+        self.exclusive_publications.push(publication);
+
+        Ok(registration_id)
+    }
+
+    /// Offer to an exclusive publication.
+    ///
+    /// # Errors
+    ///
+    /// [`None`] when no such publication is held; see [`Appended`] for the
+    /// rest.
+    pub fn offer_exclusive(
+        &self,
+        registration_id: i64,
+        payload: &[u8],
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.exclusive_publication(registration_id)?;
+
+        let limit = self
+            .cnc
+            .counters()
+            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+            .unwrap_or(0);
+
+        Some(publication.offer(limit, payload))
+    }
+
+    /// An exclusive publication this client holds.
+    pub fn exclusive_publication(&self, registration_id: i64) -> Option<&ExclusivePublication> {
+        self.exclusive_publications
+            .iter()
+            .find(|publication| publication.registration_id() == registration_id)
     }
 
     /// Add a counter and wait for the driver to allocate it.
@@ -1461,17 +1579,40 @@ impl Client {
                 channel_status_indicator_id,
                 log_file,
             } => {
-                self.complete(
-                    correlation_id,
-                    Ok(Ready::Publication {
-                        registration_id,
-                        session_id,
-                        stream_id,
-                        position_limit_counter_id,
-                        channel_status_indicator_id,
-                        log_file: path_from_bytes(log_file),
-                    }),
+                // The decoder answers both ids with this one shape, because the
+                // payload is the same; which command it was is the *id*, and it
+                // is the only thing that says which handle to build.
+                let log_file = path_from_bytes(log_file);
+                let fields = (
+                    registration_id,
+                    session_id,
+                    stream_id,
+                    position_limit_counter_id,
+                    channel_status_indicator_id,
                 );
+
+                let ready =
+                    if type_id == deepmsg_cnc::command::ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID {
+                        Ready::ExclusivePublication {
+                            registration_id: fields.0,
+                            session_id: fields.1,
+                            stream_id: fields.2,
+                            position_limit_counter_id: fields.3,
+                            channel_status_indicator_id: fields.4,
+                            log_file,
+                        }
+                    } else {
+                        Ready::Publication {
+                            registration_id: fields.0,
+                            session_id: fields.1,
+                            stream_id: fields.2,
+                            position_limit_counter_id: fields.3,
+                            channel_status_indicator_id: fields.4,
+                            log_file,
+                        }
+                    };
+
+                self.complete(correlation_id, Ok(ready));
             }
             Response::AvailableImage {
                 publication_registration_id,

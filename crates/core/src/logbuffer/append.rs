@@ -521,6 +521,20 @@ impl<'a> Appender<'a> {
         }
     }
 
+    /// Whether a caller's cached term is still the one this appender is over.
+    ///
+    /// The exclusive path takes its **offset** from the caller, and the
+    /// reference takes the term buffer from the caller's cache too
+    /// (`publication->active_partition_index`) — so a stale cache writes into
+    /// one term and advances another's tail. Here the term buffer comes from
+    /// `active_term_count` while the term id comes from the caller, and those
+    /// two can disagree: that is [`Appended::MidRotation`], a retry, exactly as
+    /// it is for a concurrent producer whose count and tail disagree.
+    fn term_is_current(&self, term_id: i32) -> bool {
+        self.active_term_count()
+            .is_some_and(|count| count == position::term_count(term_id, self.initial_term_id))
+    }
+
     /// Advance one partition's tail by a **plain store**
     /// (`aeron_put_raw_tail_release`, `aeron_exclusive_publication.c:25-28`).
     ///
@@ -572,6 +586,10 @@ impl<'a> Appender<'a> {
         term_offset: i32,
         payload: &[u8],
     ) -> Appended {
+        if !self.term_is_current(term_id) {
+            return Appended::MidRotation;
+        }
+
         // The position is **derived** from the caller's two numbers, not
         // claimed from a tail: that pair is the whole of what this producer
         // knows about where it is (`aeron_exclusive_publication.c:557-559`).
@@ -661,10 +679,12 @@ impl<'a> Appender<'a> {
     /// Claim `length` **payload** bytes at the caller's offset, without a
     /// fetch-and-add (`aeron_claim`, `aeron_exclusive_publication.c:323-355`).
     ///
-    /// The answer is the frame itself, begun but not published: the caller
-    /// writes into it and commits with [`Frame::publish`]. That split is the
-    /// reference's own — `aeron_header_write` stores the length **negated**
-    /// (`:41`) so a reader stepping the term sees a frame it may not read yet,
+    /// The answer is **where** the claim is, not a window onto it: the caller
+    /// builds a [`Frame`] over the term at that offset, writes into it, and
+    /// commits with [`Frame::publish`]. That is the reference's split too —
+    /// `aeron_claim` fills a `buffer_claim` with a pointer and a length
+    /// (`:347-350`) and `aeron_header_write` stores the length **negated**
+    /// (`:41`), so a reader stepping the term meets a frame it may not read yet
     /// and the positive length is what publishes it.
     ///
     /// # Errors
@@ -681,7 +701,11 @@ impl<'a> Appender<'a> {
         term_id: i32,
         term_offset: i32,
         length: usize,
-    ) -> Result<Frame<'_, ReadWrite>, Appended> {
+    ) -> Result<usize, Appended> {
+        if !self.term_is_current(term_id) {
+            return Err(Appended::MidRotation);
+        }
+
         let position = Position::new(
             term_id,
             term_offset,
@@ -743,7 +767,7 @@ impl<'a> Appender<'a> {
             return Err(Appended::Malformed);
         }
 
-        Ok(frame)
+        Ok(term_offset as usize)
     }
 
     /// Append a padding frame of `length` **payload** bytes at the caller's
@@ -763,6 +787,10 @@ impl<'a> Appender<'a> {
         term_offset: i32,
         length: usize,
     ) -> Appended {
+        if !self.term_is_current(term_id) {
+            return Appended::MidRotation;
+        }
+
         let position = Position::new(
             term_id,
             term_offset,
@@ -871,6 +899,10 @@ impl<'a> Appender<'a> {
         term_offset: i32,
         block: &[u8],
     ) -> Appended {
+        if !self.term_is_current(term_id) {
+            return Appended::MidRotation;
+        }
+
         let position = Position::new(
             term_id,
             term_offset,
@@ -1377,22 +1409,30 @@ mod tests {
         initialised(&mut log);
 
         let payload = b"written into a claim";
-        let appender = log.appender();
 
-        let claim = appender
-            .try_claim_exclusive(11, 22, i64::MAX, initial_term_id(), 0, payload.len())
-            .expect("a claim");
+        let offset = {
+            let appender = log.appender();
+            appender
+                .try_claim_exclusive(11, 22, i64::MAX, initial_term_id(), 0, payload.len())
+                .expect("a claim")
+        };
+        assert_eq!(0, offset, "the claim is where the caller's offset said");
 
-        assert_eq!(0, claim.offset());
         let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
-        assert_eq!(
-            Some(-frame_length),
-            claim.frame_length(),
-            "nothing may read it yet: the length is negative"
-        );
 
-        claim.write_payload(payload).expect("in range");
-        claim.publish(frame_length).expect("in range");
+        {
+            let view = AtomicBuffer::from_slice_mut(&mut log.term.0).expect("aligned");
+            let claim = frame::Frame::new(&view, offset);
+
+            assert_eq!(
+                Some(-frame_length),
+                claim.frame_length(),
+                "nothing may read it yet: the length is negative"
+            );
+
+            claim.write_payload(payload).expect("in range");
+            claim.publish(frame_length).expect("in range");
+        }
 
         let (length, type_id, read_back) = log.read_frame(0);
         assert_eq!(frame_length, length);
@@ -1424,16 +1464,14 @@ mod tests {
 
         assert_eq!(
             Err(Appended::MessageTooLarge),
-            log.appender()
-                .try_claim_exclusive(
-                    11,
-                    22,
-                    i64::MAX,
-                    initial_term_id(),
-                    max_payload as i32,
-                    max_payload + 1
-                )
-                .map(|frame| frame.offset())
+            log.appender().try_claim_exclusive(
+                11,
+                22,
+                i64::MAX,
+                initial_term_id(),
+                max_payload as i32,
+                max_payload + 1
+            )
         );
     }
 
@@ -1602,6 +1640,33 @@ mod tests {
              boundary is rotated with no padding frame, because there is no \
              remainder for one to cover"
         );
+    }
+
+    #[test]
+    fn an_exclusive_append_with_a_stale_term_is_a_retry_not_a_write() {
+        // The exclusive path takes its term id from the caller and its term
+        // buffer from `active_term_count`, so a stale cache would advance one
+        // term's tail while writing into another's pages. The reference cannot
+        // be stale here because it takes both from the same cache; this can, so
+        // it refuses instead.
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        // The log has rotated once; the caller still thinks it is in the first
+        // term.
+        log.set_tail(initial_term_id() + 1, 0, 1);
+
+        let outcome =
+            log.appender()
+                .append_exclusive(11, 22, i64::MAX, initial_term_id(), 0, b"a payload");
+
+        assert_eq!(Appended::MidRotation, outcome);
+        assert_eq!(
+            0,
+            log.tail_value(),
+            "and nothing was written into either term"
+        );
+        assert_eq!(0, log.read_frame(0).0);
     }
 
     #[test]
