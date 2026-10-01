@@ -175,10 +175,35 @@ fn a_destination_added_to_an_mds_subscription_connects_the_publisher() {
          reader images: {reader_images:?} late_connected: {late_connected:?} \
          early_connected: {early_connected:?}\n\
          publisher driver: {publisher_counters:?}\n\
-         reader driver: {reader_counters:?}"
+         reader driver: {reader_counters:?}\n\
+         --- publisher errors ---\n{}\n--- reader errors ---\n{}",
+        driver_errors(first.aeron_dir()),
+        driver_errors(second.aeron_dir()),
     );
 
     let _ = early;
+}
+
+/// Whatever the driver recorded as an error, read out of its CnC file the way
+/// the driver's own tool does — the one place a refusal says why.
+fn driver_errors(aeron_dir: &std::path::Path) -> String {
+    use deepmsg_cnc::error_log::ErrorLogEntry;
+
+    let Ok(cnc) = deepmsg_cnc::CncFile::open(aeron_dir, Duration::from_secs(1)) else {
+        return format!("<{aeron_dir:?} could not be opened>");
+    };
+    let Some(reader) = cnc.error_log() else {
+        return String::from("<no error log region>");
+    };
+
+    let mut entries: Vec<ErrorLogEntry> = Vec::new();
+    let _ = reader.read(0, &mut entries);
+
+    entries
+        .iter()
+        .map(|entry| format!("{:?}", entry.text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The counters that say whether a status message travelled, by label — the
@@ -192,6 +217,7 @@ fn interesting_counters(client: &Client) -> Vec<(String, i64)> {
     let mut found = Vec::new();
     let _ = reader.for_each(|descriptor| {
         if [
+            "Errors",
             "Status Messages sent",
             "Status Messages received",
             "Status Messages rejected",
