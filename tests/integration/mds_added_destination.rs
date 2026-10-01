@@ -74,8 +74,6 @@ fn await_connected(client: &mut Client, registration_id: i64) -> bool {
 /// socket of its own — a status message sent through the wrong one is a status
 /// message the publisher never sees.
 #[test]
-#[ignore = "known failure: a second destination on one endpoint makes no image \
-            (analysis/aeron/deepmsg-endpoint-lifecycle-plan.md §10)"]
 fn a_destination_added_to_an_mds_subscription_connects_the_publisher() {
     let Some(mut first) = OwnDriver::start("mds-added-destination-publisher") else {
         driver::announce_own_skip();

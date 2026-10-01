@@ -926,6 +926,7 @@ impl Conductor {
             match event {
                 ReceiverEvent::CreateImage {
                     endpoint_id,
+                    destination,
                     stream_id,
                     session_id,
                     initial_term_id,
@@ -1001,6 +1002,7 @@ impl Conductor {
                         registration_id,
                         client_id,
                         endpoint_id,
+                        destination,
                         &channel,
                         &setup,
                         setup_flags,

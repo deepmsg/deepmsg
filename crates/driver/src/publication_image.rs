@@ -129,6 +129,17 @@ pub struct ImageCounters {
 /// entry to describe and the image's own `eos_position` is that entry's.
 #[derive(Clone, Copy, Debug)]
 pub struct Connection {
+    /// Which of the endpoint's destinations this connection arrived on
+    /// (`aeron_publication_image_connection_t.destination`,
+    /// `aeron_publication_image.h:41`).
+    ///
+    /// It is what every frame an image sends back is sent **through**: the
+    /// control address says *where* the message goes, this says *which socket*
+    /// it leaves from. The two are not the same question, and for a
+    /// multi-destination endpoint they do not have the same answer — a status
+    /// message out of the wrong destination's socket is one the far end's
+    /// kernel drops without a word.
+    pub destination: crate::media::receive_endpoint::DestinationId,
     /// Where status messages and NAKs for this connection go (`control_addr`),
     /// taken from the channel's control address or from the first packet that
     /// arrived (`aeron_publication_image_connection_set_control_address`,
@@ -186,7 +197,7 @@ pub struct PublicationImage {
     /// Who is reading, and how far (`subscribable`).
     pub subscribers: Subscribable,
     /// Where this image hears from, one entry per source
-    /// (`connections`, `aeron_publication_image.h:76-84`).
+    /// (`connections`, `aeron_publication_image.h:79-85`).
     ///
     /// Status messages and NAKs go to **each** of these, not to one address
     /// (`:901-925`), which is what lets an image with several receivers answer
@@ -340,6 +351,7 @@ impl PublicationImage {
     pub fn create(
         registration_id: i64,
         endpoint_id: u64,
+        destination: crate::media::receive_endpoint::DestinationId,
         channel: &[u8],
         log: Box<LogFile>,
         setup: &crate::protocol::SetupFrame,
@@ -458,6 +470,15 @@ impl PublicationImage {
             counters,
             subscribers: Subscribable::new(registration_id),
             connections: vec![Connection {
+                // The `SETUP` arrived on a destination's socket, and that is
+                // the one every answer to this session leaves through. The
+                // create is given it for exactly this (`aeron_publication_image_create`'s
+                // `destination`, `aeron_publication_image.h:170`) and the image
+                // keeps no copy of its own — the reference hands it straight to
+                // the first connection it tracks
+                // (`new_connection->destination = destination`,
+                // `aeron_publication_image.c:1131`).
+                destination,
                 control_address: Some(control_address),
                 time_of_last_activity_ns: now_ns,
                 time_of_last_frame_ns: now_ns,
@@ -661,7 +682,9 @@ impl PublicationImage {
     /// Take a packet (`aeron_publication_image_insert_packet`, `:740-860`).
     ///
     /// The `source` is where the packet came from, which is what a status
-    /// message answers to when the channel named no control address.
+    /// message answers to when the channel named no control address; the
+    /// `destination` is the socket it arrived on, which is what the answer
+    /// leaves through.
     ///
     /// Returns how many bytes were accepted, which is the packet's length for
     /// anything that was written and zero for anything that was not. Three
@@ -683,6 +706,7 @@ impl PublicationImage {
         term_offset: i32,
         packet: &[u8],
         source: SocketAddr,
+        destination: crate::media::receive_endpoint::DestinationId,
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -723,7 +747,7 @@ impl PublicationImage {
             let window_bottom = (self.last_sm_position - i64::from(term_length)).max(0);
 
             if packet_position >= window_bottom {
-                self.track_connection(source, now_ns);
+                self.track_connection(source, destination, now_ns);
                 self.time_of_last_packet_ns = now_ns;
                 self.on_heartbeat(packet, packet_position, counters, regions, system);
             } else {
@@ -743,10 +767,10 @@ impl PublicationImage {
             if proposed_position
                 >= self.last_sm_position - i64::from(self.max_receiver_window_length)
             {
-                self.track_connection(source, now_ns);
+                self.track_connection(source, destination, now_ns);
             }
         } else {
-            self.track_connection(source, now_ns);
+            self.track_connection(source, destination, now_ns);
             self.time_of_last_packet_ns = now_ns;
 
             let index = Position::from_raw(packet_position).index(self.position_bits_to_shift);
@@ -862,14 +886,23 @@ impl PublicationImage {
     ///
     /// When a client adds a destination to a subscription, every image already
     /// running on that subscription's endpoint gets a connection for it
-    /// (`aeron_driver_receiver.c:483-486`) — so that the status messages and
+    /// (`aeron_driver_receiver.c:489-495`) — so that the status messages and
     /// NAKs about this stream go to the new source as well as to the ones that
     /// were already there.
     ///
     /// An address the image already hears from is not added twice. One that is
     /// [`None`] is a connection with no control address yet, which the first
     /// packet to arrive on it will supply.
-    pub fn add_destination(&mut self, control_address: Option<SocketAddr>, now_ns: i64) {
+    ///
+    /// `destination` is the socket the new connection answers through — the one
+    /// the client's destination opened, which is not the endpoint's first and
+    /// must not be confused with it.
+    pub fn add_destination(
+        &mut self,
+        control_address: Option<SocketAddr>,
+        destination: crate::media::receive_endpoint::DestinationId,
+        now_ns: i64,
+    ) {
         if let Some(address) = control_address {
             if self
                 .connections
@@ -881,6 +914,7 @@ impl PublicationImage {
         }
 
         self.connections.push(Connection {
+            destination,
             control_address,
             time_of_last_activity_ns: now_ns,
             time_of_last_frame_ns: now_ns,
@@ -889,7 +923,47 @@ impl PublicationImage {
         });
     }
 
-    fn track_connection(&mut self, source: SocketAddr, now_ns: i64) {
+    /// Let a destination go (`aeron_publication_image_remove_destination`,
+    /// `aeron_publication_image.h:225`).
+    ///
+    /// The connection goes with it, and that is the reference's rule too: the
+    /// reader's side of a destination is its socket, so a destination that has
+    /// been taken off the endpoint has no socket left to answer through.
+    pub fn remove_destination(
+        &mut self,
+        destination: crate::media::receive_endpoint::DestinationId,
+    ) {
+        self.connections
+            .retain(|connection| connection.destination != destination);
+    }
+
+    /// The connection a packet arrived on, adding one if this is the first the
+    /// image has heard from that source
+    /// (`aeron_publication_image_add_connection_if_unknown`,
+    /// `aeron_publication_image.c:639-644`).
+    ///
+    /// **A near-miss worth naming.** The reference looks a connection up by its
+    /// **destination** (`aeron_publication_image_track_connection`,
+    /// `:564-571`: `array[i].destination == destination`) and this build looks
+    /// it up by its control **address**. For every channel with one source per
+    /// destination the two agree, and that is every channel the tests cover; on
+    /// a destination several sources write to, the reference answers the second
+    /// source through the first one's connection and this build gives it one of
+    /// its own. The count of connections is what a client reads
+    /// (`active_transport_count`), so it is a difference on the wire's
+    /// accounting rather than on the wire. Reconciling it is the
+    /// destination-keyed lookup, which is this field's other half.
+    ///
+    /// The `destination` is the socket the packet came in on: for a connection
+    /// the image is meeting for the first time it is what the connection will
+    /// answer through, and for one it already has it is the same socket it was
+    /// created with.
+    fn track_connection(
+        &mut self,
+        source: SocketAddr,
+        destination: crate::media::receive_endpoint::DestinationId,
+        now_ns: i64,
+    ) {
         let index = match self
             .connections
             .iter()
@@ -898,6 +972,7 @@ impl PublicationImage {
             Some(index) => index,
             None => {
                 self.connections.push(Connection {
+                    destination,
                     control_address: None,
                     time_of_last_activity_ns: now_ns,
                     time_of_last_frame_ns: now_ns,
@@ -1120,6 +1195,7 @@ impl PublicationImage {
 
                         if endpoint
                             .send_error_frame(
+                                connection.destination,
                                 control_address,
                                 self.stream_id,
                                 self.session_id,
@@ -1167,7 +1243,7 @@ impl PublicationImage {
                     };
 
                     endpoint.send_response_setup(
-                        0,
+                        connection.destination,
                         control_address,
                         self.stream_id,
                         self.session_id,
@@ -1201,6 +1277,7 @@ impl PublicationImage {
             };
 
             sent += endpoint.send_sm(
+                connection.destination,
                 control_address,
                 self.stream_id,
                 self.session_id,
@@ -1630,6 +1707,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::media::receive_endpoint::DestinationId;
     use crate::protocol::FrameHeader;
     use crate::subscribable::TetherState;
     use deepmsg_core::buffer::AtomicBuffer;
@@ -1782,6 +1860,7 @@ mod tests {
             let image = PublicationImage::create(
                 7,
                 1,
+                DestinationId::FIRST,
                 &channel.original_uri,
                 Box::new(log),
                 &setup,
@@ -1983,7 +2062,7 @@ mod tests {
     /// `validate_packet` requires: the frames in a datagram are aligned, so a
     /// packet's length is always a multiple of the frame alignment.
     /// A destination a client adds joins every image already running on that
-    /// endpoint (`aeron_driver_receiver.c:483-486`), so a stream that is already
+    /// endpoint (`aeron_driver_receiver.c:489-495`), so a stream that is already
     /// up sends its status messages and NAKs to the new source as well.
     ///
     /// An address the image already hears from is not a second connection; one
@@ -1995,17 +2074,19 @@ mod tests {
         let before = fixture.image.connections.len();
         let address: SocketAddr = "127.0.0.1:40124".parse().expect("an address");
 
-        fixture.image.add_destination(Some(address), 1_000);
+        let second = DestinationId::FIRST;
+
+        fixture.image.add_destination(Some(address), second, 1_000);
         assert_eq!(before + 1, fixture.image.connections.len());
 
-        fixture.image.add_destination(Some(address), 2_000);
+        fixture.image.add_destination(Some(address), second, 2_000);
         assert_eq!(
             before + 1,
             fixture.image.connections.len(),
             "the same address is not a second connection"
         );
 
-        fixture.image.add_destination(None, 3_000);
+        fixture.image.add_destination(None, second, 3_000);
         assert_eq!(
             before + 2,
             fixture.image.connections.len(),
@@ -2188,6 +2269,7 @@ mod tests {
             0,
             &bytes,
             "127.0.0.1:5555".parse().expect("an address"),
+            DestinationId::FIRST,
             &system,
             &fixture.counters,
             &regions,
@@ -2206,6 +2288,7 @@ mod tests {
             offset,
             &packet(INITIAL_TERM_ID, offset, b"another frame"),
             "127.0.0.1:5556".parse().expect("an address"),
+            DestinationId::FIRST,
             &system,
             &fixture.counters,
             &regions,
@@ -2258,6 +2341,7 @@ mod tests {
             0,
             &bytes,
             "127.0.0.1:5555".parse().expect("an address"),
+            DestinationId::FIRST,
             &system,
             &fixture.counters,
             &regions,
@@ -2294,6 +2378,7 @@ mod tests {
                 0,
                 &bytes,
                 "127.0.0.1:5555".parse().expect("an address"),
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,
@@ -2330,6 +2415,7 @@ mod tests {
                 0,
                 &first,
                 source,
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,
@@ -2342,6 +2428,7 @@ mod tests {
                 320,
                 &third,
                 source,
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,
@@ -2382,6 +2469,7 @@ mod tests {
                 160,
                 &second,
                 source,
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,
@@ -2693,6 +2781,7 @@ mod tests {
                 term_offset,
                 &bytes,
                 "127.0.0.1:5555".parse().expect("an address"),
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,
@@ -2752,6 +2841,7 @@ mod tests {
                 0,
                 &bytes,
                 "127.0.0.1:5555".parse().expect("an address"),
+                DestinationId::FIRST,
                 &system,
                 &fixture.counters,
                 &regions,

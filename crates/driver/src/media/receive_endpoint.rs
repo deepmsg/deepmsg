@@ -301,6 +301,35 @@ fn destination_local_sockaddr_counter(
     Some(counter_id)
 }
 
+/// The handle a receive endpoint gives one of its destinations.
+///
+/// The reference names a destination by its **address**: an
+/// `aeron_receive_destination_t *` lives in the endpoint's `destinations`
+/// array, and everyone who has to answer *through* one carries that pointer —
+/// each connection an image has (`aeron_publication_image.h:41`) and each
+/// pending setup (`aeron_driver_receiver.h:41`). Sending then takes the
+/// destination as an argument rather than choosing one
+/// (`aeron_receive_channel_endpoint_send`,
+/// `media/aeron_receive_channel_endpoint.c:225-257`).
+///
+/// A Rust endpoint cannot hand out pointers into its own `Vec` — it has to keep
+/// writing to it — so the handle is a number. The one property it has to have
+/// is the pointer's: **never reused**. A destination is taken off with
+/// `swap_remove`, which moves the last entry into the hole, so a *position* is
+/// not an identity at all here: an image still holding the number of a
+/// destination that has gone would answer through whichever socket inherited
+/// the slot. A number that is retired with its destination cannot do that; a
+/// handle with no destination behind it sends nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DestinationId(u64);
+
+impl DestinationId {
+    /// The handle of the first destination an endpoint is given — the one a
+    /// unicast channel opens with, and the one a destination added to a manual
+    /// channel gets if it is the first.
+    pub const FIRST: Self = Self(0);
+}
+
 /// One place a receive endpoint reads from
 /// (`aeron_receive_destination_t`, `media/aeron_receive_destination.h:26-44`).
 ///
@@ -339,13 +368,23 @@ pub struct ReceiveChannelEndpoint {
     /// The channel it was created for.
     pub channel: UdpChannel,
     /// Where this endpoint reads from, one entry per destination
-    /// (`destinations`, `aeron_receive_destination.h:26-44`).
+    /// (`destinations`, `aeron_receive_destination.h:26-44`), each under the
+    /// [`DestinationId`] that names it.
     ///
-    /// A unicast channel has one — the endpoint it named — and every path below
-    /// uses it. A multi-destination channel starts with none and gains them as
-    /// clients add them (`aeron_driver_conductor.c:2099-2114`), which is why the
-    /// callers handle the empty case rather than assuming a destination.
-    destinations: Vec<ReceiveDestination>,
+    /// A unicast channel has one — the endpoint it named — and a
+    /// multi-destination channel starts with none and gains them as clients add
+    /// them (`aeron_driver_conductor.c:2099-2114`), which is why the callers
+    /// handle the empty case rather than assuming a destination.
+    ///
+    /// The pair is the point: a position in this `Vec` is a **cursor** — good
+    /// for one pass of the receive loop and nothing else — while the id beside
+    /// it is what an image, a connection or a pending setup may hold on to.
+    destinations: Vec<(DestinationId, ReceiveDestination)>,
+    /// The next handle to give out.
+    ///
+    /// Monotonic and never reset, including across a removal, which is the
+    /// whole of what makes a stale handle harmless (see [`DestinationId`]).
+    next_destination_id: u64,
     /// The `rcv-channel` counter, whose value is its state.
     channel_status_counter_id: i32,
     /// Which receiver this endpoint is, to a publisher that has several
@@ -395,12 +434,12 @@ pub struct ReceiveChannelEndpoint {
 fn publish_bound_address(
     channel_status_counter_id: i32,
     channel: &[u8],
-    destinations: &[ReceiveDestination],
+    destinations: &[(DestinationId, ReceiveDestination)],
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
 ) -> Result<(), ReceiveEndpointError> {
     let address = match destinations.first() {
-        Some(destination) => crate::udp_channel::format_source_identity(
+        Some((_, destination)) => crate::udp_channel::format_source_identity(
             destination
                 .transport
                 .local_address()
@@ -429,13 +468,13 @@ fn publish_bound_address(
 /// Release the counters a failed create had already allocated, so a refusal
 /// leaves nothing behind.
 fn release_counters(
-    destinations: &[ReceiveDestination],
+    destinations: &[(DestinationId, ReceiveDestination)],
     channel_status_counter_id: i32,
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
     now_ms: i64,
 ) {
-    for destination in destinations {
+    for (_, destination) in destinations {
         counters.free(regions, destination.local_sockaddr_counter_id, now_ms);
     }
 
@@ -499,7 +538,7 @@ impl ReceiveChannelEndpoint {
                 channel_status_counter_id,
                 now_ms,
             ) {
-                Ok(destination) => vec![destination],
+                Ok(destination) => vec![(DestinationId::FIRST, destination)],
                 Err(error) => {
                     // The counters were allocated for an endpoint that will not
                     // exist.
@@ -527,6 +566,9 @@ impl ReceiveChannelEndpoint {
         }
 
         Ok(Self {
+            // The handles given out so far, which at creation is the one
+            // destination a non-manual channel opens with.
+            next_destination_id: destinations.len() as u64,
             destinations,
             channel,
             channel_status_counter_id,
@@ -584,7 +626,7 @@ impl ReceiveChannelEndpoint {
                 channel_status_counter_id,
                 now_ms,
             ) {
-                Ok(destination) => vec![destination],
+                Ok(destination) => vec![(DestinationId::FIRST, destination)],
                 Err(error) => {
                     counters.free(regions, channel_status_counter_id, now_ms);
                     return Err(error);
@@ -610,6 +652,7 @@ impl ReceiveChannelEndpoint {
         }
 
         Ok(Self {
+            next_destination_id: destinations.len() as u64,
             destinations,
             channel,
             channel_status_counter_id,
@@ -776,11 +819,11 @@ impl ReceiveChannelEndpoint {
     /// The transport's error; an empty socket is `Ok(0)`.
     pub fn receive_from(
         &mut self,
-        index: usize,
+        id: DestinationId,
         buffers: &mut [Vec<u8>],
         datagrams: &mut crate::sys::socket::Datagrams,
     ) -> io::Result<usize> {
-        match self.destinations.get_mut(index) {
+        match self.destination_mut(id) {
             Some(destination) => destination.transport.receive(buffers, datagrams),
             // A destination that is not there has nothing to read, which is a
             // state rather than a failure — the reference polls each of them and
@@ -798,27 +841,48 @@ impl ReceiveChannelEndpoint {
     /// and hands it to the receiver, exactly as it hands over an endpoint).
     /// This is the receiver's half: the endpoint holds it, and the next pass
     /// reads from it.
-    pub fn add_destination(&mut self, destination: ReceiveDestination) {
-        self.destinations.push(destination);
+    /// Attach a client's destination under a handle of this endpoint's own,
+    /// and answer with that handle.
+    ///
+    /// The handle is what the caller passes on to everything that will have to
+    /// answer through this socket — the images on the endpoint, and the
+    /// pending setup that asks its source for a stream.
+    pub fn add_destination(&mut self, destination: ReceiveDestination) -> DestinationId {
+        let id = DestinationId(self.next_destination_id);
+        self.next_destination_id += 1;
+
+        self.destinations.push((id, destination));
+
+        id
     }
 
-    /// Take a destination off, answering with it when there was one.
+    /// Take a destination off, answering with it and its handle when there was
+    /// one.
     ///
     /// A destination is identified by its channel, which is how the reference
     /// compares two (`media/aeron_receive_channel_endpoint.c:877-905`). The
     /// counters it holds are the caller's to give back, because the caller
-    /// allocated them.
-    pub fn remove_destination(&mut self, channel: &UdpChannel) -> Option<ReceiveDestination> {
-        let index = self
-            .destinations
-            .iter()
-            .position(|destination| destination.channel.canonical_form == channel.canonical_form)?;
+    /// allocated them — and the handle comes back too, because it is what tells
+    /// the images on this endpoint which connection to let go
+    /// (`aeron_publication_image_remove_destination`,
+    /// `aeron_driver_receiver.c:527`).
+    ///
+    /// The handle is retired here and never handed out again, so a caller that
+    /// forgets to tell everyone is left with a connection that sends nothing
+    /// rather than one that sends through a stranger's socket.
+    pub fn remove_destination(
+        &mut self,
+        channel: &UdpChannel,
+    ) -> Option<(DestinationId, ReceiveDestination)> {
+        let index = self.destinations.iter().position(|(_, destination)| {
+            destination.channel.canonical_form == channel.canonical_form
+        })?;
 
         Some(self.destinations.swap_remove(index))
     }
 
     /// The destinations, in the order they were added.
-    pub fn destinations(&self) -> &[ReceiveDestination] {
+    pub fn destinations(&self) -> &[(DestinationId, ReceiveDestination)] {
         &self.destinations
     }
 
@@ -840,13 +904,14 @@ impl ReceiveChannelEndpoint {
     pub(crate) fn ask_for_setup(
         &mut self,
         endpoint_id: u64,
-        index: usize,
+        destination: DestinationId,
         now_ns: i64,
     ) -> Option<crate::receiver::PendingSetup> {
-        let address = self.destinations().get(index)?.setup_address()?;
+        let address = self.destination(destination)?.setup_address()?;
 
         let setup = crate::receiver::PendingSetup {
             endpoint_id,
+            destination,
             stream_id: 0,
             session_id: 0,
             control_address: Some(address),
@@ -856,7 +921,7 @@ impl ReceiveChannelEndpoint {
         // The channel that is not multicast and did name a control sends to
         // `local_control`, which is where the entry above will send too
         // (`media/aeron_receive_destination.c:117-124`).
-        let _ = self.send_sm_from(index, address, 0, 0, 0, 0, 0, Self::send_setup_flag());
+        let _ = self.send_sm(destination, address, 0, 0, 0, 0, 0, Self::send_setup_flag());
 
         Some(setup)
     }
@@ -871,6 +936,15 @@ impl ReceiveChannelEndpoint {
         self.destinations.len()
     }
 
+    /// The handle of the destination at `index`, for a caller walking the list.
+    ///
+    /// The position is a cursor for one pass and nothing more — a caller that
+    /// keeps one is keeping something that moves (`remove_destination` is a
+    /// `swap_remove`). What a caller keeps is this.
+    pub fn destination_id(&self, index: usize) -> Option<DestinationId> {
+        self.destinations.get(index).map(|(id, _)| *id)
+    }
+
     /// The address this endpoint's socket is bound to, which is the channel's
     /// endpoint parameter — and what the channel status reports as local.
     ///
@@ -878,7 +952,11 @@ impl ReceiveChannelEndpoint {
     ///
     /// The error from `getsockname(2)`.
     pub fn local_address(&self) -> io::Result<SocketAddr> {
-        match self.destination() {
+        match self
+            .destinations
+            .first()
+            .map(|(_, destination)| destination)
+        {
             Some(destination) => destination.transport.local_address(),
             None => Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -896,16 +974,24 @@ impl ReceiveChannelEndpoint {
     /// ([`UdpChannel::control_address`], asked of the destination's own
     /// channel): a multi-destination endpoint's destinations are channels of
     /// their own, and one of them may be a group while the endpoint is not.
-    pub fn control_address(&self, destination_index: usize, source: SocketAddr) -> SocketAddr {
-        self.destinations
-            .get(destination_index)
-            .map_or(source, |destination| {
-                destination.channel.control_address(source)
-            })
+    pub fn control_address(&self, id: DestinationId, source: SocketAddr) -> SocketAddr {
+        self.destination(id).map_or(source, |destination| {
+            destination.channel.control_address(source)
+        })
     }
 
-    /// Send a status message
+    /// Send a status message through the destination it is about
     /// (`aeron_receive_channel_endpoint_send_sm`, `:291-338`).
+    ///
+    /// The destination is the caller's to name, and that is the reference's
+    /// shape too: it passes the `aeron_receive_destination_t` the answer
+    /// belongs to (`aeron_receive_channel_endpoint_send`, `:225-257`, reached
+    /// through `destination->data_paths->send_func`). A datagram arrives on
+    /// **one** destination's socket and the answer has to leave through that
+    /// one — a status message out of another destination's socket is a receiver
+    /// reporting a position through a socket the sender never wrote to, and for
+    /// a unicast publication, whose sending socket is `connect`ed, that
+    /// datagram is dropped by the far end's kernel without a word.
     ///
     /// # Errors
     ///
@@ -913,41 +999,7 @@ impl ReceiveChannelEndpoint {
     #[allow(clippy::too_many_arguments)] // the status message's fields
     pub fn send_sm(
         &mut self,
-        destination: SocketAddr,
-        stream_id: i32,
-        session_id: i32,
-        consumption_term_id: i32,
-        consumption_term_offset: i32,
-        receiver_window: i32,
-        flags: u8,
-    ) -> io::Result<usize> {
-        self.send_sm_from(
-            0,
-            destination,
-            stream_id,
-            session_id,
-            consumption_term_id,
-            consumption_term_offset,
-            receiver_window,
-            flags,
-        )
-    }
-
-    /// The same, through the destination at `index`.
-    ///
-    /// A datagram arrives on **one** destination's socket, and an answer has to
-    /// leave through that one — a status message that went out of another
-    /// destination's socket would be a receiver reporting a position to a sender
-    /// that never asked it (`aeron_receive_channel_endpoint_send_sm`, which
-    /// takes the destination it is answering).
-    ///
-    /// # Errors
-    ///
-    /// The socket's error.
-    #[allow(clippy::too_many_arguments)] // the status message's fields
-    pub fn send_sm_from(
-        &mut self,
-        index: usize,
+        id: DestinationId,
         destination: SocketAddr,
         stream_id: i32,
         session_id: i32,
@@ -984,7 +1036,7 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         };
 
-        match self.destinations.get_mut(index) {
+        match self.destination_mut(id) {
             Some(entry) => entry
                 .transport
                 .send(Some(destination), &[&buffer[..length]]),
@@ -1004,14 +1056,14 @@ impl ReceiveChannelEndpoint {
     /// (`aeron_udp_protocol.h:158-165`).
     ///
     /// It leaves through the destination the request arrived on, the same one a
-    /// status message would ([`Self::send_sm_from`]).
+    /// status message would ([`Self::send_sm`]).
     ///
     /// # Errors
     ///
     /// The socket's error.
     pub fn send_response_setup(
         &mut self,
-        index: usize,
+        id: DestinationId,
         destination: SocketAddr,
         stream_id: i32,
         session_id: i32,
@@ -1028,19 +1080,27 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        match self.destinations.get_mut(index) {
+        match self.destination_mut(id) {
             Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
             None => Ok(0),
         }
     }
 
-    /// Send a NAK (`aeron_receive_channel_endpoint_send_nak`, `:340-375`).
+    /// Send a NAK through the destination that reported the gap
+    /// (`aeron_receive_channel_endpoint_send_nak`, `:340-375`).
+    ///
+    /// The destination is the caller's to name here for the same reason a
+    /// status message's is: a gap is a fact about what arrived on **one**
+    /// socket, and the sender that has to fill it is the one behind that
+    /// socket.
     ///
     /// # Errors
     ///
     /// The socket's error.
+    #[allow(clippy::too_many_arguments)] // the frame's fields, and where it leaves through
     pub fn send_nak(
         &mut self,
+        id: DestinationId,
         destination: SocketAddr,
         stream_id: i32,
         session_id: i32,
@@ -1061,13 +1121,14 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        match self.destination_mut() {
+        match self.destination_mut(id) {
             Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
             None => Ok(0),
         }
     }
 
-    /// Send an RTTM (`aeron_receive_channel_endpoint_send_rttm`, `:377-430`).
+    /// Send an RTTM through the destination it measures
+    /// (`aeron_receive_channel_endpoint_send_rttm`, `:377-430`).
     ///
     /// # Errors
     ///
@@ -1075,6 +1136,7 @@ impl ReceiveChannelEndpoint {
     #[allow(clippy::too_many_arguments)] // the frame's fields
     pub fn send_rttm(
         &mut self,
+        id: DestinationId,
         destination: SocketAddr,
         stream_id: i32,
         session_id: i32,
@@ -1095,7 +1157,7 @@ impl ReceiveChannelEndpoint {
             return Ok(0);
         }
 
-        match self.destination_mut() {
+        match self.destination_mut(id) {
             Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
             None => Ok(0),
         }
@@ -1107,7 +1169,10 @@ impl ReceiveChannelEndpoint {
     /// This is the **only** frame this endpoint sends that is not an answer to
     /// something the far end asked for: a status message, a NAK and an RTTM all
     /// report on data that arrived, and an `ERR` reports a decision the reader
-    /// made. It goes to the connection's control address, like the rest.
+    /// made. It goes to the connection's control address through the
+    /// connection's destination, like the rest — a refusal that left through
+    /// another socket is a publisher that never learns why its image is not
+    /// there.
     ///
     /// The text is clipped to [`MAX_ERROR_TEXT_LENGTH`], which is the frame's
     /// own bound and the client's — `strnlen(invalidation_reason,
@@ -1123,8 +1188,10 @@ impl ReceiveChannelEndpoint {
     /// # Errors
     ///
     /// The socket's error.
+    #[allow(clippy::too_many_arguments)] // the frame's fields, and where it leaves through
     pub fn send_error_frame(
         &mut self,
+        id: DestinationId,
         destination: SocketAddr,
         stream_id: i32,
         session_id: i32,
@@ -1168,7 +1235,7 @@ impl ReceiveChannelEndpoint {
         buffer[ErrorFrame::LENGTH..ErrorFrame::LENGTH + reason.len()].copy_from_slice(reason);
 
         let length = ErrorFrame::LENGTH + reason.len();
-        let sent = match self.destination_mut() {
+        let sent = match self.destination_mut(id) {
             Some(entry) => entry
                 .transport
                 .send(Some(destination), &[&buffer[..length]])?,
@@ -1192,19 +1259,25 @@ impl ReceiveChannelEndpoint {
         Ok(sent)
     }
 
-    /// The destination this endpoint reads from, or answers through.
+    /// The destination a handle names, or [`None`] when it names one that has
+    /// gone.
     ///
-    /// A unicast channel has exactly one, so every path here uses it. The
-    /// reference chooses by the destination a source belongs to, which needs the
-    /// per-destination control addresses that arrive with the multi-destination
-    /// work.
-    fn destination(&self) -> Option<&ReceiveDestination> {
-        self.destinations.first()
+    /// A retired handle is not an error and not a reason to fall back to some
+    /// other destination: it is a connection whose socket is no longer there,
+    /// and what it gets is nothing.
+    fn destination(&self, id: DestinationId) -> Option<&ReceiveDestination> {
+        self.destinations
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, destination)| destination)
     }
 
-    /// The same, mutably — reading is what needs it.
-    fn destination_mut(&mut self) -> Option<&mut ReceiveDestination> {
-        self.destinations.first_mut()
+    /// The same, mutably — sending is what needs it.
+    fn destination_mut(&mut self, id: DestinationId) -> Option<&mut ReceiveDestination> {
+        self.destinations
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, destination)| destination)
     }
 
     /// The state of one session, for the receiver's pending-setup sweep.
@@ -1261,13 +1334,17 @@ impl ReceiveChannelEndpoint {
         let mut reached = 0;
 
         for index in 0..self.destinations.len() {
-            let Some(address) = self.destinations[index].setup_address() else {
+            let Some((id, address)) = self
+                .destinations
+                .get(index)
+                .and_then(|(id, destination)| Some((*id, destination.setup_address()?)))
+            else {
                 continue;
             };
 
             if self
-                .send_sm_from(
-                    index,
+                .send_sm(
+                    id,
                     address,
                     stream_id,
                     session_id,
@@ -1558,10 +1635,11 @@ mod tests {
         )
         .expect("a destination");
 
-        endpoint.add_destination(added);
+        let added_id = endpoint.add_destination(added);
         assert_eq!(1, endpoint.destination_count());
+        assert_eq!(Some(added_id), endpoint.destination_id(0));
 
-        let removed = endpoint
+        let (removed_id, removed) = endpoint
             .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
             .expect("the destination that was added");
 
@@ -1570,6 +1648,10 @@ mod tests {
             removed.channel().canonical_form,
             "and it is the one that was added"
         );
+        assert_eq!(
+            added_id, removed_id,
+            "and it answers with the handle it was given, so the caller can tell the images"
+        );
         assert_eq!(0, endpoint.destination_count());
         assert!(
             endpoint
@@ -1577,6 +1659,166 @@ mod tests {
                 .is_none(),
             "a channel no destination has removes nothing"
         );
+    }
+
+    /// A hand that has gone sends nothing, and — the part that matters — it
+    /// does not send through whatever destination took the slot.
+    ///
+    /// This is the property that makes a handle a handle: `remove_destination`
+    /// is a `swap_remove`, so the *position* a removed destination had is the
+    /// one the last destination moves into. Anything that kept the position
+    /// would answer through a socket that never asked it anything.
+    #[test]
+    fn a_handle_whose_destination_is_gone_sends_through_nothing() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            None,
+            stub(40123),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        let second = Sent::default();
+
+        let first_id = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                Box::new(Sent::default()),
+                &mut counters,
+                &regions,
+                8,
+                endpoint.channel_status_counter_id(),
+                1_000,
+            )
+            .expect("a destination"),
+        );
+
+        // The last one added, which is the one `swap_remove` moves into the
+        // hole the first leaves.
+        let last_id = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                Box::new(second.clone()),
+                &mut counters,
+                &regions,
+                9,
+                endpoint.channel_status_counter_id(),
+                1_000,
+            )
+            .expect("a destination"),
+        );
+
+        let (removed, _) = endpoint
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
+            .expect("the first destination");
+        assert_eq!(first_id, removed);
+        assert_eq!(
+            Some(last_id),
+            endpoint.destination_id(0),
+            "the destination that is left has moved into the slot the first one had"
+        );
+
+        let control = "127.0.0.1:40500".parse().expect("an address");
+        let sent = endpoint
+            .send_sm(first_id, control, 1_001, 42, 3, 4_096, 8_192, 0)
+            .expect("nothing to send is not a failure");
+
+        assert_eq!(0, sent);
+        assert!(
+            second.frames().is_empty(),
+            "a handle that has been retired does not inherit the socket that moved into its slot"
+        );
+    }
+
+    /// An answer leaves through the destination it is **about**, not through
+    /// the endpoint's first one.
+    ///
+    /// The defect this pins: `send_sm` had no destination to name, so it sent
+    /// through the destination at position zero whatever it was answering. A
+    /// reader of a second destination therefore reported its position out of
+    /// the first destination's socket — and a unicast publication's sending
+    /// socket is `connect`ed, so the far end's kernel drops that datagram
+    /// without a word: the publisher is never told its reader exists.
+    #[test]
+    fn an_answer_leaves_through_the_destination_it_is_about() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            None,
+            stub(40123),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        let first = Sent::default();
+        let second = Sent::default();
+
+        let first_id = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                Box::new(first.clone()),
+                &mut counters,
+                &regions,
+                8,
+                endpoint.channel_status_counter_id(),
+                1_000,
+            )
+            .expect("a destination"),
+        );
+
+        let second_id = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                Box::new(second.clone()),
+                &mut counters,
+                &regions,
+                9,
+                endpoint.channel_status_counter_id(),
+                1_000,
+            )
+            .expect("a destination"),
+        );
+
+        assert_ne!(first_id, second_id, "two destinations, two handles");
+
+        let control = "127.0.0.1:40500".parse().expect("an address");
+        endpoint
+            .send_sm(second_id, control, 1_001, 42, 3, 4_096, 8_192, 0)
+            .expect("sent");
+
+        assert!(
+            first.frames().is_empty(),
+            "the first destination's socket carried nothing"
+        );
+        assert_eq!(
+            1,
+            second.frames().len(),
+            "and the second carried the answer it was about"
+        );
+    }
+
+    /// The handle of the one destination an endpoint of a test's own has — a
+    /// unicast channel opens with exactly one, under the first handle the
+    /// endpoint gives out.
+    fn only_destination(endpoint: &ReceiveChannelEndpoint) -> DestinationId {
+        endpoint
+            .destination_id(0)
+            .expect("a unicast channel opens with one destination")
     }
 
     /// An endpoint of a test's own, with a transport that keeps what leaves.
@@ -1640,7 +1882,7 @@ mod tests {
         .expect("an endpoint");
 
         let setup = endpoint
-            .ask_for_setup(9, 0, 5_000)
+            .ask_for_setup(9, only_destination(&endpoint), 5_000)
             .expect("a channel with a control address has something to ask");
 
         assert_eq!(9, setup.endpoint_id);
@@ -1669,7 +1911,11 @@ mod tests {
         let (mut counters, regions) = fixture.open();
         let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
 
-        assert!(endpoint.ask_for_setup(9, 0, 5_000).is_none());
+        assert!(
+            endpoint
+                .ask_for_setup(9, only_destination(&endpoint), 5_000)
+                .is_none()
+        );
         assert!(sent.frames().is_empty(), "and nothing went out");
     }
 
@@ -1686,9 +1932,18 @@ mod tests {
         let (mut endpoint, sent) =
             endpoint_that_records_with_tag(Some(17), &mut counters, &regions);
 
-        let destination = "127.0.0.1:40456".parse().expect("an address");
+        let control = "127.0.0.1:40456".parse().expect("an address");
         endpoint
-            .send_sm(destination, 1_001, 42, 3, 4_096, 8_192, 0)
+            .send_sm(
+                only_destination(&endpoint),
+                control,
+                1_001,
+                42,
+                3,
+                4_096,
+                8_192,
+                0,
+            )
             .expect("sent");
 
         let frame = sent.last();
@@ -1713,9 +1968,18 @@ mod tests {
         let (mut counters, regions) = fixture.open();
         let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
 
-        let destination = "127.0.0.1:40456".parse().expect("an address");
+        let control = "127.0.0.1:40456".parse().expect("an address");
         endpoint
-            .send_sm(destination, 1_001, 42, 3, 4_096, 8_192, 0)
+            .send_sm(
+                only_destination(&endpoint),
+                control,
+                1_001,
+                42,
+                3,
+                4_096,
+                8_192,
+                0,
+            )
             .expect("sent");
 
         let frame = sent.last();
@@ -1742,6 +2006,7 @@ mod tests {
         let system = system_counters::System::new(&counters, &regions);
         endpoint
             .send_error_frame(
+                only_destination(&endpoint),
                 "127.0.0.1:40456".parse().expect("an address"),
                 1_001,
                 42,
@@ -1765,6 +2030,7 @@ mod tests {
         let system = system_counters::System::new(&counters, &regions);
         endpoint
             .send_error_frame(
+                only_destination(&endpoint),
                 "127.0.0.1:40456".parse().expect("an address"),
                 1_001,
                 42,
@@ -1794,6 +2060,7 @@ mod tests {
         let reason = b"Needs to be closed";
         let length = endpoint
             .send_error_frame(
+                only_destination(&endpoint),
                 "127.0.0.1:40456".parse().expect("an address"),
                 1001,
                 42,
@@ -1846,6 +2113,7 @@ mod tests {
         let reason = vec![b'x'; 2000];
         endpoint
             .send_error_frame(
+                only_destination(&endpoint),
                 "127.0.0.1:40456".parse().expect("an address"),
                 1001,
                 42,
