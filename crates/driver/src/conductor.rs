@@ -6161,6 +6161,111 @@ mod tests {
         );
     }
 
+    /// Two subscriptions that one image would serve have to agree about
+    /// `reliable`, and the reference refuses the second rather than serving it
+    /// the first one's answer
+    /// (`aeron_driver_conductor_has_clashing_subscription`, `:320-332`).
+    #[test]
+    fn two_subscriptions_that_disagree_about_reliability_cannot_share_a_channel() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // A channel of this test's own: the fixtures are shared, and a
+        // subscription on theirs would be a clash with theirs.
+        let port = {
+            use crate::sys::AddressFamily;
+            use crate::sys::socket::DatagramSocket;
+
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        let unreliable = format!("{channel}|reliable=false");
+
+        // The first one names it, and is served: nothing about the value itself
+        // is refused.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 21, 1002, &unreliable),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "the first subscription is served"
+        );
+
+        // The second asks for the default on the same endpoint, stream and
+        // session. The image they would share can only behave one way, so the
+        // reference answers with an error rather than letting one client's
+        // choice silently become the other's.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 22, 1002, &channel),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered rather than left waiting");
+
+        assert_eq!(22i64.to_le_bytes(), payload[0..8], "on the id that asked");
+        assert_eq!(
+            22i32.to_le_bytes(),
+            payload[8..12],
+            "and under the reference's own code for it, which is the platform's \
+             `EINVAL` and not one of `AERON_ERROR_CODE_*` (`:322-330`)"
+        );
+
+        let text = String::from_utf8_lossy(&payload[16..]).to_string();
+        assert!(
+            text.contains("option conflicts with existing subscription: reliable=true"),
+            "the option and the value the caller gave: {text}"
+        );
+        assert!(
+            text.contains(&format!("existingChannel={unreliable}")),
+            "and the channel already there: {text}"
+        );
+        assert!(
+            text.contains(&format!("channel={channel}")),
+            "and the one that arrived: {text}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "no second subscription was created"
+        );
+
+        // The control, so that the refusal cannot pass by refusing everything:
+        // the same option twice is not a clash, whichever way round.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 23, 1002, &unreliable),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "a subscription that agrees about the option is served"
+        );
+    }
+
     /// `GET_NEXT_AVAILABLE_SESSION_ID`'s wire form: the correlated head and a
     /// stream id (`aeron_control_protocol.h:247-253`).
     fn next_session_id_payload(client_id: i64, correlation_id: i64, stream_id: i32) -> Vec<u8> {

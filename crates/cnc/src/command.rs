@@ -447,6 +447,17 @@ pub const ERROR_CODE_IMAGE_REJECTED: i32 = 13;
 /// revoke flag cuts the stream off on purpose, and a publisher is told so.
 pub const ERROR_CODE_PUBLICATION_REVOKED: i32 = 14;
 
+/// `EINVAL`, the platform's — **not** an `AERON_ERROR_CODE_*`.
+///
+/// The one place the driver reports an errno rather than one of its own codes:
+/// a subscription whose options disagree with one already on the same endpoint
+/// and stream is refused with `AERON_SET_ERR(EINVAL, ...)`
+/// (`aeron_driver_conductor.c:323`), and `aeron_errcode()` returns whatever it
+/// was handed (`util/aeron_error.c:355`), so 22 is what reaches the client's
+/// `ON_ERROR`. Mirroring it means the number is a Linux one; the reference's is
+/// too, because the constant is `<errno.h>`'s.
+pub const ERROR_CODE_EINVAL: i32 = 22;
+
 /// Encode `ON_OPERATION_SUCCEEDED`.
 pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEEDED_LENGTH] {
     correlation_id.to_le_bytes()
