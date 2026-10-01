@@ -97,7 +97,7 @@ impl LossDetector {
         }
     }
 
-    /// A detector with the delays a channel named, or the driver's own.
+    /// A detector for the delays a channel named, or the driver's own.
     ///
     /// `nak-delay=` is the one thing a subscription can say about how its gaps
     /// are asked for, and what it buys is exactly this: a **static** delay in
@@ -108,7 +108,19 @@ impl LossDetector {
     /// saturates rather than wrapping — a delay near `i64::MAX` is a nonsense a
     /// client typed, not one that should become a *retry before the first
     /// ask*.
-    pub fn for_channel(registration_id: i64, nak_delay_ns: Option<i64>) -> Self {
+    ///
+    /// **`reliable=false` wins over all of it**, and is the first thing the
+    /// reference checks: an unreliable channel gets a static generator at
+    /// **zero** for both delays (`aeron_publication_image_acquire_delay_generator_state`,
+    /// `:92-95`, which returns before it looks at `nak-delay=` or at group
+    /// semantics). Zero is not a detail — it is what makes an unreliable image
+    /// fill its holes at once instead of waiting out a NAK that will never be
+    /// sent (see [`crate::publication_image::PublicationImage::fill_gap`]).
+    pub fn for_channel(registration_id: i64, is_reliable: bool, nak_delay_ns: Option<i64>) -> Self {
+        if !is_reliable {
+            return Self::with_delays(registration_id, 0, 0);
+        }
+
         match nak_delay_ns {
             Some(delay_ns) => Self::with_delays(
                 registration_id,
@@ -550,7 +562,7 @@ mod tests {
         // The parameter's whole effect, and the argument order that is easy to
         // get backwards: the *first* delay is what the channel named, and the
         // retry is that times the driver's ratio.
-        let named = LossDetector::for_channel(7, Some(5_000));
+        let named = LossDetector::for_channel(7, true, Some(5_000));
 
         assert_eq!(5_000, named.delay_ns, "the delay the channel named");
         assert_eq!(
@@ -560,7 +572,7 @@ mod tests {
         );
 
         // A channel that named nothing keeps the driver's own.
-        let default = LossDetector::for_channel(7, None);
+        let default = LossDetector::for_channel(7, true, None);
         assert_eq!(NAK_UNICAST_DELAY_NS, default.delay_ns);
         assert_eq!(
             NAK_UNICAST_DELAY_NS * NAK_UNICAST_RETRY_RATIO,
@@ -569,8 +581,26 @@ mod tests {
 
         // And a delay big enough to overflow the multiplication saturates
         // instead: a retry *before* the first ask is not a thing.
-        let absurd = LossDetector::for_channel(7, Some(i64::MAX));
+        let absurd = LossDetector::for_channel(7, true, Some(i64::MAX));
         assert_eq!(i64::MAX, absurd.delay_ns);
         assert_eq!(i64::MAX, absurd.retry_ns);
+    }
+
+    #[test]
+    fn an_unreliable_channel_waits_for_nothing_and_ignores_nak_delay() {
+        // What `reliable=false` buys, in the one place a delay is visible: the
+        // hole is fillable the moment it is seen. The reference returns the
+        // zero generator *before* it reads `nak-delay=`
+        // (`aeron_publication_image.c:92-95`), so a channel that names both
+        // gets zero — the parameter it typed is not read at all.
+        let unreliable = LossDetector::for_channel(7, false, Some(5_000));
+
+        assert_eq!(0, unreliable.delay_ns);
+        assert_eq!(0, unreliable.retry_ns, "and no backoff before the next try");
+
+        // The contrast, so that the test above cannot pass by the delays being
+        // zero for every channel.
+        let reliable = LossDetector::for_channel(7, true, Some(5_000));
+        assert_eq!(5_000, reliable.delay_ns);
     }
 }

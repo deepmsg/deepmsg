@@ -37,7 +37,8 @@ use deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
-use deepmsg_core::logbuffer::position::{Position, RawTail};
+use deepmsg_core::logbuffer::position::{Position, RawTail, index_by_term};
+use deepmsg_core::logbuffer::repair;
 
 use crate::flowcontrol::receiver_window_length;
 use crate::loss_detector::{Gap, LossDetector};
@@ -258,6 +259,16 @@ pub struct PublicationImage {
     /// an image is created by a `SETUP`, so the subscription that reads it
     /// inherits these rather than setting them).
     pub untethered_window_limit_timeout_ns: i64,
+    /// Whether this image asks its sender for the frames it is missing.
+    ///
+    /// `reliable=false` is the one channel parameter that changes what an image
+    /// *does* rather than what it advertises: a hole is filled with a padding
+    /// frame instead of being asked for, and the data in it is simply not
+    /// recovered (`aeron_publication_image.c:1024-1066`). It is stored here
+    /// because the branch is taken on the receiver thread, long after the
+    /// subscription parameters it came from are gone
+    /// (`aeron_publication_image_conductor_fields_stct.is_reliable`, `.h:57`).
+    pub is_reliable: bool,
     /// How long it lingers before it is either closed or rested.
     pub untethered_linger_timeout_ns: i64,
     /// And how long it rests before it is woken.
@@ -398,8 +409,24 @@ impl PublicationImage {
                     group: u8::from(group_semantics),
                     is_response: untethered.is_response,
                     rejoin: false,
-                    reliable: true,
-                    sparse: false,
+                    // The two the *subscription* decides, rather than the
+                    // channel or the sender. `reliable` is not decoration: it
+                    // is the image's own behaviour, whether it asks for its
+                    // holes or fills them (`aeron_publication_image.c:307`,
+                    // `:1024`), and the metadata carries a copy of it for
+                    // whoever reads the image later (`:280`).
+                    //
+                    // Both are read off the channel's parameters because an
+                    // image is created by a `SETUP` and has no subscription of
+                    // its own at that moment. The reference reads `reliable`
+                    // off the subscription link being linked and `sparse` off
+                    // the *oldest* subscription matching the image
+                    // (`aeron_driver_conductor_is_oldest_subscription_sparse`),
+                    // which is the same subscription here until two of them
+                    // with different `sparse` share one image — recorded in
+                    // `docs/compat.md`.
+                    reliable: untethered.is_reliable,
+                    sparse: untethered.is_sparse,
                     signal_eos: true,
                     spies_simulate_connection: false,
                     tether: false,
@@ -457,7 +484,18 @@ impl PublicationImage {
             // whole of what a subscription may say about how its gaps are asked
             // for (`aeron_publication_image.c:100-118`), and until this line
             // the parameter was parsed by nobody and changed nothing.
-            loss_detector: LossDetector::for_channel(registration_id, untethered.nak_delay_ns),
+            //
+            // `reliable=false` outranks it: the reference checks that first and
+            // returns a static generator at zero, so an unreliable channel's
+            // gap is fillable the moment it is seen and `nak-delay=` on the
+            // same channel is never read (`:92-95`, which returns before the
+            // two branches below it).
+            loss_detector: LossDetector::for_channel(
+                registration_id,
+                untethered.is_reliable,
+                untethered.nak_delay_ns,
+            ),
+            is_reliable: untethered.is_reliable,
             untethered_window_limit_timeout_ns: untethered.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: untethered.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: untethered.untethered_resting_timeout_ns,
@@ -553,6 +591,47 @@ impl PublicationImage {
     /// Counters' ids, for the conductor's record.
     pub const fn counters(&self) -> ImageCounters {
         self.counters
+    }
+
+    /// Whether this image asks for the frames it is missing, or fills the holes
+    /// they left (`aeron_publication_image_conductor_fields_stct.is_reliable`,
+    /// `.h:57`). Read by the receiver, which is where the branch is taken.
+    pub const fn is_reliable(&self) -> bool {
+        self.is_reliable
+    }
+
+    /// Cover the hole the scan found with a padding frame, so that readers can
+    /// move past it — what an unreliable image does instead of asking its
+    /// sender for the frames (`aeron_publication_image_send_pending_loss`,
+    /// `:1053-1066`).
+    ///
+    /// Nothing goes on the network, and the frame that lands is padding: the
+    /// data in the hole is never recovered, which is the whole of what
+    /// `reliable=false` buys and the whole of what it costs.
+    ///
+    /// Returns whether the fill happened. It does not when something has landed
+    /// in the hole since it was scanned — a retransmission for another reader
+    /// of the same image, or a packet that was merely out of order — because
+    /// covering it would throw that frame away
+    /// (`concurrent/aeron_term_gap_filler.c:26-35`).
+    pub fn fill_gap(&mut self, gap: Gap) -> bool {
+        let index = index_by_term(self.initial_term_id, gap.term_id);
+
+        let Some(term) = self.log.term(index) else {
+            return false;
+        };
+        let Some(metadata) = self.log.metadata() else {
+            return false;
+        };
+
+        repair::fill_gap(
+            &term,
+            &metadata.as_read_only(),
+            gap.term_offset.unsigned_abs() as usize,
+            gap.length,
+            gap.term_id,
+        )
+        .is_some()
     }
 
     /// How far the reader has been moved, as the counters hold it.
@@ -1539,6 +1618,29 @@ mod tests {
             is_response: bool,
             nak_delay_ns: Option<i64>,
         ) -> Self {
+            Self::build(group_semantics, is_response, nak_delay_ns, true, true)
+        }
+
+        /// The same, for a channel that said `reliable=false`
+        /// (`aeron_publication_image.c:92-95`, `:1024`).
+        fn unreliable() -> Self {
+            Self::build(false, false, None, false, true)
+        }
+
+        /// The same, for a channel that said `sparse=false` — the other
+        /// parameter whose byte an image copies out of a subscription
+        /// (`aeron_publication_image.c:281`).
+        fn dense() -> Self {
+            Self::build(false, false, None, true, false)
+        }
+
+        fn build(
+            group_semantics: bool,
+            is_response: bool,
+            nak_delay_ns: Option<i64>,
+            is_reliable: bool,
+            is_sparse: bool,
+        ) -> Self {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir =
@@ -1592,6 +1694,8 @@ mod tests {
             );
             untethered.is_response = is_response;
             untethered.nak_delay_ns = nak_delay_ns;
+            untethered.is_reliable = is_reliable;
+            untethered.is_sparse = is_sparse;
 
             let image = PublicationImage::create(
                 7,
@@ -1648,6 +1752,92 @@ mod tests {
             silent.image.loss_detector.delays(),
             "and a channel that named nothing keeps the driver's own"
         );
+    }
+
+    /// A channel that said `reliable=false`, followed all the way to what the
+    /// image *does* with it.
+    ///
+    /// This is the shape G1-4 had to learn: `reliable` has been parsed into
+    /// [`SubscriptionParams`] since P1 and read by nobody, so a test of the
+    /// parser, or of the metadata byte, or of the detector, can each pass while
+    /// the image behaves exactly as it did before. The three assertions here
+    /// are the three places the one parameter has to arrive — and the third,
+    /// [`PublicationImage::fill_gap`], is the behaviour itself: an unreliable
+    /// image is the one that covers a hole rather than asking for it.
+    #[test]
+    fn an_unreliable_image_waits_for_nothing_and_fills_its_own_holes() {
+        let mut fixture = Fixture::unreliable();
+
+        assert!(!fixture.image.is_reliable());
+
+        // Zero and zero: the hole is fillable the moment it is seen, and the
+        // reference returns this generator before it reads `nak-delay=`
+        // (`aeron_publication_image.c:92-95`).
+        assert_eq!((0, 0), fixture.image.loss_detector.delays());
+
+        // And the fill is the image's own: the hole it was handed becomes a
+        // padding frame in its term, which is what lets a reader past it.
+        let gap = Gap {
+            term_id: INITIAL_TERM_ID,
+            term_offset: 64,
+            length: 128,
+        };
+        assert!(fixture.image.fill_gap(gap));
+
+        let term = fixture.image.log.term(0).expect("a term");
+        let filled = deepmsg_core::logbuffer::frame::Frame::new(&term, 64);
+        assert_eq!(Some(128), filled.frame_length());
+        assert!(filled.is_padding());
+        assert_eq!(
+            Some(INITIAL_TERM_ID),
+            filled.term_id(),
+            "the padding carries the term it is in, not the template's"
+        );
+    }
+
+    /// The same parameters, in the file: the two bytes a client that maps the
+    /// image reads to decide how the stream it is looking at behaves and how
+    /// its buffer was written (`aeron_publication_image.c:280-281`).
+    ///
+    /// The pair is the judgement again — one image of each kind — so a
+    /// hardcoded answer satisfies neither half. It was hardcoded before: an
+    /// image wrote `reliable=true, sparse=false` whatever its channel said,
+    /// which is `true` for the first and the *opposite* of the driver's own
+    /// default for the second (`TERM_BUFFER_SPARSE_FILE_DEFAULT`).
+    #[test]
+    fn an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse() {
+        for (is_reliable, is_sparse, fixture) in [
+            (true, true, Fixture::new()),
+            (false, true, Fixture::unreliable()),
+            (true, false, Fixture::dense()),
+        ] {
+            let bytes =
+                std::fs::read(fixture._dir.0.join("image.logbuffer")).expect("the log buffer");
+            let block =
+                &bytes[deepmsg_core::logbuffer::logfile::LogFile::log_length(TERM_LENGTH, 4096)
+                    .expect("a length")
+                    - descriptor::METADATA_LENGTH..];
+
+            assert_eq!(
+                7,
+                i64::from_le_bytes(
+                    block[descriptor::CORRELATION_ID_OFFSET..descriptor::CORRELATION_ID_OFFSET + 8]
+                        .try_into()
+                        .expect("eight bytes")
+                ),
+                "the block being read has to be the one this image wrote"
+            );
+            assert_eq!(
+                u8::from(is_reliable),
+                block[descriptor::RELIABLE_OFFSET],
+                "reliable={is_reliable} has to reach the metadata"
+            );
+            assert_eq!(
+                u8::from(is_sparse),
+                block[descriptor::SPARSE_OFFSET],
+                "sparse={is_sparse} has to reach the metadata"
+            );
+        }
     }
 
     /// The two metadata bytes that belong to the channel and the `SETUP`
