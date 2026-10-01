@@ -17,6 +17,7 @@
 #![deny(unsafe_code)]
 
 pub mod channel_uri;
+pub mod channel_validation;
 pub mod clients;
 pub mod conductor;
 pub mod config;
