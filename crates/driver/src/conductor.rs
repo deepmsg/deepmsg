@@ -412,6 +412,19 @@ impl ClientEvents for Transmit<'_> {
 
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
+/// Ask the sender to let an endpoint go once the last publication on it has
+/// (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks it
+/// CLOSING and asks, and the endpoint's own delete gives the counters back).
+fn try_remove_send_endpoint(
+    endpoints: &mut crate::send_endpoints::SendChannelEndpoints,
+    sender: &crate::sender::SenderProxy,
+    id: u64,
+) {
+    if endpoints.begin_release(id) {
+        let _ = sender.remove_endpoint(id);
+    }
+}
+
 /// The line the reference's conductor appends when a channel will not parse
 /// (`aeron_driver_conductor.c:4686-4687` for a publication, `:5173-5174` for a
 /// subscription), with the **empty message** its `AERON_APPEND_ERR("%s", "")`
@@ -1164,6 +1177,7 @@ impl Conductor {
         }
 
         self.send_endpoints.detach_publication(record.endpoint_id);
+        self.try_remove_send_endpoint(record.endpoint_id);
 
         true
     }
@@ -1364,6 +1378,38 @@ impl Conductor {
     /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
     /// message per **subscription** that was reading it, as the reference sends
     /// them (`:5690-5700`) — and only then is the log buffer unmapped.
+    /// Ask the sender to let an endpoint go, once the last publication on it
+    /// has (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks
+    /// it CLOSING and asks, and the endpoint's own delete is what gives the
+    /// counters back — `:250-266`).
+    fn try_remove_send_endpoint(&mut self, id: u64) {
+        try_remove_send_endpoint(&mut self.send_endpoints, self.sender.proxy(), id);
+    }
+
+    /// Give back what a send endpoint held, once the sender has let it go
+    /// (`aeron_send_channel_endpoint_delete`, `:250-266`, which is where the
+    /// counters go back in the reference — the sender owns the endpoint, the
+    /// conductor owns the region).
+    ///
+    /// The two counters the endpoint's *destinations* hold
+    /// (`local_sockaddr_indicator` and `tracker_num_destinations`) are not here
+    /// yet: they live in the sender's copy, and getting at them needs the same
+    /// thing the receive side needed — the numbers travelling back with the
+    /// confirmation.
+    fn release_send_endpoint(&mut self, id: u64) -> usize {
+        let Some(entry) = self.send_endpoints.remove(id) else {
+            return 0;
+        };
+
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, entry.channel_status_counter_id, self.now_ms);
+        }
+
+        1
+    }
+
     /// Give back everything a receive endpoint held, once the receiver has let
     /// it go (`aeron_receive_channel_endpoint_has_receiver_released`, which is
     /// what the conductor waits for — `aeron_driver_conductor.c:1560`).
@@ -1619,12 +1665,12 @@ impl Conductor {
                         );
                     }
                 }
-                crate::sender::SenderEvent::EndpointRemoved { .. }
-                | crate::sender::SenderEvent::PublicationRemoved { .. } => {
-                    // The conductor's own bookkeeping for a removal arrives
-                    // with the removal path (P1-4's last slice): an endpoint
-                    // outlives its publications only until the reference
-                    // count reaches zero, and that is the conductor's count.
+                crate::sender::SenderEvent::EndpointRemoved { id } => {
+                    work += self.release_send_endpoint(id);
+                }
+                crate::sender::SenderEvent::PublicationRemoved { .. } => {
+                    // Nothing to do: the conductor's own bookkeeping for a
+                    // publication's removal is done where the removal is made.
                 }
             }
         }
@@ -2561,6 +2607,10 @@ impl Conductor {
         // on its endpoint. The IPC half did its own release inside the drain.
         let mut released = 0usize;
 
+        // Endpoints whose last publication has just gone, to be tried after the
+        // loop: `send_endpoints` is borrowed as a whole inside it.
+        let mut to_try: Vec<u64> = Vec::new();
+
         for registration_id in pending_publication_releases {
             if let Some(record) = network_publications.remove(registration_id) {
                 let _ = sender.proxy().remove_publication(registration_id);
@@ -2589,8 +2639,13 @@ impl Conductor {
                 }
 
                 send_endpoints.detach_publication(record.endpoint_id);
+                to_try.push(record.endpoint_id);
                 released += 1;
             }
+        }
+
+        for id in to_try {
+            try_remove_send_endpoint(&mut self.send_endpoints, sender.proxy(), id);
         }
 
         // The destination commands.
@@ -5235,9 +5290,10 @@ mod tests {
             "the publication is gone from the driver"
         );
         assert_eq!(
-            counters_before + 6,
+            counters_before + 7,
             conductor.counters().free_list_len(),
-            "and its six counters came back"
+            "and its six counters came back — plus the send endpoint's, which \
+             was the last one holding that port"
         );
     }
 

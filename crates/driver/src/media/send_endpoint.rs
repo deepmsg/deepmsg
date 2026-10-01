@@ -76,6 +76,47 @@ pub struct PublicationDispatch {
     pub registration_id: i64,
 }
 
+/// The first three lines of what the reference records when a **send**
+/// endpoint cannot bind: `aeron_bind` set it, and two layers appended to it on
+/// the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:151`,
+/// `media/aeron_send_channel_endpoint.c:142`).
+///
+/// The receive side's twin is `receive_endpoint.rs::bind_report`, and the two
+/// differ in exactly the ways the probe shows: the affinity is the **sender's**
+/// (`0`, `media/aeron_udp_channel_transport_bindings.h:26-30`), the appending
+/// function is the send endpoint's, and its line writes `uri=` with no space
+/// where the receive one writes `uri = `.
+fn bind_report(
+    channel: &crate::udp_channel::UdpChannel,
+    failure: &crate::sys::socket::BindFailure,
+) -> deepmsg_cnc::error_log::ErrorReport {
+    let errno = failure.source.raw_os_error().unwrap_or(libc::EINVAL);
+
+    let mut report = deepmsg_cnc::error_log::ErrorReport::set(
+        errno,
+        "aeron_bind",
+        "aeron_socket.c",
+        93,
+        &format!("failed to bind({}, {})", failure.fd, failure.address),
+    );
+
+    report.append(
+        "aeron_udp_channel_transport_init",
+        "aeron_udp_channel_transport.c",
+        151,
+        "unicast bind, affinity=0",
+    );
+
+    report.append(
+        "aeron_send_channel_endpoint_create",
+        "aeron_send_channel_endpoint.c",
+        142,
+        &format!("uri={}", String::from_utf8_lossy(&channel.original_uri)),
+    );
+
+    report
+}
+
 /// A send channel endpoint and its socket.
 pub struct SendChannelEndpoint {
     /// The channel it was created for, canonical form included.
@@ -186,14 +227,16 @@ impl SendChannelEndpoint {
                 // The counter was allocated for an endpoint that will not
                 // exist; leaving it behind would be a counter nobody owns.
                 counters.free(regions, channel_status_counter_id, now_ms);
-                // The send path keeps the plain error: its chain is composed
-                // of different functions (`aeron_send_channel_endpoint.c`),
-                // and this build does not build it.
+                // A bind failure is the one the reference composes a chain
+                // for on this side too (`media/aeron_send_channel_endpoint.c:142`
+                // and the two layers above it); anything else keeps its error.
                 let error = match error {
-                    super::udp_transport::OpenError::Bind(failure) => failure.source,
-                    super::udp_transport::OpenError::Io(error) => error,
+                    super::udp_transport::OpenError::Bind(failure) => {
+                        SendEndpointError::Bind(Box::new(bind_report(&channel, &failure)))
+                    }
+                    super::udp_transport::OpenError::Io(error) => SendEndpointError::Socket(error),
                 };
-                return Err(SendEndpointError::Socket(error));
+                return Err(error);
             }
         };
 
@@ -603,7 +646,10 @@ impl std::fmt::Debug for SendChannelEndpoint {
 pub enum SendEndpointError {
     /// The counter manager had no room for the channel-status counter.
     NoCounter,
-    /// The socket could not be opened, bound or connected.
+    /// The socket would not bind, with the chain the reference records for a
+    /// send endpoint's `EADDRINUSE` (`bind_report`).
+    Bind(Box<deepmsg_cnc::error_log::ErrorReport>),
+    /// The socket could not be opened or connected.
     Socket(io::Error),
 }
 
@@ -611,6 +657,7 @@ impl std::fmt::Display for SendEndpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoCounter => f.write_str("could not allocate the send channel status counter"),
+            Self::Bind(report) => f.write_str(report.text()),
             Self::Socket(error) => write!(f, "{error}"),
         }
     }
@@ -953,6 +1000,18 @@ mod tests {
         assert_eq!(vec![0, 1, 3, 4], arrived);
     }
 
+    /// The file descriptor the report's second line names, read back out of it:
+    /// the descriptor is the kernel's, so a test cannot know it in advance.
+    fn report_fd(report: &deepmsg_cnc::error_log::ErrorReport) -> String {
+        report
+            .text()
+            .lines()
+            .find_map(|line| line.strip_prefix("[aeron_bind, aeron_socket.c:93] failed to bind("))
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     #[test]
     fn a_socket_that_cannot_be_made_leaves_no_counter_behind() {
         // A channel with an explicit control address binds *that* address
@@ -981,7 +1040,37 @@ mod tests {
         )
         .expect_err("the address is taken");
 
-        assert!(matches!(error, SendEndpointError::Socket(_)), "{error}");
+        // The chain the reference records for this: the errno, where it was
+        // set, the two layers that appended to it — and the sender's affinity,
+        // which is where this differs from the receive side's twin
+        // (`receive_endpoint.rs::bind_report`).
+        let SendEndpointError::Bind(report) = error else {
+            panic!("a bind failure is a bind report, not {error}");
+        };
+
+        assert!(
+            report.text().starts_with(&format!(
+                "(98) Address already in use\n[aeron_bind, aeron_socket.c:93] failed to bind({}, {bound})\n",
+                report_fd(&report),
+            )),
+            "{}",
+            report.text()
+        );
+        assert!(
+            report.text().contains(
+                "[aeron_udp_channel_transport_init, aeron_udp_channel_transport.c:151] unicast bind, affinity=0"
+            ),
+            "{}",
+            report.text()
+        );
+        assert!(
+            report.text().contains(&format!(
+                "[aeron_send_channel_endpoint_create, aeron_send_channel_endpoint.c:142] uri=aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
+            )),
+            "{}",
+            report.text()
+        );
+
         assert_eq!(
             free_before + 1,
             counters.free_list_len(),

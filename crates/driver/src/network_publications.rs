@@ -301,9 +301,33 @@ impl NetworkPublications {
                 now.ns,
                 now.ms,
             )
-            .map_err(|error| AddError::Endpoint {
-                error_code: error.error_code(),
-                message: error.to_string(),
+            .map_err(|error| {
+                let mut message = error.to_string();
+
+                // Two layers above the endpoint, and the reference appends one
+                // line for each (`aeron_driver_conductor.c:2008` where the
+                // endpoint is made, `:4433` where the publication's) — with the
+                // **empty message** its `AERON_APPEND_ERR("%s", "")` writes,
+                // which is why each ends in a space. Probed against a live
+                // reference driver for a send endpoint's `EADDRINUSE`.
+                if matches!(
+                    error,
+                    crate::send_endpoints::EndpointError::Bind(_)
+                ) {
+                    message.push_str(
+                        "[aeron_driver_conductor_get_or_add_send_channel_endpoint, \
+                         aeron_driver_conductor.c:2008] \n",
+                    );
+                    message.push_str(
+                        "[aeron_driver_conductor_execute_add_network_publication_create_publication, \
+                         aeron_driver_conductor.c:4433] \n",
+                    );
+                }
+
+                AddError::Endpoint {
+                    error_code: error.error_code(),
+                    message,
+                }
             })?;
 
         let (endpoint_id, channel_status_counter_id, new_endpoint) = match outcome {
