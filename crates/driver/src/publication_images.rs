@@ -421,6 +421,10 @@ impl PublicationImages {
             config.layout.page_size,
             pending.untethered,
             pending.group_semantics,
+            crate::loss_detector::MulticastBackoff::new(
+                config.nak_multicast_group_size,
+                config.nak_multicast_max_backoff_ns,
+            ),
             now.ns,
         );
 

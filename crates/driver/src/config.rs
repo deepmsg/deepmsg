@@ -107,6 +107,22 @@ pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 /// with `ttl=`.
 pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
 
+/// `AERON_NAK_MULTICAST_GROUP_SIZE_DEFAULT`
+/// (`aeron_driver_context.c:220`): how many receivers a group is assumed to
+/// have, which is what a NAK's backoff is drawn against.
+pub const NAK_MULTICAST_GROUP_SIZE_DEFAULT: usize = 10;
+
+/// The least a multicast backoff may be set to
+/// (`aeron_driver_context.c:949`): a microsecond.
+pub const NAK_MULTICAST_MAX_BACKOFF_NS_MIN: i64 = 1_000;
+
+/// `AERON_NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT`
+/// (`aeron_driver_context.c:221`): ten milliseconds, and **not** the sixty the
+/// dead `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` macro says
+/// (`aeron_loss_detector.h:76`). Ten is what the scale factor of this
+/// distribution is, so it is also the mean backoff.
+pub const NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT: i64 = 10 * 1000 * 1000;
+
 /// `AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT` (`aeron_driver_context.c:227`).
 pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBoolean::Infer;
 
@@ -425,6 +441,19 @@ pub struct DriverConfig {
     /// It is the *default for the parameter*, not a driver-wide switch: a
     /// subscription that names `group=true` or `group=infer` overrules it.
     pub receiver_group_consideration: InferableBoolean,
+    /// How many receivers a group is assumed to have
+    /// (`aeron.nak.multicast.group.size = 10`, `AERON_NAK_MULTICAST_GROUP_SIZE`).
+    ///
+    /// It is the `group_size` of the log-normal a multicast image's NAK delays
+    /// are drawn from: more receivers means more of them are likely to ask for
+    /// the same gap, so each waits longer to let the others be the one that
+    /// asks.
+    pub nak_multicast_group_size: usize,
+    /// The longest a multicast image waits before asking again
+    /// (`aeron.nak.multicast.max.backoff = 10ms`,
+    /// `AERON_NAK_MULTICAST_MAX_BACKOFF`). It is the *scale* of the same
+    /// distribution, and so also its mean.
+    pub nak_multicast_max_backoff_ns: i64,
     /// The window a receiver offers a publication when the channel named none
     /// (`aeron.rcv.initial.window.length`, which `aeronmd` turns into
     /// `AERON_RCV_INITIAL_WINDOW_LENGTH`,
@@ -519,6 +548,8 @@ impl Default for DriverConfig {
             socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
+            nak_multicast_group_size: NAK_MULTICAST_GROUP_SIZE_DEFAULT,
+            nak_multicast_max_backoff_ns: NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
             receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
             network_publication_max_messages_per_send:
                 NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT,
@@ -753,6 +784,29 @@ impl DriverConfig {
                 255,
             )?)
             .unwrap_or(SOCKET_MULTICAST_TTL_DEFAULT);
+        }
+        if let Some(value) = get(&Setting::NAK_MULTICAST_GROUP_SIZE) {
+            // Bounded where the reference bounds it (`:938-943`, one to
+            // `INT32_MAX`): a group of nobody is a backoff with no scale.
+            config.nak_multicast_group_size = usize::try_from(parse_bounded_size32(
+                &Setting::NAK_MULTICAST_GROUP_SIZE,
+                &value,
+                1,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?)
+            .unwrap_or(NAK_MULTICAST_GROUP_SIZE_DEFAULT);
+        }
+        if let Some(value) = get(&Setting::NAK_MULTICAST_MAX_BACKOFF) {
+            // The reference's lower bound is a microsecond (`:945-950`);
+            // above it there is none worth naming.
+            let backoff = parse_duration_ns(&Setting::NAK_MULTICAST_MAX_BACKOFF, &value)?;
+            if backoff < NAK_MULTICAST_MAX_BACKOFF_NS_MIN {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::NAK_MULTICAST_MAX_BACKOFF.property,
+                    value,
+                });
+            }
+            config.nak_multicast_max_backoff_ns = backoff;
         }
         if let Some(value) = get(&Setting::RECEIVER_GROUP_CONSIDERATION) {
             config.receiver_group_consideration =
@@ -1014,6 +1068,16 @@ impl Setting {
     const SOCKET_MULTICAST_TTL: Self = Self {
         property: "socket.multicast.ttl",
         env: "AERON_SOCKET_MULTICAST_TTL",
+    };
+    /// `aeron.nak.multicast.group.size` (`aeronmd.h:645`, read at `:938-943`).
+    const NAK_MULTICAST_GROUP_SIZE: Self = Self {
+        property: "nak.multicast.group.size",
+        env: "AERON_NAK_MULTICAST_GROUP_SIZE",
+    };
+    /// `aeron.nak.multicast.max.backoff` (`aeronmd.h:653`, read at `:945-950`).
+    const NAK_MULTICAST_MAX_BACKOFF: Self = Self {
+        property: "nak.multicast.max.backoff",
+        env: "AERON_NAK_MULTICAST_MAX_BACKOFF",
     };
     /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
     /// `:451-452` — environment only, with no property read in the reference;
@@ -1691,6 +1755,8 @@ mod tests {
                 ("AERON_SPIES_SIMULATE_CONNECTION", "true"),
                 ("AERON_SOCKET_MULTICAST_TTL", "12"),
                 ("AERON_RECEIVER_GROUP_CONSIDERATION", "true"),
+                ("AERON_NAK_MULTICAST_GROUP_SIZE", "4"),
+                ("AERON_NAK_MULTICAST_MAX_BACKOFF", "25ms"),
             ],
         )
         .expect("resolve");
@@ -1764,6 +1830,8 @@ mod tests {
             ("rcv.initial.window.length", "255"),  // below 256
             ("max.resend", "0"),                   // below one
             ("max.resend", "257"),                 // above 256
+            ("nak.multicast.max.backoff", "999"),  // below a microsecond
+            ("nak.multicast.group.size", "0"),     // below one
             ("send.to.status.poll.ratio", "0"),    // below one
             ("send.to.status.poll.ratio", "256"),  // the reference truncates this to zero
             ("rcv.status.message.timeout", "999"), // below a microsecond

@@ -347,6 +347,7 @@ impl PublicationImage {
         page_size: usize,
         untethered: SubscriptionParams,
         group_semantics: bool,
+        multicast_backoff: crate::loss_detector::MulticastBackoff,
         now_ns: i64,
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
@@ -490,10 +491,18 @@ impl PublicationImage {
             // gap is fillable the moment it is seen and `nak-delay=` on the
             // same channel is never read (`:92-95`, which returns before the
             // two branches below it).
+            //
+            // And group semantics outrank it too, which is the same reading in
+            // the other direction: a group gets the randomised generator
+            // instead of a fixed pair (`:97-100`), so `nak-delay=` on a
+            // group's channel is a parameter the reference reads and then
+            // ignores.
             loss_detector: LossDetector::for_channel(
                 registration_id,
                 untethered.is_reliable,
+                group_semantics,
                 untethered.nak_delay_ns,
+                multicast_backoff,
             ),
             is_reliable: untethered.is_reliable,
             untethered_window_limit_timeout_ns: untethered.untethered_window_limit_timeout_ns,
@@ -1715,6 +1724,10 @@ mod tests {
                 4096,
                 untethered,
                 group_semantics,
+                crate::loss_detector::MulticastBackoff::new(
+                    crate::config::NAK_MULTICAST_GROUP_SIZE_DEFAULT,
+                    crate::config::NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
+                ),
                 0,
             );
 

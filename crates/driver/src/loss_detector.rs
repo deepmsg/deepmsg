@@ -41,6 +41,138 @@ pub const NAK_UNICAST_DELAY_NS: i64 = 1_000;
 /// `aeron_driver_context.c:224`: a hundred).
 pub const NAK_UNICAST_RETRY_RATIO: i64 = 100;
 
+/// The log-normal a **multicast** image's NAK delays are drawn from
+/// (`feedback_delay_state_t.optimal_delay`,
+/// `aeron-driver/src/main/c/aeron_loss_detector.h:44-52`, built by
+/// `aeron_feedback_delay_state_init`, `aeron_loss_detector.c:91-119`).
+///
+/// Why a group needs one at all: a receiver that has lost a packet is one of
+/// several, all of which will notice the same hole, and if they all asked at
+/// once the publisher would send the same retransmission once per member.
+/// Giving each a *random* delay — drawn from a distribution whose mean is the
+/// driver's maximum backoff — spreads the asks out, and the backoff is what
+/// they wait to let somebody else be the one that asked.
+///
+/// The four constants are the reference's, in its order, and they are what the
+/// inverse-transform sample below needs: `rand_max` and `base_x` place a
+/// uniform draw on the log-normal's support, and `constant_t` and `factor_t`
+/// turn it into a time.
+#[derive(Clone, Copy, Debug)]
+pub struct MulticastBackoff {
+    /// `max_backoff_T`, kept because the state it is built into holds it:
+    /// `static_delay.delay_ns` and `static_delay.retry_ns` are both set to it
+    /// (`aeron_driver.c:960-966`).
+    max_backoff_ns: i64,
+    rand_max: f64,
+    base_x: f64,
+    constant_t: f64,
+    factor_t: f64,
+}
+
+impl MulticastBackoff {
+    /// Build one for a group of `group_size` and a maximum backoff
+    /// (`aeron_feedback_delay_state_init`, `:91-119`, which the driver calls
+    /// once with the settings it was configured with — `aeron_driver.c:960-966`).
+    ///
+    /// `lambda = log(group_size) + 1` is the reference's shape parameter, and
+    /// it is why the group size is the one input that changes the *spread*
+    /// rather than the scale: one receiver gives `lambda = 1`, ten gives
+    /// `3.30`, and a bigger group draws a wider range of delays.
+    pub fn new(group_size: usize, max_backoff_ns: i64) -> Self {
+        #[allow(clippy::cast_precision_loss)] // a group size, and a duration
+        let lambda = (group_size as f64).ln() + 1.0;
+        #[allow(clippy::cast_precision_loss)]
+        let max_backoff_t = max_backoff_ns as f64;
+
+        Self {
+            max_backoff_ns,
+            rand_max: lambda / max_backoff_t,
+            base_x: lambda / (max_backoff_t * (lambda.exp() - 1.0)),
+            constant_t: max_backoff_t / lambda,
+            factor_t: (lambda.exp() - 1.0) * (max_backoff_t / lambda),
+        }
+    }
+
+    /// The scale the driver built this with, which is also the mean.
+    pub const fn max_backoff_ns(self) -> i64 {
+        self.max_backoff_ns
+    }
+
+    /// One delay, from one uniform draw in `[0, 1)`
+    /// (`aeron_loss_detector_nak_multicast_delay_generator`, `:121-125`).
+    ///
+    /// It ignores the retry flag, which is a fact about this generator rather
+    /// than an oversight: a repeated ask draws a **fresh** delay where the
+    /// unicast one returns the same number every time
+    /// (`aeron_loss_detector.h:63-73` against `:85`).
+    pub fn delay_ns(self, sample: f64) -> i64 {
+        let x = sample * self.rand_max + self.base_x;
+
+        #[allow(clippy::cast_possible_truncation)] // a delay in nanoseconds
+        let delay = (self.constant_t * (x * self.factor_t).ln()) as i64;
+
+        delay
+    }
+}
+
+/// Uniform draws for [`MulticastBackoff`], in place of the reference's
+/// `aeron_drand48`.
+///
+/// The reference seeds drand48 **once per process** from the clock
+/// (`aeron_feedback_delay_state_init`, `:110-114`) and every image draws from
+/// that one sequence, which is what this does too — one seed, lazily taken.
+/// The numbers are not drand48's and are not meant to be: a delay is random by
+/// design, and the only thing a group's members need of it is that two of them
+/// do not draw the same one.
+mod random {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Zero until the first draw, which is when the seed is taken.
+    static STATE: AtomicU64 = AtomicU64::new(0);
+
+    /// SplitMix64's increment.
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// A uniform draw in `[0, 1)`, as `aeron_drand48` answers.
+    ///
+    /// One `compare_exchange` per draw, and none of them takes a lock: two
+    /// images asking at once get two different numbers, which is the whole
+    /// requirement.
+    pub fn unit() -> f64 {
+        let mut state = STATE.load(Ordering::Relaxed);
+
+        loop {
+            // Zero is "not seeded yet", so the first draw replaces it with the
+            // clock rather than stepping from it — one seed, as the reference
+            // takes one (`aeron_feedback_delay_state_init`, `:110-114`).
+            let next = if state == 0 {
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |since| since.as_nanos() as u64);
+
+                seed | 1
+            } else {
+                state.wrapping_add(GOLDEN)
+            };
+
+            match STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    let mut z = next;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+
+                    // The top 53 bits are a double's mantissa, so this lands in
+                    // `[0, 1)` without a rounding step.
+                    #[allow(clippy::cast_precision_loss)]
+                    return ((z >> 11) as f64) * (1.0 / 9_007_199_254_740_992.0);
+                }
+
+                Err(current) => state = current,
+            }
+        }
+    }
+}
+
 /// A hole: where it starts, and how long it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gap {
@@ -79,6 +211,14 @@ pub struct LossDetector {
     delay_ns: i64,
     /// How long a repeated NAK waits.
     retry_ns: i64,
+    /// The random generator a **multicast** image draws both of those from
+    /// instead, or [`None`] for the fixed pair above.
+    ///
+    /// One struct holds both in the reference too
+    /// (`feedback_delay_state_t`, `aeron_loss_detector.h:44-56`): the state
+    /// carries a `static_delay` and an `optimal_delay`, and the generator it
+    /// was initialised with decides which of them is read.
+    multicast: Option<MulticastBackoff>,
 }
 
 /// No timer is running (`AERON_LOSS_DETECTOR_TIMER_INACTIVE`).
@@ -94,6 +234,7 @@ impl LossDetector {
             registration_id,
             delay_ns: NAK_UNICAST_DELAY_NS,
             retry_ns: NAK_UNICAST_DELAY_NS * NAK_UNICAST_RETRY_RATIO,
+            multicast: None,
         }
     }
 
@@ -116,9 +257,29 @@ impl LossDetector {
     /// semantics). Zero is not a detail — it is what makes an unreliable image
     /// fill its holes at once instead of waiting out a NAK that will never be
     /// sent (see [`crate::publication_image::PublicationImage::fill_gap`]).
-    pub fn for_channel(registration_id: i64, is_reliable: bool, nak_delay_ns: Option<i64>) -> Self {
+    pub fn for_channel(
+        registration_id: i64,
+        is_reliable: bool,
+        treat_as_multicast: bool,
+        nak_delay_ns: Option<i64>,
+        multicast_backoff: MulticastBackoff,
+    ) -> Self {
         if !is_reliable {
             return Self::with_delays(registration_id, 0, 0);
+        }
+
+        // The group's generator comes **before** `nak-delay=`, which is what
+        // makes a `nak-delay` on a group's channel a parameter the reference
+        // reads and then does nothing with (`:97-100` returns in the arm
+        // above the `nak-delay` lookup). Both delays are the driver's maximum
+        // backoff there, and both are only ever read through the generator.
+        if treat_as_multicast {
+            return Self::with_multicast_backoff(
+                registration_id,
+                multicast_backoff,
+                multicast_backoff.max_backoff_ns(),
+                multicast_backoff.max_backoff_ns(),
+            );
         }
 
         match nak_delay_ns {
@@ -142,6 +303,42 @@ impl LossDetector {
             registration_id,
             delay_ns,
             retry_ns,
+            multicast: None,
+        }
+    }
+
+    /// The same, drawing from a multicast group's generator
+    /// (`aeron_publication_image_acquire_delay_generator_state`,
+    /// `:97-100`, which returns the context's multicast state before it looks
+    /// at `nak-delay=` — a `nak-delay` on a group's channel is read and then
+    /// **ignored**).
+    #[must_use]
+    pub const fn with_multicast_backoff(
+        registration_id: i64,
+        backoff: MulticastBackoff,
+        delay_ns: i64,
+        retry_ns: i64,
+    ) -> Self {
+        Self {
+            scanned: None,
+            active: None,
+            expiry_ns: TIMER_INACTIVE,
+            registration_id,
+            delay_ns,
+            retry_ns,
+            multicast: Some(backoff),
+        }
+    }
+
+    /// How long until the next ask — the reference's `delay_generator(state,
+    /// retry)`, which is a fixed lookup for a unicast image
+    /// (`aeron_loss_detector.h:63-73`) and a **fresh draw** for a multicast
+    /// one (`:85`, `:121-125`).
+    fn next_delay_ns(&self, retry: bool) -> i64 {
+        match self.multicast {
+            Some(backoff) => backoff.delay_ns(random::unit()),
+            None if retry => self.retry_ns,
+            None => self.delay_ns,
         }
     }
 
@@ -220,7 +417,7 @@ impl LossDetector {
 
         if self.scanned != self.active {
             self.active = self.scanned;
-            self.expiry_ns = now_ns + self.delay_ns;
+            self.expiry_ns = now_ns + self.next_delay_ns(false);
             loss_found = true;
         }
 
@@ -228,7 +425,7 @@ impl LossDetector {
 
         if now_ns >= self.expiry_ns {
             nak = self.active;
-            self.expiry_ns = now_ns + self.retry_ns;
+            self.expiry_ns = now_ns + self.next_delay_ns(true);
         }
 
         ScanResult {
@@ -338,6 +535,7 @@ pub fn is_data_frame(packet: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    use crate::config::{NAK_MULTICAST_GROUP_SIZE_DEFAULT, NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT};
     use deepmsg_core::buffer::ReadWrite;
     use deepmsg_core::logbuffer::frame::{FLAG_UNFRAGMENTED, Frame, TYPE_DATA};
 
@@ -549,6 +747,118 @@ mod tests {
         assert!(!again.loss_found, "and it is still the same hole");
     }
 
+    /// The driver's generator, built the way `create_image` builds it.
+    fn backoff() -> MulticastBackoff {
+        MulticastBackoff::new(
+            NAK_MULTICAST_GROUP_SIZE_DEFAULT,
+            NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
+        )
+    }
+
+    #[test]
+    fn a_groups_delays_are_drawn_and_not_fixed() {
+        // The range is the log-normal's support: `constant_t * log(x *
+        // factor_t)` over `x` in `[base_x, base_x + rand_max]`, which is
+        // `[0, 1] * lambda` scaled — that is, the draws land inside the
+        // driver's maximum backoff, and near it on average.
+        let backoff = backoff();
+        let max = backoff.max_backoff_ns();
+
+        let draws: Vec<i64> = (0..512).map(|_| backoff.delay_ns(random::unit())).collect();
+
+        assert!(
+            draws.iter().all(|delay| *delay >= 0 && *delay <= max),
+            "every draw is inside [0, {max}]"
+        );
+        assert!(
+            draws.iter().any(|delay| *delay != draws[0]),
+            "and they are not one number repeated"
+        );
+
+        // The endpoints, to pin the transform rather than its sample: the
+        // smallest `x` gives zero and the largest gives the scale.
+        assert_eq!(0, backoff.delay_ns(0.0));
+        assert_eq!(max, backoff.delay_ns(1.0));
+    }
+
+    #[test]
+    fn a_groups_two_delays_are_two_draws() {
+        // A retry draws afresh rather than reusing the first delay, which is
+        // the difference between this generator and the unicast one
+        // (`aeron_loss_detector.h:63-73` against `:85`). One draw is used
+        // twice here only because the state is a field: the same detector at
+        // two expiries re-draws on each.
+        let mut term = Term::new();
+        let first = write(&mut term, 0, &[1u8; 100]);
+        let third = write(&mut term, first + 128, &[3u8; 100]);
+        let hwm = (first + 128 + third) as i64;
+
+        // A static pair far from the draws, so that arming with it would be
+        // visible: the generator's scale is ten milliseconds and this is a
+        // millisecond.
+        let mut detector = LossDetector::with_multicast_backoff(7, backoff(), 1_000, 1_000);
+
+        let result = detector.scan(
+            &term.readable(),
+            0,
+            hwm,
+            TERM_LENGTH,
+            BITS,
+            INITIAL_TERM_ID,
+            1_000,
+        );
+        assert!(result.loss_found, "the hole is activated");
+
+        let armed = detector.expiry_ns;
+        assert!(
+            armed > 1_000 + 1_000 && armed <= 1_000 + backoff().max_backoff_ns(),
+            "armed by a draw rather than by the static pair: {armed}"
+        );
+
+        // And the ask re-draws rather than reusing the first delay, which is
+        // what makes the expiry move by a *different* amount each time.
+        let result = detector.scan(
+            &term.readable(),
+            0,
+            hwm,
+            TERM_LENGTH,
+            BITS,
+            INITIAL_TERM_ID,
+            armed,
+        );
+        assert!(
+            result.nak.is_some(),
+            "the ask goes out when the draw passes"
+        );
+        assert_ne!(
+            armed - 1_000,
+            detector.expiry_ns - armed,
+            "the retry is a draw of its own"
+        );
+    }
+
+    #[test]
+    fn the_draws_of_two_groups_are_not_the_same_number() {
+        // What the generator is for: two members of a group noticing one hole
+        // must not ask at the same instant. The draws are compared as a set
+        // because the pair a process makes is a sequence, not a repeat.
+        let backoff = backoff();
+        let draws: Vec<i64> = (0..64).map(|_| backoff.delay_ns(random::unit())).collect();
+
+        let distinct: std::collections::HashSet<i64> = draws.iter().copied().collect();
+        assert!(
+            distinct.len() > 8,
+            "{} distinct delays out of 64",
+            distinct.len()
+        );
+
+        let units: Vec<f64> = (0..64).map(|_| random::unit()).collect();
+        assert!(units.iter().all(|unit| *unit >= 0.0 && *unit < 1.0));
+        let distinct: std::collections::HashSet<u64> =
+            units.iter().map(|unit| unit.to_bits()).collect();
+        assert_eq!(64, distinct.len(), "and the source never repeats itself");
+    }
+
     #[test]
     fn a_detector_can_be_given_the_channels_own_delays() {
         let detector = LossDetector::with_delays(7, 5_000, 50_000);
@@ -562,7 +872,7 @@ mod tests {
         // The parameter's whole effect, and the argument order that is easy to
         // get backwards: the *first* delay is what the channel named, and the
         // retry is that times the driver's ratio.
-        let named = LossDetector::for_channel(7, true, Some(5_000));
+        let named = LossDetector::for_channel(7, true, false, Some(5_000), backoff());
 
         assert_eq!(5_000, named.delay_ns, "the delay the channel named");
         assert_eq!(
@@ -572,7 +882,7 @@ mod tests {
         );
 
         // A channel that named nothing keeps the driver's own.
-        let default = LossDetector::for_channel(7, true, None);
+        let default = LossDetector::for_channel(7, true, false, None, backoff());
         assert_eq!(NAK_UNICAST_DELAY_NS, default.delay_ns);
         assert_eq!(
             NAK_UNICAST_DELAY_NS * NAK_UNICAST_RETRY_RATIO,
@@ -581,7 +891,7 @@ mod tests {
 
         // And a delay big enough to overflow the multiplication saturates
         // instead: a retry *before* the first ask is not a thing.
-        let absurd = LossDetector::for_channel(7, true, Some(i64::MAX));
+        let absurd = LossDetector::for_channel(7, true, false, Some(i64::MAX), backoff());
         assert_eq!(i64::MAX, absurd.delay_ns);
         assert_eq!(i64::MAX, absurd.retry_ns);
     }
@@ -593,14 +903,14 @@ mod tests {
         // zero generator *before* it reads `nak-delay=`
         // (`aeron_publication_image.c:92-95`), so a channel that names both
         // gets zero — the parameter it typed is not read at all.
-        let unreliable = LossDetector::for_channel(7, false, Some(5_000));
+        let unreliable = LossDetector::for_channel(7, false, false, Some(5_000), backoff());
 
         assert_eq!(0, unreliable.delay_ns);
         assert_eq!(0, unreliable.retry_ns, "and no backoff before the next try");
 
         // The contrast, so that the test above cannot pass by the delays being
         // zero for every channel.
-        let reliable = LossDetector::for_channel(7, true, Some(5_000));
+        let reliable = LossDetector::for_channel(7, true, false, Some(5_000), backoff());
         assert_eq!(5_000, reliable.delay_ns);
     }
 }
