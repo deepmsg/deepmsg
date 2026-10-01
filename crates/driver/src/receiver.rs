@@ -554,10 +554,10 @@ fn stopped() -> io::Error {
 /// (`aeron_driver_receiver_pending_setup_entry_t`,
 /// `aeron-driver/src/main/c/aeron_driver_receiver.h:60-70`).
 #[derive(Clone, Copy, Debug)]
-struct PendingSetup {
-    endpoint_id: u64,
-    stream_id: i32,
-    session_id: i32,
+pub(crate) struct PendingSetup {
+    pub(crate) endpoint_id: u64,
+    pub(crate) stream_id: i32,
+    pub(crate) session_id: i32,
     /// Where the eliciting status message goes, or [`None`] when it goes to
     /// wherever the packets came from.
     ///
@@ -567,9 +567,9 @@ struct PendingSetup {
     /// entry is asked again every [`PENDING_SETUP_TIMEOUT_NS`]; one that is not
     /// periodic is **given up on** after that long, and the session's interest
     /// is dropped so that the next frame from it asks again.
-    control_address: Option<std::net::SocketAddr>,
+    pub(crate) control_address: Option<std::net::SocketAddr>,
     /// When it was last sent.
-    time_of_status_message_ns: i64,
+    pub(crate) time_of_status_message_ns: i64,
 }
 
 /// What the thread owns.
@@ -630,6 +630,27 @@ impl ReceiverThread {
             for command in commands.try_iter() {
                 match command {
                     ReceiverCommand::AddEndpoint { id, endpoint } => {
+                        // An endpoint whose channel named a `control=` asks
+                        // **first**, and asks as soon as it exists
+                        // (`aeron_driver_receiver_on_add_endpoint`,
+                        // `aeron-driver/src/main/c/aeron_driver_receiver.c:305-320`,
+                        // whose `add_pending_setup` is the endpoint's half of
+                        // what the destination path below does for a client's).
+                        //
+                        // It is the whole of who speaks on a dynamic channel:
+                        // the sender has nowhere to send until it is asked, so
+                        // a subscription whose own channel named the control
+                        // address that stayed silent would be a session neither
+                        // side could start.
+                        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+                        let mut endpoint = endpoint;
+
+                        for index in 0..endpoint.destination_count() {
+                            if let Some(setup) = endpoint.ask_for_setup(id, index, now_ns) {
+                                self.pending_setups.push(setup);
+                            }
+                        }
+
                         self.endpoints.push((id, endpoint));
                     }
                     ReceiverCommand::AddDestination {
@@ -641,20 +662,7 @@ impl ReceiverThread {
                         // ask, and has to keep asking until it is answered
                         // (`aeron_driver_receiver.c:475-486`, which adds a
                         // periodic pending setup for exactly these).
-                        //
-                        // Session and stream are zero, as they are there: the
-                        // ask is not about a stream yet. What it is for is the
-                        // answer — a `SETUP` describing whatever the far end
-                        // publishes — and that is what brings the stream into
-                        // being.
                         let now_ns = deepmsg_core::clock::monotonic_nano_time();
-                        let setup = destination.setup_address().map(|address| PendingSetup {
-                            endpoint_id,
-                            stream_id: 0,
-                            session_id: 0,
-                            control_address: Some(address),
-                            time_of_status_message_ns: now_ns,
-                        });
                         let setup_address = destination.setup_address();
 
                         if let Some((_, endpoint)) =
@@ -662,33 +670,11 @@ impl ReceiverThread {
                         {
                             endpoint.add_destination(*destination);
 
-                            // The periodic entry asks a second from now and keeps
-                            // asking; this is the *first* ask, so that a source
-                            // with nothing to wait for hears it at once
-                            // (`aeron_receive_channel_endpoint.c:1145-1147`,
-                            // which sends one beside adding the entry).
-                            //
-                            // It goes to the same address the entry does: for a
-                            // channel that is not multicast and did name a
-                            // control, `current_control_addr` and `local_control`
-                            // are the same value (`media/aeron_receive_destination.c:117-124`).
-                            if let Some(address) = setup_address {
-                                let index = endpoint.destination_count() - 1;
-                                let _ = endpoint.send_sm_from(
-                                    index,
-                                    address,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    ReceiveChannelEndpoint::send_setup_flag(),
-                                );
+                            let index = endpoint.destination_count() - 1;
+                            if let Some(setup) = endpoint.ask_for_setup(endpoint_id, index, now_ns)
+                            {
+                                self.pending_setups.push(setup);
                             }
-                        }
-
-                        if let Some(setup) = setup {
-                            self.pending_setups.push(setup);
                         }
 
                         // And every image already running on that endpoint hears

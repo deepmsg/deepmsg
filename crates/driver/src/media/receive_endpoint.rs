@@ -822,6 +822,45 @@ impl ReceiveChannelEndpoint {
         &self.destinations
     }
 
+    /// Ask a destination's source for a `SETUP`, and give back the periodic
+    /// entry that keeps asking until it answers
+    /// (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
+    /// `media/aeron_receive_channel_endpoint.c:1127-1152`).
+    ///
+    /// Two halves in one call, and both matter: the entry makes the ask
+    /// **periodic**, and the status message sent beside it is the *first* ask —
+    /// a source with nothing else to wait for hears it at once rather than a
+    /// second later. Session and stream are zero, as they are there: the ask is
+    /// not about a stream yet, and what it is for is the answer, a `SETUP`
+    /// describing whatever the far end publishes.
+    ///
+    /// [`None`] for a destination whose channel named no `control=`: the sender
+    /// already knows about it, and there is nothing to ask
+    /// (`:1136`, the same condition).
+    pub(crate) fn ask_for_setup(
+        &mut self,
+        endpoint_id: u64,
+        index: usize,
+        now_ns: i64,
+    ) -> Option<crate::receiver::PendingSetup> {
+        let address = self.destinations().get(index)?.setup_address()?;
+
+        let setup = crate::receiver::PendingSetup {
+            endpoint_id,
+            stream_id: 0,
+            session_id: 0,
+            control_address: Some(address),
+            time_of_status_message_ns: now_ns,
+        };
+
+        // The channel that is not multicast and did name a control sends to
+        // `local_control`, which is where the entry above will send too
+        // (`media/aeron_receive_destination.c:117-124`).
+        let _ = self.send_sm_from(index, address, 0, 0, 0, 0, 0, Self::send_setup_flag());
+
+        Some(setup)
+    }
+
     /// How many places this endpoint reads from.
     ///
     /// A unicast channel has one; a multi-destination channel has as many as
@@ -1569,6 +1608,69 @@ mod tests {
         .expect("an endpoint");
 
         (endpoint, sent)
+    }
+
+    /// A channel that named a `control=` is one the sender does not know
+    /// about, so the endpoint asks — once now, and then once a second until it
+    /// is answered (`aeron_driver_receiver.c:305-320`, which asks when the
+    /// endpoint arrives, and `media/aeron_receive_channel_endpoint.c:1127-1152`,
+    /// which is the two halves this is).
+    ///
+    /// It is the whole of who speaks on a dynamic channel: without it a
+    /// subscription whose own channel named the control address says nothing,
+    /// and the sender — which has nowhere to send until it is asked — says
+    /// nothing either.
+    #[test]
+    fn a_channel_that_named_a_control_address_asks_for_a_setup_at_once() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let sent = Sent::default();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40124|control=127.0.0.1:40125"),
+            None,
+            Box::new(sent.clone()),
+            1234,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+        )
+        .expect("an endpoint");
+
+        let setup = endpoint
+            .ask_for_setup(9, 0, 5_000)
+            .expect("a channel with a control address has something to ask");
+
+        assert_eq!(9, setup.endpoint_id);
+        assert_eq!(
+            Some("127.0.0.1:40125".parse().expect("an address")),
+            setup.control_address,
+            "the ask goes to the control address, and so does the entry that keeps asking"
+        );
+        assert_eq!(0, setup.stream_id, "the ask is not about a stream yet");
+        assert_eq!(0, setup.session_id);
+
+        let frame = sent.last();
+        let header = crate::protocol::FrameHeader::read(&frame).expect("a header");
+        assert_eq!(
+            header_flags::SM_SEND_SETUP,
+            header.flags & header_flags::SM_SEND_SETUP,
+            "and the first ask is sent beside the entry, not a second later"
+        );
+    }
+
+    /// A channel that named no `control=` is one the sender already knows
+    /// about: there is nothing to ask, and nothing is sent.
+    #[test]
+    fn a_channel_with_no_control_address_asks_for_nothing() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
+
+        assert!(endpoint.ask_for_setup(9, 0, 5_000).is_none());
+        assert!(sent.frames().is_empty(), "and nothing went out");
     }
 
     /// The eight optional bytes a group tag travels in
