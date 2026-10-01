@@ -679,13 +679,17 @@ impl<'a> Appender<'a> {
     /// Claim `length` **payload** bytes at the caller's offset, without a
     /// fetch-and-add (`aeron_claim`, `aeron_exclusive_publication.c:323-355`).
     ///
-    /// The answer is **where** the claim is, not a window onto it: the caller
-    /// builds a [`Frame`] over the term at that offset, writes into it, and
-    /// commits with [`Frame::publish`]. That is the reference's split too —
-    /// `aeron_claim` fills a `buffer_claim` with a pointer and a length
-    /// (`:347-350`) and `aeron_header_write` stores the length **negated**
-    /// (`:41`), so a reader stepping the term meets a frame it may not read yet
-    /// and the positive length is what publishes it.
+    /// The answer is **where the claim ends**, not a window onto it: the caller
+    /// knows the offset it asked at, builds a [`Frame`] over the term there,
+    /// writes into it, and commits with [`Frame::publish`]. That is the
+    /// reference's split exactly — `aeron_claim` returns `resulting_offset` and
+    /// fills its caller's `buffer_claim` with pointers into the same term
+    /// (`:347-354`), and `aeron_header_write` stores the length **negated**
+    /// (`:41`) so a reader stepping the term meets a frame it may not read yet.
+    ///
+    /// The end is what a caller needs to **move**: an exclusive producer keeps
+    /// its own offset, and this is the only thing that tells it where the log
+    /// now is (`aeron_exclusive_publication_new_position`, `….h:99-108`).
     ///
     /// # Errors
     ///
@@ -701,7 +705,7 @@ impl<'a> Appender<'a> {
         term_id: i32,
         term_offset: i32,
         length: usize,
-    ) -> Result<usize, Appended> {
+    ) -> Result<Position, Appended> {
         if !self.term_is_current(term_id) {
             return Err(Appended::MidRotation);
         }
@@ -767,7 +771,12 @@ impl<'a> Appender<'a> {
             return Err(Appended::Malformed);
         }
 
-        Ok(term_offset as usize)
+        Ok(Position::new(
+            term_id,
+            resulting_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        ))
     }
 
     /// Append a padding frame of `length` **payload** bytes at the caller's
@@ -1409,20 +1418,27 @@ mod tests {
         initialised(&mut log);
 
         let payload = b"written into a claim";
+        let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+        let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
 
-        let offset = {
+        let end = {
             let appender = log.appender();
             appender
                 .try_claim_exclusive(11, 22, i64::MAX, initial_term_id(), 0, payload.len())
                 .expect("a claim")
         };
-        assert_eq!(0, offset, "the claim is where the caller's offset said");
 
-        let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+        // The claim answers with where the frame **ends**, because that is what
+        // its caller has to move to; where it starts is what the caller asked.
+        assert_eq!(
+            aligned,
+            end.term_offset(position::bits_to_shift(TERM_LENGTH).expect("a term")),
+            "the claim answers with the end of the frame"
+        );
 
         {
             let view = AtomicBuffer::from_slice_mut(&mut log.term.0).expect("aligned");
-            let claim = frame::Frame::new(&view, offset);
+            let claim = frame::Frame::new(&view, 0);
 
             assert_eq!(
                 Some(-frame_length),

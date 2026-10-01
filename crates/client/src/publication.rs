@@ -306,8 +306,10 @@ impl ExclusivePublication {
             payload,
         );
 
-        if outcome == Appended::EndOfLog {
-            self.seed_from_log();
+        match outcome {
+            Appended::EndOfLog => self.seed_from_log(),
+            Appended::Ok { position, .. } => self.advance_to(position),
+            _ => {}
         }
 
         outcome
@@ -323,7 +325,11 @@ impl ExclusivePublication {
     /// See [`Appended`]. `EndOfLog` moves this publication's position, as it
     /// does for [`Self::offer`].
     pub fn try_claim(&self, position_limit: i64, length: usize) -> Result<Claim<'_>, Appended> {
-        let offset = {
+        // The frame starts where this publication says it does; the claim
+        // answers with where it **ends**, which is what moves the cache.
+        let offset = usize::try_from(self.term_offset.get()).unwrap_or(0);
+
+        {
             let Some(appender) = self.appender() else {
                 return Err(Appended::Malformed);
             };
@@ -336,7 +342,7 @@ impl ExclusivePublication {
                 self.term_offset.get(),
                 length,
             ) {
-                Ok(offset) => offset,
+                Ok(position) => self.advance_to(position),
                 Err(error) => {
                     if error == Appended::EndOfLog {
                         self.seed_from_log();
@@ -345,7 +351,7 @@ impl ExclusivePublication {
                     return Err(error);
                 }
             }
-        };
+        }
 
         // A **second** view of the same term, because the frame outlives the
         // call and the appender's view does not. The reference has two here as
@@ -393,8 +399,10 @@ impl ExclusivePublication {
             length,
         );
 
-        if outcome == Appended::EndOfLog {
-            self.seed_from_log();
+        match outcome {
+            Appended::EndOfLog => self.seed_from_log(),
+            Appended::Ok { position, .. } => self.advance_to(position),
+            _ => {}
         }
 
         outcome
@@ -421,11 +429,38 @@ impl ExclusivePublication {
             block,
         );
 
-        if outcome == Appended::EndOfLog {
-            self.seed_from_log();
+        match outcome {
+            Appended::EndOfLog => self.seed_from_log(),
+            Appended::Ok { position, .. } => self.advance_to(position),
+            _ => {}
         }
 
         outcome
+    }
+
+    /// Move the cached pair to where an append left the log
+    /// (`aeron_exclusive_publication_new_position`,
+    /// `aeron_exclusive_publication.h:99-108`: `term_offset = resulting_offset`
+    /// and the position follows from it).
+    ///
+    /// The **end** position, not the frame's: what the next append needs is
+    /// where this one stopped. A publication that kept the frame's offset would
+    /// write every message over the first — which is not a subtle failure, it
+    /// is a stream of one message that looks like it is being sent N times.
+    fn advance_to(&self, position: deepmsg_core::logbuffer::position::Position) {
+        let Some(term_length) = self.appender().map(|appender| appender.term_length()) else {
+            return;
+        };
+        let Some(bits) = position::bits_to_shift(term_length) else {
+            return;
+        };
+        let Some(initial_term_id) = self.appender().map(|appender| appender.initial_term_id())
+        else {
+            return;
+        };
+
+        self.term_id.set(position.term_id(bits, initial_term_id));
+        self.term_offset.set(position.term_offset(bits));
     }
 
     /// Re-read the cached pair from the log's current tail
