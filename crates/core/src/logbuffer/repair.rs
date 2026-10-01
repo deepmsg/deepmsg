@@ -127,12 +127,24 @@ pub fn scan_for_gap(
     end_of_valid
 }
 
-/// Cover a range with a padding frame.
+/// Cover a range with a padding frame, if it is still empty.
 ///
 /// Used to fill a hole the retransmit never filled, so that readers can move
 /// past it. The header is built from the metadata's default-header template —
 /// which is what gives the padding frame a session, stream and term id — and
 /// only the placement and the length are written here.
+///
+/// **A gap is only a gap while nothing else has landed in it.** The reference
+/// checks exactly that first — every frame-aligned slot from the end of the
+/// range back to its start must still read zero
+/// (`concurrent/aeron_term_gap_filler.c:26-35`) — and writes nothing when one
+/// does not. What it is avoiding is the one outcome worse than a hole: a
+/// retransmission that arrived between the scan that found the gap and this
+/// call would be overwritten by padding, and the reader would be walked past
+/// data it never saw, with nothing raised and no counter moved.
+///
+/// `None` therefore means either "something is in the way" or "the template is
+/// not a frame header" — the same conflated `false` the reference returns.
 pub fn fill_gap(
     term: &AtomicBuffer<'_, ReadWrite>,
     metadata: &AtomicBuffer<'_, ReadOnly>,
@@ -140,7 +152,26 @@ pub fn fill_gap(
     length: usize,
     term_id: i32,
 ) -> Option<()> {
-    reset_as_padding(term, metadata, offset, length as i32, term_id)
+    let length = i32::try_from(length).ok()?;
+    let offset = i32::try_from(offset).ok()?;
+    let alignment = descriptor::FRAME_ALIGNMENT;
+
+    let mut slot = offset + length - alignment;
+    while slot >= offset {
+        if Frame::new(term, usize::try_from(slot).ok()?).frame_length()? != 0 {
+            return None;
+        }
+
+        slot -= alignment;
+    }
+
+    reset_as_padding(
+        term,
+        metadata,
+        usize::try_from(offset).ok()?,
+        length,
+        term_id,
+    )
 }
 
 /// Turn a stalled claim into padding.
@@ -411,6 +442,40 @@ mod tests {
             frame.term_offset(),
             "but the placement is corrected to where the frame actually is"
         );
+    }
+
+    #[test]
+    fn a_gap_something_has_landed_in_is_left_alone() {
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+
+        // A retransmission that arrived after the gap was scanned: a real frame
+        // in the middle of what the caller still believes is empty.
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            let frame = Frame::new(&writer, 192);
+            let length = 32 + DATA_HEADER_LENGTH as i32;
+            frame
+                .begin(length, FLAG_UNFRAGMENTED, TYPE_DATA, 0, 5, 6, 7)
+                .expect("in range");
+            frame.write_payload(&[9u8; 32]).expect("in range");
+            frame.publish(length).expect("in range");
+        }
+
+        let metadata = AtomicBuffer::from_slice(&metadata_bytes.0).expect("aligned");
+        let term_buffer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+
+        assert_eq!(
+            None,
+            fill_gap(&term_buffer, &metadata, 128, 256, 33),
+            "covering a frame that has already arrived would throw the frame \
+             away, and a reader moved past it never saw it"
+        );
+
+        // And it is intact rather than half-overwritten.
+        let frame = Frame::new(&term_buffer, 192);
+        assert_eq!(Some(32 + DATA_HEADER_LENGTH as i32), frame.frame_length());
+        assert!(!frame.is_padding());
     }
 
     #[test]
