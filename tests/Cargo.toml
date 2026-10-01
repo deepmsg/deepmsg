@@ -65,6 +65,12 @@ path = "integration/udp_term_boundary.rs"
 name = "spy_subscription"
 path = "integration/spy_subscription.rs"
 
+# A publication with one producer, from our client to our driver over IPC.
+# Runs in CI: it needs our own driver, not the reference's.
+[[test]]
+name = "exclusive_publication"
+path = "integration/exclusive_publication.rs"
+
 # A `reliable=false` subscription on a lossy stream: it fills its holes instead
 # of asking for them, so the messages lost on the wire are lost. Runs in CI: the
 # loss comes from this driver's own seam, not from the reference's.
