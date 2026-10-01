@@ -222,8 +222,15 @@ impl ReceiveChannelEndpoints {
         let receiver_id = self.next_receiver_id;
         self.next_receiver_id += 1;
 
+        // `:105` reads the group tag before anything else is built, and takes
+        // the channel's own `gtag=` when it named one: a channel that names
+        // none is not a channel that named `-1`
+        // (`aeron_receive_channel_endpoint_set_group_tag`, `:39-46`).
+        let group_tag = channel.group_tag.or(config.receiver_group_tag);
+
         let endpoint = ReceiveChannelEndpoint::create(
             channel,
+            group_tag,
             params,
             receiver_id,
             config.stream_session_limit,

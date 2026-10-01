@@ -42,6 +42,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::protocol::{
     ErrorFrame, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame,
+    header_flags,
 };
 use crate::udp_channel::{ControlMode, UdpChannel};
 use crate::{position as counter_position, system_counters};
@@ -361,6 +362,14 @@ pub struct ReceiveChannelEndpoint {
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
+    /// The group tag this endpoint stamps into what it sends (`group_tag`):
+    /// the channel's own `gtag=` when it named one, the driver's setting
+    /// otherwise (`aeron_receive_channel_endpoint_set_group_tag`, `:32-53`).
+    ///
+    /// [`None`] is the difference the reference keeps between "no tag" and a
+    /// tag of `-1`: the first sends a 36-byte status message and leaves the
+    /// error frame's flag clear, the second sends 44 and sets it.
+    group_tag: Option<i64>,
 }
 
 /// Write the address the endpoint is bound to into its channel-status label
@@ -446,6 +455,7 @@ impl ReceiveChannelEndpoint {
     #[allow(clippy::too_many_arguments)] // one per field the create needs
     pub fn create(
         channel: UdpChannel,
+        group_tag: Option<i64>,
         params: &TransportParams,
         receiver_id: i64,
         stream_session_limit: usize,
@@ -526,6 +536,7 @@ impl ReceiveChannelEndpoint {
             session_refcounts: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
+            group_tag,
         })
     }
 
@@ -538,6 +549,7 @@ impl ReceiveChannelEndpoint {
     #[allow(clippy::too_many_arguments)]
     pub fn with_transport(
         channel: UdpChannel,
+        group_tag: Option<i64>,
         transport: Box<dyn Transport>,
         receiver_id: i64,
         stream_session_limit: usize,
@@ -607,6 +619,7 @@ impl ReceiveChannelEndpoint {
             session_refcounts: Vec::new(),
             socket_rcvbuf: 0,
             socket_sndbuf: 0,
+            group_tag,
         })
     }
 
@@ -913,13 +926,29 @@ impl ReceiveChannelEndpoint {
             receiver_id: self.receiver_id,
         };
 
-        let mut buffer = [0u8; StatusMessageFrame::LENGTH];
-        if frame.write_with_flags(&mut buffer, flags).is_none() {
+        // `:302-325`: a tag makes the frame eight bytes longer, and that length
+        // is the whole of what tells the sender there is one — there is no
+        // flag for it.
+        let mut buffer =
+            [0u8; StatusMessageFrame::LENGTH + StatusMessageFrame::OPTIONAL_GROUP_TAG_LENGTH];
+
+        let length = match self.group_tag {
+            Some(group_tag) => frame
+                .write_with_group_tag(&mut buffer, flags, group_tag)
+                .map(|()| buffer.len()),
+            None => frame
+                .write_with_flags(&mut buffer, flags)
+                .map(|()| StatusMessageFrame::LENGTH),
+        };
+
+        let Some(length) = length else {
             return Ok(0);
-        }
+        };
 
         match self.destinations.get_mut(index) {
-            Some(entry) => entry.transport.send(Some(destination), &[&buffer]),
+            Some(entry) => entry
+                .transport
+                .send(Some(destination), &[&buffer[..length]]),
             None => Ok(0),
         }
     }
@@ -1076,16 +1105,24 @@ impl ReceiveChannelEndpoint {
             stream_id,
             receiver_id: self.receiver_id,
             // Written even when the flag says to ignore it, which is what the
-            // reference does (`:488-489`). The flag is never set here: a group
-            // tag belongs to a multicast channel, and this build's endpoints do
-            // not carry one yet.
-            group_tag: 0,
+            // reference does (`:488-489`).
+            group_tag: self.group_tag.unwrap_or(0),
             error_code,
             error_length,
         };
 
+        // `:483`: the flag is what makes the field mean anything, and an
+        // endpoint with no tag leaves it clear.
+        let flags = match self.group_tag {
+            Some(_) => header_flags::ERR_HAS_GROUP_TAG,
+            None => 0,
+        };
+
         let mut buffer = [0u8; ErrorFrame::LENGTH + MAX_ERROR_TEXT_LENGTH as usize];
-        if frame.write(&mut buffer[..ErrorFrame::LENGTH]).is_none() {
+        if frame
+            .write_with_flags(&mut buffer[..ErrorFrame::LENGTH], flags)
+            .is_none()
+        {
             return Ok(0);
         }
 
@@ -1454,6 +1491,7 @@ mod tests {
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            None,
             stub(40123),
             1,
             16,
@@ -1507,10 +1545,19 @@ mod tests {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
     ) -> (ReceiveChannelEndpoint, Sent) {
+        endpoint_that_records_with_tag(None, counters, regions)
+    }
+
+    fn endpoint_that_records_with_tag(
+        group_tag: Option<i64>,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> (ReceiveChannelEndpoint, Sent) {
         let sent = Sent::default();
 
         let endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            group_tag,
             Box::new(sent.clone()),
             1234,
             16,
@@ -1522,6 +1569,113 @@ mod tests {
         .expect("an endpoint");
 
         (endpoint, sent)
+    }
+
+    /// The eight optional bytes a group tag travels in
+    /// (`aeron_receive_channel_endpoint_send_sm`, `:302-325`).
+    ///
+    /// There is no flag for it: the frame's **length** is the whole of what
+    /// tells the sender a tag is there, which is why an endpoint with no tag
+    /// and an endpoint with a tag of `-1` send different frames.
+    #[test]
+    fn a_status_message_carries_the_group_tag_when_the_endpoint_has_one() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) =
+            endpoint_that_records_with_tag(Some(17), &mut counters, &regions);
+
+        let destination = "127.0.0.1:40456".parse().expect("an address");
+        endpoint
+            .send_sm(destination, 1_001, 42, 3, 4_096, 8_192, 0)
+            .expect("sent");
+
+        let frame = sent.last();
+        let header = crate::protocol::FrameHeader::read(&frame).expect("a header");
+        assert_eq!(
+            i32::try_from(
+                StatusMessageFrame::LENGTH + StatusMessageFrame::OPTIONAL_GROUP_TAG_LENGTH
+            )
+            .expect("a short frame"),
+            header.frame_length
+        );
+
+        let status = StatusMessageFrame::read(&frame).expect("a status message");
+        assert_eq!(Some(17), status.group_tag(&frame));
+        assert_eq!(42, status.session_id);
+        assert_eq!(8_192, status.receiver_window);
+    }
+
+    #[test]
+    fn a_status_message_of_an_endpoint_with_no_tag_is_the_short_one() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
+
+        let destination = "127.0.0.1:40456".parse().expect("an address");
+        endpoint
+            .send_sm(destination, 1_001, 42, 3, 4_096, 8_192, 0)
+            .expect("sent");
+
+        let frame = sent.last();
+        let header = crate::protocol::FrameHeader::read(&frame).expect("a header");
+        assert_eq!(
+            i32::try_from(StatusMessageFrame::LENGTH).expect("a short frame"),
+            header.frame_length,
+            "no tag, no eight bytes"
+        );
+
+        let status = StatusMessageFrame::read(&frame).expect("a status message");
+        assert_eq!(None, status.group_tag(&frame));
+    }
+
+    /// And the error frame says so with a **flag** instead
+    /// (`aeron_receive_channel_endpoint.c:483-489`), with the field written
+    /// whether or not the flag is set.
+    #[test]
+    fn an_error_frame_flags_its_group_tag_when_the_endpoint_has_one() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, sent) =
+            endpoint_that_records_with_tag(Some(17), &mut counters, &regions);
+        let system = system_counters::System::new(&counters, &regions);
+        endpoint
+            .send_error_frame(
+                "127.0.0.1:40456".parse().expect("an address"),
+                1_001,
+                42,
+                deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+                b"nope",
+                &system,
+            )
+            .expect("sent");
+
+        let frame = sent.last();
+        let header = crate::protocol::FrameHeader::read(&frame).expect("a header");
+        assert_eq!(header_flags::ERR_HAS_GROUP_TAG, header.flags);
+        assert_eq!(
+            17,
+            ErrorFrame::read(&frame).expect("an ERR frame").group_tag
+        );
+
+        // Without one, the field is still written — and ignored, because the
+        // flag is clear.
+        let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
+        let system = system_counters::System::new(&counters, &regions);
+        endpoint
+            .send_error_frame(
+                "127.0.0.1:40456".parse().expect("an address"),
+                1_001,
+                42,
+                deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+                b"nope",
+                &system,
+            )
+            .expect("sent");
+
+        let frame = sent.last();
+        let header = crate::protocol::FrameHeader::read(&frame).expect("a header");
+        assert_eq!(0, header.flags);
+        assert_eq!(0, ErrorFrame::read(&frame).expect("an ERR frame").group_tag);
     }
 
     /// The frame a rejected image puts on the wire, byte for byte — the only

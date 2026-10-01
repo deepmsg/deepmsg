@@ -946,6 +946,38 @@ impl StatusMessageFrame {
         write_i64(buffer, 28, self.receiver_id)
     }
 
+    /// Write the frame with the eight optional bytes a group tag travels in
+    /// (`aeron_receive_channel_endpoint_send_sm`, `:302-325`).
+    ///
+    /// The frame says whether it carries one through its **length** and not
+    /// through a flag (`aeron_udp_protocol.c:31-33`), so this is the only
+    /// difference from [`write_with_flags`](Self::write_with_flags): 44 bytes
+    /// instead of 36, with the tag at the end of them.
+    ///
+    /// # Errors
+    ///
+    /// `None`, with nothing written, if `buffer` is shorter than the frame the
+    /// tag makes.
+    pub fn write_with_group_tag(&self, buffer: &mut [u8], flags: u8, group_tag: i64) -> Option<()> {
+        if buffer.len() < Self::LENGTH + Self::OPTIONAL_GROUP_TAG_LENGTH {
+            return None;
+        }
+
+        fixed_header(
+            frame_type::SM,
+            Self::LENGTH + Self::OPTIONAL_GROUP_TAG_LENGTH,
+            flags,
+        )
+        .write(buffer)?;
+        write_i32(buffer, 8, self.session_id)?;
+        write_i32(buffer, 12, self.stream_id)?;
+        write_i32(buffer, 16, self.consumption_term_id)?;
+        write_i32(buffer, 20, self.consumption_term_offset)?;
+        write_i32(buffer, 24, self.receiver_window)?;
+        write_i64(buffer, 28, self.receiver_id)?;
+        write_i64(buffer, Self::LENGTH, group_tag)
+    }
+
     /// The group tag this SM carries, if it carries one — the mirror of
     /// `aeron_udp_protocol_group_tag` (`aeron_udp_protocol.c:26-43`).
     ///

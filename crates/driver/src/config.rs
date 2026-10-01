@@ -126,6 +126,16 @@ pub const NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT: i64 = 10 * 1000 * 1000;
 /// `AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT` (`aeron_driver_context.c:227`).
 pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBoolean::Infer;
 
+/// What a channel that names no `gtag=` stamps into its status messages: none
+/// (`AERON_RECEIVER_GROUP_TAG_IS_PRESENT_DEFAULT` and
+/// `..._VALUE_DEFAULT`, `aeron_driver_context.c:194-195`).
+///
+/// The reference keeps the two halves apart — `is_present = false` *and*
+/// `value = -1` — and the difference is real: an endpoint with no tag sends a
+/// 36-byte status message, and one whose tag is `-1` sends 44
+/// (`aeron_receive_channel_endpoint.c:309-312`). [`None`] is the absent half.
+pub const RECEIVER_GROUP_TAG_DEFAULT: Option<i64> = None;
+
 /// A boolean that has a third answer: **work it out**
 /// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
 ///
@@ -434,6 +444,13 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// The group tag a channel that names no `gtag=` gets
+    /// (`aeron.receiver.group.tag`, `AERON_RECEIVER_GROUP_TAG`).
+    ///
+    /// It is the driver's half of the tag an endpoint stamps into its status
+    /// messages; the channel's own `gtag=` wins where it names one
+    /// (`aeron_receive_channel_endpoint_set_group_tag`, `:39-46`).
+    pub receiver_group_tag: Option<i64>,
     /// What a subscription's `group=` does when it names nothing
     /// (`aeron.receiver.group.consideration`, `AERON_RECEIVER_GROUP_CONSIDERATION`;
     /// the default is `infer`, `aeron_driver_context.c:227`).
@@ -548,6 +565,7 @@ impl Default for DriverConfig {
             socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
+            receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
             nak_multicast_group_size: NAK_MULTICAST_GROUP_SIZE_DEFAULT,
             nak_multicast_max_backoff_ns: NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
             receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
@@ -807,6 +825,9 @@ impl DriverConfig {
                 });
             }
             config.nak_multicast_max_backoff_ns = backoff;
+        }
+        if let Some(value) = get(&Setting::RECEIVER_GROUP_TAG) {
+            config.receiver_group_tag = Some(parse_count(&Setting::RECEIVER_GROUP_TAG, &value)?);
         }
         if let Some(value) = get(&Setting::RECEIVER_GROUP_CONSIDERATION) {
             config.receiver_group_consideration =
@@ -1082,6 +1103,11 @@ impl Setting {
     /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
     /// `:451-452` — environment only, with no property read in the reference;
     /// this build reads the property too, as it does for every other name).
+    /// `aeron.receiver.group.tag` (`aeronmd.h:558`).
+    const RECEIVER_GROUP_TAG: Self = Self {
+        property: "receiver.group.tag",
+        env: "AERON_RECEIVER_GROUP_TAG",
+    };
     const RECEIVER_GROUP_CONSIDERATION: Self = Self {
         property: "receiver.group.consideration",
         env: "AERON_RECEIVER_GROUP_CONSIDERATION",
