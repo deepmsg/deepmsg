@@ -453,11 +453,18 @@ fn parse_size(key: &str, value: &str) -> Result<u64, UriError> {
 
 /// `aeron_parse_duration_ns`, including the one-character tail it tolerates.
 fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
-    let not_a_number = || UriError::NotANumber {
+    parse_duration_value(value).ok_or_else(|| UriError::NotANumber {
         key: key.to_owned(),
         value: value.to_owned(),
-    };
+    })
+}
 
+/// The same parse, without the URI's name for a value that is not one.
+///
+/// The reference has one duration parser and its option parsers call it too
+/// (`aeron_flow_control.c:617`), so `t:` in an `fc=` reads a duration exactly
+/// as `nak-delay=` does.
+pub(crate) fn parse_duration_value(value: &str) -> Option<i64> {
     let trimmed = value.trim_start();
     let (negative, digits) = match trimmed.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -468,15 +475,15 @@ fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(digits.len());
     if end == 0 || negative {
-        return Err(not_a_number());
+        return None;
     }
 
-    let magnitude: i64 = digits[..end].parse().map_err(|_| not_a_number())?;
+    let magnitude: i64 = digits[..end].parse().ok()?;
     let tail = &digits[end..];
 
     // A bare number is nanoseconds.
     let Some(unit) = tail.chars().next() else {
-        return Ok(magnitude);
+        return Some(magnitude);
     };
 
     let after = &tail[unit.len_utf8()..];
@@ -490,12 +497,12 @@ fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
                 _ => 1,
             }
         }
-        _ => return Err(not_a_number()),
+        _ => return None,
     };
 
     // `value * multiplier` saturating, which is the reference's answer for a
     // value it would otherwise overflow: it stores `LLONG_MAX`.
-    Ok(magnitude.saturating_mul(multiplier))
+    Some(magnitude.saturating_mul(multiplier))
 }
 
 #[cfg(test)]
