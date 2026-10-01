@@ -362,6 +362,19 @@ pub enum AddSubscriptionError {
 }
 
 impl AddSubscriptionError {
+    /// The lines the reference's URI parse left behind, when this failure is
+    /// one of its (`channel_uri::UriError::parse_failure`).
+    pub fn uri_parse_failure(&self, channel: &[u8]) -> Option<String> {
+        match self {
+            Self::Params(PublicationParamsError::Uri(error)) => error.parse_failure(channel),
+            Self::Channel(error) => match error.as_ref() {
+                crate::udp_channel::UdpChannelError::Uri(error) => error.parse_failure(channel),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The `ON_ERROR` code this failure is reported under, by the same rule as
     /// [`AddError::error_code`]: a URI the driver cannot *read* is an invalid
     /// channel, a parameter *value* the reference's readers would reject is

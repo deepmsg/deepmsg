@@ -412,6 +412,18 @@ impl ClientEvents for Transmit<'_> {
 
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
+/// The line the reference's conductor appends when a channel will not parse
+/// (`aeron_driver_conductor.c:4686-4687` for a publication, `:5173-5174` for a
+/// subscription), with the **empty message** its `AERON_APPEND_ERR("%s", "")`
+/// writes — which is why the line ends in a space.
+///
+/// It is appended to whatever the URI parse left, and both together are what
+/// the client is handed as its `ON_ERROR` message: probed against a live
+/// reference driver, where the three lines arrive in one string.
+fn channel_parse_append(function: &str, line: u32) -> String {
+    format!("[{function}, aeron_driver_conductor.c:{line}] \n")
+}
+
 /// (`aeron_driver_conductor.c:3231-3235`).
 ///
 /// The code is recorded negated because the reference's `AERON_SET_ERR` is
@@ -1864,10 +1876,24 @@ impl Conductor {
                                 // answer from one whose parameters do not add
                                 // up (`aeron_driver_conductor.c:2344-2352`).
                                 *publication_failures += 1;
+                                // A channel that will not parse is described
+                                // by what the parse left behind plus this
+                                // command's own site; everything else by the
+                                // error's own words.
+                                let description = match error.uri_parse_failure(request.channel) {
+                                    Some(uri_lines) => format!(
+                                        "{uri_lines}{}",
+                                        channel_parse_append(
+                                            "aeron_driver_conductor_on_add_network_publication",
+                                            4687,
+                                        )
+                                    ),
+                                    None => error.to_string(),
+                                };
                                 transmit.error(
                                     request.correlation_id,
                                     error.error_code(),
-                                    error.to_string().as_bytes(),
+                                    description.as_bytes(),
                                 );
                             }
                         }
@@ -2031,10 +2057,20 @@ impl Conductor {
 
                         if let Err(error) = subscription_result {
                             *subscription_failures += 1;
+                            let description = match error.uri_parse_failure(request.channel) {
+                                Some(uri_lines) => format!(
+                                    "{uri_lines}{}",
+                                    channel_parse_append(
+                                        "aeron_driver_conductor_on_add_network_subscription",
+                                        5174,
+                                    )
+                                ),
+                                None => error.to_string(),
+                            };
                             transmit.error(
                                 request.correlation_id,
                                 error.error_code(),
-                                error.to_string().as_bytes(),
+                                description.as_bytes(),
                             );
                         }
                     }
