@@ -113,7 +113,7 @@ pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
 pub const NAK_MULTICAST_GROUP_SIZE_DEFAULT: usize = 10;
 
 /// The least a multicast backoff may be set to
-/// (`aeron_driver_context.c:949`): a microsecond.
+/// (`aeron_driver_context.c:945-950`): a microsecond.
 pub const NAK_MULTICAST_MAX_BACKOFF_NS_MIN: i64 = 1_000;
 
 /// `AERON_NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT`
@@ -127,7 +127,7 @@ pub const NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT: i64 = 10 * 1000 * 1000;
 pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBoolean::Infer;
 
 /// A boolean that has a third answer: **work it out**
-/// (`aeron_inferable_boolean_t`, `aeron_driver_context.c:91-97`).
+/// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
 ///
 /// One parameter needs it — a subscription's `group=` — because "this channel
 /// is a group" is a question the channel itself usually answers, and a client

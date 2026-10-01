@@ -37,7 +37,7 @@ use super::{Datagrams, Transport, TransportParams};
 /// `recv_fd` and starts them equal (`aeron_udp_channel_transport.c:141`); a
 /// second descriptor appears in exactly one case (`:157-164`): a **multicast**
 /// transport that was also given a connect address. Only a *send* endpoint
-/// passes one (`aeron_send_channel_endpoint.c:118` — receive destinations pass
+/// passes one (`aeron_send_channel_endpoint.c:91` — receive destinations pass
 /// `NULL`, `aeron_receive_destination.c:73`), which is why a subscriber to a
 /// group has one descriptor and a publisher to it has two.
 ///

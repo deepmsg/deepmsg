@@ -43,7 +43,7 @@ pub const NAK_UNICAST_RETRY_RATIO: i64 = 100;
 
 /// The log-normal a **multicast** image's NAK delays are drawn from
 /// (`feedback_delay_state_t.optimal_delay`,
-/// `aeron-driver/src/main/c/aeron_loss_detector.h:44-52`, built by
+/// `aeron-driver/src/main/c/aeron_driver_common.h:139-157`, built by
 /// `aeron_feedback_delay_state_init`, `aeron_loss_detector.c:91-119`).
 ///
 /// Why a group needs one at all: a receiver that has lost a packet is one of
@@ -99,7 +99,7 @@ impl MulticastBackoff {
     }
 
     /// One delay, from one uniform draw in `[0, 1)`
-    /// (`aeron_loss_detector_nak_multicast_delay_generator`, `:121-125`).
+    /// (`aeron_loss_detector_nak_multicast_delay_generator`, `:120-125`).
     ///
     /// It ignores the retry flag, which is a fact about this generator rather
     /// than an oversight: a repeated ask draws a **fresh** delay where the
@@ -215,7 +215,7 @@ pub struct LossDetector {
     /// instead, or [`None`] for the fixed pair above.
     ///
     /// One struct holds both in the reference too
-    /// (`feedback_delay_state_t`, `aeron_loss_detector.h:44-56`): the state
+    /// (`feedback_delay_state_t`, `aeron_driver_common.h:139-157`): the state
     /// carries a `static_delay` and an `optimal_delay`, and the generator it
     /// was initialised with decides which of them is read.
     multicast: Option<MulticastBackoff>,
@@ -333,7 +333,7 @@ impl LossDetector {
     /// How long until the next ask — the reference's `delay_generator(state,
     /// retry)`, which is a fixed lookup for a unicast image
     /// (`aeron_loss_detector.h:63-73`) and a **fresh draw** for a multicast
-    /// one (`:85`, `:121-125`).
+    /// one (`:85`, `:120-125`).
     fn next_delay_ns(&self, retry: bool) -> i64 {
         match self.multicast {
             Some(backoff) => backoff.delay_ns(random::unit()),
