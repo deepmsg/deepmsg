@@ -93,7 +93,7 @@ use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
     IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
-    validate_send_destination_uri,
+    validate_destination_uri_params, validate_send_destination_uri,
 };
 
 /// At most one command per duty cycle
@@ -2586,6 +2586,20 @@ impl Conductor {
                     );
                     continue;
                 };
+
+                // `:5889`: what a destination may not name, checked on the
+                // parse and before the socket — `mtu`, `rcv-wnd`, either
+                // buffer, the response correlation, and `control-mode=response`.
+                // A destination is a place inside a subscription's channel,
+                // not a channel of its own.
+                if let Err(error) = validate_destination_uri_params(&uri, request.channel) {
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        error.to_string().as_bytes(),
+                    );
+                    continue;
+                }
 
                 let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
                     transmit.error(

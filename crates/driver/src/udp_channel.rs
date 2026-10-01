@@ -480,6 +480,40 @@ pub const INVALID_DESTINATION_KEYS: [&str; 5] = [
     "response-correlation-id",
 ];
 
+/// The parameter half of a destination's validation
+/// (`aeron_driver_conductor_validate_destination_uri_params`, `:411-462`).
+///
+/// Both directions reach it and the send side reaches it through
+/// [`validate_send_destination_uri`]; a **receive** destination goes through
+/// its own triage, which has no address rules of its own to add.
+///
+/// # Errors
+///
+/// [`UdpChannelError::InvalidChannel`], in the reference's words: a client
+/// reads this message.
+pub fn validate_destination_uri_params(
+    uri: &ChannelUri<'_>,
+    channel: &[u8],
+) -> Result<(), UdpChannelError> {
+    let text = String::from_utf8_lossy(channel);
+
+    for key in INVALID_DESTINATION_KEYS {
+        if uri.value(key).is_some() {
+            return Err(UdpChannelError::InvalidChannel(format!(
+                "destinations must not contain the key: {key} channel={text}"
+            )));
+        }
+    }
+
+    if uri.value("control-mode") == Some("response") {
+        return Err(UdpChannelError::InvalidChannel(format!(
+            "destinations may not specify control-mode=response channel={text}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Refuse a spy channel as a **send** destination
 /// (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`).
 ///
@@ -572,19 +606,7 @@ pub fn validate_send_destination_uri(channel: &[u8]) -> Result<SocketAddr, UdpCh
         )));
     }
 
-    for key in INVALID_DESTINATION_KEYS {
-        if uri.value(key).is_some() {
-            return Err(UdpChannelError::InvalidChannel(format!(
-                "destinations must not contain the key: {key} channel={text}"
-            )));
-        }
-    }
-
-    if uri.value("control-mode") == Some("response") {
-        return Err(UdpChannelError::InvalidChannel(format!(
-            "destinations may not specify control-mode=response channel={text}"
-        )));
-    }
+    validate_destination_uri_params(&uri, channel)?;
 
     let endpoint = uri.value("endpoint").expect("checked above");
 
