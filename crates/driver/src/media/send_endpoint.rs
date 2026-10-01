@@ -164,8 +164,20 @@ impl SendChannelEndpoint {
         let connect_to = (channel.has_explicit_endpoint && !channel.is_multi_destination())
             .then_some(channel.remote_data);
 
+        // `aeron_send_channel_endpoint.c:115-135`: a multicast endpoint binds
+        // the group's **control** twin — it is the group it joins and hears
+        // NAKs on — and names `local_control` as the interface every multicast
+        // send leaves by. A unicast endpoint binds its local side and the
+        // interface parameter is never read.
+        let bind = if channel.is_multicast {
+            channel.remote_control
+        } else {
+            channel.local_control
+        };
+
         let transport = match super::udp_transport::UdpTransport::open(
-            channel.local_control,
+            bind,
+            Some(channel.local_control),
             connect_to,
             params,
         ) {

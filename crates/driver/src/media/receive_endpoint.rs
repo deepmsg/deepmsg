@@ -102,8 +102,17 @@ impl ReceiveDestination {
         channel_status_counter_id: i32,
         now_ms: i64,
     ) -> Result<Self, ReceiveEndpointError> {
-        let transport = super::udp_transport::UdpTransport::open(channel.remote_data, None, params)
-            .map_err(ReceiveEndpointError::Socket)?;
+        // `aeron_receive_destination.c:69-75`: the bind address is the
+        // channel's `remote_data` — the group, for a group — the interface is
+        // its `local_data`, and a destination **never** connects, which is why
+        // a subscriber's transport has one descriptor.
+        let transport = super::udp_transport::UdpTransport::open(
+            channel.remote_data,
+            Some(channel.local_data),
+            None,
+            params,
+        )
+        .map_err(ReceiveEndpointError::Socket)?;
 
         Self::attach(
             channel,

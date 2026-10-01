@@ -102,6 +102,11 @@ pub const SOCKET_SO_RCVBUF_DEFAULT: i32 = 128 * 1024;
 /// the socket gets unless a channel asks for more.
 pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 
+/// `AERON_SOCKET_MULTICAST_TTL_DEFAULT` (`aeron_driver_context.c:193`): zero,
+/// which leaves the hop limit to the kernel (one) unless a channel names one
+/// with `ttl=`.
+pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
+
 /// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:205`).
 pub const RCV_INITIAL_WINDOW_LENGTH_DEFAULT: i32 = 128 * 1024;
 
@@ -356,6 +361,13 @@ pub struct DriverConfig {
     /// `SO_SNDBUF`, likewise (`aeron.socket.so.sndbuf`; zero leaves the
     /// kernel's default, which is a socket *sending* into a local buffer).
     pub socket_so_sndbuf: i32,
+    /// The multicast hop limit a channel that named none gets
+    /// (`aeron.socket.multicast.ttl = 0`, `AERON_SOCKET_MULTICAST_TTL`).
+    ///
+    /// Zero is the reference's default and is also what `ttl=` with no value
+    /// leaves behind, so the two are one case and the socket keeps the
+    /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
+    pub socket_multicast_ttl: u8,
     /// The window a receiver offers a publication when the channel named none
     /// (`aeron.rcv.initial.window.length`, which `aeronmd` turns into
     /// `AERON_RCV_INITIAL_WINDOW_LENGTH`,
@@ -448,6 +460,7 @@ impl Default for DriverConfig {
             publication_window_length: PUBLICATION_WINDOW_LENGTH_DEFAULT,
             socket_so_rcvbuf: SOCKET_SO_RCVBUF_DEFAULT,
             socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
+            socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
             network_publication_max_messages_per_send:
                 NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT,
@@ -671,6 +684,17 @@ impl DriverConfig {
                 0,
                 u64::try_from(i32::MAX).unwrap_or(u64::MAX),
             )?;
+        }
+        if let Some(value) = get(&Setting::SOCKET_MULTICAST_TTL) {
+            // The reference's bounds are a `uint8_t`'s: `0..255`, refused
+            // rather than clamped (`aeron_driver_context.c:768-772`).
+            config.socket_multicast_ttl = u8::try_from(parse_bounded_size32(
+                &Setting::SOCKET_MULTICAST_TTL,
+                &value,
+                0,
+                255,
+            )?)
+            .unwrap_or(SOCKET_MULTICAST_TTL_DEFAULT);
         }
         if let Some(value) = get(&Setting::RCV_INITIAL_WINDOW_LENGTH) {
             config.receiver_window_length = parse_bounded_size32(
@@ -923,6 +947,11 @@ impl Setting {
     const SOCKET_SO_SNDBUF: Self = Self {
         property: "socket.so.sndbuf",
         env: "AERON_SOCKET_SO_SNDBUF",
+    };
+    /// `aeron.socket.multicast.ttl` (`aeronmd.h:249`, read at `:768-772`).
+    const SOCKET_MULTICAST_TTL: Self = Self {
+        property: "socket.multicast.ttl",
+        env: "AERON_SOCKET_MULTICAST_TTL",
     };
     /// `aeron.rcv.initial.window.length`: the window a receiver offers when the
     /// channel named none (`aeronmd.h:331`, read at `:834-839`).
