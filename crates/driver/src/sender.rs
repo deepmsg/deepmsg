@@ -980,6 +980,7 @@ impl SenderThread {
                 if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
                     header.flags,
+                    frame.group_tag(bytes),
                     counters,
                     regions,
                     now_ns,

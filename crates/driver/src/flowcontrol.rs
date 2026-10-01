@@ -139,21 +139,51 @@ impl std::fmt::Display for FlowControlError {
 
 impl std::error::Error for FlowControlError {}
 
+/// A status message, as a strategy sees it
+/// (`aeron_status_message_header_t`, plus the group tag that may follow it).
+///
+/// A strategy that keeps its own receivers keys them by `receiver_id` and dates
+/// them by `now_ns`, so it needs more than the window the `max` strategy reads
+/// — and the reference hands over the whole frame for exactly that reason.
+#[derive(Clone, Copy, Debug)]
+pub struct StatusMessage {
+    /// Where the receiver has read to, already computed from the frame's term
+    /// id and offset against the publication's initial term id — which is the
+    /// caller's job (`aeron_logbuffer_compute_position`,
+    /// `aeron_flow_control.c:120-124`).
+    pub consumption_position: i64,
+    /// How much room it has (`receiver_window`).
+    pub receiver_window: i32,
+    /// Who is reporting (`receiver_id`) — what a strategy that keeps receivers
+    /// keys them by.
+    pub receiver_id: i64,
+    /// Which session and stream it is reading, which the reference passes on to
+    /// the log hooks it calls when a receiver is added or dropped
+    /// (`aeron_min_flow_control.c:228-239`, `:126-137`).
+    pub session_id: i32,
+    pub stream_id: i32,
+    /// `AERON_STATUS_MESSAGE_HEADER_EOS_FLAG`: the receiver is leaving rather
+    /// than reporting (`:175`).
+    pub eos_flagged: bool,
+    /// The group tag this message carried, if it carried one — the fixed
+    /// eight bytes the reference reads by frame length
+    /// (`aeron_udp_protocol.c:26-43`).
+    pub group_tag: Option<i64>,
+}
+
 /// What a sender asks of its strategy
 /// (`aeron_flow_control_strategy_t`, `aeron_flow_control.h:46-100`).
 pub trait Strategy {
     /// A status message arrived: it carries the receiver's consumption
     /// position and its window, and the answer is the new sender limit.
     ///
-    /// `consumption_position` is the receiver's position, already computed from
-    /// the frame's term id and offset against the publication's initial term id
-    /// — which is the caller's job in both implementations
-    /// (`aeron_logbuffer_compute_position`, `aeron_flow_control.c:120-124`).
+    /// `now_ns` is the clock the caller works from, and a strategy that dates
+    /// its receivers reads it here (`aeron_min_flow_control.c:159-166`).
     fn on_sm(
         &mut self,
-        consumption_position: i64,
-        receiver_window: i32,
+        status_message: &StatusMessage,
         snd_lmt: SenderLimit,
+        now_ns: i64,
     ) -> SenderLimit;
 
     /// Nothing arrived this pass (`aeron_max_flow_control_strategy_on_idle`,
@@ -240,12 +270,12 @@ impl Default for FlowControl {
 impl Strategy for FlowControl {
     fn on_sm(
         &mut self,
-        consumption_position: i64,
-        receiver_window: i32,
+        status_message: &StatusMessage,
         snd_lmt: SenderLimit,
+        now_ns: i64,
     ) -> SenderLimit {
         match self {
-            Self::Max(strategy) => strategy.on_sm(consumption_position, receiver_window, snd_lmt),
+            Self::Max(strategy) => strategy.on_sm(status_message, snd_lmt, now_ns),
         }
     }
 
@@ -423,12 +453,14 @@ impl MaxStrategy {
 impl Strategy for MaxStrategy {
     fn on_sm(
         &mut self,
-        consumption_position: i64,
-        receiver_window: i32,
+        status_message: &StatusMessage,
         snd_lmt: SenderLimit,
+        _now_ns: i64,
     ) -> SenderLimit {
         // `:108-127`: the window edge, and the limit never goes backwards.
-        let window_edge = consumption_position.saturating_add(i64::from(receiver_window));
+        let window_edge = status_message
+            .consumption_position
+            .saturating_add(i64::from(status_message.receiver_window));
 
         snd_lmt.max(window_edge)
     }
@@ -480,6 +512,336 @@ impl Strategy for MaxStrategy {
     /// (`aeron_flow_control.c:76-79`).
     fn has_required_receivers(&self) -> bool {
         true
+    }
+}
+
+/// The `min` strategy: the sender may write only as far as the **slowest**
+/// receiver has read plus its window (`aeron_min_flow_control.c:159-258`).
+///
+/// Where `max` answers each status message on its own, this one keeps the
+/// receivers that have reported and answers from all of them, which is what
+/// makes it a *group* strategy: a sender under it waits for the reader that is
+/// furthest behind, and — with a `group_min_size` — for there to be readers at
+/// all.
+#[derive(Debug)]
+pub struct MinStrategy {
+    /// The receivers that have reported (`receivers`), in the order they were
+    /// first seen.
+    receivers: Vec<MinReceiver>,
+    /// How long a receiver may go quiet before it is dropped
+    /// (`receiver_timeout_ns`).
+    receiver_timeout_ns: i64,
+    /// How many receivers have to have reported before the limit moves at all
+    /// (`group_min_size`). Zero, the default, means the first one is enough.
+    group_min_size: i32,
+    /// The tag a status message has to carry to count (`group_tag`), or
+    /// `None` for the strategy that counts every message: the reference's two
+    /// names are one supplier with an `is_group_tag_aware` flag
+    /// (`aeron_min_flow_control.c:515-634`), and the flag is exactly whether
+    /// there is a tag to match against.
+    group_tag: Option<i64>,
+    /// Whether the receivers seen so far satisfy `group_min_size`, kept so the
+    /// publication can ask without walking the table (`has_required_receivers`).
+    has_required_receivers: bool,
+    /// When the last elicited setup went out, and the limit it carried, which
+    /// is what the sender may write until the first receiver answers
+    /// (`last_setup_snd_lmt`).
+    time_of_last_setup_ns: i64,
+    last_setup_snd_lmt: SenderLimit,
+    /// A status message with this strategy's tag asked for a setup since the
+    /// last one was sent (`has_tagged_status_message_triggered_setup`): a setup
+    /// sent for another reason does not open the gate.
+    has_matching_status_message_triggered_setup: bool,
+    /// How many receiver windows a retransmission may cover — the same option
+    /// and the same default `max` has (`aeron_min_flow_control.c:598`).
+    retransmit_receiver_window_multiple: usize,
+}
+
+/// One receiver of a [`MinStrategy`]
+/// (`aeron_min_flow_control_strategy_receiver_t`, `aeron_min_flow_control.c:34-46`).
+///
+/// The reference also keeps the session, stream and registration id of each
+/// receiver, for the log hooks it calls when one arrives or goes
+/// (`aeron_min_flow_control.c:217-218`, `:228-239`) and for the receiver
+/// counter's label (`:491-501`). This build has the default null hooks and no
+/// counter yet, so they arrive with the counter.
+#[derive(Clone, Copy, Debug)]
+struct MinReceiver {
+    receiver_id: i64,
+    /// The furthest this receiver has said it has read. It only ever moves
+    /// forwards, however the messages arrive (`:188`).
+    last_position: i64,
+    /// That position plus the window it offered, which is how far the sender
+    /// may write for this receiver's sake.
+    last_position_plus_window: i64,
+    time_of_last_status_message_ns: i64,
+    eos_flagged: bool,
+}
+
+impl MinStrategy {
+    /// A strategy with no receivers yet, which is how one starts
+    /// (`aeron_min_flow_control_strategy_supplier_init`, `:515-602`).
+    pub fn new(
+        receiver_timeout_ns: i64,
+        group_min_size: i32,
+        group_tag: Option<i64>,
+        retransmit_receiver_window_multiple: usize,
+    ) -> Self {
+        Self {
+            receivers: Vec::new(),
+            receiver_timeout_ns,
+            group_min_size,
+            group_tag,
+            has_required_receivers: false,
+            time_of_last_setup_ns: 0,
+            last_setup_snd_lmt: -1,
+            has_matching_status_message_triggered_setup: false,
+            retransmit_receiver_window_multiple,
+        }
+    }
+
+    /// How many receivers have reported.
+    pub fn receiver_count(&self) -> usize {
+        self.receivers.len()
+    }
+
+    /// Whether a group tag counts for this strategy
+    /// (`aeron_udp_protocol_group_tag`'s answer, `aeron_min_flow_control.c:353`).
+    ///
+    /// The plain strategy matches everything — including a message that carries
+    /// no tag at all — and the tagged one matches only its own tag.
+    fn tag_matches(&self, group_tag: Option<i64>) -> bool {
+        self.group_tag.is_none_or(|tag| group_tag == Some(tag))
+    }
+
+    /// Whether the receivers satisfy `group_min_size`
+    /// (`aeron_min_flow_control_strategy_has_required_receivers`, `:472-481`).
+    fn group_is_satisfied(&self) -> bool {
+        self.receivers.len() >= usize::try_from(self.group_min_size.max(0)).unwrap_or(0)
+    }
+
+    /// What the sender may write while a setup it sent is still unanswered
+    /// (`aeron_min_flow_control_strategy_last_setup_snd_lmt`, `:79-96`).
+    ///
+    /// `INT64_MAX` — no limit at all — either because no setup has gone out, or
+    /// because the one that did has aged past the receiver timeout and is
+    /// forgotten: a receiver that never answered cannot hold the sender back
+    /// for ever.
+    fn last_setup_snd_lmt(&mut self, now_ns: i64) -> SenderLimit {
+        if -1 != self.last_setup_snd_lmt {
+            if self
+                .time_of_last_setup_ns
+                .saturating_add(self.receiver_timeout_ns)
+                .saturating_sub(now_ns)
+                < 0
+            {
+                self.last_setup_snd_lmt = -1;
+            } else {
+                return self.last_setup_snd_lmt;
+            }
+        }
+
+        SenderLimit::MAX
+    }
+
+    /// The body both the plain and the tagged status message share
+    /// (`aeron_min_flow_control_strategy_process_sm`, `:159-258`).
+    ///
+    /// `matches_tag` is the one thing that differs between them: the plain
+    /// strategy matches every message, the tagged one only those carrying its
+    /// tag (`:353`).
+    fn process_status_message(
+        &mut self,
+        status_message: &StatusMessage,
+        snd_lmt: SenderLimit,
+        now_ns: i64,
+        matches_tag: bool,
+    ) -> SenderLimit {
+        let position = status_message.consumption_position;
+        let window_length = i64::from(status_message.receiver_window);
+        let position_plus_window = position.saturating_add(window_length);
+
+        let mut is_existing = false;
+        let mut min_position = self.last_setup_snd_lmt(now_ns);
+
+        for receiver in &mut self.receivers {
+            if matches_tag && status_message.receiver_id == receiver.receiver_id {
+                receiver.eos_flagged = status_message.eos_flagged;
+                receiver.last_position = position.max(receiver.last_position);
+                receiver.last_position_plus_window = position_plus_window;
+                receiver.time_of_last_status_message_ns = now_ns;
+                is_existing = true;
+            }
+
+            min_position = min_position.min(receiver.last_position_plus_window);
+        }
+
+        // `:198-202`: a receiver nobody has heard of joins only if it is not
+        // leaving, if it matches the tag, and if it is not already behind the
+        // slowest one by more than a window — a newcomer that far back cannot
+        // be waited for without stalling the stream for everyone else.
+        let is_admissible = !is_existing
+            && !status_message.eos_flagged
+            && matches_tag
+            && (self.receivers.is_empty()
+                || position_plus_window >= min_position.saturating_sub(window_length));
+
+        if is_admissible {
+            self.receivers.push(MinReceiver {
+                receiver_id: status_message.receiver_id,
+                last_position: position,
+                last_position_plus_window: position_plus_window,
+                time_of_last_status_message_ns: now_ns,
+                eos_flagged: false,
+            });
+
+            min_position = min_position.min(position_plus_window);
+            self.has_required_receivers = self.group_is_satisfied();
+
+            // `:226`: a new receiver is a new reason for the sender to be let
+            // forward, so whatever the last setup allowed is forgotten.
+            self.last_setup_snd_lmt = -1;
+        }
+
+        // `:246-257`, and the three answers are different on purpose: too few
+        // receivers means the **limit does not move** (rather than moving to
+        // this receiver's window), and the empty table — which is not the same
+        // as too few, because a group of none has no minimum — is the one case
+        // where a single message is allowed to carry the limit forwards.
+        if !self.group_is_satisfied() {
+            snd_lmt
+        } else if self.receivers.is_empty() {
+            snd_lmt.max(position_plus_window)
+        } else {
+            snd_lmt.max(min_position)
+        }
+    }
+}
+
+impl Strategy for MinStrategy {
+    fn on_sm(
+        &mut self,
+        status_message: &StatusMessage,
+        snd_lmt: SenderLimit,
+        now_ns: i64,
+    ) -> SenderLimit {
+        // `aeron_min_flow_control_strategy_on_sm`, `:260-281` (every message
+        // matches) and `aeron_tagged_flow_control_strategy_on_sm`, `:326-357`
+        // (only one carrying the tag does).
+        let matches_tag = self.tag_matches(status_message.group_tag);
+
+        self.process_status_message(status_message, snd_lmt, now_ns, matches_tag)
+    }
+
+    /// Drop the receivers that have gone quiet or left, and answer from the
+    /// slowest of the rest (`:98-157`).
+    ///
+    /// This is where a group strategy notices that its group is gone: nothing
+    /// arrives to say so, the messages simply stop.
+    fn on_idle(
+        &mut self,
+        now_ns: i64,
+        snd_lmt: SenderLimit,
+        _snd_pos: i64,
+        _is_end_of_stream: bool,
+    ) -> SenderLimit {
+        let mut min_limit_position = self.last_setup_snd_lmt(now_ns);
+        let timeout = self.receiver_timeout_ns;
+
+        // The reference removes these while walking the table backwards and
+        // calls its `receiver_removed` log hook for each (`:126-137`); the hook
+        // is one the driver context leaves null and no component here sets
+        // (`aeron_driver_context.c:1239-1240`), so there is nothing to call.
+        self.receivers.retain(|receiver| {
+            let has_gone_quiet = receiver
+                .time_of_last_status_message_ns
+                .saturating_add(timeout)
+                .saturating_sub(now_ns)
+                < 0;
+
+            !(has_gone_quiet || receiver.eos_flagged)
+        });
+
+        for receiver in &self.receivers {
+            min_limit_position = min_limit_position.min(receiver.last_position_plus_window);
+        }
+
+        self.has_required_receivers = self.group_is_satisfied();
+
+        if !self.group_is_satisfied() || self.receivers.is_empty() {
+            snd_lmt
+        } else {
+            min_limit_position
+        }
+    }
+
+    /// The same arithmetic `max` does, over the same multiple
+    /// (`aeron_min_flow_control_strategy_max_retransmission_length`, `:424-438`).
+    fn max_retransmission_length(
+        &self,
+        term_offset: usize,
+        resend_length: usize,
+        term_buffer_length: usize,
+        initial_window_length: usize,
+    ) -> usize {
+        MaxStrategy {
+            retransmit_receiver_window_multiple: self.retransmit_receiver_window_multiple,
+        }
+        .max_retransmission_length(
+            term_offset,
+            resend_length,
+            term_buffer_length,
+            initial_window_length,
+        )
+    }
+
+    /// A setup is going out (`aeron_min_flow_control_strategy_on_setup`,
+    /// `:283-303`) — and this is the one moment the strategy is told, so it is
+    /// the one moment it can say what the sender may write while the receivers
+    /// think about answering.
+    ///
+    /// Two conditions, and both matter: a status message with the matching tag
+    /// must have asked for the setup (a setup sent because the setup timer
+    /// expired is not an answer to anyone), and there must be receivers to
+    /// answer it (`:294`). Either way the flag is cleared — the next setup has
+    /// to be asked for again.
+    fn on_setup(&mut self, now_ns: i64, snd_lmt: SenderLimit) {
+        if self.has_matching_status_message_triggered_setup && !self.receivers.is_empty() {
+            self.time_of_last_setup_ns = now_ns;
+            self.last_setup_snd_lmt = snd_lmt;
+        }
+
+        self.has_matching_status_message_triggered_setup = false;
+    }
+
+    /// The reader that refused the stream is marked as leaving, and the next
+    /// pass drops it (`aeron_min_flow_control_strategy_on_error`, `:305-324`).
+    ///
+    /// Marked and not removed: this is the network thread's call, and the
+    /// receiver table is the strategy's own (`:321` sets `eos_flagged` and
+    /// stops).
+    fn on_error(&mut self, receiver_id: i64) {
+        for receiver in &mut self.receivers {
+            if receiver_id == receiver.receiver_id {
+                receiver.eos_flagged = true;
+            }
+        }
+    }
+
+    /// A status message asked for a setup
+    /// (`aeron_min_flow_control_strategy_process_on_trigger_send_setup`,
+    /// `:381-392`).
+    ///
+    /// The flag is only ever *set* here — and only by the first asking message
+    /// since the last setup went out — and only ever cleared by `on_setup`.
+    fn on_trigger_send_setup(&mut self, group_tag: Option<i64>) {
+        if !self.has_matching_status_message_triggered_setup {
+            self.has_matching_status_message_triggered_setup = self.tag_matches(group_tag);
+        }
+    }
+
+    fn has_required_receivers(&self) -> bool {
+        self.has_required_receivers
     }
 }
 
@@ -769,15 +1131,29 @@ fn scan_number(text: &str) -> Scanned<'_> {
 mod tests {
     use super::*;
 
+    /// A status message with everything but the fields under test left at
+    /// nothing.
+    pub(crate) fn reporting(consumption_position: i64, receiver_window: i32) -> StatusMessage {
+        StatusMessage {
+            consumption_position,
+            receiver_window,
+            receiver_id: 1,
+            session_id: 1,
+            stream_id: 1,
+            eos_flagged: false,
+            group_tag: None,
+        }
+    }
+
     #[test]
     fn the_sender_limit_is_the_far_edge_of_the_window_and_never_backs_up() {
         let mut strategy = MaxStrategy::default();
 
-        assert_eq!(1_600, strategy.on_sm(1_000, 600, 0));
+        assert_eq!(1_600, strategy.on_sm(&reporting(1_000, 600), 0, 0));
         // A window that moved backwards does not move the limit with it.
-        assert_eq!(1_600, strategy.on_sm(900, 300, 1_600));
+        assert_eq!(1_600, strategy.on_sm(&reporting(900, 300), 1_600, 0));
         // And a window that moved forwards does.
-        assert_eq!(2_000, strategy.on_sm(1_500, 500, 1_600));
+        assert_eq!(2_000, strategy.on_sm(&reporting(1_500, 500), 1_600, 0));
     }
 
     #[test]
@@ -818,6 +1194,348 @@ mod tests {
         assert_eq!(8 * 1024, receiver_window_length(8 * 1024, 64 * 1024));
         assert_eq!(32 * 1024, receiver_window_length(64 * 1024, 64 * 1024));
         assert_eq!(32 * 1024, receiver_window_length(1024 * 1024, 64 * 1024));
+    }
+
+    /// A status message from `receiver_id`, reading from `position` with
+    /// `window` of room.
+    fn from(receiver_id: i64, position: i64, window: i32) -> StatusMessage {
+        StatusMessage {
+            consumption_position: position,
+            receiver_window: window,
+            receiver_id,
+            session_id: 1,
+            stream_id: 1,
+            eos_flagged: false,
+            group_tag: None,
+        }
+    }
+
+    /// A `min` strategy with the default timeout and no group gate, so that
+    /// one receiver is a group.
+    fn min() -> MinStrategy {
+        MinStrategy::new(5_000_000_000, 0, None, MULTICAST_RRWM_DEFAULT)
+    }
+
+    #[test]
+    fn the_limit_is_the_slowest_receivers_window_edge() {
+        let mut strategy = min();
+
+        assert_eq!(1_500, strategy.on_sm(&from(1, 1_000, 500), 0, 0));
+        assert_eq!(
+            1_500,
+            strategy.on_sm(&from(2, 1_300, 500), 0, 0),
+            "the sender waits for the slowest reader, not for this one"
+        );
+        assert_eq!(2, strategy.receiver_count());
+
+        assert_eq!(
+            1_800,
+            strategy.on_sm(&from(1, 1_400, 400), 0, 0),
+            "receiver 1 has moved up to 1_800, which is now the lower of the two"
+        );
+    }
+
+    #[test]
+    fn the_limit_never_moves_backwards() {
+        let mut strategy = min();
+
+        assert_eq!(1_500, strategy.on_sm(&from(1, 1_000, 500), 0, 0));
+        assert_eq!(
+            1_500,
+            strategy.on_sm(&from(1, 100, 100), 1_500, 0),
+            "a receiver that moved backwards does not take the limit with it"
+        );
+    }
+
+    #[test]
+    fn an_existing_receivers_window_replaces_the_one_it_had() {
+        let mut strategy = min();
+
+        strategy.on_sm(&from(1, 1_000, 500), 0, 0);
+        // `:189`: `position + window_length`, not the larger of the two — a
+        // receiver that shrinks its window is taken at its word.
+        assert_eq!(1_200, strategy.on_sm(&from(1, 1_000, 200), 0, 0));
+    }
+
+    #[test]
+    fn a_receiver_that_has_gone_quiet_is_dropped_and_the_limit_follows_the_rest() {
+        let mut strategy = MinStrategy::new(1_000, 0, None, MULTICAST_RRWM_DEFAULT);
+
+        strategy.on_sm(&from(1, 1_000, 500), 0, 0);
+        strategy.on_sm(&from(2, 2_000, 500), 0, 500);
+        assert_eq!(2, strategy.receiver_count());
+
+        // Receiver 1 was last heard from at 0 and receiver 2 at 500, so a
+        // timeout of 1_000 that is now at 1_001 drops the first and not the
+        // second: the limit becomes what is left.
+        assert_eq!(2_500, strategy.on_idle(1_001, 1_500, 0, false));
+        assert_eq!(1, strategy.receiver_count());
+    }
+
+    #[test]
+    fn with_no_receivers_left_the_limit_does_not_move() {
+        let mut strategy = MinStrategy::new(1_000, 0, None, MULTICAST_RRWM_DEFAULT);
+
+        strategy.on_sm(&from(1, 1_000, 500), 0, 0);
+        assert_eq!(1_500, strategy.on_sm(&from(1, 1_000, 500), 0, 0));
+
+        assert_eq!(
+            1_500,
+            strategy.on_idle(1_001, 1_500, 0, false),
+            "the table is empty, so there is nothing to hold the limit back"
+        );
+        assert_eq!(0, strategy.receiver_count());
+        assert!(
+            strategy.has_required_receivers(),
+            "a group of none is satisfied by nobody (`0 >= 0`) — what keeps the \
+             publication unconnected is having no receiver at all"
+        );
+    }
+
+    #[test]
+    fn too_few_receivers_means_the_limit_does_not_move_at_all() {
+        let mut strategy = MinStrategy::new(5_000_000_000, 2, None, MULTICAST_RRWM_DEFAULT);
+
+        assert_eq!(
+            500,
+            strategy.on_sm(&from(1, 1_000, 500), 500, 0),
+            "one receiver is not a group of two: not the window edge, the limit it was given"
+        );
+        assert!(!strategy.has_required_receivers());
+        assert_eq!(1, strategy.receiver_count(), "but it is remembered");
+
+        assert_eq!(1_500, strategy.on_sm(&from(2, 1_000, 500), 500, 0));
+        assert!(strategy.has_required_receivers());
+    }
+
+    #[test]
+    fn a_receiver_that_is_leaving_does_not_join() {
+        let mut strategy = min();
+        let leaving = StatusMessage {
+            eos_flagged: true,
+            ..from(1, 1_000, 500)
+        };
+
+        assert_eq!(0, strategy.receiver_count());
+        assert_eq!(
+            1_500,
+            strategy.on_sm(&leaving, 0, 0),
+            "an empty table is the one case a message carries the limit forwards"
+        );
+        assert_eq!(
+            0,
+            strategy.receiver_count(),
+            "and it still does not become a receiver"
+        );
+    }
+
+    #[test]
+    fn a_receiver_further_behind_than_a_window_does_not_join() {
+        let mut strategy = min();
+
+        strategy.on_sm(&from(1, 10_000, 500), 0, 0);
+
+        // `:198-202`: `position_plus_window >= min_position - window_length`.
+        strategy.on_sm(&from(2, 8_500, 500), 0, 0);
+        assert_eq!(
+            1,
+            strategy.receiver_count(),
+            "9_000 is more than a window below 10_500"
+        );
+
+        strategy.on_sm(&from(3, 9_500, 500), 0, 0);
+        assert_eq!(
+            2,
+            strategy.receiver_count(),
+            "10_000 is exactly a window below it, which is close enough"
+        );
+    }
+
+    #[test]
+    fn a_leaving_receiver_is_dropped_by_the_next_pass() {
+        let mut strategy = min();
+
+        strategy.on_sm(&from(1, 1_000, 500), 0, 0);
+        strategy.on_sm(&from(2, 2_000, 500), 0, 0);
+        assert_eq!(2, strategy.receiver_count());
+
+        strategy.on_sm(
+            &StatusMessage {
+                eos_flagged: true,
+                ..from(1, 1_000, 500)
+            },
+            0,
+            0,
+        );
+        assert_eq!(
+            2,
+            strategy.receiver_count(),
+            "an end-of-stream message marks the receiver rather than removing it"
+        );
+
+        strategy.on_idle(0, 0, 0, false);
+        assert_eq!(1, strategy.receiver_count());
+        assert_eq!(2_500, strategy.on_idle(0, 2_500, 0, false));
+    }
+
+    /// A strategy that answers only to messages carrying `tag`
+    /// (`fc=tagged,g:<tag>`), with a group of one so that the empty-table
+    /// branch cannot answer for it.
+    fn tagged(tag: i64) -> MinStrategy {
+        MinStrategy::new(5_000_000_000, 1, Some(tag), MULTICAST_RRWM_DEFAULT)
+    }
+
+    #[test]
+    fn a_tagged_strategy_counts_only_messages_carrying_its_tag() {
+        let mut strategy = tagged(7);
+
+        assert_eq!(
+            999,
+            strategy.on_sm(&from(1, 1_000, 500), 999, 0),
+            "no tag at all is not its tag"
+        );
+        assert_eq!(
+            999,
+            strategy.on_sm(
+                &StatusMessage {
+                    group_tag: Some(9),
+                    ..from(1, 1_000, 500)
+                },
+                999,
+                0
+            ),
+            "nor is someone else's"
+        );
+        assert_eq!(0, strategy.receiver_count());
+
+        assert_eq!(
+            1_500,
+            strategy.on_sm(
+                &StatusMessage {
+                    group_tag: Some(7),
+                    ..from(1, 1_000, 500)
+                },
+                999,
+                0
+            ),
+            "its own tag is, and a group of one is satisfied"
+        );
+        assert_eq!(1, strategy.receiver_count());
+        assert!(strategy.has_required_receivers());
+    }
+
+    #[test]
+    fn the_plain_strategy_counts_a_message_that_carries_no_tag() {
+        let mut strategy = MinStrategy::new(5_000_000_000, 1, None, MULTICAST_RRWM_DEFAULT);
+
+        assert_eq!(1_500, strategy.on_sm(&from(1, 1_000, 500), 0, 0));
+        assert_eq!(
+            1_500,
+            strategy.on_sm(
+                &StatusMessage {
+                    group_tag: Some(9),
+                    ..from(2, 2_000, 500)
+                },
+                0,
+                0
+            ),
+            "a tag it never asked for is not a reason to ignore anyone — and the \
+             limit is still the slowest receiver's"
+        );
+        assert_eq!(2, strategy.receiver_count());
+    }
+
+    /// `on_setup` is the strategy's one chance to say what the sender may
+    /// write while the receivers it just asked are thinking about answering,
+    /// and it takes two conditions to use it (`aeron_min_flow_control.c:283-303`).
+    #[test]
+    fn only_a_setup_a_matching_message_asked_for_records_its_limit() {
+        let mut strategy = tagged(7);
+        let reporting = |position: i64, window: i32| StatusMessage {
+            group_tag: Some(7),
+            ..from(1, position, window)
+        };
+
+        strategy.on_sm(&reporting(1_000, 500), 0, 0);
+
+        // The setup timer expired rather than anyone asking: nothing recorded.
+        strategy.on_setup(10, 1_200);
+        assert_eq!(3_500, strategy.on_sm(&reporting(3_000, 500), 0, 10));
+
+        // Asked for, but by a message with someone else's tag.
+        strategy.on_trigger_send_setup(Some(9));
+        strategy.on_setup(20, 1_200);
+        assert_eq!(3_500, strategy.on_sm(&reporting(3_000, 500), 0, 20));
+
+        // Asked for by its own tag: now the limit holds.
+        strategy.on_trigger_send_setup(Some(7));
+        strategy.on_setup(30, 1_200);
+        assert_eq!(
+            1_200,
+            strategy.on_sm(&reporting(3_000, 500), 0, 30),
+            "the sender stays where the setup left it until the receivers answer"
+        );
+    }
+
+    /// And the record only lasts as long as a receiver may: a setup nobody
+    /// answers cannot hold the sender for ever (`:83-96`).
+    #[test]
+    fn the_limit_a_setup_was_sent_under_is_forgotten_on_the_receiver_timeout() {
+        let mut strategy = MinStrategy::new(1_000, 1, Some(7), MULTICAST_RRWM_DEFAULT);
+
+        strategy.on_sm(
+            &StatusMessage {
+                group_tag: Some(7),
+                ..from(1, 1_000, 500)
+            },
+            0,
+            0,
+        );
+        strategy.on_trigger_send_setup(Some(7));
+        strategy.on_setup(10, 1_200);
+
+        assert_eq!(
+            1_200,
+            strategy.on_sm(
+                &StatusMessage {
+                    group_tag: Some(7),
+                    ..from(1, 3_000, 500)
+                },
+                0,
+                10
+            )
+        );
+        assert_eq!(
+            3_500,
+            strategy.on_sm(
+                &StatusMessage {
+                    group_tag: Some(7),
+                    ..from(1, 3_000, 500)
+                },
+                0,
+                1_011
+            ),
+            "ten nanoseconds past the setup's own one thousand"
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_refused_the_stream_is_dropped_by_the_next_pass() {
+        let mut strategy = min();
+
+        strategy.on_sm(&from(1, 1_000, 500), 0, 0);
+        strategy.on_sm(&from(2, 2_000, 500), 0, 0);
+        assert_eq!(1_500, strategy.on_sm(&from(1, 1_000, 500), 0, 0));
+
+        strategy.on_error(1);
+        assert_eq!(2, strategy.receiver_count(), "marked, not removed");
+
+        assert_eq!(
+            2_500,
+            strategy.on_idle(0, 1_500, 0, false),
+            "and the limit now follows the receiver that is left"
+        );
+        assert_eq!(1, strategy.receiver_count());
     }
 
     #[test]

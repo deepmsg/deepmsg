@@ -48,7 +48,7 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
 use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
 
-use crate::flowcontrol::{FlowControl, Strategy, receiver_window_length};
+use crate::flowcontrol::{FlowControl, StatusMessage, Strategy, receiver_window_length};
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::protocol::{
     DataFrame, ErrorFrame, FrameHeader, NakFrame, RttmFrame, SetupFrame, StatusMessageFrame,
@@ -1163,6 +1163,7 @@ impl NetworkPublication {
         &mut self,
         frame: &StatusMessageFrame,
         flags: u8,
+        group_tag: Option<i64>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
@@ -1191,9 +1192,19 @@ impl NetworkPublication {
         )
         .raw();
 
-        let new_limit =
-            self.flow_control
-                .on_sm(consumption_position, frame.receiver_window, snd_lmt);
+        let new_limit = self.flow_control.on_sm(
+            &StatusMessage {
+                consumption_position,
+                receiver_window: frame.receiver_window,
+                receiver_id: frame.receiver_id,
+                session_id: frame.session_id,
+                stream_id: frame.stream_id,
+                eos_flagged: flags & header_flags::SM_EOS != 0,
+                group_tag,
+            },
+            snd_lmt,
+            now_ns,
+        );
 
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
 
@@ -2101,7 +2112,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         assert!(fixture.publication.has_subscribers(&counters, &regions));
         assert_eq!(
@@ -2159,7 +2170,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&status, 0, &counters, &regions, 1_000);
+            .on_status_message(&status, 0, None, &counters, &regions, 1_000);
 
         assert!(
             fixture
@@ -2451,7 +2462,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         assert_eq!(
             Some(8192),
@@ -2475,6 +2486,7 @@ mod tests {
         fixture.publication.on_status_message(
             &frame,
             crate::protocol::header_flags::SM_EOS,
+            None,
             &counters,
             &regions,
             1_100,
@@ -2502,7 +2514,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         // A heartbeat-less, data-less pass after the timeout: the receiver is
         // expired rather than simply never seen.
@@ -2541,7 +2553,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         let mut metadata = vec![0u8; 64 * 1024 * 4];
         let mut values = vec![0u8; 64 * 1024];
