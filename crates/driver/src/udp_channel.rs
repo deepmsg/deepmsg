@@ -33,8 +33,9 @@
 //! addresses, the socket buffer sizes, the receiver window, the tag and the
 //! control mode. The timestamp-offset parameters are **refused** rather than
 //! ignored — a driver that dropped them silently would serve a channel that
-//! behaves like a different one — and so are `group`/`gtag`, whose flow-control
-//! semantics are a later slice. Both refusals are recorded in `docs/compat.md`.
+//! behaves like a different one — and `gtag` is read here into the tag a
+//! receiver stamps into its status messages (`group_tag`). The refusal is
+//! recorded in `docs/compat.md`.
 //!
 //! # A multicast endpoint is a different shape
 //!
@@ -143,6 +144,16 @@ pub struct UdpChannel {
     pub local_control: SocketAddr,
     /// The `tags=` channel tag, or [`INVALID_TAG`].
     pub tag_id: i64,
+    /// The `gtag=` group tag, or [`None`] when the channel named none — which
+    /// is not the same as naming `-1` (`aeron_uri_get_int64`'s two answers,
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:384-407`).
+    ///
+    /// It is what a receiver puts in the eight optional bytes of every status
+    /// message it sends, and what it sets the flag for on an error frame
+    /// (`media/aeron_receive_channel_endpoint.c:302-325`, `:483-489`); a
+    /// channel that names none falls back to the driver's own
+    /// `AERON_RECEIVER_GROUP_TAG` (`:39-46`).
+    pub group_tag: Option<i64>,
     /// The kernel's index for the interface, which the multicast options use
     /// and a unicast socket does not.
     pub interface_index: u32,
@@ -289,6 +300,13 @@ impl UdpChannel {
         let control = uri.value("control");
         let control_mode = read_control_mode(uri)?;
         let channel_tag = channel_tag(uri);
+        // The receiver's group tag: what it puts in the eight optional bytes
+        // of every status message it sends (`media/aeron_receive_channel_endpoint.c:302-325`),
+        // read the way the endpoint reads it (`:32-53`, through
+        // `aeron_uri_get_int64`). A channel that names none is not a channel
+        // that named `-1`: the endpoint falls back to the driver's own tag for
+        // the first and not for the second.
+        let group_tag = uri.i64("gtag")?;
 
         refuse_unsupported(uri)?;
 
@@ -353,6 +371,7 @@ impl UdpChannel {
                 remote_control: multicast_control_address(endpoint_addr)?,
                 local_control: local,
                 tag_id,
+                group_tag,
                 interface_index,
                 multicast_ttl: read_multicast_ttl(uri),
                 has_explicit_endpoint: endpoint.is_some(),
@@ -417,6 +436,7 @@ impl UdpChannel {
             remote_control: endpoint_addr,
             local_control,
             tag_id,
+            group_tag,
             interface_index,
             multicast_ttl: 0,
             has_explicit_endpoint: endpoint.is_some(),
@@ -676,16 +696,18 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
 ///
 /// The reference would serve every one of these. A driver that dropped them
 /// silently would be a driver whose channel behaved like a different one — a
-/// multicast group that receives nothing, a timestamped image without
-/// timestamps — so they are refused and `docs/compat.md` carries the
-/// divergence.
+/// timestamped image without timestamps, an ATS endpoint without encryption —
+/// so they are refused and `docs/compat.md` carries the divergence.
+///
+/// `group=` and `gtag=` were both here and are both served now: `group=` from
+/// G3-1 (it is a subscription parameter, read where a subscription is made)
+/// and `gtag=` with the strategies that read it.
 ///
 /// # Errors
 ///
 /// [`UdpChannelError::Unsupported`] for the first such parameter present.
 fn refuse_unsupported(uri: &ChannelUri<'_>) -> Result<(), UdpChannelError> {
     for key in [
-        "gtag",
         "media-rcv-ts-offset",
         "channel-rcv-ts-offset",
         "channel-snd-ts-offset",
@@ -1548,15 +1570,44 @@ mod tests {
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|ats=1").error_code()
+        );
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|media-rcv-ts-offset=1").error_code()
         );
     }
 
     #[test]
-    fn a_group_tag_is_still_refused_where_a_group_parameter_is_not() {
+    fn a_group_tag_is_a_parameter_like_any_other() {
+        // `gtag=` is read into the channel, on a unicast one as much as on a
+        // multicast one: the reference resolves it in
+        // `aeron_receive_channel_endpoint_set_group_tag`, which asks the
+        // channel nothing about its kind (`:32-53`).
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|gtag=17");
+        assert_eq!(Some(17), named.group_tag);
+
+        let multicast = resolve("aeron:udp?endpoint=224.0.1.1:40123|gtag=-1");
+        assert_eq!(
+            Some(-1),
+            multicast.group_tag,
+            "absent and `-1` are different answers, which is why this is not a number"
+        );
+
+        assert_eq!(
+            None,
+            resolve("aeron:udp?endpoint=127.0.0.1:40123").group_tag
+        );
+
+        // The reference's reader is `strtoll(.., 0)` and requires the whole
+        // value (`aeron_uri_get_int64`, `aeron-client/src/main/c/uri/aeron_uri.c:393-402`).
+        assert_eq!(
+            Some(16),
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|gtag=0x10").group_tag
+        );
         assert!(matches!(
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1"),
-            UdpChannelError::Unsupported(_)
+            refuse("aeron:udp?endpoint=127.0.0.1:40123|gtag=1x"),
+            UdpChannelError::Uri(_)
         ));
 
         // `group=` is a *subscription* parameter and never reached this layer

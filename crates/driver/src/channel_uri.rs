@@ -114,9 +114,20 @@ pub enum UriError {
     },
     /// Not UTF-8. See the module note: the reference compares bytes.
     NotUtf8,
-    /// A parameter with no `=`, or an empty name.
+    /// A parameter with no `=` at all — `?key|…`
+    /// (`aeron_uri_parse_params`, `aeron_uri.c:60`, "invalid end of key").
     MissingKey {
         /// The text that had no key.
+        text: String,
+    },
+    /// A parameter whose name is empty — `?=value`
+    /// (`:51`, "empty key not allowed"). Not the same failure as the one
+    /// above: the reference tells them apart by the state its scanner is in
+    /// when it sees the character, and so does this — a parameter that was
+    /// never named is refused where the `=` is, and one that was named is
+    /// refused where the parameter ends.
+    EmptyKey {
+        /// The text of the parameter, `=` and all.
         text: String,
     },
     /// A parameter whose value is empty.
@@ -156,8 +167,11 @@ impl fmt::Display for UriError {
                 "URI length ({length}) exceeds the maximum supported length ({MAX_LENGTH})"
             ),
             Self::NotUtf8 => f.write_str("the URI is not valid UTF-8"),
-            Self::MissingKey { text } => write!(f, "parameter `{text}` has no value"),
-            Self::MissingValue { key } => write!(f, "parameter `{key}` has an empty value"),
+            // These three are the reference's own words: they are what it puts
+            // in the error buffer, and the composition above quotes them.
+            Self::MissingKey { .. } => f.write_str("invalid end of key"),
+            Self::EmptyKey { .. } => f.write_str("empty key not allowed"),
+            Self::MissingValue { .. } => f.write_str("empty value not allowed"),
             Self::NotANumber { key, value } => {
                 write!(f, "could not parse {key}={value} in URI as a number")
             }
@@ -172,6 +186,81 @@ impl fmt::Display for UriError {
 }
 
 impl std::error::Error for UriError {}
+
+impl UriError {
+    /// What the reference's per-thread error buffer holds after its URI parse
+    /// fails — the lines an operator reads out of `ErrorStat`, and the same
+    /// text the client is handed as its `ON_ERROR` message.
+    ///
+    /// Every line here was probed against a live reference driver rather than
+    /// read off the source, because the composition is not one function's: the
+    /// scanner sets the code and its own site (`aeron_uri_parse_params`,
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:51`, `:60`, `:78`), the parse
+    /// that called it appends the URI it was given (`aeron_uri.c:296`), and
+    /// the failure the scanner cannot see — a URI that names no transport —
+    /// is set and sited on the parse itself (`:271`, `:318`). What the
+    /// conductor adds after this is its own line, which is the caller's.
+    ///
+    /// `None` for a failure the reference has no site for: a URI that is not
+    /// UTF-8 is not something its byte-wise scanner can see.
+    pub fn parse_failure(&self, uri: &[u8]) -> Option<String> {
+        let text = String::from_utf8_lossy(uri);
+        let invalid_channel = -deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL;
+
+        let (function, line, message, appends_uri) = match self {
+            Self::InvalidScheme => (
+                "aeron_uri_parse",
+                318,
+                format!("invalid URI scheme or transport: {text}"),
+                false,
+            ),
+            Self::TooLong { length } => (
+                "aeron_uri_parse",
+                271,
+                format!(
+                    "URI length ({length}) exceeds max supported length ({}): {text}",
+                    MAX_LENGTH - 1
+                ),
+                false,
+            ),
+            // `:51` is a key that was never there — `?=value` — and `:60` a
+            // key with no `=` at the end of the parameter.
+            Self::EmptyKey { .. } => (
+                "aeron_uri_parse_params",
+                51,
+                "empty key not allowed".to_owned(),
+                true,
+            ),
+            Self::MissingKey { .. } => (
+                "aeron_uri_parse_params",
+                60,
+                "invalid end of key".to_owned(),
+                true,
+            ),
+            Self::MissingValue { .. } => (
+                "aeron_uri_parse_params",
+                78,
+                "empty value not allowed".to_owned(),
+                true,
+            ),
+            _ => return None,
+        };
+
+        let mut composed = deepmsg_cnc::error_log::compose_description(
+            invalid_channel,
+            function,
+            "aeron_uri.c",
+            line,
+            &message,
+        );
+
+        if appends_uri {
+            composed.push_str(&format!("[aeron_uri_parse, aeron_uri.c:296] {text}\n"));
+        }
+
+        Some(composed)
+    }
+}
 
 impl<'a> ChannelUri<'a> {
     /// Read a URI, exactly as far as the reference's scanner does: the scheme
@@ -256,6 +345,37 @@ impl<'a> ChannelUri<'a> {
         };
 
         i32::try_from(number)
+            .map(Some)
+            .map_err(|_| UriError::OutOfRange {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            })
+    }
+
+    /// An `int64` parameter (`aeron_uri_get_int64`,
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:384-407`).
+    ///
+    /// The same base and the same consumption rule as [`i64`](Self::i64)'s
+    /// smaller sibling, and the same two errors — the reference has one reader
+    /// per width and nothing else differs between them.
+    ///
+    /// # Errors
+    ///
+    /// [`UriError::NotANumber`] for a value that is not one in that base, and
+    /// [`UriError::OutOfRange`] for one that does not fit in 64 bits.
+    pub fn i64(&self, key: &str) -> Result<Option<i64>, UriError> {
+        let Some(value) = self.value(key) else {
+            return Ok(None);
+        };
+
+        let Some(number) = parse_base_zero(value) else {
+            return Err(UriError::NotANumber {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            });
+        };
+
+        i64::try_from(number)
             .map(Some)
             .map_err(|_| UriError::OutOfRange {
                 key: key.to_owned(),
@@ -360,7 +480,7 @@ fn scan_params<'a>(text: &'a str) -> Result<Vec<Param<'a>>, UriError> {
         };
 
         if key.is_empty() {
-            return Err(UriError::MissingKey {
+            return Err(UriError::EmptyKey {
                 text: pair.to_owned(),
             });
         }
@@ -453,11 +573,18 @@ fn parse_size(key: &str, value: &str) -> Result<u64, UriError> {
 
 /// `aeron_parse_duration_ns`, including the one-character tail it tolerates.
 fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
-    let not_a_number = || UriError::NotANumber {
+    parse_duration_value(value).ok_or_else(|| UriError::NotANumber {
         key: key.to_owned(),
         value: value.to_owned(),
-    };
+    })
+}
 
+/// The same parse, without the URI's name for a value that is not one.
+///
+/// The reference has one duration parser and its option parsers call it too
+/// (`aeron_flow_control.c:617`), so `t:` in an `fc=` reads a duration exactly
+/// as `nak-delay=` does.
+pub(crate) fn parse_duration_value(value: &str) -> Option<i64> {
     let trimmed = value.trim_start();
     let (negative, digits) = match trimmed.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -468,15 +595,15 @@ fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(digits.len());
     if end == 0 || negative {
-        return Err(not_a_number());
+        return None;
     }
 
-    let magnitude: i64 = digits[..end].parse().map_err(|_| not_a_number())?;
+    let magnitude: i64 = digits[..end].parse().ok()?;
     let tail = &digits[end..];
 
     // A bare number is nanoseconds.
     let Some(unit) = tail.chars().next() else {
-        return Ok(magnitude);
+        return Some(magnitude);
     };
 
     let after = &tail[unit.len_utf8()..];
@@ -490,17 +617,135 @@ fn parse_duration(key: &str, value: &str) -> Result<i64, UriError> {
                 _ => 1,
             }
         }
-        _ => return Err(not_a_number()),
+        _ => return None,
     };
 
     // `value * multiplier` saturating, which is the reference's answer for a
     // value it would otherwise overflow: it stores `LLONG_MAX`.
-    Ok(magnitude.saturating_mul(multiplier))
+    Some(magnitude.saturating_mul(multiplier))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lines the reference's error buffer holds after a parse failure —
+    /// every one of them read off a live reference driver rather than guessed
+    /// (`UriError::parse_failure`'s note says how).
+    #[test]
+    fn a_parse_failure_composes_the_lines_the_reference_records() {
+        assert_eq!(
+            concat!(
+                "(-1) invalid channel\n",
+                "[aeron_uri_parse, aeron_uri.c:318] invalid URI scheme or transport: invalidaeron:ipc\n",
+            ),
+            UriError::InvalidScheme
+                .parse_failure(b"invalidaeron:ipc")
+                .expect("a site")
+        );
+
+        // The parameter scanner sets its own site **and** the parse appends the
+        // URI it was given (`aeron_uri.c:296`), which is why these are three
+        // lines before the conductor has said anything.
+        assert_eq!(
+            concat!(
+                "(-1) invalid channel\n",
+                "[aeron_uri_parse_params, aeron_uri.c:51] empty key not allowed\n",
+                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?=value\n",
+            ),
+            UriError::EmptyKey {
+                text: "=value".to_owned()
+            }
+            .parse_failure(b"aeron:udp?=value")
+            .expect("a site")
+        );
+        assert_eq!(
+            concat!(
+                "(-1) invalid channel\n",
+                "[aeron_uri_parse_params, aeron_uri.c:60] invalid end of key\n",
+                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?key|endpoint=localhost:24325\n",
+            ),
+            UriError::MissingKey {
+                text: "key".to_owned()
+            }
+            .parse_failure(b"aeron:udp?key|endpoint=localhost:24325")
+            .expect("a site")
+        );
+        assert_eq!(
+            concat!(
+                "(-1) invalid channel\n",
+                "[aeron_uri_parse_params, aeron_uri.c:78] empty value not allowed\n",
+                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?endpoint=|control=localhost:24326\n",
+            ),
+            UriError::MissingValue {
+                key: "endpoint".to_owned()
+            }
+            .parse_failure(b"aeron:udp?endpoint=|control=localhost:24326")
+            .expect("a site")
+        );
+
+        assert_eq!(
+            concat!(
+                "(-1) invalid channel\n",
+                "[aeron_uri_parse, aeron_uri.c:271] URI length (4147) exceeds max supported length (4095): x\n",
+            ),
+            UriError::TooLong { length: 4147 }
+                .parse_failure(b"x")
+                .expect("a site")
+        );
+
+        // A failure the reference's byte-wise scanner cannot see has no site
+        // to quote.
+        assert_eq!(None, UriError::NotUtf8.parse_failure(b"aeron:udp?x=\xff"));
+    }
+
+    /// And the parser really raises those variants for those URIs, so that the
+    /// composition above is wired to a failure that happens rather than to one
+    /// that would.
+    #[test]
+    fn the_parser_raises_the_failures_the_reference_sites() {
+        for (uri, expected) in [
+            (
+                "invalidaeron:ipc",
+                concat!(
+                    "(-1) invalid channel\n",
+                    "[aeron_uri_parse, aeron_uri.c:318] invalid URI scheme or transport: invalidaeron:ipc\n",
+                ),
+            ),
+            (
+                "aeron:udp?=value",
+                concat!(
+                    "(-1) invalid channel\n",
+                    "[aeron_uri_parse_params, aeron_uri.c:51] empty key not allowed\n",
+                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?=value\n",
+                ),
+            ),
+            (
+                "aeron:udp?key|endpoint=localhost:24325",
+                concat!(
+                    "(-1) invalid channel\n",
+                    "[aeron_uri_parse_params, aeron_uri.c:60] invalid end of key\n",
+                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?key|endpoint=localhost:24325\n",
+                ),
+            ),
+            (
+                "aeron:udp?endpoint=|control=localhost:24326",
+                concat!(
+                    "(-1) invalid channel\n",
+                    "[aeron_uri_parse_params, aeron_uri.c:78] empty value not allowed\n",
+                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?endpoint=|control=localhost:24326\n",
+                ),
+            ),
+        ] {
+            let error = ChannelUri::parse(uri.as_bytes()).expect_err(uri);
+
+            assert_eq!(
+                Some(expected.to_owned()),
+                error.parse_failure(uri.as_bytes()),
+                "{uri}"
+            );
+        }
+    }
 
     fn parse(uri: &str) -> ChannelUri<'_> {
         ChannelUri::parse(uri.as_bytes()).unwrap_or_else(|error| panic!("{uri}: {error}"))

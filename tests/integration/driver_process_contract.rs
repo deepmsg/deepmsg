@@ -199,7 +199,12 @@ const IGNORED: &[(&str, &str)] = &[
     ),
     (
         "AERON_UNICAST_FLOWCONTROL_SUPPLIER",
-        "aeron_max_unicast_flow_control_strategy_supplier",
+        // The symbol the reference's own table holds (`aeron_flow_control.c:47`),
+        // which is what `CTestMediaDriver` sends for a `DefaultUnicastFlowControlSupplier`
+        // (`CTestMediaDriver.java:64`). It was written here as
+        // `aeron_max_unicast_…`, which is a name no table has and the reference
+        // would refuse.
+        "aeron_unicast_flow_control_strategy_supplier",
     ),
 ];
 

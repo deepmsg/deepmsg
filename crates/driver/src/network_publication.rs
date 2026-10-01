@@ -48,7 +48,7 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail};
 use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
 
-use crate::flowcontrol::{MaxStrategy, Strategy, receiver_window_length};
+use crate::flowcontrol::{FlowControl, StatusMessage, Strategy, receiver_window_length};
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::protocol::{
     DataFrame, ErrorFrame, FrameHeader, NakFrame, RttmFrame, SetupFrame, StatusMessageFrame,
@@ -91,6 +91,13 @@ pub struct PublicationCounters {
     pub snd_bpe: i32,
     /// `snd-naks-received`: how many NAKs this publication was told about.
     pub snd_naks_received: i32,
+    /// `fc-receivers`: how many receivers the flow-control strategy is
+    /// holding, for a strategy that holds any (`aeron_flow_control.h:28`).
+    ///
+    /// [`None`] under `max`, which keeps none and is given no counter — the
+    /// reference allocates this one in the group supplier alone
+    /// (`aeron_min_flow_control.c:483-513`).
+    pub fc_receivers: Option<i32>,
 }
 
 /// A receiver that has told this publication it is there
@@ -162,8 +169,9 @@ pub struct NetworkPublication {
     pub mtu_length: i32,
     /// How far ahead of the slowest local reader the producer may run.
     pub term_window_length: i32,
-    /// `max`, for a unicast channel.
-    pub flow_control: MaxStrategy,
+    /// What `fc=` chose for this publication, and `max` when it chose
+    /// nothing.
+    pub flow_control: FlowControl,
     /// The retransmissions this publication owes.
     pub retransmit_handler: RetransmitHandler,
     /// Whether the stream signals end of stream in its heartbeats.
@@ -254,6 +262,10 @@ pub struct NetworkPublication {
     track_sender_limits: bool,
     /// Whether the stream has ended (`is_end_of_stream`).
     pub is_end_of_stream: bool,
+    /// When a revoke was noticed, or [`None`] while the stream is running
+    /// (`conductor_fields.time_of_last_activity_ns` on the way into the
+    /// reference's LINGER state).
+    linger_since_ns: Option<i64>,
     /// A datagram-sized scratch buffer, allocated once, that frames are copied
     /// into on the way out — see the module note.
     scratch: Vec<u8>,
@@ -304,7 +316,7 @@ impl NetworkPublication {
         is_exclusive: bool,
         counters: PublicationCounters,
         max_messages_per_send: usize,
-        flow_control: MaxStrategy,
+        flow_control: FlowControl,
         retransmit_handler: RetransmitHandler,
         page_size: usize,
         socket_buffers: crate::sys::SocketBufferLengths,
@@ -436,6 +448,7 @@ impl NetworkPublication {
             is_connected: false,
             track_sender_limits: false,
             is_end_of_stream: false,
+            linger_since_ns: None,
             scratch: vec![0u8; max_messages_per_send * params.mtu_length as usize],
         })
     }
@@ -579,6 +592,11 @@ impl NetworkPublication {
                 let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
             }
 
+            // A group strategy drops the receivers that have gone quiet here
+            // (`aeron_min_flow_control.c:98-157`), so this is the pass its count
+            // changes on as well as the one a status message arrives on.
+            self.update_receiver_count(counters, regions);
+
             if self.expire_receivers(now_ns) {
                 self.update_connected_status(
                     counters,
@@ -642,6 +660,16 @@ impl NetworkPublication {
 
         if frame.write_with_flags(&mut buffer, flags).is_none() {
             return Ok(0);
+        }
+
+        if self.is_setup_elicited {
+            // `:414-421`: only an elicited setup is reported, and it is
+            // reported *before* the frame goes out — a strategy that gates on
+            // the setup it sent reads the limit from this moment
+            // (`aeron_min_flow_control.c:283-303`).
+            let snd_lmt = counters.value(regions, self.counters.snd_lmt).unwrap_or(0);
+
+            self.flow_control.on_setup(now_ns, snd_lmt);
         }
 
         let sent = self.do_send(endpoint, &[&buffer], counters, regions, now_ns)?;
@@ -741,6 +769,76 @@ impl NetworkPublication {
         // Bytes: this value is what a pass that sent no data reports, and the
         // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:457`).
         Ok(if sent < 1 { 0 } else { buffer.len() })
+    }
+
+    /// Cut the stream off and say so
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_EVENT_REVOKE`,
+    /// `aeron_network_publication.c:1075-1079`).
+    ///
+    /// One byte, on the log buffer every reader maps: the heartbeat that
+    /// carries `REVOKED`, the image that drains because of it and the readers
+    /// that are told are all downstream of this.
+    pub fn set_revoked(&self) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
+        }
+    }
+
+    /// What a revoked publication does on its next pass, and when it is
+    /// finished.
+    ///
+    /// Two of the reference's arms in one call
+    /// (`aeron_network_publication_check_managed_resources`, `:1240-1340`):
+    ///
+    /// * **ACTIVE → LINGER**, the first time the byte is seen. The limit stops
+    ///   where the producer did, the log says where the stream ended, this
+    ///   publication is no longer connected and — the part everything else is
+    ///   for — its heartbeats say `REVOKED` from here on. That is what a
+    ///   reader's image needs to drain, and it is why a publication cannot be
+    ///   released in the same pass as its revoke.
+    /// * **LINGER → DONE**, once nobody is left to tell: no receivers at all,
+    ///   or the linger window (`aeron.publication.linger.timeout`) gone by.
+    ///
+    /// Returns whether the publication is finished with, which is when the
+    /// conductor may finish releasing it.
+    pub fn notice_revoke(
+        &mut self,
+        now_ns: i64,
+        linger_timeout_ns: i64,
+        system: &System<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        let Some(since) = self.linger_since_ns else {
+            if !self.is_revoked() {
+                return false;
+            }
+
+            let revoked_position = self.producer_position().unwrap_or(0);
+
+            let _ = counters.set_value(regions, self.counters.pub_lmt, revoked_position);
+            self.set_end_of_stream(revoked_position);
+            self.is_end_of_stream = true;
+            self.linger_since_ns = Some(now_ns);
+
+            system.increment(system_counters::id::PUBLICATIONS_REVOKED);
+
+            return false;
+        };
+
+        if self.has_receivers() && now_ns <= since + linger_timeout_ns {
+            return false;
+        }
+
+        true
+    }
+
+    /// Write where the stream ended, which is how a reader that has not seen
+    /// the heartbeats yet still learns it is over.
+    fn set_end_of_stream(&self, position: i64) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_i64_release(descriptor::END_OF_STREAM_POSITION_OFFSET, position);
+        }
     }
 
     /// Whether the log buffer's metadata says the publication was revoked
@@ -1073,28 +1171,33 @@ impl NetworkPublication {
     /// good. Without it a receiver that has restarted, or a second one that
     /// arrives later, is never answered and builds no image.
     ///
-    /// The reference also hands the status message and its source address to
-    /// the flow control strategy here (`on_trigger_send_setup`, `.h:255-259`).
-    /// This build has one strategy, `max`, whose implementation of that hook is
-    /// empty (`aeron_flow_control.c:182-188`), so there is nothing to call it
-    /// with yet — the hook and the address it needs arrive with the strategy
-    /// that reads them, and `dispatch` does not carry a source address today.
-    /// `address` is where the message that elicited this came from, and for a
-    /// response publication it is the **only** place this publication may ever
-    /// send: the peer that asked for the channel is the one that elicited, and
-    /// it is learned here or not at all
+    /// The reference hands the status message to the flow control strategy
+    /// here as well (`on_trigger_send_setup`, `.h:255-261`), and the only thing
+    /// any strategy reads out of it is the group tag
+    /// (`aeron_min_flow_control.c:394-422`) — which is why what this takes is
+    /// the tag and not the frame.
+    ///
+    /// `elicited_from` is where the message came from, and for a response
+    /// publication it is the **only** place this publication may ever send: the
+    /// peer that asked for the channel is the one that elicited, and it is
+    /// learned here or not at all
     /// (`aeron_network_publication_trigger_send_setup_frame`,
     /// `aeron_network_publication.h:243-274`).
-    /// `elicited_from` is where the message came from. It is optional only
-    /// because this build's transport can be asked not to report a source;
-    /// a datagram off a socket always has one, and a response publication
-    /// learns its peer from nothing else.
-    pub fn trigger_send_setup_frame(&mut self, elicited_from: Option<SocketAddr>) {
+    /// It is optional only because this build's transport can be asked not to
+    /// report a source; a datagram off a socket always has one, and a response
+    /// publication learns its peer from nothing else.
+    pub fn trigger_send_setup_frame(
+        &mut self,
+        elicited_from: Option<SocketAddr>,
+        group_tag: Option<i64>,
+    ) {
         if self.is_end_of_stream {
             return;
         }
 
         self.is_setup_elicited = true;
+
+        self.flow_control.on_trigger_send_setup(group_tag);
 
         if self.is_response {
             if let Some(address) = elicited_from {
@@ -1147,6 +1250,7 @@ impl NetworkPublication {
         &mut self,
         frame: &StatusMessageFrame,
         flags: u8,
+        group_tag: Option<i64>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         now_ns: i64,
@@ -1175,11 +1279,23 @@ impl NetworkPublication {
         )
         .raw();
 
-        let new_limit =
-            self.flow_control
-                .on_sm(consumption_position, frame.receiver_window, snd_lmt);
+        let new_limit = self.flow_control.on_sm(
+            &StatusMessage {
+                consumption_position,
+                receiver_window: frame.receiver_window,
+                receiver_id: frame.receiver_id,
+                session_id: frame.session_id,
+                stream_id: frame.stream_id,
+                eos_flagged: flags & header_flags::SM_EOS != 0,
+                group_tag,
+            },
+            snd_lmt,
+            now_ns,
+        );
 
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
+
+        self.update_receiver_count(counters, regions);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
 
@@ -1268,6 +1384,11 @@ impl NetworkPublication {
     ) -> bool {
         // `error-frames-received` is counted at the endpoint, before the
         // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
+        // The strategy is told first (`aeron_network_publication.c:869`): it
+        // keeps its own receivers, and a reader that refused the stream is one
+        // of them leaving rather than one that has gone quiet.
+        self.flow_control.on_error(frame.receiver_id);
+
         let was_live = self.remove_receiver(frame.receiver_id);
 
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
@@ -1304,7 +1425,7 @@ impl NetworkPublication {
         let term_length = self.term_length as usize;
         let term_window = self.term_window_length as usize;
         let mtu = self.mtu_length as usize;
-        let flow_control = self.flow_control;
+        let flow_control = &self.flow_control;
 
         let outcome = self.retransmit_handler.on_nak(
             &mut PublicationFaults { system },
@@ -1332,6 +1453,27 @@ impl NetworkPublication {
         outcome
     }
 
+    /// Write how many receivers the strategy is holding into `fc-receivers`
+    /// (`aeron_min_flow_control.c:241-242`, `:151-152`).
+    ///
+    /// A publication under a strategy that keeps none has no counter to write
+    /// and nothing to write into it.
+    fn update_receiver_count(&self, counters: &CounterManager, regions: &CounterRegions<'_>) {
+        let Some(counter_id) = self.counters.fc_receivers else {
+            return;
+        };
+
+        let Some(count) = self.flow_control.group_receiver_count() else {
+            return;
+        };
+
+        let _ = counters.set_value(
+            regions,
+            counter_id,
+            i64::try_from(count).unwrap_or(i64::MAX),
+        );
+    }
+
     /// Whether this publication counts a reader at all
     /// (`aeron_network_publication_has_subscribers`, `:755-766`).
     ///
@@ -1342,13 +1484,16 @@ impl NetworkPublication {
     /// no one has subscribed to over the wire can still be live.
     ///
     /// The reference's receiver clause also asks the flow control whether it
-    /// *requires* receivers (`has_required_receivers`), which is true for
-    /// every strategy but a multicast one. This build serves unicast only, so
-    /// the question has one answer here.
+    /// *requires* receivers (`has_required_receivers`, `:760`), and that is the
+    /// gate a group-aware strategy is: it answers `false` until enough of them
+    /// have asked for the stream, so a publication on such a channel is not
+    /// connected while nobody is there to read it. The `and` binds to the
+    /// receiver clause alone — a local spy is not a receiver the strategy has
+    /// to have heard (`:755-761`).
     pub fn has_subscribers(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> bool {
         let _ = (counters, regions);
 
-        self.has_receivers()
+        (self.has_receivers() && self.flow_control.has_required_receivers())
             || (self.spies_simulate_connection && self.subscribers.has_working_positions())
     }
 
@@ -1963,6 +2108,7 @@ mod tests {
             &params,
             false,
             PublicationCounters {
+                fc_receivers: None,
                 pub_pos: 0,
                 pub_lmt: 1,
                 snd_pos: 2,
@@ -1971,7 +2117,7 @@ mod tests {
                 snd_naks_received: 5,
             },
             4,
-            MaxStrategy::default(),
+            FlowControl::default(),
             RetransmitHandler::new(0, 5_000_000, false, 1),
             4096,
             crate::sys::SocketBufferLengths {
@@ -2077,7 +2223,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         assert!(fixture.publication.has_subscribers(&counters, &regions));
         assert_eq!(
@@ -2135,7 +2281,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&status, 0, &counters, &regions, 1_000);
+            .on_status_message(&status, 0, None, &counters, &regions, 1_000);
 
         assert!(
             fixture
@@ -2427,7 +2573,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         assert_eq!(
             Some(8192),
@@ -2451,6 +2597,7 @@ mod tests {
         fixture.publication.on_status_message(
             &frame,
             crate::protocol::header_flags::SM_EOS,
+            None,
             &counters,
             &regions,
             1_100,
@@ -2478,7 +2625,7 @@ mod tests {
 
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         // A heartbeat-less, data-less pass after the timeout: the receiver is
         // expired rather than simply never seen.
@@ -2517,7 +2664,7 @@ mod tests {
         };
         fixture
             .publication
-            .on_status_message(&frame, 0, &counters, &regions, 1_000);
+            .on_status_message(&frame, 0, None, &counters, &regions, 1_000);
 
         let mut metadata = vec![0u8; 64 * 1024 * 4];
         let mut values = vec![0u8; 64 * 1024];
@@ -2662,6 +2809,7 @@ mod tests {
                 &params(TERM_LENGTH, MTU, 32 * 1024),
                 false,
                 PublicationCounters {
+                    fc_receivers: None,
                     pub_pos: 0,
                     pub_lmt: 1,
                     snd_pos: 2,
@@ -2670,7 +2818,7 @@ mod tests {
                     snd_naks_received: 5,
                 },
                 4,
-                MaxStrategy::default(),
+                FlowControl::default(),
                 RetransmitHandler::new(0, 5_000_000, has_group_semantics, 1),
                 4096,
                 crate::sys::SocketBufferLengths {

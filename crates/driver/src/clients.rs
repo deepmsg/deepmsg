@@ -42,6 +42,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::IpcPublications;
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::receiver::ReceiverProxy;
 use crate::sender::SenderProxy;
 use crate::system_counters;
 
@@ -389,6 +390,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
     ) -> usize {
         let mut reaped = 0;
@@ -409,6 +411,7 @@ impl Clients {
                 events,
                 publications,
                 subscriptions,
+                receiver,
                 sender,
             );
             self.records.swap_remove(index);
@@ -435,6 +438,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
     ) {
         let record = &mut self.records[index];
@@ -455,6 +459,7 @@ impl Clients {
             manager,
             regions,
             publications,
+            receiver,
             sender,
             now_ms,
         );
@@ -751,6 +756,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                None,
                 &SenderProxy::disconnected()
             )
         );
@@ -793,6 +799,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                None,
                 &SenderProxy::disconnected()
             ),
             "a zeroed heartbeat expires on the next tick, without a timeout"
@@ -840,6 +847,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            None,
             &SenderProxy::disconnected(),
         );
 
@@ -889,6 +897,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                None,
                 &SenderProxy::disconnected()
             )
         );
@@ -945,6 +954,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            None,
             &SenderProxy::disconnected(),
         );
         assert!(

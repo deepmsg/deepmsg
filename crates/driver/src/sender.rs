@@ -84,6 +84,20 @@ pub enum SenderCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Cut a publication's stream off, telling its readers why
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_EVENT_REVOKE`, which
+    /// `aeron_network_publication_handle_managed_resource_event` answers by
+    /// setting the byte on its log metadata, `:1075-1079`).
+    ///
+    /// The conductor cannot do this itself for the reason it cannot give a
+    /// publication a reader: the log buffer is the sender's. The flag is what
+    /// travels, and everything that follows — the heartbeat saying `REVOKED`,
+    /// the image at the far end draining, the readers being told — is already
+    /// this build's.
+    RevokePublication {
+        /// Which one.
+        registration_id: i64,
+    },
     /// Give a publication a local reader
     /// (`aeron_driver_subscribable_add_position`,
     /// `aeron_driver_conductor.c:3497-3523`).
@@ -179,6 +193,18 @@ pub enum SenderEvent {
     EndpointRemoved {
         /// Which endpoint.
         id: u64,
+    },
+    /// A revoked publication has nothing left to tell its readers
+    /// (`aeron_network_publication_check_managed_resources`'s LINGER arm,
+    /// `:1327-1340`), so the conductor may finish releasing it.
+    ///
+    /// It is the second half of a two-phase removal: the client's link goes
+    /// when it asks to, and the publication stays long enough to say
+    /// `REVOKED` — a publication dropped in the same pass as its revoke would
+    /// never get to say anything.
+    PublicationDrained {
+        /// Which one.
+        registration_id: i64,
     },
     /// A publication is no longer being sent.
     PublicationRemoved {
@@ -306,6 +332,18 @@ impl SenderProxy {
     pub fn remove_publication(&self, registration_id: i64) -> io::Result<()> {
         self.commands
             .send(SenderCommand::RemovePublication { registration_id })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the sender to revoke a publication
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_REVOKE`).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn revoke_publication(&self, registration_id: i64) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::RevokePublication { registration_id })
             .map_err(|_| stopped())
     }
 
@@ -445,6 +483,7 @@ impl Sender {
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
         cycle_threshold_ns: i64,
+        linger_timeout_ns: i64,
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -457,8 +496,14 @@ impl Sender {
                     return;
                 };
 
-                let mut sender =
-                    SenderThread::new(cnc, counters, mtu_length, cycle_threshold_ns, event_tx);
+                let mut sender = SenderThread::new(
+                    cnc,
+                    counters,
+                    mtu_length,
+                    cycle_threshold_ns,
+                    linger_timeout_ns,
+                    event_tx,
+                );
                 sender.run(&command_rx);
             })?;
 
@@ -504,6 +549,9 @@ struct SenderThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
     cycle_threshold_ns: i64,
+    /// How long a publication that has said everything it has to say sticks
+    /// around before it is released (`aeron.publication.linger.timeout`).
+    linger_timeout_ns: i64,
     events: Channel<SenderEvent>,
     endpoints: Vec<(u64, Box<SendChannelEndpoint>)>,
     publications: Vec<NetworkPublication>,
@@ -532,12 +580,14 @@ impl SenderThread {
         counters: CounterManager,
         mtu_length: usize,
         cycle_threshold_ns: i64,
+        linger_timeout_ns: i64,
         events: Channel<SenderEvent>,
     ) -> Self {
         Self {
             cnc,
             counters,
             cycle_threshold_ns,
+            linger_timeout_ns,
             events,
             endpoints: Vec::new(),
             publications: Vec::new(),
@@ -562,6 +612,15 @@ impl SenderThread {
                     }
                     SenderCommand::AddPublication { publication } => {
                         self.publications.push(*publication);
+                    }
+                    SenderCommand::RevokePublication { registration_id } => {
+                        if let Some(publication) = self
+                            .publications
+                            .iter()
+                            .find(|publication| publication.registration_id == registration_id)
+                        {
+                            publication.set_revoked();
+                        }
                     }
                     SenderCommand::RemovePublication { registration_id } => {
                         self.publications
@@ -647,6 +706,7 @@ impl SenderThread {
             &system,
             &self.counters,
             &regions,
+            self.linger_timeout_ns,
             &self.events,
         );
 
@@ -973,13 +1033,14 @@ impl SenderThread {
                 };
 
                 if is_send_setup {
-                    publications[index].trigger_send_setup_frame(source);
+                    publications[index].trigger_send_setup_frame(source, frame.group_tag(bytes));
                     return;
                 }
 
                 if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
                     header.flags,
+                    frame.group_tag(bytes),
                     counters,
                     regions,
                     now_ns,
@@ -1165,6 +1226,7 @@ impl SenderThread {
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
+        linger_timeout_ns: i64,
         events: &Channel<SenderEvent>,
     ) -> usize {
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
@@ -1179,6 +1241,14 @@ impl SenderThread {
 
             let endpoint = &mut endpoints[position].1;
             let registration_id = publication.registration_id;
+
+            // A revoked publication has one last thing to do — say so — and
+            // this is where it is noticed, on the thread that owns it
+            // (`aeron_network_publication_check_managed_resources`'s ACTIVE and
+            // LINGER arms, `:1240-1340`).
+            if publication.notice_revoke(now_ns, linger_timeout_ns, system, counters, regions) {
+                let _ = events.send(SenderEvent::PublicationDrained { registration_id });
+            }
 
             match publication.send(endpoint, system, counters, regions, now_ns) {
                 Ok(bytes) => {
@@ -1304,7 +1374,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
-    use crate::flowcontrol::MaxStrategy;
+    use crate::flowcontrol::FlowControl;
     use crate::media::TransportParams;
     use crate::network_publication::{NetworkPublication, PublicationCounters};
     use crate::publication_params::PublicationParams;
@@ -1504,6 +1574,7 @@ mod tests {
                 snd_lmt: allocate(&mut manager, b"snd-lmt"),
                 snd_bpe: allocate(&mut manager, b"snd-bpe"),
                 snd_naks_received: allocate(&mut manager, b"snd-naks"),
+                fc_receivers: None,
             };
 
             // The window is open and the producer has published a frame.
@@ -1566,7 +1637,7 @@ mod tests {
                 false,
                 ids,
                 4,
-                MaxStrategy::default(),
+                FlowControl::default(),
                 RetransmitHandler::new(1_000, 5_000_000, false, 1),
                 4096,
                 crate::sys::SocketBufferLengths {
@@ -1588,6 +1659,7 @@ mod tests {
             1_000,
             1408,
             100_000_000,
+            crate::config::PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT,
         )
         .expect("a sender");
 

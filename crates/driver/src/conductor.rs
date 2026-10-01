@@ -412,6 +412,18 @@ impl ClientEvents for Transmit<'_> {
 
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
+/// The line the reference's conductor appends when a channel will not parse
+/// (`aeron_driver_conductor.c:4686-4687` for a publication, `:5173-5174` for a
+/// subscription), with the **empty message** its `AERON_APPEND_ERR("%s", "")`
+/// writes — which is why the line ends in a space.
+///
+/// It is appended to whatever the URI parse left, and both together are what
+/// the client is handed as its `ON_ERROR` message: probed against a live
+/// reference driver, where the three lines arrive in one string.
+fn channel_parse_append(function: &str, line: u32) -> String {
+    format!("[{function}, aeron_driver_conductor.c:{line}] \n")
+}
+
 /// (`aeron_driver_conductor.c:3231-3235`).
 ///
 /// The code is recorded negated because the reference's `AERON_SET_ERR` is
@@ -522,6 +534,13 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
+    /// Revoked publications whose release waits for the sender to say they
+    /// have finished saying `REVOKED`
+    /// ([`SenderEvent::PublicationDrained`](crate::sender::SenderEvent::PublicationDrained)).
+    awaiting_drain: std::collections::HashSet<i64>,
+    /// The ones the sender has finished with since the last pass, waiting to
+    /// be released by a pass that has the counter regions.
+    drained_publications: Vec<i64>,
     /// Publications a receiver refused, as the sender heard it: each owes its
     /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
     /// datagram they arrived in.
@@ -648,6 +667,7 @@ impl Conductor {
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.publication_linger_timeout_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -737,6 +757,8 @@ impl Conductor {
             pending_log_errors: Vec::new(),
             pending_untethered: Vec::new(),
             pending_publication_errors: Vec::new(),
+            awaiting_drain: std::collections::HashSet::new(),
+            drained_publications: Vec::new(),
         };
 
         Ok(conductor)
@@ -1117,14 +1139,20 @@ impl Conductor {
         self.release_spies_of(registration_id);
 
         if let Some(region) = self.cnc.counter_regions() {
-            for counter_id in [
+            let mut counter_ids = vec![
                 record.counters.pub_pos,
                 record.counters.pub_lmt,
                 record.counters.snd_pos,
                 record.counters.snd_lmt,
                 record.counters.snd_bpe,
                 record.counters.snd_naks_received,
-            ] {
+            ];
+
+            // Only a strategy that keeps receivers was given one
+            // (`aeron_min_flow_control.c:454-470` frees it with the strategy).
+            counter_ids.extend(record.counters.fc_receivers);
+
+            for counter_id in counter_ids {
                 let _ = self.counters.free(&region, counter_id, self.now_ms);
             }
         }
@@ -1494,6 +1522,13 @@ impl Conductor {
                 } => {
                     self.pending_untethered.push((registration_id, events));
                 }
+                crate::sender::SenderEvent::PublicationDrained { registration_id } => {
+                    // The publication has said `REVOKED` and is done with; the
+                    // release the client asked for can finish now.
+                    if self.awaiting_drain.remove(&registration_id) {
+                        self.drained_publications.push(registration_id);
+                    }
+                }
                 crate::sender::SenderEvent::Fault {
                     error_code,
                     description,
@@ -1749,7 +1784,8 @@ impl Conductor {
         // release itself needs the sender and the endpoint registry, which the
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
-        let mut pending_publication_releases: Vec<i64> = Vec::new();
+        let mut pending_publication_releases: Vec<i64> =
+            std::mem::take(&mut self.drained_publications);
         // The destination commands, for the same reason: the *sender* is what
         // puts a destination on a tracker, and the drain's closure cannot reach
         // it. The payloads are kept verbatim, so that what is decoded below is
@@ -1858,10 +1894,24 @@ impl Conductor {
                                 // answer from one whose parameters do not add
                                 // up (`aeron_driver_conductor.c:2344-2352`).
                                 *publication_failures += 1;
+                                // A channel that will not parse is described
+                                // by what the parse left behind plus this
+                                // command's own site; everything else by the
+                                // error's own words.
+                                let description = match error.uri_parse_failure(request.channel) {
+                                    Some(uri_lines) => format!(
+                                        "{uri_lines}{}",
+                                        channel_parse_append(
+                                            "aeron_driver_conductor_on_add_network_publication",
+                                            4687,
+                                        )
+                                    ),
+                                    None => error.to_string(),
+                                };
                                 transmit.error(
                                     request.correlation_id,
                                     error.error_code(),
-                                    error.to_string().as_bytes(),
+                                    description.as_bytes(),
                                 );
                             }
                         }
@@ -1886,21 +1936,47 @@ impl Conductor {
 
                         match link {
                             Some(link) => {
+                                // A revoked **network** publication is the one
+                                // removal that does not finish here: the sender
+                                // owns it, and it has one more thing to say —
+                                // `REVOKED` — which takes at least a heartbeat
+                                // (`aeron_network_publication.c:1244-1280`, then
+                                // LINGER at `:1327-1340`). Its release waits for
+                                // the sender to report it drained.
+                                let mut is_draining = false;
+
                                 if request.flags & REMOVE_PUBLICATION_FLAG_REVOKE != 0 {
-                                    if let Some(publication) = publications
-                                        .publications_mut()
-                                        .iter_mut()
-                                        .find(|publication| {
-                                            publication.registration_id
-                                                == link.publication_registration_id
-                                        })
+                                    // The publication is in one of two places —
+                                    // the IPC registry here, the sender's own
+                                    // list otherwise — and the reference reaches
+                                    // it the same way in both: through the
+                                    // resource its link holds (`:4716-4719`).
+                                    let registration_id = link.publication_registration_id;
+
+                                    if network_publications.find(registration_id).is_some() {
+                                        let _ =
+                                            sender.proxy().revoke_publication(registration_id);
+
+                                        self.awaiting_drain.insert(registration_id);
+                                        is_draining = true;
+                                    } else if let Some(publication) =
+                                        publications.publications_mut().iter_mut().find(
+                                            |publication| {
+                                                publication.registration_id == registration_id
+                                            },
+                                        )
                                     {
                                         publication.set_revoked();
                                     }
                                 }
 
                                 publications.release_links(&[link], counters, &counter_regions);
-                                pending_publication_releases.push(link.publication_registration_id);
+
+                                if !is_draining {
+                                    pending_publication_releases
+                                        .push(link.publication_registration_id);
+                                }
+
                                 transmit.operation_succeeded(request.correlated.correlation_id);
                             }
                             None => {
@@ -1941,6 +2017,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                Some(receiver.proxy()),
                                 sender.proxy(),
                                 now_ms,
                             );
@@ -2024,10 +2101,20 @@ impl Conductor {
 
                         if let Err(error) = subscription_result {
                             *subscription_failures += 1;
+                            let description = match error.uri_parse_failure(request.channel) {
+                                Some(uri_lines) => format!(
+                                    "{uri_lines}{}",
+                                    channel_parse_append(
+                                        "aeron_driver_conductor_on_add_network_subscription",
+                                        5174,
+                                    )
+                                ),
+                                None => error.to_string(),
+                            };
                             transmit.error(
                                 request.correlation_id,
                                 error.error_code(),
-                                error.to_string().as_bytes(),
+                                description.as_bytes(),
                             );
                         }
                     }
@@ -2925,6 +3012,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            Some(self.receiver.proxy()),
             self.sender.proxy(),
         );
 

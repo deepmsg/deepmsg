@@ -272,6 +272,22 @@ impl AddError {
     /// only ever answered to a client. `AgentStopped` falls back on purpose:
     /// the reference sets its code from the log-buffer agent's own result
     /// (`:6579`), which this build does not carry.
+    /// The lines the reference's URI parse left behind, when this failure is
+    /// one of its (`channel_uri::UriError::parse_failure`).
+    ///
+    /// `channel` is the URI as the client wrote it, which several of those
+    /// lines quote.
+    pub fn uri_parse_failure(&self, channel: &[u8]) -> Option<String> {
+        match self {
+            Self::Params(PublicationParamsError::Uri(error)) => error.parse_failure(channel),
+            Self::Channel(error) => match error.as_ref() {
+                crate::udp_channel::UdpChannelError::Uri(error) => error.parse_failure(channel),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub const fn recorded_error_code(&self) -> i32 {
         match self {
             Self::SenderMtu(_) => libc::EINVAL,
@@ -1154,6 +1170,7 @@ impl IpcPublications {
             config.socket_buffers,
             pub_pos_counter_id,
             pub_lmt_counter_id,
+            config.image_liveness_timeout_ns,
         ) {
             Ok(publication) => publication,
             Err(log) => {

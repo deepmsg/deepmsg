@@ -109,23 +109,49 @@ impl std::fmt::Display for ReceiveEndpointErrorKind {
 impl std::error::Error for ReceiveEndpointErrorKind {}
 
 /// The endpoints a driver receives through, and the receiver ids they hold.
-#[derive(Debug, Default)]
+/// The id the first receiver of a driver introduces itself with
+/// (`aeron_driver_context.c:1306-1313`).
+fn first_receiver_id() -> i64 {
+    loop {
+        let id = i64::from(sys::random_i32()) * i64::from(sys::random_i32());
+
+        if 0 != id {
+            return id;
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ReceiveChannelEndpoints {
     entries: Vec<ReceiveChannelEndpointEntry>,
     next_id: u64,
     /// The id the next endpoint introduces itself with
     /// (`context->next_receiver_id++`,
-    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:96`).
+    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:92`).
     next_receiver_id: i64,
+}
+
+impl Default for ReceiveChannelEndpoints {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReceiveChannelEndpoints {
     /// No endpoints, and the first receiver id.
-    pub const fn new() -> Self {
+    ///
+    /// That id is **random and not one** (`aeron_driver_context.c:1303-1313`):
+    /// the product of two randomised `int32`s, retried until it is not zero.
+    /// A driver that started at one would hand out the same receiver ids as
+    /// every other driver, and a sender that keeps its receivers keyed by that
+    /// id — which is what a group strategy does
+    /// (`aeron_min_flow_control.c:185`) — would take two readers on two drivers
+    /// for one reader reporting twice.
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             next_id: 1,
-            next_receiver_id: 0,
+            next_receiver_id: first_receiver_id(),
         }
     }
 
@@ -222,8 +248,15 @@ impl ReceiveChannelEndpoints {
         let receiver_id = self.next_receiver_id;
         self.next_receiver_id += 1;
 
+        // `:105` reads the group tag before anything else is built, and takes
+        // the channel's own `gtag=` when it named one: a channel that names
+        // none is not a channel that named `-1`
+        // (`aeron_receive_channel_endpoint_set_group_tag`, `:39-46`).
+        let group_tag = channel.group_tag.or(config.receiver_group_tag);
+
         let endpoint = ReceiveChannelEndpoint::create(
             channel,
+            group_tag,
             params,
             receiver_id,
             config.stream_session_limit,
@@ -532,6 +565,24 @@ mod tests {
         found.expect("a counter").label
     }
 
+    /// Two drivers must not introduce their receivers with the same id
+    /// (`aeron_driver_context.c:1306-1313`).
+    ///
+    /// A sender keys its receivers by that id — the liveness tracker does, and
+    /// so does every group strategy (`aeron_min_flow_control.c:185`) — so a
+    /// driver that started counting at one would make another driver's
+    /// receivers look like its own reporting twice.
+    #[test]
+    fn a_driver_hands_out_receiver_ids_no_other_driver_hands_out() {
+        let first = first_receiver_id();
+        assert_ne!(0, first, "the reference retries until it is not zero");
+
+        assert!(
+            (0..8).any(|_| first_receiver_id() != first),
+            "a constant is not a random start"
+        );
+    }
+
     #[test]
     fn the_label_names_the_address_the_endpoint_is_bound_to() {
         let mut fixture = Fixture::new();
@@ -539,7 +590,7 @@ mod tests {
 
         let (_, id, _) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:40223"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
                 // A window no receive buffer can be smaller than: this test is
@@ -559,7 +610,7 @@ mod tests {
         // so the address is that port — and a reader that gets the whole label
         // knows which socket it is looking at.
         assert_eq!(
-            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40123 127.0.0.1:40123",
+            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40223 127.0.0.1:40223",
             label(&regions, id)
         );
     }
@@ -600,9 +651,9 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
-        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40123";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m";
+        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40243";
 
         endpoints
             .get_or_add(
@@ -635,8 +686,8 @@ mod tests {
                 error,
                 ReceiveEndpointErrorKind::ChannelValidation(ref message) if message ==
                     "so-rcvbuf=2097152 does not match existing value of 1048576: \
-                     existingChannel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m \
-                     channel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m"
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m"
             ),
             "{error}"
         );
@@ -683,8 +734,8 @@ mod tests {
         // clause reachable at all. A manual channel's destinations arrive one
         // at a time from clients, so it is asking to *join* a socket rather
         // than to describe one, and the reference leaves it alone entirely.
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40253|so-rcvbuf=1m";
+        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40253|control-mode=manual|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(
@@ -723,8 +774,8 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(

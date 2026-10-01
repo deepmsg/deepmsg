@@ -51,10 +51,14 @@ use crate::system_counters::{self, System};
 /// (`aeron.status.message.timeout`, 200 ms).
 pub const STATUS_MESSAGE_TIMEOUT_NS: i64 = 200_000_000;
 
-/// How long an image may go without a packet before it starts draining
-/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:204` — ten seconds).
-pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
+/// What an image is built with when nothing configures one
+/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:204`).
+///
+/// The value a driver actually uses is
+/// [`DriverConfig::image_liveness_timeout_ns`](crate::config::DriverConfig::image_liveness_timeout_ns);
+/// this is the default that setting starts from, and what a test that builds an
+/// image by hand passes.
+pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = crate::config::IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT;
 
 /// How many status-message periods a drained image waits before lingering
 /// (`AERON_IMAGE_SM_EOS_MULTIPLE`,
@@ -344,6 +348,7 @@ impl PublicationImage {
         counters: ImageCounters,
         initial_window_length: i32,
         sm_timeout_ns: i64,
+        liveness_timeout_ns: i64,
         page_size: usize,
         untethered: SubscriptionParams,
         group_semantics: bool,
@@ -480,7 +485,7 @@ impl PublicationImage {
             sm_timeout_ns,
             initial_window_length: window,
             max_receiver_window_length: window,
-            liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS,
+            liveness_timeout_ns,
             // The channel's own delays, when it named one. `nak-delay=` is the
             // whole of what a subscription may say about how its gaps are asked
             // for (`aeron_publication_image.c:100-118`), and until this line
@@ -825,6 +830,15 @@ impl PublicationImage {
         if let Some(metadata) = self.log.metadata() {
             let _ =
                 metadata.store_i64_release(descriptor::END_OF_STREAM_POSITION_OFFSET, eos_position);
+
+            // `:800`: the byte goes in the **image's** metadata, which is the
+            // file a client's `Image` maps — `Image.isPublicationRevoked`
+            // reads exactly this byte, and an image told the stream was
+            // revoked without it is an image whose reader cannot say why it
+            // went away.
+            if self.is_revoked {
+                let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
+            }
         }
     }
 
@@ -1398,6 +1412,17 @@ impl PublicationImage {
     ) -> bool {
         match self.state {
             ImageState::Active => {
+                // `:1307-1311`: a revoked publication takes the image out of
+                // ACTIVE at once. It is the one case that does not wait for the
+                // stream to go quiet — the sender has said the stream is over
+                // and a reader that keeps waiting is reading nothing.
+                if self.is_revoked {
+                    self.state = ImageState::Draining;
+                    self.time_of_last_state_change_ns = now_ns;
+                    self.is_sending_eos_sm = true;
+                    return true;
+                }
+
                 let quiet = now_ns > self.time_of_last_packet_ns + self.liveness_timeout_ns;
                 let drained = self.is_end_of_stream && self.is_drained(counters, regions);
 
@@ -1426,7 +1451,12 @@ impl PublicationImage {
             ImageState::Linger => {
                 let expired = now_ns > self.time_of_last_state_change_ns + self.liveness_timeout_ns;
 
-                if !self.has_subscribers() || expired {
+                // A revoked image lingers for nobody: this build tells the
+                // readers the image is gone when it reaches DONE rather than on
+                // the way into LINGER, so a revoked one has to get there
+                // without waiting out a liveness window that exists for
+                // senders that might come back. A revoked one will not.
+                if self.is_revoked || !self.has_subscribers() || expired {
                     self.state = ImageState::Done;
                     return true;
                 }
@@ -1764,6 +1794,7 @@ mod tests {
                 },
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
+                IMAGE_LIVENESS_TIMEOUT_NS,
                 4096,
                 untethered,
                 group_semantics,
@@ -2588,6 +2619,33 @@ mod tests {
             "the last reader leaving is what the clause is for"
         );
         assert_eq!(ImageState::Draining, fixture.image.state);
+    }
+
+    /// A revoked image does not wait for anything: `ACTIVE → DRAINING` the
+    /// moment the flag is seen (`:1307-1311`), `DRAINING → LINGER` on the same
+    /// flag (`:1330-1349`), and out of `LINGER` without waiting out a liveness
+    /// window that exists for a sender that might come back — a revoked one
+    /// will not.
+    #[test]
+    fn a_revoked_image_walks_to_done_without_waiting() {
+        let mut fixture = Fixture::new();
+        let _reader = add_reader(&mut fixture);
+        let regions = fixture.holder.open();
+
+        fixture.image.is_revoked = true;
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Draining, fixture.image.state);
+        assert!(
+            fixture.image.is_sending_eos_sm,
+            "and it owes its readers an end-of-stream status message"
+        );
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Linger, fixture.image.state);
+
+        assert!(fixture.image.on_time_event(&fixture.counters, &regions, 0));
+        assert_eq!(ImageState::Done, fixture.image.state);
     }
 
     /// A heartbeat proposes the position it arrived at, and nothing on top.
