@@ -251,6 +251,26 @@ impl UdpChannel {
         self.is_multicast || self.control_mode.is_multi_destination()
     }
 
+    /// Where a control frame about data that arrived from `source` goes
+    /// (`aeron_receive_destination.c:120-129`, and the same three arms in
+    /// `aeron_data_packet_dispatcher.c:636-637`).
+    ///
+    /// The multicast arm is the one that is easy to miss and impossible to
+    /// work without: a group's control frames go to the group's **control
+    /// twin**, not back to the source address they came from. A subscriber
+    /// that answered the source would be answering a port the publisher never
+    /// listens on, and the publisher would wait for a status message that can
+    /// never arrive.
+    pub fn control_address(&self, source: SocketAddr) -> SocketAddr {
+        if self.is_multicast {
+            self.remote_control
+        } else if self.has_explicit_control {
+            self.local_control
+        } else {
+            source
+        }
+    }
+
     /// [`UdpChannel::has_group_semantics`] for a channel that has been parsed
     /// but not resolved into an address.
     ///
@@ -1636,6 +1656,26 @@ mod tests {
         assert_eq!(
             plain.canonical_form, tagged.canonical_form,
             "but the canonical form of a group takes no suffix (`:421-441`)"
+        );
+    }
+
+    #[test]
+    fn a_groups_control_frames_go_to_its_control_twin() {
+        let source = ipv4("127.0.0.1:5555");
+
+        assert_eq!(
+            ipv4("224.0.1.2:40123"),
+            resolve("aeron:udp?endpoint=224.0.1.1:40123").control_address(source),
+            "a group answers on its control twin, not to whoever wrote"
+        );
+        assert_eq!(
+            ipv4("127.0.0.1:40124"),
+            resolve("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124")
+                .control_address(source)
+        );
+        assert_eq!(
+            source,
+            resolve("aeron:udp?endpoint=127.0.0.1:40123").control_address(source)
         );
     }
 

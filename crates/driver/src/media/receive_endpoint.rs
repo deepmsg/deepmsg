@@ -780,14 +780,20 @@ impl ReceiveChannelEndpoint {
     }
 
     /// Where a status message about `source` should go
-    /// (`aeron_receive_destination.c:120-129`): the channel's control address
-    /// when it named one, and otherwise the source of the data being answered.
-    pub fn control_address(&self, source: SocketAddr) -> SocketAddr {
-        if self.channel.has_explicit_control {
-            self.channel.local_control
-        } else {
-            source
-        }
+    /// (`aeron_receive_destination.c:120-129`): a group's control twin, the
+    /// control address a channel named, or else the source of the data being
+    /// answered.
+    ///
+    /// It is the **destination's** channel that answers, not the endpoint's
+    /// ([`UdpChannel::control_address`], asked of the destination's own
+    /// channel): a multi-destination endpoint's destinations are channels of
+    /// their own, and one of them may be a group while the endpoint is not.
+    pub fn control_address(&self, destination_index: usize, source: SocketAddr) -> SocketAddr {
+        self.destinations
+            .get(destination_index)
+            .map_or(source, |destination| {
+                destination.channel.control_address(source)
+            })
     }
 
     /// Send a status message
