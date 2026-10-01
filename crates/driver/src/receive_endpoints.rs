@@ -88,6 +88,11 @@ pub enum ReceiveEndpointErrorKind {
     /// client's `RegistrationException` carries — the checks that produce it
     /// are [`crate::channel_validation`]'s business.
     ChannelValidation(String),
+    /// The **bind** failed. The composition arrives already started — the
+    /// syscall, the transport and the destination each wrote a line — and this
+    /// layer adds the correlation id the reference names here
+    /// (`aeron_driver_conductor.c:2110`).
+    Bind(deepmsg_cnc::error_log::ErrorReport),
 }
 
 impl std::fmt::Display for ReceiveEndpointErrorKind {
@@ -96,6 +101,7 @@ impl std::fmt::Display for ReceiveEndpointErrorKind {
             Self::NoCounter => f.write_str("could not allocate the receive channel status counter"),
             Self::Socket(error) => write!(f, "{error}"),
             Self::ChannelValidation(message) => f.write_str(message),
+            Self::Bind(report) => f.write_str(report.text()),
         }
     }
 }
@@ -229,6 +235,16 @@ impl ReceiveChannelEndpoints {
         .map_err(|error| match error {
             ReceiveEndpointError::NoCounter => ReceiveEndpointErrorKind::NoCounter,
             ReceiveEndpointError::Socket(error) => ReceiveEndpointErrorKind::Socket(error),
+            ReceiveEndpointError::Bind(mut report) => {
+                // `:2110`: `AERON_APPEND_ERR("correlation_id=%" PRId64, …)`.
+                report.append(
+                    "aeron_driver_conductor_get_or_add_receive_channel_endpoint",
+                    "aeron_driver_conductor.c",
+                    2110,
+                    &format!("correlation_id={registration_id}"),
+                );
+                ReceiveEndpointErrorKind::Bind(report)
+            }
         })?;
 
         // The same status the send side writes, for the same reason: a

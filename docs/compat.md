@@ -194,6 +194,15 @@ the sender-MTU refusal below is the first site that does. Both drivers are
 driven through that fault and their entries compared, masked only for the
 session id, by `tests/interop/mtu_fault_entry.rs`.
 
+An appended line is a site and a message and nothing else — no code of its own
+— and a failure that crosses several layers collects one per layer as it
+unwinds. `deepmsg_cnc::error_log::ErrorReport` is that buffer as a value, since
+this build has no thread-local and the buffer has to reach the top to be
+finished. Both drivers are driven through a subscription whose port cannot be
+bound — the longest such chain, five lines — and the entry *and* the message
+the client is answered with are compared, masked only for the descriptor
+number, by `tests/interop/bind_fault_entry.rs`.
+
 One recorded text diverges: a broadcast transmit failure. The reference
 appends it with `AERON_APPEND_ERR` (`aeron_driver_conductor.c:2240`), which
 resets neither the code nor the thread's error buffer — so the entry is the

@@ -51,7 +51,7 @@ use crate::ipc_publications::{AddError, IpcPublications};
 use crate::network_publications::{NetworkPublicationRecord, NetworkPublications};
 use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
-use crate::receive_endpoints::ReceiveChannelEndpoints;
+use crate::receive_endpoints::{ReceiveChannelEndpoints, ReceiveEndpointErrorKind};
 use crate::receiver::ReceiverProxy;
 use crate::sender::SenderProxy;
 use crate::subscribable::TetherState;
@@ -1428,7 +1428,22 @@ impl IpcSubscriptions {
                 now.ms,
             )
             .map_err(|error| AddSubscriptionError::Endpoint {
-                message: error.to_string(),
+                message: match error {
+                    ReceiveEndpointErrorKind::Bind(mut report) => {
+                        // `:5043`: the last `AERON_APPEND_ERR` on the way up,
+                        // and the one with an **empty message** — the site
+                        // line alone says "this is where the subscription was
+                        // being added", and the reference writes it that way.
+                        report.append(
+                            "aeron_driver_conductor_execute_add_network_subscription",
+                            "aeron_driver_conductor.c",
+                            5043,
+                            "",
+                        );
+                        report.into_text()
+                    }
+                    other => other.to_string(),
+                },
             })?;
 
         if let Some(endpoint) = new_endpoint {

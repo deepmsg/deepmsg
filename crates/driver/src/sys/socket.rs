@@ -106,6 +106,30 @@ const IPV6_JOIN_GROUP: libc::c_int = libc::IPV6_ADD_MEMBERSHIP;
 /// *any* group.
 const IPV6_MULTICAST_ALL: libc::c_int = 29;
 
+/// A bind that failed, with the two things the reference's message names: the
+/// descriptor and the address (`aeron_bind`, `aeron_socket.c:88-95`).
+///
+/// Carried rather than folded into an `io::Error` because the caller three
+/// layers up is the one that composes the entry, and the descriptor number is
+/// knowable only here.
+#[derive(Debug)]
+pub struct BindFailure {
+    /// The errno, which is also what the composition's first line carries.
+    pub source: io::Error,
+    /// The descriptor the bind was attempted on.
+    pub fd: i32,
+    /// The address it was attempted at.
+    pub address: SocketAddr,
+}
+
+impl std::fmt::Display for BindFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for BindFailure {}
+
 /// A UDP socket, owned for as long as this value lives.
 #[derive(Debug)]
 pub struct DatagramSocket {
@@ -144,7 +168,7 @@ impl DatagramSocket {
     /// # Errors
     ///
     /// The error from `bind(2)`.
-    pub fn bind(&self, address: SocketAddr) -> io::Result<()> {
+    pub fn bind(&self, address: SocketAddr) -> Result<(), BindFailure> {
         let (storage, length) = to_sockaddr_storage(address);
 
         // SAFETY: the descriptor is live, and `storage` is a `sockaddr_storage`
@@ -158,7 +182,11 @@ impl DatagramSocket {
         };
 
         if result < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(BindFailure {
+                source: io::Error::last_os_error(),
+                fd: self.fd,
+                address,
+            });
         }
 
         Ok(())

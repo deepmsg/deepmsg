@@ -55,9 +55,21 @@ failed to transmit message`. That divergence is recorded in `docs/compat.md`.
   sender-MTU refusal is one: `aeron_receiver_channel_endpoint_validate_sender_mtu_length`
   raises it and the conductor's call site appends a second site line naming the
   stream and the session (`aeron_driver_conductor.c:6509`).
+- How many appended lines there are is a property of **how many layers** the
+  failure crossed, because each one appends as it unwinds. A subscription whose
+  port cannot be bound is the longest this driver records: five —
+  `aeron_bind` sets it (`aeron_socket.c:93`), then the transport
+  (`aeron_udp_channel_transport.c:151`), the destination
+  (`aeron_receive_destination.c:78`) and two frames of the conductor
+  (`aeron_driver_conductor.c:2110`, `:5043`) add theirs. The last of them has an
+  **empty message**: the site line alone says where it was.
 
 Rust: `deepmsg_cnc::error_log::compose_description`, with the OS's text coming
-through `deepmsg_core::pal::error_string`. The golden texts are pinned by its
+through `deepmsg_core::pal::error_string`, and `ErrorReport` for the
+accumulation — the reference's per-thread buffer as a value, since this build
+has no thread-local and the buffer has to travel up five layers to be finished.
+The whole of it is both what the log holds and what an `ON_ERROR` carries: one
+composition with two readers. The golden texts are pinned by its
 unit tests, by the interop suite's comparison of both drivers' entries through
 the reference's own `ErrorStat`, and — for the appended-line shape — by
 `tests/interop/mtu_fault_entry.rs`, which drives both drivers through the
