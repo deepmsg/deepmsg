@@ -177,6 +177,16 @@ pub enum ReceiverCommand {
         /// The destination itself.
         destination: Box<ReceiveDestination>,
     },
+    /// Let an endpoint go: it has no subscriptions and no images left
+    /// (`aeron_driver_receiver_on_remove_endpoint`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:322-…`).
+    ///
+    /// The endpoint lives here, so this is the only place its socket can be
+    /// closed — and closing it is what a port being free again means.
+    RemoveEndpoint {
+        /// Which endpoint.
+        id: u64,
+    },
     /// Take a destination off (`aeron_driver_receiver_on_remove_destination`).
     RemoveDestination {
         /// Which endpoint read from it.
@@ -239,6 +249,20 @@ pub enum ReceiverEvent {
         /// What happened, per reader.
         events: Vec<crate::publication_image::UntetheredEvent>,
     },
+    /// The endpoint is let go, and the counters it held go with it
+    /// (`aeron_receive_channel_endpoint_has_receiver_released`, which is what
+    /// the conductor waits for before it reclaims them —
+    /// `aeron_driver_conductor.c:1560`).
+    ///
+    /// The destination counters travel with the news because the destinations
+    /// lived here: the conductor owns the counter region, but this is the only
+    /// place that knows which numbers were the released endpoint's.
+    EndpointReleased {
+        /// Which endpoint.
+        id: u64,
+        /// The `rcv-local-sockaddr` counters of its destinations.
+        destination_counter_ids: Vec<i32>,
+    },
     /// Something for the conductor to record.
     Fault {
         /// The protocol error code to record it under.
@@ -265,6 +289,17 @@ impl ReceiverProxy {
     pub fn add_endpoint(&self, id: u64, endpoint: Box<ReceiveChannelEndpoint>) -> io::Result<()> {
         self.commands
             .send(ReceiverCommand::AddEndpoint { id, endpoint })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the receiver to let an endpoint go.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_endpoint(&self, id: u64) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RemoveEndpoint { id })
             .map_err(|_| stopped())
     }
 
@@ -629,6 +664,28 @@ impl ReceiverThread {
 
             for command in commands.try_iter() {
                 match command {
+                    ReceiverCommand::RemoveEndpoint { id } => {
+                        // The pending setups first: an ask for an endpoint that
+                        // is going away is a question nobody will answer
+                        // (`aeron_driver_receiver.c:334-348`, which drops them
+                        // before it lets the endpoint go).
+                        self.pending_setups.retain(|setup| setup.endpoint_id != id);
+
+                        if let Some(index) =
+                            self.endpoints.iter().position(|(entry, _)| *entry == id)
+                        {
+                            let (_, endpoint) = self.endpoints.swap_remove(index);
+
+                            let _ = self.events.send(ReceiverEvent::EndpointReleased {
+                                id,
+                                destination_counter_ids: endpoint
+                                    .destinations()
+                                    .iter()
+                                    .map(ReceiveDestination::local_sockaddr_counter_id)
+                                    .collect(),
+                            });
+                        }
+                    }
                     ReceiverCommand::AddEndpoint { id, endpoint } => {
                         // An endpoint whose channel named a `control=` asks
                         // **first**, and asks as soon as it exists

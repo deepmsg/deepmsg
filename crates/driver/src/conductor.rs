@@ -1015,6 +1015,12 @@ impl Conductor {
                             .push((error.recorded_error_code(), error.to_string()));
                     }
                 }
+                ReceiverEvent::EndpointReleased {
+                    id,
+                    destination_counter_ids,
+                } => {
+                    work += self.release_endpoint(id, destination_counter_ids);
+                }
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
                 }
@@ -1358,6 +1364,30 @@ impl Conductor {
     /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
     /// message per **subscription** that was reading it, as the reference sends
     /// them (`:5690-5700`) — and only then is the log buffer unmapped.
+    /// Give back everything a receive endpoint held, once the receiver has let
+    /// it go (`aeron_receive_channel_endpoint_has_receiver_released`, which is
+    /// what the conductor waits for — `aeron_driver_conductor.c:1560`).
+    ///
+    /// The counters are the conductor's to free because the region is: the
+    /// receiver could only say which numbers were its.
+    fn release_endpoint(&mut self, id: u64, destination_counter_ids: Vec<i32>) -> usize {
+        let Some(entry) = self.receive_endpoints.remove(id) else {
+            return 0;
+        };
+
+        if let Some(region) = self.cnc.counter_regions() {
+            for counter_id in destination_counter_ids {
+                let _ = self.counters.free(&region, counter_id, self.now_ms);
+            }
+
+            let _ = self
+                .counters
+                .free(&region, entry.channel_status_counter_id, self.now_ms);
+        }
+
+        1
+    }
+
     fn release_image(&mut self, registration_id: i64) -> usize {
         let Some(image) = self.images.find(registration_id).cloned() else {
             return 0;
@@ -1393,6 +1423,19 @@ impl Conductor {
 
         self.subscriptions.forget_publication(registration_id);
         self.receive_endpoints.detach_image(image.endpoint_id);
+
+        // An endpoint whose last image has just gone is one to try again on:
+        // the reference asks both times — here, and where a subscription
+        // leaves (`aeron_publication_image.c:1380`).
+        if let Some(region) = self.cnc.counter_regions() {
+            crate::ipc_subscriptions::try_remove_endpoint(
+                image.endpoint_id,
+                &mut self.counters,
+                &region,
+                &mut self.receive_endpoints,
+                self.receiver.proxy(),
+            );
+        }
 
         // The counters and the log buffer. The image is gone from the
         // receiver, so nothing is reading either of them.
@@ -2017,6 +2060,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                receive_endpoints,
                                 Some(receiver.proxy()),
                                 sender.proxy(),
                                 now_ms,
@@ -3012,6 +3056,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            &mut self.receive_endpoints,
             Some(self.receiver.proxy()),
             self.sender.proxy(),
         );

@@ -48,6 +48,12 @@ path = "integration/cnc_terminate.rs"
 # interop suite cannot.
 # A client giving a publication or a subscription back — the three ways it can,
 # against a real driver of ours. Runs in CI.
+# The port a subscription listened on coming back when it goes — the receive
+# endpoint's lifecycle, from the outside. Runs in CI.
+[[test]]
+name = "receive_endpoint_lifecycle"
+path = "integration/receive_endpoint_lifecycle.rs"
+
 [[test]]
 name = "resource_lifecycle"
 path = "integration/resource_lifecycle.rs"

@@ -1131,6 +1131,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
         now_ms: i64,
@@ -1146,7 +1147,7 @@ impl IpcSubscriptions {
             }
 
             let link = self.links.swap_remove(index);
-            unlink_from_endpoint(&link, receiver);
+            unlink_from_endpoint(&link, counters, regions, endpoints, receiver);
             unlink_all(
                 link,
                 counters,
@@ -1172,6 +1173,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
         now_ms: i64,
@@ -1189,7 +1191,7 @@ impl IpcSubscriptions {
             let link = self.links.swap_remove(index);
             // `aeron_client_delete` takes the same two steps in the same order
             // for a client's network subscriptions (`:1246-1258`).
-            unlink_from_endpoint(&link, receiver);
+            unlink_from_endpoint(&link, counters, regions, endpoints, receiver);
             unlink_all(
                 link,
                 counters,
@@ -1753,7 +1755,13 @@ fn validate_for_subscription(channel: &UdpChannel) -> Result<(), AddSubscription
 ///
 /// A link with no endpoint — an IPC one, and a spy's — has no count to drop,
 /// which is why this is an `Option` rather than a branch at every call site.
-fn unlink_from_endpoint(link: &SubscriptionLink, receiver: Option<&ReceiverProxy>) {
+fn unlink_from_endpoint(
+    link: &SubscriptionLink,
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
+    receiver: Option<&ReceiverProxy>,
+) {
     let (Some(receiver), Some(endpoint_id)) = (receiver, link.endpoint_id) else {
         return;
     };
@@ -1764,6 +1772,41 @@ fn unlink_from_endpoint(link: &SubscriptionLink, receiver: Option<&ReceiverProxy
     // subscription's own properties; the receiver decides, because the counts
     // are its.
     let _ = receiver.remove_subscription(endpoint_id, link.stream_id, link.session_id);
+
+    // And if that was the last thing on the endpoint, the endpoint goes too
+    // (`aeron_receive_channel_endpoint_decref_to_stream` ends in
+    // `try_remove_endpoint` for exactly this case, `:736-741`).
+    if !endpoints.detach_subscription(endpoint_id) {
+        return;
+    }
+
+    try_remove_endpoint(endpoint_id, counters, regions, endpoints, receiver);
+}
+
+/// Let an idle endpoint go: mark it, then ask the receiver, which owns the
+/// socket (`aeron_receive_channel_endpoint_try_remove_endpoint`,
+/// `media/aeron_receive_channel_endpoint.c:691-702`, whose CLOSING is
+/// `conductor_fields.status` at `:699`).
+///
+/// The `rcv-channel` counter is **not** written here: the reference writes it
+/// once, ACTIVE, when the endpoint is made
+/// (`aeron_driver_conductor.c:2013`) and then gives the record back
+/// (`aeron_receive_channel_endpoint_delete`,
+/// `media/aeron_receive_channel_endpoint.c:163-168`, which is where the counter
+/// goes back — the receiver owns the endpoint, but the counters are the
+/// conductor's, so the giving back happens on this side).
+pub(crate) fn try_remove_endpoint(
+    endpoint_id: u64,
+    _counters: &mut CounterManager,
+    _regions: &CounterRegions<'_>,
+    endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
+    receiver: &ReceiverProxy,
+) {
+    if !endpoints.begin_release(endpoint_id) {
+        return;
+    }
+
+    let _ = receiver.remove_endpoint(endpoint_id);
 }
 
 /// Detach every reader a link holds and give its counter back
