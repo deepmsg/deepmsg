@@ -944,17 +944,23 @@ impl Conductor {
                     // it named no session or it named this one. A stream two
                     // clients both read is owned by the first of them, which is
                     // the same one-link answer the reference gives.
-                    let client_id = self
-                        .subscriptions
-                        .links()
-                        .iter()
-                        .find(|link| {
-                            link.stream_id == setup.stream_id
-                                && link
-                                    .session_id
-                                    .is_none_or(|session_id| session_id == setup.session_id)
-                        })
-                        .map_or(0, |link| link.client_id);
+                    //
+                    // The link is also where `group=` was left, for the same
+                    // reason the reference keeps it there: the `SETUP` that
+                    // creates this image arrives long after the subscription
+                    // that will read it (`aeron_driver_conductor.c:6702-6703`).
+                    // With no link there is nobody's `group=` to read, so the
+                    // driver's own consideration stands.
+                    let link = self.subscriptions.links().iter().find(|link| {
+                        link.stream_id == setup.stream_id
+                            && link
+                                .session_id
+                                .is_none_or(|session_id| session_id == setup.session_id)
+                    });
+
+                    let client_id = link.map_or(0, |link| link.client_id);
+                    let is_group =
+                        link.map_or(self.config.receiver_group_consideration, |link| link.group);
 
                     let result = self.images.begin_create(
                         registration_id,
@@ -963,6 +969,8 @@ impl Conductor {
                         &channel,
                         &setup,
                         setup_flags,
+                        entry.channel.is_multicast,
+                        is_group,
                         source,
                         control_address,
                         &self.config,

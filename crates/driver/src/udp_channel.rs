@@ -271,19 +271,6 @@ impl UdpChannel {
         }
     }
 
-    /// [`UdpChannel::has_group_semantics`] for a channel that has been parsed
-    /// but not resolved into an address.
-    ///
-    /// An image is created from a channel's *bytes* — the conductor hands
-    /// `PublicationImages::begin_create` the URI it was given — and one bit is
-    /// not worth resolving a second time, with the interface lookup and the
-    /// host resolution that implies. The multicast arm is the one thing this
-    /// cheap form cannot answer, since it is read off the *resolved* endpoint;
-    /// the caller supplies it, from the receive endpoint's own channel.
-    pub(crate) fn uri_has_group_semantics(uri: &ChannelUri<'_>) -> bool {
-        read_control_mode(uri).is_ok_and(ControlMode::is_multi_destination)
-    }
-
     /// Read a `aeron:udp` URI into the addresses an endpoint works with
     /// (`aeron_udp_channel_finish_parse`, `aeron_udp_channel.c:278-523`).
     ///
@@ -676,7 +663,6 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
 /// [`UdpChannelError::Unsupported`] for the first such parameter present.
 fn refuse_unsupported(uri: &ChannelUri<'_>) -> Result<(), UdpChannelError> {
     for key in [
-        "group",
         "gtag",
         "media-rcv-ts-offset",
         "channel-rcv-ts-offset",
@@ -1524,20 +1510,25 @@ mod tests {
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|group=true").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1").error_code()
         );
     }
 
     #[test]
-    fn a_group_parameter_is_still_refused_but_a_group_endpoint_is_served() {
-        assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|group=true"),
-            UdpChannelError::Unsupported(_)
-        ));
+    fn a_group_tag_is_still_refused_where_a_group_parameter_is_not() {
         assert!(matches!(
             refuse("aeron:udp?endpoint=224.0.1.1:40123|gtag=1"),
             UdpChannelError::Unsupported(_)
         ));
+
+        // `group=` is a *subscription* parameter and never reached this layer
+        // in the first place: it is read where a subscription is created, into
+        // the parameters an image is built from
+        // (`aeron_driver_uri.c:494-495`), so a channel that carries it resolves
+        // like any other.
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|group=true");
+        assert!(!named.is_multicast);
+        assert_eq!(ipv4("127.0.0.1:40123"), named.remote_data);
     }
 
     /// The interface this host would join a group on, asked of the kernel the

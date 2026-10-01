@@ -107,6 +107,56 @@ pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 /// with `ttl=`.
 pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
 
+/// `AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT` (`aeron_driver_context.c:227`).
+pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBoolean::Infer;
+
+/// A boolean that has a third answer: **work it out**
+/// (`aeron_inferable_boolean_t`, `aeron_driver_context.c:91-97`).
+///
+/// One parameter needs it — a subscription's `group=` — because "this channel
+/// is a group" is a question the channel itself usually answers, and a client
+/// sometimes wants to overrule it in either direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InferableBoolean {
+    /// The channel decided: it is a group if it is a multicast one, or if the
+    /// `SETUP` that opened it said so.
+    #[default]
+    Infer,
+    /// It is one whatever the channel says.
+    ForceTrue,
+    /// It is not, whatever the channel says.
+    ForceFalse,
+}
+
+impl InferableBoolean {
+    /// `aeron_config_parse_inferable_boolean`
+    /// (`aeron_driver_context.c:99-119`).
+    ///
+    /// Both comparisons are **exact**, though they do not look it: the
+    /// reference's `strncmp(text, "true", sizeof("true"))` compares five
+    /// bytes, the fifth being the literal's own terminator — so `truex` and
+    /// `inferno` are `ForceFalse` rather than a prefix match.
+    pub fn parse(text: Option<&str>, default: Self) -> Self {
+        match text {
+            None => default,
+            Some("true") => Self::ForceTrue,
+            Some("infer") => Self::Infer,
+            Some(_) => Self::ForceFalse,
+        }
+    }
+
+    /// The answer, given what the channel itself says
+    /// (`aeron_driver_conductor_treat_image_as_multicast`,
+    /// `aeron_driver_conductor.c:674-680`).
+    pub const fn resolve(self, channel_says_so: bool) -> bool {
+        match self {
+            Self::Infer => channel_says_so,
+            Self::ForceTrue => true,
+            Self::ForceFalse => false,
+        }
+    }
+}
+
 /// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:205`).
 pub const RCV_INITIAL_WINDOW_LENGTH_DEFAULT: i32 = 128 * 1024;
 
@@ -368,6 +418,13 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// What a subscription's `group=` does when it names nothing
+    /// (`aeron.receiver.group.consideration`, `AERON_RECEIVER_GROUP_CONSIDERATION`;
+    /// the default is `infer`, `aeron_driver_context.c:227`).
+    ///
+    /// It is the *default for the parameter*, not a driver-wide switch: a
+    /// subscription that names `group=true` or `group=infer` overrules it.
+    pub receiver_group_consideration: InferableBoolean,
     /// The window a receiver offers a publication when the channel named none
     /// (`aeron.rcv.initial.window.length`, which `aeronmd` turns into
     /// `AERON_RCV_INITIAL_WINDOW_LENGTH`,
@@ -461,6 +518,7 @@ impl Default for DriverConfig {
             socket_so_rcvbuf: SOCKET_SO_RCVBUF_DEFAULT,
             socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
+            receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
             network_publication_max_messages_per_send:
                 NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT,
@@ -695,6 +753,10 @@ impl DriverConfig {
                 255,
             )?)
             .unwrap_or(SOCKET_MULTICAST_TTL_DEFAULT);
+        }
+        if let Some(value) = get(&Setting::RECEIVER_GROUP_CONSIDERATION) {
+            config.receiver_group_consideration =
+                InferableBoolean::parse(Some(&value), RECEIVER_GROUP_CONSIDERATION_DEFAULT);
         }
         if let Some(value) = get(&Setting::RCV_INITIAL_WINDOW_LENGTH) {
             config.receiver_window_length = parse_bounded_size32(
@@ -952,6 +1014,13 @@ impl Setting {
     const SOCKET_MULTICAST_TTL: Self = Self {
         property: "socket.multicast.ttl",
         env: "AERON_SOCKET_MULTICAST_TTL",
+    };
+    /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
+    /// `:451-452` — environment only, with no property read in the reference;
+    /// this build reads the property too, as it does for every other name).
+    const RECEIVER_GROUP_CONSIDERATION: Self = Self {
+        property: "receiver.group.consideration",
+        env: "AERON_RECEIVER_GROUP_CONSIDERATION",
     };
     /// `aeron.rcv.initial.window.length`: the window a receiver offers when the
     /// channel named none (`aeronmd.h:331`, read at `:834-839`).
@@ -1620,6 +1689,8 @@ mod tests {
                 ("AERON_SEND_TO_STATUS_POLL_RATIO", "3"),
                 ("AERON_MAX_RESEND", "4"),
                 ("AERON_SPIES_SIMULATE_CONNECTION", "true"),
+                ("AERON_SOCKET_MULTICAST_TTL", "12"),
+                ("AERON_RECEIVER_GROUP_CONSIDERATION", "true"),
             ],
         )
         .expect("resolve");
@@ -1642,6 +1713,43 @@ mod tests {
         assert_eq!(3, config.send_to_sm_poll_ratio);
         assert_eq!(4, config.max_resend);
         assert!(config.spies_simulate_connection);
+        assert_eq!(12, config.socket_multicast_ttl);
+        assert_eq!(
+            InferableBoolean::ForceTrue,
+            config.receiver_group_consideration
+        );
+    }
+
+    #[test]
+    fn the_group_consideration_is_read_the_way_the_reference_reads_it() {
+        // `aeron_config_parse_inferable_boolean` (`aeron_driver_context.c:99-119`)
+        // compares against the literal **including its terminator**, so these
+        // are exact matches and not prefixes — `truex` is neither `true` nor
+        // an error, it is the third answer.
+        for (text, expected) in [
+            ("true", InferableBoolean::ForceTrue),
+            ("infer", InferableBoolean::Infer),
+            ("false", InferableBoolean::ForceFalse),
+            ("truex", InferableBoolean::ForceFalse),
+            ("inferno", InferableBoolean::ForceFalse),
+            ("", InferableBoolean::ForceFalse),
+        ] {
+            assert_eq!(
+                expected,
+                InferableBoolean::parse(Some(text), InferableBoolean::Infer),
+                "{text}"
+            );
+        }
+
+        assert_eq!(
+            InferableBoolean::ForceTrue,
+            InferableBoolean::parse(None, InferableBoolean::ForceTrue),
+            "naming nothing is the driver's own consideration, whatever it is"
+        );
+        assert_eq!(
+            RECEIVER_GROUP_CONSIDERATION_DEFAULT,
+            DriverConfig::default().receiver_group_consideration
+        );
     }
 
     #[test]
