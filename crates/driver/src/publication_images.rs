@@ -217,6 +217,13 @@ impl PublicationImages {
     /// The registration id is burned here, before the log buffer is asked for,
     /// because the buffer's *name* carries it.
     ///
+    /// `window_max_length` and `socket_rcvbuf` come off the **endpoint's**
+    /// channel, not off this `SETUP`'s: the window a receiver offers is a
+    /// property of the subscription that made the socket
+    /// (`aeron_udp_channel_receiver_window(endpoint->…->udp_channel, …)`,
+    /// `aeron_driver_conductor.c:6496-6497`), which is why the conductor reads
+    /// them off the entry and hands them in.
+    ///
     /// # Errors
     ///
     /// [`AddError`] for an MTU the endpoint cannot serve, or an agent that has
@@ -234,6 +241,8 @@ impl PublicationImages {
         is_group: crate::config::InferableBoolean,
         source: SocketAddr,
         control_address: SocketAddr,
+        window_max_length: usize,
+        socket_rcvbuf: usize,
         config: &crate::config::DriverConfig,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -241,13 +250,20 @@ impl PublicationImages {
     ) -> Result<(), AddError> {
         // The sender's MTU has to fit the endpoint's socket and the window this
         // receiver offers (`validate_sender_mtu_length`,
-        // `media/aeron_receive_channel_endpoint.c:990-1040`).
-        if setup.mtu > config.mtu_length.max(setup.mtu) || setup.mtu <= 0 {
-            return Err(AddError::InvalidChannel(format!(
-                "mtuLength={} > MAX_UDP_PAYLOAD_LENGTH",
-                setup.mtu
-            )));
-        }
+        // `media/aeron_receive_channel_endpoint.c:984-1044`). A refusal here is
+        // *recorded* rather than only answered: this is not a client's
+        // registration being turned down, it is a stream the driver cannot
+        // serve, and the conductor's fault list is what puts it in the error
+        // log and counts it in `ERRORS` (`conductor.rs`, `record_pending_faults`).
+        let os_default_socket_rcvbuf = usize::try_from(os_defaults().rcvbuf).unwrap_or(0);
+
+        crate::channel_validation::validate_sender_mtu_length(
+            usize::try_from(setup.mtu).unwrap_or(0),
+            window_max_length,
+            socket_rcvbuf,
+            os_default_socket_rcvbuf,
+        )
+        .map_err(AddError::InvalidChannel)?;
 
         // The channel's subscription parameters: an image is created by a
         // `SETUP`, so the timeouts its readers are held to come from the
