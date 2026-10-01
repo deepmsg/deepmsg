@@ -582,12 +582,18 @@ impl NetworkPublications {
             .and_then(|uri| uri.value("fc").map(str::to_owned));
 
         let flow_control = match crate::flowcontrol::strategy_for_channel(
-            pending.endpoint_channel.is_multi_destination(),
+            pending.endpoint_channel.is_multi_destination()
+                || pending.endpoint_channel.is_multicast,
             fc.as_deref(),
-            crate::flowcontrol::UNICAST_RRWM_DEFAULT,
-            crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
+            crate::flowcontrol::Defaults {
+                unicast_rrwm: crate::flowcontrol::UNICAST_RRWM_DEFAULT,
+                multicast_rrwm: crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
+                group_tag: config.flow_control_group_tag,
+                group_min_size: config.flow_control_group_min_size,
+                receiver_timeout_ns: config.flow_control_receiver_timeout_ns,
+            },
         ) {
-            Ok(strategy) => crate::flowcontrol::FlowControl::Max(strategy),
+            Ok(strategy) => strategy,
             Err(error) => {
                 events.error(
                     pending.registration_id,
@@ -597,6 +603,33 @@ impl NetworkPublications {
                 return;
             }
         };
+
+        // A strategy that keeps receivers gets the counter that says how many,
+        // and one that does not gets none: the counter belongs to the supplier
+        // in the reference, not to the publication
+        // (`aeron_min_flow_control.c:589-594`).
+        if flow_control.group_receiver_count().is_some() {
+            let Some(fc_receivers) = allocate_receiver_counter(
+                counters,
+                regions,
+                pending.client_id,
+                pending.registration_id,
+                pending.session_id,
+                pending.stream_id,
+                &pending.channel,
+                now.ms,
+            ) else {
+                events.error(
+                    pending.registration_id,
+                    deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                    b"no counter record for fc-receivers",
+                );
+
+                return;
+            };
+
+            pending.counters.fc_receivers = Some(fc_receivers);
+        }
 
         // The retransmit handler's delay is the driver's unicast delay — zero
         // when nothing configured it, which is what makes a NAK answered at
@@ -941,7 +974,41 @@ fn allocate_counters(
         snd_lmt,
         snd_bpe,
         snd_naks_received,
+        fc_receivers: None,
     })
+}
+
+/// The `fc-receivers` counter a group strategy keeps
+/// (`AERON_MIN_FLOW_CONTROL_RECEIVERS_COUNTER_NAME`, `aeron_flow_control.h:28`).
+///
+/// Allocated *after* the strategy is chosen, because it belongs to the
+/// strategy: the reference does it in the supplier that keeps receivers
+/// (`aeron_min_flow_control.c:589-594`), so a publication under `max` never
+/// has one.
+#[allow(clippy::too_many_arguments)] // one per field the counter's label carries
+fn allocate_receiver_counter(
+    counters: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    client_id: i64,
+    registration_id: i64,
+    session_id: i32,
+    stream_id: i32,
+    channel: &[u8],
+    now_ms: i64,
+) -> Option<i32> {
+    counter_position::allocate_stream_counter(
+        counters,
+        regions,
+        "fc-receivers",
+        counter_position::type_id::FC_NUM_RECEIVERS,
+        client_id,
+        registration_id,
+        session_id,
+        stream_id,
+        channel,
+        "",
+        now_ms,
+    )
 }
 
 /// `AERON_COUNTER_SENDER_BPE_TYPE_ID` (`aeron-client/src/main/c/aeron_counters.h:104-105`):

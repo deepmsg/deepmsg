@@ -1505,6 +1505,7 @@ mod tests {
                 snd_lmt: allocate(&mut manager, b"snd-lmt"),
                 snd_bpe: allocate(&mut manager, b"snd-bpe"),
                 snd_naks_received: allocate(&mut manager, b"snd-naks"),
+                fc_receivers: None,
             };
 
             // The window is open and the producer has published a frame.

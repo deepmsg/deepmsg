@@ -1117,14 +1117,20 @@ impl Conductor {
         self.release_spies_of(registration_id);
 
         if let Some(region) = self.cnc.counter_regions() {
-            for counter_id in [
+            let mut counter_ids = vec![
                 record.counters.pub_pos,
                 record.counters.pub_lmt,
                 record.counters.snd_pos,
                 record.counters.snd_lmt,
                 record.counters.snd_bpe,
                 record.counters.snd_naks_received,
-            ] {
+            ];
+
+            // Only a strategy that keeps receivers was given one
+            // (`aeron_min_flow_control.c:454-470` frees it with the strategy).
+            counter_ids.extend(record.counters.fc_receivers);
+
+            for counter_id in counter_ids {
                 let _ = self.counters.free(&region, counter_id, self.now_ms);
             }
         }

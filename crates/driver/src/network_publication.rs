@@ -91,6 +91,13 @@ pub struct PublicationCounters {
     pub snd_bpe: i32,
     /// `snd-naks-received`: how many NAKs this publication was told about.
     pub snd_naks_received: i32,
+    /// `fc-receivers`: how many receivers the flow-control strategy is
+    /// holding, for a strategy that holds any (`aeron_flow_control.h:28`).
+    ///
+    /// [`None`] under `max`, which keeps none and is given no counter — the
+    /// reference allocates this one in the group supplier alone
+    /// (`aeron_min_flow_control.c:483-513`).
+    pub fc_receivers: Option<i32>,
 }
 
 /// A receiver that has told this publication it is there
@@ -579,6 +586,11 @@ impl NetworkPublication {
             if new_limit != snd_lmt {
                 let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
             }
+
+            // A group strategy drops the receivers that have gone quiet here
+            // (`aeron_min_flow_control.c:98-157`), so this is the pass its count
+            // changes on as well as the one a status message arrives on.
+            self.update_receiver_count(counters, regions);
 
             if self.expire_receivers(now_ns) {
                 self.update_connected_status(
@@ -1208,6 +1220,8 @@ impl NetworkPublication {
 
         let _ = counters.set_value(regions, self.counters.snd_lmt, new_limit);
 
+        self.update_receiver_count(counters, regions);
+
         self.update_connected_status(counters, regions, self.has_subscribers(counters, regions));
 
         // A publication that has just acquired its **first** live receiver
@@ -1362,6 +1376,27 @@ impl NetworkPublication {
         }
 
         outcome
+    }
+
+    /// Write how many receivers the strategy is holding into `fc-receivers`
+    /// (`aeron_min_flow_control.c:241-242`, `:151-152`).
+    ///
+    /// A publication under a strategy that keeps none has no counter to write
+    /// and nothing to write into it.
+    fn update_receiver_count(&self, counters: &CounterManager, regions: &CounterRegions<'_>) {
+        let Some(counter_id) = self.counters.fc_receivers else {
+            return;
+        };
+
+        let Some(count) = self.flow_control.group_receiver_count() else {
+            return;
+        };
+
+        let _ = counters.set_value(
+            regions,
+            counter_id,
+            i64::try_from(count).unwrap_or(i64::MAX),
+        );
     }
 
     /// Whether this publication counts a reader at all
@@ -1998,6 +2033,7 @@ mod tests {
             &params,
             false,
             PublicationCounters {
+                fc_receivers: None,
                 pub_pos: 0,
                 pub_lmt: 1,
                 snd_pos: 2,
@@ -2698,6 +2734,7 @@ mod tests {
                 &params(TERM_LENGTH, MTU, 32 * 1024),
                 false,
                 PublicationCounters {
+                    fc_receivers: None,
                     pub_pos: 0,
                     pub_lmt: 1,
                     snd_pos: 2,

@@ -259,6 +259,27 @@ pub enum FlowControl {
     /// `fc=max` — and the default for a channel that names nothing, unicast or
     /// multicast (`aeron_driver_context.c:201`).
     Max(MaxStrategy),
+    /// `fc=min`: the sender waits for the slowest receiver
+    /// (`aeron_min_flow_control.c:260-281`).
+    Min(MinStrategy),
+    /// `fc=tagged`: the same, over the receivers carrying its group tag
+    /// (`:326-357`).
+    Tagged(MinStrategy),
+}
+
+impl FlowControl {
+    /// How many receivers this strategy is holding, when it holds any.
+    ///
+    /// `None` for `max`, which keeps none — the reference allocates the
+    /// `fc-receivers` counter in the group supplier alone
+    /// (`aeron_min_flow_control.c:589-594`), so a publication under `max` has
+    /// no such counter to write.
+    pub fn group_receiver_count(&self) -> Option<usize> {
+        match self {
+            Self::Max(_) => None,
+            Self::Min(strategy) | Self::Tagged(strategy) => Some(strategy.receiver_count()),
+        }
+    }
 }
 
 impl Default for FlowControl {
@@ -276,6 +297,9 @@ impl Strategy for FlowControl {
     ) -> SenderLimit {
         match self {
             Self::Max(strategy) => strategy.on_sm(status_message, snd_lmt, now_ns),
+            Self::Min(strategy) | Self::Tagged(strategy) => {
+                strategy.on_sm(status_message, snd_lmt, now_ns)
+            }
         }
     }
 
@@ -288,6 +312,9 @@ impl Strategy for FlowControl {
     ) -> SenderLimit {
         match self {
             Self::Max(strategy) => strategy.on_idle(now_ns, snd_lmt, snd_pos, is_end_of_stream),
+            Self::Min(strategy) | Self::Tagged(strategy) => {
+                strategy.on_idle(now_ns, snd_lmt, snd_pos, is_end_of_stream)
+            }
         }
     }
 
@@ -305,30 +332,42 @@ impl Strategy for FlowControl {
                 term_buffer_length,
                 initial_window_length,
             ),
+            Self::Min(strategy) | Self::Tagged(strategy) => strategy.max_retransmission_length(
+                term_offset,
+                resend_length,
+                term_buffer_length,
+                initial_window_length,
+            ),
         }
     }
 
     fn on_setup(&mut self, now_ns: i64, snd_lmt: SenderLimit) {
         match self {
             Self::Max(strategy) => strategy.on_setup(now_ns, snd_lmt),
+            Self::Min(strategy) | Self::Tagged(strategy) => strategy.on_setup(now_ns, snd_lmt),
         }
     }
 
     fn on_error(&mut self, receiver_id: i64) {
         match self {
             Self::Max(strategy) => strategy.on_error(receiver_id),
+            Self::Min(strategy) | Self::Tagged(strategy) => strategy.on_error(receiver_id),
         }
     }
 
     fn on_trigger_send_setup(&mut self, group_tag: Option<i64>) {
         match self {
             Self::Max(strategy) => strategy.on_trigger_send_setup(group_tag),
+            Self::Min(strategy) | Self::Tagged(strategy) => {
+                strategy.on_trigger_send_setup(group_tag)
+            }
         }
     }
 
     fn has_required_receivers(&self) -> bool {
         match self {
             Self::Max(strategy) => strategy.has_required_receivers(),
+            Self::Min(strategy) | Self::Tagged(strategy) => strategy.has_required_receivers(),
         }
     }
 }
@@ -381,6 +420,27 @@ pub const UNICAST_RRWM_DEFAULT: usize = 16;
 /// asked could hold rather than to what the term allows.
 pub const MULTICAST_RRWM_DEFAULT: usize = 4;
 
+/// What the driver's configuration says when a channel names nothing
+/// (`aeron_driver_context_t`'s own `flow_control` fields, and the two
+/// retransmit multiples beside them).
+#[derive(Clone, Copy, Debug)]
+pub struct Defaults {
+    /// The multiple a unicast channel gets
+    /// (`unicast_flow_control_rrwm`).
+    pub unicast_rrwm: usize,
+    /// The multiple a multicast or multi-destination one gets, and what an
+    /// `rrwm:` on its `fc=` overrides (`aeron_flow_control.c:530`).
+    pub multicast_rrwm: usize,
+    /// `aeron.flow.control.gtag`: the tag a `tagged` channel that names no
+    /// `g:` matches against (`aeron_min_flow_control.c:576`).
+    pub group_tag: i64,
+    /// `aeron.flow.control.group.min.size`: how many receivers a group needs
+    /// when the channel names no `g:<tag>/<size>`.
+    pub group_min_size: i32,
+    /// `aeron.flow.control.receiver.timeout`: how long a receiver may go quiet.
+    pub receiver_timeout_ns: i64,
+}
+
 /// The strategy an endpoint's channel asks for
 /// (`aeron_default_multicast_flow_control_strategy_supplier`,
 /// `aeron_flow_control.c:400-475`).
@@ -409,25 +469,56 @@ pub const MULTICAST_RRWM_DEFAULT: usize = 4;
 /// first comma, [`FlowControlError::UnknownStrategy`] for a name this build
 /// cannot serve, and the option errors of [`MaxStrategy::from_options`].
 pub fn strategy_for_channel(
-    is_multi_destination: bool,
+    names_a_group_of_receivers: bool,
     fc: Option<&str>,
-    unicast_rrwm: usize,
-    multicast_rrwm: usize,
-) -> Result<MaxStrategy, FlowControlError> {
-    if !is_multi_destination {
-        return Ok(MaxStrategy {
-            retransmit_receiver_window_multiple: unicast_rrwm,
-        });
+    defaults: Defaults,
+) -> Result<FlowControl, FlowControlError> {
+    // `:413-414`: the question is whether the channel is multi-destination
+    // **or multicast**. Both may have several receivers at once, which is the
+    // whole reason the answer can differ from `max`.
+    if !names_a_group_of_receivers {
+        return Ok(FlowControl::Max(MaxStrategy {
+            retransmit_receiver_window_multiple: defaults.unicast_rrwm,
+        }));
     }
 
     let Some(options) = fc else {
-        return Ok(MaxStrategy {
-            retransmit_receiver_window_multiple: multicast_rrwm,
-        });
+        return Ok(FlowControl::Max(MaxStrategy {
+            retransmit_receiver_window_multiple: defaults.multicast_rrwm,
+        }));
     };
 
     match options.split(',').next().unwrap_or("") {
-        "max" => MaxStrategy::from_options(multicast_rrwm, Some(options)),
+        "max" => Ok(FlowControl::Max(MaxStrategy::from_options(
+            defaults.multicast_rrwm,
+            Some(options),
+        )?)),
+
+        // `:440-444`: `min` and `tagged` are one supplier with
+        // `is_group_tag_aware` false and true, so they differ only in whether
+        // there is a tag to match against.
+        "min" => {
+            let parsed = tagged_options(Some(options))?;
+
+            Ok(FlowControl::Min(MinStrategy::new(
+                parsed.timeout_ns.unwrap_or(defaults.receiver_timeout_ns),
+                parsed.group_min_size.unwrap_or(defaults.group_min_size),
+                None,
+                parsed.rrwm.unwrap_or(defaults.multicast_rrwm),
+            )))
+        }
+
+        "tagged" => {
+            let parsed = tagged_options(Some(options))?;
+
+            Ok(FlowControl::Tagged(MinStrategy::new(
+                parsed.timeout_ns.unwrap_or(defaults.receiver_timeout_ns),
+                parsed.group_min_size.unwrap_or(defaults.group_min_size),
+                Some(parsed.group_tag.unwrap_or(defaults.group_tag)),
+                parsed.rrwm.unwrap_or(defaults.multicast_rrwm),
+            )))
+        }
+
         "" => Err(FlowControlError::NoStrategyName),
         name => Err(FlowControlError::UnknownStrategy(name.to_owned())),
     }
@@ -1582,6 +1673,17 @@ mod tests {
         );
     }
 
+    /// The driver's own answers when a channel names nothing.
+    fn defaults() -> Defaults {
+        Defaults {
+            unicast_rrwm: UNICAST_RRWM_DEFAULT,
+            multicast_rrwm: MULTICAST_RRWM_DEFAULT,
+            group_tag: -1,
+            group_min_size: 0,
+            receiver_timeout_ns: 5_000_000_000,
+        }
+    }
+
     /// A unicast channel never reads `fc=`. The reference picks the unicast
     /// supplier outright and hands it no options at all
     /// (`aeron_unicast_flow_control_strategy_supplier`, `aeron_flow_control.c:326-365`),
@@ -1593,63 +1695,137 @@ mod tests {
     #[test]
     fn a_unicast_channel_is_served_as_though_fc_were_not_there() {
         let rrwm = |fc| {
-            strategy_for_channel(false, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
-                .expect("a unicast channel cannot be refused for its `fc=`")
-                .retransmit_receiver_window_multiple
+            let strategy = strategy_for_channel(false, fc, defaults())
+                .expect("a unicast channel cannot be refused for its `fc=`");
+
+            match strategy {
+                FlowControl::Max(strategy) => strategy.retransmit_receiver_window_multiple,
+                other => panic!("a unicast channel gets `max`, not {other:?}"),
+            }
         };
 
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(None));
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("max")));
         // Not `7`: the option is not read either.
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("max,rrwm:7")));
-        // And not an error, which is the whole point.
+        // And not another strategy, which is the whole point.
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("min")));
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("tagged")));
         assert_eq!(UNICAST_RRWM_DEFAULT, rrwm(Some("nonsense")));
     }
 
-    /// A multi-destination channel does read it, and no `fc=` at all falls to
-    /// the context's multicast supplier, which is `max`
+    /// A multicast or multi-destination channel does read it, and no `fc=` at
+    /// all falls to the context's multicast supplier, which is `max`
     /// (`aeron_driver_context.c:201`).
     #[test]
-    fn a_multi_destination_channel_reads_fc_and_defaults_to_four() {
-        let rrwm = |fc| {
-            strategy_for_channel(true, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
-                .expect("a strategy")
-                .retransmit_receiver_window_multiple
-        };
+    fn a_channel_with_several_receivers_reads_fc_and_defaults_to_four() {
+        let strategy = |fc| strategy_for_channel(true, fc, defaults()).expect("a strategy");
 
         assert_eq!(4, MULTICAST_RRWM_DEFAULT, "the context's own default");
-        assert_eq!(MULTICAST_RRWM_DEFAULT, rrwm(None));
-        assert_eq!(MULTICAST_RRWM_DEFAULT, rrwm(Some("max")));
-        assert_eq!(
-            7,
-            rrwm(Some("max,rrwm:7")),
-            "the option is read here, unlike the unicast branch"
+
+        for fc in [None, Some("max")] {
+            match strategy(fc) {
+                FlowControl::Max(strategy) => assert_eq!(
+                    MULTICAST_RRWM_DEFAULT,
+                    strategy.retransmit_receiver_window_multiple
+                ),
+                other => panic!("`{fc:?}` is `max`'s, not {other:?}'s"),
+            }
+        }
+
+        match strategy(Some("max,rrwm:7")) {
+            FlowControl::Max(strategy) => assert_eq!(
+                7, strategy.retransmit_receiver_window_multiple,
+                "the option is read here, unlike the unicast branch"
+            ),
+            other => panic!("`max,rrwm:7` is `max`'s, not {other:?}'s"),
+        }
+
+        assert!(matches!(strategy(Some("min")), FlowControl::Min(_)));
+        assert!(matches!(strategy(Some("tagged")), FlowControl::Tagged(_)));
+    }
+
+    /// What a group channel's `fc=` says about its receivers reaches the
+    /// strategy: the tag `tagged` matches on, the size a group has to have,
+    /// and the timeout — each falling back to the driver's own setting when the
+    /// channel names none (`aeron_min_flow_control.c:572-576`).
+    #[test]
+    fn the_group_options_a_channel_names_reach_the_strategy() {
+        let mut configured = defaults();
+        configured.group_tag = 42;
+        configured.group_min_size = 3;
+
+        let FlowControl::Tagged(mut tagged) =
+            strategy_for_channel(true, Some("tagged"), configured).expect("a strategy")
+        else {
+            panic!("`fc=tagged` is a tagged strategy");
+        };
+
+        // The driver's tag is what it matches.
+        tagged.on_sm(
+            &StatusMessage {
+                group_tag: Some(7),
+                ..from(1, 1_000, 500)
+            },
+            0,
+            0,
+        );
+        assert_eq!(0, tagged.receiver_count(), "someone else's tag");
+
+        tagged.on_sm(
+            &StatusMessage {
+                group_tag: Some(42),
+                ..from(1, 1_000, 500)
+            },
+            0,
+            0,
+        );
+        assert_eq!(1, tagged.receiver_count());
+        assert!(
+            !tagged.has_required_receivers(),
+            "one receiver is not the group of three the driver asked for"
+        );
+
+        let FlowControl::Min(mut min) =
+            strategy_for_channel(true, Some("min,g:7/1"), configured).expect("a strategy")
+        else {
+            panic!("`fc=min` is a plain strategy");
+        };
+
+        // `min` matches every message whatever tag it carries, and `g:7/1`
+        // overrules the driver's group size for this channel.
+        min.on_sm(
+            &StatusMessage {
+                group_tag: Some(7),
+                ..from(1, 1_000, 500)
+            },
+            0,
+            0,
+        );
+        assert_eq!(1, min.receiver_count());
+        assert!(
+            min.has_required_receivers(),
+            "`/1` is the group size, and one receiver satisfies it"
         );
     }
 
-    /// The two strategies this build does not have come back as such, and an
-    /// `fc=` with nothing before its comma is the reference's own distinct
-    /// refusal (`aeron_flow_control.c:425-431`).
+    /// A name this build cannot serve comes back as such, and an `fc=` with
+    /// nothing before its comma is the reference's own distinct refusal
+    /// (`aeron_flow_control.c:425-431`).
     #[test]
-    fn a_multi_destination_channel_naming_a_strategy_this_build_lacks_is_refused() {
+    fn a_group_channel_naming_a_strategy_this_build_lacks_is_refused() {
         let refusal = |fc| {
-            strategy_for_channel(true, fc, UNICAST_RRWM_DEFAULT, MULTICAST_RRWM_DEFAULT)
+            strategy_for_channel(true, fc, defaults())
                 .expect_err("this build cannot serve that strategy")
         };
 
         assert_eq!(
-            FlowControlError::UnknownStrategy("min".to_owned()),
-            refusal(Some("min"))
-        );
-        assert_eq!(
-            FlowControlError::UnknownStrategy("tagged".to_owned()),
-            refusal(Some("tagged"))
-        );
-        assert_eq!(
             FlowControlError::UnknownStrategy("cubic".to_owned()),
             refusal(Some("cubic"))
+        );
+        assert_eq!(
+            FlowControlError::UnknownStrategy("maximum".to_owned()),
+            refusal(Some("maximum"))
         );
         assert_eq!(FlowControlError::NoStrategyName, refusal(Some("")));
         assert_eq!(

@@ -46,6 +46,13 @@ pub mod type_id {
     pub const SENDER_POSITION: i32 = 2;
     /// `AERON_COUNTER_SENDER_LIMIT_TYPE_ID` (`:108-110`), label `"snd-lmt"`.
     pub const SENDER_LIMIT: i32 = 9;
+    /// `AERON_COUNTER_FC_NUM_RECEIVERS_TYPE_ID` (`:115`), label
+    /// `"fc-receivers"` (`aeron_flow_control.h:28`).
+    ///
+    /// One per publication whose strategy keeps a group, and none for a
+    /// publication whose does not: the reference allocates it in the group
+    /// supplier (`aeron_min_flow_control.c:589-594`).
+    pub const FC_NUM_RECEIVERS: i32 = 17;
 }
 
 /// The key a stream-position counter carries

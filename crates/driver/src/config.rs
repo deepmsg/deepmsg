@@ -136,6 +136,21 @@ pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBool
 /// (`aeron_receive_channel_endpoint.c:309-312`). [`None`] is the absent half.
 pub const RECEIVER_GROUP_TAG_DEFAULT: Option<i64> = None;
 
+/// `AERON_FLOW_CONTROL_GROUP_TAG_DEFAULT` (`aeron_driver_context.c:196`): no
+/// tag, which is a tag of `-1` and not an absent one — this is the `tagged`
+/// strategy's own group tag, the one a status message has to carry, and the
+/// endpoint's `gtag` is a different setting.
+pub const FLOW_CONTROL_GROUP_TAG_DEFAULT: i64 = -1;
+
+/// `AERON_FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT` (`:197`): a group of one, so
+/// that naming `fc=min` alone means "wait for the slowest of whoever is there"
+/// rather than "wait for a quorum nobody configured".
+pub const FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT: i32 = 0;
+
+/// `AERON_FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT` (`:198`): five seconds
+/// before a receiver that has gone quiet is dropped.
+pub const FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
+
 /// A boolean that has a third answer: **work it out**
 /// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
 ///
@@ -444,6 +459,17 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// The tag a `fc=tagged` channel that names no `g:` matches against
+    /// (`aeron.flow.control.gtag`, `AERON_FLOW_CONTROL_GROUP_TAG`).
+    pub flow_control_group_tag: i64,
+    /// How many receivers a group needs before the sender limit moves
+    /// (`aeron.flow.control.group.min.size`,
+    /// `AERON_FLOW_CONTROL_GROUP_MIN_SIZE`).
+    pub flow_control_group_min_size: i32,
+    /// How long a receiver may go quiet before a group strategy drops it
+    /// (`aeron.flow.control.receiver.timeout`,
+    /// `AERON_FLOW_CONTROL_RECEIVER_TIMEOUT`).
+    pub flow_control_receiver_timeout_ns: i64,
     /// The group tag a channel that names no `gtag=` gets
     /// (`aeron.receiver.group.tag`, `AERON_RECEIVER_GROUP_TAG`).
     ///
@@ -566,6 +592,9 @@ impl Default for DriverConfig {
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
+            flow_control_group_tag: FLOW_CONTROL_GROUP_TAG_DEFAULT,
+            flow_control_group_min_size: FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT,
+            flow_control_receiver_timeout_ns: FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT,
             nak_multicast_group_size: NAK_MULTICAST_GROUP_SIZE_DEFAULT,
             nak_multicast_max_backoff_ns: NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
             receiver_window_length: RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
@@ -825,6 +854,23 @@ impl DriverConfig {
                 });
             }
             config.nak_multicast_max_backoff_ns = backoff;
+        }
+        if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_TAG) {
+            config.flow_control_group_tag = parse_count(&Setting::FLOW_CONTROL_GROUP_TAG, &value)?;
+        }
+        if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_MIN_SIZE) {
+            // `aeron_config_parse_int32` refuses a value the type cannot hold
+            // rather than wrapping it (`aeron_driver_context.c:249-290`).
+            config.flow_control_group_min_size =
+                i32::try_from(parse_count(&Setting::FLOW_CONTROL_GROUP_MIN_SIZE, &value)?)
+                    .map_err(|_| ConfigError::OutOfRange {
+                        name: Setting::FLOW_CONTROL_GROUP_MIN_SIZE.property,
+                        value: value.clone(),
+                    })?;
+        }
+        if let Some(value) = get(&Setting::FLOW_CONTROL_RECEIVER_TIMEOUT) {
+            config.flow_control_receiver_timeout_ns =
+                parse_duration_ns(&Setting::FLOW_CONTROL_RECEIVER_TIMEOUT, &value)?;
         }
         if let Some(value) = get(&Setting::RECEIVER_GROUP_TAG) {
             config.receiver_group_tag = Some(parse_count(&Setting::RECEIVER_GROUP_TAG, &value)?);
@@ -1107,6 +1153,21 @@ impl Setting {
     const RECEIVER_GROUP_TAG: Self = Self {
         property: "receiver.group.tag",
         env: "AERON_RECEIVER_GROUP_TAG",
+    };
+    /// `aeron.flow.control.gtag` (`aeronmd.h:542`).
+    const FLOW_CONTROL_GROUP_TAG: Self = Self {
+        property: "flow.control.gtag",
+        env: "AERON_FLOW_CONTROL_GROUP_TAG",
+    };
+    /// `aeron.flow.control.group.min.size` (`:550`).
+    const FLOW_CONTROL_GROUP_MIN_SIZE: Self = Self {
+        property: "flow.control.group.min.size",
+        env: "AERON_FLOW_CONTROL_GROUP_MIN_SIZE",
+    };
+    /// `aeron.flow.control.receiver.timeout` (`:533`).
+    const FLOW_CONTROL_RECEIVER_TIMEOUT: Self = Self {
+        property: "flow.control.receiver.timeout",
+        env: "AERON_FLOW_CONTROL_RECEIVER_TIMEOUT",
     };
     const RECEIVER_GROUP_CONSIDERATION: Self = Self {
         property: "receiver.group.consideration",
@@ -1916,6 +1977,51 @@ mod tests {
                 "{bad} is not a size"
             );
         }
+    }
+
+    /// The four settings a group strategy reads, with the reference's own
+    /// defaults: no tag and no minimum group, a five-second receiver timeout,
+    /// and — a different setting — no endpoint tag at all.
+    #[test]
+    fn the_flow_control_settings_have_the_references_defaults() {
+        let config = resolve(&[("aeron.dir", "/tmp/aeron-test")]).expect("a config");
+
+        assert_eq!(-1, config.flow_control_group_tag);
+        assert_eq!(0, config.flow_control_group_min_size);
+        assert_eq!(5_000_000_000, config.flow_control_receiver_timeout_ns);
+        assert_eq!(None, config.receiver_group_tag);
+    }
+
+    #[test]
+    fn the_flow_control_settings_are_read_under_both_names() {
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("aeron.flow.control.gtag", "123"),
+            ("aeron.flow.control.group.min.size", "3"),
+            ("aeron.flow.control.receiver.timeout", "1s"),
+            ("aeron.receiver.group.tag", "-1"),
+        ])
+        .expect("a config");
+
+        assert_eq!(123, config.flow_control_group_tag);
+        assert_eq!(3, config.flow_control_group_min_size);
+        assert_eq!(1_000_000_000, config.flow_control_receiver_timeout_ns);
+        assert_eq!(
+            Some(-1),
+            config.receiver_group_tag,
+            "and `-1` is a tag, unlike naming nothing"
+        );
+    }
+
+    #[test]
+    fn a_group_min_size_the_type_cannot_hold_is_refused() {
+        assert!(
+            resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("aeron.flow.control.group.min.size", "2147483648"),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
