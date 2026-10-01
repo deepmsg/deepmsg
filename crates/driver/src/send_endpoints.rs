@@ -6,7 +6,7 @@
 //! decide whether a channel *is* an endpoint that exists
 //! (`find_existing_send_channel_endpoint`, `:224-286`), the agreement a shared
 //! one has to reach (`validate_channel_against_send_channel_endpoint`,
-//! `:1907-1953`) and the timeout that collects an endpoint nobody publishes
+//! `:1913-1959`) and the timeout that collects an endpoint nobody publishes
 //! through any more (`:1533-1586`).
 //!
 //! # Sharing is by canonical form, not by URI
@@ -21,10 +21,17 @@
 //!
 //! # What a shared endpoint must agree on
 //!
-//! Its socket buffer sizes (`:1948-1966`): the second channel is not making a
-//! socket, it is using one, and a `so-rcvbuf=` that disagrees with the socket
-//! that exists is a channel whose configuration would be silently ignored.
-//! The reference refuses it and so does this.
+//! Its socket buffer sizes and its MTU (`:1913-1959`): the second channel is
+//! not making a socket, it is using one, and a `so-rcvbuf=` that disagrees with
+//! the socket that exists is a channel whose configuration would be silently
+//! ignored. The reference refuses it and so does this.
+//!
+//! Every one of those checks measures the arriving channel against the value
+//! the endpoint **adopted** when it was made — never against the arriving
+//! channel's own parameters, which would make the comparison a channel against
+//! itself. That is why [`SendChannelEndpointEntry`] carries the two buffer
+//! lengths the socket was opened with: the endpoint that knows them has been
+//! moved to the sender by the time a second channel arrives.
 //!
 //! # Where the socket lives
 //!
@@ -36,6 +43,7 @@
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::channel_validation;
 use crate::media::loss_generator::EveryNthDatagram;
 use crate::media::send_endpoint::{self, EndpointStatus, PublicationDispatch, SendChannelEndpoint};
 use crate::sys;
@@ -60,6 +68,20 @@ pub struct SendChannelEndpointEntry {
     pub sender_released: bool,
     /// When the endpoint last had a publication, for the collection timeout.
     pub time_of_last_activity_ns: i64,
+    /// The `SO_RCVBUF` the socket was opened with: the creating channel's own
+    /// number when it named one, the context's otherwise, and zero when
+    /// neither did — which is the kernel's default
+    /// (`aeron_send_channel_endpoint.c:100-103`).
+    ///
+    /// Kept here rather than read back off the endpoint because the endpoint
+    /// has been *moved to the sender* by the time a second channel arrives,
+    /// and because this is the value the reference compares against: what the
+    /// endpoint adopted, not what the arriving channel says. A build that
+    /// recomputed it from the arriving channel's parameters would be
+    /// comparing a channel with itself (`:1936-1945`).
+    pub socket_rcvbuf: usize,
+    /// The `SO_SNDBUF`, likewise.
+    pub socket_sndbuf: usize,
 }
 
 /// What `get_or_add` did.
@@ -128,16 +150,13 @@ pub enum EndpointError {
         /// The tag both channels named.
         tag: i64,
     },
-    /// A buffer parameter that disagrees with the socket that exists
-    /// (`:1948-1966`).
-    BufferMismatch {
-        /// Which parameter.
-        param: &'static str,
-        /// What the new channel asked for.
-        requested: u64,
-        /// What the socket has.
-        existing: u64,
-    },
+    /// A channel parameter the endpoint cannot honour
+    /// (`validate_channel_against_send_channel_endpoint`, `:1913-1959`).
+    ///
+    /// The message is the reference's own, verbatim, because it is what the
+    /// client's `RegistrationException` carries — the check that produced it
+    /// is [`crate::channel_validation`]'s business.
+    ChannelValidation(String),
     /// The counter manager is full.
     NoCounter,
     /// The socket could not be opened.
@@ -167,14 +186,7 @@ impl std::fmt::Display for EndpointError {
                 f.write_str("send_channel_endpoint found in CLOSING state, please retry")
             }
             Self::TagMismatch { tag } => write!(f, "matching tag {tag} has mismatched endpoint"),
-            Self::BufferMismatch {
-                param,
-                requested,
-                existing,
-            } => write!(
-                f,
-                "{param}={requested} does not match existing value of {existing}"
-            ),
+            Self::ChannelValidation(message) => f.write_str(message),
             Self::NoCounter => f.write_str("could not allocate the channel status counter"),
             Self::Socket(error) => write!(f, "{error}"),
         }
@@ -295,33 +307,48 @@ impl SendChannelEndpoints {
     /// Create the endpoint for a channel, or find the one it shares
     /// (`get_or_add_send_channel_endpoint`, `:1961-2030`).
     ///
+    /// `config` is the driver's context, which is where the MTU chain ends
+    /// when neither the endpoint nor the channel named a send buffer, and
+    /// `mtu_length` is the publication's `mtu=`, its 32-byte frame header
+    /// included (`params->mtu_length`, `:1925`).
+    ///
     /// # Errors
     ///
     /// [`EndpointError`] for a channel nothing can be built from, a closing
-    /// endpoint, a tag or buffer disagreement, or a socket that will not open.
+    /// endpoint, a tag or parameter disagreement, or a socket that will not
+    /// open.
     #[allow(clippy::too_many_arguments)] // the collaborators a create needs
     pub fn get_or_add(
         &mut self,
         channel: UdpChannel,
         params: &crate::media::TransportParams,
+        config: &crate::config::DriverConfig,
+        mtu_length: usize,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ns: i64,
         now_ms: i64,
     ) -> Result<EndpointOutcome, EndpointError> {
-        let defaults = sys::SocketBufferLengths {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            rcvbuf: params.socket_rcvbuf as i32,
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            sndbuf: params.socket_sndbuf as i32,
-        };
+        #[allow(clippy::cast_sign_loss)] // a buffer length is not negative
+        let context_socket_sndbuf = config.socket_so_sndbuf.max(0) as usize;
+
+        // The kernel's own buffers, which is the last arm of the MTU chain and
+        // the value `default_so_sndbuf` holds in the reference
+        // (`aeron_driver_context.c:1315-1320`, read at `:1930`). A host the
+        // probe cannot ask leaves zeroes, and the arm is then simply absent.
+        let os_default_socket_sndbuf = sys::default_socket_buffers()
+            .map_or(0, |lengths| usize::try_from(lengths.sndbuf).unwrap_or(0));
 
         if let Some(id) = self.find(&channel)? {
             let entry = self.get(id).expect("just found");
-            if let Some(mismatch) = buffer_mismatch_of(&channel, entry, defaults) {
-                return Err(mismatch);
-            }
+            validate_against_endpoint(
+                &channel,
+                entry,
+                context_socket_sndbuf,
+                mtu_length,
+                os_default_socket_sndbuf,
+            )?;
 
             return Ok(EndpointOutcome::Shared {
                 id,
@@ -337,6 +364,17 @@ impl SendChannelEndpoints {
         {
             return Err(EndpointError::NoAddress);
         }
+
+        // `:1983-1992`: an endpoint that does not exist yet has adopted
+        // nothing, so the chain starts at the channel.
+        channel_validation::validate_mtu_for_sndbuf(
+            mtu_length,
+            0,
+            channel.socket_sndbuf_length,
+            context_socket_sndbuf,
+            os_default_socket_sndbuf,
+        )
+        .map_err(EndpointError::ChannelValidation)?;
 
         let mut endpoint = SendChannelEndpoint::create(
             channel,
@@ -369,6 +407,13 @@ impl SendChannelEndpoints {
 
         let channel_status_counter_id = endpoint.channel_status_counter_id();
 
+        // What the socket was opened with, read off the endpoint before the
+        // sender takes it: `aeron_send_channel_endpoint_create` writes these
+        // two fields for exactly this purpose (`:100-103`) and the socket
+        // itself is the authority on what it got.
+        let socket_rcvbuf = endpoint.socket_rcvbuf;
+        let socket_sndbuf = endpoint.socket_sndbuf;
+
         self.entries.push(SendChannelEndpointEntry {
             id,
             channel: endpoint.channel.clone(),
@@ -377,6 +422,8 @@ impl SendChannelEndpoints {
             refcount: 0,
             sender_released: false,
             time_of_last_activity_ns: now_ns,
+            socket_rcvbuf,
+            socket_sndbuf,
         });
 
         Ok(EndpointOutcome::Created {
@@ -483,25 +530,64 @@ fn matches_tag(channel: &UdpChannel, existing: &UdpChannel) -> Result<bool, Endp
     Ok(true)
 }
 
-/// The buffer-parameter agreement a shared endpoint requires
-/// (`validate_channel_against_send_channel_endpoint`, `:1907-1953`).
-fn buffer_mismatch_of(
+/// The three checks a channel must pass before it may share an endpoint
+/// (`aeron_driver_conductor_validate_channel_against_send_channel_endpoint`,
+/// `:1913-1959`).
+///
+/// Each one measures the arriving channel against what the endpoint **has**,
+/// never against what the arriving channel asks for: the two are only equal by
+/// accident, and the whole point of the check is the case where they are not.
+///
+/// # Errors
+///
+/// [`EndpointError::ChannelValidation`] carrying the reference's own message —
+/// the client reads it, so it is not paraphrased.
+fn validate_against_endpoint(
     channel: &UdpChannel,
     entry: &SendChannelEndpointEntry,
-    defaults: sys::SocketBufferLengths,
-) -> Option<EndpointError> {
-    let (param, requested, existing) = send_endpoint::buffer_mismatch(
-        channel,
-        entry.channel.socket_rcvbuf_length,
-        entry.channel.socket_sndbuf_length,
-        defaults,
-    )?;
+    context_socket_sndbuf: usize,
+    mtu_length: usize,
+    os_default_socket_sndbuf: usize,
+) -> Result<(), EndpointError> {
+    // `:1925-1934`: a frame has to fit the buffer that carries it. The
+    // endpoint comes first because it is the number the socket actually has,
+    // and each arm names itself in the message.
+    channel_validation::validate_mtu_for_sndbuf(
+        mtu_length,
+        entry.socket_sndbuf,
+        channel.socket_sndbuf_length,
+        context_socket_sndbuf,
+        os_default_socket_sndbuf,
+    )
+    .map_err(EndpointError::ChannelValidation)?;
 
-    Some(EndpointError::BufferMismatch {
-        param,
-        requested,
-        existing,
-    })
+    // `:1936-1945` and `:1947-1956`: the buffers the socket already has. A
+    // channel that names none agrees with anything — it is asking for the
+    // socket that exists, which is what makes `so-sndbuf=` optional on every
+    // channel after the first.
+    for (param, named, adopted) in [
+        (
+            "so-rcvbuf",
+            channel.socket_rcvbuf_length,
+            entry.socket_rcvbuf,
+        ),
+        (
+            "so-sndbuf",
+            channel.socket_sndbuf_length,
+            entry.socket_sndbuf,
+        ),
+    ] {
+        channel_validation::validate_channel_buffer_length(
+            param,
+            named,
+            adopted,
+            &channel.original_uri,
+            &entry.channel.original_uri,
+        )
+        .map_err(EndpointError::ChannelValidation)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,6 +595,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::config::DriverConfig;
     use crate::media::TransportParams;
     use crate::position as counter_position;
     use deepmsg_core::buffer::AtomicBuffer;
@@ -551,6 +638,15 @@ mod tests {
         TransportParams::default()
     }
 
+    /// The transport parameters the driver would open this channel with:
+    /// the channel's own numbers where it named one, the context's otherwise
+    /// (`network_publications::transport_params`). This is also what an
+    /// endpoint *adopts*, which is the value the second channel is measured
+    /// against.
+    fn params(uri: &str) -> TransportParams {
+        crate::network_publications::transport_params(&DriverConfig::default(), &channel(uri))
+    }
+
     #[test]
     fn a_channel_that_canonicalises_alike_shares_the_endpoint() {
         let mut fixture = Fixture::new();
@@ -561,6 +657,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -576,6 +674,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123|mtu=1408"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 8,
@@ -603,6 +703,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123|tags=1"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -615,6 +717,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123|tags=2"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 8,
@@ -637,6 +741,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123|tags=5"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -651,6 +757,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40124|tags=5"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 8,
@@ -678,6 +786,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?tags=3"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -700,6 +810,8 @@ mod tests {
                 .get_or_add(
                     channel("aeron:udp?control-mode=manual|tags=3"),
                     &defaults(),
+                    &DriverConfig::default(),
+                    0,
                     &mut counters,
                     &regions,
                     7,
@@ -716,10 +828,20 @@ mod tests {
         let (mut counters, regions) = fixture.open();
         let mut endpoints = SendChannelEndpoints::new();
 
+        // `params` and not a bare `TransportParams::default()`: the endpoint
+        // adopts what the socket was opened with, and a channel that named
+        // `so-sndbuf=1m` is a socket that was opened with one. A test whose
+        // parameters said zero would be testing a different endpoint from the
+        // one the channel describes.
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=2m";
+
         endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m"),
-                &defaults(),
+                channel(FIRST),
+                &params(FIRST),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -730,8 +852,10 @@ mod tests {
 
         let error = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=2m"),
-                &defaults(),
+                channel(SECOND),
+                &params(SECOND),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 8,
@@ -740,14 +864,17 @@ mod tests {
             )
             .expect_err("refused");
 
+        // The reference's sentence, both channels named: the arriving channel
+        // is measured against the endpoint's *adopted* 1m, and a build that
+        // measured it against the arriving channel's own parameters would
+        // find 2m equal to 2m and let it through.
         assert!(
             matches!(
                 error,
-                EndpointError::BufferMismatch {
-                    param: "so-sndbuf",
-                    requested: 2_097_152,
-                    existing: 1_048_576,
-                }
+                EndpointError::ChannelValidation(ref message) if message ==
+                    "so-sndbuf=2097152 does not match existing value of 1048576: \
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=2m"
             ),
             "{error}"
         );
@@ -758,6 +885,8 @@ mod tests {
                 .get_or_add(
                     channel("aeron:udp?endpoint=127.0.0.1:40123"),
                     &defaults(),
+                    &DriverConfig::default(),
+                    0,
                     &mut counters,
                     &regions,
                     9,
@@ -780,6 +909,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 77,
@@ -845,6 +976,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 78,
@@ -927,6 +1060,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 7,
@@ -941,6 +1076,8 @@ mod tests {
             .get_or_add(
                 channel("aeron:udp?endpoint=127.0.0.1:40123"),
                 &defaults(),
+                &DriverConfig::default(),
+                0,
                 &mut counters,
                 &regions,
                 8,
@@ -966,6 +1103,8 @@ mod tests {
             refcount: 1,
             sender_released: false,
             time_of_last_activity_ns: 1_000,
+            socket_rcvbuf: 0,
+            socket_sndbuf: 0,
         };
 
         assert!(!SendChannelEndpoints::is_collectable(&entry, 2_000, 500));
