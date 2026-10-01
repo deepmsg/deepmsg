@@ -105,6 +105,10 @@ pub struct IpcPublication {
     pub untethered_linger_timeout_ns: i64,
     /// And the resting half.
     pub untethered_resting_timeout_ns: i64,
+    /// How long a rejection lasts (`aeron_ipc_publication.c:177`, which takes
+    /// it from `context->image_liveness_timeout_ns` — the same ten seconds an
+    /// image waits before deciding a publication is gone).
+    pub liveness_timeout_ns: i64,
     /// Where the limit may next jump to (`aeron_ipc_publication.h:172`).
     trip_gain: i32,
     trip_limit: i64,
@@ -117,6 +121,13 @@ pub struct IpcPublication {
     /// When the state last changed (`managed_resource.time_of_last_state_change_ns`).
     time_of_last_state_change_ns: i64,
     state: State,
+    /// Whether this publication is refusing its readers
+    /// (`aeron_ipc_publication.h:71`). Unlike every other field here it is not
+    /// a state: a rejected publication stays `Active` throughout, and the flag
+    /// is what keeps subscribers off it until the cool down runs out.
+    in_cool_down: bool,
+    /// When that ends (`aeron_ipc_publication.h:72`).
+    cool_down_expire_time_ns: i64,
     has_reached_end_of_life: bool,
 }
 
@@ -389,6 +400,7 @@ impl IpcPublication {
             untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
+            liveness_timeout_ns: crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
             trip_gain: params.publication_window_length / 8,
             trip_limit: 0,
             consumer_position: start_position,
@@ -396,6 +408,8 @@ impl IpcPublication {
             refcount: 0,
             time_of_last_state_change_ns: 0,
             state: State::Active,
+            in_cool_down: false,
+            cool_down_expire_time_ns: 0,
             has_reached_end_of_life: false,
         })
     }
@@ -574,6 +588,77 @@ impl IpcPublication {
         self.state = State::Linger;
 
         true
+    }
+
+    /// Whether a rejection arriving now would cut the readers off, or only
+    /// push the deadline out (`aeron_ipc_publication.c:252`, the
+    /// `if (!publication->in_cool_down)` that guards all of the work).
+    ///
+    /// A rejected-but-not-yet-cooled publication is left exactly as it is: a
+    /// second rejection inside the window is a client repeating itself, and the
+    /// reference answers it by extending the silence rather than by unlinking
+    /// readers that are already unlinked.
+    pub const fn is_in_cool_down(&self) -> bool {
+        self.in_cool_down
+    }
+
+    /// Refuse readers until `now_ns + liveness_timeout_ns`
+    /// (`aeron_ipc_publication.c:273-276`).
+    pub fn enter_cool_down(&mut self, now_ns: i64) {
+        self.in_cool_down = true;
+        self.cool_down_expire_time_ns = now_ns + self.liveness_timeout_ns;
+    }
+
+    /// End the cool down if it has run out, and say whether it did
+    /// (`aeron_ipc_publication_check_cooldown_status`,
+    /// `aeron_ipc_publication.c:468-479`).
+    ///
+    /// The caller links the subscriptions again — that is a conductor's act,
+    /// and this publication cannot reach them. The comparison is the
+    /// reference's strict `<`: a deadline of exactly now is not yet past.
+    pub fn cool_down_has_expired(&mut self, now_ns: i64) -> bool {
+        if !self.in_cool_down || self.cool_down_expire_time_ns >= now_ns {
+            return false;
+        }
+
+        self.in_cool_down = false;
+        self.cool_down_expire_time_ns = 0;
+
+        true
+    }
+
+    /// Close the log's `is_connected` byte, the first thing a rejection does
+    /// (`aeron_ipc_publication.c:254`).
+    ///
+    /// Written rather than recomputed from the readers, which is what
+    /// [`Self::update_connected_status`] does and what the untethered machine
+    /// needs: here the answer is already known — nobody is connected to a
+    /// publication that has just refused them — and the reference stores it
+    /// rather than deriving it.
+    pub fn mark_disconnected(&self) {
+        if let Some(metadata) = self.log.metadata() {
+            let _ = metadata.store_i32_release(descriptor::IS_CONNECTED_OFFSET, 0);
+        }
+    }
+
+    /// Give every reader's counter back and empty the set
+    /// (`aeron_ipc_publication.c:258-271`).
+    ///
+    /// The counters belong to the publication's set and not to the subscription
+    /// links that point at them, which is why the links are unlinked first and
+    /// without freeing: the reference's `unlink_subscribable` drops the link's
+    /// entries and this frees what they named.
+    pub fn clear_subscribers(
+        &mut self,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+    ) {
+        for reader in self.subscribers.positions() {
+            counters.free(regions, reader.counter_id, now_ms);
+        }
+
+        self.subscribers.clear();
     }
 
     /// The timeout tier's turn for this publication
@@ -1015,12 +1100,17 @@ impl IpcPublication {
 
     /// Whether a subscriber arriving now would be attached
     /// (`aeron_ipc_publication.h:224-230`): an active publication, or a draining
-    /// one that still has unread data.
+    /// one that still has unread data — and never one that is refusing readers,
+    /// whatever state it is in.
     pub fn is_accepting_subscriptions(
         &self,
         manager: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> bool {
+        if self.in_cool_down {
+            return false;
+        }
+
         match self.state {
             State::Active => true,
             State::Draining => !self.is_drained(manager, regions),
@@ -1142,6 +1232,16 @@ mod tests {
 
             (manager, regions)
         }
+    }
+
+    /// The log's `is_connected` byte, read fresh — the metadata view borrows
+    /// the publication, so a test that held one would have to give it up
+    /// before touching the publication again.
+    fn connected(publication: &IpcPublication) -> Option<i32> {
+        publication
+            .log
+            .metadata()?
+            .load_i32_acquire(descriptor::IS_CONNECTED_OFFSET)
     }
 
     /// One reader, as the conductor leaves it when it links a subscriber.
@@ -1947,5 +2047,99 @@ mod tests {
         }
 
         assert!(!publication.is_drained(&manager, &region_pair));
+    }
+
+    #[test]
+    fn a_rejection_refuses_readers_until_the_cool_down_runs_out() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+
+        let now = 1_000_000_000i64;
+        let expires = now + publication.liveness_timeout_ns;
+
+        assert!(!publication.is_in_cool_down());
+        assert!(publication.is_accepting_subscriptions(&manager, &region_pair));
+
+        publication.enter_cool_down(now);
+
+        assert!(publication.is_in_cool_down());
+        assert!(
+            !publication.is_accepting_subscriptions(&manager, &region_pair),
+            "a publication that has just refused its readers takes no new ones"
+        );
+
+        // The comparison is the reference's strict `<` — a deadline of exactly
+        // now is not yet past (`aeron_ipc_publication.c:471`).
+        assert!(!publication.cool_down_has_expired(expires - 1));
+        assert!(!publication.cool_down_has_expired(expires));
+
+        assert!(publication.cool_down_has_expired(expires + 1));
+        assert!(!publication.is_in_cool_down());
+        assert!(
+            publication.is_accepting_subscriptions(&manager, &region_pair),
+            "and readers are welcome again"
+        );
+
+        // Once only: the second call finds no cool down to end, which is what
+        // stops the caller re-linking the same subscriptions on every tier.
+        assert!(!publication.cool_down_has_expired(expires + 2));
+    }
+
+    #[test]
+    fn a_second_rejection_inside_the_window_only_pushes_the_deadline_out() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+
+        // The reference's guard is `if (!publication->in_cool_down)`
+        // (`aeron_ipc_publication.c:252`): everything that takes the readers
+        // away is skipped the second time, and this is what tells the caller
+        // so.
+        publication.enter_cool_down(1_000);
+        assert!(publication.is_in_cool_down());
+        assert!(!publication.cool_down_has_expired(1_000 + publication.liveness_timeout_ns));
+
+        publication.enter_cool_down(2_000);
+        assert!(publication.is_in_cool_down());
+        assert!(
+            !publication.cool_down_has_expired(1_000 + publication.liveness_timeout_ns + 1),
+            "the later rejection moved the deadline, not the first one"
+        );
+        assert!(publication.cool_down_has_expired(2_000 + publication.liveness_timeout_ns + 1));
+    }
+
+    #[test]
+    fn rejecting_a_publication_closes_its_connection_and_gives_the_readers_back() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let (mut publication, stalled, reading) =
+            stalled_and_reading(&dir, &mut manager, &region_pair, true);
+
+        assert_eq!(Some(1), connected(&publication), "two readers are reading");
+
+        let free_before = manager.free_list_len();
+
+        publication.mark_disconnected();
+        publication.clear_subscribers(&mut manager, &region_pair, 0);
+
+        assert_eq!(
+            Some(0),
+            connected(&publication),
+            "nobody is connected to a publication that just refused them"
+        );
+        assert!(
+            publication.subscribers.is_empty(),
+            "the set is empty, not merely inactive"
+        );
+        assert_eq!(
+            free_before + 2,
+            manager.free_list_len(),
+            "and exactly the two readers' counters came back — {stalled} and {reading}; \
+             the publication's own `pub-pos` and `pub-lmt` are still out"
+        );
     }
 }

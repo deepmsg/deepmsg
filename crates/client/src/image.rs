@@ -188,7 +188,14 @@ impl Image {
         })
     }
 
-    /// The publication's registration id.
+    /// The **publication's** registration id — not this subscriber's
+    /// (`aeron_image_t.correlation_id`, `aeron_image.h:28`; `Image.correlationId()`,
+    /// `Image.java:184`).
+    ///
+    /// It is what [`crate::client::Client::reject_image`] takes, and what a
+    /// [`PublicationErrorEvent`](crate::publication_error::PublicationErrorEvent)
+    /// about this image's stream will name — which is why the two ids must not
+    /// be confused: handing the subscriber's id to a rejection names nothing.
     pub const fn registration_id(&self) -> i64 {
         self.registration_id
     }
@@ -214,7 +221,14 @@ impl Image {
         &self.log
     }
 
-    /// How far this reader has consumed.
+    /// How far this **reader** has consumed — not how far the publisher has
+    /// written (`aeron_image_position`, `aeron_image.c:735-738`;
+    /// `Image.position()`, `Image.java:224`).
+    ///
+    /// An image that has read nothing reports nothing, however much is in the
+    /// term. The reference rejects an image at this position and not at the
+    /// publisher's for that reason: what travels to the far end is where the
+    /// stream was cut off, which is where its reader stopped.
     pub const fn position(&self) -> i64 {
         self.position.raw()
     }
@@ -279,11 +293,23 @@ impl Image {
                         break;
                     }
                 }
-                // A padding frame means the producer ran out of term, so
-                // the rest of this term is consumed whatever it contains.
-                Step::Padding { .. } => {
-                    next = term_end;
-                    break;
+                // A padding frame covers the bytes it covers, and the scan
+                // steps over it (`aeron_image.c:375-379`, and Java's
+                // `Image.java:357-359`) — which is the only handling that reads
+                // **both** shapes of padding correctly.
+                //
+                // A producer's tail padding reaches exactly to the term's end,
+                // so stepping over it ends the term anyway and this is what the
+                // old `next = term_end` did. A **repaired hole** does not: an
+                // image that fills a gap because its channel said
+                // `reliable=false` leaves a padding frame in the middle of a
+                // term, with frames the reader has not seen on the other side
+                // of it. Jumping to the term's end threw those away — silently,
+                // and only ever on an unreliable stream, which is why nothing
+                // noticed until one was read end to end.
+                Step::Padding { frame_length, .. } => {
+                    let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+                    next = Position::from_raw(next.raw() + i64::from(aligned));
                 }
                 // The scan reached the term's end because the previous
                 // frame ended exactly on the boundary, with no padding

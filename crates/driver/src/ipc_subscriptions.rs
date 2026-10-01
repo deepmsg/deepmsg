@@ -40,7 +40,7 @@
 
 use deepmsg_cnc::command::{
     AddSubscriptionCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, DestinationCommandReceived,
-    ERROR_CODE_GENERIC_ERROR, ImageBuffersReady,
+    ERROR_CODE_EINVAL, ERROR_CODE_GENERIC_ERROR, ImageBuffersReady,
 };
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -340,6 +340,15 @@ pub enum AddSubscriptionError {
     /// An `ADD_RCV_DESTINATION` named a subscription whose channel does not
     /// allow manual control, and so may not have sources added to it (`:5608-5611`).
     NotManualControl,
+    /// A subscription named an option that disagrees with one already on the
+    /// same endpoint and stream, so the two cannot share the image that would
+    /// serve them (`aeron_driver_conductor_has_clashing_subscription`,
+    /// `aeron_driver_conductor.c:286-366`).
+    Clashing {
+        /// The reference's words, which name the option, its value and both
+        /// channels.
+        message: String,
+    },
 }
 
 impl AddSubscriptionError {
@@ -359,6 +368,12 @@ impl AddSubscriptionError {
             Self::UnsupportedTransport => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
             Self::UnknownSubscription => deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
             Self::NotManualControl => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
+            // Not one of Aeron's codes: the reference hands `AERON_SET_ERR` the
+            // platform's `EINVAL` here (`:323`), and `aeron_errcode()` returns
+            // whatever it was given (`util/aeron_error.c:355`), so 22 is what
+            // the client reads back. It is the one refusal in this family whose
+            // code is an errno rather than an `AERON_ERROR_CODE_*`.
+            Self::Clashing { .. } => ERROR_CODE_EINVAL,
             Self::Channel(error) => error.error_code(),
             Self::Params(_)
             | Self::NoClientRecord
@@ -383,6 +398,7 @@ impl std::fmt::Display for AddSubscriptionError {
             Self::Receiver => f.write_str("the receiver thread has stopped"),
             Self::UnknownSubscription => f.write_str("unknown subscription"),
             Self::NotManualControl => f.write_str("channel does not allow manual control"),
+            Self::Clashing { message } => f.write_str(message),
         }
     }
 }
@@ -983,6 +999,58 @@ impl IpcSubscriptions {
         }
     }
 
+    /// A publication is being rejected: tell every subscription reading it
+    /// that the image is gone, and drop those readers from the subscriptions
+    /// (`aeron_driver_conductor_unlink_ipc_subscriptions`,
+    /// `aeron_driver_conductor.c:6453-6473`).
+    ///
+    /// Nothing is freed here. The counter a reader was given belongs to the
+    /// publication's own set, and that set is what gives it back a step later
+    /// (`aeron_ipc_publication.c:256-271`: `unlink_subscribable` drops the
+    /// link's entries, then the subscribable's array is freed) — freeing it
+    /// here as well would give the same counter back twice.
+    ///
+    /// The message names what the **link** holds — its own stream id and its
+    /// own channel — where the revoke path names the publication's stream and
+    /// the constant `aeron:ipc`. That asymmetry is the reference's, and the two
+    /// are thirty lines apart in the conductor (`:6462-6468` against
+    /// `:503-517`).
+    ///
+    /// # Returns
+    ///
+    /// How many subscriptions were told.
+    pub fn unlink_publication(
+        &mut self,
+        publication_registration_id: i64,
+        events: &mut impl ClientEvents,
+    ) -> usize {
+        let mut told = 0;
+
+        for link in &mut self.links {
+            let before = link.subscribables.len();
+
+            link.subscribables.retain(|entry| {
+                !matches!(
+                    entry.target,
+                    SubscriptionTarget::IpcPublication(registration_id)
+                        if registration_id == publication_registration_id
+                )
+            });
+
+            if link.subscribables.len() != before {
+                events.unavailable_image(
+                    publication_registration_id,
+                    link.registration_id,
+                    link.stream_id,
+                    &link.channel,
+                );
+                told += 1;
+            }
+        }
+
+        told
+    }
+
     /// Whether a **network** subscription with this registration id exists
     /// (`aeron_driver_conductor.c:641-648`, which walks
     /// `network_subscriptions`).
@@ -1207,6 +1275,54 @@ impl IpcSubscriptions {
         None
     }
 
+    /// Refuse a subscription whose `reliable` disagrees with one already
+    /// reading the same endpoint and stream
+    /// (`aeron_driver_conductor_has_clashing_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:286-366`; the arm is
+    /// `:320-332`).
+    ///
+    /// Two subscriptions that one image would serve have to agree about the
+    /// options that decide how it behaves. Without this the second is served by
+    /// the first one's image and reads a stream whose rules it did not choose —
+    /// a client that asked for `reliable=false` silently getting retransmissions
+    /// — with nothing raised and no counter moved.
+    ///
+    /// The reference checks three options in this loop; this is the one of the
+    /// three that changes behaviour here, because `rejoin` and `is_response` are
+    /// read by nothing yet (see `docs/compat.md`).
+    ///
+    /// The match is the reference's own: same endpoint, same stream, and the
+    /// same session *including* both being wildcards — a subscription that named
+    /// a session and one that did not are two subscriptions the reference does
+    /// not call clashing, whatever image they later end up sharing
+    /// (`aeron_driver_conductor_network_subscription_link_matches`, `:62-70`).
+    fn refuse_a_clashing_reliability(
+        &self,
+        endpoint_id: u64,
+        stream_id: i32,
+        session_id: Option<i32>,
+        is_reliable: bool,
+        channel: &[u8],
+    ) -> Result<(), AddSubscriptionError> {
+        let Some(existing) = self.links.iter().find(|link| {
+            link.endpoint_id == Some(endpoint_id)
+                && link.stream_id == stream_id
+                && link.session_id == session_id
+                && link.is_reliable != is_reliable
+        }) else {
+            return Ok(());
+        };
+
+        Err(AddSubscriptionError::Clashing {
+            message: format!(
+                "option conflicts with existing subscription: reliable={} existingChannel={} channel={}",
+                is_reliable,
+                String::from_utf8_lossy(&existing.channel),
+                String::from_utf8_lossy(channel),
+            ),
+        })
+    }
+
     /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
     /// (`aeron_driver_conductor_on_add_network_subscription`,
     /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5156-5280`).
@@ -1246,6 +1362,21 @@ impl IpcSubscriptions {
         let params = SubscriptionParams::resolve(&uri, config)?;
 
         validate_for_subscription(&channel)?;
+
+        // Before the endpoint is made, as the reference checks it before it
+        // makes one (`aeron_driver_conductor.c:5035-5041`): a subscription whose
+        // options disagree with one already reading that endpoint and stream
+        // cannot be served, because the image they would share can only behave
+        // one way.
+        if let Some(existing) = endpoints.find(&channel) {
+            self.refuse_a_clashing_reliability(
+                existing,
+                request.stream_id,
+                params.session_id,
+                params.is_reliable,
+                request.channel,
+            )?;
+        }
 
         let Some(_client) = clients.get_or_add(
             request.client_id,

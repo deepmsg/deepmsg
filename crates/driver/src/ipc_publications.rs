@@ -37,9 +37,10 @@ use std::path::PathBuf;
 
 use deepmsg_cnc::command::{
     AddPublicationCommand, CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, ERROR_CODE_GENERIC_ERROR,
-    ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_STORAGE_SPACE,
-    ImageBuffersReady, PublicationBuffersReady,
+    ERROR_CODE_IMAGE_REJECTED, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED,
+    ERROR_CODE_STORAGE_SPACE, ImageBuffersReady, PublicationBuffersReady, PublicationError,
 };
+use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position;
@@ -418,6 +419,24 @@ impl IpcPublications {
         self.session_ids
     }
 
+    /// Hand out the next session id and move the cursor past it
+    /// (`aeron_driver_conductor_next_session_id` followed by
+    /// `aeron_driver_conductor_update_next_session_id`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1062-1075`).
+    ///
+    /// The two are one act here because a caller that read the cursor and
+    /// forgot to move it would hand the same id out twice — which is what the
+    /// reference's `GET_NEXT_AVAILABLE_SESSION_ID` handler is careful not to
+    /// do, and the reason it advances *before* it checks whether the id
+    /// collides. An id that collides is skipped by asking again, not by
+    /// rewinding.
+    pub fn next_session_id(&mut self) -> i32 {
+        let next = self.session_ids.cursor();
+        self.session_ids.advance(next);
+
+        next
+    }
+
     /// Serve an `ADD_PUBLICATION` or `ADD_EXCLUSIVE_PUBLICATION`.
     ///
     /// Nothing is sent from here unless the publication already exists: a new
@@ -718,6 +737,116 @@ impl IpcPublications {
         }
     }
 
+    /// Cut a publication off from its readers, because a client asked
+    /// (`aeron_ipc_publication_reject`, `aeron_ipc_publication.c:216-277`).
+    ///
+    /// Three things, in the reference's order, and the order is the part a
+    /// caller has to keep:
+    ///
+    /// 1. the **publisher** is told first — an `ON_PUBLICATION_ERROR` naming the
+    ///    publication, carrying the client's own words;
+    /// 2. then, if the publication was not already refusing readers, it stops
+    ///    accepting them: the log's `is_connected` byte closes, every
+    ///    subscription reading it is told the image is gone and loses the
+    ///    reader, and the readers' counters are given back;
+    /// 3. and the silence is set to last [`IpcPublication::liveness_timeout_ns`]
+    ///    from now.
+    ///
+    /// **The command's `position` is not used here.** It travels into the
+    /// receiver's `ERR` frame on the network path, and the reference's IPC path
+    /// drops it: an IPC publication has no image to invalidate at a position,
+    /// and the publisher is told the news without one
+    /// (`aeron_ipc_publication_reject` takes no such argument at all).
+    ///
+    /// The reason is at most 1023 bytes when it gets here — that bound is the
+    /// decoder's, refused before the handler runs
+    /// ([`deepmsg_cnc::command::MAX_REASON_TEXT_LENGTH`]) — so the clipping the
+    /// reference does inside its own version (`:227`) has nothing to clip.
+    ///
+    /// # Returns
+    ///
+    /// Whether a publication was found under that registration id.
+    #[allow(clippy::too_many_arguments)] // the conductor's own collaborators
+    pub fn reject(
+        &mut self,
+        registration_id: i64,
+        reason: &[u8],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        subscriptions: &mut IpcSubscriptions,
+        events: &mut impl ClientEvents,
+        now_ns: i64,
+        now_ms: i64,
+    ) -> bool {
+        let Some(index) = self
+            .publications
+            .iter()
+            .position(|publication| publication.registration_id == registration_id)
+        else {
+            return false;
+        };
+
+        let (session_id, stream_id, already_refusing) = {
+            let publication = &self.publications[index];
+
+            (
+                publication.session_id,
+                publication.stream_id,
+                publication.is_in_cool_down(),
+            )
+        };
+
+        events.publication_error(&PublicationError {
+            registration_id,
+            // An IPC publication answers no destination and hears from no
+            // receiver, so three of these are the reference's `AERON_NULL_VALUE`
+            // (`aeron_ipc_publication.c:238-243`).
+            destination_registration_id: NULL_VALUE,
+            session_id,
+            stream_id,
+            receiver_id: NULL_VALUE,
+            group_tag: NULL_VALUE,
+            // …and its source is a freshly zeroed `sockaddr_in` with a zero
+            // port whose address is `INADDR_LOOPBACK` (`:231-236`).
+            //
+            // Those octets are **reversed**, and that is not a typo here: the
+            // reference assigns the host-order constant straight into
+            // `sin_addr.s_addr` — `s_addr = INADDR_LOOPBACK`, with no `htonl` —
+            // so what is memcpy'd out at `aeron_driver_conductor.c:2303` is the
+            // little-endian image of `0x7f000001`, which is `1.0.0.127`. Its
+            // network path is not affected, because a `sockaddr_in` filled in
+            // by the kernel holds the octets in order.
+            //
+            // The reference's own Java client reads those four bytes as the
+            // octets and hands the application `1.0.0.127`
+            // (`PublicationErrorFrameFlyweight.sourceAddress`,
+            // `aeron-client/src/main/java/io/aeron/command/PublicationErrorFrameFlyweight.java:286-317`,
+            // which is a `getBytes` and an `Inet4Address.getByAddress`). A
+            // driver that sent the sane address would put different bytes on
+            // the ring for the same event, which is the one thing this project
+            // is for — the interop test
+            // `tests/interop/our_client_rejects_on_the_reference_driver.rs`
+            // compares the two drivers' bytes for exactly this field.
+            source: Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::new(1, 0, 0, 127),
+                0,
+            ))),
+            error_code: ERROR_CODE_IMAGE_REJECTED,
+            message: reason,
+        });
+
+        if !already_refusing {
+            let publication = &mut self.publications[index];
+            publication.mark_disconnected();
+            subscriptions.unlink_publication(registration_id, events);
+            publication.clear_subscribers(counters, regions, now_ms);
+        }
+
+        self.publications[index].enter_cool_down(now_ns);
+
+        true
+    }
+
     /// The timeout tier's turn for every publication
     /// (`aeron_driver_conductor_on_check_managed_resources`, `:1691-1712`):
     /// advance the ones on their way out, and remove the ones that are done.
@@ -735,10 +864,11 @@ impl IpcPublications {
         regions: &CounterRegions<'_>,
         subscriptions: &mut IpcSubscriptions,
         events: &mut impl ClientEvents,
-        now_ns: i64,
-        now_ms: i64,
+        now: Now,
     ) -> usize {
         let mut work = 0;
+        let now_ns = now.ns;
+        let now_ms = now.ms;
 
         for index in 0..self.publications.len() {
             // The revoke is the active state's only duty here: a publication
@@ -790,6 +920,19 @@ impl IpcPublications {
                 // just took out of the working count is one the producer can
                 // no longer see reading.
                 self.publications[index].update_connected_status();
+
+                // A publication rejected a liveness timeout ago is readable
+                // again, and this is where it comes back
+                // (`aeron_ipc_publication_check_cooldown_status`, `:546`).
+                // Without it a rejection would be permanent, which is not what
+                // the reference's cool down means: it is a *pause*, and the
+                // readers that were unlinked are re-linked to the same
+                // publication rather than to a new one.
+                if self.publications[index].cool_down_has_expired(now_ns) {
+                    let publication = &mut self.publications[index];
+                    subscriptions.link_publication(publication, counters, regions, now, events);
+                    work += 1;
+                }
             }
 
             work += usize::from(self.publications[index].on_time_event(counters, regions, now_ns));

@@ -113,6 +113,27 @@ pub enum ReceiverCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Refuse an image: a client rejected it, and its publisher has to be told
+    /// (`aeron_driver_receiver_on_invalidate_image`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:633-649`).
+    ///
+    /// The command reaches the conductor first, which is what knows whether an
+    /// image answers that registration id at all; what arrives here is the
+    /// reason, because the reason is what the `ERR` frames carry and the
+    /// receiver's thread is what sends them.
+    ///
+    /// **No position.** `REJECT_IMAGE` carries where the rejecting client had
+    /// read to, and the reference drops it twice over: its receiver command has
+    /// the field and never reads it (`aeron_driver_receiver.c:636-648`), and
+    /// `aeron_publication_image_invalidate` does not take one
+    /// (`aeron_publication_image.c:1383-1387`). A field nothing reads is not a
+    /// fact about the wire, so it is not carried here.
+    InvalidateImage {
+        /// Which image.
+        image_correlation_id: i64,
+        /// The rejecting client's own words, which ride the `ERR` frames.
+        reason: Vec<u8>,
+    },
     /// Give an image a reader (`link_subscribable`'s image case).
     AddSubscriber {
         /// Which image.
@@ -384,6 +405,20 @@ impl ReceiverProxy {
             .send(ReceiverCommand::RemoveSubscriber {
                 registration_id,
                 counter_id,
+            })
+            .map_err(|_| stopped())
+    }
+
+    /// Refuse an image: reject it, and let it say so to its publisher.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn invalidate_image(&self, image_correlation_id: i64, reason: Vec<u8>) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::InvalidateImage {
+                image_correlation_id,
+                reason,
             })
             .map_err(|_| stopped())
     }
@@ -813,6 +848,25 @@ impl ReceiverThread {
                             }
                         }
                     }
+                    ReceiverCommand::InvalidateImage {
+                        image_correlation_id,
+                        reason,
+                    } => {
+                        // The image is marked, not removed: what happens next
+                        // is that it tells its publisher, on the status
+                        // message's own timer, and only the conductor's
+                        // removal takes it away. A command that cannot find
+                        // its image is one that was removed between the two
+                        // threads, which is a race the reference has too — its
+                        // loop simply finds nothing (`:640-648`).
+                        if let Some(image) = self
+                            .images
+                            .iter_mut()
+                            .find(|image| image.registration_id == image_correlation_id)
+                        {
+                            image.invalidate(&reason);
+                        }
+                    }
                     ReceiverCommand::AddSubscriber {
                         registration_id,
                         position,
@@ -1202,38 +1256,57 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
-                // A NAK goes to every connection this image hears from, like a
-                // status message: each receiver has its own view of what is
-                // missing, and one of them having it is not the others having
-                // it. With one connection this is the message it always was.
-                for connection in &image.connections {
-                    let Some(control_address) = connection.control_address else {
-                        continue;
-                    };
+                if image.is_reliable() {
+                    // A NAK goes to every connection this image hears from, like
+                    // a status message: each receiver has its own view of what is
+                    // missing, and one of them having it is not the others having
+                    // it. With one connection this is the message it always was.
+                    for connection in &image.connections {
+                        let Some(control_address) = connection.control_address else {
+                            continue;
+                        };
 
-                    if endpoint
-                        .send_nak(
-                            control_address,
-                            image.stream_id,
-                            image.session_id,
-                            gap.term_id,
-                            gap.term_offset,
-                            i32::try_from(gap.length).unwrap_or(i32::MAX),
-                        )
-                        .is_ok()
-                    {
-                        system.increment(system_counters::id::NAK_MESSAGES_SENT);
-                        // …and the same count under the image that asked for
-                        // it: the system counter says the driver is
-                        // retransmitting, this one says for which stream
-                        // (`aeron_publication_image.c:1052`).
-                        let _ = system_counters::increment(
-                            counters,
-                            regions,
-                            image.counters().rcv_naks_sent,
-                        );
-                        work += 1;
+                        if endpoint
+                            .send_nak(
+                                control_address,
+                                image.stream_id,
+                                image.session_id,
+                                gap.term_id,
+                                gap.term_offset,
+                                i32::try_from(gap.length).unwrap_or(i32::MAX),
+                            )
+                            .is_ok()
+                        {
+                            system.increment(system_counters::id::NAK_MESSAGES_SENT);
+                            // …and the same count under the image that asked for
+                            // it: the system counter says the driver is
+                            // retransmitting, this one says for which stream
+                            // (`aeron_publication_image.c:1052`).
+                            let _ = system_counters::increment(
+                                counters,
+                                regions,
+                                image.counters().rcv_naks_sent,
+                            );
+                            work += 1;
+                        }
                     }
+                } else {
+                    // An unreliable image does not ask: it covers the hole and
+                    // reads on, so whatever was in it is gone for good — which
+                    // is what the channel asked for
+                    // (`aeron_publication_image_send_pending_loss`,
+                    // `:1053-1066`). Nothing goes on the network, and the
+                    // counter is the only trace of it.
+                    //
+                    // `work` moves whether or not the fill was made, as the
+                    // reference's `work_count = 1` does: a gap that could not be
+                    // filled is one something else has landed in, and the next
+                    // scan will not find a gap at all.
+                    if image.fill_gap(gap) {
+                        system.increment(system_counters::id::LOSS_GAP_FILLS);
+                    }
+
+                    work += 1;
                 }
             }
 

@@ -43,6 +43,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender as Channel};
 use std::thread::JoinHandle;
 
+use deepmsg_cnc::command::OwnedPublicationError;
+use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
 use crate::idle::Backoff;
@@ -197,6 +199,19 @@ pub enum SenderEvent {
         response_correlation_id: i64,
         /// The session that subscription should now read.
         response_session_id: i32,
+    },
+    /// A publication's receiver refused the stream: an `ERR` frame named this
+    /// publication, and its client has to be told
+    /// (`aeron_driver_conductor_proxy_on_publication_error`,
+    /// `aeron_driver_conductor_proxy.c:207-242`).
+    ///
+    /// The reference's sender reaches the conductor's handler directly through
+    /// the proxy. Here the words travel as an event and the conductor sends the
+    /// response, because every client message in this build is written by the
+    /// one thread that holds the to-clients ring.
+    PublicationError {
+        /// The response's fields and its message.
+        error: OwnedPublicationError,
     },
     /// A publication heard from a live receiver for the first time
     /// (`aeron_driver_conductor_proxy_on_response_connected`,
@@ -1023,11 +1038,59 @@ impl SenderThread {
                 // error that arrived (`:686`).
                 system.increment(system_counters::id::ERROR_FRAMES_RECEIVED);
 
-                if let Some(publication) =
-                    find_publication(publications, frame.stream_id, frame.session_id)
-                {
-                    publication.on_error(&frame, counters, regions);
+                let Some(index) =
+                    index_of_publication(publications, frame.stream_id, frame.session_id)
+                else {
+                    return;
+                };
+
+                // The frame is what a reader says when it refuses the stream,
+                // and the two things it carries that the client cannot work out
+                // are kept: whether this was a receiver the publication was
+                // still waiting on — an `ERR` from one already gone is counted
+                // and dropped (`:872-875`) — and what it said.
+                if !publications[index].on_error(&frame, counters, regions) {
+                    return;
                 }
+
+                let endpoint_id = publications[index].endpoint_id;
+
+                // The reference asks the endpoint's destination tracker which
+                // destination the datagram belongs to, and answers
+                // `AERON_NULL_VALUE` when there is no tracker at all
+                // (`media/aeron_send_channel_endpoint.c:685-691`).
+                let destination_registration_id = source
+                    .and_then(|source| {
+                        endpoints
+                            .iter()
+                            .find(|(id, _)| *id == endpoint_id)
+                            .and_then(|(_, endpoint)| endpoint.destination_tracker())
+                            .map(|tracker| tracker.find_registration_id(frame.receiver_id, &source))
+                    })
+                    .unwrap_or(NULL_VALUE);
+
+                // A group tag is meaningful only under its flag, and a reader
+                // that sees the bit clear must ignore what it finds in the
+                // field (`aeron_network_publication.c:880`).
+                let group_tag = if 0 != header.flags & header_flags::ERR_HAS_GROUP_TAG {
+                    frame.group_tag
+                } else {
+                    NULL_VALUE
+                };
+
+                let _ = events.send(SenderEvent::PublicationError {
+                    error: OwnedPublicationError {
+                        registration_id: publications[index].registration_id,
+                        destination_registration_id,
+                        session_id: frame.session_id,
+                        stream_id: frame.stream_id,
+                        receiver_id: frame.receiver_id,
+                        group_tag,
+                        source,
+                        error_code: frame.error_code,
+                        message: frame.text(bytes).unwrap_or_default().to_vec(),
+                    },
+                });
             }
             frame_type::RTTM => {
                 // A measurement request. Answering it is the publication's job,

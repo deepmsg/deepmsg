@@ -107,8 +107,9 @@ struct PendingImage {
     source: SocketAddr,
     /// Where a control frame goes.
     control_address: SocketAddr,
-    /// Whether the image was rejected while it was being built.
-    invalidation: Option<String>,
+    /// Whether the image was rejected while it was being built, and the words
+    /// the `ERR` frame will carry.
+    invalidation: Option<Vec<u8>>,
     /// The untethered timeouts the channel named, which the image's readers
     /// inherit (`untethered-window-limit-timeout` and its two siblings).
     untethered: crate::publication_params::SubscriptionParams,
@@ -309,13 +310,17 @@ impl PublicationImages {
 
     /// Reject a pending image, saying why: an image that cannot be built still
     /// has to tell its sender (`aeron_publication_image_invalidate`).
+    ///
+    /// The reason is this driver's own here — it is a refusal this build
+    /// produced, not words a client sent — so it is taken as text and stored as
+    /// the bytes the `ERR` frame will carry.
     pub fn reject_pending(&mut self, registration_id: i64, reason: &str) {
         if let Some(pending) = self
             .pending
             .iter_mut()
             .find(|pending| pending.registration_id == registration_id)
         {
-            pending.invalidation = Some(reason.to_owned());
+            pending.invalidation = Some(reason.as_bytes().to_vec());
         }
     }
 

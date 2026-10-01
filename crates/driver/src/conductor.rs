@@ -54,13 +54,17 @@ use deepmsg_cnc::command::{
     ERROR_CODE_STORAGE_SPACE, ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID, ERROR_CODE_UNKNOWN_COUNTER,
     ERROR_CODE_UNKNOWN_PUBLICATION, ERROR_CODE_UNKNOWN_SUBSCRIPTION, ImageBuffersReady,
     ON_AVAILABLE_IMAGE_TYPE_ID, ON_CLIENT_TIMEOUT_TYPE_ID, ON_COUNTER_READY_TYPE_ID,
-    ON_ERROR_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
+    ON_ERROR_TYPE_ID, ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, ON_OPERATION_SUCCEEDED_TYPE_ID,
+    ON_PUBLICATION_ERROR_TYPE_ID, ON_STATIC_COUNTER_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
     ON_UNAVAILABLE_COUNTER_TYPE_ID, ON_UNAVAILABLE_IMAGE_TYPE_ID, PublicationBuffersReady,
-    REMOVE_PUBLICATION_FLAG_REVOKE, decode_add_counter, decode_add_publication,
-    decode_add_subscription, decode_correlated, decode_destination_by_id_command,
-    decode_destination_command, decode_remove_counter, decode_remove_publication,
-    decode_remove_subscription, encode_client_timeout, encode_counter_update, encode_error,
-    encode_operation_succeeded, encode_subscription_ready, encode_unavailable_image,
+    PublicationError, REMOVE_PUBLICATION_FLAG_REVOKE, RejectImageError, decode_add_counter,
+    decode_add_publication, decode_add_static_counter, decode_add_subscription, decode_correlated,
+    decode_destination_by_id_command, decode_destination_command,
+    decode_get_next_available_session_id, decode_reject_image, decode_remove_counter,
+    decode_remove_publication, decode_remove_subscription, encode_client_timeout,
+    encode_counter_update, encode_error, encode_next_available_session_id,
+    encode_operation_succeeded, encode_publication_error, encode_static_counter,
+    encode_subscription_ready, encode_unavailable_image,
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
@@ -338,6 +342,42 @@ impl ClientEvents for Transmit<'_> {
         self.record_fault(error_code, String::from_utf8_lossy(message).into_owned());
     }
 
+    /// Answer with an `ON_PUBLICATION_ERROR` — and record it, because the
+    /// reference does not do the one without the other.
+    ///
+    /// The entry is written *before* the message and in a different shape from
+    /// an `ON_ERROR`'s: the reference builds one line of its own
+    /// (`aeron_driver_conductor.c:2269-2287`) and hands it to
+    /// `aeron_driver_conductor_log_explicit_error`, which records it verbatim
+    /// and raises the errors counter (`:1203-1211`). There is no `AERON_SET_ERR`
+    /// site in it, so unlike every other entry this one has no `[func,
+    /// file:line]` half — the line itself is the whole of what is recorded.
+    ///
+    /// Every field of the command goes into it, including the ones the response
+    /// does not carry (`destination_registration_id`) and the message with its
+    /// length, so the entry says what arrived rather than what was sent.
+    fn publication_error(&mut self, error: &PublicationError<'_>) {
+        self.record_fault(
+            error.error_code,
+            format!(
+                "onPublicationError: registrationId={}, destinationRegistrationId={}, \
+                 sessionId={}, streamId={}, receiverId={}, groupId={}, errorCode={}, \
+                 errorMessage={}",
+                error.registration_id,
+                error.destination_registration_id,
+                error.session_id,
+                error.stream_id,
+                error.receiver_id,
+                error.group_tag,
+                error.error_code,
+                String::from_utf8_lossy(error.message),
+            ),
+        );
+
+        let payload = encode_publication_error(error);
+        self.send(ON_PUBLICATION_ERROR_TYPE_ID, &payload);
+    }
+
     fn publication_ready(&mut self, ready: &PublicationBuffersReady<'_>, is_exclusive: bool) {
         let payload = ready.encode();
         self.send(PublicationBuffersReady::type_id(is_exclusive), &payload);
@@ -482,6 +522,10 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
+    /// Publications a receiver refused, as the sender heard it: each owes its
+    /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
+    /// datagram they arrived in.
+    pending_publication_errors: Vec<deepmsg_cnc::command::OwnedPublicationError>,
 }
 
 impl Conductor {
@@ -692,6 +736,7 @@ impl Conductor {
             last_unhandled: None,
             pending_log_errors: Vec::new(),
             pending_untethered: Vec::new(),
+            pending_publication_errors: Vec::new(),
         };
 
         Ok(conductor)
@@ -768,8 +813,9 @@ impl Conductor {
     /// conductor's thread, where the command ring and the counters are.
     fn poll_publications(&mut self) -> usize {
         // The order matters and is left to right: the events are taken off the
-        // sender first, and what was taken is what the flush sends.
-        let mut work = self.poll_sender_events() + self.flush_untethered();
+        // sender first, and what was taken is what the flushes send.
+        let mut work =
+            self.poll_sender_events() + self.flush_untethered() + self.flush_publication_errors();
 
         if self.publications.pending() == 0 && self.network_publications.pending() == 0 {
             return work;
@@ -1164,6 +1210,39 @@ impl Conductor {
         work
     }
 
+    /// Tell the publications a receiver refused, in the words that receiver
+    /// used (`aeron_driver_conductor_on_publication_error`,
+    /// `aeron_driver_conductor.c:2263-2323`).
+    ///
+    /// The handler is the same one the IPC path reaches through
+    /// `aeron_ipc_publication_reject` (`aeron_ipc_publication.c:249`) — one
+    /// function, two ways in, which is why the response is built here from the
+    /// same [`PublicationError`] either way.
+    fn flush_publication_errors(&mut self) -> usize {
+        if self.pending_publication_errors.is_empty() {
+            return 0;
+        }
+
+        let pending = std::mem::take(&mut self.pending_publication_errors);
+
+        let Some(event_region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &event_region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        for error in &pending {
+            transmit.publication_error(&error.as_error());
+        }
+
+        pending.len()
+    }
+
     /// Tell every spy reading a publication that it is gone, and give their
     /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
     ///
@@ -1403,6 +1482,12 @@ impl Conductor {
                     description,
                 } => {
                     self.pending_log_errors.push((error_code, description));
+                }
+                crate::sender::SenderEvent::PublicationError { error } => {
+                    // A response rather than a fault: the publication's client
+                    // is owed an `ON_PUBLICATION_ERROR`, which only the pass
+                    // that holds the ring can write.
+                    self.pending_publication_errors.push(error);
                 }
                 crate::sender::SenderEvent::ResponseSetup {
                     response_correlation_id,
@@ -2048,6 +2133,253 @@ impl Conductor {
                     }
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
+                // A client refusing an image it was reading.
+                //
+                // Two targets, and the second is the one to miss: when no
+                // **image** answers that registration id the driver looks among
+                // its **IPC publications**, because for `aeron:ipc` what a
+                // subscriber was handed *is* the publication
+                // (`aeron_driver_conductor.c:6367-6398`). Both branches are
+                // answered the same way afterwards — the rejections counter,
+                // then `ON_OPERATION_SUCCEEDED` — and only a client that named
+                // neither hears an error.
+                Command::RejectImage => match decode_reject_image(payload) {
+                    Err(RejectImageError::Malformed) => {
+                        malformed_command(type_id, payload.len(), malformed, &mut transmit);
+                    }
+                    Err(RejectImageError::ReasonTooLong { correlated }) => {
+                        // The handler's refusal, which the dispatch turns into
+                        // an `ON_ERROR` on the command's own correlation id
+                        // (`aeron_driver_conductor.c:6357-6364`, then its
+                        // `result < 0` at `:3224-3227`).
+                        transmit.error(
+                            correlated.correlation_id,
+                            ERROR_CODE_GENERIC_ERROR,
+                            b"Invalidation reason_text must be 1023 bytes or less",
+                        );
+                    }
+                    Ok(request) => {
+                        let image_correlation_id = request.image_correlation_id;
+
+                        let rejected = if images.find(image_correlation_id).is_some() {
+                            // The image belongs to the receiver, so this is a
+                            // command to that thread rather than a change here:
+                            // all the conductor knows is *that* the image
+                            // exists, and the receiver is what has the
+                            // connections to send an `ERR` frame down
+                            // (`aeron_driver_receiver_proxy_on_invalidate_image`,
+                            // `aeron_driver_receiver_proxy.c:252-274`).
+                            let _ =
+                                receiver
+                                    .proxy()
+                                    .invalidate_image(image_correlation_id, request.reason.to_vec());
+
+                            true
+                        } else {
+                            publications.reject(
+                                image_correlation_id,
+                                request.reason,
+                                counters,
+                                &counter_regions,
+                                subscriptions,
+                                &mut transmit,
+                                now_ns,
+                                now_ms,
+                            )
+                        };
+
+                        if rejected {
+                            let _ = system_counters::increment(
+                                counters,
+                                &counter_regions,
+                                system_counters::id::IMAGES_REJECTED,
+                            );
+
+                            transmit.operation_succeeded(request.correlated.correlation_id);
+                        } else {
+                            transmit.error(
+                                request.correlated.correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                format!(
+                                    "Unable to resolve image for correlationId={image_correlation_id}"
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
+                },
+                // A client asking what session id to publish under.
+                //
+                // The driver's answer is a **hint**, and the only thing it
+                // guarantees is that no publication it holds already uses it on
+                // that stream — which is why the handler walks its own lists
+                // rather than trusting the cursor: the cursor is where it would
+                // look next, and a client may have published under an id it
+                // made up in the meantime.
+                // A counter the **driver** owns, at a client's request.
+                //
+                // The one thing that makes it static is the owner id: the
+                // reference allocates it with `AERON_NULL_VALUE` and does *not*
+                // put it in the client's list of counters
+                // (`aeron_driver_conductor.c:6300-6312`), which is the whole of
+                // why a client that dies does not take it with it. Pushing a
+                // `CounterLink` here would look harmless and would free a
+                // counter the driver is meant to keep — `Clients::reap` walks
+                // that list for exactly that purpose.
+                Command::AddStaticCounter => match decode_add_static_counter(payload) {
+                    Some(command) => {
+                        let client_id = command.correlated.client_id;
+                        let correlation_id = command.correlated.correlation_id;
+
+                        // Registering the client is this command's first act,
+                        // the same as `ADD_COUNTER`'s (`:6259`).
+                        let Some(_record) = clients.get_or_add(
+                            client_id,
+                            now_ms,
+                            liveness_timeout_ns,
+                            counters,
+                            &counter_regions,
+                            &mut transmit,
+                        ) else {
+                            *counter_failures += 1;
+                            transmit.error(
+                                correlation_id,
+                                ERROR_CODE_GENERIC_ERROR,
+                                b"failed to add client",
+                            );
+                            return;
+                        };
+
+                        // An id and a type id that already name a counter: the
+                        // answer depends on who owns it (`:6265-6281`). One with
+                        // an owner is somebody's, and a static counter may not be
+                        // put in its place; one without is a static counter
+                        // already, and this call is a client asking for the one
+                        // it has.
+                        let existing = counter_regions
+                            .reader()
+                            .find_by_type_and_registration(command.type_id, command.registration_id);
+
+                        let counter_id = match existing {
+                            Some(counter_id) => {
+                                let owner_id = counter_regions
+                                    .reader()
+                                    .get(counter_id)
+                                    .map_or(layout::NULL_VALUE, |descriptor| descriptor.owner_id);
+
+                                if layout::NULL_VALUE != owner_id {
+                                    *counter_failures += 1;
+                                    transmit.error(
+                                        correlation_id,
+                                        ERROR_CODE_GENERIC_ERROR,
+                                        format!(
+                                            "cannot add static counter, because a non-static counter exists \
+                                             (counterId={counter_id}) for typeId={} and registrationId={}",
+                                            command.type_id, command.registration_id
+                                        )
+                                        .as_bytes(),
+                                    );
+                                    return;
+                                }
+
+                                counter_id
+                            }
+                            None => {
+                                let Some(counter_id) = counters.allocate(
+                                    &counter_regions,
+                                    command.type_id,
+                                    command.key,
+                                    command.label,
+                                    now_ms,
+                                ) else {
+                                    *counter_failures += 1;
+                                    // The reference returns `-1` here with no
+                                    // `AERON_SET_ERR` of its own
+                                    // (`aeron_driver_conductor.c:6300-6304`),
+                                    // so its client is answered with whatever
+                                    // the thread's error slot last held — a
+                                    // value it does not define and this build
+                                    // cannot reproduce. The code is the generic
+                                    // one and the words are this build's, which
+                                    // is the divergence `docs/compat.md` already
+                                    // records for every `ON_ERROR` that is not
+                                    // one of the two quoted ones.
+                                    transmit.error(
+                                        correlation_id,
+                                        ERROR_CODE_GENERIC_ERROR,
+                                        b"failed to allocate static counter",
+                                    );
+                                    return;
+                                };
+
+                                let _ = counters.set_registration_id(
+                                    &counter_regions,
+                                    counter_id,
+                                    command.registration_id,
+                                );
+                                let _ = counters.set_owner_id(
+                                    &counter_regions,
+                                    counter_id,
+                                    layout::NULL_VALUE,
+                                );
+
+                                counter_id
+                            }
+                        };
+
+                        transmit.send(
+                            ON_STATIC_COUNTER_TYPE_ID,
+                            &encode_static_counter(correlation_id, counter_id),
+                        );
+                    }
+                    None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
+                },
+                Command::GetNextAvailableSessionId => {
+                    match decode_get_next_available_session_id(payload) {
+                        Some(request) => {
+                            let stream_id = request.stream_id;
+
+                            // `outer: while (true)` (`aeron_driver_conductor.c:6422-6450`).
+                            //
+                            // It terminates, and the argument is worth having
+                            // because the loop has no counter: every turn moves
+                            // the cursor one id on, so the turns ask for
+                            // *different* ids, and the only ones refused are
+                            // those a publication **on this stream** already
+                            // holds. There are finitely many of those and 2^32
+                            // ids, so an id nobody holds arrives within
+                            // `held + 1` turns.
+                            let next_session_id = loop {
+                                let candidate = publications.next_session_id();
+
+                                let taken = publications.publications().iter().any(
+                                    |publication| {
+                                        publication.stream_id == stream_id
+                                            && publication.session_id == candidate
+                                    },
+                                ) || network_publications.publications().iter().any(
+                                    |publication| {
+                                        publication.stream_id == stream_id
+                                            && publication.session_id == candidate
+                                    },
+                                );
+
+                                if !taken {
+                                    break candidate;
+                                }
+                            };
+
+                            transmit.send(
+                                ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+                                &encode_next_available_session_id(
+                                    request.correlated.correlation_id,
+                                    next_session_id,
+                                ),
+                            );
+                        }
+                        None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
+                    }
+                }
                 Command::AddDestination
                 | Command::RemoveDestination
                 | Command::RemoveDestinationById
@@ -2500,8 +2832,11 @@ impl Conductor {
             &counter_regions,
             &mut self.subscriptions,
             &mut transmit,
-            now_ns,
-            self.now_ms,
+            Now {
+                ms: self.now_ms,
+                ns: now_ns,
+                client_liveness_timeout_ns: self.liveness_timeout_ns,
+            },
         )
     }
 
@@ -2766,9 +3101,9 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 mod tests {
     use super::*;
     use deepmsg_cnc::command::{
-        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
-        ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED, ON_ERROR_TYPE_ID,
-        ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, ON_PUBLICATION_READY_TYPE_ID,
+        ADD_EXCLUSIVE_PUBLICATION_TYPE_ID, ADD_PUBLICATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
+        ADD_SUBSCRIPTION_TYPE_ID, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_NOT_SUPPORTED,
+        ON_ERROR_TYPE_ID, ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID, ON_PUBLICATION_READY_TYPE_ID,
     };
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
     use deepmsg_core::logbuffer::{descriptor, frame};
@@ -3199,24 +3534,28 @@ mod tests {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
         // Two commands that are both counted, so the counts say how many the
-        // pass read without any byte arithmetic. `0x10` is REJECT_IMAGE: still
-        // unimplemented, which is what a test wants from a stand-in — a command
-        // whose handling cannot start happening. (`0x07` used to be the
-        // stand-in until ADD_DESTINATION was implemented, which is exactly the
-        // way a stand-in like this stops being one.)
-        send(&conductor, 0x10, b"first");
-        send(&conductor, 0x10, b"second");
+        // pass read without any byte arithmetic.
+        //
+        // A type id the protocol does not define, and there is no other kind
+        // left to use: this test wants a command whose handling cannot start
+        // happening, and as of `ADD_STATIC_COUNTER` every one of the eighteen
+        // the protocol defines is served. The stand-in has run out — `0x07` was
+        // one until ADD_DESTINATION, `0x10` until REJECT_IMAGE, `0x12` until
+        // GET_NEXT_AVAILABLE_SESSION_ID, `0x0F` until this one — so what is
+        // counted below is `unknown_commands` and not `unhandled_commands`.
+        send(&conductor, 0x7F, b"first");
+        send(&conductor, 0x7F, b"second");
 
         conductor.do_work();
-        assert_eq!(1, conductor.unhandled_commands(), "one command per pass");
+        assert_eq!(1, conductor.unknown_commands(), "one command per pass");
 
         // And the ring is not stuck: the next pass finds the other one.
         conductor.do_work();
-        assert_eq!(2, conductor.unhandled_commands());
+        assert_eq!(2, conductor.unknown_commands());
 
         // A third pass finds nothing, and the second pass left the ring empty.
         conductor.do_work();
-        assert_eq!(2, conductor.unhandled_commands());
+        assert_eq!(2, conductor.unknown_commands());
 
         let ring = conductor.cnc.to_driver_ring().expect("producer view");
         let consumed =
@@ -3371,46 +3710,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_command_is_counted_and_named() {
-        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
-
-        send(&conductor, 0x10, b"aeron:ipc|1"); // REJECT_IMAGE
-        conductor.do_work();
-
-        assert_eq!(1, conductor.unhandled_commands());
-        assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::RejectImage), conductor.last_unhandled());
-        assert!(conductor.is_running(), "and nothing else happened");
-    }
-
-    #[test]
-    fn a_static_counter_request_is_recognised_and_not_served() {
-        // ADD_STATIC_COUNTER is the one unimplemented command whose absence is
-        // a recorded divergence rather than an unbuilt transport feature: the
-        // reference's driver allocates the counter
-        // (`aeron_driver_conductor.c:3153-3166`, the handler at `:6255`) and
-        // answers `ON_STATIC_COUNTER`, which its client pairs with the ready
-        // handler (`aeron_client_conductor.c:1147`). deepmsg recognises the
-        // command — it is in the protocol's table — but serves nothing, so a
-        // client that asks for one waits for a reply that never comes
-        // (docs/compat.md, "The counter a client asks for").
-        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
-
-        send(&conductor, 0x0F, &[0u8; 16]);
-        conductor.do_work();
-
-        assert_eq!(1, conductor.unhandled_commands());
-        assert_eq!(0, conductor.unknown_commands());
-        assert_eq!(Some(Command::AddStaticCounter), conductor.last_unhandled());
-
-        // Counted, not recorded: the protocol defines this command, so it is
-        // no error to receive one — merely a thing this driver cannot do.
-        let mut errors = Vec::new();
-        let log = conductor.cnc.error_log().expect("the error log");
-        assert_eq!(0, log.read(i64::MIN, &mut errors).entries);
-    }
-
-    #[test]
     fn a_type_id_the_protocol_does_not_define_is_counted_separately() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
@@ -3492,14 +3791,14 @@ mod tests {
     fn a_command_is_consumed_exactly_once() {
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
 
-        send(&conductor, 0x10, b"channel");
+        send(&conductor, 0x7F, b"channel");
         conductor.do_work();
-        assert_eq!(1, conductor.unhandled_commands());
+        assert_eq!(1, conductor.unknown_commands());
 
         conductor.do_work();
         assert_eq!(
             1,
-            conductor.unhandled_commands(),
+            conductor.unknown_commands(),
             "the second pass finds an empty ring"
         );
 
@@ -5559,6 +5858,1280 @@ mod tests {
         assert_eq!(
             Some(0),
             conductor.publications().publications()[0].end_of_stream_position()
+        );
+    }
+
+    /// `ADD_STATIC_COUNTER`'s wire form, built by the **client's** encoder so
+    /// that the two directions of the protocol are checked against each other
+    /// — the same reason `add_counter_payload` exists.
+    fn add_static_counter_payload(
+        client_id: i64,
+        correlation_id: i64,
+        registration_id: i64,
+        type_id: i32,
+        key: &[u8],
+        label: &[u8],
+    ) -> Vec<u8> {
+        deepmsg_cnc::command::encode_add_static_counter(
+            client_id,
+            correlation_id,
+            registration_id,
+            type_id,
+            key,
+            label,
+        )
+    }
+
+    /// The `counter_id` an `ON_STATIC_COUNTER` carried, and the heartbeat
+    /// counter the driver announced for the client on the way past.
+    fn static_counter_from(events: &[(i32, Vec<u8>)], correlation_id: i64) -> i32 {
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_STATIC_COUNTER_TYPE_ID)
+            .map(|(_, payload)| payload)
+            .expect("the driver answers with a static counter");
+
+        assert_eq!(
+            correlation_id.to_le_bytes(),
+            payload[0..8],
+            "on the correlation id of the request, with no correlated head"
+        );
+
+        i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn a_static_counter_belongs_to_the_driver_and_not_to_the_client() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let counter_id = static_counter_from(&events, 50);
+
+        let regions = counter_regions(&conductor);
+        let descriptor = regions
+            .reader()
+            .get(counter_id)
+            .expect("the counter exists");
+
+        assert_eq!(99, descriptor.type_id);
+        assert_eq!(42, descriptor.registration_id, "the id it is found by");
+        assert_eq!(
+            NULL_VALUE, descriptor.owner_id,
+            "which is the whole of what makes it static: an owner id of nothing"
+        );
+        assert_eq!("a static counter", descriptor.label);
+
+        // And the client is told about it the *other* way. `ADD_COUNTER`
+        // announces its counter with `ON_COUNTER_READY`, which is a message
+        // about a counter the client now owns; this one is answered with
+        // `ON_STATIC_COUNTER` and no announcement, which is the difference that
+        // matters — there is nothing for this client to give back, and nothing
+        // will be taken away from it.
+        assert!(
+            !events.iter().any(|(type_id, payload)| {
+                *type_id == ON_COUNTER_READY_TYPE_ID
+                    && i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+                        == counter_id
+            }),
+            "a static counter is not announced as one of the client's"
+        );
+    }
+
+    #[test]
+    fn a_static_counter_outlives_the_client_that_asked_for_it() {
+        // The trap this slice exists to avoid, and the reason it is a test of
+        // its own: a static counter is not in the client's list of counters, so
+        // the tier that reaps a dead client does not take it. Pushing a
+        // `CounterLink` for one would look harmless and would free a counter
+        // the driver is meant to keep.
+        let temp = TempDir::new();
+        let config = DriverConfig {
+            aeron_dir: temp.0.clone(),
+            ipc_term_buffer_length: 64 * 1024,
+            client_liveness_timeout_ns: 100_000_000,
+            timer_interval_ns: 10_000_000,
+            ..DriverConfig::default()
+        };
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let counter_id = static_counter_from(&events, 50);
+
+        // The client's heartbeat, which the driver announced on the way past:
+        // its correlation id is the client id, which is the one id no command
+        // can ever carry again.
+        let heartbeat_counter_id = events
+            .iter()
+            .find(|(type_id, payload)| {
+                *type_id == ON_COUNTER_READY_TYPE_ID && payload[0..8] == 7i64.to_le_bytes()
+            })
+            .map(|(_, payload)| i32::from_le_bytes(payload[8..12].try_into().expect("four bytes")))
+            .expect("the client's heartbeat was announced");
+
+        // Stop saying it is alive, and let the driver decide.
+        set_counter(&conductor, heartbeat_counter_id, 0);
+
+        for _ in 0..4 {
+            conductor.timeout_check_deadline_ns = 0;
+            conductor.do_work();
+        }
+
+        let events = drain(&cnc, &mut receiver);
+
+        // A positive observation in the negative control: the client really was
+        // reaped, so the counter's survival is not the survival of everything.
+        assert!(
+            events.iter().any(|(type_id, payload)| *type_id
+                == deepmsg_cnc::command::ON_CLIENT_TIMEOUT_TYPE_ID
+                && payload[0..8] == 7i64.to_le_bytes()),
+            "the client timed out"
+        );
+        assert!(
+            !events.iter().any(|(type_id, payload)| {
+                *type_id == ON_UNAVAILABLE_COUNTER_TYPE_ID && payload[0..8] == 42i64.to_le_bytes()
+            }),
+            "and its static counter was not announced as going with it"
+        );
+
+        let regions = counter_regions(&conductor);
+        let descriptor = regions
+            .reader()
+            .get(counter_id)
+            .unwrap_or_else(|| panic!("counter {counter_id} is still the driver's"));
+
+        assert_eq!(NULL_VALUE, descriptor.owner_id);
+        assert_eq!(42, descriptor.registration_id);
+    }
+
+    #[test]
+    fn a_static_counter_is_found_again_by_its_type_and_registration_id() {
+        // How two processes agree on one counter: the second ask names the same
+        // pair and is answered with what the first one made, rather than with a
+        // second counter nobody would find.
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        let payload = add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter");
+
+        send(&conductor, ADD_STATIC_COUNTER_TYPE_ID, &payload);
+        conductor.do_work();
+        let first = static_counter_from(&drain(&cnc, &mut receiver), 50);
+
+        send(&conductor, ADD_STATIC_COUNTER_TYPE_ID, &payload);
+        conductor.do_work();
+        let second = static_counter_from(&drain(&cnc, &mut receiver), 50);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_static_counter_may_not_take_a_live_counters_place() {
+        // A pair that already names a counter **somebody owns** is refused
+        // rather than handed over: a static counter has no owner, so taking a
+        // live counter's id would leave two clients believing different things
+        // about one slot (`aeron_driver_conductor.c:6270-6281`).
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::ADD_COUNTER_TYPE_ID,
+            &add_counter_payload(7, 42, 99, b"stat", b"a counter a client owns"),
+        );
+        conductor.do_work();
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            ADD_STATIC_COUNTER_TYPE_ID,
+            &add_static_counter_payload(7, 50, 42, 99, b"stat", b"a static counter"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(50i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert!(
+            String::from_utf8_lossy(&payload[16..]).contains("cannot add static counter"),
+            "the reference's words: {}",
+            String::from_utf8_lossy(&payload[16..])
+        );
+    }
+
+    #[test]
+    fn a_channel_parameter_this_driver_cannot_serve_is_answered_rather_than_ignored() {
+        // G1-4's whole point, at the client's end: `cc=` and `nak-delay=` used
+        // to reach the parser's generic list and change nothing, so a client
+        // that named one got a subscription behaving like a different one.
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // A strategy this build does not carry: refused, by name, on the
+        // correlation id that asked — where the reference's supplier fails with
+        // no error set at all and the client is told nothing.
+        let port = {
+            use crate::sys::AddressFamily;
+            use crate::sys::socket::DatagramSocket;
+
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(
+                7,
+                11,
+                1001,
+                &format!("aeron:udp?endpoint=127.0.0.1:{port}|cc=cubic"),
+            ),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered rather than left waiting");
+
+        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
+        assert!(
+            String::from_utf8_lossy(&payload[16..]).contains("cc=cubic"),
+            "and told which parameter: {}",
+            String::from_utf8_lossy(&payload[16..])
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "no subscription was created"
+        );
+
+        // And the half that *is* served: a named `nak-delay` is read, and the
+        // subscription is created with it.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(
+                7,
+                12,
+                1001,
+                &format!("aeron:udp?endpoint=127.0.0.1:{port}|nak-delay=2ms"),
+            ),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "a channel this build can serve is served"
+        );
+    }
+
+    /// Two subscriptions that one image would serve have to agree about
+    /// `reliable`, and the reference refuses the second rather than serving it
+    /// the first one's answer
+    /// (`aeron_driver_conductor_has_clashing_subscription`, `:320-332`).
+    #[test]
+    fn two_subscriptions_that_disagree_about_reliability_cannot_share_a_channel() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // A channel of this test's own: the fixtures are shared, and a
+        // subscription on theirs would be a clash with theirs.
+        let port = {
+            use crate::sys::AddressFamily;
+            use crate::sys::socket::DatagramSocket;
+
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        let unreliable = format!("{channel}|reliable=false");
+
+        // The first one names it, and is served: nothing about the value itself
+        // is refused.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 21, 1002, &unreliable),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "the first subscription is served"
+        );
+
+        // The second asks for the default on the same endpoint, stream and
+        // session. The image they would share can only behave one way, so the
+        // reference answers with an error rather than letting one client's
+        // choice silently become the other's.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 22, 1002, &channel),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered rather than left waiting");
+
+        assert_eq!(22i64.to_le_bytes(), payload[0..8], "on the id that asked");
+        assert_eq!(
+            22i32.to_le_bytes(),
+            payload[8..12],
+            "and under the reference's own code for it, which is the platform's \
+             `EINVAL` and not one of `AERON_ERROR_CODE_*` (`:322-330`)"
+        );
+
+        let text = String::from_utf8_lossy(&payload[16..]).to_string();
+        assert!(
+            text.contains("option conflicts with existing subscription: reliable=true"),
+            "the option and the value the caller gave: {text}"
+        );
+        assert!(
+            text.contains(&format!("existingChannel={unreliable}")),
+            "and the channel already there: {text}"
+        );
+        assert!(
+            text.contains(&format!("channel={channel}")),
+            "and the one that arrived: {text}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "no second subscription was created"
+        );
+
+        // The control, so that the refusal cannot pass by refusing everything:
+        // the same option twice is not a clash, whichever way round.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 23, 1002, &unreliable),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "a subscription that agrees about the option is served"
+        );
+    }
+
+    /// `GET_NEXT_AVAILABLE_SESSION_ID`'s wire form: the correlated head and a
+    /// stream id (`aeron_control_protocol.h:247-253`).
+    fn next_session_id_payload(client_id: i64, correlation_id: i64, stream_id: i32) -> Vec<u8> {
+        let command = deepmsg_cnc::command::GetNextAvailableSessionId {
+            correlated: deepmsg_cnc::command::Correlated {
+                client_id,
+                correlation_id,
+            },
+            stream_id,
+        };
+
+        let mut out = vec![0u8; command.encoded_length()];
+        assert!(command.encode_into(&mut out));
+
+        out
+    }
+
+    /// Ask for a session id and read the answer off the ring.
+    fn ask_for_a_session_id(
+        conductor: &mut Conductor,
+        cnc: &CncFile,
+        receiver: &mut ToClientsReceiver,
+        pending: &mut Vec<(i32, Vec<u8>)>,
+        stream_id: i32,
+    ) -> i32 {
+        send(
+            conductor,
+            deepmsg_cnc::command::GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+            &next_session_id_payload(7, 8, stream_id),
+        );
+
+        let payload = await_event(
+            conductor,
+            cnc,
+            receiver,
+            pending,
+            ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+        );
+
+        i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn the_session_id_answering_skips_one_a_publication_already_holds() {
+        let (_temp, mut conductor, cnc, mut receiver, mut pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        // The cursor is a random id the driver drew at startup, so a clash is
+        // not something a test can wait for — it is something the test has to
+        // *make*. What makes it possible is that the URI may name its own
+        // session, so a publication can be put exactly where the cursor is.
+        let cursor = conductor.publications().session_ids().cursor();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 43, 1002, &format!("aeron:ipc?session-id={cursor}")),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        assert_eq!(
+            cursor,
+            conductor
+                .publications()
+                .publications()
+                .iter()
+                .find(|publication| publication.registration_id == 43)
+                .expect("the publication that named its session")
+                .session_id
+        );
+
+        // Naming a session is not an allocation, so it must not have moved the
+        // cursor onto it (`aeron_driver_conductor.c:1071-1075`, whose advance is
+        // for speculated ids only) — otherwise the id below would be skipped by
+        // accident and this test would prove nothing.
+        assert_eq!(
+            cursor,
+            conductor.publications().session_ids().cursor(),
+            "a URI that named its own session did not move the cursor"
+        );
+
+        // The clash, and it has to be asked **first**: every ask moves the
+        // cursor, so an ask about anything else beforehand would leave this one
+        // testing nothing — which is what an earlier version of this test did.
+        send(
+            &conductor,
+            deepmsg_cnc::command::GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+            &next_session_id_payload(7, 8, 1002),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_NEXT_AVAILABLE_SESSION_ID_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the driver answers");
+
+        assert_eq!(
+            8i64.to_le_bytes(),
+            payload[0..8],
+            "on its own correlation id"
+        );
+        assert_eq!(
+            cursor.wrapping_add(1),
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes")),
+            "the id the publication holds is skipped, not answered with"
+        );
+
+        // The cursor moved past what was handed out, so the next ask does not
+        // repeat the last answer — which is all the driver promises, and why
+        // the reference advances *before* it checks for a clash
+        // (`aeron_driver_conductor.c:6425-6426`).
+        assert_eq!(
+            cursor.wrapping_add(2),
+            conductor.publications().session_ids().cursor()
+        );
+
+        // And somebody else's stream holds nothing, so there the cursor's own
+        // id is free: a session id is only unique per stream.
+        assert_eq!(
+            cursor.wrapping_add(2),
+            ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 9999),
+            "another stream does not hold it"
+        );
+    }
+
+    #[test]
+    fn the_session_id_answering_skips_a_network_publication_too() {
+        // The reference walks **both** lists, IPC first and then network
+        // (`aeron_driver_conductor.c:6429-6444`), and the second walk is the one
+        // easy to leave out: a driver that only checked its IPC publications
+        // would hand a client a session id a network publication on that stream
+        // already holds — and the client would then be refused by the create's
+        // own clash check, having done exactly what it was told.
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let first = ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 1002);
+
+        let socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        let endpoint = socket.local_address().expect("an address");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(
+                7,
+                42,
+                1002,
+                &format!(
+                    "aeron:udp?endpoint={endpoint}|session-id={}",
+                    first.wrapping_add(1)
+                ),
+            ),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        let second = ask_for_a_session_id(&mut conductor, &cnc, &mut receiver, &mut pending, 1002);
+
+        assert_eq!(
+            first.wrapping_add(2),
+            second,
+            "the id the network publication holds is skipped as well"
+        );
+    }
+
+    /// A `REJECT_IMAGE` payload (`aeron_control_protocol.h:220-227`): the
+    /// correlated head, the target's registration id, where the rejecting
+    /// client had read to, and the reason with its own length.
+    ///
+    /// The record's shape is checked before anything else, and a reason of four
+    /// characters is the shortest one that makes the record
+    /// `sizeof(aeron_reject_image_command_t)` — 40 bytes
+    /// (`aeron_driver_conductor.c:3177-3180`).
+    fn reject_image_payload(
+        client_id: i64,
+        correlation_id: i64,
+        image_correlation_id: i64,
+        position: i64,
+        reason: &[u8],
+    ) -> Vec<u8> {
+        assert!(
+            40 <= 36 + reason.len(),
+            "a record shorter than the struct is malformed, not a short command"
+        );
+
+        let mut out = vec![0u8; 36 + reason.len()];
+        out[0..8].copy_from_slice(&client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&correlation_id.to_le_bytes());
+        out[16..24].copy_from_slice(&image_correlation_id.to_le_bytes());
+        out[24..32].copy_from_slice(&position.to_le_bytes());
+        out[32..36].copy_from_slice(
+            &i32::try_from(reason.len())
+                .expect("a reason far below i32::MAX")
+                .to_le_bytes(),
+        );
+        out[36..].copy_from_slice(reason);
+
+        out
+    }
+
+    #[test]
+    fn a_rejected_ipc_publication_tells_its_publisher_and_takes_its_readers_away() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        let reader_counter_id = conductor.subscriptions().links()[0].subscribables[0].counter_id;
+        let free_before = conductor.counters().free_list_len();
+
+        // The id a client would have been handed for an IPC image is the
+        // publication's own registration id — the correlation id of its
+        // `ADD_PUBLICATION` — which is why one command has two targets.
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_PUBLICATION_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the publisher is told");
+
+        assert_eq!(42i64.to_le_bytes(), payload[0..8], "the publication named");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[8..16],
+            "an IPC publication answers no destination"
+        );
+        assert_eq!(
+            conductor.publications().publications()[0].session_id,
+            i32::from_le_bytes(payload[16..20].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            1001,
+            i32::from_le_bytes(payload[20..24].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[24..32],
+            "…and hears from no receiver"
+        );
+        assert_eq!(NULL_VALUE.to_le_bytes(), payload[32..40], "nor a group");
+        assert_eq!(
+            1,
+            i16::from_le_bytes(payload[40..42].try_into().expect("two bytes")),
+            "the loopback source is sent as an ordinary IPv4 address"
+        );
+        assert_eq!(
+            [1, 0, 0, 127],
+            payload[44..48],
+            "the reference's own bytes: `INADDR_LOOPBACK` written without an `htonl`"
+        );
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            i32::from_le_bytes(payload[60..64].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            18,
+            i32::from_le_bytes(payload[64..68].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Needs to be closed",
+            &payload[68..],
+            "the client's own words"
+        );
+
+        // The reader is told the image is gone and loses its position.
+        let unavailable = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_UNAVAILABLE_IMAGE_TYPE_ID)
+            .expect("the reader is told");
+        assert_eq!(42i64.to_le_bytes(), unavailable.1[0..8]);
+        assert_eq!(9i64.to_le_bytes(), unavailable.1[8..16]);
+        assert!(
+            conductor.subscriptions().links()[0]
+                .subscribables
+                .is_empty(),
+            "the subscription holds no reader for it any more"
+        );
+        assert_eq!(
+            free_before + 1,
+            conductor.counters().free_list_len(),
+            "and the reader's counter came back"
+        );
+        assert!(
+            counter_value(&conductor, reader_counter_id).is_some(),
+            "the id is still a readable slot — `free` reclaims it, it does not erase it"
+        );
+
+        // Both halves of the answer, in the reference's order: the counter,
+        // then the completion.
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID)
+        );
+        assert_eq!(0, conductor.unhandled_commands());
+    }
+
+    #[test]
+    fn a_reader_that_arrives_while_a_publication_is_rejected_is_not_linked() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+        drain(&cnc, &mut receiver);
+
+        assert!(conductor.publications().publications()[0].is_in_cool_down());
+
+        // A second reader, arriving inside the cool down. It is told its
+        // subscription exists — that is a fact about the subscription — and it
+        // is *not* given an image, which is what refusing readers means.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 10, 1001, "aeron:ipc"),
+        );
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        let events = drain(&cnc, &mut receiver);
+
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
+            "the subscription itself is fine"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_AVAILABLE_IMAGE_TYPE_ID),
+            "but nothing links it to a publication that is refusing readers"
+        );
+    }
+
+    #[test]
+    fn a_reject_image_that_names_nothing_is_answered_with_the_references_error() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 12_345, 0, b"nowhere"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(
+            8i64.to_le_bytes(),
+            payload[0..8],
+            "on its own correlation id"
+        );
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Unable to resolve image for correlationId=12345",
+            &payload[16..],
+            "the reference's words (aeron_driver_conductor.c:6389-6392)"
+        );
+
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED),
+            "nothing was rejected"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID),
+            "and nothing succeeded"
+        );
+    }
+
+    #[test]
+    fn an_invalidation_reason_longer_than_the_reference_allows_is_answered_with_an_error() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        let reason = vec![b'x'; 1024];
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, 42, 0, &reason),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        let payload = events
+            .iter()
+            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
+            .map(|(_, payload)| payload.clone())
+            .expect("the client is answered");
+
+        assert_eq!(8i64.to_le_bytes(), payload[0..8]);
+        assert_eq!(
+            ERROR_CODE_GENERIC_ERROR,
+            i32::from_le_bytes(payload[8..12].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            b"Invalidation reason_text must be 1023 bytes or less",
+            &payload[16..],
+            "the reference's words (aeron_driver_conductor.c:6357-6364)"
+        );
+
+        // The publication is untouched: the bound was refused before the
+        // registration id in the command was ever looked up.
+        assert!(!conductor.publications().publications()[0].is_in_cool_down());
+        assert_eq!(
+            Some(0),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+    }
+
+    #[test]
+    fn a_reject_image_shorter_than_its_own_struct_is_malformed() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+
+        drain(&cnc, &mut receiver);
+
+        // 36 bytes is `offsetof(reason_text)` and not `sizeof` — the record the
+        // reference's own Java client would send for an empty reason, and one
+        // its dispatch refuses before any handler sees it
+        // (`aeron_driver_conductor.c:3177-3180`).
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &[0u8; 36],
+        );
+        conductor.do_work();
+
+        assert_eq!(1, conductor.malformed_commands());
+        assert!(
+            drain(&cnc, &mut receiver).is_empty(),
+            "a malformed command is recorded, not answered"
+        );
+    }
+
+    /// Read this test's own socket until an `ERR` frame turns up, or the
+    /// deadline passes.
+    ///
+    /// An image sends its status messages on the same socket, so what arrives
+    /// first is whatever it said before it was rejected; the frame is picked
+    /// out by type rather than by being the next datagram.
+    fn await_error_frame(
+        socket: &crate::sys::socket::DatagramSocket,
+        within: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        use crate::protocol::{FrameHeader, frame_type};
+        use crate::sys::socket::Datagrams;
+
+        let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 2048]).collect();
+        let mut datagrams = Datagrams::new();
+        let until = std::time::Instant::now() + within;
+
+        while std::time::Instant::now() < until {
+            if let Ok(_count) = socket.receive_batch(&mut buffers, &mut datagrams) {
+                for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
+                    let packet = &buffers[slot][..datagram.length];
+
+                    if FrameHeader::read(packet)
+                        .is_some_and(|header| header.frame_type == frame_type::ERR)
+                    {
+                        return Some(packet.to_vec());
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        None
+    }
+
+    /// A publication sending to a socket this test owns, the driver's own send
+    /// address, and the session the publication runs under.
+    ///
+    /// The address is learned the way a receiver learns it: the publication
+    /// says `SETUP` to its endpoint on a timer, and where that datagram came
+    /// from is where to answer it.
+    fn publishing_to_a_socket() -> (
+        TempDir,
+        Conductor,
+        CncFile,
+        ToClientsReceiver,
+        crate::sys::socket::DatagramSocket,
+        std::net::SocketAddr,
+        i32,
+    ) {
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        socket.set_nonblocking().expect("non-blocking");
+        let endpoint = socket.local_address().expect("an address");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 42, 1001, &format!("aeron:udp?endpoint={endpoint}")),
+        );
+        let ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+        let session_id = i32::from_le_bytes(ready[16..20].try_into().expect("four bytes"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut driver_address = None;
+
+        while std::time::Instant::now() < deadline && driver_address.is_none() {
+            conductor.do_work();
+            driver_address = next_datagram(&socket).map(|(_, source)| source);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let driver_address = driver_address.expect("the publication says SETUP to its endpoint");
+
+        (
+            temp,
+            conductor,
+            cnc,
+            receiver,
+            socket,
+            driver_address,
+            session_id,
+        )
+    }
+
+    /// Read this test's own socket once, with where the datagram came from.
+    fn next_datagram(
+        socket: &crate::sys::socket::DatagramSocket,
+    ) -> Option<(Vec<u8>, std::net::SocketAddr)> {
+        use crate::sys::socket::Datagrams;
+
+        let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 2048]).collect();
+        let mut datagrams = Datagrams::new();
+
+        if let Ok(_count) = socket.receive_batch(&mut buffers, &mut datagrams) {
+            for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
+                if let Some(source) = datagram.source {
+                    return Some((buffers[slot][..datagram.length].to_vec(), source));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// The other end of the same chain: an `ERR` frame that arrives at **this**
+    /// driver's own publication has to reach that publication's client.
+    ///
+    /// This is the half a publisher actually sees, and the two ends are in one
+    /// process whenever a client publishes and subscribes to one stream — which
+    /// is what every one of the reference's own rejection tests does. Without
+    /// it the frame leaves and nothing tells the client, so `RejectImageTest`
+    /// waits out its deadline with the whole mechanism working underneath.
+    #[test]
+    fn an_error_frame_from_a_live_receiver_reaches_the_publications_client() {
+        use crate::protocol::{ErrorFrame, StatusMessageFrame};
+
+        let (_temp, mut conductor, cnc, mut receiver, socket, driver_address, session_id) =
+            publishing_to_a_socket();
+        let mut pending = Vec::new();
+
+        // A status message makes the publication record this receiver, which is
+        // what an `ERR` from it is checked against a moment later.
+        // The publication's own first term — which is a value the driver made
+        // up, not one this test can guess — because a status message a term and
+        // a half outside it is refused before it reaches the publication at all
+        // (`aeron_network_publication_is_valid_status_message`, `:841-856`).
+        let initial_term_id = conductor.network_publications()[0].params.initial_term_id;
+        let status = StatusMessageFrame {
+            session_id,
+            stream_id: 1001,
+            consumption_term_id: initial_term_id,
+            consumption_term_offset: 0,
+            receiver_window: 0,
+            receiver_id: 99,
+        };
+        let mut frame = [0u8; StatusMessageFrame::LENGTH];
+        assert!(status.write_with_flags(&mut frame, 0).is_some());
+        socket
+            .send_batch(Some(driver_address), &[&frame])
+            .expect("a send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline
+            && counter_value(
+                &conductor,
+                crate::system_counters::id::STATUS_MESSAGES_RECEIVED,
+            )
+            .unwrap_or(0)
+                < 1
+        {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            Some(1),
+            counter_value(
+                &conductor,
+                crate::system_counters::id::STATUS_MESSAGES_RECEIVED
+            ),
+            "the sender has the receiver now"
+        );
+
+        // And the refusal.
+        let reason = b"Needs to be closed";
+        let refusal = ErrorFrame {
+            session_id,
+            stream_id: 1001,
+            receiver_id: 99,
+            group_tag: 0,
+            error_code: deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error_length: i32::try_from(reason.len()).expect("a short reason"),
+        };
+        let mut frame = [0u8; ErrorFrame::LENGTH + 18];
+        assert!(refusal.write(&mut frame[..ErrorFrame::LENGTH]).is_some());
+        frame[ErrorFrame::LENGTH..].copy_from_slice(reason);
+        socket
+            .send_batch(Some(driver_address), &[&frame])
+            .expect("a send");
+
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(42i64.to_le_bytes(), payload[0..8], "the publication named");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[8..16],
+            "this channel has no destination tracker to name one from"
+        );
+        assert_eq!(
+            session_id,
+            i32::from_le_bytes(payload[16..20].try_into().expect("four bytes"))
+        );
+        assert_eq!(
+            1001,
+            i32::from_le_bytes(payload[20..24].try_into().expect("four bytes"))
+        );
+        assert_eq!(99i64.to_le_bytes(), payload[24..32], "who refused it");
+        assert_eq!(
+            NULL_VALUE.to_le_bytes(),
+            payload[32..40],
+            "the frame carried no group tag, so the field is ignored"
+        );
+        assert_eq!(
+            1,
+            i16::from_le_bytes(payload[40..42].try_into().expect("two bytes")),
+            "and the datagram's source is sent as an ordinary IPv4 address"
+        );
+        assert_eq!(
+            socket.local_address().expect("an address").port(),
+            u16::from_le_bytes(payload[42..44].try_into().expect("two bytes"))
+        );
+        assert_eq!([127, 0, 0, 1], payload[44..48]);
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            i32::from_le_bytes(payload[60..64].try_into().expect("four bytes"))
+        );
+        assert_eq!(b"Needs to be closed", &payload[68..]);
+    }
+
+    #[test]
+    fn a_rejected_network_image_is_refused_by_the_receiver_that_owns_it() {
+        use crate::protocol::{FrameHeader, SetupFrame, frame_type};
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        // A port nobody holds: the driver's receive endpoint will bind it, and
+        // this test's socket is the publisher that sends to it.
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &format!("aeron:udp?endpoint=127.0.0.1:{port}")),
+        );
+        await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+
+        let session_id = 99;
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        publisher.set_nonblocking().expect("non-blocking");
+
+        for _ in 0..3 {
+            conductor.do_work();
+        }
+
+        publisher
+            .send_batch(
+                Some(format!("127.0.0.1:{port}").parse().expect("an address")),
+                &[&frame],
+            )
+            .expect("a send");
+
+        // The image is built off the conductor's thread — there is a log buffer
+        // to map — so this waits for it rather than asserting after one pass.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        while std::time::Instant::now() < deadline && conductor.publication_images().is_empty() {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let image_registration_id = conductor.publication_images()[0].registration_id;
+        assert_eq!(session_id, conductor.publication_images()[0].session_id);
+
+        drain(&cnc, &mut receiver);
+
+        send(
+            &conductor,
+            deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
+            &reject_image_payload(7, 8, image_registration_id, 0, b"Needs to be closed"),
+        );
+        conductor.do_work();
+
+        let events = drain(&cnc, &mut receiver);
+
+        // The other branch of the handler, and the reason the two are one
+        // command: an id that names an image is *not* looked for among the IPC
+        // publications, so no publisher is told anything here.
+        assert!(
+            !events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_PUBLICATION_ERROR_TYPE_ID),
+            "an image is not an IPC publication, and nothing here publishes"
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::IMAGES_REJECTED)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(type_id, _)| *type_id == ON_OPERATION_SUCCEEDED_TYPE_ID)
+        );
+
+        // And the publisher is told — on the wire, by the receiver, which is the
+        // only half of this that a client on the other end can see.
+        let frame = await_error_frame(&publisher, std::time::Duration::from_secs(5))
+            .expect("an ERR frame reaches the publisher");
+        let error = crate::protocol::ErrorFrame::read(&frame).expect("an ERR frame");
+
+        assert_eq!(
+            frame_type::ERR,
+            FrameHeader::read(&frame).expect("a header").frame_type
+        );
+        assert_eq!(session_id, error.session_id);
+        assert_eq!(1001, error.stream_id);
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
+            error.error_code
+        );
+        assert_eq!(
+            b"Needs to be closed",
+            error.text(&frame).expect("the reason it was given")
+        );
+        assert_eq!(
+            Some(1),
+            counter_value(&conductor, crate::system_counters::id::ERROR_FRAMES_SENT)
         );
     }
 

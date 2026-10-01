@@ -57,6 +57,15 @@ pub mod key {
     pub const EOS: &str = "eos";
     /// `ssc`: spies simulate a connection.
     pub const SPIES_SIMULATE_CONNECTION: &str = "ssc";
+    /// `nak-delay`: how long the receiver waits before asking again for a
+    /// gap, in place of the adaptive delays it would otherwise use
+    /// (`aeron-client/src/main/c/uri/aeron_uri.h:82`).
+    pub const NAK_DELAY: &str = "nak-delay";
+    /// `cc`: the congestion-control strategy the receiver's image is to use
+    /// (`aeron-client/src/main/c/uri/aeron_uri.h:70`, and the same name in
+    /// Java: `CommonContext.CONGESTION_CONTROL_PARAM_NAME`,
+    /// `aeron-client/src/main/java/io/aeron/CommonContext.java:386`).
+    pub const CONGESTION_CONTROL: &str = "cc";
     /// `response-correlation-id`: which request this channel answers.
     pub const RESPONSE_CORRELATION_ID: &str = "response-correlation-id";
     /// `untethered-window-limit-timeout`.
@@ -205,7 +214,42 @@ pub struct SubscriptionParams {
     pub untethered_linger_timeout_ns: i64,
     /// See [`Self::untethered_window_limit_timeout_ns`].
     pub untethered_resting_timeout_ns: i64,
+    /// The delay a gap is asked for after, when the channel named one
+    /// (`nak-delay=`); [`None`] leaves the receiver the driver's own delays.
+    ///
+    /// Read here rather than at the image because this is where a channel URI
+    /// is read at all — and the image is built later, off another thread, from
+    /// what the subscription left behind.
+    pub nak_delay_ns: Option<i64>,
+    /// The strategy the image is to use for the window it advertises
+    /// (`cc=`). Resolved and checked here for the same reason
+    /// [`Self::nak_delay_ns`] is: a value this build cannot serve is a
+    /// subscription that must not be created, not an image that quietly
+    /// behaves like a different one.
+    pub congestion_control: CongestionControl,
 }
+
+/// The congestion-control strategies a channel may name with `cc=`
+/// (`aeron_congestion_control.c:165-205`).
+///
+/// The reference has three arms — nothing named or `static` gives the static
+/// window strategy, `cubic` gives cubic, and anything else **fails the supplier
+/// with no error set at all** (`:178-204`, whose `result` stays `-1`). This
+/// build carries only the first, so the other two are refused where the
+/// reference would build something else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CongestionControl {
+    /// `AERON_STATICWINDOWCONGESTIONCONTROL_CC_PARAM_VALUE` — and what a
+    /// channel that names nothing gets.
+    Static,
+}
+
+/// `AERON_STATICWINDOWCONGESTIONCONTROL_CC_PARAM_VALUE`
+/// (`aeron-driver/src/main/c/aeron_congestion_control.c`).
+pub const CONGESTION_CONTROL_STATIC: &str = "static";
+
+/// `AERON_CUBICCONGESTIONCONTROL_CC_PARAM_VALUE`.
+pub const CONGESTION_CONTROL_CUBIC: &str = "cubic";
 
 /// `AERON_RELIABLE_STREAM_DEFAULT` (`aeron-driver/src/main/c/aeron_driver_context.c:213`).
 pub const RELIABLE_STREAM_DEFAULT: bool = true;
@@ -238,6 +282,8 @@ impl SubscriptionParams {
             untethered_window_limit_timeout_ns: config.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
+            nak_delay_ns: None,
+            congestion_control: CongestionControl::Static,
         }
     }
 
@@ -260,6 +306,8 @@ impl SubscriptionParams {
             untethered_window_limit_timeout_ns: config.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
+            nak_delay_ns: None,
+            congestion_control: CongestionControl::Static,
         };
 
         if let Some(reliable) = uri.bool(key::RELIABLE)? {
@@ -279,6 +327,27 @@ impl SubscriptionParams {
         // here, because a subscription is not choosing a publication to
         // continue (`aeron_driver_uri.c:159-168`).
         params.session_id = uri.i32(key::SESSION_ID)?;
+
+        // `nak-delay` is a duration, and it is one of the two things a receiver
+        // tunes per channel (`aeron_publication_image.c:100-118`). An
+        // unparseable one fails here, where the reference fails the *image*
+        // later with `EINVAL` and leaves the subscription standing — a
+        // difference in when a client hears about it, not in whether the
+        // channel is served.
+        params.nak_delay_ns = uri.duration_ns(key::NAK_DELAY)?;
+
+        // `cc` is checked for the values this build cannot serve. Naming
+        // nothing means the reference's own default, which is the static window
+        // — the one strategy that is implemented here — so naming it is
+        // accepted too, and everything else is refused rather than served as
+        // something it is not.
+        if let Some(named) = uri.value(key::CONGESTION_CONTROL) {
+            if !named.starts_with(CONGESTION_CONTROL_STATIC) {
+                return Err(PublicationParamsError::CongestionControl {
+                    value: named.to_owned(),
+                });
+            }
+        }
 
         if let Some(window_limit) = uri.duration_ns(key::UNTETHERED_WINDOW_LIMIT_TIMEOUT)? {
             params.untethered_window_limit_timeout_ns = window_limit;
@@ -362,6 +431,16 @@ pub enum PublicationParamsError {
         /// The tag the URI named.
         tag: i64,
     },
+    /// `cc=` named a congestion-control strategy this build does not carry.
+    ///
+    /// The reference serves `cubic` and fails silently on anything else
+    /// (`aeron_congestion_control.c:165-205`); this build carries the static
+    /// window only, so every other name is refused rather than served as
+    /// something it is not.
+    CongestionControl {
+        /// What the URI said.
+        value: String,
+    },
 }
 
 /// What was wrong with a starting position.
@@ -433,6 +512,11 @@ impl std::fmt::Display for PublicationParamsError {
             Self::UnknownSessionIdTag { tag } => write!(
                 f,
                 "session-id=tag:{tag} does not name a network publication"
+            ),
+            Self::CongestionControl { value } => write!(
+                f,
+                "cc={value} names a congestion control this driver does not serve; \
+                 the only strategy it carries is `{CONGESTION_CONTROL_STATIC}`"
             ),
             Self::Position(error) => write!(f, "{error}"),
         }
@@ -846,6 +930,82 @@ mod tests {
 
     fn resolve_ok(uri: &str) -> PublicationParams {
         resolve(uri).unwrap_or_else(|error| panic!("{uri}: {error}"))
+    }
+
+    /// `SubscriptionParams::resolve` for a channel, which the publication
+    /// helper above does not cover.
+    fn resolve_subscription(uri: &str) -> Result<SubscriptionParams, PublicationParamsError> {
+        let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+        SubscriptionParams::resolve(&parsed, &config())
+    }
+
+    #[test]
+    fn a_channels_nak_delay_is_read_or_left_to_the_driver() {
+        let named = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|nak-delay=2ms")
+            .expect("a subscription");
+
+        assert_eq!(
+            Some(2_000_000),
+            named.nak_delay_ns,
+            "the duration the channel named, in nanoseconds"
+        );
+
+        let silent =
+            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123").expect("a subscription");
+
+        assert_eq!(
+            None, silent.nak_delay_ns,
+            "which leaves the receiver the driver's own delays"
+        );
+    }
+
+    #[test]
+    fn a_nak_delay_that_is_not_a_duration_is_refused_rather_than_ignored() {
+        // The reference fails the *image* with `EINVAL` and leaves the
+        // subscription standing (`aeron_publication_image.c:113-117`); this
+        // refuses the subscription, which is the same answer a client can act
+        // on, delivered earlier.
+        let error = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|nak-delay=soon")
+            .expect_err("a duration that is not one");
+
+        assert!(
+            matches!(
+                error,
+                PublicationParamsError::Uri(UriError::NotANumber { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_congestion_control_this_driver_does_not_carry_is_refused() {
+        // Three arms in the reference: nothing or `static` is the static window,
+        // `cubic` is cubic, and anything else leaves its supplier's `result` at
+        // `-1` with **no error set** (`aeron_congestion_control.c:165-205`) —
+        // a client told nothing at all. This build carries the static window and
+        // refuses the rest by name.
+        let named_static = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|cc=static")
+            .expect("a subscription");
+        assert_eq!(CongestionControl::Static, named_static.congestion_control);
+
+        let silent =
+            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123").expect("a subscription");
+        assert_eq!(
+            CongestionControl::Static,
+            silent.congestion_control,
+            "naming nothing is the reference's own default"
+        );
+
+        for uri in [
+            "aeron:udp?endpoint=127.0.0.1:40123|cc=cubic",
+            "aeron:udp?endpoint=127.0.0.1:40123|cc=nonsense",
+        ] {
+            let error = resolve_subscription(uri).expect_err("a strategy this build lacks");
+            assert!(
+                matches!(error, PublicationParamsError::CongestionControl { .. }),
+                "{uri}: {error}"
+            );
+        }
     }
 
     #[test]
