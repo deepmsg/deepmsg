@@ -586,6 +586,8 @@ impl NetworkPublications {
                 || pending.endpoint_channel.is_multicast,
             fc.as_deref(),
             crate::flowcontrol::Defaults {
+                unicast_supplier: config.unicast_flow_control_supplier,
+                multicast_supplier: config.multicast_flow_control_supplier,
                 unicast_rrwm: crate::flowcontrol::UNICAST_RRWM_DEFAULT,
                 multicast_rrwm: crate::flowcontrol::MULTICAST_RRWM_DEFAULT,
                 group_tag: config.flow_control_group_tag,

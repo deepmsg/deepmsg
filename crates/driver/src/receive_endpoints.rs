@@ -109,23 +109,49 @@ impl std::fmt::Display for ReceiveEndpointErrorKind {
 impl std::error::Error for ReceiveEndpointErrorKind {}
 
 /// The endpoints a driver receives through, and the receiver ids they hold.
-#[derive(Debug, Default)]
+/// The id the first receiver of a driver introduces itself with
+/// (`aeron_driver_context.c:1306-1313`).
+fn first_receiver_id() -> i64 {
+    loop {
+        let id = i64::from(sys::random_i32()) * i64::from(sys::random_i32());
+
+        if 0 != id {
+            return id;
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ReceiveChannelEndpoints {
     entries: Vec<ReceiveChannelEndpointEntry>,
     next_id: u64,
     /// The id the next endpoint introduces itself with
     /// (`context->next_receiver_id++`,
-    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:96`).
+    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:92`).
     next_receiver_id: i64,
+}
+
+impl Default for ReceiveChannelEndpoints {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReceiveChannelEndpoints {
     /// No endpoints, and the first receiver id.
-    pub const fn new() -> Self {
+    ///
+    /// That id is **random and not one** (`aeron_driver_context.c:1303-1313`):
+    /// the product of two randomised `int32`s, retried until it is not zero.
+    /// A driver that started at one would hand out the same receiver ids as
+    /// every other driver, and a sender that keeps its receivers keyed by that
+    /// id — which is what a group strategy does
+    /// (`aeron_min_flow_control.c:185`) — would take two readers on two drivers
+    /// for one reader reporting twice.
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             next_id: 1,
-            next_receiver_id: 0,
+            next_receiver_id: first_receiver_id(),
         }
     }
 
@@ -537,6 +563,24 @@ mod tests {
         });
 
         found.expect("a counter").label
+    }
+
+    /// Two drivers must not introduce their receivers with the same id
+    /// (`aeron_driver_context.c:1306-1313`).
+    ///
+    /// A sender keys its receivers by that id — the liveness tracker does, and
+    /// so does every group strategy (`aeron_min_flow_control.c:185`) — so a
+    /// driver that started counting at one would make another driver's
+    /// receivers look like its own reporting twice.
+    #[test]
+    fn a_driver_hands_out_receiver_ids_no_other_driver_hands_out() {
+        let first = first_receiver_id();
+        assert_ne!(0, first, "the reference retries until it is not zero");
+
+        assert!(
+            (0..8).any(|_| first_receiver_id() != first),
+            "a constant is not a random start"
+        );
     }
 
     #[test]

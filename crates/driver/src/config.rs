@@ -44,6 +44,7 @@ use std::path::PathBuf;
 
 use deepmsg_cnc::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncLayout};
 
+use crate::flowcontrol::Supplier;
 use crate::publication_params;
 use crate::sys::{self, SocketBufferLengths};
 
@@ -158,6 +159,14 @@ pub const FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000
 /// (`aeron_ipc_publication.c:177`), which is why it is a driver setting rather
 /// than an image's own.
 pub const IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
+
+/// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`aeron_driver_context.c:201`):
+/// `max`.
+pub const MULTICAST_FLOW_CONTROL_SUPPLIER_DEFAULT: Supplier = Supplier::Max;
+
+/// `AERON_UNICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`:202`): `max` as well, under
+/// the name of the unicast supplier (`aeron_flow_control.c:326-365`).
+pub const UNICAST_FLOW_CONTROL_SUPPLIER_DEFAULT: Supplier = Supplier::Max;
 
 /// A boolean that has a third answer: **work it out**
 /// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
@@ -467,6 +476,15 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// Which strategy a multicast or multi-destination channel gets when it
+    /// names no `fc=`
+    /// (`aeron.multicast.flowcontrol.supplier`,
+    /// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER`).
+    pub multicast_flow_control_supplier: Supplier,
+    /// Which strategy a **unicast** channel gets, which never reads `fc=`
+    /// (`aeron.unicast.flowcontrol.supplier`,
+    /// `AERON_UNICAST_FLOWCONTROL_SUPPLIER`).
+    pub unicast_flow_control_supplier: Supplier,
     /// How long an image may go without a packet before it drains, and how
     /// long an IPC publication's refusal lasts
     /// (`aeron.image.liveness.timeout`, `AERON_IMAGE_LIVENESS_TIMEOUT`).
@@ -605,6 +623,8 @@ impl Default for DriverConfig {
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
             image_liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT,
+            multicast_flow_control_supplier: MULTICAST_FLOW_CONTROL_SUPPLIER_DEFAULT,
+            unicast_flow_control_supplier: UNICAST_FLOW_CONTROL_SUPPLIER_DEFAULT,
             flow_control_group_tag: FLOW_CONTROL_GROUP_TAG_DEFAULT,
             flow_control_group_min_size: FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT,
             flow_control_receiver_timeout_ns: FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT,
@@ -867,6 +887,14 @@ impl DriverConfig {
                 });
             }
             config.nak_multicast_max_backoff_ns = backoff;
+        }
+        if let Some(value) = get(&Setting::MULTICAST_FLOWCONTROL_SUPPLIER) {
+            config.multicast_flow_control_supplier =
+                parse_supplier(&Setting::MULTICAST_FLOWCONTROL_SUPPLIER, &value)?;
+        }
+        if let Some(value) = get(&Setting::UNICAST_FLOWCONTROL_SUPPLIER) {
+            config.unicast_flow_control_supplier =
+                parse_supplier(&Setting::UNICAST_FLOWCONTROL_SUPPLIER, &value)?;
         }
         if let Some(value) = get(&Setting::IMAGE_LIVENESS_TIMEOUT) {
             config.image_liveness_timeout_ns =
@@ -1166,6 +1194,17 @@ impl Setting {
     /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
     /// `:451-452` — environment only, with no property read in the reference;
     /// this build reads the property too, as it does for every other name).
+    /// `aeron.multicast.flowcontrol.supplier`
+    /// (`aeronmd.h:684-690`).
+    const MULTICAST_FLOWCONTROL_SUPPLIER: Self = Self {
+        property: "multicast.flowcontrol.supplier",
+        env: "AERON_MULTICAST_FLOWCONTROL_SUPPLIER",
+    };
+    /// `aeron.unicast.flowcontrol.supplier` (`aeronmd.h:676-682`).
+    const UNICAST_FLOWCONTROL_SUPPLIER: Self = Self {
+        property: "unicast.flowcontrol.supplier",
+        env: "AERON_UNICAST_FLOWCONTROL_SUPPLIER",
+    };
     /// `aeron.image.liveness.timeout` (`aeronmd.h:323`).
     const IMAGE_LIVENESS_TIMEOUT: Self = Self {
         property: "image.liveness.timeout",
@@ -1328,6 +1367,14 @@ pub enum ConfigError {
         /// What it was set to.
         value: String,
     },
+    /// A flow-control supplier name the reference's symbol table does not
+    /// know, which for the reference is a driver that does not start.
+    UnknownSupplier {
+        /// The setting, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+    },
     /// A validator name the reference's symbol table does not know.
     UnknownValidator {
         /// What it was set to.
@@ -1357,6 +1404,9 @@ impl std::fmt::Display for ConfigError {
             Self::OutOfRange { name, value } => {
                 write!(f, "{name} is {value}, outside the range the driver holds")
             }
+            Self::UnknownSupplier { name, value } => {
+                write!(f, "{name} is {value}, which names no flow control supplier")
+            }
             Self::UnknownValidator { value } => {
                 write!(
                     f,
@@ -1377,6 +1427,7 @@ impl std::error::Error for ConfigError {
             | Self::NotABoolean { .. }
             | Self::NotANumber { .. }
             | Self::OutOfRange { .. }
+            | Self::UnknownSupplier { .. }
             | Self::UnknownValidator { .. } => None,
         }
     }
@@ -1522,6 +1573,21 @@ fn parse_bounded_size32(
 
 /// Parse a plain count, the way `aeron_config_parse_uint64` does: digits, and
 /// nothing else.
+/// A flow-control supplier, named the way the reference names it — its symbol,
+/// or the short name beside it in the same table
+/// (`aeron_flow_control_strategy_supplier_load`, `aeron_flow_control.c:70-79`).
+///
+/// # Errors
+///
+/// [`ConfigError::UnknownSupplier`] for a name the reference's own table does
+/// not hold, which in the reference makes the context fail to initialise.
+fn parse_supplier(setting: &Setting, value: &str) -> Result<Supplier, ConfigError> {
+    Supplier::from_name(value).ok_or_else(|| ConfigError::UnknownSupplier {
+        name: setting.property,
+        value: value.to_owned(),
+    })
+}
+
 fn parse_count(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
     value.parse().map_err(|_| ConfigError::NotANumber {
         name: setting.property,
@@ -2033,6 +2099,62 @@ mod tests {
             config.receiver_group_tag,
             "and `-1` is a tag, unlike naming nothing"
         );
+    }
+
+    /// The two supplier settings name the reference's **symbols**, and a name
+    /// its table does not hold is a driver that does not start
+    /// (`aeron_driver_context.c:563-580`).
+    #[test]
+    fn a_flow_control_supplier_is_named_by_its_the_references_symbol() {
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            (
+                "aeron.multicast.flowcontrol.supplier",
+                "aeron_min_flow_control_strategy_supplier",
+            ),
+            (
+                "aeron.unicast.flowcontrol.supplier",
+                "aeron_tagged_flow_control_strategy_supplier",
+            ),
+        ])
+        .expect("a config");
+
+        assert_eq!(Supplier::Min, config.multicast_flow_control_supplier);
+        assert_eq!(Supplier::Tagged, config.unicast_flow_control_supplier);
+
+        assert_eq!(
+            Supplier::Max,
+            resolve(&[("aeron.dir", "/tmp/aeron-test")])
+                .expect("a config")
+                .multicast_flow_control_supplier,
+            "and `max` is what a driver that names none gets"
+        );
+
+        // The short name beside the symbol in the same table is the same
+        // supplier, and the name `fc=` uses is not on that table at all
+        // (`aeron_flow_control.c:43-64` against `aeronmd.h:286-289`).
+        assert_eq!(
+            Supplier::Tagged,
+            resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("aeron.multicast.flowcontrol.supplier", "multicast_tagged"),
+            ])
+            .expect("a config")
+            .multicast_flow_control_supplier
+        );
+
+        for unknown in ["min", "aeron_cubic_supplier"] {
+            assert!(
+                matches!(
+                    resolve(&[
+                        ("aeron.dir", "/tmp/aeron-test"),
+                        ("aeron.multicast.flowcontrol.supplier", unknown),
+                    ]),
+                    Err(ConfigError::UnknownSupplier { .. })
+                ),
+                "{unknown} names no supplier"
+            );
+        }
     }
 
     #[test]

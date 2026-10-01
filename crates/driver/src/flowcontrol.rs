@@ -420,11 +420,89 @@ pub const UNICAST_RRWM_DEFAULT: usize = 16;
 /// asked could hold rather than to what the term allows.
 pub const MULTICAST_RRWM_DEFAULT: usize = 4;
 
+/// Which strategy a channel that names no `fc=` gets — the driver's two
+/// supplier settings (`multicast_flow_control_supplier_func` and
+/// `unicast_flow_control_supplier_func`, `aeron_driver_context.c:400-408`).
+///
+/// The reference resolves these from a **symbol name** through `dlsym`
+/// (`aeron_flow_control_strategy_supplier_load`, `aeron_flow_control.c:70-79`,
+/// reading `AERON_MULTICAST_FLOWCONTROL_SUPPLIER` and its unicast twin at
+/// `aeron_driver_context.c:563-580`), and the names are the four in its table
+/// (`:369-372`). This build has the same three strategies and no dynamic
+/// loading, so the same names are mapped to them — and a name that is none of
+/// the four is refused, which is what the reference does too: its context init
+/// fails and the driver does not start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Supplier {
+    /// `aeron_max_multicast_flow_control_strategy_supplier`, and the unicast
+    /// `aeron_unicast_flow_control_strategy_supplier`, which is the same
+    /// strategy (`aeron_flow_control.c:30-40`). It is also both defaults
+    /// (`aeron_driver_context.c:201-202`).
+    #[default]
+    Max,
+    /// `aeron_min_flow_control_strategy_supplier`.
+    Min,
+    /// `aeron_tagged_flow_control_strategy_supplier`.
+    Tagged,
+}
+
+impl Supplier {
+    /// The strategy this supplier builds, with the driver's own group settings.
+    fn build(self, defaults: &Defaults) -> FlowControl {
+        match self {
+            Self::Max => FlowControl::Max(MaxStrategy {
+                retransmit_receiver_window_multiple: defaults.multicast_rrwm,
+            }),
+            Self::Min => FlowControl::Min(MinStrategy::new(
+                defaults.receiver_timeout_ns,
+                defaults.group_min_size,
+                None,
+                defaults.multicast_rrwm,
+            )),
+            Self::Tagged => FlowControl::Tagged(MinStrategy::new(
+                defaults.receiver_timeout_ns,
+                defaults.group_min_size,
+                Some(defaults.group_tag),
+                defaults.multicast_rrwm,
+            )),
+        }
+    }
+
+    /// The supplier a name picks, or `None` for one this build has no strategy
+    /// for — the reference's own two answers for a name its table does not hold
+    /// (`aeron_symbol_table_func_scan`,
+    /// `aeron-client/src/main/c/util/aeron_symbol_table.c:98-120`).
+    ///
+    /// Each entry of the table has **two** names and the scan takes either
+    /// (`aeron_flow_control.c:43-64`): the short one from `aeronmd.h:286-289`
+    /// and the symbol's own. So `multicast_min` and
+    /// `aeron_min_flow_control_strategy_supplier` are the same supplier, while
+    /// `min` — the name `fc=` uses — is not on this list at all.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "unicast_max"
+            | "aeron_unicast_flow_control_strategy_supplier"
+            | "multicast_max"
+            | "aeron_max_multicast_flow_control_strategy_supplier" => Some(Self::Max),
+            "multicast_min" | "aeron_min_flow_control_strategy_supplier" => Some(Self::Min),
+            "multicast_tagged" | "aeron_tagged_flow_control_strategy_supplier" => {
+                Some(Self::Tagged)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// What the driver's configuration says when a channel names nothing
 /// (`aeron_driver_context_t`'s own `flow_control` fields, and the two
 /// retransmit multiples beside them).
 #[derive(Clone, Copy, Debug)]
 pub struct Defaults {
+    /// The supplier a **unicast** channel gets, which reads no `fc=` at all.
+    pub unicast_supplier: Supplier,
+    /// The supplier a multicast or multi-destination channel gets when it
+    /// names no `fc=`.
+    pub multicast_supplier: Supplier,
     /// The multiple a unicast channel gets
     /// (`unicast_flow_control_rrwm`).
     pub unicast_rrwm: usize,
@@ -477,15 +555,16 @@ pub fn strategy_for_channel(
     // **or multicast**. Both may have several receivers at once, which is the
     // whole reason the answer can differ from `max`.
     if !names_a_group_of_receivers {
-        return Ok(FlowControl::Max(MaxStrategy {
-            retransmit_receiver_window_multiple: defaults.unicast_rrwm,
-        }));
+        return Ok(match defaults.unicast_supplier {
+            Supplier::Max => FlowControl::Max(MaxStrategy {
+                retransmit_receiver_window_multiple: defaults.unicast_rrwm,
+            }),
+            other => other.build(&defaults),
+        });
     }
 
     let Some(options) = fc else {
-        return Ok(FlowControl::Max(MaxStrategy {
-            retransmit_receiver_window_multiple: defaults.multicast_rrwm,
-        }));
+        return Ok(defaults.multicast_supplier.build(&defaults));
     };
 
     match options.split(',').next().unwrap_or("") {
@@ -1676,6 +1755,8 @@ mod tests {
     /// The driver's own answers when a channel names nothing.
     fn defaults() -> Defaults {
         Defaults {
+            unicast_supplier: Supplier::Max,
+            multicast_supplier: Supplier::Max,
             unicast_rrwm: UNICAST_RRWM_DEFAULT,
             multicast_rrwm: MULTICAST_RRWM_DEFAULT,
             group_tag: -1,
