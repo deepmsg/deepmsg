@@ -263,6 +263,37 @@ impl<'a> ChannelUri<'a> {
             })
     }
 
+    /// An `int64` parameter (`aeron_uri_get_int64`,
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:384-407`).
+    ///
+    /// The same base and the same consumption rule as [`i64`](Self::i64)'s
+    /// smaller sibling, and the same two errors — the reference has one reader
+    /// per width and nothing else differs between them.
+    ///
+    /// # Errors
+    ///
+    /// [`UriError::NotANumber`] for a value that is not one in that base, and
+    /// [`UriError::OutOfRange`] for one that does not fit in 64 bits.
+    pub fn i64(&self, key: &str) -> Result<Option<i64>, UriError> {
+        let Some(value) = self.value(key) else {
+            return Ok(None);
+        };
+
+        let Some(number) = parse_base_zero(value) else {
+            return Err(UriError::NotANumber {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            });
+        };
+
+        i64::try_from(number)
+            .map(Some)
+            .map_err(|_| UriError::OutOfRange {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            })
+    }
+
     /// A `bool` parameter (`aeron_uri_get_bool`,
     /// `aeron-client/src/main/c/uri/aeron_uri.c:409-430`).
     ///
