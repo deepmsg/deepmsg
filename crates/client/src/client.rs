@@ -1085,6 +1085,184 @@ impl Client {
         Ok(correlation_id)
     }
 
+    /// Give a publication back to the driver
+    /// (`aeron_publication_close`, `aeron_publication.c:91-112`, through
+    /// `aeron_client_conductor_async_close_publication`).
+    ///
+    /// The publication goes away on this call: the driver answers when the link
+    /// is gone, and until that answer arrives the publication is still this
+    /// client's. A caller that wants the stream cut off with a message to its
+    /// readers wants [`Self::revoke_publication`] — the difference is one flag
+    /// (`REMOVE_PUBLICATION_FLAG_REVOKE`), and everything the flag sets off.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] for a driver that fell silent, or one that answers with
+    /// something other than an acknowledgement.
+    pub fn remove_publication(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        self.remove_publication_with_flags(registration_id, 0, timeout)
+    }
+
+    /// Cut a publication's stream off and give it back
+    /// (`Publication.revokeOnClose` / `Publication.revoke`, which is the same
+    /// command with `REMOVE_PUBLICATION_FLAG_REVOKE`).
+    ///
+    /// Every reader of the stream is told: their images are revoked, drained,
+    /// and reported unavailable with `Image::is_publication_revoked` true.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_publication`].
+    pub fn revoke_publication(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        self.remove_publication_with_flags(
+            registration_id,
+            deepmsg_cnc::command::REMOVE_PUBLICATION_FLAG_REVOKE,
+            timeout,
+        )
+    }
+
+    fn remove_publication_with_flags(
+        &mut self,
+        registration_id: i64,
+        flags: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = deepmsg_cnc::command::RemovePublication {
+            correlated: deepmsg_cnc::command::Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            registration_id,
+            flags,
+        };
+
+        let mut payload = vec![0u8; deepmsg_cnc::command::RemovePublication::encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(
+            deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.forget_publication(registration_id);
+
+        Ok(())
+    }
+
+    /// Give a subscription back to the driver
+    /// (`aeron_subscription_close`, through
+    /// `aeron_client_conductor_async_close_subscription`).
+    ///
+    /// The driver answers when its link is gone; every image it held goes with
+    /// it, and a receiver that has no readers left stops feeding the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_publication`].
+    pub fn remove_subscription(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        let command = deepmsg_cnc::command::RemoveSubscription {
+            correlated: deepmsg_cnc::command::Correlated {
+                client_id: self.client_id,
+                correlation_id,
+            },
+            registration_id,
+        };
+
+        let mut payload = vec![0u8; deepmsg_cnc::command::RemoveSubscription::encoded_length()];
+        if !command.encode_into(&mut payload) {
+            return Err(CommandError::Encoding);
+        }
+
+        self.send(
+            deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID,
+            &payload,
+            correlation_id,
+            timeout,
+        )?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.forget_subscription(registration_id);
+
+        Ok(())
+    }
+
+    /// Forget a publication without telling the driver
+    /// (`Publication.forceClose`).
+    ///
+    /// The link the driver holds is left behind on purpose: it is what a client
+    /// does when it is about to die, and the cost of it is the driver holding a
+    /// resource until the client's own liveness timeout reaps it. Returns
+    /// whether there was one to forget.
+    pub fn force_remove_publication(&mut self, registration_id: i64) -> bool {
+        self.forget_publication(registration_id)
+    }
+
+    /// The same for a subscription.
+    pub fn force_remove_subscription(&mut self, registration_id: i64) -> bool {
+        self.forget_subscription(registration_id)
+    }
+
+    /// Drop a publication from this client's list, and close it.
+    fn forget_publication(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .publications
+            .iter()
+            .position(|publication| publication.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        // Dropped rather than closed in place: this client hands resources
+        // out **borrowed**, so a caller that still held one would not be able
+        // to call this at all — and the observable that says a publication is
+        // closed is that [`Self::publication`] no longer answers with it.
+        let _ = self.publications.swap_remove(index);
+
+        true
+    }
+
+    /// The same for a subscription.
+    fn forget_subscription(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .subscriptions
+            .iter()
+            .position(|subscription| subscription.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        let _ = self.subscriptions.swap_remove(index);
+
+        true
+    }
+
     /// Ask the driver to allocate a counter it will keep, and wait for it.
     ///
     /// The counter belongs to the **driver**, not to this client: it is

@@ -46,6 +46,12 @@ path = "integration/cnc_terminate.rs"
 
 # The client's matching loop against fabricated replies. Runs in CI, which the
 # interop suite cannot.
+# A client giving a publication or a subscription back — the three ways it can,
+# against a real driver of ours. Runs in CI.
+[[test]]
+name = "resource_lifecycle"
+path = "integration/resource_lifecycle.rs"
+
 [[test]]
 name = "client_round_trip"
 path = "integration/client_round_trip.rs"

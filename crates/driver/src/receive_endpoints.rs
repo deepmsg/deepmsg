@@ -590,7 +590,7 @@ mod tests {
 
         let (_, id, _) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:40223"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
                 // A window no receive buffer can be smaller than: this test is
@@ -610,7 +610,7 @@ mod tests {
         // so the address is that port — and a reader that gets the whole label
         // knows which socket it is looking at.
         assert_eq!(
-            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40123 127.0.0.1:40123",
+            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40223 127.0.0.1:40223",
             label(&regions, id)
         );
     }
@@ -651,9 +651,9 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
-        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40123";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m";
+        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40243";
 
         endpoints
             .get_or_add(
@@ -686,8 +686,8 @@ mod tests {
                 error,
                 ReceiveEndpointErrorKind::ChannelValidation(ref message) if message ==
                     "so-rcvbuf=2097152 does not match existing value of 1048576: \
-                     existingChannel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m \
-                     channel=aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m"
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m"
             ),
             "{error}"
         );
@@ -734,8 +734,8 @@ mod tests {
         // clause reachable at all. A manual channel's destinations arrive one
         // at a time from clients, so it is asking to *join* a socket rather
         // than to describe one, and the reference leaves it alone entirely.
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40253|so-rcvbuf=1m";
+        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40253|control-mode=manual|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(
@@ -774,8 +774,8 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(

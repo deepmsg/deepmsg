@@ -1224,6 +1224,58 @@ pub struct RemovePublication {
     pub flags: i64,
 }
 
+impl RemovePublication {
+    /// The payload a client sends: the correlated head, the registration id and
+    /// the flags word (`aeron_remove_publication_command_t`,
+    /// `aeron_control_protocol.h:70-76`).
+    ///
+    /// The driver still accepts the 24-byte form without the flags
+    /// ([`decode_remove_publication`]), but there is no reason to send it: the
+    /// flags word is where the revoke lives.
+    pub const fn encoded_length() -> usize {
+        CORRELATED_COMMAND_LENGTH + 8 + 8
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`Self::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != Self::encoded_length() {
+            return false;
+        }
+
+        out[0..8].copy_from_slice(&self.correlated.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlated.correlation_id.to_le_bytes());
+        out[CORRELATED_COMMAND_LENGTH..CORRELATED_COMMAND_LENGTH + 8]
+            .copy_from_slice(&self.registration_id.to_le_bytes());
+        out[CORRELATED_COMMAND_LENGTH + 8..].copy_from_slice(&self.flags.to_le_bytes());
+
+        true
+    }
+}
+
+impl RemoveSubscription {
+    /// The payload a client sends: the correlated head and the subscription's
+    /// registration id (`aeron_remove_subscription_command_t`,
+    /// `aeron_control_protocol.h:146-151`).
+    pub const fn encoded_length() -> usize {
+        CORRELATED_COMMAND_LENGTH + 8
+    }
+
+    /// Write the payload into `out`, which must be exactly
+    /// [`Self::encoded_length`] bytes.
+    pub fn encode_into(&self, out: &mut [u8]) -> bool {
+        if out.len() != Self::encoded_length() {
+            return false;
+        }
+
+        out[0..8].copy_from_slice(&self.correlated.client_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.correlated.correlation_id.to_le_bytes());
+        out[CORRELATED_COMMAND_LENGTH..].copy_from_slice(&self.registration_id.to_le_bytes());
+
+        true
+    }
+}
+
 /// `AERON_COMMAND_REMOVE_PUBLICATION_FLAG_REVOKE`
 /// (`aeron_control_protocol.h:60`): revoke the publication instead of just
 /// letting go of it, so its readers are told the stream is done.
