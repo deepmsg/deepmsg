@@ -29,7 +29,8 @@ use crate::buffer::{AtomicBuffer, ReadWrite};
 use super::descriptor;
 use super::frame::{
     DATA_HEADER_LENGTH, FLAG_BEGIN, FLAG_END, FLAG_UNFRAGMENTED, Frame, SESSION_ID_FIELD_OFFSET,
-    STREAM_ID_FIELD_OFFSET, TYPE_DATA, TYPE_PAD,
+    STREAM_ID_FIELD_OFFSET, TERM_ID_FIELD_OFFSET, TERM_OFFSET_FIELD_OFFSET, TYPE_DATA, TYPE_OFFSET,
+    TYPE_PAD,
 };
 use super::position::{self, Position, RawTail};
 
@@ -657,6 +658,297 @@ impl<'a> Appender<'a> {
         }
     }
 
+    /// Claim `length` **payload** bytes at the caller's offset, without a
+    /// fetch-and-add (`aeron_claim`, `aeron_exclusive_publication.c:323-355`).
+    ///
+    /// The answer is the frame itself, begun but not published: the caller
+    /// writes into it and commits with [`Frame::publish`]. That split is the
+    /// reference's own — `aeron_header_write` stores the length **negated**
+    /// (`:41`) so a reader stepping the term sees a frame it may not read yet,
+    /// and the positive length is what publishes it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. A claim is one frame, so the bound is
+    /// `max_payload_length` and not the message maximum: the reference refuses
+    /// a longer claim outright rather than fragmenting it (`:717-726`), which
+    /// is what makes a claimed frame something a caller can straddle.
+    pub fn try_claim_exclusive(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        length: usize,
+    ) -> Result<Frame<'_, ReadWrite>, Appended> {
+        let position = Position::new(
+            term_id,
+            term_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if position.raw() >= position_limit {
+            return Err(self.back_pressure(position, length));
+        }
+
+        if length > self.max_payload_length {
+            return Err(Appended::MessageTooLarge);
+        }
+
+        let Some(frame_length) = i32::try_from(length + DATA_HEADER_LENGTH).ok() else {
+            return Err(Appended::Malformed);
+        };
+
+        let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+        let resulting_offset = term_offset.saturating_add(aligned_length);
+        let term_count = position::term_count(term_id, self.initial_term_id);
+
+        if self
+            .put_raw_tail(
+                position::index_by_term_count(term_count),
+                term_id,
+                resulting_offset,
+            )
+            .is_none()
+        {
+            return Err(Appended::Malformed);
+        }
+
+        if resulting_offset > self.term_length {
+            let end_position = Position::new(
+                term_id,
+                resulting_offset,
+                self.bits_to_shift,
+                self.initial_term_id,
+            );
+
+            return Err(self.handle_end_of_log(term_offset, term_id, end_position));
+        }
+
+        let frame = Frame::new(&self.term, term_offset as usize);
+        if frame
+            .begin(
+                frame_length,
+                FLAG_UNFRAGMENTED,
+                TYPE_DATA,
+                term_offset,
+                session_id,
+                stream_id,
+                term_id,
+            )
+            .is_none()
+        {
+            return Err(Appended::Malformed);
+        }
+
+        Ok(frame)
+    }
+
+    /// Append a padding frame of `length` **payload** bytes at the caller's
+    /// offset (`aeron_append_padding`, `aeron_exclusive_publication.c:356-388`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]; `length` above `max_message_length` is refused, which
+    /// is the bound the reference names here and **not** the one-frame bound
+    /// [`Appender::try_claim_exclusive`] uses (`:761-770`).
+    pub fn append_padding_exclusive(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        length: usize,
+    ) -> Appended {
+        let position = Position::new(
+            term_id,
+            term_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if position.raw() >= position_limit {
+            return self.back_pressure(position, length);
+        }
+
+        if length > self.max_message_length {
+            return Appended::MessageTooLarge;
+        }
+
+        let Some(frame_length) = i32::try_from(length + DATA_HEADER_LENGTH).ok() else {
+            return Appended::Malformed;
+        };
+
+        let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+        let resulting_offset = term_offset.saturating_add(aligned_length);
+        let term_count = position::term_count(term_id, self.initial_term_id);
+
+        if self
+            .put_raw_tail(
+                position::index_by_term_count(term_count),
+                term_id,
+                resulting_offset,
+            )
+            .is_none()
+        {
+            return Appended::Malformed;
+        }
+
+        let end_position = Position::new(
+            term_id,
+            resulting_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if resulting_offset > self.term_length {
+            return self.handle_end_of_log(term_offset, term_id, end_position);
+        }
+
+        // Written as a data frame and then retyped, as the end-of-log padding
+        // is: a padding frame keeps `BEGIN|END`, and only its type says it is
+        // not for reading.
+        let frame = Frame::new(&self.term, term_offset as usize);
+        if frame
+            .begin(
+                frame_length,
+                FLAG_UNFRAGMENTED,
+                TYPE_DATA,
+                term_offset,
+                session_id,
+                stream_id,
+                term_id,
+            )
+            .is_none()
+            || frame.set_type(TYPE_PAD).is_none()
+            || frame.publish(frame_length).is_none()
+        {
+            return Appended::Malformed;
+        }
+
+        Appended::Ok {
+            position: end_position,
+            term_offset,
+        }
+    }
+
+    /// Append a frame the caller has already built
+    /// (`aeron_append_block`, `aeron_exclusive_publication.c:389-416`, through
+    /// `aeron_exclusive_publication_offer_block`, `:810-895`).
+    ///
+    /// `block` is a **whole aligned frame** — header and payload — and it is
+    /// copied in rather than written field by field. That is what makes the
+    /// ordering below the point of the function: the header's last eight bytes
+    /// carry the frame length, they are stored **release** and last, so a
+    /// reader that sees the length sees everything the length covers.
+    ///
+    /// Three of `offer_block`'s rules live here rather than in a caller,
+    /// because they are about the block's shape and nothing else:
+    ///
+    /// * a block may not straddle a term, so a caller sitting exactly at the
+    ///   end is rotated first and told to come back (`:836-839`) — **not**
+    ///   padded, which is why this cannot go through `handle_end_of_log`'s
+    ///   usual path;
+    /// * a block longer than what is left of the term is refused rather than
+    ///   padded around (`:847-855`);
+    /// * the block is checked against **five** fields — offset, session,
+    ///   stream, term id and type — and any disagreement is a refusal
+    ///   (`:857-877`). A block whose header says it belongs somewhere else
+    ///   would publish a frame that lies about where it is.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`].
+    pub fn append_block_exclusive(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        block: &[u8],
+    ) -> Appended {
+        let position = Position::new(
+            term_id,
+            term_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        // A caller whose offset has reached the end of the term is not asking
+        // about a block that fits: it is asking about the next term. The
+        // reference rotates here and carries on; here the rotation is done and
+        // the caller is told, because the new offset lives on the caller.
+        if term_offset >= self.term_length {
+            return self.handle_end_of_log(term_offset, term_id, position);
+        }
+
+        if position.raw() >= position_limit {
+            return self.back_pressure(position, block.len());
+        }
+
+        if block.len() > (self.term_length - term_offset) as usize {
+            return Appended::MessageTooLarge;
+        }
+
+        if !block_belongs_at(block, session_id, stream_id, term_id, term_offset) {
+            return Appended::Malformed;
+        }
+
+        let resulting_offset =
+            term_offset.saturating_add(i32::try_from(block.len()).unwrap_or(i32::MAX));
+        let term_count = position::term_count(term_id, self.initial_term_id);
+
+        if self
+            .put_raw_tail(
+                position::index_by_term_count(term_count),
+                term_id,
+                resulting_offset,
+            )
+            .is_none()
+        {
+            return Appended::Malformed;
+        }
+
+        if self.copy_block_in(term_offset, block).is_none() {
+            return Appended::Malformed;
+        }
+
+        Appended::Ok {
+            position: Position::new(
+                term_id,
+                resulting_offset,
+                self.bits_to_shift,
+                self.initial_term_id,
+            ),
+            term_offset,
+        }
+    }
+
+    /// Copy a whole frame in, publishing it with the header's last word
+    /// (`aeron_append_block`, `aeron_exclusive_publication.c:389-416`).
+    ///
+    /// The order is the reference's and it is the whole reason this is not a
+    /// `copy_in`: the three words **after** the first are stored first, so that
+    /// the release store of the first — which holds the frame length — is what
+    /// makes the frame readable. A reader that sees the length has, by the
+    /// release, seen everything the length covers.
+    fn copy_block_in(&self, term_offset: i32, block: &[u8]) -> Option<()> {
+        let base = term_offset as usize;
+        self.term
+            .copy_in(base + DATA_HEADER_LENGTH, &block[DATA_HEADER_LENGTH..])?;
+
+        for offset in [24usize, 16, 8] {
+            let value = read_i64(block, offset)?;
+            self.term.store_i64_relaxed(base + offset, value)?;
+        }
+
+        self.term.store_i64_release(base, read_i64(block, 0)?)
+    }
+
     /// Claim `length` bytes of one partition's tail.
     ///
     /// A fetch-and-add, not a compare-and-exchange: every producer gets a
@@ -842,6 +1134,47 @@ impl<'a> Appender<'a> {
     }
 }
 
+/// Whether a block's own header says it belongs at this offset of this stream
+/// (`aeron_exclusive_publication.c:857-877`).
+///
+/// All **five** fields the reference compares, and every one of them is a way
+/// a block can be wrong: a frame whose header disagrees with where it is being
+/// written would be published claiming a term, a stream or a session it is not
+/// on, and a reader would take it.
+fn block_belongs_at(
+    block: &[u8],
+    session_id: i32,
+    stream_id: i32,
+    term_id: i32,
+    term_offset: i32,
+) -> bool {
+    read_i32(block, TERM_OFFSET_FIELD_OFFSET) == Some(term_offset)
+        && read_i32(block, SESSION_ID_FIELD_OFFSET) == Some(session_id)
+        && read_i32(block, STREAM_ID_FIELD_OFFSET) == Some(stream_id)
+        && read_i32(block, TERM_ID_FIELD_OFFSET) == Some(term_id)
+        && read_i16(block, TYPE_OFFSET) == Some(TYPE_DATA)
+}
+
+/// A little-endian field out of a frame a caller built. A block too short to
+/// hold the field is not one that belongs anywhere.
+fn read_i32(block: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        block.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_i16(block: &[u8], offset: usize) -> Option<i16> {
+    Some(i16::from_le_bytes(
+        block.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_i64(block: &[u8], offset: usize) -> Option<i64> {
+    Some(i64::from_le_bytes(
+        block.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1334,274 @@ mod tests {
             .initialise_tails(initial_term_id())
             .then_some(())
             .expect("tails initialised");
+    }
+
+    /// A whole aligned frame, as a caller would have built it for
+    /// `append_block_exclusive`: header and payload, ready to be copied in.
+    fn a_block(
+        term_id: i32,
+        term_offset: i32,
+        session_id: i32,
+        stream_id: i32,
+        payload: &[u8],
+    ) -> Buffer<256> {
+        let mut block = Buffer([0u8; 256]);
+        let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+
+        let view = AtomicBuffer::from_slice_mut(&mut block.0).expect("aligned");
+        let frame = frame::Frame::new(&view, 0);
+        frame
+            .begin(
+                frame_length,
+                FLAG_UNFRAGMENTED,
+                TYPE_DATA,
+                term_offset,
+                session_id,
+                stream_id,
+                term_id,
+            )
+            .expect("fits");
+        frame.write_payload(payload).expect("fits");
+        frame.publish(frame_length).expect("fits");
+
+        block
+    }
+
+    #[test]
+    fn a_claim_hands_back_a_frame_its_caller_publishes() {
+        // The split the reference makes with `aeron_header_write` (`:30-49`):
+        // the header is written with the length **negated**, so a reader
+        // stepping the term meets a frame it may not read, and the positive
+        // length is what makes it readable.
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let payload = b"written into a claim";
+        let appender = log.appender();
+
+        let claim = appender
+            .try_claim_exclusive(11, 22, i64::MAX, initial_term_id(), 0, payload.len())
+            .expect("a claim");
+
+        assert_eq!(0, claim.offset());
+        let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+        assert_eq!(
+            Some(-frame_length),
+            claim.frame_length(),
+            "nothing may read it yet: the length is negative"
+        );
+
+        claim.write_payload(payload).expect("in range");
+        claim.publish(frame_length).expect("in range");
+
+        let (length, type_id, read_back) = log.read_frame(0);
+        assert_eq!(frame_length, length);
+        assert_eq!(TYPE_DATA, type_id);
+        assert_eq!(payload.to_vec(), read_back);
+    }
+
+    #[test]
+    fn a_claim_is_one_frame_and_is_refused_beyond_it() {
+        // A claim cannot be fragmented — that is what makes it something a
+        // caller can hold open — so the bound is the frame's, not the
+        // message's (`aeron_exclusive_publication.c:717-726`).
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let appender = log.appender();
+        let max_payload = appender.max_payload_length();
+        assert!(
+            max_payload < appender.max_message_length(),
+            "the two differ"
+        );
+
+        assert!(
+            appender
+                .try_claim_exclusive(11, 22, i64::MAX, initial_term_id(), 0, max_payload)
+                .is_ok(),
+            "exactly one frame's worth is a claim"
+        );
+
+        assert_eq!(
+            Err(Appended::MessageTooLarge),
+            log.appender()
+                .try_claim_exclusive(
+                    11,
+                    22,
+                    i64::MAX,
+                    initial_term_id(),
+                    max_payload as i32,
+                    max_payload + 1
+                )
+                .map(|frame| frame.offset())
+        );
+    }
+
+    #[test]
+    fn a_padding_frame_carries_the_length_it_was_asked_for() {
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let length = 64usize;
+        let outcome =
+            log.appender()
+                .append_padding_exclusive(11, 22, i64::MAX, initial_term_id(), 0, length);
+
+        assert_eq!(
+            Appended::Ok {
+                position: Position::new(
+                    initial_term_id(),
+                    i32::try_from(length + DATA_HEADER_LENGTH).expect("small"),
+                    position::bits_to_shift(TERM_LENGTH).expect("a term"),
+                    initial_term_id(),
+                ),
+                term_offset: 0,
+            },
+            outcome
+        );
+
+        let (frame_length, type_id, read_back) = log.read_frame(0);
+        assert_eq!(TYPE_PAD, type_id, "a padding frame, not a data frame");
+        assert_eq!(
+            i32::try_from(length + DATA_HEADER_LENGTH).expect("small"),
+            frame_length
+        );
+        assert_eq!(
+            length,
+            read_back.len(),
+            "it carries a payload's worth of bytes"
+        );
+        assert!(
+            read_back.iter().all(|byte| *byte == 0),
+            "and the reference writes nothing into them: a padding frame is \n             skipped by its type, not by having no payload"
+        );
+    }
+
+    /// **What this does not cover**: `copy_block_in`'s *ordering*
+    /// (`hdr[3]`, `hdr[2]`, `hdr[1]`, then the release on `hdr[0]`) is a claim
+    /// about what a reader can see while the copy is happening, and a reader in
+    /// this process cannot be made to look mid-copy. A single-threaded test can
+    /// only check that the bytes came out right — which a plain `copy_in`
+    /// would also satisfy. The order is pinned by the comment on
+    /// [`Appender::copy_block_in`] and by `aeron_exclusive_publication.c:389-416`,
+    /// not by anything below.
+    #[test]
+    fn a_block_is_copied_in_whole_only_when_its_header_belongs_here() {
+        // Five fields, and each one is a way a caller can be wrong
+        // (`aeron_exclusive_publication.c:857-877`). A block that disagrees
+        // with any of them would publish a frame claiming a place it is not.
+        let payload = b"a block";
+
+        for (term_id, term_offset, session_id, stream_id) in [
+            (initial_term_id(), 0, 11, 22),
+            (initial_term_id() + 1, 0, 11, 22),
+            (initial_term_id(), 64, 11, 22),
+            (initial_term_id(), 0, 99, 22),
+            (initial_term_id(), 0, 11, 99),
+        ] {
+            let mut log = Log::new();
+            initialised(&mut log);
+
+            let block = a_block(term_id, term_offset, session_id, stream_id, payload);
+            let outcome = log.appender().append_block_exclusive(
+                11,
+                22,
+                i64::MAX,
+                initial_term_id(),
+                0,
+                &block.0[..payload.len() + DATA_HEADER_LENGTH],
+            );
+
+            let agrees = term_id == initial_term_id()
+                && term_offset == 0
+                && session_id == 11
+                && stream_id == 22;
+
+            if agrees {
+                let Appended::Ok { term_offset, .. } = outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!(0, term_offset);
+
+                let (_, type_id, read_back) = log.read_frame(0);
+                assert_eq!(TYPE_DATA, type_id);
+                assert_eq!(payload.to_vec(), read_back);
+            } else {
+                assert_eq!(
+                    Appended::Malformed,
+                    outcome,
+                    "term_id={term_id} offset={term_offset} session={session_id} stream={stream_id}"
+                );
+                assert_eq!(0, log.read_frame(0).0, "and nothing was copied in");
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_longer_than_the_term_has_left_is_refused_rather_than_padded_around() {
+        // A block may not straddle a term, and unlike an offer it is not
+        // padded around: the caller built a frame that does not fit, which is a
+        // different mistake from a payload that happens to land at the end
+        // (`aeron_exclusive_publication.c:847-855`).
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let payload = b"a block";
+        let frame_length = i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+        let offset = TERM_LENGTH - frame_length / 2;
+        log.set_tail(initial_term_id(), offset, 0);
+
+        let block = a_block(initial_term_id(), offset, 11, 22, payload);
+        let outcome = log.appender().append_block_exclusive(
+            11,
+            22,
+            i64::MAX,
+            initial_term_id(),
+            offset,
+            &block.0[..payload.len() + DATA_HEADER_LENGTH],
+        );
+
+        assert_eq!(Appended::MessageTooLarge, outcome);
+        assert_eq!(
+            offset,
+            log.tail_value(),
+            "and the refusal comes before the store"
+        );
+    }
+
+    #[test]
+    fn a_block_asked_for_at_the_end_of_a_term_rotates_and_says_so() {
+        // The one place `offer_block` differs in *shape* from the other three:
+        // a caller sitting exactly at the end of a term is not being offered a
+        // block that fits, it is being offered the next term
+        // (`aeron_exclusive_publication.c:836-839`).
+        let mut log = Log::new();
+        initialised(&mut log);
+        log.set_tail(initial_term_id(), TERM_LENGTH, 0);
+
+        let block = a_block(initial_term_id() + 1, 0, 11, 22, b"a block");
+        let outcome = log.appender().append_block_exclusive(
+            11,
+            22,
+            i64::MAX,
+            initial_term_id(),
+            TERM_LENGTH,
+            &block.0[..],
+        );
+
+        assert_eq!(Appended::EndOfLog, outcome, "rotate, and come back");
+        assert_eq!(
+            TERM_LENGTH,
+            log.tail_value(),
+            "the tail of the term it was asked about is where it was: a full              term is rotated, not padded and not written into"
+        );
+        assert_eq!(
+            0,
+            log.read_frame(TERM_LENGTH as usize - 128).0,
+            "and nothing was written into it: a term that ends exactly on the \
+             boundary is rotated with no padding frame, because there is no \
+             remainder for one to cover"
+        );
     }
 
     #[test]
