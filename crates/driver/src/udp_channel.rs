@@ -823,7 +823,23 @@ fn read_interface(text: Option<&str>) -> Result<InterfaceSpec, UdpChannelError> 
         _ => (host, 0),
     };
 
-    let address = host.parse::<IpAddr>().map_err(|_| bad())?;
+    // A literal first, and only then a name — which is the reference's order
+    // (`aeron_ipv4_addr_resolver`: `inet_pton`, then `getaddrinfo`).
+    //
+    // The family is **IPv4** for any spec that is not bracketed
+    // (`aeron_parse_util.c:505-517`, where a missing `[...]` sets the hint to
+    // 4), so an interface named `localhost` resolves the way every other
+    // unbracketed host does. Since 1.53.2 resolves a host at all here, a name
+    // was a *refusal* before — `interface=localhost` is written 25 times across
+    // the reference's own system tests.
+    let address = match host.parse::<IpAddr>() {
+        Ok(address) => address,
+        Err(_) => lookup(host, 0, AddressFamily::Inet)
+            .map_err(|_| bad())?
+            .map(|resolved| resolved.ip())
+            .ok_or_else(bad)?,
+    };
+
     let full_length = if address.is_ipv4() { 32 } else { 128 };
 
     let prefix_length = match prefix {
@@ -1572,6 +1588,31 @@ mod tests {
             format!("UDP-{}:0-224.0.1.1:40123", interface.address),
             channel.canonical_form
         );
+    }
+
+    #[test]
+    fn an_interface_named_by_host_resolves_like_any_other_host() {
+        // `interface=localhost` is written 25 times across 17 of the
+        // reference's own system-test files, and until this it was refused:
+        // the host went through `parse::<IpAddr>` and a name is not a literal.
+        // The reference tries the literal first and then resolves
+        // (`aeron_netutil.c:115-126`), and every unbracketed spec is resolved
+        // as IPv4 (`aeron_parse_util.c:505-517`).
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=localhost");
+        let literal = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=127.0.0.1");
+
+        assert_eq!(
+            literal.local_data, named.local_data,
+            "a name that resolves to the literal is the same interface"
+        );
+        assert_eq!(literal.interface_index, named.interface_index);
+
+        // And it is a real name that is resolved, not a special case for this
+        // one: a name that does not resolve is still refused.
+        assert!(matches!(
+            refuse("aeron:udp?endpoint=127.0.0.1:40123|interface=nosuchhost.invalid"),
+            UdpChannelError::Resolution(_)
+        ));
     }
 
     #[test]
