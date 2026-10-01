@@ -2074,6 +2074,7 @@ mod tests {
             },
             1,
             2,
+            crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
         )
         .expect("a publication");
 

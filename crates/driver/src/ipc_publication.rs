@@ -106,8 +106,9 @@ pub struct IpcPublication {
     /// And the resting half.
     pub untethered_resting_timeout_ns: i64,
     /// How long a rejection lasts (`aeron_ipc_publication.c:177`, which takes
-    /// it from `context->image_liveness_timeout_ns` — the same ten seconds an
-    /// image waits before deciding a publication is gone).
+    /// it from `context->image_liveness_timeout_ns` — the same window an image
+    /// waits before deciding a publication is gone, and the same setting that
+    /// value comes from).
     pub liveness_timeout_ns: i64,
     /// Where the limit may next jump to (`aeron_ipc_publication.h:172`).
     trip_gain: i32,
@@ -278,6 +279,7 @@ impl IpcPublication {
         socket_buffers: SocketBufferLengths,
         pub_pos_counter_id: i32,
         pub_lmt_counter_id: i32,
+        liveness_timeout_ns: i64,
     ) -> Result<Self, Box<LogFile>> {
         // The term length is the caller's, not the metadata's: this function is
         // what writes the metadata, so reading it here would read zero.
@@ -400,7 +402,7 @@ impl IpcPublication {
             untethered_window_limit_timeout_ns: params.untethered_window_limit_timeout_ns,
             untethered_linger_timeout_ns: params.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: params.untethered_resting_timeout_ns,
-            liveness_timeout_ns: crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
+            liveness_timeout_ns,
             trip_gain: params.publication_window_length / 8,
             trip_limit: 0,
             consumer_position: start_position,
@@ -1561,9 +1563,17 @@ mod tests {
             sndbuf: 212_992,
         };
 
-        let mut publication =
-            IpcPublication::create(log, identity, &params, PAGE_SIZE, socket_buffers, 0, 0)
-                .expect("a publication");
+        let mut publication = IpcPublication::create(
+            log,
+            identity,
+            &params,
+            PAGE_SIZE,
+            socket_buffers,
+            0,
+            0,
+            crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
+        )
+        .expect("a publication");
 
         publication.pub_pos_counter_id = crate::position::allocate_publisher_position(
             manager,
@@ -1822,6 +1832,7 @@ mod tests {
             },
             0,
             0,
+            crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
         )
         .expect("a publication");
 

@@ -446,6 +446,7 @@ impl PublicationImages {
             pending.counters,
             window,
             config.status_message_timeout_ns,
+            config.image_liveness_timeout_ns,
             config.layout.page_size,
             pending.untethered,
             pending.group_semantics,

@@ -51,10 +51,14 @@ use crate::system_counters::{self, System};
 /// (`aeron.status.message.timeout`, 200 ms).
 pub const STATUS_MESSAGE_TIMEOUT_NS: i64 = 200_000_000;
 
-/// How long an image may go without a packet before it starts draining
-/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:204` — ten seconds).
-pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = 10_000_000_000;
+/// What an image is built with when nothing configures one
+/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:204`).
+///
+/// The value a driver actually uses is
+/// [`DriverConfig::image_liveness_timeout_ns`](crate::config::DriverConfig::image_liveness_timeout_ns);
+/// this is the default that setting starts from, and what a test that builds an
+/// image by hand passes.
+pub const IMAGE_LIVENESS_TIMEOUT_NS: i64 = crate::config::IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT;
 
 /// How many status-message periods a drained image waits before lingering
 /// (`AERON_IMAGE_SM_EOS_MULTIPLE`,
@@ -344,6 +348,7 @@ impl PublicationImage {
         counters: ImageCounters,
         initial_window_length: i32,
         sm_timeout_ns: i64,
+        liveness_timeout_ns: i64,
         page_size: usize,
         untethered: SubscriptionParams,
         group_semantics: bool,
@@ -480,7 +485,7 @@ impl PublicationImage {
             sm_timeout_ns,
             initial_window_length: window,
             max_receiver_window_length: window,
-            liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS,
+            liveness_timeout_ns,
             // The channel's own delays, when it named one. `nak-delay=` is the
             // whole of what a subscription may say about how its gaps are asked
             // for (`aeron_publication_image.c:100-118`), and until this line
@@ -1764,6 +1769,7 @@ mod tests {
                 },
                 128 * 1024,
                 STATUS_MESSAGE_TIMEOUT_NS,
+                IMAGE_LIVENESS_TIMEOUT_NS,
                 4096,
                 untethered,
                 group_semantics,

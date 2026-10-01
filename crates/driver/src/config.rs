@@ -151,6 +151,14 @@ pub const FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT: i32 = 0;
 /// before a receiver that has gone quiet is dropped.
 pub const FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
+/// `AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:204`):
+/// how long an image may go quiet before it starts draining.
+///
+/// It is also what an IPC publication measures a refusal against
+/// (`aeron_ipc_publication.c:177`), which is why it is a driver setting rather
+/// than an image's own.
+pub const IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
+
 /// A boolean that has a third answer: **work it out**
 /// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
 ///
@@ -459,6 +467,10 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// How long an image may go without a packet before it drains, and how
+    /// long an IPC publication's refusal lasts
+    /// (`aeron.image.liveness.timeout`, `AERON_IMAGE_LIVENESS_TIMEOUT`).
+    pub image_liveness_timeout_ns: i64,
     /// The tag a `fc=tagged` channel that names no `g:` matches against
     /// (`aeron.flow.control.gtag`, `AERON_FLOW_CONTROL_GROUP_TAG`).
     pub flow_control_group_tag: i64,
@@ -592,6 +604,7 @@ impl Default for DriverConfig {
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
+            image_liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT,
             flow_control_group_tag: FLOW_CONTROL_GROUP_TAG_DEFAULT,
             flow_control_group_min_size: FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT,
             flow_control_receiver_timeout_ns: FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT,
@@ -854,6 +867,10 @@ impl DriverConfig {
                 });
             }
             config.nak_multicast_max_backoff_ns = backoff;
+        }
+        if let Some(value) = get(&Setting::IMAGE_LIVENESS_TIMEOUT) {
+            config.image_liveness_timeout_ns =
+                parse_duration_ns(&Setting::IMAGE_LIVENESS_TIMEOUT, &value)?;
         }
         if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_TAG) {
             config.flow_control_group_tag = parse_count(&Setting::FLOW_CONTROL_GROUP_TAG, &value)?;
@@ -1149,6 +1166,11 @@ impl Setting {
     /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
     /// `:451-452` — environment only, with no property read in the reference;
     /// this build reads the property too, as it does for every other name).
+    /// `aeron.image.liveness.timeout` (`aeronmd.h:323`).
+    const IMAGE_LIVENESS_TIMEOUT: Self = Self {
+        property: "image.liveness.timeout",
+        env: "AERON_IMAGE_LIVENESS_TIMEOUT",
+    };
     /// `aeron.receiver.group.tag` (`aeronmd.h:558`).
     const RECEIVER_GROUP_TAG: Self = Self {
         property: "receiver.group.tag",
