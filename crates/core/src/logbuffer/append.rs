@@ -163,6 +163,13 @@ impl<'a> Appender<'a> {
         self.max_payload_length
     }
 
+    /// The largest message of any shape
+    /// (`min(term_length / 8, 16 MiB)`), beyond which a payload is refused
+    /// rather than fragmented.
+    pub const fn max_message_length(&self) -> usize {
+        self.max_message_length
+    }
+
     /// The term length every offset here is relative to.
     pub const fn term_length(&self) -> i32 {
         self.term_length
@@ -254,22 +261,7 @@ impl<'a> Appender<'a> {
         // stream outranks a closed window, and whether anyone is listening
         // decides between the other two.
         if position.raw() >= position_limit {
-            let frame_length = payload.len().saturating_add(DATA_HEADER_LENGTH);
-            let aligned_length = frame_length
-                .saturating_add(descriptor::FRAME_ALIGNMENT as usize - 1)
-                & !(descriptor::FRAME_ALIGNMENT as usize - 1);
-
-            if position.raw().saturating_add(aligned_length as i64)
-                >= position::max_possible_position(self.term_length)
-            {
-                return Appended::MaxPositionExceeded;
-            }
-
-            return match self.is_connected() {
-                Some(true) => Appended::BackPressured,
-                Some(false) => Appended::NotConnected,
-                None => Appended::Malformed,
-            };
+            return self.back_pressure(position, payload.len());
         }
 
         // Inside the window, and only now, the payload's *shape* matters
@@ -500,6 +492,169 @@ impl<'a> Appender<'a> {
         frame.publish(frame_length)?;
 
         Some(())
+    }
+
+    /// Which of the three "not now" answers a stalled offer gets
+    /// (`aeron_publication.h:76-95`, and the same body again as
+    /// `aeron_exclusive_publication_back_pressure_status`,
+    /// `aeron_exclusive_publication.h:116-131` — the reference writes it twice,
+    /// once per publication kind).
+    ///
+    /// The order is the reference's: an exhausted stream outranks a closed
+    /// window, and whether anyone is listening decides between the other two.
+    fn back_pressure(&self, position: Position, payload_length: usize) -> Appended {
+        let frame_length = payload_length.saturating_add(DATA_HEADER_LENGTH);
+        let aligned_length = frame_length.saturating_add(descriptor::FRAME_ALIGNMENT as usize - 1)
+            & !(descriptor::FRAME_ALIGNMENT as usize - 1);
+
+        if position.raw().saturating_add(aligned_length as i64)
+            >= position::max_possible_position(self.term_length)
+        {
+            return Appended::MaxPositionExceeded;
+        }
+
+        match self.is_connected() {
+            Some(true) => Appended::BackPressured,
+            Some(false) => Appended::NotConnected,
+            None => Appended::Malformed,
+        }
+    }
+
+    /// Advance one partition's tail by a **plain store**
+    /// (`aeron_put_raw_tail_release`, `aeron_exclusive_publication.c:25-28`).
+    ///
+    /// Release, not relaxed: the frame is written before the tail that
+    /// publishes it, and a reader that saw the tail must see the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`None`] for a partition outside the ring, or a metadata block too short
+    /// to hold the counter.
+    fn put_raw_tail(&self, partition: usize, term_id: i32, term_offset: i32) -> Option<()> {
+        if partition >= descriptor::PARTITION_COUNT {
+            return None;
+        }
+
+        let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
+            + partition * descriptor::TERM_TAIL_COUNTER_STRIDE;
+
+        self.metadata
+            .store_i64_release(offset, RawTail::new(term_id, term_offset).raw())
+    }
+
+    /// Append at a position the caller already holds, advancing the tail with a
+    /// plain store instead of a claim
+    /// (`aeron_exclusive_publication.c:73-115` and its three siblings).
+    ///
+    /// One line is the whole difference from [`Appender::append`]: the tail
+    /// goes forward with `aeron_put_raw_tail_release` rather than a
+    /// fetch-and-add, and the offset comes from the caller's record of where
+    /// the last offer ended — the reference keeps that on the publication
+    /// object (`publication->term_offset`, `:558`) and so does this.
+    ///
+    /// A claim is a promise that nobody else is writing this term. An exclusive
+    /// producer *is* that promise, which is why dropping the fetch-and-add
+    /// costs nothing — and also why two of them on one log buffer produce a
+    /// corrupt log rather than a slow one: there is nothing left to keep them
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. [`Appended::EndOfLog`] is the one a caller must act
+    /// on: the term rotated, so the `term_offset` it passed is stale.
+    pub fn append_exclusive(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        payload: &[u8],
+    ) -> Appended {
+        // The position is **derived** from the caller's two numbers, not
+        // claimed from a tail: that pair is the whole of what this producer
+        // knows about where it is (`aeron_exclusive_publication.c:557-559`).
+        let position = Position::new(
+            term_id,
+            term_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if position.raw() >= position_limit {
+            return self.back_pressure(position, payload.len());
+        }
+
+        // The bound, then the one-frame-or-several choice (`:565-604`). The
+        // reference nests the bound inside the fragmented arm, because a
+        // payload small enough for one frame cannot exceed a message maximum
+        // that is never below one frame; checking it for both is the same
+        // answer with one line fewer, and is what [`Appender::append`] does.
+        if payload.len() > self.max_message_length {
+            return Appended::MessageTooLarge;
+        }
+
+        let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+            return Appended::Malformed;
+        };
+        let fragmented = payload.len() > self.max_payload_length;
+
+        #[allow(clippy::cast_possible_wrap)] // bounded by the message maximum
+        let framed_length = if fragmented {
+            descriptor::compute_fragmented_length(payload.len(), self.max_payload_length) as i32
+        } else {
+            position::align_up(frame_length, descriptor::FRAME_ALIGNMENT)
+        };
+
+        let resulting_offset = term_offset.saturating_add(framed_length);
+        let term_count = position::term_count(term_id, self.initial_term_id);
+
+        // The tail moves **before** the bounds test (`:87-88`), and it moves
+        // even for the append that overruns: the next producer — or the
+        // rotation — has to see where this one got to.
+        if self
+            .put_raw_tail(
+                position::index_by_term_count(term_count),
+                term_id,
+                resulting_offset,
+            )
+            .is_none()
+        {
+            return Appended::Malformed;
+        }
+
+        let end_position = Position::new(
+            term_id,
+            resulting_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if resulting_offset > self.term_length {
+            return self.handle_end_of_log(term_offset, term_id, end_position);
+        }
+
+        let written = if fragmented {
+            self.write_fragmented(session_id, stream_id, term_offset, term_id, payload)
+        } else {
+            self.write_frame(
+                session_id,
+                stream_id,
+                term_offset,
+                term_id,
+                frame_length,
+                payload,
+            )
+        };
+
+        if written.is_none() {
+            return Appended::Malformed;
+        }
+
+        Appended::Ok {
+            position: end_position,
+            term_offset,
+        }
     }
 
     /// Claim `length` bytes of one partition's tail.
@@ -795,6 +950,21 @@ mod tests {
             Some(RawTail::from_raw(view.load_i64_acquire(offset)?).term_offset(TERM_LENGTH))
         }
 
+        /// The current partition's tail **without** the term-length
+        /// saturation, so a tail that has run past the end still reads as
+        /// itself — which is the whole point of testing the overrun.
+        fn tail_value(&self) -> i32 {
+            self.tail_value_opt().expect("a tail")
+        }
+
+        fn tail_value_opt(&self) -> Option<i32> {
+            let view = AtomicBuffer::from_slice(&self.metadata.0).expect("aligned");
+            let raw = view.load_i64_acquire(descriptor::TERM_TAIL_COUNTERS_OFFSET)?;
+
+            #[allow(clippy::cast_possible_truncation)] // a term offset
+            Some(RawTail::from_raw(raw).raw_term_offset() as i32)
+        }
+
         /// What a scanner sees first.
         fn first_step(&self) -> Step {
             let view = AtomicBuffer::from_slice(&self.term.0).expect("aligned");
@@ -831,6 +1001,170 @@ mod tests {
             .initialise_tails(initial_term_id())
             .then_some(())
             .expect("tails initialised");
+    }
+
+    #[test]
+    fn an_exclusive_append_writes_the_same_bytes_as_a_claimed_one() {
+        // The two paths differ in how the tail moves and in nothing else, so
+        // the strongest thing to say about the new one is that a reader cannot
+        // tell them apart.
+        let payload = b"a payload both paths have to agree on";
+        let (session_id, stream_id) = (11, 22);
+
+        let mut claimed = Log::new();
+        claimed.set_tail(initial_term_id(), 0, 0);
+        let claimed_outcome = claimed
+            .appender()
+            .append(session_id, stream_id, i64::MAX, payload);
+
+        let mut exclusive = Log::new();
+        exclusive.set_tail(initial_term_id(), 0, 0);
+        let exclusive_outcome = exclusive.appender().append_exclusive(
+            session_id,
+            stream_id,
+            i64::MAX,
+            initial_term_id(),
+            0,
+            payload,
+        );
+
+        assert_eq!(claimed_outcome, exclusive_outcome, "same answer");
+        assert_eq!(
+            claimed.term.0[..],
+            exclusive.term.0[..],
+            "and byte for byte the same term"
+        );
+
+        let (length, type_id, read_back) = exclusive.read_frame(0);
+        assert_eq!(payload.len() + DATA_HEADER_LENGTH, length as usize);
+        assert_eq!(TYPE_DATA, type_id);
+        assert_eq!(payload.to_vec(), read_back);
+    }
+
+    #[test]
+    fn an_exclusive_append_writes_where_the_caller_says_not_where_the_tail_is() {
+        // The one observable difference from a claim, and the reason the
+        // caller owns the offset: an exclusive producer's position is its own
+        // record, not something it asks the log for
+        // (`aeron_exclusive_publication.c:558`). The tail is deliberately set
+        // somewhere else, so a claim-shaped implementation would write at 4096
+        // and this has to write at 0.
+        let mut log = Log::new();
+        initialised(&mut log);
+        log.set_tail(initial_term_id(), 4096, 0);
+
+        let payload = b"where the caller says";
+        let outcome =
+            log.appender()
+                .append_exclusive(11, 22, i64::MAX, initial_term_id(), 0, payload);
+
+        let Appended::Ok { term_offset, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(0, term_offset, "the caller's offset, not the tail's");
+
+        let (_, type_id, read_back) = log.read_frame(0);
+        assert_eq!(TYPE_DATA, type_id, "the frame is at 0");
+        assert_eq!(payload.to_vec(), read_back);
+
+        let (_, _, at_the_tail) = log.read_frame(4096);
+        assert_eq!(0, at_the_tail.len(), "and nothing was written at 4096");
+    }
+
+    #[test]
+    fn an_exclusive_append_that_overruns_the_term_still_moves_the_tail() {
+        // The store comes **before** the bounds test
+        // (`aeron_exclusive_publication.c:87-88`), which reads like an
+        // accident and is not: the append that overruns is the one that ends
+        // the term, and a next producer — or the rotation — that saw the old
+        // tail would write a frame where this one already padded.
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        let offset = TERM_LENGTH - 64;
+        log.set_tail(initial_term_id(), offset, 0);
+
+        let outcome = log.appender().append_exclusive(
+            11,
+            22,
+            i64::MAX,
+            initial_term_id(),
+            offset,
+            &[0xAB; 128],
+        );
+
+        assert_eq!(Appended::EndOfLog, outcome);
+
+        // 128 bytes plus a header, aligned, from an offset 64 short of the end.
+        let frame_length = i32::try_from(128 + DATA_HEADER_LENGTH).expect("small");
+        let expected = offset + position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+        assert!(
+            expected > TERM_LENGTH,
+            "the span has to leave the term for this test to say anything"
+        );
+        assert_eq!(
+            expected,
+            log.tail_value(),
+            "the tail carries the overrun, not the last offset that fitted"
+        );
+    }
+
+    #[test]
+    fn an_exclusive_append_past_the_window_is_classified_like_a_claimed_one() {
+        // The three "not now" answers are one body in the reference, written
+        // twice (`aeron_exclusive_publication.h:116-131`), and the two paths
+        // here share one — so the interesting part is that a caller that has
+        // run out of window is told *which* way it has run out.
+        let mut log = Log::new();
+        initialised(&mut log);
+        log.set_connected(false);
+
+        let outcome = log
+            .appender()
+            .append_exclusive(11, 22, 0, initial_term_id(), 0, b"payload");
+
+        assert_eq!(
+            Appended::NotConnected,
+            outcome,
+            "no window, and nobody listening"
+        );
+
+        log.set_connected(true);
+        let outcome = log
+            .appender()
+            .append_exclusive(11, 22, 0, initial_term_id(), 0, b"payload");
+
+        assert_eq!(
+            Appended::BackPressured,
+            outcome,
+            "no window, but somebody is"
+        );
+    }
+
+    #[test]
+    fn an_exclusive_append_beyond_the_message_maximum_is_refused() {
+        let mut log = Log::new();
+        initialised(&mut log);
+
+        // A tail that is somewhere, so "unchanged" is a claim worth making.
+        log.set_tail(initial_term_id(), 4096, 0);
+
+        let too_large = log.appender().max_message_length() + 1;
+        let outcome = log.appender().append_exclusive(
+            11,
+            22,
+            i64::MAX,
+            initial_term_id(),
+            0,
+            &vec![0u8; too_large],
+        );
+
+        assert_eq!(Appended::MessageTooLarge, outcome);
+        assert_eq!(
+            4096,
+            log.tail_value(),
+            "and the refusal comes before the store, so the tail has not moved"
+        );
     }
 
     #[test]
