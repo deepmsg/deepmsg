@@ -79,6 +79,13 @@ pub enum ReceiveEndpointError {
     /// two layers above append the correlation id and the subscription, which
     /// is why it travels as a value rather than being finished here.
     Bind(deepmsg_cnc::error_log::ErrorReport),
+    /// The wildcard port manager had no port to give
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:93-104`).
+    ///
+    /// The words are the manager's own, because they are what a client reads in
+    /// its `RegistrationException` when the driver has run out of ports
+    /// (`WildcardPortManagerSystemTest.java:90`).
+    Port(crate::port_manager::PortError),
 }
 
 impl std::fmt::Display for ReceiveEndpointError {
@@ -87,6 +94,7 @@ impl std::fmt::Display for ReceiveEndpointError {
             Self::NoCounter => f.write_str("could not allocate the receive channel status counter"),
             Self::Socket(error) => write!(f, "{error}"),
             Self::Bind(report) => f.write_str(report.text()),
+            Self::Port(error) => write!(f, "{error}"),
         }
     }
 }
@@ -146,6 +154,7 @@ impl ReceiveDestination {
     #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     pub fn open(
         channel: UdpChannel,
+        port_manager: &mut crate::port_manager::WildcardPortManager,
         params: &TransportParams,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -154,27 +163,45 @@ impl ReceiveDestination {
         now_ms: i64,
         now_ns: i64,
     ) -> Result<Self, ReceiveEndpointError> {
-        // `aeron_receive_destination.c:69-75`: the bind address is the
-        // channel's `remote_data` — the group, for a group — the interface is
-        // its `local_data`, and a destination **never** connects, which is why
-        // a subscriber's transport has one descriptor.
+        // `aeron_receive_destination.c:47-56`: the manager is asked for the
+        // port **before** the socket is opened, on the address the channel
+        // wrote as `endpoint=` — `remote_data`, the group for a group.
+        //
+        // A subscription is the case a managed range is for: a reader that
+        // named `endpoint=127.0.0.1:0` is one the writer has to be *told*
+        // about, and the port it got is the telling.
+        let bind = port_manager
+            .get_managed_port(&channel, channel.remote_data)
+            .map_err(ReceiveEndpointError::Port)?;
+        let managed_port = bind.port();
+
+        // `:69-75`: the bind address is that one, the interface is the
+        // channel's `local_data`, and a destination **never** connects, which
+        // is why a subscriber's transport has one descriptor.
         let transport = match super::udp_transport::UdpTransport::open(
-            channel.remote_data,
+            bind,
             Some(channel.local_data),
             None,
             params,
         ) {
             Ok(transport) => transport,
             Err(super::udp_transport::OpenError::Bind(failure)) => {
+                // The port goes back with the socket that could not have it:
+                // the reference's create calls its own delete on every failure
+                // path, and the managed port is freed there
+                // (`:54`, `:79`, `:152-156`).
+                port_manager.free_managed_port(managed_port);
                 return Err(ReceiveEndpointError::Bind(bind_report(&channel, &failure)));
             }
             Err(super::udp_transport::OpenError::Io(error)) => {
+                port_manager.free_managed_port(managed_port);
                 return Err(ReceiveEndpointError::Socket(error));
             }
         };
 
         Self::attach(
             channel,
+            managed_port,
             Box::new(transport),
             counters,
             regions,
@@ -195,6 +222,7 @@ impl ReceiveDestination {
     #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     fn attach(
         channel: UdpChannel,
+        managed_port: u16,
         transport: Box<dyn Transport>,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -229,6 +257,7 @@ impl ReceiveDestination {
             channel,
             transport,
             local_sockaddr_counter_id,
+            managed_port,
             has_explicit_control,
             control_addr,
             time_of_last_activity_ns: now_ns,
@@ -274,6 +303,12 @@ impl ReceiveDestination {
     /// (`rcv-local-sockaddr`, type 14).
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// The port the wildcard port manager is holding for this destination, and
+    /// zero when it holds none.
+    pub const fn managed_port(&self) -> u16 {
+        self.managed_port
     }
 
     /// Whether the receiver has to ask this destination to describe its stream
@@ -417,6 +452,17 @@ pub struct ReceiveDestination {
     /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
     /// bound, which is not what the channel said when it named port zero.
     local_sockaddr_counter_id: i32,
+    /// The port the wildcard port manager is holding for this destination, and
+    /// zero when it holds none
+    /// (`aeron_receive_destination.port_manager` + the bind address it was
+    /// given, `media/aeron_receive_destination.c:47-58`).
+    ///
+    /// Non-zero only when the driver named a range and the channel named port
+    /// zero. It travels back to the conductor with the counter when the
+    /// destination is gone, because giving the port back is the conductor's —
+    /// the manager is on its thread — and because the reference gives it back
+    /// where the destination is deleted (`:152-156`), which is here.
+    managed_port: u16,
     /// Whether the destination's channel named a `control=`
     /// (`has_explicit_control`).
     ///
@@ -579,6 +625,7 @@ impl ReceiveChannelEndpoint {
     pub fn create(
         channel: UdpChannel,
         group_tag: Option<i64>,
+        port_manager: &mut crate::port_manager::WildcardPortManager,
         params: &TransportParams,
         receiver_id: i64,
         stream_session_limit: usize,
@@ -616,6 +663,7 @@ impl ReceiveChannelEndpoint {
         } else {
             match ReceiveDestination::open(
                 channel.clone(),
+                port_manager,
                 params,
                 counters,
                 regions,
@@ -706,6 +754,9 @@ impl ReceiveChannelEndpoint {
         } else {
             match ReceiveDestination::attach(
                 channel.clone(),
+                // A transport a caller built was not bound by the manager, so
+                // there is no port for it to hold — the tests' seam.
+                0,
                 transport,
                 counters,
                 regions,
@@ -1671,6 +1722,7 @@ mod tests {
 
         let first = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            0,
             stub(40123),
             &mut counters,
             &regions,
@@ -1683,6 +1735,7 @@ mod tests {
 
         let second = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            0,
             stub(40124),
             &mut counters,
             &regions,
@@ -1724,6 +1777,7 @@ mod tests {
 
         let mut with_control = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            0,
             stub(40123),
             &mut counters,
             &regions,
@@ -1736,6 +1790,7 @@ mod tests {
 
         let without = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            0,
             stub(40125),
             &mut counters,
             &regions,
@@ -1798,6 +1853,7 @@ mod tests {
 
         let with_control = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            0,
             stub(40123),
             &mut counters,
             &regions,
@@ -1820,6 +1876,7 @@ mod tests {
 
         let without = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            0,
             stub(40125),
             &mut counters,
             &regions,
@@ -1863,6 +1920,7 @@ mod tests {
 
         let added = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            0,
             stub(40124),
             &mut counters,
             &regions,
@@ -1930,6 +1988,7 @@ mod tests {
         let first_id = endpoint.add_destination(
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                0,
                 Box::new(Sent::default()),
                 &mut counters,
                 &regions,
@@ -1946,6 +2005,7 @@ mod tests {
         let last_id = endpoint.add_destination(
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                0,
                 Box::new(second.clone()),
                 &mut counters,
                 &regions,
@@ -2013,6 +2073,7 @@ mod tests {
         let first_id = endpoint.add_destination(
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                0,
                 Box::new(first.clone()),
                 &mut counters,
                 &regions,
@@ -2027,6 +2088,7 @@ mod tests {
         let second_id = endpoint.add_destination(
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                0,
                 Box::new(second.clone()),
                 &mut counters,
                 &regions,
@@ -2374,5 +2436,80 @@ mod tests {
 
         assert_eq!(MAX_ERROR_TEXT_LENGTH, error.error_length);
         assert_eq!(ErrorFrame::LENGTH + 1023, frame.len());
+    }
+
+    /// A removed destination hands back the port the manager held for it,
+    /// which is what the receiver puts in
+    /// [`crate::receiver::ReleasedDestination`] for the conductor to give back.
+    ///
+    /// The port has to travel with the removal because the conductor cannot
+    /// work it out: it knows the channel the client named, and a channel that
+    /// named port zero does not say which port it was given — that is the whole
+    /// reason the manager exists.
+    #[test]
+    fn a_removed_destination_hands_back_the_port_it_was_bound_with() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            None,
+            stub(40123),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+            1_000_000,
+        )
+        .expect("an endpoint");
+
+        let uri = "aeron:udp?endpoint=127.0.0.1:40124";
+        let id = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel(uri),
+                40310,
+                Box::new(Sent::default()),
+                &mut counters,
+                &regions,
+                8,
+                endpoint.channel_status_counter_id(),
+                1_000,
+                1_000_000,
+            )
+            .expect("a destination"),
+        );
+
+        let (removed_id, destination) = endpoint
+            .remove_destination(&channel(uri))
+            .expect("the destination it was given");
+
+        assert_eq!(id, removed_id);
+        assert_eq!(40310, destination.managed_port());
+
+        // And a destination the manager held nothing for says zero, which is
+        // not a port: the caller gives back nothing.
+        let kernel_chosen = endpoint.add_destination(
+            ReceiveDestination::attach(
+                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                0,
+                Box::new(Sent::default()),
+                &mut counters,
+                &regions,
+                9,
+                endpoint.channel_status_counter_id(),
+                1_000,
+                1_000_000,
+            )
+            .expect("a destination"),
+        );
+
+        let (removed_id, destination) = endpoint
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40125"))
+            .expect("the destination it was given");
+
+        assert_eq!(kernel_chosen, removed_id);
+        assert_eq!(0, destination.managed_port());
     }
 }

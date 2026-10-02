@@ -90,7 +90,7 @@ use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
 use crate::receive_endpoints::ReceiveChannelEndpoints;
-use crate::receiver::{Receiver, ReceiverEvent};
+use crate::receiver::{Receiver, ReceiverEvent, ReleasedDestination};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
@@ -844,7 +844,14 @@ impl Conductor {
             },
             network_publications,
             sender,
-            receive_endpoints: ReceiveChannelEndpoints::new(),
+            receive_endpoints: {
+                // The receiver's range, set once at start-up beside the
+                // sender's (`aeron_wildcard_port_manager_set_range`, called
+                // from the context's own init, `aeron_driver_context.c:1071-1081`).
+                let mut endpoints = ReceiveChannelEndpoints::new();
+                endpoints.set_port_range(config.receiver_wildcard_port_range);
+                endpoints
+            },
             images,
             receiver,
             termination: config.termination,
@@ -1144,11 +1151,11 @@ impl Conductor {
                             .push((error.recorded_error_code(), error.to_string()));
                     }
                 }
-                ReceiverEvent::EndpointReleased {
-                    id,
-                    destination_counter_ids,
-                } => {
-                    work += self.release_endpoint(id, destination_counter_ids);
+                ReceiverEvent::EndpointReleased { id, destinations } => {
+                    work += self.release_endpoint(id, destinations);
+                }
+                ReceiverEvent::DestinationReleased { destination, .. } => {
+                    work += self.release_destination(destination);
                 }
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
@@ -1472,20 +1479,44 @@ impl Conductor {
     ///
     /// The counters are the conductor's to free because the region is: the
     /// receiver could only say which numbers were its.
-    fn release_endpoint(&mut self, id: u64, destination_counter_ids: Vec<i32>) -> usize {
+    fn release_endpoint(&mut self, id: u64, destinations: Vec<ReleasedDestination>) -> usize {
         let Some(entry) = self.receive_endpoints.remove(id) else {
             return 0;
         };
 
-        if let Some(region) = self.cnc.counter_regions() {
-            for counter_id in destination_counter_ids {
-                let _ = self.counters.free(&region, counter_id, self.now_ms);
-            }
+        for destination in destinations {
+            self.release_destination(destination);
+        }
 
+        if let Some(region) = self.cnc.counter_regions() {
             let _ = self
                 .counters
                 .free(&region, entry.channel_status_counter_id, self.now_ms);
         }
+
+        1
+    }
+
+    /// Give back what one destination held: its `rcv-local-sockaddr` counter
+    /// and, when the wildcard port manager is holding one for it, the port.
+    ///
+    /// The port is the part that has to be timed right. This runs when the
+    /// receiver says the destination is gone — the socket closed with it —
+    /// which is where the reference gives it back too
+    /// (`aeron_receive_destination_delete`,
+    /// `media/aeron_receive_destination.c:152-156`). The conductor hears about
+    /// a removal a command earlier than this, when it *asks*; giving the port
+    /// back then would hand it to a second reader while the first still has it
+    /// bound.
+    fn release_destination(&mut self, destination: ReleasedDestination) -> usize {
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, destination.counter_id, self.now_ms);
+        }
+
+        self.receive_endpoints
+            .free_managed_port(destination.managed_port);
 
         1
     }
@@ -2991,6 +3022,7 @@ impl Conductor {
                     let params = ReceiveChannelEndpoints::transport_params(config, &channel);
                     let destination = match ReceiveDestination::open(
                         channel,
+                        receive_endpoints.port_manager(),
                         &params,
                         counters,
                         &counter_regions,

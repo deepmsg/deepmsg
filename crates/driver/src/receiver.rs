@@ -55,6 +55,19 @@ const RECEIVE_SLOTS: usize = 16;
 /// `aeron-driver/src/main/c/aeron_driver_receiver.c:47` — 100 ms).
 pub const PENDING_SETUP_TIMEOUT_NS: i64 = 1_000_000_000;
 
+/// A destination the receiver has let go, as the conductor needs it: the two
+/// things the conductor allocated for it and only the receiver can say are
+/// gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedDestination {
+    /// The `rcv-local-sockaddr` counter it held.
+    pub counter_id: i32,
+    /// The port the wildcard port manager held for it, or zero when the
+    /// manager held none — a channel that named a port, or one the kernel
+    /// chose (`aeron_port_manager.c:165-174`, where a zero is not a port).
+    pub managed_port: u16,
+}
+
 /// What the conductor asks the receiver to do.
 pub enum ReceiverCommand {
     /// Take ownership of an endpoint and its socket.
@@ -285,14 +298,34 @@ pub enum ReceiverEvent {
     /// the conductor waits for before it reclaims them —
     /// `aeron_driver_conductor.c:1560`).
     ///
-    /// The destination counters travel with the news because the destinations
-    /// lived here: the conductor owns the counter region, but this is the only
-    /// place that knows which numbers were the released endpoint's.
+    /// What the destination held travels with the news because the destinations
+    /// lived here: the conductor owns the counter region *and* the wildcard
+    /// port manager, but this is the only place that knows which numbers and
+    /// which ports were the released endpoint's. Giving them back is the
+    /// conductor's, and it does it on this news — which is the reference's own
+    /// moment, where the destination is deleted
+    /// (`aeron_receive_destination_delete`,
+    /// `media/aeron_receive_destination.c:141-160`).
     EndpointReleased {
         /// Which endpoint.
         id: u64,
-        /// The `rcv-local-sockaddr` counters of its destinations.
-        destination_counter_ids: Vec<i32>,
+        /// Its destinations, by what each was holding.
+        destinations: Vec<ReleasedDestination>,
+    },
+    /// One destination is let go while its endpoint lives on — a client
+    /// removed one from a multi-destination subscription
+    /// (`aeron_receive_channel_endpoint_remove_destination`, called from
+    /// `aeron_driver_receiver.c:507`).
+    ///
+    /// The endpoint's own release says nothing about this one, so it has to be
+    /// said here or the port is never given back: the conductor is told the
+    /// command was sent, not that the socket is gone, and the port may not be
+    /// handed to a second reader while the first still holds it bound.
+    DestinationReleased {
+        /// The endpoint it was removed from.
+        endpoint_id: u64,
+        /// What it was holding.
+        destination: ReleasedDestination,
     },
     /// Something for the conductor to record.
     Fault {
@@ -782,10 +815,13 @@ impl ReceiverThread {
 
                             let _ = self.events.send(ReceiverEvent::EndpointReleased {
                                 id,
-                                destination_counter_ids: endpoint
+                                destinations: endpoint
                                     .destinations()
                                     .iter()
-                                    .map(|(_, destination)| destination.local_sockaddr_counter_id())
+                                    .map(|(_, destination)| ReleasedDestination {
+                                        counter_id: destination.local_sockaddr_counter_id(),
+                                        managed_port: destination.managed_port(),
+                                    })
                                     .collect(),
                             });
                         }
@@ -867,15 +903,32 @@ impl ReceiverThread {
                         channel,
                     } => {
                         let mut removed = None;
+                        let mut released = None;
 
                         if let Some((_, endpoint)) =
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
-                            // The counter the destination held is not freed
-                            // here: the conductor allocated it, and giving a
-                            // counter back is the conductor's to do — the
-                            // receiver only stops reading.
-                            removed = endpoint.remove_destination(&channel).map(|(id, _)| id);
+                            // Neither the counter nor the port the destination
+                            // held is given back here: the conductor allocated
+                            // both, and giving either back is the conductor's
+                            // to do — the receiver only stops reading. What it
+                            // owes the conductor is the news, and this is the
+                            // only place that knows which destination the
+                            // channel named.
+                            if let Some((id, destination)) = endpoint.remove_destination(&channel) {
+                                released = Some(ReleasedDestination {
+                                    counter_id: destination.local_sockaddr_counter_id(),
+                                    managed_port: destination.managed_port(),
+                                });
+                                removed = Some(id);
+                            }
+                        }
+
+                        if let Some(destination) = released {
+                            let _ = self.events.send(ReceiverEvent::DestinationReleased {
+                                endpoint_id,
+                                destination,
+                            });
                         }
 
                         // And the images stop answering it

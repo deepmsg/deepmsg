@@ -31,6 +31,7 @@ use crate::channel_validation;
 use crate::media::receive_endpoint::{
     EndpointStatus, ReceiveChannelEndpoint, ReceiveEndpointError,
 };
+use crate::port_manager::{PortRange, WildcardPortManager};
 use crate::sys;
 use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 
@@ -107,6 +108,14 @@ pub enum ReceiveEndpointErrorKind {
     /// layer adds the correlation id the reference names here
     /// (`aeron_driver_conductor.c:2110`).
     Bind(deepmsg_cnc::error_log::ErrorReport),
+    /// The wildcard port manager had no port to give: every one in the range is
+    /// spoken for (`aeron_wildcard_port_manager_allocate_open_port`,
+    /// `aeron_port_manager.c:93-104`).
+    ///
+    /// The message is the manager's, and it travels verbatim: it is what a
+    /// client that has run the driver out of ports reads in its
+    /// `RegistrationException` (`WildcardPortManagerSystemTest.java:90`).
+    Port(crate::port_manager::PortError),
 }
 
 impl std::fmt::Display for ReceiveEndpointErrorKind {
@@ -116,6 +125,7 @@ impl std::fmt::Display for ReceiveEndpointErrorKind {
             Self::Socket(error) => write!(f, "{error}"),
             Self::ChannelValidation(message) => f.write_str(message),
             Self::Bind(report) => f.write_str(report.text()),
+            Self::Port(error) => write!(f, "{error}"),
         }
     }
 }
@@ -143,6 +153,14 @@ pub struct ReceiveChannelEndpoints {
     /// (`context->next_receiver_id++`,
     /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:92`).
     next_receiver_id: i64,
+    /// Which ports a subscription whose channel named port zero listens on
+    /// (`context->receiver_port_manager`, `aeron_driver_context.c:428-437`).
+    ///
+    /// The receiver's half of what [`crate::send_endpoints`] keeps for the
+    /// sender, and one range each: a deployment can give the two directions
+    /// different ports, and the oracle does
+    /// (`WildcardPortManagerSystemTest.java:68-69`).
+    receiver_port_manager: WildcardPortManager,
 }
 
 impl Default for ReceiveChannelEndpoints {
@@ -166,7 +184,32 @@ impl ReceiveChannelEndpoints {
             entries: Vec::new(),
             next_id: 1,
             next_receiver_id: first_receiver_id(),
+            receiver_port_manager: WildcardPortManager::receiver(),
         }
+    }
+
+    /// The range a subscription whose channel named port zero is given one out
+    /// of, set once at start-up from the driver's settings
+    /// (`aeron_wildcard_port_manager_set_range`, `aeron_port_manager.c:58-65`).
+    pub fn set_port_range(&mut self, range: PortRange) {
+        self.receiver_port_manager.set_range(range);
+    }
+
+    /// Give a managed port back, which is what a destination the receiver has
+    /// released does (`aeron_receive_destination_delete`,
+    /// `media/aeron_receive_destination.c:152-156`).
+    pub fn free_managed_port(&mut self, port: u16) {
+        self.receiver_port_manager.free_managed_port(port);
+    }
+
+    /// The manager a destination's port comes from.
+    ///
+    /// For the one caller that builds a destination outside this registry: the
+    /// conductor, when a client adds one to a multi-destination subscription
+    /// (`aeron_driver_conductor.c:5903`, which hands the create the context's
+    /// manager the same way).
+    pub fn port_manager(&mut self) -> &mut WildcardPortManager {
+        &mut self.receiver_port_manager
     }
 
     /// The endpoints, in the order they were created.
@@ -338,6 +381,7 @@ impl ReceiveChannelEndpoints {
         let endpoint = ReceiveChannelEndpoint::create(
             channel,
             group_tag,
+            &mut self.receiver_port_manager,
             params,
             receiver_id,
             config.stream_session_limit,
@@ -350,6 +394,7 @@ impl ReceiveChannelEndpoints {
         .map_err(|error| match error {
             ReceiveEndpointError::NoCounter => ReceiveEndpointErrorKind::NoCounter,
             ReceiveEndpointError::Socket(error) => ReceiveEndpointErrorKind::Socket(error),
+            ReceiveEndpointError::Port(error) => ReceiveEndpointErrorKind::Port(error),
             ReceiveEndpointError::Bind(mut report) => {
                 // `:2110`: `AERON_APPEND_ERR("correlation_id=%" PRId64, …)`.
                 report.append(
@@ -935,5 +980,107 @@ mod tests {
 
         assert_eq!(id, second, "the second channel joins the same endpoint");
         assert_eq!(1, endpoints.entries().len());
+    }
+
+    /// A subscription whose channel named port zero listens on a port out of
+    /// the driver's range, and that port comes back when the destination is
+    /// gone.
+    ///
+    /// The oracle's first half (`WildcardPortManagerSystemTest.java:77-96`):
+    /// two subscriptions on a two-port range take the two ports in turn, a
+    /// third is refused with the reference's words, and the one the second
+    /// gives up is the one the third gets.
+    #[test]
+    fn a_subscription_that_named_no_port_is_given_one_until_it_is_gone() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = ReceiveChannelEndpoints::new();
+        endpoints.set_port_range(PortRange {
+            low: 40310,
+            high: 40311,
+        });
+
+        let open = |counters: &mut CounterManager,
+                    endpoints: &mut ReceiveChannelEndpoints,
+                    uri: &str,
+                    registration_id: i64| {
+            endpoints
+                .get_or_add(
+                    channel(uri),
+                    &TransportParams::default(),
+                    &DriverConfig::default(),
+                    SMALL_WINDOW,
+                    counters,
+                    &regions,
+                    registration_id,
+                    1,
+                    1_000_000,
+                )
+                .map(|(id, _, endpoint)| (id, endpoint))
+        };
+
+        // A wildcard address for the second and third, so that each is a
+        // channel of its own canonical form rather than a share of the first.
+        const SECOND: &str = "aeron:udp?endpoint=0.0.0.0:0";
+
+        let (first_id, first) = open(
+            &mut counters,
+            &mut endpoints,
+            "aeron:udp?endpoint=127.0.0.1:0",
+            7,
+        )
+        .expect("a port");
+        let (second_id, second) = open(&mut counters, &mut endpoints, SECOND, 8).expect("a port");
+
+        let first = first.expect("a new endpoint");
+        let second = second.expect("a new endpoint");
+
+        assert_ne!(first_id, second_id, "two channels, two sockets");
+        assert_eq!(
+            Some(40310),
+            first
+                .destinations()
+                .first()
+                .map(|(_, destination)| destination.managed_port())
+        );
+        assert_eq!(
+            Some(40311),
+            second
+                .destinations()
+                .first()
+                .map(|(_, destination)| destination.managed_port())
+        );
+
+        // The range is full, and the refusal is the manager's own sentence.
+        let refused = open(
+            &mut counters,
+            &mut endpoints,
+            "aeron:udp?endpoint=0.0.0.0:0",
+            9,
+        );
+
+        assert_eq!(
+            "no available ports in range 40310 40311",
+            refused.expect_err("a full range").to_string()
+        );
+
+        // The receiver has let the second destination go — its socket with it
+        // — and the conductor gives the port back on that news
+        // (`ReceiverEvent::DestinationReleased`).
+        drop(second);
+        endpoints.free_managed_port(40311);
+
+        let (third_id, third) =
+            open(&mut counters, &mut endpoints, SECOND, 10).expect("the port came back");
+
+        assert_ne!(second_id, third_id);
+        assert_eq!(
+            Some(40311),
+            third
+                .expect("a new endpoint")
+                .destinations()
+                .first()
+                .map(|(_, destination)| destination.managed_port())
+        );
     }
 }
