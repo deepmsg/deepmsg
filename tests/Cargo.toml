@@ -287,5 +287,14 @@ name = "response_channel_reference"
 path = "interop/response_channel_reference.rs"
 required-features = ["interop"]
 
+# Q3: our `driver` name resolver and a reference `aeronmd`'s see each other.
+# The one arrangement in which the RES datagram's dialect is decided by two
+# drivers that share no code, which is the whole of the "can replace the
+# driver" criterion for name resolution.
+[[test]]
+name = "resolver_gossip"
+path = "interop/resolver_gossip.rs"
+required-features = ["interop"]
+
 [lints]
 workspace = true
