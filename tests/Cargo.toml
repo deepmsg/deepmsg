@@ -68,6 +68,13 @@ path = "integration/receive_endpoint_lifecycle.rs"
 name = "resource_lifecycle"
 path = "integration/resource_lifecycle.rs"
 
+# A channel whose name does not resolve is refused **by name**, on both sides.
+# The reference's own case is `AsyncResourceTest.shouldDetectUnknownHost`, which
+# only its Java driver can run; this one runs in CI.
+[[test]]
+name = "unresolved_endpoint"
+path = "integration/unresolved_endpoint.rs"
+
 [[test]]
 name = "client_round_trip"
 path = "integration/client_round_trip.rs"
