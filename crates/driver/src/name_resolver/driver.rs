@@ -477,15 +477,17 @@ impl DriverResolver {
             Ok(received) => received,
             Err(error) => {
                 if error.kind() != std::io::ErrorKind::WouldBlock {
-                    // The reference reaches this through its receive and names
-                    // the same failure (`:858`).
+                    // `:857` — the poller's own failure, which the reference
+                    // appends under whatever code the error buffer holds.
                     self.record_error(
                         counters,
                         regions,
-                        -EINVAL,
-                        858,
-                        &format!("failed to receive: {error}"),
+                        "aeron_driver_name_resolver_poll",
+                        857,
+                        0,
+                        &format!("Failed to poll in driver name resolver: {}", self.name),
                     );
+                    let _ = error;
                 }
 
                 self.receive_buffers = buffers;
@@ -551,11 +553,14 @@ impl DriverResolver {
                 if is_known_res_type(remaining[0] as i8) {
                     system_counters::increment(counters, regions, self.invalid_packets_counter);
                 } else {
+                    // `:796` — the one site here that *sets* a code, and the
+                    // only reason any of these entries has one of its own.
                     self.record_error(
                         counters,
                         regions,
+                        "aeron_driver_name_resolver_receive",
+                        796,
                         EINVAL,
-                        797,
                         &format!("Invalid res type on entry: {}", remaining[0] as i8),
                     );
                 }
@@ -581,8 +586,9 @@ impl DriverResolver {
                     self.record_error(
                         counters,
                         regions,
-                        EINVAL,
-                        808,
+                        "aeron_driver_name_resolver_receive",
+                        807,
+                        0,
                         "Failed to replace wildcard with source addr",
                     );
 
@@ -599,8 +605,9 @@ impl DriverResolver {
                 self.record_error(
                     counters,
                     regions,
-                    EINVAL,
-                    819,
+                    "aeron_driver_name_resolver_receive",
+                    818,
+                    0,
                     "Failed to handle resolution entry",
                 );
             }
@@ -748,13 +755,21 @@ impl DriverResolver {
                 // here — `aeron_errcode()` and `aeron_errmsg()`, which for a
                 // name no one answers for is the unknown-host pair — and leaves
                 // the neighbour with no address rather than the whole list.
-                Err(error) => {
+                Err(_) => {
+                    // The entry's words are the wrapper's own last line
+                    // (`Unresolved - %s=%s, name-and-port=%s`), and the code is
+                    // the failed resolution's: `unknown host`. The line above
+                    // it in the reference — the resolver's
+                    // `Unable to resolve host=(…)` with the `getaddrinfo`
+                    // code — is not composed on this build's fallback path,
+                    // which reaches the system through `ToSocketAddrs`.
                     self.record_error(
                         counters,
                         regions,
-                        -deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+                        "aeron_driver_name_resolver_resolve_bootstrap_neighbors",
                         214,
-                        &format!("Unable to resolve bootstrap neighbour ({name}): {error}"),
+                        -deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+                        &format!("Unresolved - bootstrap_neighbor={name}, name-and-port={name}"),
                     );
 
                     None
@@ -950,10 +965,12 @@ impl DriverResolver {
                 self.record_error(
                     counters,
                     regions,
-                    -EINVAL,
-                    1073,
-                    &format!("failed to send: {error}"),
+                    "aeron_driver_name_resolver_send_neighbor_resolutions",
+                    1072,
+                    0,
+                    "Failed to send neighbor resolutions",
                 );
+                let _ = error;
 
                 false
             }
@@ -965,17 +982,25 @@ impl DriverResolver {
     /// records the thread-local error and bumps the errors counter, and both
     /// halves happen here.
     ///
-    /// The words are per site, because this build has no thread-local error to
-    /// read — the reference's `aeron_errmsg()` is whatever the failing call
-    /// set, and each call site below names its own failure the way that call
-    /// did. `line` is the reference's own recording site, which is what a
-    /// reader of the entry is being pointed at.
+    /// The words and the site are per failure, because this build has no
+    /// thread-local error to read: the reference's entry is composed from
+    /// `aeron_errmsg()` and from whichever `AERON_SET_ERR` or `AERON_APPEND_ERR`
+    /// wrote it, so `function` and `line` are **that** site and not the
+    /// logger's — a reader of the entry is being pointed at what failed.
+    ///
+    /// The code follows the same rule. A site that sets one (`:796`) records
+    /// it; a site that only appends records whatever the thread's error
+    /// already held, which for a buffer the logger just cleared is zero — the
+    /// same shape `docs/compat.md` records for the conductor's own
+    /// `AERON_APPEND_ERR` sites.
+    #[allow(clippy::too_many_arguments)] // the site, the code, and the words
     fn record_error(
         &mut self,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
-        error_code: i32,
+        function: &str,
         line: u32,
+        error_code: i32,
         message: &str,
     ) {
         system_counters::increment(counters, regions, self.error_counter);
@@ -984,7 +1009,7 @@ impl DriverResolver {
             error_code,
             description: deepmsg_cnc::error_log::compose_description(
                 error_code,
-                "aeron_name_resolver_log_and_clear_error",
+                function,
                 "aeron_driver_name_resolver.c",
                 line,
                 message,
