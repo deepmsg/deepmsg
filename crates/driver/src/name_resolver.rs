@@ -20,11 +20,13 @@
 //! after this one.
 
 pub mod cache;
+pub mod driver;
 
 use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::sys::AddressFamily;
 use crate::udp_channel::{self, UdpChannelError};
 
 /// What a resolver's `resolve` answers (`aeron_name_resolver_resolve_func_t`):
@@ -96,11 +98,21 @@ pub enum Lookup {
 /// caller, so it is lent to the call instead of living in the resolver.
 pub trait Resolver {
     /// `host:port` into an address (`resolve_func`).
+    ///
+    /// `family` is the one the answer has to come back in, and it is an
+    /// argument here because it is one in the reference too: its `resolve_func`
+    /// is handed an **out**-parameter whose family the caller has already set,
+    /// and the driver's resolver reads it back to decide *which cached row*
+    /// answers the question (`aeron_driver_name_resolver.c:1210-1211`, and the
+    /// reference's own test sets it before every call,
+    /// `aeron_name_resolver_test.cpp:529-531`, `:567-569`). The synchronous
+    /// resolvers have nothing to choose between and ignore it.
     fn resolve(
         &mut self,
         name: &str,
         uri_param_name: &str,
         is_re_resolution: bool,
+        family: AddressFamily,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> Resolution;
@@ -122,10 +134,20 @@ pub trait Resolver {
 
     /// Take whatever resources the resolver needs (`start_func`).
     ///
+    /// The counters come with it because the driver's resolver resolves its
+    /// bootstrap neighbors here — and labels their counters with what they
+    /// resolved to (`aeron_driver_name_resolver_on_start`, `:1238-1250`, which
+    /// calls `resolve_bootstrap_neighbors`). The default resolver and the CSV
+    /// table do nothing at all on start.
+    ///
     /// # Errors
     ///
     /// What went wrong, for a caller that has to fail the driver's start.
-    fn start(&mut self) -> Result<(), String> {
+    fn start(
+        &mut self,
+        _counters: &CounterManager,
+        _regions: &CounterRegions<'_>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -168,6 +190,7 @@ impl Resolver for DefaultResolver {
         name: &str,
         _uri_param_name: &str,
         _is_re_resolution: bool,
+        _family: AddressFamily,
         _counters: &CounterManager,
         _regions: &CounterRegions<'_>,
     ) -> Resolution {
@@ -324,6 +347,7 @@ impl Resolver for CsvTableResolver {
         name: &str,
         uri_param_name: &str,
         is_re_resolution: bool,
+        family: AddressFamily,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> Resolution {
@@ -356,6 +380,7 @@ impl Resolver for CsvTableResolver {
             hostname,
             uri_param_name,
             is_re_resolution,
+            family,
             counters,
             regions,
         )
@@ -416,7 +441,14 @@ mod tests {
 
         fn resolve(&mut self, resolver: &mut CsvTableResolver, name: &str) -> Resolution {
             let regions = self.holder.open();
-            resolver.resolve(name, "endpoint", false, &self.counters, &regions)
+            resolver.resolve(
+                name,
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &self.counters,
+                &regions,
+            )
         }
     }
 
@@ -431,11 +463,25 @@ mod tests {
 
         assert_eq!(
             Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
-            resolver.resolve("127.0.0.1:40456", "endpoint", false, &counters, &regions),
+            resolver.resolve(
+                "127.0.0.1:40456",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &counters,
+                &regions
+            ),
             "a literal address is taken as itself, with no lookup"
         );
 
-        let hostname = resolver.resolve("localhost:40456", "endpoint", false, &counters, &regions);
+        let hostname = resolver.resolve(
+            "localhost:40456",
+            "endpoint",
+            false,
+            AddressFamily::Inet,
+            &counters,
+            &regions,
+        );
 
         match hostname {
             Resolution::Found(address) => assert_eq!(40456, address.port()),
@@ -464,6 +510,7 @@ mod tests {
                 "not-a-host-at-all.invalid:40456",
                 "endpoint",
                 false,
+                AddressFamily::Inet,
                 &counters,
                 &regions
             ),
@@ -474,6 +521,7 @@ mod tests {
                 "127.0.0.1:not-a-port",
                 "endpoint",
                 false,
+                AddressFamily::Inet,
                 &counters,
                 &regions
             ),

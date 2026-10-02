@@ -2240,11 +2240,21 @@ impl<'a> ResolutionFrame<'a> {
         Some(Self { header, packet })
     }
 
+    /// The bytes behind the header: the run of entries and nothing else.
+    ///
+    /// What a caller walks when it has to tell *why* the run ended — the
+    /// reference's receive loop counts a truncated datagram and an entry of an
+    /// unknown type differently (`aeron_driver_name_resolver.c:769-774` versus
+    /// `:794-799`), and an iterator that stops cannot say which happened.
+    pub fn entry_bytes(&self) -> &'a [u8] {
+        self.packet.get(HEADER_LENGTH..).unwrap_or_default()
+    }
+
     /// The entries, walked the way the reference's receive loop walks them
     /// (`:748-823`).
     pub fn entries(&self) -> ResolutionEntries<'a> {
         ResolutionEntries {
-            remaining: self.packet.get(HEADER_LENGTH..).unwrap_or_default(),
+            remaining: self.entry_bytes(),
             malformed: false,
         }
     }

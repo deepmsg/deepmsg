@@ -1038,6 +1038,43 @@ fn wildcard_socket(family: AddressFamily) -> SocketAddr {
     }
 }
 
+/// An `interface=` spec into the address a socket binds on
+/// (`aeron_interface_parse_and_resolve`,
+/// `aeron-client/src/main/c/util/aeron_netutil.c:255-273`, which is
+/// `aeron_interface_split` and then a resolve of the host it named).
+///
+/// This is the same parse a channel's `interface=` goes through
+/// ([`read_interface`]) and the same step a named interface takes
+/// ([`InterfaceSpec::resolve_by_name`]), but **without** the netmask match a
+/// channel's interface makes against this host's own addresses: the reference
+/// resolves the host and stops (`aeron_host_port_prefixlen_resolver`, `:172-252`),
+/// and the driver's own name resolver is the caller that binds what comes out
+/// (`aeron_driver_name_resolver.c:286-290`).
+///
+/// # Errors
+///
+/// [`UdpChannelError::Resolution`] for text that is none of the three shapes,
+/// for a name that does not resolve, or for a named interface this host does
+/// not have.
+pub fn resolve_interface(text: &str) -> Result<SocketAddr, UdpChannelError> {
+    match read_interface(Some(text))? {
+        // An interface spec that named nothing is the IPv4 wildcard, which is
+        // what an unbracketed spec's family hint makes it
+        // (`aeron_parse_util.c:505-517`).
+        InterfaceSpec::Wildcard => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+
+        InterfaceSpec::Address { address, port, .. } => Ok(SocketAddr::new(address, port)),
+
+        InterfaceSpec::Named { name, port } => {
+            let interface = sys::interface_by_name(AddressFamily::Inet, &name)
+                .map_err(|error| UdpChannelError::Resolution(format!("interface {name}: {error}")))?
+                .ok_or_else(|| UdpChannelError::Resolution(format!("unknown interface {name}")))?;
+
+            Ok(SocketAddr::new(interface.address, port))
+        }
+    }
+}
+
 /// `host:port` into an address, the default resolver's synchronous path
 /// (`aeron_name_resolver_resolve_host_and_port`,
 /// `aeron-driver/src/main/c/aeron_name_resolver.c:129-215`, with the default
