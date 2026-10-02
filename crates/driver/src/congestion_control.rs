@@ -53,6 +53,55 @@ pub const RTT_COUNTER_NAME: &str = "rcv-cc-cubic-rtt";
 /// And the one its current window is read from.
 pub const WINDOW_COUNTER_NAME: &str = "rcv-cc-cubic-wnd";
 
+/// Which supplier a **driver** names for its images
+/// (`aeron_congestion_control_strategy_supplier_load`, `:45-62`, loaded from
+/// the context at `aeron_driver_context.c:579-585`).
+///
+/// The three names are the reference's table, and the first is the default: a
+/// driver that names none gets the *chooser*, which is what makes a channel's
+/// `cc=` mean anything. Naming `static` or `cubic` here is naming the supplier
+/// **instead** — every image runs that one, whatever its channel says — and a
+/// name the table does not carry fails the driver at start-up, which is what
+/// the reference's `goto error` does with an unfindable symbol.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Supplier {
+    /// `aeron_congestion_control_default_strategy_supplier`: the channel's
+    /// `cc=` decides, per image.
+    #[default]
+    Default,
+    /// `aeron_static_window_congestion_control_strategy_supplier`.
+    Static,
+    /// `aeron_cubic_congestion_control_strategy_supplier`.
+    Cubic,
+}
+
+impl Supplier {
+    /// The supplier a name names, or `None` for one this build cannot load —
+    /// the reference's `NULL` from its symbol table.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            STATIC => Some(Self::Static),
+            CUBIC => Some(Self::Cubic),
+            _ => None,
+        }
+    }
+
+    /// The strategy this supplier builds for a channel
+    /// (`aeron_congestion_control_default_strategy_supplier`, `:165-205`): the
+    /// chooser reads `cc=`, and either of the other two already knows.
+    ///
+    /// `None` for a channel the chooser cannot serve, which is the reference's
+    /// `result` left at `-1` and the caller's to report.
+    pub fn strategy(self, congestion_control: Option<&str>) -> Option<Strategy> {
+        match self {
+            Self::Default => Strategy::from_name(congestion_control),
+            Self::Static => Some(Strategy::Static),
+            Self::Cubic => Some(Strategy::Cubic),
+        }
+    }
+}
+
 /// Which strategy a channel's `cc=` names
 /// (`aeron_congestion_control_default_strategy_supplier`, `:165-205`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -595,6 +644,40 @@ mod tests {
                 1_000,
             )
         }
+    }
+
+    /// The context's supplier overrides the channel: naming `static` or
+    /// `cubic` as the **supplier** means every image runs that one, and only
+    /// `default` — the driver's own default — reads `cc=` per channel
+    /// (`aeron_congestion_control.c:45-62`, `:165-205`).
+    #[test]
+    fn a_named_supplier_decides_for_every_image_and_the_default_reads_the_channel() {
+        assert_eq!(
+            Some(Strategy::Cubic),
+            Supplier::Default.strategy(Some("cubic"))
+        );
+        assert_eq!(None, Supplier::Default.strategy(Some("nonsense")));
+        assert_eq!(Some(Strategy::Static), Supplier::Default.strategy(None));
+
+        assert_eq!(
+            Some(Strategy::Static),
+            Supplier::Static.strategy(Some("cubic")),
+            "a channel cannot argue with the driver's supplier"
+        );
+        assert_eq!(
+            Some(Strategy::Cubic),
+            Supplier::Cubic.strategy(None),
+            "and a channel that names nothing gets it all the same"
+        );
+
+        assert_eq!(Some(Supplier::Default), Supplier::from_name("default"));
+        assert_eq!(Some(Supplier::Static), Supplier::from_name("static"));
+        assert_eq!(Some(Supplier::Cubic), Supplier::from_name("cubic"));
+        assert_eq!(
+            None,
+            Supplier::from_name("aeron_cubic_congestion_control_strategy_supplier"),
+            "a symbol this build cannot load is a name it cannot serve"
+        );
     }
 
     /// `cc=` names the strategy by its **whole** string: nothing and `static`

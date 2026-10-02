@@ -473,9 +473,13 @@ impl PublicationImages {
         // (`aeron_driver_conductor.c:6633-6640` appends exactly those two).
         let uri = crate::channel_uri::ChannelUri::parse(&channel.original_uri).ok()?;
 
-        let Some(strategy) = crate::congestion_control::Strategy::from_name(
-            uri.value(crate::publication_params::key::CONGESTION_CONTROL),
-        ) else {
+        // The **driver's** supplier decides first: `default` is the chooser and
+        // reads `cc=`; `static` or `cubic` names the strategy outright
+        // (`aeron_driver_conductor.c:6629` calls whatever the context loaded).
+        let Some(strategy) = config
+            .congestion_control_supplier
+            .strategy(uri.value(crate::publication_params::key::CONGESTION_CONTROL))
+        else {
             faults.push((
                 deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
                 format!(

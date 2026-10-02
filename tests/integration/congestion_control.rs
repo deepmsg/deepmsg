@@ -152,6 +152,64 @@ fn a_cubic_subscription_measures_its_round_trip() {
     let _ = own.stop();
 }
 
+/// The **driver's** supplier wins over the channel's: with
+/// `aeron.congestioncontrol.supplier=static` no image takes CUBIC's counters
+/// however its channel is spelled.
+///
+/// The reference's chooser is what the `default` supplier *is*
+/// (`aeron_congestion_control.c:45-62`), so naming another one is naming the
+/// strategy for every image — and this is the difference between a setting that
+/// is read and one that is merely carried.
+#[test]
+fn a_named_supplier_decides_for_every_image() {
+    let Some(mut own) = OwnDriver::start_with(
+        "cubic-static-supplier",
+        &["-Daeron.congestioncontrol.supplier=static"],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{}|cc=cubic", free_port(13));
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on a cubic channel");
+    let subscription = client
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription on a cubic channel");
+
+    let payload = vec![0x77u8; LENGTH];
+    let deadline = Instant::now() + DEADLINE;
+    let mut received = 0_i64;
+
+    while received < 10 {
+        assert!(
+            Instant::now() < deadline,
+            "{received} of 10 messages after {DEADLINE:?}"
+        );
+
+        let _ = client.offer(publication, &payload);
+        client.poll();
+
+        received += client.poll_subscription(subscription, 10, |_message| {}) as i64;
+    }
+
+    let (rtt, window) = cubic_counters(&client);
+
+    assert_eq!(
+        (None, None),
+        (rtt, window),
+        "the driver's supplier built the static window, so there is nothing cubic to count"
+    );
+
+    let _ = own.stop();
+}
+
 /// A `cc=` this driver cannot serve is a **subscription that exists and an
 /// image that is never built** — the reference's answer
 /// (`aeron_congestion_control.c:165-205` fails its supplier, and
