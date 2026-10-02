@@ -19,6 +19,8 @@
 //! the CSV table the reference's tests steer it with arrive in the commits
 //! after this one.
 
+pub mod cache;
+
 use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};

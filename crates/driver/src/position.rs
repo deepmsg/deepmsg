@@ -57,6 +57,19 @@ pub mod type_id {
     /// publication whose does not: the reference allocates it in the group
     /// supplier (`aeron_min_flow_control.c:589-594`).
     pub const FC_NUM_RECEIVERS: i32 = 17;
+    /// `AERON_COUNTER_NAME_RESOLVER_NEIGHBORS_COUNTER_TYPE_ID` (`:111`), the
+    /// counter a **driver's own resolver** keeps the size of its neighbor list
+    /// in, labelled `Resolver neighbors: bound <address>`
+    /// (`aeron_driver_name_resolver.c:234-243`, `:476-489`).
+    pub const NAME_RESOLVER_NEIGHBORS: i32 = 15;
+    /// `AERON_COUNTER_NAME_RESOLVER_CACHE_ENTRIES_COUNTER_TYPE_ID` (`:113`),
+    /// labelled `Resolver cache entries: name=<name>` (`:490-506`).
+    pub const NAME_RESOLVER_CACHE_ENTRIES: i32 = 16;
+    /// `AERON_COUNTER_NAME_RESOLVER_BOOTSTRAP_NEIGHBOR_COUNTER_TYPE_ID`
+    /// (`:126`), one for each bootstrap neighbor the resolver was configured
+    /// with, each carrying that neighbor's index as its **key** and its name
+    /// and current address in its label (`:368-396`).
+    pub const NAME_RESOLVER_BOOTSTRAP_NEIGHBOR: i32 = 21;
 }
 
 /// The key a stream-position counter carries
