@@ -1042,6 +1042,11 @@ impl SenderThread {
                     return;
                 }
 
+                // The endpoint remembers when it last heard from anyone at all,
+                // which is what its own re-resolution measures
+                // (`aeron_send_channel_endpoint.c:658`, the line `:765` reads).
+                endpoints[endpoint_index].1.on_status_message(now_ns);
+
                 if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
                     header.flags,
@@ -1580,6 +1585,7 @@ mod tests {
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 

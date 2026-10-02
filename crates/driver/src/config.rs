@@ -180,6 +180,16 @@ pub const RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 2 * 1000 * 100
 /// (`:234`).
 pub const RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
 
+/// `AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT`
+/// (`aeron_driver_context.c:235`): how often a sender and a receiver look for
+/// names that need resolving again.
+///
+/// One second, and a value of **zero turns the whole feature off** — the two
+/// loops are `if interval_ns > 0 && deadline passed`
+/// (`aeron_driver_sender.c:183`, `aeron_driver_receiver.c:254`), so a driver
+/// configured with zero does no re-resolution at all.
+pub const RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
+
 /// `AERON_DRIVER_NAME_RESOLVER_THRESHOLD_NS_DEFAULT` (`:239`): how long a
 /// single resolution may take before system counter 33 counts it.
 ///
@@ -704,6 +714,11 @@ pub struct DriverConfig {
     /// `aeronmd.h:932`): how long one resolution may take before system counter
     /// 33 counts it (`aeron_driver_native_resource_agent.c:39-60`).
     pub name_resolver_threshold_ns: i64,
+    /// `aeron.driver.reresolution.check.interval`
+    /// (`AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL`, `aeronmd.h:857`): how often
+    /// the sender and the receiver look for names that need resolving again,
+    /// and **zero to turn it off** (`aeron_driver_sender.c:183`).
+    pub re_resolution_check_interval_ns: i64,
 }
 
 impl Default for DriverConfig {
@@ -781,6 +796,7 @@ impl Default for DriverConfig {
             resolver_bootstrap_neighbor_resolution_interval_ns:
                 RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
             name_resolver_threshold_ns: NAME_RESOLVER_THRESHOLD_NS_DEFAULT,
+            re_resolution_check_interval_ns: RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT,
         }
     }
 }
@@ -1230,6 +1246,15 @@ impl DriverConfig {
                 parse_duration_ns(&Setting::DRIVER_NAME_RESOLVER_THRESHOLD, &value)?;
         }
 
+        // And so is the re-resolution interval, whose minimum is zero for the
+        // same reason (`:1024-1028`): zero is how a deployment turns the whole
+        // feature off, and the reference's two loops test for it
+        // (`aeron_driver_sender.c:183`).
+        if let Some(value) = get(&Setting::DRIVER_RERESOLUTION_CHECK_INTERVAL) {
+            config.re_resolution_check_interval_ns =
+                parse_duration_ns(&Setting::DRIVER_RERESOLUTION_CHECK_INTERVAL, &value)?;
+        }
+
         // A resolver that gossips needs a name: its own name is what it
         // announces, and the reference refuses the start-up rather than
         // running one that can only answer other people's questions
@@ -1513,6 +1538,11 @@ impl Setting {
     const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL: Self = Self {
         property: "driver.resolver.bootstrap.neighbor.resolution.interval",
         env: "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
+    };
+    /// `aeron.driver.reresolution.check.interval` (`aeronmd.h:857`).
+    const DRIVER_RERESOLUTION_CHECK_INTERVAL: Self = Self {
+        property: "driver.reresolution.check.interval",
+        env: "AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL",
     };
     /// `aeron.name.resolver.threshold` (`aeronmd.h:932`).
     const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {

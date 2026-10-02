@@ -1454,6 +1454,10 @@ mod tests {
             Ok(0)
         }
 
+        fn reconnect(&mut self, _address: std::net::SocketAddr) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn local_address(&self) -> io::Result<SocketAddr> {
             Ok(self.0)
         }
@@ -1508,6 +1512,10 @@ mod tests {
             _datagrams: &mut crate::sys::socket::Datagrams,
         ) -> io::Result<usize> {
             Ok(0)
+        }
+
+        fn reconnect(&mut self, _address: std::net::SocketAddr) -> std::io::Result<()> {
+            Ok(())
         }
 
         fn local_address(&self) -> io::Result<SocketAddr> {

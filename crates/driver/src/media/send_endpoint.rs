@@ -139,10 +139,19 @@ pub struct SendChannelEndpoint {
     /// zero, and then the port the kernel chose is readable from nowhere else.
     /// A client that has to tell someone where to reply finds it here.
     local_sockaddr_counter_id: i32,
-    /// Where data is sent. The channel's remote address; nothing here
-    /// re-resolves it, and `docs/compat.md`'s name-resolution row is where that
-    /// absence is recorded.
+    /// Where data is sent: the channel's remote address, unless a
+    /// re-resolution has moved it (`current_data_addr`,
+    /// `aeron_send_channel_endpoint.h:52`).
     current_data_addr: SocketAddr,
+    /// When the last status message for one of this endpoint's publications
+    /// arrived (`time_of_last_sm_ns`, `:232` at creation, `:658` on a status
+    /// message).
+    ///
+    /// It is how "this endpoint has no connection" is spelled: a channel with
+    /// an explicit endpoint that has heard nothing for
+    /// [`DESTINATION_TIMEOUT_NS`] has its name resolved again
+    /// (`:754-774`).
+    time_of_last_sm_ns: i64,
     /// Where this endpoint sends, when its channel has several destinations
     /// (`destination_tracker`, `aeron_send_channel_endpoint.h:62`).
     ///
@@ -184,6 +193,7 @@ impl SendChannelEndpoint {
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
+        now_ns: i64,
     ) -> Result<Self, SendEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -272,6 +282,7 @@ impl SendChannelEndpoint {
 
         Ok(Self {
             current_data_addr: channel.remote_data,
+            time_of_last_sm_ns: now_ns,
             channel,
             transport: Box::new(transport),
             data_loss_generator: None,
@@ -291,6 +302,7 @@ impl SendChannelEndpoint {
     /// # Errors
     ///
     /// [`SendEndpointError::NoCounter`] when the manager is full.
+    #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     pub fn with_transport(
         channel: UdpChannel,
         transport: Box<dyn Transport>,
@@ -299,6 +311,7 @@ impl SendChannelEndpoint {
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
+        now_ns: i64,
     ) -> Result<Self, SendEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -341,6 +354,7 @@ impl SendChannelEndpoint {
 
         Ok(Self {
             current_data_addr: channel.remote_data,
+            time_of_last_sm_ns: now_ns,
             channel,
             transport,
             data_loss_generator: None,
@@ -356,6 +370,75 @@ impl SendChannelEndpoint {
     /// The channel-status counter a client reads.
     pub const fn channel_status_counter_id(&self) -> i32 {
         self.channel_status_counter_id
+    }
+
+    /// A status message arrived for one of this endpoint's publications, which
+    /// is the whole of what "this endpoint has a connection" means
+    /// (`aeron_send_channel_endpoint.c:658`).
+    pub const fn on_status_message(&mut self, now_ns: i64) {
+        self.time_of_last_sm_ns = now_ns;
+    }
+
+    /// Whether this endpoint's channel has to be resolved again
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    ///
+    /// Three conditions and a clock, in the reference's order:
+    ///
+    /// * a **manual** channel is the destination tracker's business, not this
+    ///   endpoint's — it has no single address to reconnect (`:757-761`);
+    /// * a multicast channel is left alone: its endpoint is a group, and a name
+    ///   that resolved to a group is not re-resolved at all;
+    /// * only a channel that **named** an endpoint has a name to ask about
+    ///   (`:763`), and a response channel is not one of them (`:764`);
+    /// * and only when nothing has been heard from the other side for
+    ///   [`DESTINATION_TIMEOUT_NS`] (`:765`) — which is "this endpoint has no
+    ///   connection", spelled as a clock.
+    pub fn needs_re_resolution(&self, now_ns: i64) -> bool {
+        self.channel.control_mode != ControlMode::Manual
+            && !self.channel.is_multicast
+            && self.channel.has_explicit_endpoint
+            && self.channel.control_mode != ControlMode::Response
+            && now_ns > self.time_of_last_sm_ns + DESTINATION_TIMEOUT_NS
+    }
+
+    /// What this endpoint's name is, for the resolver to be asked about it
+    /// (`endpoint_name`, `:768`).
+    pub fn endpoint_name(&self) -> Option<&str> {
+        self.channel.endpoint_name.as_deref()
+    }
+
+    /// The address a re-resolution is measured against, so that an answer that
+    /// is the same address is not a change (`:6932-6938`, the `memcmp` that
+    /// decides whether anything happens at all).
+    pub const fn remote_data_addr(&self) -> SocketAddr {
+        self.current_data_addr
+    }
+
+    /// Take the answer (`aeron_send_channel_endpoint_resolution_change`,
+    /// `:776-800`).
+    ///
+    /// A channel with several destinations hands it to the tracker, which
+    /// matches destinations by name; a channel with one **reconnects** its
+    /// transport, because that is the only thing its address was.
+    ///
+    /// # Errors
+    ///
+    /// The syscall's error when the transport cannot be reconnected.
+    pub fn on_resolution_change(
+        &mut self,
+        endpoint_name: &str,
+        new_addr: SocketAddr,
+    ) -> std::io::Result<()> {
+        if let Some(tracker) = self.destination_tracker.as_mut() {
+            tracker.on_resolution_change(endpoint_name, new_addr);
+
+            return Ok(());
+        }
+
+        self.transport.reconnect(new_addr)?;
+        self.current_data_addr = new_addr;
+
+        Ok(())
     }
 
     /// Where this endpoint sends when its channel has several destinations, so
@@ -818,6 +901,10 @@ mod tests {
         }
     }
 
+    /// When the endpoints below were created, so that the five-second timeout
+    /// is a number and not a wall clock.
+    const TIMEOUT_START_NS: i64 = 1_000_000_000;
+
     fn channel(uri: &str) -> UdpChannel {
         let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
         UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
@@ -829,6 +916,131 @@ mod tests {
             session_id,
             registration_id,
         }
+    }
+
+    /// An endpoint's own clock: only a **unicast** channel that named an
+    /// endpoint, is not a response channel, and has heard nothing for five
+    /// seconds has a name to resolve again
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    ///
+    /// The four other shapes are the reference's own exclusions, and each one is
+    /// a different reason: a manual channel's addresses are its destinations'
+    /// (which have their own check), a multicast channel's endpoint is a group,
+    /// a channel that named no endpoint has no name, and a response channel's
+    /// address belongs to the stream that asked for it.
+    #[test]
+    fn only_a_quiet_unicast_endpoint_is_resolved_again() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let build = |counters: &mut CounterManager, regions: &CounterRegions<'_>, uri: &str| {
+            SendChannelEndpoint::create(
+                channel(uri),
+                &TransportParams::default(),
+                counters,
+                regions,
+                7,
+                1_000_000,
+                TIMEOUT_START_NS,
+            )
+            .expect("an endpoint")
+        };
+
+        let mut unicast = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40123",
+        );
+        let manual = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40124|control-mode=manual",
+        );
+        let multicast = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=224.0.1.1:40125",
+        );
+        let response = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40126|control-mode=response",
+        );
+        let unaddressed = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?control=127.0.0.1:40127|control-mode=manual",
+        );
+
+        let just_inside = TIMEOUT_START_NS + DESTINATION_TIMEOUT_NS;
+        let just_past = TIMEOUT_START_NS + DESTINATION_TIMEOUT_NS + 1;
+
+        assert!(
+            !unicast.needs_re_resolution(just_inside),
+            "five seconds is not enough"
+        );
+        assert!(
+            unicast.needs_re_resolution(just_past),
+            "and five seconds and a nanosecond is"
+        );
+
+        assert!(
+            !manual.needs_re_resolution(just_past),
+            "manual is the tracker's"
+        );
+        assert!(
+            !multicast.needs_re_resolution(just_past),
+            "a group has no name to ask about"
+        );
+        assert!(
+            !response.needs_re_resolution(just_past),
+            "a response channel is not one"
+        );
+        assert!(
+            !unaddressed.needs_re_resolution(just_past),
+            "a channel with destinations is the tracker's business too"
+        );
+
+        // And a status message is what "it is connected" means: the clock
+        // starts again from it (`aeron_send_channel_endpoint.c:658`).
+        unicast.on_status_message(just_past);
+        assert!(
+            !unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS),
+            "ten seconds after a status message is five seconds after one"
+        );
+        assert!(unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS + 1));
+    }
+
+    /// The answer to a re-resolution reaches a **unicast** endpoint by
+    /// reconnecting its transport, which is a thing a socket can be asked about
+    /// (`aeron_send_channel_endpoint_resolution_change`, `:776-800`).
+    #[test]
+    fn an_answer_moves_a_unicast_endpoint() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1_000_000,
+            TIMEOUT_START_NS,
+        )
+        .expect("an endpoint");
+
+        let moved: SocketAddr = "127.0.0.2:40123".parse().expect("an address");
+        endpoint
+            .on_resolution_change("somewhere:40123", moved)
+            .expect("the transport reconnects");
+
+        assert_eq!(moved, endpoint.remote_data_addr());
+        assert_eq!(
+            Some("127.0.0.1:40123"),
+            endpoint.endpoint_name(),
+            "and the name it was parsed with is kept, which is what a re-resolution asks about"
+        );
     }
 
     #[test]
@@ -843,6 +1055,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -883,6 +1096,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -924,6 +1138,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -970,6 +1185,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1037,6 +1253,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect_err("the address is taken");
 
@@ -1093,6 +1310,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1114,6 +1332,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1161,6 +1380,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 

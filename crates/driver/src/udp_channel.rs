@@ -187,6 +187,15 @@ pub struct UdpChannel {
     pub socket_rcvbuf_length: usize,
     /// `rcv-wnd=`, in bytes; zero means the subscription default.
     pub receiver_window_length: usize,
+    /// The `endpoint=` text as it was written, which is what a **re-resolution**
+    /// asks about (`endpoint->conductor_fields.udp_channel->uri.params.udp.endpoint`,
+    /// `media/aeron_send_channel_endpoint.c:768`): a name that has to be
+    /// resolved again is the name the client wrote, not the address it once
+    /// resolved to.
+    pub endpoint_name: Option<String>,
+    /// The `control=` text as it was written, which the receiver side
+    /// re-resolves (`media/aeron_receive_channel_endpoint.c:1057`).
+    pub control_name: Option<String>,
 }
 
 /// Why a URI could not become a channel.
@@ -400,6 +409,8 @@ impl UdpChannel {
                 socket_sndbuf_length: read_size(uri, "so-sndbuf")?,
                 socket_rcvbuf_length: read_size(uri, "so-rcvbuf")?,
                 receiver_window_length: read_size(uri, "rcv-wnd")?,
+                endpoint_name: endpoint.map(str::to_owned),
+                control_name: control.map(str::to_owned),
             });
         }
 
@@ -465,6 +476,8 @@ impl UdpChannel {
             socket_sndbuf_length: read_size(uri, "so-sndbuf")?,
             socket_rcvbuf_length: read_size(uri, "so-rcvbuf")?,
             receiver_window_length: read_size(uri, "rcv-wnd")?,
+            endpoint_name: endpoint.map(str::to_owned),
+            control_name: control.map(str::to_owned),
         })
     }
 }

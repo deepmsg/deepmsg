@@ -387,6 +387,7 @@ impl SendChannelEndpoints {
             regions,
             registration_id,
             now_ms,
+            now_ns,
         )
         .map_err(|error| match error {
             send_endpoint::SendEndpointError::NoCounter => EndpointError::NoCounter,

@@ -2348,6 +2348,7 @@ mod tests {
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -2425,6 +2426,7 @@ mod tests {
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -2492,6 +2494,7 @@ mod tests {
             .expect("four-to-one"),
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -2554,6 +2557,7 @@ mod tests {
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -2699,6 +2703,7 @@ mod tests {
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -2823,6 +2828,7 @@ mod tests {
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint")
     }
