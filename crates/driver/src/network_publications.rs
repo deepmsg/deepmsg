@@ -282,6 +282,7 @@ impl NetworkPublications {
                 regions,
                 threshold_ns: config.name_resolver_threshold_ns,
             },
+            crate::udp_channel::Unresolved::Refuse,
             request.channel,
             &uri,
         )

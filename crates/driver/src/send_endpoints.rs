@@ -41,6 +41,8 @@
 //! module keeps is the bookkeeping the conductor needs afterwards — the
 //! counter id it announced, the reference count, and the state.
 
+use std::net::SocketAddr;
+
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::channel_validation;
@@ -56,6 +58,21 @@ pub struct SendChannelEndpointEntry {
     pub id: u64,
     /// The channel it was created for.
     pub channel: UdpChannel,
+    /// Where it sends **now**, which is the channel's address until a
+    /// re-resolution moves it (`current_data_addr`,
+    /// `media/aeron_send_channel_endpoint.h:52`).
+    ///
+    /// The conductor keeps its own copy because the endpoint itself lives on
+    /// the sender's thread, and this is what a tag match compares against: the
+    /// reference hands `aeron_udp_channel_matches_tag` the endpoint's *current*
+    /// address as an override
+    /// (`aeron_udp_channel_endpoints_match_with_override`'s `remote_address`,
+    /// `media/aeron_udp_channel.c:31-45`, passed from
+    /// `aeron_driver_conductor_find_existing_send_channel_endpoint`). Without
+    /// it a publication that names a re-resolved endpoint by tag is refused
+    /// with `matching tag … has mismatched endpoint` — which is what
+    /// `NameReResolutionTest.shouldHandleTaggedPublication` caught.
+    pub current_data_addr: SocketAddr,
     /// The `snd-channel` counter whose value is its state.
     pub channel_status_counter_id: i32,
     /// Where it is in its life.
@@ -269,7 +286,7 @@ impl SendChannelEndpoints {
         // answers to it, wherever its canonical form puts it.
         if channel.tag_id != INVALID_TAG {
             for entry in &self.entries {
-                if matches_tag(channel, &entry.channel)? {
+                if matches_tag(channel, &entry.channel, entry.current_data_addr)? {
                     return self.usable(entry);
                 }
             }
@@ -423,6 +440,7 @@ impl SendChannelEndpoints {
         self.entries.push(SendChannelEndpointEntry {
             id,
             channel: endpoint.channel.clone(),
+            current_data_addr: endpoint.remote_data_addr(),
             channel_status_counter_id,
             status: EndpointStatus::Active,
             refcount: 0,
@@ -544,7 +562,11 @@ impl SendChannelEndpoints {
 ///
 /// [`EndpointError::TagMismatch`] when the tags are equal and something else
 /// is not.
-fn matches_tag(channel: &UdpChannel, existing: &UdpChannel) -> Result<bool, EndpointError> {
+fn matches_tag(
+    channel: &UdpChannel,
+    existing: &UdpChannel,
+    existing_data_addr: SocketAddr,
+) -> Result<bool, EndpointError> {
     if channel.tag_id == INVALID_TAG
         || existing.tag_id == INVALID_TAG
         || channel.tag_id != existing.tag_id
@@ -567,7 +589,7 @@ fn matches_tag(channel: &UdpChannel, existing: &UdpChannel) -> Result<bool, Endp
         return Ok(true);
     }
 
-    if channel.remote_data != existing.remote_data || channel.local_data != existing.local_data {
+    if channel.remote_data != existing_data_addr || channel.local_data != existing.local_data {
         return Err(EndpointError::TagMismatch {
             tag: channel.tag_id,
         });
@@ -1356,6 +1378,7 @@ mod tests {
         let entry = SendChannelEndpointEntry {
             id: 1,
             channel: channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            current_data_addr: "127.0.0.1:40123".parse().expect("an address"),
             channel_status_counter_id: 0,
             status: EndpointStatus::Active,
             refcount: 1,

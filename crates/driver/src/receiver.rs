@@ -262,6 +262,16 @@ pub enum ReceiverEvent {
         /// Which one.
         registration_id: i64,
     },
+    /// An image has left DRAINING for LINGER, which is when its readers are
+    /// told it is gone (`aeron_driver_conductor_image_transition_to_linger`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1642-1675`).
+    ///
+    /// Told **here** and not at the release, which is a linger window further
+    /// on: an image that has stopped is not one a reader should keep polling.
+    ImageLingering {
+        /// Which one.
+        registration_id: i64,
+    },
     /// The untethered state machine moved a reader: the conductor is the side
     /// that can tell the client, and the only side that owns the transmitter.
     Untethered {
@@ -1733,14 +1743,27 @@ impl ReceiverThread {
         let mut work = 0;
         let mut done = Vec::new();
 
+        let mut lingering = Vec::new();
+
         for image in self.images.iter_mut() {
             if image.on_time_event(&self.counters, regions, now_ns) {
                 work += 1;
             }
 
+            if image.take_linger_notice() {
+                lingering.push(image.registration_id);
+            }
+
             if image.state == crate::publication_image::ImageState::Done {
                 done.push(image.registration_id);
             }
+        }
+
+        for registration_id in lingering {
+            let _ = self
+                .events
+                .send(ReceiverEvent::ImageLingering { registration_id });
+            work += 1;
         }
 
         for registration_id in done {

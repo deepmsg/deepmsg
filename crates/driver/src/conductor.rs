@@ -1148,6 +1148,9 @@ impl Conductor {
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
                 }
+                ReceiverEvent::ImageLingering { registration_id } => {
+                    work += self.announce_image_unavailable(registration_id);
+                }
                 ReceiverEvent::ReResolveControl {
                     endpoint_id,
                     destination,
@@ -1560,15 +1563,16 @@ impl Conductor {
         1
     }
 
-    fn release_image(&mut self, registration_id: i64) -> usize {
+    /// Tell every subscription reading this image that it is gone, and stop
+    /// calling them its readers
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`,
+    /// which is the reference's own **one** announcement — it unlinks as it
+    /// tells, so the release a moment later finds nobody left to tell).
+    fn announce_image_unavailable(&mut self, registration_id: i64) -> usize {
         let Some(image) = self.images.find(registration_id).cloned() else {
             return 0;
         };
 
-        let _ = self.receiver.proxy().remove_image(registration_id);
-
-        // The readers, told — before anything is freed, because the message
-        // names the file they were reading.
         let Some(event_region) = self.cnc.to_clients_region_writable() else {
             return 0;
         };
@@ -1590,10 +1594,27 @@ impl Conductor {
         }
 
         // The transmit borrows the faults list and the ring; it goes out of
-        // scope here so the counter regions can be taken below.
+        // scope here so the link list can be taken below.
         let _ = &transmit;
 
         self.subscriptions.forget_publication(registration_id);
+
+        1
+    }
+
+    fn release_image(&mut self, registration_id: i64) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let _ = self.receiver.proxy().remove_image(registration_id);
+
+        // A reader that has not been told yet is told now: the normal path has
+        // already said so as the image left DRAINING (`:1642-1675`), and a
+        // **revoked** one has not — it goes LINGER→DONE without a linger to
+        // announce on, which is this build's own divergence and the reason this
+        // call is here rather than gone.
+        self.announce_image_unavailable(registration_id);
         self.receive_endpoints.detach_image(image.endpoint_id);
 
         // An endpoint whose last image has just gone is one to try again on:
@@ -2998,6 +3019,7 @@ impl Conductor {
                     counters,
                     &counter_regions,
                     config.name_resolver_threshold_ns,
+                    crate::udp_channel::Unresolved::Refuse,
                     request.channel,
                     &uri,
                 ) else {
@@ -3121,6 +3143,7 @@ impl Conductor {
                     regions: &counter_regions,
                     threshold_ns: config.name_resolver_threshold_ns,
                 },
+                crate::udp_channel::Unresolved::Keep,
                 request.channel,
             ) {
                 Ok(address) => Some(address),
@@ -3144,20 +3167,29 @@ impl Conductor {
                 continue;
             };
 
-            let Ok(channel) = Self::resolve_channel(
+            // A **send** destination whose name does not resolve is kept, so
+            // the parse tolerates one: the reference sets the address to
+            // `AF_UNSPEC` and adds the destination anyway (`:5337-5343`), which
+            // is what makes a name that answers later answer *this*
+            // destination.
+            let channel = match Self::resolve_channel(
                 &mut **resolver,
                 counters,
                 &counter_regions,
                 config.name_resolver_threshold_ns,
+                crate::udp_channel::Unresolved::Keep,
                 request.channel,
                 &uri,
-            ) else {
-                transmit.error(
-                    request.correlation_id,
-                    ERROR_CODE_INVALID_CHANNEL,
-                    b"incorrect URI format for destination",
-                );
-                continue;
+            ) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        error.to_string().as_bytes(),
+                    );
+                    continue;
+                }
             };
 
             let registration_id = request.correlation_id;
@@ -3605,6 +3637,15 @@ impl Conductor {
                     {
                         work += 1;
                     }
+
+                    // The conductor's own copy follows, because the sender's
+                    // is on another thread and a tag match has to compare
+                    // against where the endpoint sends **now**
+                    // (`aeron_driver_conductor_find_existing_send_channel_endpoint`
+                    // hands the tag match the endpoint's `current_data_addr`).
+                    if let Some(entry) = self.send_endpoints.get_mut(endpoint_id) {
+                        entry.current_data_addr = address;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -3689,6 +3730,7 @@ impl Conductor {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         threshold_ns: i64,
+        unresolved: crate::udp_channel::Unresolved,
         original_uri: &[u8],
         uri: &crate::channel_uri::ChannelUri<'_>,
     ) -> Result<UdpChannel, UdpChannelError> {
@@ -3699,6 +3741,7 @@ impl Conductor {
                 regions,
                 threshold_ns,
             },
+            unresolved,
             original_uri,
             uri,
         )

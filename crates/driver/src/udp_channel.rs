@@ -302,7 +302,7 @@ impl UdpChannel {
     /// [`UdpChannelError`] for a URI this build cannot serve, a channel the
     /// reference refuses, or an address that does not resolve.
     pub fn resolve(original_uri: &[u8], uri: &ChannelUri<'_>) -> Result<Self, UdpChannelError> {
-        Self::resolve_with(&mut Names::System, original_uri, uri)
+        Self::resolve_with(&mut Names::System, Unresolved::Refuse, original_uri, uri)
     }
 
     /// [`UdpChannel::resolve`] with the resolver the driver built, which is
@@ -315,6 +315,7 @@ impl UdpChannel {
     /// The same ones, plus whatever the resolver refuses.
     pub fn resolve_with(
         names: &mut Names<'_>,
+        unresolved: Unresolved,
         original_uri: &[u8],
         uri: &ChannelUri<'_>,
     ) -> Result<Self, UdpChannelError> {
@@ -357,12 +358,12 @@ impl UdpChannel {
         // `:346-374`: the control address resolves first, because it decides
         // the family of the endpoint when no endpoint was named.
         let explicit_control_addr = match control {
-            Some(text) => Some(resolve_name(names, CONTROL_PARAM, text)?),
+            Some(text) => Some(resolve_name(names, unresolved, CONTROL_PARAM, text)?),
             None => None,
         };
 
         let endpoint_addr = match endpoint {
-            Some(text) => resolve_name(names, ENDPOINT_PARAM, text)?,
+            Some(text) => resolve_name(names, unresolved, ENDPOINT_PARAM, text)?,
             None => wildcard_socket(
                 explicit_control_addr
                     .map_or(AddressFamily::Inet, |addr| AddressFamily::of(addr.ip())),
@@ -657,6 +658,7 @@ pub fn resolve_spy_channel(channel: &[u8]) -> Result<UdpChannel, UdpChannelError
 /// that does not resolve.
 pub fn validate_send_destination_uri(
     names: &mut Names<'_>,
+    unresolved: Unresolved,
     channel: &[u8],
 ) -> Result<SocketAddr, UdpChannelError> {
     let uri = ChannelUri::parse(channel)?;
@@ -683,7 +685,7 @@ pub fn validate_send_destination_uri(
         }
     }
 
-    resolve_name(names, ENDPOINT_PARAM, endpoint)
+    resolve_name(names, unresolved, ENDPOINT_PARAM, endpoint)
 }
 
 /// The channel tag: `tags=` up to the first comma
@@ -1129,6 +1131,30 @@ pub const CONTROL_PARAM: &str = "control";
 /// One name through whichever resolver the caller brought.
 fn resolve_name(
     names: &mut Names<'_>,
+    unresolved: Unresolved,
+    uri_param_name: &str,
+    text: &str,
+) -> Result<SocketAddr, UdpChannelError> {
+    let resolved = resolve_name_inner(names, uri_param_name, text);
+
+    match (resolved, unresolved) {
+        (Err(UdpChannelError::Resolution(_)), Unresolved::Keep) => {
+            // The port survives and the address does not: `0.0.0.0:40456` is
+            // what "known, not resolvable" looks like here, and the port is
+            // what a re-resolution asks about (`:5337-5343`).
+            let (_, port_text, family) = split_address(text)?;
+            let port = parse_port(port_text)
+                .map_err(|error| UdpChannelError::Resolution(format!("{error}: {text}")))?;
+
+            Ok(SocketAddr::new(wildcard_socket(family).ip(), port))
+        }
+        (result, _) => result,
+    }
+}
+
+/// One name through whichever resolver the caller brought.
+fn resolve_name_inner(
+    names: &mut Names<'_>,
     uri_param_name: &str,
     text: &str,
 ) -> Result<SocketAddr, UdpChannelError> {
@@ -1148,6 +1174,29 @@ fn resolve_name(
             text,
         ),
     }
+}
+
+/// What to do with a channel whose name does not resolve
+/// (`aeron_driver_conductor_execute_add_send_destination`, `:5332-5343`).
+///
+/// The reference has the same choice in two places and answers it differently:
+/// a **subscription** or a publication whose channel will not resolve is
+/// refused (`aeron_udp_channel_parse` fails and the command errors), while a
+/// **send destination** is kept with its address set to `AF_UNSPEC` and asked
+/// about again — the `TODO` comment beside that fall-through says it is
+/// deliberate, and `NameReResolutionTest`'s
+/// `shouldHandleMdcManualEndpointInitiallyUnresolved` is the case that depends
+/// on it: a destination added while its name is unresolvable must exist and
+/// must connect once the name answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unresolved {
+    /// Refuse the channel. What every path but one does.
+    Refuse,
+    /// Keep it, with the wildcard where the address would be — this build's
+    /// spelling of the reference's `AF_UNSPEC`. The port it named is kept,
+    /// because that is what a later re-resolution will ask about and what the
+    /// destination will be matched by.
+    Keep,
 }
 
 /// The resolver a channel's names go through
@@ -1672,6 +1721,40 @@ mod tests {
         ));
     }
 
+    /// A name that does not resolve is refused — unless the caller asked for
+    /// it to be **kept**, which is what a send destination does
+    /// (`aeron_driver_conductor_execute_add_send_destination`, `:5332-5343`).
+    ///
+    /// Kept means the wildcard where the address would be and the port it
+    /// named: the destination exists, cannot be sent to, and is asked about
+    /// again — which is what
+    /// `NameReResolutionTest.shouldHandleMdcManualEndpointInitiallyUnresolved`
+    /// turns on.
+    #[test]
+    fn an_unresolvable_name_is_kept_for_a_destination_that_asks_for_it() {
+        let uri = b"aeron:udp?endpoint=not-a-host-at-all.invalid:40456";
+        let parsed = ChannelUri::parse(uri).expect("a URI");
+
+        assert!(
+            UdpChannel::resolve_with(&mut Names::System, Unresolved::Refuse, uri, &parsed).is_err(),
+            "the default is a refusal"
+        );
+
+        let kept = UdpChannel::resolve_with(&mut Names::System, Unresolved::Keep, uri, &parsed)
+            .expect("a channel that is kept");
+
+        assert_eq!(
+            "0.0.0.0:40456".parse::<SocketAddr>().expect("an address"),
+            kept.remote_data,
+            "the wildcard, and the port it named"
+        );
+        assert_eq!(
+            Some("not-a-host-at-all.invalid:40456"),
+            kept.endpoint_name.as_deref(),
+            "the name is kept, because that is what a re-resolution asks about"
+        );
+    }
+
     /// What a destination URI has to be, and the four ways it can fail
     /// (`:5369-5410`, `:411-460`).
     #[test]
@@ -1680,13 +1763,14 @@ mod tests {
             "127.0.0.1:40456".parse::<SocketAddr>().expect("an address"),
             validate_send_destination_uri(
                 &mut Names::System,
+                Unresolved::Refuse,
                 b"aeron:udp?endpoint=127.0.0.1:40456"
             )
             .expect("a destination")
         );
 
         let refusal = |channel: &[u8]| {
-            validate_send_destination_uri(&mut Names::System, channel)
+            validate_send_destination_uri(&mut Names::System, Unresolved::Refuse, channel)
                 .expect_err("this destination is refused")
                 .to_string()
         };
@@ -1700,7 +1784,8 @@ mod tests {
         // UDP, but naming nowhere to send. Which of the two refusals it is
         // depends on where the URI parser gives up, and either is a refusal.
         assert!(
-            validate_send_destination_uri(&mut Names::System, b"aeron:udp").is_err(),
+            validate_send_destination_uri(&mut Names::System, Unresolved::Refuse, b"aeron:udp")
+                .is_err(),
             "a destination with no endpoint is refused"
         );
 
@@ -2160,6 +2245,7 @@ mod tests {
                 // measurement's own and not a race with a clock.
                 threshold_ns: 0,
             },
+            Unresolved::Refuse,
             uri,
             &parsed,
         )
@@ -2190,6 +2276,7 @@ mod tests {
                 // measurement's own and not a race with a clock.
                 threshold_ns: 0,
             },
+            Unresolved::Refuse,
             uri,
             &parsed,
         )
