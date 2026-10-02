@@ -73,6 +73,7 @@ use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
     ToDriverRingConsumer,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
@@ -95,7 +96,7 @@ use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
     IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
-    validate_destination_uri_params, validate_send_destination_uri,
+    validate_destination_uri_params,
 };
 
 /// At most one command per duty cycle
@@ -585,6 +586,10 @@ pub struct Conductor {
     /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
     /// datagram they arrived in.
     pending_publication_errors: Vec<deepmsg_cnc::command::OwnedPublicationError>,
+    /// Endpoints whose names the sender has asked about again, waiting for a
+    /// pass that holds the counter regions — the resolver reads counters, and a
+    /// resolution is measured (`SenderEvent::ReResolveEndpoint`).
+    pending_re_resolutions: Vec<(u64, String, SocketAddr)>,
 }
 
 impl Conductor {
@@ -764,6 +769,7 @@ impl Conductor {
             usize::try_from(config.mtu_length).unwrap_or(1408),
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
             config.publication_linger_timeout_ns,
+            config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -856,6 +862,7 @@ impl Conductor {
             pending_publication_errors: Vec::new(),
             awaiting_drain: std::collections::HashSet::new(),
             drained_publications: Vec::new(),
+            pending_re_resolutions: Vec::new(),
         };
 
         Ok(conductor)
@@ -909,7 +916,7 @@ impl Conductor {
         self.record_pending_faults();
         self.record_storage_warnings();
         self.flush_broadcast_failures();
-        work
+        work + self.re_resolve_endpoints()
     }
 
     /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
@@ -1778,6 +1785,16 @@ impl Conductor {
                     // Nothing to do: the conductor's own bookkeeping for a
                     // publication's removal is done where the removal is made.
                 }
+                crate::sender::SenderEvent::ReResolveEndpoint {
+                    endpoint_id,
+                    endpoint_name,
+                    address,
+                } => {
+                    // Held rather than resolved here: this method has no
+                    // counter regions, and the resolution is measured.
+                    self.pending_re_resolutions
+                        .push((endpoint_id, endpoint_name, address));
+                }
             }
         }
 
@@ -2284,6 +2301,7 @@ impl Conductor {
                                         config,
                                         counters,
                                         &counter_regions,
+                                        &mut **resolver,
                                         clients,
                                         receive_endpoints,
                                         images,
@@ -3070,7 +3088,15 @@ impl Conductor {
             // `None` here. The consequence is in `docs/compat.md`'s
             // name-resolution row: this build has no re-resolution, so that
             // destination never recovers.
-            let address = match validate_send_destination_uri(request.channel) {
+            let address = match crate::udp_channel::validate_send_destination_uri(
+                &mut crate::udp_channel::Names::Built {
+                    resolver: &mut **resolver,
+                    counters,
+                    regions: &counter_regions,
+                    threshold_ns: config.name_resolver_threshold_ns,
+                },
+                request.channel,
+            ) {
                 Ok(address) => Some(address),
                 Err(UdpChannelError::Resolution(_)) => None,
                 Err(error) => {
@@ -3501,6 +3527,77 @@ impl Conductor {
 
         self.resolver
             .close(&mut self.counters, &regions, self.now_ms);
+    }
+
+    /// Resolve the names the sender asked about again, and tell it what changed
+    /// (`aeron_driver_conductor_execute_re_resolve_endpoint`, `:6890-6938`).
+    ///
+    /// The resolution is the **wrapper**'s, not the resolver's alone
+    /// (`aeron_name_resolver_resolve_host_and_port`): what a re-resolution
+    /// answers with is an address with the port the channel named, which is
+    /// what the endpoint compares against the one it has (`:6932-6938`) and
+    /// what it reconnects to.
+    ///
+    /// A name that resolves to **the address the endpoint already has** is not
+    /// a change and nothing happens — which is the reference's `memcmp`, and is
+    /// what `shouldReResolveEndpointOnNotConnectedWhenNamePointsBackAtTheOriginalAddress`
+    /// is about.
+    ///
+    /// A name that will not resolve is an **error a deployment can see**: the
+    /// counter and the log entry, both, which is what the reference's
+    /// `set_error_from_result` plus `AERON_APPEND_ERR` do (`:6905-6911`) and
+    /// what `shouldReportErrorOnReResolveFailure` waits for.
+    fn re_resolve_endpoints(&mut self) -> usize {
+        if self.pending_re_resolutions.is_empty() {
+            return 0;
+        }
+
+        let Some(regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let pending = std::mem::take(&mut self.pending_re_resolutions);
+        let mut work = 0;
+
+        for (endpoint_id, endpoint_name, existing) in pending {
+            let resolved = crate::udp_channel::resolve_host_and_port_with(
+                &mut *self.resolver,
+                &self.counters,
+                &regions,
+                self.config.name_resolver_threshold_ns,
+                "endpoint",
+                &endpoint_name,
+            );
+
+            match resolved {
+                Ok(address) if address != existing => {
+                    if self
+                        .sender
+                        .proxy()
+                        .resolution_change(endpoint_id, endpoint_name, address)
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // The recording is deferred, like every other error this
+                    // pass notices: the regions are held here and
+                    // `record_pending_faults` is the pass that has both the log
+                    // and the counter (`log_error`). The words are the
+                    // reference's own (`aeron_name_resolver.c:204-208`,
+                    // `Unresolved - %s=%s, name-and-port=%s`), because a
+                    // deployment reads this line to find which name went wrong.
+                    let description = format!("Unresolved - endpoint={endpoint_name}, {error}");
+
+                    self.pending_log_errors
+                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                }
+            }
+        }
+
+        work
     }
 
     /// Resolve a channel through the driver's resolver, which is what times it

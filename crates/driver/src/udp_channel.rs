@@ -642,13 +642,23 @@ pub fn resolve_spy_channel(channel: &[u8]) -> Result<UdpChannel, UdpChannelError
 /// destination with no address — so the difference is when the work happens,
 /// not what it produces.
 ///
+/// It goes through the **driver's resolver** like every other name does, and
+/// that is not a detail: a name the driver was configured to steer (a CSV
+/// table's row, a neighbor's answer) is a name this must steer too, and a name
+/// it does *not* know is one it must not hand to a name server on the
+/// conductor's own thread — which is a lookup that can take seconds and is the
+/// only thing in this build that can stall a driver's heartbeat.
+///
 /// # Errors
 ///
 /// [`UdpChannelError::InvalidChannel`] for a URI that is not UDP, names no
 /// endpoint, names port zero, carries one of [`INVALID_DESTINATION_KEYS`], or
 /// asks for `control-mode=response`; and [`UdpChannelError::Resolve`] for a host
 /// that does not resolve.
-pub fn validate_send_destination_uri(channel: &[u8]) -> Result<SocketAddr, UdpChannelError> {
+pub fn validate_send_destination_uri(
+    names: &mut Names<'_>,
+    channel: &[u8],
+) -> Result<SocketAddr, UdpChannelError> {
     let uri = ChannelUri::parse(channel)?;
     let text = String::from_utf8_lossy(channel);
 
@@ -673,7 +683,7 @@ pub fn validate_send_destination_uri(channel: &[u8]) -> Result<SocketAddr, UdpCh
         }
     }
 
-    resolve_host_and_port(endpoint)
+    resolve_name(names, ENDPOINT_PARAM, endpoint)
 }
 
 /// The channel tag: `tags=` up to the first comma
@@ -1668,12 +1678,15 @@ mod tests {
     fn a_send_destination_is_a_udp_endpoint_with_a_port() {
         assert_eq!(
             "127.0.0.1:40456".parse::<SocketAddr>().expect("an address"),
-            validate_send_destination_uri(b"aeron:udp?endpoint=127.0.0.1:40456")
-                .expect("a destination")
+            validate_send_destination_uri(
+                &mut Names::System,
+                b"aeron:udp?endpoint=127.0.0.1:40456"
+            )
+            .expect("a destination")
         );
 
         let refusal = |channel: &[u8]| {
-            validate_send_destination_uri(channel)
+            validate_send_destination_uri(&mut Names::System, channel)
                 .expect_err("this destination is refused")
                 .to_string()
         };
@@ -1687,7 +1700,7 @@ mod tests {
         // UDP, but naming nowhere to send. Which of the two refusals it is
         // depends on where the URI parser gives up, and either is a refusal.
         assert!(
-            validate_send_destination_uri(b"aeron:udp").is_err(),
+            validate_send_destination_uri(&mut Names::System, b"aeron:udp").is_err(),
             "a destination with no endpoint is refused"
         );
 
