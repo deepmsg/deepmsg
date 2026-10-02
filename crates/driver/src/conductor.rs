@@ -589,7 +589,7 @@ pub struct Conductor {
     /// Endpoints whose names the sender has asked about again, waiting for a
     /// pass that holds the counter regions — the resolver reads counters, and a
     /// resolution is measured (`SenderEvent::ReResolveEndpoint`).
-    pending_re_resolutions: Vec<(u64, String, SocketAddr)>,
+    pending_re_resolutions: Vec<(u64, String, Option<SocketAddr>)>,
 }
 
 impl Conductor {
@@ -3570,7 +3570,7 @@ impl Conductor {
             );
 
             match resolved {
-                Ok(address) if address != existing => {
+                Ok(address) if Some(address) != existing => {
                     if self
                         .sender
                         .proxy()

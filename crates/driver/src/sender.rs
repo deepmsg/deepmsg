@@ -48,6 +48,7 @@ use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
 use crate::idle::Backoff;
+use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
@@ -238,8 +239,10 @@ pub enum SenderEvent {
         endpoint_id: u64,
         /// The name the channel named, which is what is resolved again.
         endpoint_name: String,
-        /// The address it has now, which the answer is compared against.
-        address: SocketAddr,
+        /// The address it has now, which the answer is compared against —
+        /// [`None`] for a destination that never resolved, which is the
+        /// reference's `AF_UNSPEC` and is always a change once it does.
+        address: Option<SocketAddr>,
     },
     /// A responder answered a publication that asked for a response channel
     /// (`aeron_driver_conductor_proxy_on_response_setup`,
@@ -777,7 +780,7 @@ impl SenderThread {
         // a zero interval is a driver that never asks.
         if self.re_resolution_interval_ns > 0 && now_ns > self.re_resolution_deadline_ns {
             self.re_resolution_deadline_ns = now_ns + self.re_resolution_interval_ns;
-            resolved += Self::check_for_re_resolution(&self.endpoints, &self.events, now_ns);
+            resolved += Self::check_for_re_resolution(&mut self.endpoints, &self.events, now_ns);
         }
 
         let mut work = Self::receive_control_frames(
@@ -966,30 +969,56 @@ impl SenderThread {
     /// The endpoint is not touched here — the answer comes back as a command
     /// and is applied by [`Self::apply_resolution_changes`].
     fn check_for_re_resolution(
-        endpoints: &[(u64, Box<SendChannelEndpoint>)],
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
         events: &Channel<SenderEvent>,
         now_ns: i64,
     ) -> usize {
         let mut work = 0;
 
-        for (id, endpoint) in endpoints {
-            if !endpoint.needs_re_resolution(now_ns) {
+        for (id, endpoint) in endpoints.iter_mut() {
+            // The endpoint's own address, for the channel that has one
+            // (`:763-773`).
+            if endpoint.needs_re_resolution(now_ns) {
+                if let Some(name) = endpoint.endpoint_name() {
+                    if events
+                        .send(SenderEvent::ReResolveEndpoint {
+                            endpoint_id: *id,
+                            endpoint_name: name.to_owned(),
+                            address: Some(endpoint.remote_data_addr()),
+                        })
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+                }
+
                 continue;
             }
 
-            let Some(name) = endpoint.endpoint_name() else {
+            // And its **destinations**, for the manual channel that has those
+            // instead (`:757-761`, which hands the check to the tracker —
+            // `aeron_udp_destination_tracker.c:402-428`). Each one is asked
+            // about once per timeout, because asking stamps it.
+            let Some(tracker) = endpoint.destination_tracker_mut() else {
                 continue;
             };
 
-            if events
-                .send(SenderEvent::ReResolveEndpoint {
-                    endpoint_id: *id,
-                    endpoint_name: name.to_owned(),
-                    address: endpoint.remote_data_addr(),
-                })
-                .is_ok()
-            {
-                work += 1;
+            let due = tracker.destinations_to_re_resolve(now_ns, DESTINATION_TIMEOUT_NS);
+
+            for (index, name) in due {
+                let address = tracker.destination_addr(index);
+                tracker.mark_re_resolution_checked(index, now_ns);
+
+                if events
+                    .send(SenderEvent::ReResolveEndpoint {
+                        endpoint_id: *id,
+                        endpoint_name: name,
+                        address,
+                    })
+                    .is_ok()
+                {
+                    work += 1;
+                }
             }
         }
 
