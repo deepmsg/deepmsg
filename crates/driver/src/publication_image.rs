@@ -1087,12 +1087,33 @@ impl PublicationImage {
 
         system_counters::propose_max(counters, regions, self.counters.rcv_pos, rebuilt);
 
-        // A status message is due when the reader has moved a quarter of a
-        // window since the last one (`:545-553`).
-        let window_length = self.next_sm_receiver_window_length;
+        // The strategy is asked what window this rebuild leaves, and whether
+        // the reader has to be told now (`:534-541`). What it is given is the
+        // whole of what the reference gives it, `loss_found` included — CUBIC
+        // shrinks on a loss and cannot see one from anywhere else.
+        let rebuild = self.congestion_control.on_track_rebuild(
+            counters,
+            regions,
+            now_ns,
+            min_sub_pos,
+            self.next_sm_position,
+            hwm_position,
+            rebuild_position,
+            rebuilt,
+            scan.loss_found,
+        );
+
+        let window_length = rebuild.window_length;
         let threshold = window_length / 4;
 
-        if min_sub_pos > self.next_sm_position + i64::from(threshold) {
+        // Three reasons to send one, and the first two are the reference's
+        // (`:543-553`): the strategy said so, the reader has moved a quarter of
+        // a window, or the window itself changed — which is how a CUBIC image
+        // tells its sender that a loss just cost it half of it.
+        if rebuild.should_force_sm
+            || min_sub_pos > self.next_sm_position + i64::from(threshold)
+            || window_length != self.next_sm_receiver_window_length
+        {
             // A term behind the slowest reader is a term that reader is done
             // with, and cleaning it here — in the same breath as the status
             // message that reports it — is what the reference does (`:551`).
@@ -1605,6 +1626,13 @@ impl PublicationImage {
         self.congestion_control.initial_window_length()
     }
 
+    /// The strategy this image runs, for a caller that has to know what it took
+    /// — the conductor, which gives an image's counters back
+    /// (`aeron_cubic_…_fini`, `aeron_congestion_control.c:342-352`).
+    pub const fn congestion_control(&self) -> &CongestionControl {
+        &self.congestion_control
+    }
+
     /// The term length, as the metadata holds it.
     pub const fn term_length(&self) -> i32 {
         self.term_length
@@ -1738,6 +1766,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::congestion_control::{CongestionControl, Strategy};
     use crate::media::receive_endpoint::DestinationId;
     use crate::protocol::FrameHeader;
     use crate::subscribable::TetherState;
@@ -1778,6 +1807,36 @@ mod tests {
             )
             .expect("four-to-one")
         }
+    }
+
+    /// The strategy the fixture's image runs, built the way the conductor
+    /// builds one (`CongestionControl::create`) over the fixture's own counter
+    /// manager — so a CUBIC image here has real `rcv-cc-cubic-*` counters to
+    /// write into.
+    fn strategy_for(
+        strategy: Strategy,
+        counters: &mut CounterManager,
+        holder: &mut Counters,
+        term_length: i32,
+    ) -> CongestionControl {
+        let regions = holder.open();
+
+        CongestionControl::create(
+            strategy,
+            &crate::config::DriverConfig::default(),
+            counters,
+            &regions,
+            7,
+            SESSION_ID,
+            STREAM_ID,
+            b"aeron:udp?endpoint=127.0.0.1:40123",
+            1408,
+            term_length,
+            CHANNEL_WINDOW,
+            0,
+            0,
+        )
+        .expect("a strategy")
     }
 
     /// The directory an image's log buffer lands in, removed when it goes.
@@ -1831,7 +1890,31 @@ mod tests {
             Self::build(false, false, None, true, false)
         }
 
+        /// The same image under a **CUBIC** strategy, for the tests that need
+        /// a window that moves.
+        fn cubic() -> Self {
+            Self::build_with(Strategy::Cubic, false, false, None, true, true)
+        }
+
         fn build(
+            group_semantics: bool,
+            is_response: bool,
+            nak_delay_ns: Option<i64>,
+            is_reliable: bool,
+            is_sparse: bool,
+        ) -> Self {
+            Self::build_with(
+                Strategy::Static,
+                group_semantics,
+                is_response,
+                nak_delay_ns,
+                is_reliable,
+                is_sparse,
+            )
+        }
+
+        fn build_with(
+            strategy: Strategy,
             group_semantics: bool,
             is_response: bool,
             nak_delay_ns: Option<i64>,
@@ -1908,7 +1991,7 @@ mod tests {
                     rcv_pos,
                     rcv_naks_sent,
                 },
-                CongestionControl::static_window(CHANNEL_WINDOW, TERM_LENGTH),
+                strategy_for(strategy, &mut counters, &mut holder, TERM_LENGTH),
                 // The channel's own window, uncut: what the metadata carries.
                 CHANNEL_WINDOW,
                 STATUS_MESSAGE_TIMEOUT_NS,
@@ -2953,6 +3036,35 @@ mod tests {
             Some(CHANNEL_WINDOW),
             metadata.load_i32_relaxed(descriptor::RECEIVER_WINDOW_LENGTH_OFFSET),
             "uncut, as the reference writes it"
+        );
+    }
+
+    /// A CUBIC image is a CUBIC window. The image advertises what its strategy
+    /// says (`aeron_publication_image.c:377-380` — it keeps no window of its
+    /// own), and with CUBIC that is the congestion window it starts at, not the
+    /// channel's `rcv-wnd=` that the static strategy would have offered.
+    ///
+    /// Ten MTUs, because the channel's window of 128 KiB is cut to half a 64 KiB
+    /// term, which is 23 congestion windows — more than `INITIAL_CWND`, so the
+    /// start is ten.
+    #[test]
+    fn a_cubic_image_advertises_the_congestion_window() {
+        let fixture = Fixture::cubic();
+
+        assert_eq!(10 * 1408, fixture.image.initial_window_length());
+        assert_eq!(
+            10 * 1408,
+            fixture.image.window_length(),
+            "and that is what its next status message carries"
+        );
+        assert_eq!(
+            2,
+            fixture.image.congestion_control().counter_ids().len(),
+            "with the two counters CUBIC takes"
+        );
+        assert!(
+            fixture.image.initial_window_length() < CHANNEL_WINDOW,
+            "which is a different window from the channel's, or this test says nothing"
         );
     }
 

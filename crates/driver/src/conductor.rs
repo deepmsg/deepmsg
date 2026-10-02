@@ -1486,7 +1486,9 @@ impl Conductor {
         }
 
         // The counters and the log buffer. The image is gone from the
-        // receiver, so nothing is reading either of them.
+        // receiver, so nothing is reading either of them — the strategy's own
+        // two among them, which CUBIC is the only one to take
+        // (`aeron_cubic_…_fini`, `aeron_congestion_control.c:342-352`).
         if let Some(region) = self.cnc.counter_regions() {
             let _ = self
                 .counters
@@ -1494,6 +1496,10 @@ impl Conductor {
             let _ = self
                 .counters
                 .free(&region, image.counters.rcv_pos, self.now_ms);
+
+            for counter_id in &image.congestion_control_counters {
+                let _ = self.counters.free(&region, *counter_id, self.now_ms);
+            }
         }
 
         // The image's log buffer goes back through the agent, because a delete

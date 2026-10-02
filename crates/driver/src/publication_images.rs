@@ -61,6 +61,17 @@ pub struct PublicationImageRecord {
     pub path: PathBuf,
     /// The counters a client reads.
     pub counters: ImageCounters,
+    /// The counters the image's **strategy** took, if it took any: CUBIC's
+    /// `rcv-cc-cubic-rtt` and `rcv-cc-cubic-wnd`
+    /// (`aeron_cubic_congestion_control_strategy_state_stct`,
+    /// `aeron_congestion_control.c:432-462`). The static window takes none.
+    ///
+    /// They are kept here, on the conductor's side, for the same reason the
+    /// three above are: the strategy itself lives with the image in the
+    /// receiver's thread, and giving a counter back is the conductor's to do
+    /// (`aeron_cubic_…_fini`, `:342-352`, which the reference calls when the
+    /// image goes at `:422`).
+    pub congestion_control_counters: Vec<i32>,
     /// Where it is in its life (`aeron_publication_image_on_time_event`).
     pub state: ImageState,
     /// When that changed.
@@ -496,6 +507,8 @@ impl PublicationImages {
             now.ns,
         );
 
+        let congestion_control_counters = image.congestion_control().counter_ids().to_vec();
+
         if let Some(reason) = pending.invalidation {
             image.invalidate(&reason);
         }
@@ -517,6 +530,7 @@ impl PublicationImages {
                 .unwrap_or_default(),
             path: pending.path,
             counters: pending.counters,
+            congestion_control_counters,
             state: ImageState::Active,
             time_of_last_state_change_ns: now.ns,
             refcount: 0,
