@@ -3630,14 +3630,20 @@ impl Conductor {
                     // The recording is deferred, like every other error this
                     // pass notices: the regions are held here and
                     // `record_pending_faults` is the pass that has both the log
-                    // and the counter (`log_error`). The words are the
-                    // reference's own (`aeron_name_resolver.c:204-208`,
-                    // `Unresolved - %s=%s, name-and-port=%s`), because a
-                    // deployment reads this line to find which name went wrong.
-                    let description = format!("Unresolved - endpoint={endpoint_name}, {error}");
-
+                    // and the counter (`log_error`). The words come from the
+                    // resolution itself — the wrapper composes the reference's
+                    // `Unresolved - %s=%s, name-and-port=%s` line under the
+                    // code line, because a deployment reads it to find which
+                    // name went wrong — and the code is the one that failure
+                    // carries, not the generic code it used to be recorded
+                    // under: the reference's re-resolve command takes its
+                    // failure's code from the result the agent filled in
+                    // (`aeron_driver_conductor.c:6900-6911`), and a name that
+                    // will not resolve arrives there as `-9`
+                    // (`:2333-2338` turns it back into the positive code the
+                    // client is told and the log records).
                     self.pending_log_errors
-                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                        .push((error.error_code(), error.to_string()));
                 }
             }
         }
@@ -3697,10 +3703,10 @@ impl Conductor {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let description = format!("Unresolved - control={control_name}, {error}");
-
+                    // The same words and the same code as the send side above:
+                    // the wrapper composes the line, this pass only files it.
                     self.pending_log_errors
-                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                        .push((error.error_code(), error.to_string()));
                 }
             }
         }

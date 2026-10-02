@@ -66,7 +66,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::channel_uri::{ChannelUri, Transport, UriError};
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use crate::name_resolver::Resolver;
+use crate::name_resolver::{Resolution, Resolver};
 use crate::sys::{self, AddressFamily};
 
 /// The tag of a channel that did not name one (`AERON_URI_INVALID_TAG`,
@@ -210,6 +210,16 @@ pub enum UdpChannelError {
     /// A host, a service or an interface that did not resolve. The reference's
     /// answer is `EINVAL`, which reaches a client as a generic error.
     Resolution(String),
+    /// A **name** the resolver refused (`aeron_name_resolver_resolve_func`'s
+    /// `-1`). Its own variant rather than a [`UdpChannelError::Resolution`],
+    /// because the code differs: the reference sets
+    /// `-AERON_ERROR_CODE_UNKNOWN_HOST` here (`util/aeron_netutil.c:76`) and
+    /// an `EINVAL` there, and `aeron_driver_conductor_on_error` sends the
+    /// negated one as its absolute value and the positive one as a generic
+    /// error (`:2333-2338`). The code is part of what the client is told *and*
+    /// of what the driver records — the entry's first line is the code's own
+    /// text — so the two cases cannot share one.
+    UnknownHost(String),
     /// A channel this build does not serve. A divergence from the reference,
     /// which would serve it — recorded in `docs/compat.md`.
     Unsupported(String),
@@ -232,7 +242,15 @@ impl UdpChannelError {
             )
             | Self::InvalidChannel(_) => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             Self::Unsupported(_) => deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            Self::Uri(_) | Self::Resolution(_) => deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+            // A name that will not resolve is its own code, not the generic
+            // one: the reference sets `-AERON_ERROR_CODE_UNKNOWN_HOST` at the
+            // resolver's own site (`util/aeron_netutil.c:76`), and its
+            // conductor turns the negated code back into this positive one for
+            // the client (`aeron_driver_conductor.c:2333-2338`). The code is
+            // not cosmetic — it is the first line of the entry the driver
+            // records, and the reference's own tests filter on that text.
+            Self::UnknownHost(_) => deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+            Self::Resolution(_) | Self::Uri(_) => deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
         }
     }
 }
@@ -243,6 +261,7 @@ impl std::fmt::Display for UdpChannelError {
             Self::Uri(error) => write!(f, "{error}"),
             Self::InvalidChannel(message)
             | Self::Resolution(message)
+            | Self::UnknownHost(message)
             | Self::Unsupported(message) => f.write_str(message),
         }
     }
@@ -1138,7 +1157,19 @@ fn resolve_name(
     let resolved = resolve_name_inner(names, uri_param_name, text);
 
     match (resolved, unresolved) {
-        (Err(UdpChannelError::Resolution(_)), Unresolved::Keep) => {
+        // What is kept is a **name** that did not answer, which is the case
+        // the reference sets `AF_UNSPEC` for. Two variants spell it, and the
+        // second is why this arm names both: a channel resolved through the
+        // driver's resolver answers [`UdpChannelError::UnknownHost`], while
+        // `Names::System` — the shortcut with no resolver in it, and so no URI
+        // parameter to compose a message with — answers the same failure as a
+        // plain [`UdpChannelError::Resolution`]. A channel whose `endpoint=` is
+        // not `host:port` at all reaches this arm too and is still refused:
+        // the `split_address` below is where it fails.
+        (
+            Err(UdpChannelError::UnknownHost(_) | UdpChannelError::Resolution(_)),
+            Unresolved::Keep,
+        ) => {
             // The port survives and the address does not: `0.0.0.0:40456` is
             // what "known, not resolvable" looks like here, and the port is
             // what a re-resolution asks about (`:5337-5343`).
@@ -1289,15 +1320,72 @@ pub fn resolve_host_and_port_with(
         );
     }
 
-    resolution
-        .into_address(text)
-        .map(|address| SocketAddr::new(address.ip(), port))
+    match resolution {
+        Resolution::Found(address) => Ok(SocketAddr::new(address.ip(), port)),
+        Resolution::Failed(what) => Err(UdpChannelError::UnknownHost(resolution_failure(
+            uri_param_name,
+            text,
+            &what,
+        ))),
+    }
+}
+
+/// The words a name that will not resolve leaves behind
+/// (`aeron_name_resolver_resolve_host_and_port`'s `exit` block,
+/// `aeron_name_resolver.c:198-211`).
+///
+/// The reference's message is **three lines**, because it is a per-thread
+/// buffer that each layer appends to, and the whole of it is what the client
+/// is handed and what the driver records:
+///
+/// ```text
+/// (-9) unknown host
+/// [aeron_ip_addr_resolver, aeron_netutil.c:75] Unable to resolve host=(wibble): …
+/// [aeron_name_resolver_resolve_host_and_port, aeron_name_resolver.c:204] Unresolved - endpoint=wibble:1234, name-and-port=wibble:1234
+/// ```
+///
+/// The first line is `aeron_err_set`'s preamble — `"(%d) %s\n"` with the
+/// negated code and `aeron_error_code_str`'s text for it
+/// (`util/aeron_error.c:351-374`) — the middle line is the resolver's own
+/// (`util/aeron_netutil.c:75-76`, also the CSV table's `(forced)` refusal at
+/// `aeron_csv_table_name_resolver.c:73`), and the last is this wrapper's
+/// `AERON_APPEND_ERR("Unresolved - %s=%s, name-and-port=%s", …)`.
+///
+/// Probe, reference `aeronmd` on this host, `aeron:udp?endpoint=wibble:1234`:
+/// `cnc-dump --errors` shows the first line and the last two exactly as above,
+/// in that order, each ending in a newline. `name-and-port` is the answer the
+/// **lookup** gave (`address_str`, `:143`, `null` when it failed), and every
+/// resolver in this build answers with the name it was asked, so the text the
+/// channel named is what goes there.
+///
+/// The lines the parse and the agent append after this one
+/// (`[aeron_udp_channel_finish_parse, aeron_udp_channel.c:360] URI: …`,
+/// `failed to parse channel`, the conductor's own command-state line) are not
+/// here: those sites are the resolution-on-the-agent slice's, and they arrive
+/// with it.
+fn resolution_failure(uri_param_name: &str, text: &str, what: &str) -> String {
+    let code = deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST;
+
+    format!(
+        "(-{code}) {}\n{what}\n\
+         [aeron_name_resolver_resolve_host_and_port, aeron_name_resolver.c:204] \
+         Unresolved - {uri_param_name}={text}, name-and-port={text}\n",
+        deepmsg_cnc::error_log::error_code_description(code),
+    )
 }
 
 /// `host:port` into an address, the default resolver's synchronous path
 /// (`aeron_name_resolver_resolve_host_and_port`,
 /// `aeron-driver/src/main/c/aeron_name_resolver.c:129-215`, with the default
 /// resolver's lookup doing nothing on the way, `:103-115`).
+///
+/// This is the shortcut for a caller with **no resolver** — `Names::System`,
+/// which is [`UdpChannel::resolve`] and the tests that use it. A driver's
+/// channels never come here: they go through [`resolve_host_and_port_with`],
+/// which is where the reference's per-thread message, the parameter's name and
+/// [`UdpChannelError::UnknownHost`] live. A name that will not resolve is a
+/// [`UdpChannelError::Resolution`] here, not `UnknownHost`, and that is a
+/// property of the shortcut rather than of the reference.
 ///
 /// # Errors
 ///
@@ -1755,6 +1843,80 @@ mod tests {
         );
     }
 
+    /// The same two answers, through a **resolver** — which is the path a
+    /// driver's destinations take, and the one the test above cannot see: it
+    /// goes through `Names::System`, the shortcut with no resolver in it, and
+    /// a destination that is refused there is refused one layer further out
+    /// than a destination the resolver refuses.
+    ///
+    /// `NameReResolutionTest.shouldHandleMdcManualEndpointInitiallyUnresolved`
+    /// is the reference's case, and it is the one that caught this: the arm
+    /// that keeps an unresolvable destination matched the wrong variant the
+    /// moment a refused name got its own.
+    #[test]
+    fn a_refused_name_is_kept_for_a_destination_and_answered_with_its_own_code() {
+        /// A resolver that refuses everything, the way a name with no answer
+        /// is refused.
+        struct Refusing;
+
+        impl Resolver for Refusing {
+            fn resolve(
+                &mut self,
+                name: &str,
+                _uri_param_name: &str,
+                _is_re_resolution: bool,
+                _family: AddressFamily,
+                _counters: &CounterManager,
+                _regions: &CounterRegions<'_>,
+            ) -> crate::name_resolver::Resolution {
+                crate::name_resolver::Resolution::Failed(format!(
+                    "[aeron_ip_addr_resolver, aeron_netutil.c:75] \
+                     Unable to resolve host=({name}): (forced)"
+                ))
+            }
+        }
+
+        let mut holder = Region(vec![0u8; 64 * 1024 * 4]);
+        let mut values = Region(vec![0u8; 64 * 1024]);
+        let regions = CounterRegions::new(
+            AtomicBuffer::from_slice_mut(&mut holder.0).expect("aligned"),
+            AtomicBuffer::from_slice_mut(&mut values.0).expect("aligned"),
+        )
+        .expect("four-to-one");
+        let counters = CounterManager::new(64 * 1024, 1_000).expect("room");
+        let mut names = Names::Built {
+            resolver: &mut Refusing,
+            counters: &counters,
+            regions: &regions,
+            threshold_ns: 0,
+        };
+
+        let uri = b"aeron:udp?endpoint=ReResTestEndpoint:24326";
+        let parsed = ChannelUri::parse(uri).expect("a URI");
+
+        // Refused: its own variant, and the code the client is told.
+        let refused = UdpChannel::resolve_with(&mut names, Unresolved::Refuse, uri, &parsed)
+            .expect_err("a name the resolver refused is not a channel");
+        assert!(
+            matches!(refused, UdpChannelError::UnknownHost(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+            refused.error_code()
+        );
+
+        // Kept: the wildcard where the address would be, the port it named,
+        // and the name for the re-resolution that follows.
+        let kept = UdpChannel::resolve_with(&mut names, Unresolved::Keep, uri, &parsed)
+            .expect("a destination that is kept");
+        assert_eq!(
+            "0.0.0.0:24326".parse::<SocketAddr>().expect("an address"),
+            kept.remote_data,
+            "the wildcard, and the port it named"
+        );
+    }
+
     /// What a destination URI has to be, and the four ways it can fail
     /// (`:5369-5410`, `:411-460`).
     #[test]
@@ -1873,11 +2035,46 @@ mod tests {
         );
     }
 
+    /// The words of a name that will not resolve, byte for byte, as the
+    /// reference's own driver answers them.
+    ///
+    /// Probed rather than read: a reference `aeronmd` on this host, a client
+    /// adding `aeron:udp?endpoint=wibble:1234`, and the entry read back out of
+    /// its CnC file with `cnc-dump --errors`. The middle line is the
+    /// resolver's, and this build's wording of the failure *after* the colon
+    /// differs — `getaddrinfo`'s `(%d) %s` there, `ToSocketAddrs`'s io error
+    /// here — so what is pinned is the composition around it: the code line
+    /// the entry is filtered on, and the wrapper's own line, which names the
+    /// parameter and the text the channel asked about.
+    #[test]
+    fn a_name_that_will_not_resolve_leaves_the_references_three_lines() {
+        assert_eq!(
+            "(-9) unknown host\n\
+             [aeron_ip_addr_resolver, aeron_netutil.c:75] \
+             Unable to resolve host=(wibble): failed to lookup address information: \
+             Name or service not known\n\
+             [aeron_name_resolver_resolve_host_and_port, aeron_name_resolver.c:204] \
+             Unresolved - endpoint=wibble:1234, name-and-port=wibble:1234\n",
+            resolution_failure(
+                "endpoint",
+                "wibble:1234",
+                "[aeron_ip_addr_resolver, aeron_netutil.c:75] Unable to resolve host=(wibble): \
+                 failed to lookup address information: Name or service not known",
+            )
+        );
+    }
+
     #[test]
     fn the_error_codes_are_the_ones_the_reference_answers_with() {
         // `-AERON_ERROR_CODE_INVALID_CHANNEL` is sent as its absolute value; a
-        // resolution failure is an errno, which reaches the client as a
-        // generic error (`aeron_driver_conductor.c:2326-2358`).
+        // failure that is not a *name* is an errno — `EINVAL` for a multicast
+        // group that will not do, say — and reaches the client as a generic
+        // error (`aeron_driver_conductor.c:2326-2358`). A name, on the other
+        // hand, arrives negated from the resolver and is sent as
+        // `ERROR_CODE_UNKNOWN_HOST`; this path cannot reach that one, because
+        // `Names::System` is the shortcut without a resolver in it — the
+        // driver's channels go through [`resolve_host_and_port_with`], which
+        // answers [`UdpChannelError::UnknownHost`].
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             refuse("aeron:udp?mtu=1408").error_code()

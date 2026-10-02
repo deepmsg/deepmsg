@@ -392,6 +392,23 @@ pub const ERROR_CODE_UNKNOWN_PUBLICATION: i32 = 3;
 /// `AERON_ERROR_CODE_NOT_SUPPORTED` (`aeron_client_error.h:20`).
 pub const ERROR_CODE_NOT_SUPPORTED: i32 = 8;
 
+/// `AERON_ERROR_CODE_UNKNOWN_HOST` (`aeron_client_error.h:19`).
+///
+/// What a channel whose name will not resolve answers with — the code the
+/// reference's `aeron_driver_conductor_on_error` derives from the negated code
+/// its resolver set: `AERON_SET_ERR(-AERON_ERROR_CODE_UNKNOWN_HOST, …)` leaves
+/// `aeron_errcode()` at `-9`, and the conductor sends `-os_errno`
+/// (`aeron_driver_conductor.c:2333-2338`).
+///
+/// The sign is the whole reason this code is worth its own constant: the
+/// **description** the driver records starts with the code's own text
+/// (`compose_description`, and in C `aeron_err_set`'s `"(%d) %s\n"` preamble),
+/// so a resolution failure recorded under `GENERIC_ERROR` puts
+/// `(11) generic error, see message` where the reference puts
+/// `(-9) unknown host` — and the reference's own `SystemTestWatcher` filters
+/// **by that text** (`AsyncResourceTest.java:180-181`).
+pub const ERROR_CODE_UNKNOWN_HOST: i32 = 9;
+
 /// `AERON_ERROR_CODE_GENERIC_ERROR` (`aeron_client_error.h:21`).
 ///
 /// What the reference sends when a command fails for a reason it has no code

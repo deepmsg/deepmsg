@@ -1427,16 +1427,17 @@ mod tests {
             "and C's address came from B, which was the only one configured with it"
         );
         assert!(
-            a.resolve(
-                "D",
-                "endpoint",
-                false,
-                AddressFamily::Inet,
-                &fixture.counters,
-                &regions
-            )
-            .into_address("endpoint=D:40456")
-            .is_err(),
+            matches!(
+                a.resolve(
+                    "D",
+                    "endpoint",
+                    false,
+                    AddressFamily::Inet,
+                    &fixture.counters,
+                    &regions
+                ),
+                crate::name_resolver::Resolution::Failed(_)
+            ),
             "and a name nobody knows is still nobody's"
         );
     }
