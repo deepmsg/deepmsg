@@ -17,23 +17,34 @@ use deepmsg_tests::driver::{self, OwnDriver};
 /// The stream every test here asks on.
 const STREAM_ID: i32 = 1001;
 
-/// A name that cannot resolve, and that fails **without asking a nameserver**.
+/// A name that cannot resolve, and that is refused **without a nameserver being
+/// asked** — which is the whole of why it looks like this.
 ///
-/// The reference's own case uses a bare `wibble`, and RFC 2606 would suggest
-/// `something.invalid`; both were tried here and both turn this test into a
-/// measure of the host's DNS. A name glibc has to *ask* about costs whatever
-/// the resolver costs — this machine's nameserver is unreachable and takes
-/// anywhere from 0.2 s to 20 s to say so — while the resolution is
-/// **synchronous in the conductor**, so a slow answer stops the driver's
-/// heartbeat and the client declares the driver dead at ten seconds
-/// (`AsyncResourceTest.shouldDetectUnknownHost` fails here for the same
-/// reason, against any driver that resolves where the reference C driver
-/// does).
+/// Every name that is *asked about* costs whatever the host's resolver costs,
+/// and this host's nameserver is unreachable: measured here, `wibble` takes
+/// 0.4 s to 15 s, `wibble.invalid` 10 s to 20 s, `wibble.` a steady 5 s, and a
+/// dotted quad that is not a quad — `999.999.999.999`, the first thing tried —
+/// 0.17 s most runs and 5.78 s in others. That matters because the resolution
+/// is **synchronous in the conductor** on this build: a slow answer stops the
+/// driver's heartbeat, and the client declares the driver dead after ten
+/// seconds of it. A test written with any of those names fails here one run in
+/// five, and the driver is not what is slow.
 ///
-/// An address that is not an address is refused by `getaddrinfo` itself, in
-/// microseconds, which is the same failure — a name that does not resolve —
-/// with the network taken out of it.
-const CHANNEL: &str = "aeron:udp?endpoint=999.999.999.999:1234";
+/// An empty label is refused by the resolver's own syntax in microseconds on
+/// every run measured, which is the same failure — a name that does not
+/// resolve — with the network taken out of it.
+///
+/// The divergence underneath is real and belongs to a slice of its own: the
+/// reference's add-publication command is a state machine that waits while the
+/// **native resource agent** parses the channel
+/// (`aeron_driver_conductor.c:4113-4131`,
+/// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_PENDING`), so its
+/// conductor never waits on a nameserver, and `AsyncResourceTest` passes there
+/// on this same host. It is written up in `docs/compat.md`.
+const CHANNEL: &str = "aeron:udp?endpoint=nothing..invalid:1234";
+
+/// The host of [`CHANNEL`], which every refusal is expected to name.
+const HOST: &str = "nothing..invalid";
 
 #[test]
 fn a_publication_whose_name_does_not_resolve_is_refused_by_name() {
@@ -50,11 +61,11 @@ fn a_publication_whose_name_does_not_resolve_is_refused_by_name() {
         .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
         .expect_err("a name that does not resolve is not a publication");
 
-    // The words are the default resolver's own, and they name the host: a
-    // client that is told `Unable to resolve host=(...)` knows which part of
-    // its channel to change.
+    // The words are the resolver's own, and they name the host: a client told
+    // which name could not be resolved knows which part of its channel to
+    // change.
     assert!(
-        error.to_string().contains("999.999.999.999"),
+        error.to_string().contains(HOST),
         "the refusal does not name the host it could not resolve: {error}\n\
          the driver said:\n{}",
         own.log_tail(40)
@@ -77,7 +88,7 @@ fn a_subscription_whose_name_does_not_resolve_is_refused_by_name() {
         .expect_err("a name that does not resolve is not a subscription");
 
     assert!(
-        error.to_string().contains("999.999.999.999"),
+        error.to_string().contains(HOST),
         "the refusal does not name the host it could not resolve: {error}\n\
          the driver said:\n{}",
         own.log_tail(40)
