@@ -867,22 +867,27 @@ impl ReceiveChannelEndpoint {
     /// the refcount the conductor's link keeps here).
     pub fn add_subscription(&mut self, stream_id: i32) {
         self.dispatcher.add_subscription(stream_id);
-
-        match self
-            .stream_refcounts
-            .iter_mut()
-            .find(|(id, _)| *id == stream_id)
-        {
-            Some((_, count)) => *count += 1,
-            None => self.stream_refcounts.push((stream_id, 1)),
-        }
+        self.incref_stream(stream_id);
     }
 
     /// A subscription that named a session arrived.
+    ///
+    /// The stream is **not** marked as reading every session — that is the
+    /// whole difference from [`Self::add_subscription`], and it is what the
+    /// reference's two dispatcher calls do: `on_add_subscription` marks the
+    /// stream (`:839-843`) while `on_add_subscription_by_session` only names
+    /// the session (`:851-855`). A response subscription is the one that
+    /// arrives this way, and it reads the session its `RSP_SETUP` named and
+    /// nothing else, so a `SETUP` carrying any other session on the same
+    /// stream is silence rather than an image.
+    ///
+    /// The stream's **refcount** is still taken, because the endpoint is held
+    /// for as long as the subscription is; the release path takes it back the
+    /// same way (`remove_subscription_by_session` decrements both).
     pub fn add_subscription_by_session(&mut self, stream_id: i32, session_id: i32) {
         self.dispatcher
             .add_subscription_by_session(stream_id, session_id);
-        self.add_subscription(stream_id);
+        self.incref_stream(stream_id);
 
         match self
             .session_refcounts
@@ -891,6 +896,18 @@ impl ReceiveChannelEndpoint {
         {
             Some((_, count)) => *count += 1,
             None => self.session_refcounts.push(((stream_id, session_id), 1)),
+        }
+    }
+
+    /// One more holder of a stream, which is what the endpoint is released on.
+    fn incref_stream(&mut self, stream_id: i32) {
+        match self
+            .stream_refcounts
+            .iter_mut()
+            .find(|(id, _)| *id == stream_id)
+        {
+            Some((_, count)) => *count += 1,
+            None => self.stream_refcounts.push((stream_id, 1)),
         }
     }
 
@@ -1594,6 +1611,8 @@ mod tests {
 
     use deepmsg_core::buffer::AtomicBuffer;
 
+    use crate::media::dispatcher::SetupInterest;
+
     const VALUES_LENGTH: usize = 64 * 1024;
 
     #[repr(align(64))]
@@ -1889,6 +1908,65 @@ mod tests {
 
         assert!(!without.has_explicit_control());
         assert_eq!(None, without.setup_address(), "nothing to ask");
+    }
+
+    /// A subscription that named a session does **not** make the whole stream
+    /// readable, which is the difference between the endpoint's two add calls
+    /// and the reference's (`aeron_receive_channel_endpoint_on_add_subscription`
+    /// marks the stream, `:839-843`; `..._on_add_subscription_by_session` names
+    /// one session and nothing else, `:851-855`).
+    ///
+    /// It is a distinction with a wire consequence: a **response** subscription
+    /// arrives by session, and a `SETUP` carrying any other session on the same
+    /// stream has to be silence rather than an image — which is what
+    /// `tests/interop/response_channel.rs::a_response_subscription_is_not_a_reader`
+    /// is about, and what this build got wrong by routing the by-session add
+    /// through the whole-stream one.
+    #[test]
+    fn a_subscription_that_named_a_session_does_not_open_the_whole_stream() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40223|control-mode=manual"),
+            None,
+            stub(40223),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+            1_000_000,
+        )
+        .expect("an endpoint");
+
+        endpoint.add_subscription_by_session(1001, 7);
+
+        assert_eq!(
+            SetupInterest::CreateImage,
+            endpoint.dispatcher_mut().on_setup(1001, 7),
+            "the session it named is wanted"
+        );
+        assert_eq!(
+            SetupInterest::None,
+            endpoint.dispatcher_mut().on_setup(1001, 8),
+            "and another session on the same stream is not: a response \
+             subscription reads only what its RSP_SETUP named"
+        );
+        assert_eq!(
+            SetupInterest::None,
+            endpoint.dispatcher_mut().on_setup(1002, 7),
+            "nor is a stream nothing subscribed to"
+        );
+
+        // The whole-stream call is the one that opens every session, and the
+        // endpoint still makes it for an ordinary subscription.
+        endpoint.add_subscription(1003);
+        assert_eq!(
+            SetupInterest::CreateImage,
+            endpoint.dispatcher_mut().on_setup(1003, 9)
+        );
     }
 
     /// An endpoint holds what it is given and reads from all of them: one on
