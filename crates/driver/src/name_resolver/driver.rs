@@ -1332,6 +1332,79 @@ mod tests {
         );
     }
 
+    /// A name gets past the **first** hop: C is only ever configured on B, and
+    /// A learns it anyway, because B sends its whole cache to everyone it knows
+    /// (`aeron_driver_name_resolver_send_neighbor_resolutions`, `:1023-1085`) —
+    /// the reference's own `shouldSeeNeighborFromGossip`
+    /// (`aeron_name_resolver_test.cpp:575-629`, which asserts the same three-way
+    /// knowledge among three resolvers).
+    #[test]
+    fn a_name_travels_past_the_first_hop() {
+        let mut fixture = Fixture::new();
+        let port_c = free_port();
+
+        let mut c = resolver(&mut fixture, "C", port_c, None);
+        let port_b = free_port();
+        let mut b = resolver(
+            &mut fixture,
+            "B",
+            port_b,
+            Some(&format!("127.0.0.1:{port_c}")),
+        );
+        let port_a = free_port();
+        let mut a = resolver(
+            &mut fixture,
+            "A",
+            port_a,
+            Some(&format!("127.0.0.1:{port_b}")),
+        );
+
+        let regions = fixture.holder.open();
+        let mut now_ms = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while Instant::now() < deadline {
+            now_ms += DUTY_CYCLE_MS;
+            a.work(now_ms, &fixture.counters, &regions);
+            b.work(now_ms, &fixture.counters, &regions);
+            c.work(now_ms, &fixture.counters, &regions);
+
+            // A knows B and, through B, C: two names it was never told about.
+            if 2 <= a.cached_names() {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(2, a.cached_names(), "A heard about B and about C");
+        assert_eq!(
+            Resolution::Found(format!("127.0.0.1:{port_c}").parse().expect("an address")),
+            a.resolve(
+                "C",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &fixture.counters,
+                &regions
+            ),
+            "and C's address came from B, which was the only one configured with it"
+        );
+        assert!(
+            a.resolve(
+                "D",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &fixture.counters,
+                &regions
+            )
+            .into_address("endpoint=D:40456")
+            .is_err(),
+            "and a name nobody knows is still nobody's"
+        );
+    }
+
     /// A list is believed for as long as its entries are: with the neighbor
     /// timeout reached, the neighbor and the cached name are both gone and both
     /// counters are back to zero (`:1087-1112`, and the cache's own timeout
