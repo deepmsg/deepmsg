@@ -208,6 +208,31 @@ pub struct DriverResolver {
     /// `aligned_buffer` (`:136-137`): reused, because a resolver sends on a
     /// clock and neither path allocates.
     send_buffer: Vec<u8>,
+    /// The resolver this one asks when its own knowledge runs out — and the
+    /// answer to a name it does not know, which is every name that is neither
+    /// its own nor in its cache (`bootstrap_resolver`, `:96`, used at
+    /// `:1226-1227`).
+    ///
+    /// The reference builds it from a supplier of its own
+    /// (`driver_name_resolver_bootstrap_resolver_supplier_func`, `:299-307`),
+    /// defaulting to the default resolver; no setting in `aeronmd.h` or
+    /// `Configuration.java` names another, so this build holds that default —
+    /// but it holds it **as a resolver**, which is the part that matters:
+    /// [`Resolver::resolve`] takes a host, not `host:port`.
+    ///
+    /// This is where `DriverNameResolverSystemTest`'s
+    /// `shouldResolveDriverNameAndAllowConnection` failed: the fall-through
+    /// called `udp_channel::resolve_host_and_port`, whose contract is
+    /// `host:port`, so a channel naming `localhost:24325` was answered with
+    /// `port invalid: '': localhost` — the port half of an address the
+    /// resolver was never given. Same shape as the slice's other contract
+    /// corrections: the wrapper's signature is not the callee's contract.
+    ///
+    /// `Send` beside `Resolver` because the whole resolver is: the supplier
+    /// hands one back as `Box<dyn Resolver + Send>`, and the reference's own
+    /// reason for that is the one written up in `docs/compat.md` — it runs on
+    /// the native-resource agent's thread, not the conductor's.
+    bootstrap_resolver: Box<dyn Resolver + Send>,
 }
 
 impl DriverResolver {
@@ -344,6 +369,7 @@ impl DriverResolver {
                 .collect(),
             receive_datagrams: Datagrams::new(),
             send_buffer: vec![0u8; MAX_UDP_PAYLOAD_LENGTH as usize],
+            bootstrap_resolver: Box::new(DefaultResolver),
         })
     }
 
@@ -1006,11 +1032,11 @@ impl Resolver for DriverResolver {
     fn resolve(
         &mut self,
         name: &str,
-        _uri_param_name: &str,
-        _is_re_resolution: bool,
+        uri_param_name: &str,
+        is_re_resolution: bool,
         family: AddressFamily,
-        _counters: &CounterManager,
-        _regions: &CounterRegions<'_>,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
     ) -> Resolution {
         let res_type = match family {
             AddressFamily::Inet6 => RES_TYPE_NAME_TO_IP6,
@@ -1025,10 +1051,17 @@ impl Resolver for DriverResolver {
             return Resolution::Found(self.local_socket_addr);
         }
 
-        match resolve_host_and_port(name) {
-            Ok(address) => Resolution::Found(address),
-            Err(error) => Resolution::Failed(error.to_string()),
-        }
+        // The answered address carries port zero — the contract is a **host**
+        // — and the caller writes the channel's port back
+        // (`aeron_name_resolver.c:181-191`).
+        self.bootstrap_resolver.resolve(
+            name,
+            uri_param_name,
+            is_re_resolution,
+            family,
+            counters,
+            regions,
+        )
     }
 
     /// The reference's driver resolver asks its **bootstrap resolver** and
@@ -1042,7 +1075,8 @@ impl Resolver for DriverResolver {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> Lookup {
-        DefaultResolver.lookup(name, uri_param_name, is_re_lookup, counters, regions)
+        self.bootstrap_resolver
+            .lookup(name, uri_param_name, is_re_lookup, counters, regions)
     }
 
     /// Resolve the bootstrap neighbors, which is the whole of what starting
