@@ -45,8 +45,12 @@ const NEIGHBORS_TYPE_ID: i32 = 15;
 /// generous multiple of the slowest of them rather than a tuned number.
 const GOSSIP_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The neighbors one driver reports: each counter's value and label.
-fn neighbors(dir: &std::path::Path) -> Vec<(i64, String)> {
+/// What one driver's counter file says about its neighbors: each counter's
+/// value, and the label it was given.
+type Neighbors = Vec<(i64, String)>;
+
+/// The neighbors one driver reports.
+fn neighbors(dir: &std::path::Path) -> Neighbors {
     let Ok(cnc) = CncFile::try_open(dir) else {
         return Vec::new();
     };
@@ -76,10 +80,7 @@ fn sole_neighbor(reported: &[(i64, String)]) -> Option<&str> {
 }
 
 /// Poll both drivers until each reports one neighbor, or the deadline passes.
-fn await_both(
-    ours: &std::path::Path,
-    theirs: &std::path::Path,
-) -> (Vec<(i64, String)>, Vec<(i64, String)>) {
+fn await_both(ours: &std::path::Path, theirs: &std::path::Path) -> (Neighbors, Neighbors) {
     let start = Instant::now();
     let mut our_neighbors = Vec::new();
     let mut their_neighbors = Vec::new();
