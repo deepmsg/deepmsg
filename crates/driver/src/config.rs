@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use deepmsg_cnc::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncLayout};
 
 use crate::flowcontrol::Supplier;
+use crate::port_manager::{PortRange, PortRangeError};
 use crate::publication_params;
 use crate::sys::{self, SocketBufferLengths};
 
@@ -719,6 +720,15 @@ pub struct DriverConfig {
     /// the sender and the receiver look for names that need resolving again,
     /// and **zero to turn it off** (`aeron_driver_sender.c:183`).
     pub re_resolution_check_interval_ns: i64,
+    /// `aeron.sender.wildcard.port.range`
+    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:878`): the ports a
+    /// publication whose channel named port zero is given, and `0 0` to let the
+    /// kernel choose (`aeron_driver_context.c:1058-1069`).
+    pub sender_wildcard_port_range: PortRange,
+    /// `aeron.receiver.wildcard.port.range`
+    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`), likewise, for
+    /// the destinations a subscription listens on (`:1071-1081`).
+    pub receiver_wildcard_port_range: PortRange,
 }
 
 impl Default for DriverConfig {
@@ -797,6 +807,12 @@ impl Default for DriverConfig {
                 RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
             name_resolver_threshold_ns: NAME_RESOLVER_THRESHOLD_NS_DEFAULT,
             re_resolution_check_interval_ns: RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT,
+            // Both default to the kernel's wildcard, which is the state
+            // `aeron_wildcard_port_manager_init` leaves them in
+            // (`aeron_port_manager.c:49-52`): a driver that named no range is
+            // not a driver that named `0 0`, but it behaves as one.
+            sender_wildcard_port_range: PortRange::OS_WILDCARD,
+            receiver_wildcard_port_range: PortRange::OS_WILDCARD,
         }
     }
 }
@@ -1255,6 +1271,30 @@ impl DriverConfig {
                 parse_duration_ns(&Setting::DRIVER_RERESOLUTION_CHECK_INTERVAL, &value)?;
         }
 
+        // The two wildcard ranges are read as text and parsed here, which is
+        // where the reference reads them too: a range that will not parse
+        // fails the driver's start-up rather than the channel that needed it
+        // (`aeron_driver_context.c:1058-1082`, whose `goto error` is the whole
+        // of what its `AERON_APPEND_ERR` is for).
+        for (setting, field) in [
+            (
+                &Setting::SENDER_WILDCARD_PORT_RANGE,
+                &mut config.sender_wildcard_port_range,
+            ),
+            (
+                &Setting::RECEIVER_WILDCARD_PORT_RANGE,
+                &mut config.receiver_wildcard_port_range,
+            ),
+        ] {
+            if let Some(value) = get(setting) {
+                *field = PortRange::parse(&value).map_err(|reason| ConfigError::PortRange {
+                    name: setting.property,
+                    value,
+                    reason,
+                })?;
+            }
+        }
+
         // A resolver that gossips needs a name: its own name is what it
         // announces, and the reference refuses the start-up rather than
         // running one that can only answer other people's questions
@@ -1513,6 +1553,20 @@ impl Setting {
         property: "driver.resolver.interface",
         env: "AERON_DRIVER_RESOLVER_INTERFACE",
     };
+    /// `aeron.sender.wildcard.port.range`
+    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:878`): **two numbers
+    /// separated by a space**, which is what the reference's two `strtoll`
+    /// calls make of it (`aeron_port_manager.c:176-211`).
+    const SENDER_WILDCARD_PORT_RANGE: Self = Self {
+        property: "sender.wildcard.port.range",
+        env: "AERON_SENDER_WILDCARD_PORT_RANGE",
+    };
+    /// `aeron.receiver.wildcard.port.range`
+    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`).
+    const RECEIVER_WILDCARD_PORT_RANGE: Self = Self {
+        property: "receiver.wildcard.port.range",
+        env: "AERON_RECEIVER_WILDCARD_PORT_RANGE",
+    };
     /// `aeron.driver.resolver.bootstrap.neighbor` (`aeronmd.h:800`).
     const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR: Self = Self {
         property: "driver.resolver.bootstrap.neighbor",
@@ -1744,6 +1798,18 @@ pub enum ConfigError {
         /// What it was set to.
         value: String,
     },
+    /// A wildcard port range the reference's parser would reject
+    /// (`aeron_parse_port_range`, `aeron_port_manager.c:176-211`) — which for
+    /// the reference is a driver that does not start
+    /// (`aeron_driver_context.c:1062-1066`).
+    PortRange {
+        /// The setting, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+        /// Which of the three ways it was not a range.
+        reason: PortRangeError,
+    },
     /// The lengths do not describe a CnC file the reference would accept.
     Layout(CncCreateError),
 }
@@ -1771,6 +1837,11 @@ impl std::fmt::Display for ConfigError {
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::PortRange {
+                name,
+                value,
+                reason,
+            } => write!(f, "{name} is {value}, which is not a port range: {reason}"),
             Self::ResolverNameRequired => write!(
                 f,
                 "`resolverName` is required when `resolverInterface` is set"
@@ -1790,6 +1861,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Layout(error) => Some(error),
+            Self::PortRange { reason, .. } => Some(reason),
             Self::MalformedArgument { .. }
             | Self::MissingAeronDir { .. }
             | Self::NotABoolean { .. }
@@ -2046,6 +2118,66 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         })
+    }
+
+    /// The two wildcard port ranges, under both of the names every setting
+    /// answers to — including the property the Java client writes, which is
+    /// the one a system test sets (`WildcardPortManagerSystemTest.java:68-69`).
+    #[test]
+    fn the_wildcard_port_ranges_are_read_and_a_bad_one_stops_the_driver() {
+        let config = resolve_with_env(
+            &[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("aeron.sender.wildcard.port.range", "20702 20702"),
+            ],
+            &[("AERON_RECEIVER_WILDCARD_PORT_RANGE", "20700 20701")],
+        )
+        .expect("a config");
+
+        assert_eq!(
+            PortRange {
+                low: 20702,
+                high: 20702
+            },
+            config.sender_wildcard_port_range
+        );
+        assert_eq!(
+            PortRange {
+                low: 20700,
+                high: 20701
+            },
+            config.receiver_wildcard_port_range
+        );
+
+        // A driver that named none is the kernel's wildcard, not an empty
+        // range: the manager leaves the zero alone.
+        assert_eq!(
+            PortRange::OS_WILDCARD,
+            resolve(&[("deepmsg.dir", "/tmp/aeron")])
+                .expect("a config")
+                .receiver_wildcard_port_range
+        );
+
+        // The three ways a range is not one, and the one that would look right
+        // to a reader who never read the parser.
+        for (value, reason) in [
+            ("20700-20701", PortRangeError::SecondPart),
+            ("20700", PortRangeError::SecondPart),
+            ("20701 20700", PortRangeError::LowAboveHigh),
+        ] {
+            let error = resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("aeron.sender.wildcard.port.range", value),
+            ])
+            .expect_err("a range that is not one");
+
+            assert_eq!(
+                format!(
+                    "sender.wildcard.port.range is {value}, which is not a port range: {reason}"
+                ),
+                error.to_string()
+            );
+        }
     }
 
     /// The resolver settings, under both of the names every setting answers
