@@ -436,12 +436,41 @@ impl PublicationImages {
         log: deepmsg_core::logbuffer::logfile::LogFile,
         now: Now,
     ) -> Option<i64> {
-        let window = crate::flowcontrol::receiver_window_length(
-            config.receiver_window_length.unsigned_abs() as usize,
-            pending.setup.term_length.unsigned_abs() as usize,
-        );
+        // The strategy comes from the **endpoint channel**, which is where the
+        // reference reads it: its `cc=` names the strategy
+        // (`aeron_congestion_control.c:165-205`) and its `rcv-wnd=` the window
+        // (`aeron_udp_channel_receiver_window`), and the conductor hands the
+        // supplier `endpoint->conductor_fields.udp_channel`
+        // (`aeron_driver_conductor.c:6629-6631`) rather than the subscription
+        // link's channel or the driver's own defaults.
+        let entry = endpoints.get(pending.endpoint_id)?;
+        let channel = &entry.channel;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let window = window as i32;
+        let channel_window =
+            crate::receive_endpoints::ReceiveChannelEndpoints::initial_window_length(
+                config, channel,
+            ) as i32;
+
+        let uri = crate::channel_uri::ChannelUri::parse(&channel.original_uri).ok()?;
+        let strategy = crate::congestion_control::Strategy::from_name(
+            uri.value(crate::publication_params::key::CONGESTION_CONTROL),
+        )?;
+
+        let congestion_control = crate::congestion_control::CongestionControl::create(
+            strategy,
+            config,
+            counters,
+            regions,
+            pending.registration_id,
+            pending.session_id,
+            pending.stream_id,
+            &pending.channel,
+            pending.setup.mtu,
+            pending.setup.term_length,
+            channel_window,
+            now.ms,
+            now.ns,
+        )?;
 
         let mut image = PublicationImage::create(
             pending.registration_id,
@@ -453,7 +482,8 @@ impl PublicationImages {
             pending.source,
             pending.control_address,
             pending.counters,
-            window,
+            congestion_control,
+            channel_window,
             config.status_message_timeout_ns,
             config.image_liveness_timeout_ns,
             config.layout.page_size,

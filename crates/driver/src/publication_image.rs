@@ -40,7 +40,7 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail, index_by_term};
 use deepmsg_core::logbuffer::repair;
 
-use crate::flowcontrol::receiver_window_length;
+use crate::congestion_control::CongestionControl;
 use crate::loss_detector::{Gap, LossDetector};
 use crate::protocol::{DataFrame, FrameHeader, header_flags};
 use crate::publication_params::SubscriptionParams;
@@ -260,8 +260,13 @@ pub struct PublicationImage {
     next_sm_deadline_ns: i64,
     /// How often a status message is forced (`status.message.timeout`).
     sm_timeout_ns: i64,
-    /// The window this endpoint offers (`receiver.window.length`).
-    initial_window_length: i32,
+    /// The strategy this image runs, named by the endpoint channel's `cc=`
+    /// (`congestion_control`, `aeron_publication_image.c:290`).
+    ///
+    /// It is where both windows come from, and — for `cubic` — the thing the
+    /// rebuild and the round-trip measurements go through. The image keeps no
+    /// window of its own beyond the one the next status message will carry.
+    congestion_control: CongestionControl,
     /// The largest window it will ever offer (`max_window_length`).
     max_receiver_window_length: i32,
     /// How long this image may go quiet before it drains.
@@ -358,7 +363,8 @@ impl PublicationImage {
         _source: SocketAddr,
         control_address: SocketAddr,
         counters: ImageCounters,
-        initial_window_length: i32,
+        congestion_control: CongestionControl,
+        channel_window_length: i32,
         sm_timeout_ns: i64,
         liveness_timeout_ns: i64,
         page_size: usize,
@@ -369,15 +375,14 @@ impl PublicationImage {
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
 
-        // The window the receiver offers: its configured one, cut to half a
-        // term because a receiver needs the other half to keep reading
-        // (`aeron_receiver_window_length`).
-        let window = receiver_window_length(
-            initial_window_length.unsigned_abs() as usize,
-            setup.term_length.unsigned_abs() as usize,
-        );
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let window = window as i32;
+        // The two windows are the strategy's and are not computed here at all:
+        // the reference reads them off it (`aeron_publication_image.c:377-380`)
+        // and keeps no window of its own, which is what makes `cc=` mean
+        // anything. `static` answers the channel's window cut to half a term —
+        // `aeron_receiver_window_length`, which the strategy applies — and
+        // `cubic` the congestion window it starts at.
+        let window = congestion_control.initial_window_length();
+        let max_window = congestion_control.max_window_length();
 
         // The tails, so a reader that maps this file sees the stream where it
         // starts rather than at zero (`aeron_publication_image.c:250-300`).
@@ -398,7 +403,13 @@ impl PublicationImage {
                     term_length: setup.term_length,
                     page_size: i32::try_from(page_size).unwrap_or(4096),
                     publication_window_length: 0,
-                    receiver_window_length: window,
+                    // **Uncut by the term**, which is what the reference writes
+                    // here: it passes `params.initial_window_length` straight
+                    // through (`aeron_publication_image.c:250-262`), and that
+                    // is the context default or the channel's own `rcv-wnd=`
+                    // (`aeron_driver_uri.c:466`, `:502`) with no cap on it. The
+                    // cap belongs to whoever uses the value as a window.
+                    receiver_window_length: channel_window_length,
                     socket_sndbuf_length: 0,
                     os_default_socket_sndbuf_length: 0,
                     os_max_socket_sndbuf_length: 0,
@@ -493,6 +504,7 @@ impl PublicationImage {
             eos_position: initial_position,
             invalidation_reason: None,
             next_sm_position: initial_position,
+            congestion_control,
             next_sm_receiver_window_length: window,
             last_sm_position: initial_position,
             clean_position: initial_position,
@@ -504,8 +516,7 @@ impl PublicationImage {
             // waiting for.
             next_sm_deadline_ns: now_ns - 1,
             sm_timeout_ns,
-            initial_window_length: window,
-            max_receiver_window_length: window,
+            max_receiver_window_length: max_window,
             liveness_timeout_ns,
             // The channel's own delays, when it named one. `nak-delay=` is the
             // whole of what a subscription may say about how its gaps are asked
@@ -1590,8 +1601,8 @@ impl PublicationImage {
 
     /// The initial window, for a caller that wants to report the configured
     /// value rather than the current one.
-    pub const fn initial_window_length(&self) -> i32 {
-        self.initial_window_length
+    pub fn initial_window_length(&self) -> i32 {
+        self.congestion_control.initial_window_length()
     }
 
     /// The term length, as the metadata holds it.
@@ -1734,6 +1745,12 @@ mod tests {
     use deepmsg_core::logbuffer::frame::Frame;
 
     const TERM_LENGTH: i32 = 64 * 1024;
+
+    /// The window the fixture's channel names, in its `rcv-wnd=`. It is
+    /// deliberately **larger than half a term**, so that the two values the
+    /// window has — the channel's and the one an image may advertise — are
+    /// different numbers a test can tell apart.
+    const CHANNEL_WINDOW: i32 = 128 * 1024;
     const SESSION_ID: i32 = 42;
     const STREAM_ID: i32 = 1001;
     const INITIAL_TERM_ID: i32 = 1_000;
@@ -1891,7 +1908,9 @@ mod tests {
                     rcv_pos,
                     rcv_naks_sent,
                 },
-                128 * 1024,
+                CongestionControl::static_window(CHANNEL_WINDOW, TERM_LENGTH),
+                // The channel's own window, uncut: what the metadata carries.
+                CHANNEL_WINDOW,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 IMAGE_LIVENESS_TIMEOUT_NS,
                 4096,
@@ -2904,6 +2923,36 @@ mod tests {
             i64::from(term_offset),
             fixture.image.hwm_position(&fixture.counters, &regions),
             "the heartbeat's own position, with nothing added on top of it"
+        );
+    }
+
+    /// The window an image offers is the **channel's**, cut to half a term —
+    /// and the metadata block records it **uncut**. Two facts from one call,
+    /// and they are two different values on purpose: the strategy cuts what it
+    /// advertises (`aeron_receiver_window_length`,
+    /// `aeron_congestion_control.c:155-157`) while the block
+    /// `aeron_logbuffer_metadata_init` is handed is `params.initial_window_length`
+    /// straight (`aeron_publication_image.c:250-262`), which is the channel's
+    /// own or the driver's default (`aeron_driver_uri.c:466`, `:502`).
+    ///
+    /// A build that wrote the cut value into the block would be handing a
+    /// reader of an image's metadata a window the image never advertised.
+    #[test]
+    fn the_window_is_the_channels_and_the_metadata_keeps_it_uncut() {
+        let fixture = Fixture::new();
+
+        assert_eq!(
+            TERM_LENGTH / 2,
+            fixture.image.initial_window_length(),
+            "the channel names a window of {CHANNEL_WINDOW} and the term is {TERM_LENGTH}, so \
+             half a term is what may be offered"
+        );
+        let metadata = fixture.image.log.metadata().expect("metadata");
+
+        assert_eq!(
+            Some(CHANNEL_WINDOW),
+            metadata.load_i32_relaxed(descriptor::RECEIVER_WINDOW_LENGTH_OFFSET),
+            "uncut, as the reference writes it"
         );
     }
 

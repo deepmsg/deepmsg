@@ -161,6 +161,16 @@ impl CongestionControl {
         }
     }
 
+    /// The identity, built from the two lengths alone — `create`'s own
+    /// `Strategy::Static` arm, for a caller that has a channel's window and its
+    /// term and nothing else to read (a test, or a construction that has
+    /// already decided the strategy).
+    pub fn static_window(channel_window_length: i32, term_length: i32) -> Self {
+        Self::Static(StaticWindow {
+            window_length: window_for_channel(channel_window_length, term_length),
+        })
+    }
+
     /// Whether a round trip is worth measuring right now
     /// (`should_measure_rtt`).
     pub fn should_measure_rtt(&self, now_ns: i64) -> bool {
