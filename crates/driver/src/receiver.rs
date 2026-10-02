@@ -26,6 +26,7 @@
 //! receiver's poll returns "work" for sends as well as reads.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver as Inbox, Sender as Outbox};
 use std::thread::JoinHandle;
@@ -62,6 +63,18 @@ pub enum ReceiverCommand {
         id: u64,
         /// The endpoint itself.
         endpoint: Box<ReceiveChannelEndpoint>,
+    },
+    /// The control name resolved somewhere else: answer there from now on
+    /// (`aeron_driver_receiver_on_resolution_change`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:610-631`), which is
+    /// also where `Resolution changes` is counted.
+    ResolutionChange {
+        /// Which endpoint.
+        endpoint_id: u64,
+        /// Which of its destinations.
+        destination: crate::media::receive_endpoint::DestinationId,
+        /// Where the name resolved to.
+        new_addr: SocketAddr,
     },
     /// A subscription to a whole stream arrived.
     AddSubscription {
@@ -240,9 +253,9 @@ pub enum ReceiverEvent {
         setup_flags: u8,
         /// Where a control frame goes: the source of the `SETUP`, or the
         /// channel's control address.
-        control_address: std::net::SocketAddr,
+        control_address: SocketAddr,
         /// Where the packet came from.
-        source: std::net::SocketAddr,
+        source: SocketAddr,
     },
     /// An image has finished its life and may be released.
     ImageDone {
@@ -277,6 +290,24 @@ pub enum ReceiverEvent {
         error_code: i32,
         /// The words.
         description: String,
+    },
+    /// A destination has named a control address and not been heard from for
+    /// five seconds, so that name has to be resolved again
+    /// (`aeron_driver_conductor_proxy_on_re_resolve_control`,
+    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:1046-1062`).
+    ///
+    /// The conductor resolves it — the resolver is its — and answers with
+    /// [`ReceiverCommand::ResolutionChange`], or with nothing when the name
+    /// resolves to the address the destination already has.
+    ReResolveControl {
+        /// Which endpoint.
+        endpoint_id: u64,
+        /// Which of its destinations, by the id that names it.
+        destination: crate::media::receive_endpoint::DestinationId,
+        /// The name its channel wrote as `control=`.
+        control_name: String,
+        /// The address it has now, which the answer is compared against.
+        address: SocketAddr,
     },
 }
 
@@ -348,6 +379,26 @@ impl ReceiverProxy {
     /// # Errors
     ///
     /// [`io::Error`] when the thread is gone.
+    /// Tell the receiver that a control name resolved somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn resolution_change(
+        &self,
+        endpoint_id: u64,
+        destination: crate::media::receive_endpoint::DestinationId,
+        new_addr: SocketAddr,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::ResolutionChange {
+                endpoint_id,
+                destination,
+                new_addr,
+            })
+            .map_err(|_| stopped())
+    }
+
     pub fn add_subscription(
         &self,
         endpoint_id: u64,
@@ -525,6 +576,7 @@ impl Receiver {
     /// # Errors
     ///
     /// [`io::Error`] if the thread cannot be spawned.
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     pub fn start(
         cnc: Arc<CncFile>,
         values_length: usize,
@@ -533,6 +585,7 @@ impl Receiver {
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
+        re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
         let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
@@ -552,6 +605,8 @@ impl Receiver {
                     status_message_timeout_ns,
                     initial_window_length,
                     cycle_threshold_ns,
+                    re_resolution_interval_ns,
+                    deepmsg_core::clock::monotonic_nano_time(),
                     event_tx,
                 );
                 receiver.run(&command_rx);
@@ -636,6 +691,17 @@ struct ReceiverThread {
     endpoints: Vec<(u64, Box<ReceiveChannelEndpoint>)>,
     images: Vec<PublicationImage>,
     pending_setups: Vec<PendingSetup>,
+    /// Answers to control-name re-resolutions, waiting for a pass that has the
+    /// counter regions — the same hand-off the destination commands make.
+    pending_resolutions: Vec<(
+        u64,
+        crate::media::receive_endpoint::DestinationId,
+        SocketAddr,
+    )>,
+    /// How often to look, and when to look next
+    /// (`aeron_driver_receiver.c:254-258`). Zero is a driver that does not look.
+    re_resolution_interval_ns: i64,
+    re_resolution_deadline_ns: i64,
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
     last_cycle_ns: i64,
@@ -651,6 +717,8 @@ impl ReceiverThread {
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
+        re_resolution_interval_ns: i64,
+        now_ns: i64,
         events: Outbox<ReceiverEvent>,
     ) -> Self {
         Self {
@@ -660,10 +728,13 @@ impl ReceiverThread {
             status_message_timeout_ns,
             initial_window_length,
             cycle_threshold_ns,
+            re_resolution_interval_ns,
+            re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
             events,
             endpoints: Vec::new(),
             images: Vec::new(),
             pending_setups: Vec::new(),
+            pending_resolutions: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
@@ -677,6 +748,16 @@ impl ReceiverThread {
 
             for command in commands.try_iter() {
                 match command {
+                    ReceiverCommand::ResolutionChange {
+                        endpoint_id,
+                        destination,
+                        new_addr,
+                    } => {
+                        // Held for a pass: the counter is `Resolution changes`
+                        // and the counter regions belong to `do_work`.
+                        self.pending_resolutions
+                            .push((endpoint_id, destination, new_addr));
+                    }
                     ReceiverCommand::RemoveEndpoint { id } => {
                         // The pending setups first: an ask for an endpoint that
                         // is going away is a question nobody will answer
@@ -1013,6 +1094,22 @@ impl ReceiverThread {
         let system = System::new(&self.counters, &regions);
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
+        // The answers to control-name re-resolutions first, so that a
+        // destination that has just moved answers there this pass.
+        let mut re_resolved = Self::apply_resolution_changes(
+            &mut self.endpoints,
+            &mut self.pending_setups,
+            &mut self.pending_resolutions,
+            &system,
+        );
+
+        // And the question, on its own deadline (`aeron_driver_receiver.c:254-258`):
+        // a zero interval is a driver that never asks.
+        if self.re_resolution_interval_ns > 0 && now_ns > self.re_resolution_deadline_ns {
+            self.re_resolution_deadline_ns = now_ns + self.re_resolution_interval_ns;
+            re_resolved += Self::check_for_re_resolution(&mut self.endpoints, &self.events, now_ns);
+        }
+
         let mut work = Self::receive_datagrams(
             &mut self.endpoints,
             &mut self.images,
@@ -1057,6 +1154,90 @@ impl ReceiverThread {
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
         );
+
+        work + re_resolved
+    }
+
+    /// Ask about the control names of the destinations that have gone quiet
+    /// (`aeron_udp_transport_poller_check_receive_endpoint_re_resolutions`,
+    /// `media/aeron_udp_transport_poller.c:312-328`, which the receiver calls on
+    /// its own deadline).
+    ///
+    /// One event per destination, and asking stamps it — so a destination is
+    /// asked about once per timeout rather than once per pass.
+    fn check_for_re_resolution(
+        endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
+        events: &Outbox<ReceiverEvent>,
+        now_ns: i64,
+    ) -> usize {
+        let mut work = 0;
+
+        for (endpoint_id, endpoint) in endpoints.iter_mut() {
+            let due = endpoint.destinations_to_re_resolve(now_ns);
+
+            for (destination, control_name, address) in due {
+                endpoint.mark_re_resolution_checked(destination, now_ns);
+
+                if events
+                    .send(ReceiverEvent::ReResolveControl {
+                        endpoint_id: *endpoint_id,
+                        destination,
+                        control_name,
+                        address,
+                    })
+                    .is_ok()
+                {
+                    work += 1;
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Apply the answers the conductor sent back
+    /// (`aeron_driver_receiver_on_resolution_change`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:610-631`).
+    ///
+    /// Two things move, and the reference moves them in this order: every
+    /// **periodic pending setup** for that destination answers the new address
+    /// from now on (`:617-628`), and then the destination's own control address
+    /// follows (`:630`). `Resolution changes` is counted once per pending setup
+    /// it moved — which is the reference's own arithmetic, and is what the
+    /// counter means to a reader: how many asks were redirected.
+    fn apply_resolution_changes(
+        endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
+        pending_setups: &mut [PendingSetup],
+        pending: &mut Vec<(
+            u64,
+            crate::media::receive_endpoint::DestinationId,
+            SocketAddr,
+        )>,
+        system: &System<'_>,
+    ) -> usize {
+        let mut work = 0;
+
+        for (endpoint_id, destination, new_addr) in pending.drain(..) {
+            let mut changed = false;
+
+            for setup in pending_setups.iter_mut() {
+                if setup.endpoint_id == endpoint_id
+                    && setup.destination == destination
+                    && setup.control_address.is_some()
+                {
+                    setup.control_address = Some(new_addr);
+                    system.increment(system_counters::id::RESOLUTION_CHANGES);
+                    changed = true;
+                }
+            }
+
+            if let Some((_, endpoint)) = endpoints.iter_mut().find(|(id, _)| *id == endpoint_id) {
+                endpoint.on_resolution_change(destination, new_addr);
+                changed = true;
+            }
+
+            work += usize::from(changed);
+        }
 
         work
     }
@@ -1159,7 +1340,7 @@ impl ReceiverThread {
         images: &mut [PublicationImage],
         pending_setups: &mut Vec<PendingSetup>,
         packet: &[u8],
-        source: std::net::SocketAddr,
+        source: SocketAddr,
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -1631,6 +1812,7 @@ mod tests {
             crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
             128 * 1024,
             100_000_000,
+            0,
         )
         .expect("a receiver");
 

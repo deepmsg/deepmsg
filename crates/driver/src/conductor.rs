@@ -590,6 +590,14 @@ pub struct Conductor {
     /// pass that holds the counter regions — the resolver reads counters, and a
     /// resolution is measured (`SenderEvent::ReResolveEndpoint`).
     pending_re_resolutions: Vec<(u64, String, Option<SocketAddr>)>,
+    /// Destinations whose **control** names the receiver has asked about
+    /// again, waiting for a pass that holds the counter regions.
+    pending_control_re_resolutions: Vec<(
+        u64,
+        crate::media::receive_endpoint::DestinationId,
+        String,
+        SocketAddr,
+    )>,
 }
 
 impl Conductor {
@@ -795,6 +803,7 @@ impl Conductor {
             config.status_message_timeout_ns,
             config.receiver_window_length,
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -863,6 +872,7 @@ impl Conductor {
             awaiting_drain: std::collections::HashSet::new(),
             drained_publications: Vec::new(),
             pending_re_resolutions: Vec::new(),
+            pending_control_re_resolutions: Vec::new(),
         };
 
         Ok(conductor)
@@ -916,7 +926,7 @@ impl Conductor {
         self.record_pending_faults();
         self.record_storage_warnings();
         self.flush_broadcast_failures();
-        work + self.re_resolve_endpoints()
+        work + self.re_resolve_endpoints() + self.re_resolve_controls()
     }
 
     /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
@@ -1137,6 +1147,21 @@ impl Conductor {
                 }
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
+                }
+                ReceiverEvent::ReResolveControl {
+                    endpoint_id,
+                    destination,
+                    control_name,
+                    address,
+                } => {
+                    // Held rather than resolved here: this method has no
+                    // counter regions, and a resolution is measured.
+                    self.pending_control_re_resolutions.push((
+                        endpoint_id,
+                        destination,
+                        control_name,
+                        address,
+                    ));
                 }
                 ReceiverEvent::Untethered {
                     registration_id,
@@ -3004,6 +3029,7 @@ impl Conductor {
                         request.registration_id,
                         channel_status_counter_id,
                         now_ms,
+                        now_ns,
                     ) {
                         Ok(destination) => destination,
                         Err(error) => {
@@ -3590,6 +3616,60 @@ impl Conductor {
                     // `Unresolved - %s=%s, name-and-port=%s`), because a
                     // deployment reads this line to find which name went wrong.
                     let description = format!("Unresolved - endpoint={endpoint_name}, {error}");
+
+                    self.pending_log_errors
+                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Resolve the **control** names the receiver asked about again, and tell
+    /// it what changed
+    /// (`aeron_driver_conductor_execute_re_resolve_control`, `:6957-6990`).
+    ///
+    /// The same shape as [`Self::re_resolve_endpoints`] with one word changed:
+    /// the name is the channel's `control=`, the wrapper is asked with that
+    /// parameter's own name, and what travels back is a destination rather than
+    /// an endpoint.
+    fn re_resolve_controls(&mut self) -> usize {
+        if self.pending_control_re_resolutions.is_empty() {
+            return 0;
+        }
+
+        let Some(regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let pending = std::mem::take(&mut self.pending_control_re_resolutions);
+        let mut work = 0;
+
+        for (endpoint_id, destination, control_name, existing) in pending {
+            let resolved = crate::udp_channel::resolve_host_and_port_with(
+                &mut *self.resolver,
+                &self.counters,
+                &regions,
+                self.config.name_resolver_threshold_ns,
+                "control",
+                &control_name,
+            );
+
+            match resolved {
+                Ok(address) if address != existing => {
+                    if self
+                        .receiver
+                        .proxy()
+                        .resolution_change(endpoint_id, destination, address)
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let description = format!("Unresolved - control={control_name}, {error}");
 
                     self.pending_log_errors
                         .push((ERROR_CODE_GENERIC_ERROR, description));

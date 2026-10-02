@@ -1622,6 +1622,7 @@ impl IpcSubscriptions {
                 regions,
                 request.correlation_id,
                 now.ms,
+                now.ns,
             )
             .map_err(|error| AddSubscriptionError::Endpoint {
                 message: match error {

@@ -202,6 +202,7 @@ impl ReceiveChannelEndpoints {
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
+        now_ns: i64,
     ) -> Result<(u64, i32, Option<Box<ReceiveChannelEndpoint>>), ReceiveEndpointErrorKind> {
         // The kernel's own receive buffer, the arm the window check falls to
         // when the channel named no `so-rcvbuf` and the context has none
@@ -264,6 +265,7 @@ impl ReceiveChannelEndpoints {
             regions,
             registration_id,
             now_ms,
+            now_ns,
         )
         .map_err(|error| match error {
             ReceiveEndpointError::NoCounter => ReceiveEndpointErrorKind::NoCounter,
@@ -624,6 +626,7 @@ mod tests {
                 &regions,
                 77,
                 1,
+                1_000_000,
             )
             .expect("an endpoint");
 
@@ -653,6 +656,7 @@ mod tests {
                 &regions,
                 77,
                 1,
+                1_000_000,
             )
             .expect("an endpoint");
 
@@ -688,6 +692,7 @@ mod tests {
                 &regions,
                 7,
                 1,
+                1_000_000,
             )
             .expect("an endpoint");
 
@@ -701,6 +706,7 @@ mod tests {
                 &regions,
                 8,
                 2,
+                1_000_000,
             )
             .expect_err("refused");
 
@@ -732,6 +738,7 @@ mod tests {
                 &regions,
                 9,
                 3,
+                1_000_000,
             )
             .expect_err("the context's 128k is not the socket's 1m");
 
@@ -770,6 +777,7 @@ mod tests {
                 &regions,
                 7,
                 1,
+                1_000_000,
             )
             .expect("an endpoint");
 
@@ -783,6 +791,7 @@ mod tests {
                 &regions,
                 8,
                 2,
+                1_000_000,
             )
             .expect("a manual channel is not compared");
 
@@ -810,6 +819,7 @@ mod tests {
                 &regions,
                 7,
                 1,
+                1_000_000,
             )
             .expect("an endpoint");
 
@@ -830,6 +840,7 @@ mod tests {
                 &regions,
                 8,
                 2,
+                1_000_000,
             )
             .expect("an endpoint with two destinations is not the shape it was made in");
 
