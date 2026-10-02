@@ -851,6 +851,168 @@ impl IpcSubscriptions {
         Ok(())
     }
 
+    /// Serve an `ADD_RCV_DESTINATION` whose channel is `aeron:ipc`
+    /// (`aeron_driver_conductor_on_add_receive_ipc_destination`, `:5617-5700`).
+    ///
+    /// An IPC destination is a **source** rather than a socket, like a spy's,
+    /// and the difference between the two is where the bytes come from: a spy
+    /// reads a network publication's log buffer, and this reads an IPC one. It
+    /// is what lets a multi-destination subscription — whose own channel is a
+    /// network one — be fed by a publisher in this process, and it is the
+    /// reference's one way to mix IPC and UDP publishers on one stream.
+    ///
+    /// The link is built the same way the spy link is and the reference builds
+    /// both in one shape (`:5646-5665` against `:5808-5870`): the channel is
+    /// the **destination's**, the stream is the **subscription's**, the session
+    /// and the options are the destination URI's, and the registration id is
+    /// the subscription's — because a destination is not a subscription and
+    /// must not be one to a client's `removeSubscription`. Three fields are the
+    /// IPC ones: no endpoint and no spy channel, so the link is local, and
+    /// `is_reliable` is written **true** rather than taken from the URI: there
+    /// is no datagram to lose.
+    ///
+    /// # Errors
+    ///
+    /// [`AddSubscriptionError::UnknownSubscription`] for a registration id no
+    /// network subscription carries, [`AddSubscriptionError::NotManualControl`]
+    /// for one whose channel may not have sources added to it, and the
+    /// channel's own errors for the URI.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn add_ipc_destination(
+        &mut self,
+        request: &DestinationCommandReceived<'_>,
+        config: &DriverConfig,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        endpoints: &ReceiveChannelEndpoints,
+        publications: &mut IpcPublications,
+        now: crate::ipc_publications::Now,
+        events: &mut impl ClientEvents,
+    ) -> Result<(), AddSubscriptionError> {
+        let uri = ChannelUri::parse(request.channel)?;
+        let params = SubscriptionParams::resolve(&uri, config)?;
+
+        // The subscription the destination is added to, and the one thing it
+        // has to be: a network subscription whose channel allows manual control
+        // (`aeron_driver_conductor_find_mds_subscription`, `:5581-5599`, which
+        // is the same lookup the spy path makes).
+        let Some(mds) = self.find_mds(request.registration_id) else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        let Some(endpoint_id) = mds.endpoint_id else {
+            return Err(AddSubscriptionError::UnknownSubscription);
+        };
+
+        if !endpoints
+            .get(endpoint_id)
+            .is_some_and(|entry| entry.channel.control_mode == ControlMode::Manual)
+        {
+            return Err(AddSubscriptionError::NotManualControl);
+        }
+
+        let link = SubscriptionLink {
+            registration_id: mds.registration_id,
+            client_id: request.client_id,
+            stream_id: mds.stream_id,
+            session_id: params.session_id,
+            channel: request.channel.to_vec(),
+            is_tether: params.is_tether,
+            is_rejoin: params.is_rejoin,
+            is_response: false,
+            // `AERON_INFER`, written where the spy path copies the URI's: a
+            // local read has no group to infer from.
+            group: InferableBoolean::Infer,
+            setup_status: SetupStatus::Pending,
+            is_reliable: true,
+            is_sparse: params.is_sparse,
+            endpoint_id: None,
+            spy_channel: None,
+            subscribables: Vec::new(),
+        };
+
+        // An acknowledgement, not a subscription ready (`:5668`), and it goes
+        // out **before** the publications are read: what follows is the images
+        // the client is told about, as separate messages.
+        events.operation_succeeded(request.correlation_id);
+
+        self.links.push(link);
+
+        let link = self.links.last_mut().expect("just pushed");
+
+        for publication in publications.publications_mut() {
+            if !link.matches(publication)
+                || !publication.is_accepting_subscriptions(counters, regions)
+            {
+                continue;
+            }
+
+            // The reference stops at the first failure rather than carrying on
+            // (`:5682-5686` goes to its cleanup), and the link it has already
+            // added stays where it is.
+            link_subscribable(link, publication, counters, regions, now, events)
+                .map_err(|()| AddSubscriptionError::Link)?;
+        }
+
+        Ok(())
+    }
+
+    /// Serve a `REMOVE_RCV_DESTINATION` whose channel is `aeron:ipc`
+    /// (`aeron_driver_conductor_on_remove_receive_ipc_destination`,
+    /// `:5984-6018`).
+    ///
+    /// The link is found by its registration id **and** the channel it was
+    /// added with — an id alone would name either of two destinations on one
+    /// subscription. Its readers are told which images are going
+    /// (`subscription_link_notify_unavailable_images`), then let go, in that
+    /// order: a client that hears about an image after the position it reads
+    /// has been freed is reading a counter id that may already be someone
+    /// else's.
+    ///
+    /// # Returns
+    ///
+    /// `false` when no such link is there, which the reference answers with an
+    /// error naming the subscription.
+    #[allow(clippy::too_many_arguments)] // one per collaborator
+    pub fn remove_ipc_destination(
+        &mut self,
+        registration_id: i64,
+        channel: &[u8],
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        publications: &mut IpcPublications,
+        now_ms: i64,
+        events: &mut impl ClientEvents,
+    ) -> bool {
+        let Some(index) = self.links.iter().position(|link| {
+            link.registration_id == registration_id
+                && link.endpoint_id.is_none()
+                && link.spy_channel.is_none()
+                && link.channel == channel
+        }) else {
+            return false;
+        };
+
+        let link = self.links.swap_remove(index);
+
+        for entry in &link.subscribables {
+            events.unavailable_image(
+                entry.target.registration_id(),
+                link.registration_id,
+                link.stream_id,
+                &link.channel,
+            );
+        }
+
+        // No receiver and no sender: an IPC link's readers are the
+        // publication's own, and `unlink_all` finds it by the registration id
+        // in the target (`aeron_driver_conductor_unlink_all_subscribable`,
+        // `:3620-3691`).
+        unlink_all(link, counters, regions, publications, None, None, now_ms);
+
+        true
+    }
+
     /// Serve a `REMOVE_RCV_DESTINATION` whose channel is a spy
     /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6065`).
     ///

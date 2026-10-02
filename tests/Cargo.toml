@@ -83,6 +83,12 @@ path = "integration/udp_term_boundary.rs"
 name = "spy_subscription"
 path = "integration/spy_subscription.rs"
 
+# An IPC publication added to a manual subscription as a source — the same third
+# way a link is made, reading a buffer rather than a socket. Runs in CI.
+[[test]]
+name = "ipc_destination"
+path = "integration/ipc_destination.rs"
+
 # A publication with one producer, from our client to our driver over IPC.
 # Runs in CI: it needs our own driver, not the reference's.
 [[test]]

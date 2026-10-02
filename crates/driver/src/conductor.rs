@@ -2672,11 +2672,6 @@ impl Conductor {
             // names (`aeron_driver_conductor.c:3051-3065`): `aeron:ipc` is one
             // kind of destination, `aeron-spy:` another, and everything else is
             // a network one.
-            //
-            // `aeron:ipc` is the one this build refuses **by name** — a client
-            // told nothing waits out its timeout, and this is not a command
-            // this driver is going to get to later. The refusal is recorded in
-            // `docs/compat.md`.
             if Command::AddReceiveDestination == command
                 || Command::RemoveReceiveDestination == command
             {
@@ -2686,11 +2681,55 @@ impl Conductor {
                 };
 
                 if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
-                    transmit.error(
-                        request.correlation_id,
-                        ERROR_CODE_NOT_SUPPORTED,
-                        b"aeron:ipc destinations are not served by this driver",
-                    );
+                    let now = Now {
+                        ms: now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: liveness_timeout_ns,
+                    };
+
+                    if Command::AddReceiveDestination == command {
+                        let added = subscriptions.add_ipc_destination(
+                            &request,
+                            config,
+                            counters,
+                            &counter_regions,
+                            receive_endpoints,
+                            publications,
+                            now,
+                            &mut transmit,
+                        );
+
+                        if let Err(error) = added {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlation_id,
+                                error.error_code(),
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    } else if subscriptions.remove_ipc_destination(
+                        request.registration_id,
+                        request.channel,
+                        counters,
+                        &counter_regions,
+                        publications,
+                        now_ms,
+                        &mut transmit,
+                    ) {
+                        transmit.operation_succeeded(request.correlation_id);
+                    } else {
+                        *subscription_failures += 1;
+                        let unknown = format!(
+                            "unknown subscription client_id={} registration_id={}",
+                            request.client_id, request.registration_id,
+                        );
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            unknown.as_bytes(),
+                        );
+                    }
+
                     continue;
                 }
 
@@ -3840,17 +3879,20 @@ mod tests {
     /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
     /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel.
     ///
-    /// Only the first is refused by name — a client told nothing waits out its
-    /// timeout, and this is not a command this driver will get to later. The
-    /// other two are **served**: a spy destination is a local read added to a
-    /// multi-destination subscription (`:5704-5806`) and a network one is a
-    /// socket added to any network subscription (`:5879-5910`), and both reach
-    /// the subscription first. The registration id here names no subscription,
+    /// All three are **served** and each is its own branch: `aeron:ipc` and
+    /// `aeron-spy:` are local reads added to a multi-destination subscription
+    /// (`:5617-5700`, `:5808-5870`) and a network one is a socket added to any
+    /// network subscription (`:5924-5960`) — and all three reach the
+    /// subscription first, because a destination is something a subscription
+    /// has, not a subscription. The registration id here names no subscription,
     /// so what this covers is the triage — each prefix reaching its own branch,
     /// with each branch's own answer for a subscription that is not there.
-    /// What a destination does once it is attached is `media::receive_endpoint`'s
-    /// tests, and a spy destination against a real subscription is
-    /// `tests/integration/spy_subscription.rs`.
+    ///
+    /// `aeron:ipc` used to be answered here with a refusal of its own, which is
+    /// what this test pinned; both the refusal and that row of `docs/compat.md`
+    /// are gone. What a destination does once it is attached is
+    /// `media::receive_endpoint`'s tests, and a spy destination against a real
+    /// subscription is `tests/integration/spy_subscription.rs`.
     #[test]
     fn a_receive_destination_is_triaged_by_the_prefix_it_names() {
         use deepmsg_cnc::command::{
@@ -3858,12 +3900,10 @@ mod tests {
         };
 
         let channels = [
-            (
-                "aeron:ipc",
-                "aeron:ipc destinations are not served by this driver",
-            ),
-            // A spy names a subscription it cannot find, which is the
-            // reference's own unknown-subscription error (`:6053-6062`).
+            // An IPC destination names a subscription it cannot find, which is
+            // the reference's own unknown-subscription error (`:5630-5635`).
+            ("aeron:ipc", "unknown subscription"),
+            // And so does a spy (`:6053-6062`).
             (
                 "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
                 "unknown subscription",
