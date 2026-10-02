@@ -1481,11 +1481,21 @@ impl Conductor {
     /// sender's proxy and the endpoint registry, and neither belongs in the
     /// client pool.
     fn release_orphaned_network_publications(&mut self) -> usize {
+        // A publication is an orphan when **no live client holds a link on
+        // it**, which is not the same as its first client being gone: a
+        // publication can have several, and the reference releases the links a
+        // dying client held rather than the resource
+        // (`aeron_driver_conductor_client_remove`'s publication links,
+        // `aeron_driver_conductor.c:1220-1241`).
         let orphans: Vec<i64> = self
             .network_publications
             .publications()
             .iter()
-            .filter(|publication| !self.clients.knows(publication.client_id))
+            .filter(|publication| {
+                !self
+                    .clients
+                    .any_holds_publication(publication.registration_id)
+            })
             .map(|publication| publication.registration_id)
             .collect();
 
@@ -2240,8 +2250,20 @@ impl Conductor {
                                 publications.release_links(&[link], counters, &counter_regions);
 
                                 if !is_draining {
-                                    pending_publication_releases
-                                        .push(link.publication_registration_id);
+                                    // The link's own hold goes, and the
+                                    // publication follows only when it was the
+                                    // **last** one: a second publication on one
+                                    // channel shares the publication, and one
+                                    // client closing its own must not take the
+                                    // other's (`aeron_driver_conductor_on_remove_publication`
+                                    // decrements the resource and lets the zero
+                                    // case do the releasing, `:4705-4735`).
+                                    if network_publications
+                                        .remove_link(link.publication_registration_id, 1)
+                                    {
+                                        pending_publication_releases
+                                            .push(link.publication_registration_id);
+                                    }
                                 }
 
                                 transmit.operation_succeeded(request.correlated.correlation_id);

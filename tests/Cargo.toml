@@ -57,6 +57,10 @@ name = "mds_added_destination"
 path = "integration/mds_added_destination.rs"
 
 [[test]]
+name = "publication_links"
+path = "integration/publication_links.rs"
+
+[[test]]
 name = "receive_endpoint_lifecycle"
 path = "integration/receive_endpoint_lifecycle.rs"
 

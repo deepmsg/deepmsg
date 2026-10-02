@@ -915,6 +915,11 @@ impl NetworkPublications {
         // (`aeron_driver_conductor.c:4195-4196`, which answers with the
         // publication's `log_file_name` on this path too).
         let log_file = publication.path_bytes();
+        // The two ids the reference's wire carries
+        // (`aeron_driver_conductor.c:2387-2388`): `correlation_id` is **this
+        // link's** — the id the client removes by, and the one it matches the
+        // answer to — and `registration_id` is the publication's own, shared by
+        // every client on this channel.
         let ready = PublicationBuffersReady {
             correlation_id: request.correlation_id,
             registration_id: publication.registration_id,
@@ -935,6 +940,31 @@ impl NetworkPublications {
         }
 
         events.publication_ready(&ready, is_exclusive);
+    }
+
+    /// A client's hold on a publication goes
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_DECREF`, `media/aeron_network_publication.c:...`,
+    /// reached from `aeron_driver_conductor_on_remove_publication`,
+    /// `aeron_driver_conductor.c:4705-4735`), answering whether that was the
+    /// **last** one — which is when the publication itself may be released.
+    ///
+    /// `count` is how many links the caller is giving up at once, which is what
+    /// a client that timed out gives up: every link it held.
+    pub fn remove_link(&mut self, publication_registration_id: i64, count: i32) -> bool {
+        let Some(publication) = self
+            .publications
+            .iter_mut()
+            .find(|publication| publication.registration_id == publication_registration_id)
+        else {
+            // Not a network publication at all — an IPC one, whose own release
+            // has already happened — or one that is already gone. Either way
+            // there is nothing here to decrement.
+            return false;
+        };
+
+        publication.refcount -= count.max(1);
+
+        publication.refcount <= 0
     }
 
     /// Take a publication's record out of the collection, for a caller that is
