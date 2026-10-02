@@ -39,7 +39,21 @@ fn free_udp_port() -> u16 {
 /// Compile the probe against the reference's client library, or answer `None`
 /// when the checkout is not there — which is a skip, as it is for every other
 /// interop test.
+///
+/// **Once per process, and that is a correctness matter rather than a
+/// speed one.** The three tests in this file run on three threads, and a `cc`
+/// writing `target/destination_probe` while another thread is `exec`ing it is
+/// `ETXTBSY` — "Text file busy" — which is how this test used to fail about one
+/// run in six (and two in three once the driver's start-up grew). Compiling
+/// under a lock means the file is written once, before any of them runs it.
 fn build_probe() -> Option<PathBuf> {
+    static BUILT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+    BUILT.get_or_init(compile_probe).clone()
+}
+
+/// The compile itself, which [`build_probe`] runs once.
+fn compile_probe() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = manifest.join("fixtures/destination_probe.c");
     let include = manifest.join(REFERENCE_INCLUDE);
