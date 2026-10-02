@@ -23,6 +23,8 @@
 //! client is reading (`image_ref_count`,
 //! `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.h:52-56`).
 
+use std::net::SocketAddr;
+
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::channel_validation;
@@ -30,7 +32,7 @@ use crate::media::receive_endpoint::{
     EndpointStatus, ReceiveChannelEndpoint, ReceiveEndpointError,
 };
 use crate::sys;
-use crate::udp_channel::{ControlMode, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 
 /// One endpoint, as the conductor sees it.
 #[derive(Debug)]
@@ -39,6 +41,18 @@ pub struct ReceiveChannelEndpointEntry {
     pub id: u64,
     /// The channel it was created for.
     pub channel: UdpChannel,
+    /// Where the endpoint's **own destination** answers control frames now —
+    /// its channel's `local_control` until a re-resolution moves it
+    /// (`current_control_addr` of the one destination whose channel is the
+    /// endpoint's own and which named an explicit control,
+    /// `media/aeron_receive_channel_endpoint.c:668-689`).
+    ///
+    /// It is here rather than read off the endpoint because the endpoint itself
+    /// has been moved to the receiver by the time a second subscription
+    /// arrives, and it is the address a **tag match** is measured against:
+    /// a subscription that names the same endpoint by tag after its control
+    /// name resolved somewhere else must join it, not open a second one.
+    pub control_addr: Option<SocketAddr>,
     /// The `rcv-channel` counter whose value is its state.
     pub channel_status_counter_id: i32,
     /// Where it is in its life.
@@ -173,10 +187,76 @@ impl ReceiveChannelEndpoints {
     /// The endpoint a channel canonicalises to, if there is one
     /// (`find_existing_receive_channel_endpoint`, `:288-340`).
     pub fn find(&self, channel: &UdpChannel) -> Option<u64> {
-        self.entries
+        // `:189-208`: a channel with a tag looks for the endpoint that already
+        // answers to it, wherever its canonical form puts it — which is what
+        // makes a tagged subscription join an endpoint whose control name has
+        // since resolved somewhere else.
+        if channel.tag_id != INVALID_TAG {
+            for entry in &self.entries {
+                if Self::matches_tag(channel, entry) {
+                    return Some(entry.id);
+                }
+            }
+        }
+
+        let entry = self
+            .entries
             .iter()
-            .find(|entry| entry.channel.canonical_form == channel.canonical_form)
-            .map(|entry| entry.id)
+            .find(|entry| entry.channel.canonical_form == channel.canonical_form)?;
+
+        // `:212-218`: two different, named tags are two endpoints, even on one
+        // canonical form.
+        if entry.channel.tag_id != INVALID_TAG
+            && channel.tag_id != INVALID_TAG
+            && channel.tag_id != entry.channel.tag_id
+        {
+            return None;
+        }
+
+        Some(entry.id)
+    }
+
+    /// Whether a tagged channel joins this endpoint
+    /// (`aeron_receive_channel_endpoint_matches_tag`, `:668-689`, which hands
+    /// `aeron_udp_channel_matches_tag` the endpoint's **current control address**
+    /// as the local-side override).
+    ///
+    /// The two rules are the send side's, with the receiving half's addresses: a
+    /// channel that named no address at all is the wildcard and matches whatever
+    /// the endpoint is, and a channel that named one has to agree on both sides —
+    /// its data address against the endpoint's, its control address against the one
+    /// the endpoint's destination uses **now**.
+    fn matches_tag(channel: &UdpChannel, entry: &ReceiveChannelEndpointEntry) -> bool {
+        if channel.tag_id == INVALID_TAG
+            || entry.channel.tag_id == INVALID_TAG
+            || channel.tag_id != entry.channel.tag_id
+        {
+            return false;
+        }
+
+        if channel.control_mode != crate::udp_channel::ControlMode::None
+            && channel.control_mode != entry.channel.control_mode
+        {
+            return false;
+        }
+
+        if Self::is_wildcard(channel) {
+            return true;
+        }
+
+        let control_matches = entry.control_addr.map_or(
+            channel.local_control == entry.channel.local_control,
+            |addr| channel.local_control == addr,
+        );
+
+        channel.remote_data == entry.channel.remote_data && control_matches
+    }
+
+    /// `aeron_udp_channel_is_wildcard` (`media/aeron_udp_channel.h:98-102`): both of
+    /// a channel's data addresses are the wildcard, which is what `aeron:udp?tags=`
+    /// names.
+    fn is_wildcard(channel: &UdpChannel) -> bool {
+        channel.remote_data.ip().is_unspecified() && channel.local_data.ip().is_unspecified()
     }
 
     /// Create the endpoint for a channel, or find the one it shares.
@@ -300,9 +380,18 @@ impl ReceiveChannelEndpoints {
         let socket_sndbuf = endpoint.socket_sndbuf;
         let destination_count = endpoint.destination_count();
 
+        // `:668-679`: the override is the endpoint's **own** destination's
+        // current control address, and only when that destination is the one
+        // the endpoint was made for and named an explicit control.
+        let control_addr = endpoint
+            .channel
+            .has_explicit_control
+            .then_some(endpoint.channel.local_control);
+
         self.entries.push(ReceiveChannelEndpointEntry {
             id,
             channel: endpoint.channel.clone(),
+            control_addr,
             channel_status_counter_id,
             status: EndpointStatus::Active,
             refcount: 0,

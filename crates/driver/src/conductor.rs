@@ -3649,6 +3649,15 @@ impl Conductor {
                     {
                         work += 1;
                     }
+
+                    // The conductor's own copy follows, because the receiver's
+                    // is on another thread and a **tag match** is measured
+                    // against where the endpoint answers control frames now
+                    // (`aeron_receive_channel_endpoint_matches_tag`,
+                    // `media/aeron_receive_channel_endpoint.c:668-689`).
+                    if let Some(entry) = self.receive_endpoints.get_mut(endpoint_id) {
+                        entry.control_addr = Some(address);
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
