@@ -37,7 +37,7 @@ use crate::idle::Backoff;
 use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::media::receive_endpoint::ReceiveDestination;
-use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
+use crate::protocol::{FrameHeader, RttmFrame, SetupFrame, frame_type, is_frame_valid};
 use crate::publication_image::PublicationImage;
 use crate::subscribable::TetherablePosition;
 use crate::sys::socket::Datagrams;
@@ -1308,11 +1308,52 @@ impl ReceiverThread {
                 });
             }
             frame_type::RTTM => {
-                // An RTTM is the answer to a measurement this build does not
-                // ask for: `max` with the static window never measures a round
-                // trip (`aeron_static_window_congestion_control_strategy_should_measure_rtt`,
-                // `aeron_congestion_control.c:78-81`).
-                system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
+                let Some(frame) = RttmFrame::read(packet) else {
+                    return;
+                };
+
+                // A measurement addressed to another receiver — or to none —
+                // is not this endpoint's to act on
+                // (`media/aeron_receive_channel_endpoint.c:657-660`), and the
+                // destination it came in on is alive either way (`:658`),
+                // which is what keeps a channel with several destinations
+                // measuring each of them.
+                if frame.receiver_id != 0 && frame.receiver_id != endpoint.receiver_id() {
+                    return;
+                }
+
+                // A measurement is traffic, and the reference marks the
+                // destination alive for it (`media/aeron_receive_channel_endpoint.c:658`,
+                // whose `aeron_receive_destination_update_last_activity_ns`
+                // this build has no per-destination clock for — a destination
+                // here is a socket and a channel, and what reads liveness is
+                // the image's connections, which an RTTM does not move).
+                if header.flags & crate::protocol::header_flags::RTTM_REPLY != 0 {
+                    // A request: it is answered here, echoing the requester's
+                    // own timestamp and reporting no time spent, so the reply
+                    // carries **no** flag and is not answered in turn
+                    // (`aeron_data_packet_dispatcher.c:562-575`).
+                    let control_address = endpoint.control_address(destination, source);
+                    let _ = endpoint.send_rttm(
+                        destination,
+                        control_address,
+                        frame.stream_id,
+                        frame.session_id,
+                        frame.echo_timestamp,
+                        0,
+                        0,
+                    );
+
+                    return;
+                }
+
+                // An answer, so it is a round trip this image measured
+                // (`aeron_publication_image_on_rttm`, `:849-857`).
+                if let Some(image) = images.iter_mut().find(|image| {
+                    image.stream_id == frame.stream_id && image.session_id == frame.session_id
+                }) {
+                    image.on_rttm(&frame, counters, regions, now_ns);
+                }
             }
             _ => {}
         }
@@ -1434,6 +1475,12 @@ impl ReceiverThread {
             {
                 work += 1;
             }
+
+            // And the measurement, if this image's strategy wants one — the
+            // third thing this loop does for every image, in the reference's
+            // own order (`aeron_driver_receiver.c:170-209`: the status message,
+            // the loss, then the round trip).
+            work += image.initiate_rttm(endpoint, counters, regions, now_ns);
         }
 
         work

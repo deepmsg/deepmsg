@@ -42,6 +42,7 @@ use deepmsg_core::logbuffer::repair;
 
 use crate::congestion_control::CongestionControl;
 use crate::loss_detector::{Gap, LossDetector};
+use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::protocol::{DataFrame, FrameHeader, header_flags};
 use crate::publication_params::SubscriptionParams;
 use crate::subscribable::{Subscribable, TetherState, TetherablePosition};
@@ -50,6 +51,12 @@ use crate::system_counters::{self, System};
 /// How long a status message may go unsent before one is sent anyway
 /// (`aeron.status.message.timeout`, 200 ms).
 pub const STATUS_MESSAGE_TIMEOUT_NS: i64 = 200_000_000;
+
+/// How long a destination may go unheard from before it is no longer a place a
+/// round-trip measurement is sent to
+/// (`AERON_RECEIVE_DESTINATION_TIMEOUT_NS`,
+/// `media/aeron_receive_destination.h:24`, five seconds).
+pub const RECEIVE_DESTINATION_TIMEOUT_NS: i64 = 5 * 1000 * 1000 * 1000;
 
 /// What an image is built with when nothing configures one
 /// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:204`).
@@ -1368,6 +1375,97 @@ impl PublicationImage {
         if let Some(metadata) = self.log.metadata() {
             let _ = metadata.store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, count);
         }
+    }
+
+    /// Ask every live connection to measure a round trip
+    /// (`aeron_publication_image_initiate_rttm`, `:1075-1110`).
+    ///
+    /// Three conditions, all the reference's. The strategy has to want a
+    /// measurement at all — `should_measure_rtt`, which is false for the static
+    /// window and false for CUBIC until a setting turns it on. The connection
+    /// has to be **alive**: a destination that has an address to answer at, and
+    /// has been heard from within `AERON_RECEIVE_DESTINATION_TIMEOUT_NS`
+    /// (`:632-637`). And the request goes out **through the destination it
+    /// measures**, with the `REPLY` flag, so the answer comes back the way the
+    /// data does.
+    ///
+    /// The flag is the whole of the protocol: an RTTM that arrives with it is a
+    /// request (the far end echoes the timestamp), and one that arrives without
+    /// it is an answer, which is what [`Self::on_rttm`] measures.
+    pub fn initiate_rttm(
+        &mut self,
+        endpoint: &mut ReceiveChannelEndpoint,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> usize {
+        let _ = (counters, regions);
+
+        if !self.congestion_control.should_measure_rtt(now_ns) {
+            return 0;
+        }
+
+        let mut work = 0;
+
+        for index in 0..self.connections.len() {
+            let destination = self.connections[index].destination;
+            let Some(control_address) = self.connections[index].control_address else {
+                continue;
+            };
+
+            if !Self::connection_is_alive(&self.connections[index], now_ns) {
+                continue;
+            }
+
+            if endpoint
+                .send_rttm(
+                    destination,
+                    control_address,
+                    self.stream_id,
+                    self.session_id,
+                    now_ns,
+                    0,
+                    crate::protocol::header_flags::RTTM_REPLY,
+                )
+                .is_ok()
+            {
+                self.congestion_control.on_rttm_sent(now_ns);
+                work += 1;
+            }
+        }
+
+        work
+    }
+
+    /// A measurement came back (`aeron_publication_image_on_rttm`, `:849-857`):
+    /// the round trip is what has passed since the timestamp the **far end**
+    /// echoed, less the delta it reported for its own handling.
+    ///
+    /// Wrapping arithmetic, as the C's is: both numbers come off the wire and
+    /// neither is this driver's clock.
+    pub fn on_rttm(
+        &mut self,
+        frame: &crate::protocol::RttmFrame,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) {
+        let rtt_in_ns = now_ns
+            .wrapping_sub(frame.echo_timestamp)
+            .wrapping_sub(frame.reception_delta);
+
+        self.congestion_control
+            .on_rttm(counters, regions, now_ns, rtt_in_ns);
+    }
+
+    /// Whether a connection is one an RTTM may be sent through
+    /// (`aeron_publication_image_connection_is_alive`, `:632-637`).
+    fn connection_is_alive(connection: &Connection, now_ns: i64) -> bool {
+        connection.control_address.is_some()
+            && now_ns
+                < connection
+                    .time_of_last_activity_ns
+                    .wrapping_add(RECEIVE_DESTINATION_TIMEOUT_NS)
     }
 
     /// How many senders have been heard from recently
@@ -3065,6 +3163,40 @@ mod tests {
         assert!(
             fixture.image.initial_window_length() < CHANNEL_WINDOW,
             "which is a different window from the channel's, or this test says nothing"
+        );
+    }
+
+    /// A measurement that comes back is a round trip: what has passed since the
+    /// timestamp the far end echoed, less the delta it reported for its own
+    /// handling (`aeron_publication_image.c:849-857`) — and the image hands both
+    /// numbers to its strategy, which is where CUBIC keeps the estimate.
+    #[test]
+    fn an_rttm_that_comes_back_is_the_round_trip_it_measures() {
+        let mut fixture = Fixture::cubic();
+        let regions = fixture.holder.open();
+        let ids = fixture.image.congestion_control().counter_ids().to_vec();
+
+        // The far end echoed a timestamp from 500 µs ago, and spent 20 µs of
+        // the trip on its own handling.
+        let frame = crate::protocol::RttmFrame {
+            session_id: SESSION_ID,
+            stream_id: STREAM_ID,
+            echo_timestamp: 1_000_000 - 500_000,
+            reception_delta: 20_000,
+            receiver_id: 1,
+        };
+
+        fixture
+            .image
+            .on_rttm(&frame, &fixture.counters, &regions, 1_000_000);
+
+        assert_eq!(
+            480_000,
+            fixture
+                .counters
+                .value(&regions, ids[0])
+                .expect("the rtt counter"),
+            "500 µs less the 20 µs the far end spent"
         );
     }
 
