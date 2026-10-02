@@ -40,8 +40,9 @@ use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{Position, RawTail, index_by_term};
 use deepmsg_core::logbuffer::repair;
 
-use crate::flowcontrol::receiver_window_length;
+use crate::congestion_control::CongestionControl;
 use crate::loss_detector::{Gap, LossDetector};
+use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::protocol::{DataFrame, FrameHeader, header_flags};
 use crate::publication_params::SubscriptionParams;
 use crate::subscribable::{Subscribable, TetherState, TetherablePosition};
@@ -50,6 +51,12 @@ use crate::system_counters::{self, System};
 /// How long a status message may go unsent before one is sent anyway
 /// (`aeron.status.message.timeout`, 200 ms).
 pub const STATUS_MESSAGE_TIMEOUT_NS: i64 = 200_000_000;
+
+/// How long a destination may go unheard from before it is no longer a place a
+/// round-trip measurement is sent to
+/// (`AERON_RECEIVE_DESTINATION_TIMEOUT_NS`,
+/// `media/aeron_receive_destination.h:24`, five seconds).
+pub const RECEIVE_DESTINATION_TIMEOUT_NS: i64 = 5 * 1000 * 1000 * 1000;
 
 /// What an image is built with when nothing configures one
 /// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:204`).
@@ -260,8 +267,13 @@ pub struct PublicationImage {
     next_sm_deadline_ns: i64,
     /// How often a status message is forced (`status.message.timeout`).
     sm_timeout_ns: i64,
-    /// The window this endpoint offers (`receiver.window.length`).
-    initial_window_length: i32,
+    /// The strategy this image runs, named by the endpoint channel's `cc=`
+    /// (`congestion_control`, `aeron_publication_image.c:290`).
+    ///
+    /// It is where both windows come from, and — for `cubic` — the thing the
+    /// rebuild and the round-trip measurements go through. The image keeps no
+    /// window of its own beyond the one the next status message will carry.
+    congestion_control: CongestionControl,
     /// The largest window it will ever offer (`max_window_length`).
     max_receiver_window_length: i32,
     /// How long this image may go quiet before it drains.
@@ -358,7 +370,8 @@ impl PublicationImage {
         _source: SocketAddr,
         control_address: SocketAddr,
         counters: ImageCounters,
-        initial_window_length: i32,
+        congestion_control: CongestionControl,
+        channel_window_length: i32,
         sm_timeout_ns: i64,
         liveness_timeout_ns: i64,
         page_size: usize,
@@ -369,15 +382,14 @@ impl PublicationImage {
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
 
-        // The window the receiver offers: its configured one, cut to half a
-        // term because a receiver needs the other half to keep reading
-        // (`aeron_receiver_window_length`).
-        let window = receiver_window_length(
-            initial_window_length.unsigned_abs() as usize,
-            setup.term_length.unsigned_abs() as usize,
-        );
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let window = window as i32;
+        // The two windows are the strategy's and are not computed here at all:
+        // the reference reads them off it (`aeron_publication_image.c:377-380`)
+        // and keeps no window of its own, which is what makes `cc=` mean
+        // anything. `static` answers the channel's window cut to half a term —
+        // `aeron_receiver_window_length`, which the strategy applies — and
+        // `cubic` the congestion window it starts at.
+        let window = congestion_control.initial_window_length();
+        let max_window = congestion_control.max_window_length();
 
         // The tails, so a reader that maps this file sees the stream where it
         // starts rather than at zero (`aeron_publication_image.c:250-300`).
@@ -398,7 +410,13 @@ impl PublicationImage {
                     term_length: setup.term_length,
                     page_size: i32::try_from(page_size).unwrap_or(4096),
                     publication_window_length: 0,
-                    receiver_window_length: window,
+                    // **Uncut by the term**, which is what the reference writes
+                    // here: it passes `params.initial_window_length` straight
+                    // through (`aeron_publication_image.c:250-262`), and that
+                    // is the context default or the channel's own `rcv-wnd=`
+                    // (`aeron_driver_uri.c:466`, `:502`) with no cap on it. The
+                    // cap belongs to whoever uses the value as a window.
+                    receiver_window_length: channel_window_length,
                     socket_sndbuf_length: 0,
                     os_default_socket_sndbuf_length: 0,
                     os_max_socket_sndbuf_length: 0,
@@ -493,6 +511,7 @@ impl PublicationImage {
             eos_position: initial_position,
             invalidation_reason: None,
             next_sm_position: initial_position,
+            congestion_control,
             next_sm_receiver_window_length: window,
             last_sm_position: initial_position,
             clean_position: initial_position,
@@ -504,8 +523,7 @@ impl PublicationImage {
             // waiting for.
             next_sm_deadline_ns: now_ns - 1,
             sm_timeout_ns,
-            initial_window_length: window,
-            max_receiver_window_length: window,
+            max_receiver_window_length: max_window,
             liveness_timeout_ns,
             // The channel's own delays, when it named one. `nak-delay=` is the
             // whole of what a subscription may say about how its gaps are asked
@@ -1076,12 +1094,33 @@ impl PublicationImage {
 
         system_counters::propose_max(counters, regions, self.counters.rcv_pos, rebuilt);
 
-        // A status message is due when the reader has moved a quarter of a
-        // window since the last one (`:545-553`).
-        let window_length = self.next_sm_receiver_window_length;
+        // The strategy is asked what window this rebuild leaves, and whether
+        // the reader has to be told now (`:534-541`). What it is given is the
+        // whole of what the reference gives it, `loss_found` included — CUBIC
+        // shrinks on a loss and cannot see one from anywhere else.
+        let rebuild = self.congestion_control.on_track_rebuild(
+            counters,
+            regions,
+            now_ns,
+            min_sub_pos,
+            self.next_sm_position,
+            hwm_position,
+            rebuild_position,
+            rebuilt,
+            scan.loss_found,
+        );
+
+        let window_length = rebuild.window_length;
         let threshold = window_length / 4;
 
-        if min_sub_pos > self.next_sm_position + i64::from(threshold) {
+        // Three reasons to send one, and the first two are the reference's
+        // (`:543-553`): the strategy said so, the reader has moved a quarter of
+        // a window, or the window itself changed — which is how a CUBIC image
+        // tells its sender that a loss just cost it half of it.
+        if rebuild.should_force_sm
+            || min_sub_pos > self.next_sm_position + i64::from(threshold)
+            || window_length != self.next_sm_receiver_window_length
+        {
             // A term behind the slowest reader is a term that reader is done
             // with, and cleaning it here — in the same breath as the status
             // message that reports it — is what the reference does (`:551`).
@@ -1338,6 +1377,97 @@ impl PublicationImage {
         }
     }
 
+    /// Ask every live connection to measure a round trip
+    /// (`aeron_publication_image_initiate_rttm`, `:1075-1110`).
+    ///
+    /// Three conditions, all the reference's. The strategy has to want a
+    /// measurement at all — `should_measure_rtt`, which is false for the static
+    /// window and false for CUBIC until a setting turns it on. The connection
+    /// has to be **alive**: a destination that has an address to answer at, and
+    /// has been heard from within `AERON_RECEIVE_DESTINATION_TIMEOUT_NS`
+    /// (`:632-637`). And the request goes out **through the destination it
+    /// measures**, with the `REPLY` flag, so the answer comes back the way the
+    /// data does.
+    ///
+    /// The flag is the whole of the protocol: an RTTM that arrives with it is a
+    /// request (the far end echoes the timestamp), and one that arrives without
+    /// it is an answer, which is what [`Self::on_rttm`] measures.
+    pub fn initiate_rttm(
+        &mut self,
+        endpoint: &mut ReceiveChannelEndpoint,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> usize {
+        let _ = (counters, regions);
+
+        if !self.congestion_control.should_measure_rtt(now_ns) {
+            return 0;
+        }
+
+        let mut work = 0;
+
+        for index in 0..self.connections.len() {
+            let destination = self.connections[index].destination;
+            let Some(control_address) = self.connections[index].control_address else {
+                continue;
+            };
+
+            if !Self::connection_is_alive(&self.connections[index], now_ns) {
+                continue;
+            }
+
+            if endpoint
+                .send_rttm(
+                    destination,
+                    control_address,
+                    self.stream_id,
+                    self.session_id,
+                    now_ns,
+                    0,
+                    crate::protocol::header_flags::RTTM_REPLY,
+                )
+                .is_ok()
+            {
+                self.congestion_control.on_rttm_sent(now_ns);
+                work += 1;
+            }
+        }
+
+        work
+    }
+
+    /// A measurement came back (`aeron_publication_image_on_rttm`, `:849-857`):
+    /// the round trip is what has passed since the timestamp the **far end**
+    /// echoed, less the delta it reported for its own handling.
+    ///
+    /// Wrapping arithmetic, as the C's is: both numbers come off the wire and
+    /// neither is this driver's clock.
+    pub fn on_rttm(
+        &mut self,
+        frame: &crate::protocol::RttmFrame,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) {
+        let rtt_in_ns = now_ns
+            .wrapping_sub(frame.echo_timestamp)
+            .wrapping_sub(frame.reception_delta);
+
+        self.congestion_control
+            .on_rttm(counters, regions, now_ns, rtt_in_ns);
+    }
+
+    /// Whether a connection is one an RTTM may be sent through
+    /// (`aeron_publication_image_connection_is_alive`, `:632-637`).
+    fn connection_is_alive(connection: &Connection, now_ns: i64) -> bool {
+        connection.control_address.is_some()
+            && now_ns
+                < connection
+                    .time_of_last_activity_ns
+                    .wrapping_add(RECEIVE_DESTINATION_TIMEOUT_NS)
+    }
+
     /// How many senders have been heard from recently
     /// (`aeron_update_active_transport_count`,
     /// `aeron_publication_image.c:40-57`).
@@ -1590,8 +1720,15 @@ impl PublicationImage {
 
     /// The initial window, for a caller that wants to report the configured
     /// value rather than the current one.
-    pub const fn initial_window_length(&self) -> i32 {
-        self.initial_window_length
+    pub fn initial_window_length(&self) -> i32 {
+        self.congestion_control.initial_window_length()
+    }
+
+    /// The strategy this image runs, for a caller that has to know what it took
+    /// — the conductor, which gives an image's counters back
+    /// (`aeron_cubic_…_fini`, `aeron_congestion_control.c:342-352`).
+    pub const fn congestion_control(&self) -> &CongestionControl {
+        &self.congestion_control
     }
 
     /// The term length, as the metadata holds it.
@@ -1727,6 +1864,7 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::congestion_control::{CongestionControl, Strategy};
     use crate::media::receive_endpoint::DestinationId;
     use crate::protocol::FrameHeader;
     use crate::subscribable::TetherState;
@@ -1734,6 +1872,12 @@ mod tests {
     use deepmsg_core::logbuffer::frame::Frame;
 
     const TERM_LENGTH: i32 = 64 * 1024;
+
+    /// The window the fixture's channel names, in its `rcv-wnd=`. It is
+    /// deliberately **larger than half a term**, so that the two values the
+    /// window has — the channel's and the one an image may advertise — are
+    /// different numbers a test can tell apart.
+    const CHANNEL_WINDOW: i32 = 128 * 1024;
     const SESSION_ID: i32 = 42;
     const STREAM_ID: i32 = 1001;
     const INITIAL_TERM_ID: i32 = 1_000;
@@ -1761,6 +1905,36 @@ mod tests {
             )
             .expect("four-to-one")
         }
+    }
+
+    /// The strategy the fixture's image runs, built the way the conductor
+    /// builds one (`CongestionControl::create`) over the fixture's own counter
+    /// manager — so a CUBIC image here has real `rcv-cc-cubic-*` counters to
+    /// write into.
+    fn strategy_for(
+        strategy: Strategy,
+        counters: &mut CounterManager,
+        holder: &mut Counters,
+        term_length: i32,
+    ) -> CongestionControl {
+        let regions = holder.open();
+
+        CongestionControl::create(
+            strategy,
+            &crate::config::DriverConfig::default(),
+            counters,
+            &regions,
+            7,
+            SESSION_ID,
+            STREAM_ID,
+            b"aeron:udp?endpoint=127.0.0.1:40123",
+            1408,
+            term_length,
+            CHANNEL_WINDOW,
+            0,
+            0,
+        )
+        .expect("a strategy")
     }
 
     /// The directory an image's log buffer lands in, removed when it goes.
@@ -1814,7 +1988,31 @@ mod tests {
             Self::build(false, false, None, true, false)
         }
 
+        /// The same image under a **CUBIC** strategy, for the tests that need
+        /// a window that moves.
+        fn cubic() -> Self {
+            Self::build_with(Strategy::Cubic, false, false, None, true, true)
+        }
+
         fn build(
+            group_semantics: bool,
+            is_response: bool,
+            nak_delay_ns: Option<i64>,
+            is_reliable: bool,
+            is_sparse: bool,
+        ) -> Self {
+            Self::build_with(
+                Strategy::Static,
+                group_semantics,
+                is_response,
+                nak_delay_ns,
+                is_reliable,
+                is_sparse,
+            )
+        }
+
+        fn build_with(
+            strategy: Strategy,
             group_semantics: bool,
             is_response: bool,
             nak_delay_ns: Option<i64>,
@@ -1891,7 +2089,9 @@ mod tests {
                     rcv_pos,
                     rcv_naks_sent,
                 },
-                128 * 1024,
+                strategy_for(strategy, &mut counters, &mut holder, TERM_LENGTH),
+                // The channel's own window, uncut: what the metadata carries.
+                CHANNEL_WINDOW,
                 STATUS_MESSAGE_TIMEOUT_NS,
                 IMAGE_LIVENESS_TIMEOUT_NS,
                 4096,
@@ -2904,6 +3104,99 @@ mod tests {
             i64::from(term_offset),
             fixture.image.hwm_position(&fixture.counters, &regions),
             "the heartbeat's own position, with nothing added on top of it"
+        );
+    }
+
+    /// The window an image offers is the **channel's**, cut to half a term —
+    /// and the metadata block records it **uncut**. Two facts from one call,
+    /// and they are two different values on purpose: the strategy cuts what it
+    /// advertises (`aeron_receiver_window_length`,
+    /// `aeron_congestion_control.c:155-157`) while the block
+    /// `aeron_logbuffer_metadata_init` is handed is `params.initial_window_length`
+    /// straight (`aeron_publication_image.c:250-262`), which is the channel's
+    /// own or the driver's default (`aeron_driver_uri.c:466`, `:502`).
+    ///
+    /// A build that wrote the cut value into the block would be handing a
+    /// reader of an image's metadata a window the image never advertised.
+    #[test]
+    fn the_window_is_the_channels_and_the_metadata_keeps_it_uncut() {
+        let fixture = Fixture::new();
+
+        assert_eq!(
+            TERM_LENGTH / 2,
+            fixture.image.initial_window_length(),
+            "the channel names a window of {CHANNEL_WINDOW} and the term is {TERM_LENGTH}, so \
+             half a term is what may be offered"
+        );
+        let metadata = fixture.image.log.metadata().expect("metadata");
+
+        assert_eq!(
+            Some(CHANNEL_WINDOW),
+            metadata.load_i32_relaxed(descriptor::RECEIVER_WINDOW_LENGTH_OFFSET),
+            "uncut, as the reference writes it"
+        );
+    }
+
+    /// A CUBIC image is a CUBIC window. The image advertises what its strategy
+    /// says (`aeron_publication_image.c:377-380` — it keeps no window of its
+    /// own), and with CUBIC that is the congestion window it starts at, not the
+    /// channel's `rcv-wnd=` that the static strategy would have offered.
+    ///
+    /// Ten MTUs, because the channel's window of 128 KiB is cut to half a 64 KiB
+    /// term, which is 23 congestion windows — more than `INITIAL_CWND`, so the
+    /// start is ten.
+    #[test]
+    fn a_cubic_image_advertises_the_congestion_window() {
+        let fixture = Fixture::cubic();
+
+        assert_eq!(10 * 1408, fixture.image.initial_window_length());
+        assert_eq!(
+            10 * 1408,
+            fixture.image.window_length(),
+            "and that is what its next status message carries"
+        );
+        assert_eq!(
+            2,
+            fixture.image.congestion_control().counter_ids().len(),
+            "with the two counters CUBIC takes"
+        );
+        assert!(
+            fixture.image.initial_window_length() < CHANNEL_WINDOW,
+            "which is a different window from the channel's, or this test says nothing"
+        );
+    }
+
+    /// A measurement that comes back is a round trip: what has passed since the
+    /// timestamp the far end echoed, less the delta it reported for its own
+    /// handling (`aeron_publication_image.c:849-857`) — and the image hands both
+    /// numbers to its strategy, which is where CUBIC keeps the estimate.
+    #[test]
+    fn an_rttm_that_comes_back_is_the_round_trip_it_measures() {
+        let mut fixture = Fixture::cubic();
+        let regions = fixture.holder.open();
+        let ids = fixture.image.congestion_control().counter_ids().to_vec();
+
+        // The far end echoed a timestamp from 500 µs ago, and spent 20 µs of
+        // the trip on its own handling.
+        let frame = crate::protocol::RttmFrame {
+            session_id: SESSION_ID,
+            stream_id: STREAM_ID,
+            echo_timestamp: 1_000_000 - 500_000,
+            reception_delta: 20_000,
+            receiver_id: 1,
+        };
+
+        fixture
+            .image
+            .on_rttm(&frame, &fixture.counters, &regions, 1_000_000);
+
+        assert_eq!(
+            480_000,
+            fixture
+                .counters
+                .value(&regions, ids[0])
+                .expect("the rtt counter"),
+            "500 µs less the 20 µs the far end spent"
         );
     }
 

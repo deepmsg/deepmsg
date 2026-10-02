@@ -1486,7 +1486,9 @@ impl Conductor {
         }
 
         // The counters and the log buffer. The image is gone from the
-        // receiver, so nothing is reading either of them.
+        // receiver, so nothing is reading either of them — the strategy's own
+        // two among them, which CUBIC is the only one to take
+        // (`aeron_cubic_…_fini`, `aeron_congestion_control.c:342-352`).
         if let Some(region) = self.cnc.counter_regions() {
             let _ = self
                 .counters
@@ -1494,6 +1496,10 @@ impl Conductor {
             let _ = self
                 .counters
                 .free(&region, image.counters.rcv_pos, self.now_ms);
+
+            for counter_id in &image.congestion_control_counters {
+                let _ = self.counters.free(&region, *counter_id, self.now_ms);
+            }
         }
 
         // The image's log buffer goes back through the agent, because a delete
@@ -1541,6 +1547,12 @@ impl Conductor {
             self.receiver.proxy(),
             now,
             &mut warnings,
+            // The same sink the receiver's own faults go into
+            // (`Transmit::faults`), which is where a create that failed
+            // belongs: there is no client waiting on an image's correlation
+            // id, and the reference's answer to a failed image create is a
+            // recorded error and nothing else.
+            transmit.faults,
         );
 
         for registration_id in &created {
@@ -3626,6 +3638,39 @@ mod tests {
         }
     }
 
+    /// Drive the conductor until `expected` more counters have come back, and
+    /// answer with the count it reached.
+    ///
+    /// A **send endpoint's** release is asynchronous, and that is the driver's
+    /// shape rather than this test's business: the publication's own counters
+    /// come back in the pass that answers the client, while the endpoint
+    /// belongs to the *sender* — `try_remove_send_endpoint` sends it a command
+    /// and the conductor frees the endpoint's `snd-channel` counter when the
+    /// confirmation comes back, a pass or two later
+    /// (`aeron_send_channel_endpoint_delete`, `:250-266`). Asserting the moment
+    /// the client was answered read a count that had not finished moving, which
+    /// is what made this test fail under load and never on its own.
+    fn await_counter_frees(conductor: &mut Conductor, before: usize, expected: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            let free = conductor.counters().free_list_len();
+
+            if free >= before + expected {
+                return free;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the free list grew by {} of the {expected} counters owed",
+                free.saturating_sub(before)
+            );
+
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// `REMOVE_PUBLICATION`'s wire form, in either shape.
     ///
     /// Written here rather than in the `cnc` crate because the client's own
@@ -5336,11 +5381,13 @@ mod tests {
             conductor.network_publications().is_empty(),
             "the publication is gone from the driver"
         );
+        // Six counters of its own, freed in the pass that answered the client,
+        // and the endpoint's `snd-channel` — which was the last one holding
+        // that port — once the sender has confirmed it let the endpoint go.
         assert_eq!(
             counters_before + 7,
-            conductor.counters().free_list_len(),
-            "and its six counters came back — plus the send endpoint's, which \
-             was the last one holding that port"
+            await_counter_frees(&mut conductor, counters_before, 7),
+            "all seven came back"
         );
     }
 
@@ -6364,16 +6411,20 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_parameter_this_driver_cannot_serve_is_answered_rather_than_ignored() {
+    fn a_channel_parameter_this_driver_reads_is_served_rather_than_ignored() {
         // G1-4's whole point, at the client's end: `cc=` and `nak-delay=` used
         // to reach the parser's generic list and change nothing, so a client
         // that named one got a subscription behaving like a different one.
+        //
+        // Both are read now, and **neither is refused here**: `cc=` is a
+        // strategy the *image* is built with (`aeron_congestion_control.c:165-205`
+        // is reached from the image create), so a subscription that names one
+        // this driver cannot serve is a subscription that exists and never
+        // reads — which is the reference's answer too, and pinned from the
+        // outside by `tests/integration/congestion_control.rs`.
         let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
         drain(&cnc, &mut receiver);
 
-        // A strategy this build does not carry: refused, by name, on the
-        // correlation id that asked — where the reference's supplier fails with
-        // no error set at all and the client is told nothing.
         let port = {
             use crate::sys::AddressFamily;
             use crate::sys::socket::DatagramSocket;
@@ -6398,23 +6449,18 @@ mod tests {
         conductor.do_work();
 
         let events = drain(&cnc, &mut receiver);
-        let payload = events
-            .iter()
-            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
-            .map(|(_, payload)| payload.clone())
-            .expect("the client is answered rather than left waiting");
 
-        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
-        assert!(
-            String::from_utf8_lossy(&payload[16..]).contains("cc=cubic"),
-            "and told which parameter: {}",
-            String::from_utf8_lossy(&payload[16..])
-        );
         assert!(
             !events
                 .iter()
+                .any(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID),
+            "a strategy is named on the channel and decided at the image, so naming one is not an error here"
+        );
+        assert!(
+            events
+                .iter()
                 .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "no subscription was created"
+            "the subscription is created"
         );
 
         // And the half that *is* served: a named `nak-delay` is read, and the

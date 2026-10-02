@@ -489,6 +489,34 @@ pub struct DriverConfig {
     /// long an IPC publication's refusal lasts
     /// (`aeron.image.liveness.timeout`, `AERON_IMAGE_LIVENESS_TIMEOUT`).
     pub image_liveness_timeout_ns: i64,
+    /// Which supplier builds an image's congestion-control strategy
+    /// (`aeron.congestioncontrol.supplier`,
+    /// `AERON_CONGESTIONCONTROL_SUPPLIER`) — `default`, `static` or `cubic`.
+    ///
+    /// The default is the **chooser**: with it, the channel's `cc=` decides,
+    /// image by image. Naming one of the others makes every image that one.
+    pub congestion_control_supplier: crate::congestion_control::Supplier,
+    /// The raw `aeron.cubiccongestioncontrol.initialrtt`
+    /// (`AERON_CUBICCONGESTIONCONTROL_INITIALRTT`, `aeronmd.h:351`).
+    ///
+    /// **A string, not a duration, and the shape is the reference's.** The
+    /// three `aeron.cubiccongestioncontrol.*` settings are read by `getenv`
+    /// **inside CUBIC's supplier**, not into the driver context
+    /// (`aeron_congestion_control.c:392-402`) — so a value that is not a
+    /// duration is not a driver that will not start: it is every CUBIC image
+    /// failing to be created, which is what [`Self::cubic_initial_rtt_ns`]
+    /// keeps. Every other timeout in this file is a context value in the
+    /// reference and fails the start-up instead.
+    pub cubic_initial_rtt: Option<String>,
+    /// Whether CUBIC measures round trips at all
+    /// (`aeron.cubiccongestioncontrol.measurertt`, `aeronmd.h:346`).
+    ///
+    /// Off by default, and that is the reference's default — an image that does
+    /// not measure sends no RTTM and keeps the initial RTT for ever.
+    pub cubic_measure_rtt: bool,
+    /// Whether CUBIC takes the TCP-friendly window after a loss
+    /// (`aeron.cubiccongestioncontrol.tcpmode`, `aeronmd.h:359`).
+    pub cubic_tcp_mode: bool,
     /// The tag a `fc=tagged` channel that names no `g:` matches against
     /// (`aeron.flow.control.gtag`, `AERON_FLOW_CONTROL_GROUP_TAG`).
     pub flow_control_group_tag: i64,
@@ -625,6 +653,10 @@ impl Default for DriverConfig {
             image_liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT,
             multicast_flow_control_supplier: MULTICAST_FLOW_CONTROL_SUPPLIER_DEFAULT,
             unicast_flow_control_supplier: UNICAST_FLOW_CONTROL_SUPPLIER_DEFAULT,
+            congestion_control_supplier: crate::congestion_control::Supplier::default(),
+            cubic_initial_rtt: None,
+            cubic_measure_rtt: false,
+            cubic_tcp_mode: false,
             flow_control_group_tag: FLOW_CONTROL_GROUP_TAG_DEFAULT,
             flow_control_group_min_size: FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT,
             flow_control_receiver_timeout_ns: FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT,
@@ -646,6 +678,21 @@ impl Default for DriverConfig {
 }
 
 impl DriverConfig {
+    /// CUBIC's initial RTT as a duration — the property if it named one, the
+    /// reference's 100 µs otherwise (`aeron_congestion_control.c:38`,
+    /// `:396-402`).
+    ///
+    /// # Returns
+    ///
+    /// `None` when the property named something that is not a duration, which
+    /// is the supplier's failure and not the driver's.
+    pub fn cubic_initial_rtt_ns(&self) -> Option<i64> {
+        match self.cubic_initial_rtt.as_deref() {
+            None => Some(crate::congestion_control::INITIAL_RTT_NS_DEFAULT),
+            Some(value) => cubic_duration(value),
+        }
+    }
+
     /// Read the configuration from `args` (which may include `-D` properties)
     /// and the process environment.
     ///
@@ -895,6 +942,26 @@ impl DriverConfig {
         if let Some(value) = get(&Setting::UNICAST_FLOWCONTROL_SUPPLIER) {
             config.unicast_flow_control_supplier =
                 parse_supplier(&Setting::UNICAST_FLOWCONTROL_SUPPLIER, &value)?;
+        }
+        // The three cubic settings, carried rather than parsed: see
+        // `cubic_initial_rtt`. The two booleans are parsed here like every
+        // other boolean property, which is the one place this build is
+        // stricter than the reference's prefix comparison (see `parse_bool`).
+        if let Some(value) = get(&Setting::CONGESTIONCONTROL_SUPPLIER) {
+            // A name the reference's table does not carry is a **driver that
+            // does not start** (`aeron_driver_context.c:579-585`'s `goto
+            // error`), not an image that fails later.
+            config.congestion_control_supplier =
+                parse_congestion_control_supplier(&Setting::CONGESTIONCONTROL_SUPPLIER, &value)?;
+        }
+        if let Some(value) = get(&Setting::CUBIC_INITIAL_RTT) {
+            config.cubic_initial_rtt = Some(value);
+        }
+        if let Some(value) = get(&Setting::CUBIC_MEASURE_RTT) {
+            config.cubic_measure_rtt = parse_bool(&Setting::CUBIC_MEASURE_RTT, &value)?;
+        }
+        if let Some(value) = get(&Setting::CUBIC_TCP_MODE) {
+            config.cubic_tcp_mode = parse_bool(&Setting::CUBIC_TCP_MODE, &value)?;
         }
         if let Some(value) = get(&Setting::IMAGE_LIVENESS_TIMEOUT) {
             config.image_liveness_timeout_ns =
@@ -1204,6 +1271,27 @@ impl Setting {
     const UNICAST_FLOWCONTROL_SUPPLIER: Self = Self {
         property: "unicast.flowcontrol.supplier",
         env: "AERON_UNICAST_FLOWCONTROL_SUPPLIER",
+    };
+    /// `aeron.congestioncontrol.supplier`
+    /// (`AERON_CONGESTIONCONTROL_SUPPLIER`, `aeronmd.h:339`).
+    const CONGESTIONCONTROL_SUPPLIER: Self = Self {
+        property: "congestioncontrol.supplier",
+        env: "AERON_CONGESTIONCONTROL_SUPPLIER",
+    };
+    /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:351`).
+    const CUBIC_INITIAL_RTT: Self = Self {
+        property: "cubiccongestioncontrol.initialrtt",
+        env: "AERON_CUBICCONGESTIONCONTROL_INITIALRTT",
+    };
+    /// `aeron.cubiccongestioncontrol.measurertt` (`aeronmd.h:346`).
+    const CUBIC_MEASURE_RTT: Self = Self {
+        property: "cubiccongestioncontrol.measurertt",
+        env: "AERON_CUBICCONGESTIONCONTROL_MEASURERTT",
+    };
+    /// `aeron.cubiccongestioncontrol.tcpmode` (`aeronmd.h:359`).
+    const CUBIC_TCP_MODE: Self = Self {
+        property: "cubiccongestioncontrol.tcpmode",
+        env: "AERON_CUBICCONGESTIONCONTROL_TCPMODE",
     };
     /// `aeron.image.liveness.timeout` (`aeronmd.h:323`).
     const IMAGE_LIVENESS_TIMEOUT: Self = Self {
@@ -1588,6 +1676,21 @@ fn parse_supplier(setting: &Setting, value: &str) -> Result<Supplier, ConfigErro
     })
 }
 
+/// The congestion-control supplier a property names
+/// (`aeron_congestion_control_strategy_supplier_load`'s table,
+/// `aeron_congestion_control.c:45-62`).
+fn parse_congestion_control_supplier(
+    setting: &Setting,
+    value: &str,
+) -> Result<crate::congestion_control::Supplier, ConfigError> {
+    crate::congestion_control::Supplier::from_name(value).ok_or_else(|| {
+        ConfigError::UnknownSupplier {
+            name: setting.property,
+            value: value.to_owned(),
+        }
+    })
+}
+
 fn parse_count(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
     value.parse().map_err(|_| ConfigError::NotANumber {
         name: setting.property,
@@ -1598,6 +1701,16 @@ fn parse_count(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
 /// Parse a duration in nanoseconds, with the reference's suffixes
 /// (`aeron-client/src/main/c/util/aeron_parse_util.c:170-268`): `s`, `ms`,
 /// `us`, `ns`, either case.
+/// The duration a CUBIC property names, or `None` when it is not one.
+///
+/// Read lazily, at the point the reference reads it: CUBIC's supplier calls
+/// `aeron_parse_duration_ns` on the `getenv` result and fails the image when it
+/// will not parse (`aeron_congestion_control.c:394-402`). A driver whose start
+/// depended on this value would be one the reference does not have.
+pub(crate) fn cubic_duration(value: &str) -> Option<i64> {
+    parse_duration_ns(&Setting::CUBIC_INITIAL_RTT, value).ok()
+}
+
 fn parse_duration_ns(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
     let lower = value.to_ascii_lowercase();
     let (digits, multiplier) = if let Some(head) = lower.strip_suffix("ns") {
@@ -1652,6 +1765,57 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         })
+    }
+
+    /// The three cubic settings are the only ones this driver carries as
+    /// **strings** and parses where the supplier is built
+    /// (`aeron_congestion_control.c:392-402`), and the supplier's own name is
+    /// the one cubic setting that fails the *driver*: the reference's load
+    /// returns `NULL` and its context init goes to `error`
+    /// (`aeron_driver_context.c:579-585`).
+    #[test]
+    fn the_cubic_settings_are_carried_and_the_supplier_name_is_checked() {
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("aeron.cubiccongestioncontrol.initialrtt", "1s"),
+            ("aeron.cubiccongestioncontrol.measurertt", "true"),
+            ("aeron.cubiccongestioncontrol.tcpmode", "on"),
+            ("aeron.congestioncontrol.supplier", "cubic"),
+        ])
+        .expect("a config");
+
+        assert_eq!(Some("1s".to_owned()), config.cubic_initial_rtt);
+        assert_eq!(Some(1_000_000_000), config.cubic_initial_rtt_ns());
+        assert!(config.cubic_measure_rtt);
+        assert!(config.cubic_tcp_mode);
+        assert_eq!(
+            crate::congestion_control::Supplier::Cubic,
+            config.congestion_control_supplier
+        );
+
+        // A duration that will not parse is **not** an error here: it is an
+        // image that will not be built, which is where the reference fails it.
+        let unparseable = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("aeron.cubiccongestioncontrol.initialrtt", "soon"),
+        ])
+        .expect("a config");
+
+        assert_eq!(Some("soon".to_owned()), unparseable.cubic_initial_rtt);
+        assert_eq!(None, unparseable.cubic_initial_rtt_ns());
+
+        // And a supplier this build cannot load stops the driver, as the
+        // reference's does.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                (
+                    "aeron.congestioncontrol.supplier",
+                    "aeron_cubic_congestion_control_strategy_supplier"
+                ),
+            ]),
+            Err(ConfigError::UnknownSupplier { .. })
+        ));
     }
 
     #[test]

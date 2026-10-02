@@ -21,6 +21,7 @@ pub mod channel_validation;
 pub mod clients;
 pub mod conductor;
 pub mod config;
+pub mod congestion_control;
 pub mod dir;
 pub mod flowcontrol;
 pub mod idle;

@@ -41,6 +41,10 @@ pub mod type_id {
     /// `AERON_COUNTER_RECEIVER_NAKS_SENT_TYPE_ID` (`:124`), label
     /// `"rcv-naks-sent"`.
     pub const RECEIVER_NAKS_SENT: i32 = 20;
+    /// `AERON_COUNTER_PER_IMAGE_TYPE_ID` (`aeron_counters.h:95`), the id a
+    /// counter that belongs to one image and nobody else carries — CUBIC's two
+    /// (`rcv-cc-cubic-rtt`, `rcv-cc-cubic-wnd`) are the only ones so far.
+    pub const PER_IMAGE: i32 = 10;
     /// `AERON_COUNTER_SENDER_POSITION_TYPE_ID` (`:104-106`), label
     /// `"snd-pos"`.
     pub const SENDER_POSITION: i32 = 2;

@@ -231,12 +231,6 @@ pub struct SubscriptionParams {
     /// is read at all — and the image is built later, off another thread, from
     /// what the subscription left behind.
     pub nak_delay_ns: Option<i64>,
-    /// The strategy the image is to use for the window it advertises
-    /// (`cc=`). Resolved and checked here for the same reason
-    /// [`Self::nak_delay_ns`] is: a value this build cannot serve is a
-    /// subscription that must not be created, not an image that quietly
-    /// behaves like a different one.
-    pub congestion_control: CongestionControl,
     /// What `group=` said, or the driver's own consideration when it said
     /// nothing: whether this channel is to be treated as one of a group even
     /// when the channel itself gives no sign of it.
@@ -247,28 +241,6 @@ pub struct SubscriptionParams {
     /// `SETUP`, long after the subscription that will read it.
     pub group: InferableBoolean,
 }
-
-/// The congestion-control strategies a channel may name with `cc=`
-/// (`aeron_congestion_control.c:165-205`).
-///
-/// The reference has three arms — nothing named or `static` gives the static
-/// window strategy, `cubic` gives cubic, and anything else **fails the supplier
-/// with no error set at all** (`:178-204`, whose `result` stays `-1`). This
-/// build carries only the first, so the other two are refused where the
-/// reference would build something else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CongestionControl {
-    /// `AERON_STATICWINDOWCONGESTIONCONTROL_CC_PARAM_VALUE` — and what a
-    /// channel that names nothing gets.
-    Static,
-}
-
-/// `AERON_STATICWINDOWCONGESTIONCONTROL_CC_PARAM_VALUE`
-/// (`aeron-driver/src/main/c/aeron_congestion_control.c`).
-pub const CONGESTION_CONTROL_STATIC: &str = "static";
-
-/// `AERON_CUBICCONGESTIONCONTROL_CC_PARAM_VALUE`.
-pub const CONGESTION_CONTROL_CUBIC: &str = "cubic";
 
 /// `AERON_RELIABLE_STREAM_DEFAULT` (`aeron-driver/src/main/c/aeron_driver_context.c:213`).
 pub const RELIABLE_STREAM_DEFAULT: bool = true;
@@ -302,7 +274,6 @@ impl SubscriptionParams {
             untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
             nak_delay_ns: None,
-            congestion_control: CongestionControl::Static,
             group: config.receiver_group_consideration,
         }
     }
@@ -327,7 +298,6 @@ impl SubscriptionParams {
             untethered_linger_timeout_ns: config.untethered_linger_timeout_ns,
             untethered_resting_timeout_ns: config.untethered_resting_timeout_ns,
             nak_delay_ns: None,
-            congestion_control: CongestionControl::Static,
             group: config.receiver_group_consideration,
         };
 
@@ -360,18 +330,14 @@ impl SubscriptionParams {
         // channel is served.
         params.nak_delay_ns = uri.duration_ns(key::NAK_DELAY)?;
 
-        // `cc` is checked for the values this build cannot serve. Naming
-        // nothing means the reference's own default, which is the static window
-        // — the one strategy that is implemented here — so naming it is
-        // accepted too, and everything else is refused rather than served as
-        // something it is not.
-        if let Some(named) = uri.value(key::CONGESTION_CONTROL) {
-            if !named.starts_with(CONGESTION_CONTROL_STATIC) {
-                return Err(PublicationParamsError::CongestionControl {
-                    value: named.to_owned(),
-                });
-            }
-        }
+        // `cc=` is **not** read here at all, and that is the reference's
+        // shape: the strategy is chosen when an *image* is built, off the
+        // endpoint's channel (`aeron_congestion_control.c:165-205` called from
+        // `aeron_driver_conductor.c:6629`), and a subscription that names a
+        // strategy this driver cannot serve is a subscription that exists and
+        // never reads anything. This build refused those names here instead —
+        // early, and with a message — which is where a `cc=` this build *did*
+        // serve would have been refused for the wrong reason too.
 
         if let Some(window_limit) = uri.duration_ns(key::UNTETHERED_WINDOW_LIMIT_TIMEOUT)? {
             params.untethered_window_limit_timeout_ns = window_limit;
@@ -455,16 +421,6 @@ pub enum PublicationParamsError {
         /// The tag the URI named.
         tag: i64,
     },
-    /// `cc=` named a congestion-control strategy this build does not carry.
-    ///
-    /// The reference serves `cubic` and fails silently on anything else
-    /// (`aeron_congestion_control.c:165-205`); this build carries the static
-    /// window only, so every other name is refused rather than served as
-    /// something it is not.
-    CongestionControl {
-        /// What the URI said.
-        value: String,
-    },
 }
 
 /// What was wrong with a starting position.
@@ -536,11 +492,6 @@ impl std::fmt::Display for PublicationParamsError {
             Self::UnknownSessionIdTag { tag } => write!(
                 f,
                 "session-id=tag:{tag} must reference a network publication"
-            ),
-            Self::CongestionControl { value } => write!(
-                f,
-                "cc={value} names a congestion control this driver does not serve; \
-                 the only strategy it carries is `{CONGESTION_CONTROL_STATIC}`"
             ),
             Self::Position(error) => write!(f, "{error}"),
         }
@@ -1068,34 +1019,28 @@ mod tests {
         );
     }
 
+    /// `cc=` is a subscription's to name and **not** its to have checked:
+    /// every one of the reference's three arms is decided when an image is
+    /// built, not when the subscription is made
+    /// (`aeron_congestion_control.c:165-205`, reached from
+    /// `aeron_driver_conductor.c:6629`).
+    ///
+    /// This build used to refuse a name it could not serve here, which meant a
+    /// subscription that named `cubic` was refused outright while the driver it
+    /// was talking to could serve it. The two that are worth naming resolve
+    /// into a subscription like any other channel; what they *mean* is the
+    /// image's question, and `congestion_control::Strategy::from_name` is where
+    /// it is answered.
     #[test]
-    fn a_congestion_control_this_driver_does_not_carry_is_refused() {
-        // Three arms in the reference: nothing or `static` is the static window,
-        // `cubic` is cubic, and anything else leaves its supplier's `result` at
-        // `-1` with **no error set** (`aeron_congestion_control.c:165-205`) —
-        // a client told nothing at all. This build carries the static window and
-        // refuses the rest by name.
-        let named_static = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|cc=static")
-            .expect("a subscription");
-        assert_eq!(CongestionControl::Static, named_static.congestion_control);
-
-        let silent =
-            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123").expect("a subscription");
-        assert_eq!(
-            CongestionControl::Static,
-            silent.congestion_control,
-            "naming nothing is the reference's own default"
-        );
-
+    fn a_congestion_control_is_a_subscriptions_to_name_and_the_images_to_read() {
         for uri in [
+            "aeron:udp?endpoint=127.0.0.1:40123",
+            "aeron:udp?endpoint=127.0.0.1:40123|cc=static",
             "aeron:udp?endpoint=127.0.0.1:40123|cc=cubic",
             "aeron:udp?endpoint=127.0.0.1:40123|cc=nonsense",
         ] {
-            let error = resolve_subscription(uri).expect_err("a strategy this build lacks");
-            assert!(
-                matches!(error, PublicationParamsError::CongestionControl { .. }),
-                "{uri}: {error}"
-            );
+            resolve_subscription(uri)
+                .unwrap_or_else(|error| panic!("{uri} makes a subscription: {error}"));
         }
     }
 

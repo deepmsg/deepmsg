@@ -89,6 +89,12 @@ path = "integration/spy_subscription.rs"
 name = "ipc_destination"
 path = "integration/ipc_destination.rs"
 
+# CUBIC on a live stream: the round trip an image measures, and the window it
+# runs. Runs in CI.
+[[test]]
+name = "congestion_control"
+path = "integration/congestion_control.rs"
+
 # A publication with one producer, from our client to our driver over IPC.
 # Runs in CI: it needs our own driver, not the reference's.
 [[test]]

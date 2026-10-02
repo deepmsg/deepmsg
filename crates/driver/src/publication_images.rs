@@ -61,6 +61,17 @@ pub struct PublicationImageRecord {
     pub path: PathBuf,
     /// The counters a client reads.
     pub counters: ImageCounters,
+    /// The counters the image's **strategy** took, if it took any: CUBIC's
+    /// `rcv-cc-cubic-rtt` and `rcv-cc-cubic-wnd`
+    /// (`aeron_cubic_congestion_control_strategy_state_stct`,
+    /// `aeron_congestion_control.c:432-462`). The static window takes none.
+    ///
+    /// They are kept here, on the conductor's side, for the same reason the
+    /// three above are: the strategy itself lives with the image in the
+    /// receiver's thread, and giving a counter back is the conductor's to do
+    /// (`aeron_cubic_…_fini`, `:342-352`, which the reference calls when the
+    /// image goes at `:422`).
+    pub congestion_control_counters: Vec<i32>,
     /// Where it is in its life (`aeron_publication_image_on_time_event`).
     pub state: ImageState,
     /// When that changed.
@@ -389,6 +400,7 @@ impl PublicationImages {
         receiver: &ReceiverProxy,
         now: Now,
         storage_warnings: &mut Vec<StorageWarning>,
+        faults: &mut Vec<(i32, String)>,
     ) -> Vec<i64> {
         let completions = self.agent.poll();
         let mut created = Vec::new();
@@ -406,7 +418,7 @@ impl PublicationImages {
 
                     let pending = self.pending.swap_remove(index);
                     created.push(self.create_image(
-                        config, counters, regions, endpoints, receiver, pending, *log, now,
+                        config, counters, regions, endpoints, receiver, pending, *log, now, faults,
                     ));
                 }
                 Completion::MapFailed { .. } => {
@@ -435,13 +447,77 @@ impl PublicationImages {
         pending: PendingImage,
         log: deepmsg_core::logbuffer::logfile::LogFile,
         now: Now,
+        faults: &mut Vec<(i32, String)>,
     ) -> Option<i64> {
-        let window = crate::flowcontrol::receiver_window_length(
-            config.receiver_window_length.unsigned_abs() as usize,
-            pending.setup.term_length.unsigned_abs() as usize,
-        );
+        // The strategy comes from the **endpoint channel**, which is where the
+        // reference reads it: its `cc=` names the strategy
+        // (`aeron_congestion_control.c:165-205`) and its `rcv-wnd=` the window
+        // (`aeron_udp_channel_receiver_window`), and the conductor hands the
+        // supplier `endpoint->conductor_fields.udp_channel`
+        // (`aeron_driver_conductor.c:6629-6631`) rather than the subscription
+        // link's channel or the driver's own defaults.
+        let entry = endpoints.get(pending.endpoint_id)?;
+        let channel = &entry.channel;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let window = window as i32;
+        let channel_window =
+            crate::receive_endpoints::ReceiveChannelEndpoints::initial_window_length(
+                config, channel,
+            ) as i32;
+
+        // A channel whose `cc=` names a strategy this driver cannot serve — or
+        // whose CUBIC settings will not parse — is a strategy that cannot be
+        // built, and the reference answers that the same way it answers any
+        // other failure here: the image is never created, the publication is
+        // left sending `SETUP`s into a receiver that keeps failing to build
+        // one, and what is recorded is a line naming the stream and the session
+        // (`aeron_driver_conductor.c:6633-6640` appends exactly those two).
+        let uri = crate::channel_uri::ChannelUri::parse(&channel.original_uri).ok()?;
+
+        // The **driver's** supplier decides first: `default` is the chooser and
+        // reads `cc=`; `static` or `cubic` names the strategy outright
+        // (`aeron_driver_conductor.c:6629` calls whatever the context loaded).
+        let Some(strategy) = config
+            .congestion_control_supplier
+            .strategy(uri.value(crate::publication_params::key::CONGESTION_CONTROL))
+        else {
+            faults.push((
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "stream_id={} session_id={}",
+                    pending.setup.stream_id, pending.setup.session_id
+                ),
+            ));
+
+            return None;
+        };
+
+        let congestion_control = crate::congestion_control::CongestionControl::create(
+            strategy,
+            config,
+            counters,
+            regions,
+            pending.registration_id,
+            pending.session_id,
+            pending.stream_id,
+            &pending.channel,
+            pending.setup.mtu,
+            pending.setup.term_length,
+            channel_window,
+            now.ms,
+            now.ns,
+        );
+
+        let Some(congestion_control) = congestion_control else {
+            faults.push((
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "stream_id={} session_id={}",
+                    pending.setup.stream_id, pending.setup.session_id
+                ),
+            ));
+
+            return None;
+        };
 
         let mut image = PublicationImage::create(
             pending.registration_id,
@@ -453,7 +529,8 @@ impl PublicationImages {
             pending.source,
             pending.control_address,
             pending.counters,
-            window,
+            congestion_control,
+            channel_window,
             config.status_message_timeout_ns,
             config.image_liveness_timeout_ns,
             config.layout.page_size,
@@ -465,6 +542,8 @@ impl PublicationImages {
             ),
             now.ns,
         );
+
+        let congestion_control_counters = image.congestion_control().counter_ids().to_vec();
 
         if let Some(reason) = pending.invalidation {
             image.invalidate(&reason);
@@ -487,6 +566,7 @@ impl PublicationImages {
                 .unwrap_or_default(),
             path: pending.path,
             counters: pending.counters,
+            congestion_control_counters,
             state: ImageState::Active,
             time_of_last_state_change_ns: now.ns,
             refcount: 0,
