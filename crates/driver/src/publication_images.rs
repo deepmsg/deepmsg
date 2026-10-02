@@ -400,6 +400,7 @@ impl PublicationImages {
         receiver: &ReceiverProxy,
         now: Now,
         storage_warnings: &mut Vec<StorageWarning>,
+        faults: &mut Vec<(i32, String)>,
     ) -> Vec<i64> {
         let completions = self.agent.poll();
         let mut created = Vec::new();
@@ -417,7 +418,7 @@ impl PublicationImages {
 
                     let pending = self.pending.swap_remove(index);
                     created.push(self.create_image(
-                        config, counters, regions, endpoints, receiver, pending, *log, now,
+                        config, counters, regions, endpoints, receiver, pending, *log, now, faults,
                     ));
                 }
                 Completion::MapFailed { .. } => {
@@ -446,6 +447,7 @@ impl PublicationImages {
         pending: PendingImage,
         log: deepmsg_core::logbuffer::logfile::LogFile,
         now: Now,
+        faults: &mut Vec<(i32, String)>,
     ) -> Option<i64> {
         // The strategy comes from the **endpoint channel**, which is where the
         // reference reads it: its `cc=` names the strategy
@@ -462,10 +464,28 @@ impl PublicationImages {
                 config, channel,
             ) as i32;
 
+        // A channel whose `cc=` names a strategy this driver cannot serve — or
+        // whose CUBIC settings will not parse — is a strategy that cannot be
+        // built, and the reference answers that the same way it answers any
+        // other failure here: the image is never created, the publication is
+        // left sending `SETUP`s into a receiver that keeps failing to build
+        // one, and what is recorded is a line naming the stream and the session
+        // (`aeron_driver_conductor.c:6633-6640` appends exactly those two).
         let uri = crate::channel_uri::ChannelUri::parse(&channel.original_uri).ok()?;
-        let strategy = crate::congestion_control::Strategy::from_name(
+
+        let Some(strategy) = crate::congestion_control::Strategy::from_name(
             uri.value(crate::publication_params::key::CONGESTION_CONTROL),
-        )?;
+        ) else {
+            faults.push((
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "stream_id={} session_id={}",
+                    pending.setup.stream_id, pending.setup.session_id
+                ),
+            ));
+
+            return None;
+        };
 
         let congestion_control = crate::congestion_control::CongestionControl::create(
             strategy,
@@ -481,7 +501,19 @@ impl PublicationImages {
             channel_window,
             now.ms,
             now.ns,
-        )?;
+        );
+
+        let Some(congestion_control) = congestion_control else {
+            faults.push((
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!(
+                    "stream_id={} session_id={}",
+                    pending.setup.stream_id, pending.setup.session_id
+                ),
+            ));
+
+            return None;
+        };
 
         let mut image = PublicationImage::create(
             pending.registration_id,

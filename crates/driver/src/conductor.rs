@@ -1547,6 +1547,12 @@ impl Conductor {
             self.receiver.proxy(),
             now,
             &mut warnings,
+            // The same sink the receiver's own faults go into
+            // (`Transmit::faults`), which is where a create that failed
+            // belongs: there is no client waiting on an image's correlation
+            // id, and the reference's answer to a failed image create is a
+            // recorded error and nothing else.
+            transmit.faults,
         );
 
         for registration_id in &created {
@@ -6370,16 +6376,20 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_parameter_this_driver_cannot_serve_is_answered_rather_than_ignored() {
+    fn a_channel_parameter_this_driver_reads_is_served_rather_than_ignored() {
         // G1-4's whole point, at the client's end: `cc=` and `nak-delay=` used
         // to reach the parser's generic list and change nothing, so a client
         // that named one got a subscription behaving like a different one.
+        //
+        // Both are read now, and **neither is refused here**: `cc=` is a
+        // strategy the *image* is built with (`aeron_congestion_control.c:165-205`
+        // is reached from the image create), so a subscription that names one
+        // this driver cannot serve is a subscription that exists and never
+        // reads — which is the reference's answer too, and pinned from the
+        // outside by `tests/integration/congestion_control.rs`.
         let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
         drain(&cnc, &mut receiver);
 
-        // A strategy this build does not carry: refused, by name, on the
-        // correlation id that asked — where the reference's supplier fails with
-        // no error set at all and the client is told nothing.
         let port = {
             use crate::sys::AddressFamily;
             use crate::sys::socket::DatagramSocket;
@@ -6404,23 +6414,18 @@ mod tests {
         conductor.do_work();
 
         let events = drain(&cnc, &mut receiver);
-        let payload = events
-            .iter()
-            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
-            .map(|(_, payload)| payload.clone())
-            .expect("the client is answered rather than left waiting");
 
-        assert_eq!(11i64.to_le_bytes(), payload[0..8]);
-        assert!(
-            String::from_utf8_lossy(&payload[16..]).contains("cc=cubic"),
-            "and told which parameter: {}",
-            String::from_utf8_lossy(&payload[16..])
-        );
         assert!(
             !events
                 .iter()
+                .any(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID),
+            "a strategy is named on the channel and decided at the image, so naming one is not an error here"
+        );
+        assert!(
+            events
+                .iter()
                 .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "no subscription was created"
+            "the subscription is created"
         );
 
         // And the half that *is* served: a named `nak-delay` is read, and the
