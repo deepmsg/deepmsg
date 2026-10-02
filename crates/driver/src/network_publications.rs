@@ -34,6 +34,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::name_resolver::Resolver;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
@@ -55,7 +56,7 @@ use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, Names, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -258,6 +259,7 @@ impl NetworkPublications {
         config: &DriverConfig,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
+        resolver: &mut dyn Resolver,
         clients: &mut Clients,
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
@@ -273,8 +275,16 @@ impl NetworkPublications {
             return Err(AddError::UnsupportedTransport);
         }
 
-        let channel = UdpChannel::resolve(request.channel, &uri)
-            .map_err(|error| AddError::Channel(Box::new(error)))?;
+        let channel = UdpChannel::resolve_with(
+            &mut Names::Built {
+                resolver,
+                counters,
+                regions,
+            },
+            request.channel,
+            &uri,
+        )
+        .map_err(|error| AddError::Channel(Box::new(error)))?;
         let mut params = PublicationParams::resolve(&uri, config, |tag| self.find_by_tag(tag))?;
 
         validate_for_publication(&channel)?;

@@ -64,6 +64,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::channel_uri::{ChannelUri, Transport, UriError};
+use deepmsg_cnc::{CounterManager, CounterRegions};
+
+use crate::name_resolver::Resolver;
 use crate::sys::{self, AddressFamily};
 
 /// The tag of a channel that did not name one (`AERON_URI_INVALID_TAG`,
@@ -290,6 +293,22 @@ impl UdpChannel {
     /// [`UdpChannelError`] for a URI this build cannot serve, a channel the
     /// reference refuses, or an address that does not resolve.
     pub fn resolve(original_uri: &[u8], uri: &ChannelUri<'_>) -> Result<Self, UdpChannelError> {
+        Self::resolve_with(&mut Names::System, original_uri, uri)
+    }
+
+    /// [`UdpChannel::resolve`] with the resolver the driver built, which is
+    /// what a driver that was configured with one parses its channels through
+    /// (`aeron_driver_native_resource_agent_on_parse_udp_channel`,
+    /// `aeron_driver_native_resource_agent.c:385-397`).
+    ///
+    /// # Errors
+    ///
+    /// The same ones, plus whatever the resolver refuses.
+    pub fn resolve_with(
+        names: &mut Names<'_>,
+        original_uri: &[u8],
+        uri: &ChannelUri<'_>,
+    ) -> Result<Self, UdpChannelError> {
         if uri.transport() != Transport::Udp {
             return Err(UdpChannelError::InvalidChannel(
                 "UDP channels must use UDP URIs".to_owned(),
@@ -329,12 +348,12 @@ impl UdpChannel {
         // `:346-374`: the control address resolves first, because it decides
         // the family of the endpoint when no endpoint was named.
         let explicit_control_addr = match control {
-            Some(text) => Some(resolve_host_and_port(text)?),
+            Some(text) => Some(resolve_name(names, CONTROL_PARAM, text)?),
             None => None,
         };
 
         let endpoint_addr = match endpoint {
-            Some(text) => resolve_host_and_port(text)?,
+            Some(text) => resolve_name(names, ENDPOINT_PARAM, text)?,
             None => wildcard_socket(
                 explicit_control_addr
                     .map_or(AddressFamily::Inet, |addr| AddressFamily::of(addr.ip())),
@@ -1075,6 +1094,98 @@ pub fn resolve_interface(text: &str) -> Result<SocketAddr, UdpChannelError> {
     }
 }
 
+/// `AERON_UDP_CHANNEL_ENDPOINT_KEY` (`aeron-driver/src/main/c/aeronmd.h`'s
+/// `aeron_udp_channel_uri_keys`): the URI parameter a name came from, which a
+/// resolver is handed so it can say which one it refused
+/// (`aeron_name_resolver.c:204-208`).
+pub const ENDPOINT_PARAM: &str = "endpoint";
+
+/// `AERON_UDP_CHANNEL_CONTROL_KEY`, the other one a channel's names come from.
+pub const CONTROL_PARAM: &str = "control";
+
+/// One name through whichever resolver the caller brought.
+fn resolve_name(
+    names: &mut Names<'_>,
+    uri_param_name: &str,
+    text: &str,
+) -> Result<SocketAddr, UdpChannelError> {
+    match names {
+        Names::System => resolve_host_and_port(text),
+        Names::Built {
+            resolver,
+            counters,
+            regions,
+        } => resolve_host_and_port_with(&mut **resolver, counters, regions, uri_param_name, text),
+    }
+}
+
+/// The resolver a channel's names go through
+/// (`aeron_name_resolver_resolve_host_and_port`,
+/// `aeron-driver/src/main/c/aeron_name_resolver.c:129-215`).
+///
+/// Two shapes rather than one, because the two need different things: the
+/// system's own lookup needs nothing at all, and the driver's own resolver
+/// (G3-3) is a value the conductor owns with a counter view beside it — the
+/// CSV table's operation counters are counters, and a resolver reads them where
+/// it is called.
+pub enum Names<'a> {
+    /// The system's own lookup, which is what this build has always had and
+    /// what a channel gets when nothing configured a resolver.
+    System,
+    /// The resolver a driver built, which answers out of what its neighbors
+    /// told it before it asks the system anything.
+    Built {
+        /// The resolver itself.
+        resolver: &'a mut dyn Resolver,
+        /// The counter manager its `resolve` reads.
+        counters: &'a CounterManager,
+        /// The region those counter ids are offsets into.
+        regions: &'a CounterRegions<'a>,
+    },
+}
+
+/// `host:port` into an address **through a resolver**
+/// (`aeron_name_resolver_resolve_host_and_port`, `:129-215`).
+///
+/// The three steps are the reference's, and the middle one is the whole point:
+///
+/// * a literal address is taken as itself, with no resolver involved
+///   (`:158-178`) — a channel that names an address cannot be steered by one;
+/// * anything else goes to the resolver, which is handed the **host alone**:
+///   the reference splits the address first and passes `parsed_address.host`
+///   (`:145`, `:164`, `:176`). That is why a gossip resolver's cache is keyed
+///   by a bare name — what a driver announces about itself is its own name, and
+///   a channel's `endpoint=B:24325` asks about `B`;
+/// * the **port is the channel's**, written into whatever the resolver answered
+///   (`:181-191`), so a neighbor's own port never leaks into a channel's.
+///
+/// # Errors
+///
+/// [`UdpChannelError::Resolution`] when the text is not `host:port`, when the
+/// port is not a port, or when the resolver refuses the name.
+pub fn resolve_host_and_port_with(
+    resolver: &mut dyn Resolver,
+    counters: &CounterManager,
+    regions: &CounterRegions<'_>,
+    uri_param_name: &str,
+    text: &str,
+) -> Result<SocketAddr, UdpChannelError> {
+    let (host, port_text, family) = split_address(text)?;
+    let port = parse_port(port_text)
+        .map_err(|error| UdpChannelError::Resolution(format!("{error}: {text}")))?;
+
+    if let Ok(address) = host.parse::<IpAddr>() {
+        if AddressFamily::of(address) == family {
+            return Ok(SocketAddr::new(address, port));
+        }
+    }
+
+    resolver
+        .resolve(host, uri_param_name, false, family, counters, regions)
+        .into_address(text)
+        .map(|address| SocketAddr::new(address.ip(), port))
+}
+
 /// `host:port` into an address, the default resolver's synchronous path
 /// (`aeron_name_resolver_resolve_host_and_port`,
 /// `aeron-driver/src/main/c/aeron_name_resolver.c:129-215`, with the default
@@ -1100,6 +1211,23 @@ pub fn resolve_host_and_port(text: &str) -> Result<SocketAddr, UdpChannelError> 
     lookup(host, port, family)
         .map_err(|error| UdpChannelError::Resolution(format!("{text}: {error}")))?
         .ok_or_else(|| UdpChannelError::Resolution(format!("could not resolve host: {text}")))
+}
+
+/// A **host** into an address of that family, with no port
+/// (`aeron_ip_addr_resolver`, `aeron-client/src/main/c/util/aeron_netutil.c:56-100`,
+/// which is `getaddrinfo(host, NULL, ...)`).
+///
+/// The default resolver's whole job, and the reason its answers carry port
+/// zero: a resolver is handed the host out of a `host:port` and the caller
+/// writes the port in afterwards (`aeron_name_resolver.c:145`, `:181-191`).
+///
+/// # Errors
+///
+/// The resolver's own error — `getaddrinfo`'s, in a build that has a name
+/// service — and `Ok(None)` when it answered with a family that was not asked
+/// for.
+pub fn lookup_host(host: &str, family: AddressFamily) -> std::io::Result<Option<SocketAddr>> {
+    lookup(host, 0, family)
 }
 
 /// Ask the system to resolve `host` and keep the address of the family the
@@ -1307,6 +1435,12 @@ fn canonicalise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    /// An aligned counter region.
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
 
     fn resolve(uri: &str) -> UdpChannel {
         let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
@@ -1902,6 +2036,99 @@ mod tests {
             ipv4("127.0.0.1:40123"),
             resolve("aeron:udp?endpoint=localhost:40123").remote_data
         );
+    }
+
+    /// A channel's names go through the resolver the driver built, and the
+    /// **port in the channel is the one that survives**: the reference hands
+    /// the resolver the host alone and writes the port into its answer
+    /// afterwards (`aeron_name_resolver.c:145`, `:164`, `:181-191`).
+    ///
+    /// Which is what makes a gossip resolver work at all: what a driver
+    /// announces about itself is a bare name, and what a channel asks for is
+    /// `name:port`.
+    #[test]
+    fn a_name_goes_through_the_resolver_and_keeps_the_channels_port() {
+        /// A resolver that answers with what it was built with, and records
+        /// what it was asked.
+        struct Stub {
+            answer: SocketAddr,
+            asked: std::cell::RefCell<Vec<String>>,
+        }
+
+        impl Resolver for Stub {
+            fn resolve(
+                &mut self,
+                name: &str,
+                _uri_param_name: &str,
+                _is_re_resolution: bool,
+                _family: AddressFamily,
+                _counters: &CounterManager,
+                _regions: &CounterRegions<'_>,
+            ) -> crate::name_resolver::Resolution {
+                self.asked.borrow_mut().push(name.to_owned());
+
+                crate::name_resolver::Resolution::Found(self.answer)
+            }
+        }
+
+        let mut holder = Region(vec![0u8; 64 * 1024 * 4]);
+        let mut values = Region(vec![0u8; 64 * 1024]);
+        let regions = CounterRegions::new(
+            AtomicBuffer::from_slice_mut(&mut holder.0).expect("aligned"),
+            AtomicBuffer::from_slice_mut(&mut values.0).expect("aligned"),
+        )
+        .expect("four-to-one");
+        let counters = CounterManager::new(64 * 1024, 1_000).expect("room");
+
+        let mut stub = Stub {
+            // A port of its own, which is *not* the port the channel named —
+            // so a channel that took it would be resolved to somewhere else.
+            answer: ipv4("10.1.2.3:9999"),
+            asked: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let uri = b"aeron:udp?endpoint=ReResTestEndpoint:40456";
+        let parsed = ChannelUri::parse(uri).expect("a URI");
+        let channel = UdpChannel::resolve_with(
+            &mut Names::Built {
+                resolver: &mut stub,
+                counters: &counters,
+                regions: &regions,
+            },
+            uri,
+            &parsed,
+        )
+        .expect("a channel");
+
+        assert_eq!(
+            vec!["ReResTestEndpoint".to_owned()],
+            stub.asked.borrow().clone(),
+            "the resolver was asked about the host, without the port"
+        );
+        assert_eq!(
+            ipv4("10.1.2.3:40456"),
+            channel.remote_data,
+            "and the channel kept its own port"
+        );
+
+        // A literal is not a question for a resolver at all
+        // (`aeron_name_resolver.c:158-178`): a channel that names an address
+        // cannot be steered by one.
+        let uri = b"aeron:udp?endpoint=127.0.0.1:40456";
+        let parsed = ChannelUri::parse(uri).expect("a URI");
+        let channel = UdpChannel::resolve_with(
+            &mut Names::Built {
+                resolver: &mut stub,
+                counters: &counters,
+                regions: &regions,
+            },
+            uri,
+            &parsed,
+        )
+        .expect("a channel");
+
+        assert_eq!(ipv4("127.0.0.1:40456"), channel.remote_data);
+        assert_eq!(1, stub.asked.borrow().len(), "still just the one question");
     }
 
     #[test]

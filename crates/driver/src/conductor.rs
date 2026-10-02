@@ -48,6 +48,7 @@
 //! lengths claim — is counted separately, because it is a bug or a hostile
 //! client rather than a feature this build has not reached.
 
+use deepmsg_cnc::CounterRegions;
 use deepmsg_cnc::command::{
     ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
     ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
@@ -83,6 +84,7 @@ use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::media::receive_endpoint::ReceiveDestination;
+use crate::name_resolver::Resolver;
 use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
@@ -104,6 +106,11 @@ pub const COMMAND_DRAIN_LIMIT: usize = 1;
 /// (`AERON_DRIVER_CONDUCTOR_CLOCK_UPDATE_INTERNAL_NS` = 1 ms,
 /// `aeron-driver/src/main/c/aeron_driver_conductor.h:38`).
 pub const CLOCK_UPDATE_INTERVAL_NS: i64 = 1_000_000;
+
+/// A millisecond in nanoseconds, for the settings the reference holds in
+/// nanoseconds and the resolver counts in milliseconds
+/// (`aeron_driver_name_resolver.c:455-461`).
+const NANOS_PER_MILLI: i64 = 1_000_000;
 
 /// A command in the control protocol.
 ///
@@ -227,6 +234,14 @@ pub enum ConductorError {
     /// The native resource agent — the thread that creates log buffers — could
     /// not be started. Nothing can be published without it.
     Agent(std::io::Error),
+    /// The name resolver the settings named could not be built or started —
+    /// see [`crate::name_resolver::Supplier`]. The reference fails its context
+    /// init for a name its table does not hold, and its agent records a
+    /// resolver that will not start and carries on
+    /// (`aeron_driver_native_resource_agent.c:233-251`); this build refuses the
+    /// start, because a driver whose resolver is not the one it was configured
+    /// with is a driver that resolves something else.
+    Resolver(String),
 }
 
 impl std::fmt::Display for ConductorError {
@@ -238,6 +253,7 @@ impl std::fmt::Display for ConductorError {
             Self::NoCounterRegions => {
                 f.write_str("the counter regions cannot hold a driver's counters")
             }
+            Self::Resolver(what) => write!(f, "the name resolver could not be built: {what}"),
             Self::SystemCounters(error) => {
                 write!(f, "the system counters were not published: {error}")
             }
@@ -253,7 +269,10 @@ impl std::error::Error for ConductorError {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
             Self::Agent(error) | Self::Sender(error) => Some(error),
-            Self::NoCommandRing | Self::NoEventRing | Self::NoCounterRegions => None,
+            Self::NoCommandRing
+            | Self::NoEventRing
+            | Self::NoCounterRegions
+            | Self::Resolver(_) => None,
         }
     }
 }
@@ -480,6 +499,14 @@ pub struct Conductor {
     /// What this driver allocated for itself, so its shutdown gives back
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
+    /// The resolver the settings named (`aeron.name.resolver.supplier`), which
+    /// every channel this driver parses goes through and whose clock runs on
+    /// the driver's own pass.
+    ///
+    /// `Send` because it is built here and the reference runs it on the native
+    /// resource agent (`aeron_driver_native_resource_agent.c:260`); this build
+    /// keeps it on the conductor thread, which `docs/compat.md` records.
+    resolver: Box<dyn Resolver + Send>,
     /// The process's half of the distinct error log; the region it writes
     /// comes from the CnC file per call, like the counters.
     error_log: DistinctErrorLog,
@@ -612,9 +639,65 @@ impl Conductor {
                 .ok_or(ConductorError::NoCounterRegions)?;
             #[allow(clippy::cast_possible_wrap)] // a file length, far below i64::MAX
             let bytes_mapped = cnc.file_length() as i64;
-            system_counters::allocate_all(&mut counters, &regions, now_ms, bytes_mapped)
-                .map_err(ConductorError::SystemCounters)?
+            system_counters::allocate_all(
+                &mut counters,
+                &regions,
+                now_ms,
+                bytes_mapped,
+                config.resolver_name.as_deref().unwrap_or(""),
+                config.name_resolver_threshold_ns,
+            )
+            .map_err(ConductorError::SystemCounters)?
         };
+
+        // The resolver the settings named, built where the counters and the
+        // clock are in hand — the reference builds it in the native resource
+        // agent's init, from the context, and runs it on that agent's thread
+        // (`aeron_driver_native_resource_agent.c:299-320`, `:260`).
+        let mut resolver = {
+            let regions = cnc
+                .counter_regions()
+                .ok_or(ConductorError::NoCounterRegions)?;
+            let params = crate::name_resolver::driver::Params {
+                name: config.resolver_name.clone().unwrap_or_default(),
+                interface: config.resolver_interface.clone().unwrap_or_default(),
+                bootstrap_neighbor: config.resolver_bootstrap_neighbor.clone(),
+                mtu_length: usize::try_from(config.mtu_length).unwrap_or(1408),
+                socket_rcvbuf: usize::try_from(config.socket_so_rcvbuf).unwrap_or(0),
+                socket_sndbuf: usize::try_from(config.socket_so_sndbuf).unwrap_or(0),
+                // The four intervals are settings in nanoseconds and the
+                // resolver counts milliseconds, which is the reference's own
+                // division (`aeron_driver_name_resolver.c:455-461`).
+                neighbor_timeout_ms: config.resolver_neighbor_timeout_ns / NANOS_PER_MILLI,
+                self_resolution_interval_ms: config.resolver_self_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+                neighbor_resolution_interval_ms: config.resolver_neighbor_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+                bootstrap_neighbor_resolution_interval_ms: config
+                    .resolver_bootstrap_neighbor_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+            };
+
+            config
+                .name_resolver_supplier
+                .build(
+                    &params,
+                    config.name_resolver_init_args.as_deref(),
+                    &mut counters,
+                    &regions,
+                    now_ms,
+                )
+                .map_err(ConductorError::Resolver)?
+        };
+
+        {
+            let regions = cnc
+                .counter_regions()
+                .ok_or(ConductorError::NoCounterRegions)?;
+            resolver
+                .start(&counters, &regions)
+                .map_err(ConductorError::Resolver)?;
+        }
 
         // The id the driver burns at startup belongs to the same counter a
         // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
@@ -723,6 +806,7 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
+            resolver,
             error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
             publications,
@@ -789,6 +873,14 @@ impl Conductor {
         let mut work_count = 0;
 
         self.track_cycle(now_ns);
+
+        // The resolver's own clock, which runs on this driver's pass whether or
+        // not anything else has work: a driver nobody is talking to still has
+        // to answer when someone does, and its gossip is on its own intervals
+        // (`aeron_driver_name_resolver.c:1252-1292`).
+        if let Some(regions) = self.cnc.counter_regions() {
+            work_count += self.resolver.do_work(self.now_ms, &self.counters, &regions);
+        }
 
         if now_ns > self.clock_update_deadline_ns {
             self.now_ms = self.clock.update(clock::epoch_nano_time());
@@ -1791,6 +1883,8 @@ impl Conductor {
     ///
     /// The error from flushing the mapping, if any.
     pub fn close(&mut self) -> std::io::Result<()> {
+        self.close_resolver();
+
         // The counters the driver owns go first (`aeron_system_counters_close`,
         // called at `aeron_driver_conductor.c:3487`), and the heartbeat is
         // nulled after (`:3493`). It is why a driver that stopped on purpose
@@ -1863,6 +1957,7 @@ impl Conductor {
         let running = &mut self.running;
         let termination = self.termination;
         let config = &self.config;
+        let resolver = &mut self.resolver;
         let publications = &mut self.publications;
         let network_publications = &mut self.network_publications;
         let send_endpoints = &mut self.send_endpoints;
@@ -1967,6 +2062,7 @@ impl Conductor {
                                         config,
                                         counters,
                                         &counter_regions,
+                                        &mut **resolver,
                                         clients,
                                         send_endpoints,
                                         sender.proxy(),
@@ -2854,7 +2950,14 @@ impl Conductor {
                     continue;
                 }
 
-                let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                let Ok(channel) = Self::resolve_channel(
+                    &mut **resolver,
+                    counters,
+                    &counter_regions,
+                    config.name_resolver_threshold_ns,
+                    request.channel,
+                    &uri,
+                ) else {
                     transmit.error(
                         request.correlation_id,
                         ERROR_CODE_INVALID_CHANNEL,
@@ -2989,7 +3092,14 @@ impl Conductor {
                 continue;
             };
 
-            let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+            let Ok(channel) = Self::resolve_channel(
+                &mut **resolver,
+                counters,
+                &counter_regions,
+                config.name_resolver_threshold_ns,
+                request.channel,
+                &uri,
+            ) else {
                 transmit.error(
                     request.correlation_id,
                     ERROR_CODE_INVALID_CHANNEL,
@@ -3378,6 +3488,68 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
     }
 
     (nanoseconds / 1_000_000).max(1)
+}
+
+impl Conductor {
+    /// Let the resolver go, counters and all (`aeron_driver_name_resolver_close`,
+    /// `aeron_driver_name_resolver.c:525-536`, which frees its memory and none
+    /// of its counters).
+    fn close_resolver(&mut self) {
+        let Some(regions) = self.cnc.counter_regions() else {
+            return;
+        };
+
+        self.resolver
+            .close(&mut self.counters, &regions, self.now_ms);
+    }
+
+    /// Resolve a channel through the driver's resolver, and **measure** it
+    /// (`aeron_time_tracking_name_resolver_resolve`,
+    /// `aeron_driver_native_resource_agent.c:29-60`): system counter 32 takes
+    /// the longest resolution so far and 33 counts the ones that ran past the
+    /// configured threshold.
+    ///
+    /// The measurement is per **call**, not per pass: what the reference times
+    /// is the resolver being asked, which is why the tracker is updated at the
+    /// start of the call and measured at the end of it.
+    fn resolve_channel(
+        resolver: &mut dyn Resolver,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        threshold_ns: i64,
+        original_uri: &[u8],
+        uri: &crate::channel_uri::ChannelUri<'_>,
+    ) -> Result<UdpChannel, UdpChannelError> {
+        let begin_ns = clock::monotonic_nano_time();
+
+        let channel = UdpChannel::resolve_with(
+            &mut crate::udp_channel::Names::Built {
+                resolver,
+                counters,
+                regions,
+            },
+            original_uri,
+            uri,
+        );
+
+        let elapsed_ns = clock::monotonic_nano_time().saturating_sub(begin_ns);
+
+        system_counters::propose_max(
+            counters,
+            regions,
+            system_counters::id::NAME_RESOLVER_MAX_TIME,
+            elapsed_ns,
+        );
+        if elapsed_ns > threshold_ns {
+            system_counters::increment(
+                counters,
+                regions,
+                system_counters::id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED,
+            );
+        }
+
+        channel
+    }
 }
 
 #[cfg(test)]
@@ -8524,5 +8696,85 @@ mod tests {
             producer.offer(reopened, &message),
             deepmsg_core::logbuffer::append::Appended::Ok { .. }
         ));
+    }
+    /// The resolver the settings named is **built and started** by the
+    /// conductor, and it is where its counters come from: the neighbor list and
+    /// the cache, with the labels a reader finds them by
+    /// (`aeron_driver_name_resolver.c:234-243`, `:490-497`).
+    #[test]
+    fn a_driver_resolver_is_built_from_the_settings() {
+        let temp = TempDir::new();
+        let port = free_port();
+
+        let config = DriverConfig {
+            name_resolver_supplier: crate::name_resolver::Supplier::Driver,
+            resolver_name: Some("A".to_owned()),
+            resolver_interface: Some(format!("127.0.0.1:{port}")),
+            ..config_with(&temp.0, 10_000_000_000, 1_000_000_000)
+        };
+
+        let cnc = create(&temp.0);
+        let conductor = Conductor::new(cnc, &config).expect("a conductor");
+
+        let regions = counter_regions(&conductor);
+        let reader = regions.reader();
+
+        assert_eq!(
+            format!("Resolver neighbors: bound 127.0.0.1:{port}"),
+            reader
+                .find_by_type_id(crate::position::type_id::NAME_RESOLVER_NEIGHBORS)
+                .expect("the neighbor counter")
+                .label
+        );
+        assert_eq!(
+            "Resolver cache entries: name=A",
+            reader
+                .find_by_type_id(crate::position::type_id::NAME_RESOLVER_CACHE_ENTRIES)
+                .expect("the cache counter")
+                .label
+        );
+
+        // And the settings' own name reaches the counter a reader tells two
+        // drivers apart by (`aeron_driver_conductor.c:848-856`).
+        assert_eq!(
+            "Resolution changes: driverName=A",
+            reader
+                .get(system_counters::id::RESOLUTION_CHANGES)
+                .expect("the resolution-changes counter")
+                .label
+        );
+    }
+
+    /// A resolver that cannot be built is a driver that does not start, which
+    /// is stricter than the reference — its agent records the failure and runs
+    /// on (`aeron_driver_native_resource_agent.c:233-251`). A driver whose
+    /// resolver is not the one it was configured with resolves something else,
+    /// which is not a state worth starting in. `docs/compat.md` records it.
+    #[test]
+    fn a_resolver_that_cannot_be_built_stops_the_driver() {
+        let temp = TempDir::new();
+
+        let config = DriverConfig {
+            name_resolver_supplier: crate::name_resolver::Supplier::Driver,
+            resolver_name: Some("A".to_owned()),
+            resolver_interface: Some("not an interface".to_owned()),
+            ..config_with(&temp.0, 10_000_000_000, 1_000_000_000)
+        };
+
+        let cnc = create(&temp.0);
+        let Err(error) = Conductor::new(cnc, &config) else {
+            panic!("a resolver that cannot be built must stop the driver");
+        };
+
+        assert!(matches!(error, ConductorError::Resolver(_)), "{error}");
+    }
+
+    /// A port nobody is using, taken by binding and letting go.
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("a port")
+            .local_addr()
+            .expect("an address")
+            .port()
     }
 }

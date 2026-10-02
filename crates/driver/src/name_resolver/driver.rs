@@ -1132,7 +1132,9 @@ mod tests {
 
         fn allocate_system_counters(&mut self) {
             let regions = self.holder.open();
-            self.system = Some(allocate_all(&mut self.counters, &regions, 0, 0).expect("room"));
+            self.system = Some(
+                allocate_all(&mut self.counters, &regions, 0, 0, "", 5_000_000_000).expect("room"),
+            );
         }
 
         /// What a reader sees *about* a counter, which is where the labels and

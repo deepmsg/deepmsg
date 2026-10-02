@@ -22,7 +22,7 @@
 pub mod cache;
 pub mod driver;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
@@ -97,7 +97,18 @@ pub enum Lookup {
 /// (`aeron_csv_table_name_resolver.c:60-90`). In Rust the region belongs to the
 /// caller, so it is lent to the call instead of living in the resolver.
 pub trait Resolver {
-    /// `host:port` into an address (`resolve_func`).
+    /// A **host** into an address (`resolve_func`).
+    ///
+    /// Not `host:port`: the reference's own wrapper splits the name in two and
+    /// hands the resolver the host alone (`parsed_address.host`,
+    /// `aeron_name_resolver.c:145`, `:164`, `:176`), then writes the port into
+    /// the answer itself (`:181-191`). Three things in the reference say the
+    /// same: the default resolver hands what it is given straight to
+    /// `getaddrinfo(host, NULL, ...)` (`:87-95`,
+    /// `aeron-netutil.c:56-100`), the driver's resolver compares it with its own
+    /// **name** (`:1219`), and the CSV table's rows are bare names
+    /// (`aeron_csv_table_name_resolver.c:150-156`). So an answer's port is
+    /// zero — it is the caller's to set.
     ///
     /// `family` is the one the answer has to come back in, and it is an
     /// argument here because it is one in the reference too: its `resolve_func`
@@ -221,6 +232,10 @@ impl Supplier {
     /// `aeron_driver_name_resolver_supplier`, each of which takes the same
     /// `(resolver, args, context)`).
     ///
+    /// `Send`, because the reference hands the built resolver to the native
+    /// resource agent's thread, which then runs its clock
+    /// (`aeron_driver_native_resource_agent.c:260`).
+    ///
     /// `driver` is the parameters the gossip resolver needs — read from the
     /// settings either way, and ignored by the two that do not gossip.
     ///
@@ -236,7 +251,7 @@ impl Supplier {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         now_ms: i64,
-    ) -> Result<Box<dyn Resolver>, String> {
+    ) -> Result<Box<dyn Resolver + Send>, String> {
         match self {
             Self::Default => Ok(Box::new(DefaultResolver)),
             Self::CsvTable => Ok(Box::new(CsvTableResolver::new(
@@ -261,6 +276,15 @@ impl Supplier {
 pub struct DefaultResolver;
 
 impl Resolver for DefaultResolver {
+    /// A host into an address (`aeron_default_name_resolver_resolve`,
+    /// `aeron_name_resolver.c:87-95`): IPv4 first, IPv6 only if that fails,
+    /// which is the reference calling `aeron_ip_addr_resolver` twice.
+    ///
+    /// The caller's `family` is **ignored**, and that is the reference's shape
+    /// too — this resolver has no cache to choose a row from, so it takes
+    /// whatever family answers. The address it answers with carries port zero,
+    /// because there is no port in this contract; the caller writes the one the
+    /// channel named (`:181-191`).
     fn resolve(
         &mut self,
         name: &str,
@@ -270,10 +294,23 @@ impl Resolver for DefaultResolver {
         _counters: &CounterManager,
         _regions: &CounterRegions<'_>,
     ) -> Resolution {
-        match udp_channel::resolve_host_and_port(name) {
-            Ok(address) => Resolution::Found(address),
-            Err(error) => Resolution::Failed(error.to_string()),
+        // A literal is an address whatever family was hinted at, which is what
+        // `getaddrinfo` does with one (`aeron_netutil.c:73-91`).
+        if let Ok(address) = name.parse::<IpAddr>() {
+            return Resolution::Found(SocketAddr::new(address, 0));
         }
+
+        let mut failure = String::new();
+
+        for family in [AddressFamily::Inet, AddressFamily::Inet6] {
+            match udp_channel::lookup_host(name, family) {
+                Ok(Some(address)) => return Resolution::Found(address),
+                Ok(None) => {}
+                Err(error) => failure = error.to_string(),
+            }
+        }
+
+        Resolution::Failed(format!("Unable to resolve host=({name}): {failure}"))
     }
 }
 
@@ -560,9 +597,9 @@ mod tests {
             .build(&driver_params, None, &mut fixture.counters, &regions, 0)
             .expect("a default resolver");
         assert_eq!(
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
+            Resolution::Found("127.0.0.1:0".parse().expect("an address")),
             default.resolve(
-                "127.0.0.1:40456",
+                "127.0.0.1",
                 "endpoint",
                 false,
                 AddressFamily::Inet,
@@ -574,16 +611,16 @@ mod tests {
         let mut table = Supplier::CsvTable
             .build(
                 &driver_params,
-                Some("127.0.0.1:40457,127.0.0.1:40456,somewhere:40456"),
+                Some("127.0.0.2,127.0.0.1,server0"),
                 &mut fixture.counters,
                 &regions,
                 0,
             )
             .expect("a csv table");
         assert_eq!(
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
+            Resolution::Found("127.0.0.1:0".parse().expect("an address")),
             table.resolve(
-                "somewhere:40456",
+                "server0",
                 "endpoint",
                 false,
                 AddressFamily::Inet,
@@ -625,8 +662,9 @@ mod tests {
         );
     }
 
-    /// The default resolver is the system's own lookup, and it needs nothing
-    /// from the caller to do it.
+    /// The default resolver is the system's own lookup, and what it is given
+    /// is a **host**: the answer carries no port, because the port belongs to
+    /// the channel the caller is parsing (`aeron_name_resolver.c:181-191`).
     #[test]
     fn the_default_resolver_is_the_systems_own_lookup() {
         let mut holder = Counters::new();
@@ -635,20 +673,20 @@ mod tests {
         let mut resolver = DefaultResolver;
 
         assert_eq!(
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
+            Resolution::Found("127.0.0.1:0".parse().expect("an address")),
             resolver.resolve(
-                "127.0.0.1:40456",
+                "127.0.0.1",
                 "endpoint",
                 false,
                 AddressFamily::Inet,
                 &counters,
                 &regions
             ),
-            "a literal address is taken as itself, with no lookup"
+            "a literal host is taken as itself, with no lookup"
         );
 
         let hostname = resolver.resolve(
-            "localhost:40456",
+            "localhost",
             "endpoint",
             false,
             AddressFamily::Inet,
@@ -657,13 +695,13 @@ mod tests {
         );
 
         match hostname {
-            Resolution::Found(address) => assert_eq!(40456, address.port()),
+            Resolution::Found(address) => assert_eq!(0, address.port(), "and with no port"),
             other => panic!("localhost resolves: {other:?}"),
         }
 
         assert_eq!(
             Lookup::Unchanged,
-            resolver.lookup("localhost:40456", "endpoint", false, &counters, &regions),
+            resolver.lookup("localhost", "endpoint", false, &counters, &regions),
             "the default resolver has nothing to say about names"
         );
         assert_eq!(0, resolver.do_work(0, &counters, &regions));
@@ -671,6 +709,10 @@ mod tests {
 
     /// A name the system cannot make an address of is a **failure**: a
     /// synchronous resolver has no one to pass the name to.
+    ///
+    /// And a `host:port` is one of those, which is the contract in one
+    /// assertion: what a resolver is handed is the host, split off by the
+    /// caller (`aeron_name_resolver.c:145`).
     #[test]
     fn a_synchronous_resolver_answers_yes_or_no() {
         let mut holder = Counters::new();
@@ -680,7 +722,7 @@ mod tests {
 
         assert!(matches!(
             resolver.resolve(
-                "not-a-host-at-all.invalid:40456",
+                "not-a-host-at-all.invalid",
                 "endpoint",
                 false,
                 AddressFamily::Inet,
@@ -689,17 +731,20 @@ mod tests {
             ),
             Resolution::Failed(_)
         ));
-        assert!(matches!(
-            resolver.resolve(
-                "127.0.0.1:not-a-port",
-                "endpoint",
-                false,
-                AddressFamily::Inet,
-                &counters,
-                &regions
+        assert!(
+            matches!(
+                resolver.resolve(
+                    "127.0.0.1:40456",
+                    "endpoint",
+                    false,
+                    AddressFamily::Inet,
+                    &counters,
+                    &regions
+                ),
+                Resolution::Failed(_)
             ),
-            Resolution::Failed(_)
-        ));
+            "a host and a port is not a host"
+        );
     }
 
     /// The table steers: a row's counter is the operation, and flipping it
@@ -708,27 +753,27 @@ mod tests {
     #[test]
     fn a_rows_counter_is_the_operation() {
         let mut fixture = Fixture::new();
-        let mut resolver = fixture.resolver("127.0.0.1:40457,127.0.0.1:40456,somewhere:40456");
+        let mut resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
         let ids = resolver.counter_ids();
 
         assert_eq!(1, ids.len());
         assert_eq!(
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
-            fixture.resolve(&mut resolver, "somewhere:40456"),
+            Resolution::Found("127.0.0.1:0".parse().expect("an address")),
+            fixture.resolve(&mut resolver, "server0"),
             "a fresh row is the initial resolution host, which is `0`"
         );
 
         fixture.set(ids[0], USE_RE_RESOLUTION_HOST);
         assert_eq!(
-            Resolution::Found("127.0.0.1:40457".parse().expect("an address")),
-            fixture.resolve(&mut resolver, "somewhere:40456"),
+            Resolution::Found("127.0.0.2:0".parse().expect("an address")),
+            fixture.resolve(&mut resolver, "server0"),
             "and the re-resolution host is what the other operation picks"
         );
 
         fixture.set(ids[0], DISABLE_RESOLUTION);
         assert_eq!(
-            Resolution::Failed("Unable to resolve host=(somewhere:40456): (forced)".to_owned()),
-            fixture.resolve(&mut resolver, "somewhere:40456"),
+            Resolution::Failed("Unable to resolve host=(server0): (forced)".to_owned()),
+            fixture.resolve(&mut resolver, "server0"),
             "the third operation is a refusal, in the reference's own words"
         );
 
@@ -738,7 +783,7 @@ mod tests {
         // initial host.
         fixture.set(ids[0], 7);
         assert!(matches!(
-            fixture.resolve(&mut resolver, "somewhere:40456"),
+            fixture.resolve(&mut resolver, "server0"),
             Resolution::Failed(_)
         ));
     }
@@ -749,16 +794,16 @@ mod tests {
     #[test]
     fn a_name_the_table_does_not_know_goes_through_it() {
         let mut fixture = Fixture::new();
-        let mut resolver = fixture.resolver("127.0.0.1:40457,127.0.0.1:40456,somewhere:40456");
+        let mut resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
 
         assert_eq!(
-            Resolution::Found("127.0.0.1:40458".parse().expect("an address")),
-            fixture.resolve(&mut resolver, "127.0.0.1:40458"),
+            Resolution::Found("127.0.0.1:0".parse().expect("an address")),
+            fixture.resolve(&mut resolver, "127.0.0.1"),
             "which is how every channel that names an address keeps working"
         );
 
         assert!(matches!(
-            fixture.resolve(&mut resolver, "not-a-host-at-all.invalid:40456"),
+            fixture.resolve(&mut resolver, "not-a-host-at-all.invalid"),
             Resolution::Failed(_)
         ));
     }
@@ -778,7 +823,7 @@ mod tests {
     #[test]
     fn a_rows_counter_is_named_the_way_a_reader_finds_it() {
         let mut fixture = Fixture::new();
-        let resolver = fixture.resolver("127.0.0.1:40457,127.0.0.1:40456,somewhere:40456");
+        let resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
         let ids = resolver.counter_ids();
 
         let regions = fixture.holder.open();
@@ -786,8 +831,8 @@ mod tests {
 
         assert_eq!(CSV_ENTRY_COUNTER_TYPE_ID, descriptor.type_id);
         assert_eq!(
-            "NameEntry{name='somewhere:40456', initialResolutionHost='127.0.0.1:40456', \
-             reResolutionHost='127.0.0.1:40457'}",
+            "NameEntry{name='server0', initialResolutionHost='127.0.0.1', \
+             reResolutionHost='127.0.0.2'}",
             descriptor.label
         );
     }
