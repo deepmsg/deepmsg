@@ -2186,3 +2186,226 @@ mod tests {
         assert_eq!(compute_max_message_length(i32::MIN), i32::MIN >> 3);
     }
 }
+
+/// A `RES` datagram: how one resolver tells another about a name
+/// (`aeron_resolution_header_t` and its two tails,
+/// `aeron-client/src/main/c/protocol/aeron_udp_protocol.h:121-146`).
+///
+/// **Not a frame** and not in this module's usual shape: there is no
+/// `aeron_frame_header_t` on it, no version and no flags byte of that kind —
+/// the resolver's own socket carries these and nothing else, which is why the
+/// type byte is first and the port is the second thing a reader sees.
+///
+/// The layout is the packed C struct: eight bytes of header, then the address
+/// (four or sixteen, chosen by `res_type`), then the name's length as an
+/// `int16` and the name. The name is the *channel* name being resolved — the
+/// whole `host:port` text a URI wrote, not the host alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionDatagram<'a> {
+    /// `AERON_RES_HEADER_TYPE_NAME_TO_IP4_MD` or `..._IP6_MD`, which is also
+    /// what says how long the address that follows is.
+    pub res_type: i8,
+    /// `AERON_RES_HEADER_SELF_FLAG` when the sender is resolving its own name
+    /// (`aeron_driver_name_resolver.c:801`, `:941`).
+    pub res_flags: u8,
+    /// The port the name resolves to. The address that follows carries no port
+    /// of its own, so this is where it lives.
+    pub udp_port: u16,
+    /// How old the sender's answer is (`age_in_ms`), so a neighbor can prefer
+    /// the freshest.
+    pub age_in_ms: i32,
+    /// The address that follows the header.
+    pub address: std::net::IpAddr,
+    /// The name this is an answer about.
+    pub name: &'a [u8],
+}
+
+/// `AERON_RES_HEADER_TYPE_NAME_TO_IP4_MD` (`aeron_udp_protocol.h:207`).
+pub const RES_TYPE_NAME_TO_IP4: i8 = 0x01;
+
+/// `AERON_RES_HEADER_TYPE_NAME_TO_IP6_MD` (`:208`).
+pub const RES_TYPE_NAME_TO_IP6: i8 = 0x02;
+
+/// `AERON_RES_HEADER_SELF_FLAG` (`:209`).
+pub const RES_FLAG_SELF: u8 = 0x80;
+
+/// The header itself (`aeron_resolution_header_t`): `int8`, `uint8`, `uint16`,
+/// `int32` — eight bytes, packed.
+const RES_HEADER_LENGTH: usize = 8;
+
+impl<'a> ResolutionDatagram<'a> {
+    /// The datagram a name and an address make, and how many bytes it takes.
+    pub const fn length(&self) -> usize {
+        RES_HEADER_LENGTH + self.address_bytes() + 2 + self.name.len()
+    }
+
+    /// How long the address in this datagram is, which its type decides.
+    pub const fn address_bytes(&self) -> usize {
+        if self.res_type == RES_TYPE_NAME_TO_IP6 {
+            16
+        } else {
+            4
+        }
+    }
+
+    /// Read one (`aeron_driver_name_resolver_receive`,
+    /// `aeron_driver_name_resolver.c:725-826`, which reads the type, then the
+    /// header, then the address the type names).
+    ///
+    /// `None` when the datagram is shorter than it says it is, or when its type
+    /// is not one of the two — a resolver that guessed at the address length
+    /// would read a name out of the middle of something else.
+    pub fn read(packet: &'a [u8]) -> Option<Self> {
+        if packet.len() < RES_HEADER_LENGTH {
+            return None;
+        }
+
+        let res_type = packet[0] as i8;
+        let res_flags = packet[1];
+        let udp_port = u16::from_le_bytes([packet[2], packet[3]]);
+        let age_in_ms = i32::from_le_bytes(packet[4..8].try_into().ok()?);
+
+        let address_bytes = match res_type {
+            RES_TYPE_NAME_TO_IP4 => 4,
+            RES_TYPE_NAME_TO_IP6 => 16,
+            _ => return None,
+        };
+
+        let name_at = RES_HEADER_LENGTH + address_bytes;
+        let name_length = usize::try_from(i16::from_le_bytes(
+            packet.get(name_at..name_at + 2)?.try_into().ok()?,
+        ))
+        .ok()?;
+
+        let address = match address_bytes {
+            4 => std::net::IpAddr::from(
+                <[u8; 4]>::try_from(&packet[RES_HEADER_LENGTH..name_at]).ok()?,
+            ),
+            _ => std::net::IpAddr::from(
+                <[u8; 16]>::try_from(&packet[RES_HEADER_LENGTH..name_at]).ok()?,
+            ),
+        };
+
+        let name = packet.get(name_at + 2..name_at + 2 + name_length)?;
+
+        Some(Self {
+            res_type,
+            res_flags,
+            udp_port,
+            age_in_ms,
+            address,
+            name,
+        })
+    }
+
+    /// Write one, answering with how many bytes it took.
+    ///
+    /// `None` when the buffer is too small — the reference writes into a
+    /// `sizeof(aeron_resolution_header_ipv4_t)` stack buffer and would overrun
+    /// it, and a sender that did the same here would be writing a name into
+    /// whatever followed.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        let length = self.length();
+
+        if out.len() < length {
+            return None;
+        }
+
+        out[0] = self.res_type as u8;
+        out[1] = self.res_flags;
+        out[2..4].copy_from_slice(&self.udp_port.to_le_bytes());
+        out[4..8].copy_from_slice(&self.age_in_ms.to_le_bytes());
+
+        let address_bytes = self.address_bytes();
+        match self.address {
+            std::net::IpAddr::V4(address) => {
+                if address_bytes != 4 {
+                    return None;
+                }
+
+                out[RES_HEADER_LENGTH..RES_HEADER_LENGTH + 4].copy_from_slice(&address.octets());
+            }
+            std::net::IpAddr::V6(address) => {
+                if address_bytes != 16 {
+                    return None;
+                }
+
+                out[RES_HEADER_LENGTH..RES_HEADER_LENGTH + 16].copy_from_slice(&address.octets());
+            }
+        }
+
+        let name_at = RES_HEADER_LENGTH + address_bytes;
+        let name_length = i16::try_from(self.name.len()).ok()?;
+        out[name_at..name_at + 2].copy_from_slice(&name_length.to_le_bytes());
+        out[name_at + 2..length].copy_from_slice(self.name);
+
+        Some(length)
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    /// The datagram is eight bytes of header, the address its type sizes, the
+    /// name's length and the name — and it round-trips through both families,
+    /// which is the whole of what a reader can get wrong: **the address
+    /// length is not written anywhere**, it is the type that says it.
+    #[test]
+    fn a_resolution_datagram_round_trips_in_both_families() {
+        let name = b"localhost:8051";
+
+        let v4 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: RES_FLAG_SELF,
+            udp_port: 8051,
+            age_in_ms: 17,
+            address: "192.168.0.1".parse().expect("an address"),
+            name,
+        };
+
+        assert_eq!(8 + 4 + 2 + name.len(), v4.length());
+
+        let mut buffer = [0u8; 64];
+        let written = v4.write(&mut buffer).expect("room");
+        assert_eq!(v4.length(), written);
+        assert_eq!(Some(v4), ResolutionDatagram::read(&buffer[..written]));
+
+        let v6 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP6,
+            res_flags: 0,
+            udp_port: 8052,
+            age_in_ms: -3,
+            address: "::1".parse().expect("an address"),
+            name,
+        };
+
+        assert_eq!(8 + 16 + 2 + name.len(), v6.length());
+
+        let mut buffer = [0u8; 64];
+        let written = v6.write(&mut buffer).expect("room");
+        assert_eq!(Some(v6), ResolutionDatagram::read(&buffer[..written]));
+    }
+
+    /// A type that is neither of the two is not a datagram this build reads:
+    /// guessing the address length would take a name out of the middle of an
+    /// address.
+    #[test]
+    fn only_the_two_types_are_read() {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x07;
+
+        assert_eq!(None, ResolutionDatagram::read(&packet));
+        assert_eq!(None, ResolutionDatagram::read(&packet[..4]));
+    }
+
+    /// And a name that does not fit the datagram it claims is not one either.
+    #[test]
+    fn a_name_longer_than_the_packet_is_refused() {
+        let mut packet = vec![0u8; 8 + 4 + 2 + 4];
+        packet[0] = RES_TYPE_NAME_TO_IP4 as u8;
+        packet[12..14].copy_from_slice(&100i16.to_le_bytes());
+
+        assert_eq!(None, ResolutionDatagram::read(&packet));
+    }
+}
