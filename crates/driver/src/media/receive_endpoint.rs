@@ -328,6 +328,16 @@ impl DestinationId {
     /// unicast channel opens with, and the one a destination added to a manual
     /// channel gets if it is the first.
     pub const FIRST: Self = Self(0);
+
+    /// A handle a test hands itself when it has no endpoint to mint one.
+    ///
+    /// Handles are the endpoint's to give and are never reused (see above), so
+    /// this exists for the tests that build an image on its own and would
+    /// otherwise have only [`Self::FIRST`] to name a second destination with.
+    #[cfg(test)]
+    pub const fn for_test(index: u64) -> Self {
+        Self(index)
+    }
 }
 
 /// One place a receive endpoint reads from

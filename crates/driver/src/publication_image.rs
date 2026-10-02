@@ -747,7 +747,7 @@ impl PublicationImage {
             let window_bottom = (self.last_sm_position - i64::from(term_length)).max(0);
 
             if packet_position >= window_bottom {
-                self.track_connection(source, destination, now_ns);
+                self.track_connection(None, source, destination, now_ns);
                 self.time_of_last_packet_ns = now_ns;
                 self.on_heartbeat(packet, packet_position, counters, regions, system);
             } else {
@@ -767,10 +767,10 @@ impl PublicationImage {
             if proposed_position
                 >= self.last_sm_position - i64::from(self.max_receiver_window_length)
             {
-                self.track_connection(source, destination, now_ns);
+                self.track_connection(None, source, destination, now_ns);
             }
         } else {
-            self.track_connection(source, destination, now_ns);
+            self.track_connection(None, source, destination, now_ns);
             self.time_of_last_packet_ns = now_ns;
 
             let index = Position::from_raw(packet_position).index(self.position_bits_to_shift);
@@ -873,14 +873,6 @@ impl PublicationImage {
         self.eos_position
     }
 
-    /// Remember that this source is still there
-    /// (`aeron_publication_image_track_connection`, `:557-592`).
-    ///
-    /// The reference finds the connection by **destination** and adds one if
-    /// the destination is new; here it is found by the source its packets come
-    /// from, and a source that is new gets a connection of its own. A
-    /// connection with no control address yet takes this source as one, which
-    /// is how an implicit-unicast image learns where to answer.
     /// A destination this image now also hears from
     /// (`aeron_publication_image_add_destination`, `:229-236`).
     ///
@@ -890,9 +882,13 @@ impl PublicationImage {
     /// NAKs about this stream go to the new source as well as to the ones that
     /// were already there.
     ///
-    /// An address the image already hears from is not added twice. One that is
-    /// [`None`] is a connection with no control address yet, which the first
-    /// packet to arrive on it will supply.
+    /// A destination the image already has a connection for is not added
+    /// twice, and the identity is the **handle**: one destination is one
+    /// socket. The reference reaches the same place from the other side, by
+    /// looking the connection up before it calls this
+    /// (`aeron_publication_image_track_connection`, `:564-571`), and a handle
+    /// is never handed out twice, so a second one here is a caller asking again
+    /// rather than a second place answers go.
     ///
     /// `destination` is the socket the new connection answers through — the one
     /// the client's destination opened, which is not the endpoint's first and
@@ -903,14 +899,12 @@ impl PublicationImage {
         destination: crate::media::receive_endpoint::DestinationId,
         now_ns: i64,
     ) {
-        if let Some(address) = control_address {
-            if self
-                .connections
-                .iter()
-                .any(|connection| connection.control_address == Some(address))
-            {
-                return;
-            }
+        if self
+            .connections
+            .iter()
+            .any(|connection| connection.destination == destination)
+        {
+            return;
         }
 
         self.connections.push(Connection {
@@ -937,22 +931,47 @@ impl PublicationImage {
             .retain(|connection| connection.destination != destination);
     }
 
-    /// The connection a packet arrived on, adding one if this is the first the
-    /// image has heard from that source
-    /// (`aeron_publication_image_add_connection_if_unknown`,
-    /// `aeron_publication_image.c:639-644`).
+    /// A `SETUP` from a destination the image may not be able to answer yet
+    /// (`aeron_publication_image_add_connection_if_unknown`, `:639-644`).
     ///
-    /// **A near-miss worth naming.** The reference looks a connection up by its
-    /// **destination** (`aeron_publication_image_track_connection`,
-    /// `:564-571`: `array[i].destination == destination`) and this build looks
-    /// it up by its control **address**. For every channel with one source per
-    /// destination the two agree, and that is every channel the tests cover; on
-    /// a destination several sources write to, the reference answers the second
-    /// source through the first one's connection and this build gives it one of
-    /// its own. The count of connections is what a client reads
-    /// (`active_transport_count`), so it is a difference on the wire's
-    /// accounting rather than on the wire. Reconciling it is the
-    /// destination-keyed lookup, which is this field's other half.
+    /// This is what a session two publications share looks like from the
+    /// image's side: the second publication's `SETUP` arrives on the second
+    /// destination, and without a connection for it the image has no socket to
+    /// send the status message the second sender is waiting for — so it never
+    /// connects and its offers stay refused (`aeron_data_packet_dispatcher.c:499-502`,
+    /// `shouldMergeStreamsFromMultiplePublicationsWithSameParams`).
+    ///
+    /// It is the same connection a data packet would find or make. Only the
+    /// address it starts with is different, and the reference's is the same
+    /// one: a destination whose channel named a `control=` is answered there
+    /// (`:1131-1132`) rather than at whoever happened to write, and the caller
+    /// resolves it because the handle knows only which socket it is.
+    pub fn add_connection_if_unknown(
+        &mut self,
+        control_address: SocketAddr,
+        source: SocketAddr,
+        destination: crate::media::receive_endpoint::DestinationId,
+        now_ns: i64,
+    ) {
+        self.track_connection(Some(control_address), source, destination, now_ns);
+    }
+
+    /// The connection a packet arrived on, adding one if this is the first the
+    /// image has heard from that destination
+    /// (`aeron_publication_image_track_connection`, `:557-592`).
+    ///
+    /// The lookup is by **destination** (`:564-571`:
+    /// `array[i].destination == destination`), not by the address a packet came
+    /// from: one destination is one socket and one connection. A second source
+    /// writing to a destination the image already answers refreshes the
+    /// connection that is there; it does not add a transport, and the count of
+    /// transports is what a client reads (`active_transport_count`).
+    ///
+    /// A connection the image is meeting for the first time starts with the
+    /// address the caller resolved for that destination — [`Self::add_destination`]'s
+    /// rule, `:1131-1132` — and one that has none yet takes the source this
+    /// packet came from (`:585-589`), which is how an implicit-unicast image
+    /// learns where to answer.
     ///
     /// The `destination` is the socket the packet came in on: for a connection
     /// the image is meeting for the first time it is what the connection will
@@ -960,6 +979,7 @@ impl PublicationImage {
     /// created with.
     fn track_connection(
         &mut self,
+        control_address: Option<SocketAddr>,
         source: SocketAddr,
         destination: crate::media::receive_endpoint::DestinationId,
         now_ns: i64,
@@ -967,13 +987,13 @@ impl PublicationImage {
         let index = match self
             .connections
             .iter()
-            .position(|connection| connection.control_address == Some(source))
+            .position(|connection| connection.destination == destination)
         {
             Some(index) => index,
             None => {
                 self.connections.push(Connection {
                     destination,
-                    control_address: None,
+                    control_address,
                     time_of_last_activity_ns: now_ns,
                     time_of_last_frame_ns: now_ns,
                     is_eos: false,
@@ -2065,16 +2085,18 @@ mod tests {
     /// endpoint (`aeron_driver_receiver.c:489-495`), so a stream that is already
     /// up sends its status messages and NAKs to the new source as well.
     ///
-    /// An address the image already hears from is not a second connection; one
-    /// with no address yet is a connection the first packet to arrive on it will
-    /// place.
+    /// A destination is the identity, not the address: the same handle is not
+    /// a second connection, a second handle is — even when it answers at the
+    /// same address, which is what two clients behind one address look like.
+    /// One with no address yet is a connection the first packet to arrive on it
+    /// will place.
     #[test]
     fn an_image_takes_a_destination_once() {
         let mut fixture = Fixture::new();
         let before = fixture.image.connections.len();
         let address: SocketAddr = "127.0.0.1:40124".parse().expect("an address");
 
-        let second = DestinationId::FIRST;
+        let second = DestinationId::for_test(1);
 
         fixture.image.add_destination(Some(address), second, 1_000);
         assert_eq!(before + 1, fixture.image.connections.len());
@@ -2083,14 +2105,76 @@ mod tests {
         assert_eq!(
             before + 1,
             fixture.image.connections.len(),
-            "the same address is not a second connection"
+            "the same destination is not a second connection"
         );
 
-        fixture.image.add_destination(None, second, 3_000);
+        fixture
+            .image
+            .add_destination(Some(address), DestinationId::for_test(2), 3_000);
         assert_eq!(
             before + 2,
             fixture.image.connections.len(),
+            "a second destination is a connection of its own, even at the same \
+             address — the address-keyed lookup this replaced collapsed them"
+        );
+
+        fixture
+            .image
+            .add_destination(None, DestinationId::for_test(3), 4_000);
+        assert_eq!(
+            before + 3,
+            fixture.image.connections.len(),
             "one with no address yet is still a connection"
+        );
+    }
+
+    /// The `SETUP` case: a session the image already serves, arriving on a
+    /// destination it has no connection for — which is what two publications of
+    /// one session look like from here
+    /// (`aeron_publication_image_add_connection_if_unknown`, `:639-644`).
+    ///
+    /// The connection it takes starts at the address the caller resolved for
+    /// that destination, not at the one the `SETUP` came from: a channel that
+    /// named a `control=` is answered there (`:1131-1132`), and being answered
+    /// is the whole of what the second sender is waiting for — an image that
+    /// keeps one socket leaves it offering into a stream nobody hears about.
+    #[test]
+    fn a_setup_from_a_second_destination_is_a_connection() {
+        let mut fixture = Fixture::new();
+        let before = fixture.image.connections.len();
+        let source: SocketAddr = "127.0.0.1:5556".parse().expect("a source");
+        let control: SocketAddr = "127.0.0.1:40125".parse().expect("a control address");
+        let second = DestinationId::for_test(1);
+
+        fixture
+            .image
+            .add_connection_if_unknown(control, source, second, 1_000);
+
+        assert_eq!(before + 1, fixture.image.connections.len());
+
+        let connection = fixture.image.connections.last().expect("a connection");
+        assert_eq!(second, connection.destination);
+        assert_eq!(
+            Some(control),
+            connection.control_address,
+            "the destination's address, not the one the SETUP came from"
+        );
+
+        // A retransmission of the same `SETUP` is not a second connection.
+        fixture
+            .image
+            .add_connection_if_unknown(control, source, second, 2_000);
+
+        assert_eq!(before + 1, fixture.image.connections.len());
+        assert_eq!(
+            2_000,
+            fixture
+                .image
+                .connections
+                .last()
+                .expect("a connection")
+                .time_of_last_activity_ns,
+            "and it is the retransmission's business to keep it alive"
         );
     }
 
@@ -2279,14 +2363,16 @@ mod tests {
         assert_eq!(1, fixture.image.active_transport_count(sent + timeout - 1));
         assert_eq!(0, fixture.image.active_transport_count(sent + timeout));
 
-        // A second source on the same image is a second connection, which is
-        // the case the reference's own test asserts the number on
-        // (`aeron_publication_image_test.cpp:485`, `:497`, `:503`).
+        // A second source writing to the **same destination** is not a second
+        // connection: the image answers that socket either way, and it is the
+        // destination the connection is keyed by, as the reference keys it
+        // (`aeron_publication_image.c:564-571`).
         let offset = bytes.len() as i32;
+        let another = packet(INITIAL_TERM_ID, offset, b"another frame");
         fixture.image.insert_packet(
             INITIAL_TERM_ID,
             offset,
-            &packet(INITIAL_TERM_ID, offset, b"another frame"),
+            &another,
             "127.0.0.1:5556".parse().expect("an address"),
             DestinationId::FIRST,
             &system,
@@ -2295,7 +2381,31 @@ mod tests {
             sent,
         );
 
-        assert_eq!(2, fixture.image.connections.len(), "two connections");
+        assert_eq!(
+            1,
+            fixture.image.connections.len(),
+            "one destination is one transport, whoever writes to it"
+        );
+        assert_eq!(1, fixture.image.active_transport_count(sent + 1));
+
+        // A second **destination** is a second connection, which is the case
+        // the reference's own test asserts the number on
+        // (`aeron_publication_image_test.cpp:485`, `:497`, `:503` — its two
+        // packets go to `dest_1` and `dest_2`, not to two addresses).
+        let third_offset = offset + another.len() as i32;
+        fixture.image.insert_packet(
+            INITIAL_TERM_ID,
+            third_offset,
+            &packet(INITIAL_TERM_ID, third_offset, b"a third frame"),
+            "127.0.0.1:5556".parse().expect("an address"),
+            DestinationId::for_test(1),
+            &system,
+            &fixture.counters,
+            &regions,
+            sent,
+        );
+
+        assert_eq!(2, fixture.image.connections.len(), "two destinations");
         assert_eq!(2, fixture.image.active_transport_count(sent + 1));
     }
 

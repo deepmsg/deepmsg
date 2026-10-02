@@ -64,6 +64,29 @@ pub enum Interest {
     None,
 }
 
+/// What a `SETUP` was answered with ([`DataPacketDispatcher::on_setup`]).
+///
+/// Three answers rather than two, because "an image already serves this
+/// session" is not the same as "nothing wants it": the first still has work to
+/// do (`aeron_data_packet_dispatcher.c:499-502`), and that work is a
+/// **connection**.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupInterest {
+    /// An image already serves the session. The `SETUP` is the sender saying
+    /// it is still there, and the destination it arrived on is one the image
+    /// has to be able to answer — it may be the second publication of a session
+    /// the image has only ever heard from one of.
+    Image {
+        /// The image's registration id.
+        registration_id: i64,
+    },
+    /// No image yet and the stream wants the session: ask the conductor to
+    /// create one.
+    CreateImage,
+    /// Nothing wants it.
+    None,
+}
+
 /// One stream's interest, keyed by stream id
 /// (`aeron_data_packet_dispatcher_stream_interest_t`, `:44-58`).
 #[derive(Clone, Debug, Default)]
@@ -325,37 +348,38 @@ impl DataPacketDispatcher {
     /// A `SETUP` arrived for this (stream, session)
     /// (`on_setup`, `:475-540`).
     ///
-    /// Returns whether the conductor should be asked to create the image, and
-    /// leaves the state `InitInProgress` when it says yes — so a second
-    /// `SETUP`, from a second retransmission of the same request, does not ask
-    /// twice.
-    pub fn on_setup(&mut self, stream_id: i32, session_id: i32) -> bool {
+    /// An image already serving the session is **not** the end of the answer:
+    /// the reference adds a connection for the destination the `SETUP` came in
+    /// on (`aeron_publication_image_add_connection_if_unknown`, `:499-502`),
+    /// and that is the only way a session two publications share — two
+    /// destinations, one session — ever gets answered on the second one.
+    ///
+    /// `CreateImage` leaves the state `InitInProgress`, so a second `SETUP`
+    /// from a retransmission of the same request does not ask twice.
+    pub fn on_setup(&mut self, stream_id: i32, session_id: i32) -> SetupInterest {
         let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
-            return false;
+            return SetupInterest::None;
         };
 
-        if interest.image(session_id).is_some() {
-            // A `SETUP` for a session an image already serves says only that
-            // the sender is still saying `SETUP`: the connection is already
-            // there (`aeron_publication_image_add_connection_if_unknown`).
-            return false;
+        if let Some(registration_id) = interest.image(session_id) {
+            return SetupInterest::Image { registration_id };
         }
 
         match interest.state_of(session_id) {
             ImageState::PendingSetup | ImageState::Unknown => {
                 if !interest.wants(session_id) {
                     interest.set_state(session_id, ImageState::NoInterest);
-                    return false;
+                    return SetupInterest::None;
                 }
 
                 if interest.state.len() >= self.stream_session_limit {
-                    return false;
+                    return SetupInterest::None;
                 }
 
                 interest.set_state(session_id, ImageState::InitInProgress);
-                true
+                SetupInterest::CreateImage
             }
-            _ => false,
+            _ => SetupInterest::None,
         }
     }
 
@@ -515,9 +539,17 @@ mod tests {
         dispatcher.on_data(1001, 7, false);
         dispatcher.elicit_setup_from_source(1001, 7);
 
-        assert!(dispatcher.on_setup(1001, 7));
+        assert_eq!(
+            SetupInterest::CreateImage,
+            dispatcher.on_setup(1001, 7),
+            "nothing serves the session yet"
+        );
         assert_eq!(ImageState::InitInProgress, dispatcher.state_of(1001, 7));
-        assert!(!dispatcher.on_setup(1001, 7), "the create is in flight");
+        assert_eq!(
+            SetupInterest::None,
+            dispatcher.on_setup(1001, 7),
+            "the create is in flight"
+        );
 
         // The conductor answers with the image, and packets go to it.
         dispatcher.add_image(1001, 7, 42);
@@ -528,14 +560,21 @@ mod tests {
             },
             dispatcher.on_data(1001, 7, false)
         );
-        assert!(!dispatcher.on_setup(1001, 7), "the image is already there");
+        assert_eq!(
+            SetupInterest::Image {
+                registration_id: 42
+            },
+            dispatcher.on_setup(1001, 7),
+            "the image is already there, and the connection it arrives on is \
+             the image's to take"
+        );
     }
 
     #[test]
     fn a_setup_for_a_stream_nothing_subscribes_to_is_refused() {
         let mut dispatcher = DataPacketDispatcher::new(16);
 
-        assert!(!dispatcher.on_setup(1001, 7));
+        assert_eq!(SetupInterest::None, dispatcher.on_setup(1001, 7));
         assert_eq!(0, dispatcher.stream_count());
     }
 

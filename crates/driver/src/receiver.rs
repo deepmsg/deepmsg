@@ -34,7 +34,7 @@ use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
 use crate::idle::Backoff;
 
-use crate::media::dispatcher::Interest;
+use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::media::receive_endpoint::ReceiveDestination;
 use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
@@ -1257,15 +1257,39 @@ impl ReceiverThread {
                     return;
                 };
                 let setup_flags = header.flags;
+                let control_address = endpoint.control_address(destination, source);
 
-                if !endpoint
+                match endpoint
                     .dispatcher_mut()
                     .on_setup(setup.stream_id, setup.session_id)
                 {
-                    return;
+                    // An image is already serving this session, and the one
+                    // thing it has not seen is the destination this `SETUP`
+                    // came in on: a session two publications share arrives on
+                    // two destinations, and the second one is answered — or
+                    // not — through the connection taken here
+                    // (`aeron_data_packet_dispatcher.c:499-502`). Without it
+                    // the image keeps one socket and the second sender waits
+                    // for a status message that goes to the first.
+                    SetupInterest::Image { registration_id } => {
+                        if let Some(image) = images
+                            .iter_mut()
+                            .find(|image| image.registration_id == registration_id)
+                        {
+                            image.add_connection_if_unknown(
+                                control_address,
+                                source,
+                                destination,
+                                now_ns,
+                            );
+                        }
+
+                        return;
+                    }
+                    SetupInterest::None => return,
+                    SetupInterest::CreateImage => {}
                 }
 
-                let control_address = endpoint.control_address(destination, source);
                 let _ = endpoint_id;
 
                 let _ = events.send(ReceiverEvent::CreateImage {
