@@ -1975,6 +1975,11 @@ impl Conductor {
                                     subscriptions,
                                     now,
                                     &mut transmit,
+                                    // The IPC path resolves a tag against the
+                                    // network publications all the same
+                                    // (`aeron_driver_uri.c:163` is handed the
+                                    // conductor, and both paths call it).
+                                    |tag| network_publications.find_by_tag(tag),
                                 ),
                             };
 

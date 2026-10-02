@@ -24,7 +24,7 @@
 
 use deepmsg_core::logbuffer::descriptor;
 
-use crate::channel_uri::{ChannelUri, Transport, UriError};
+use crate::channel_uri::{ChannelUri, Transport, UriError, parse_base_zero};
 use crate::config::{DriverConfig, InferableBoolean};
 
 /// The parameter names this module reads
@@ -448,9 +448,9 @@ pub enum PublicationParamsError {
         /// What the URI said.
         value: String,
     },
-    /// `session-id=tag:N` names a network publication, and there is none with
-    /// that tag — which in this build is every tag, because IPC is the only
-    /// transport that makes publications here.
+    /// `session-id=tag:N` names a network publication, and no publication in
+    /// the driver carries that tag
+    /// (`aeron_driver_uri.c:184-187`: `must reference a network publication`).
     UnknownSessionIdTag {
         /// The tag the URI named.
         tag: i64,
@@ -535,7 +535,7 @@ impl std::fmt::Display for PublicationParamsError {
             Self::EntityTag { value } => write!(f, "entity tag `{value}` is not a number"),
             Self::UnknownSessionIdTag { tag } => write!(
                 f,
-                "session-id=tag:{tag} does not name a network publication"
+                "session-id=tag:{tag} must reference a network publication"
             ),
             Self::CongestionControl { value } => write!(
                 f,
@@ -593,10 +593,33 @@ impl From<UriError> for PublicationParamsError {
     }
 }
 
+/// What a `session-id=tag:N` channel takes from the publication it names: the
+/// session, and the two lengths that make the two publications the same shape
+/// (`aeron_driver_uri.c:188-190`, which copies all three out of the
+/// `aeron_network_publication_t`).
+///
+/// The lengths are copied rather than compared, and the flags that say the URI
+/// *named* them are left alone: that is how two channels that share a session
+/// come out identical enough for `aeron_confirm_publication_match` to let the
+/// second one link to the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaggedPublication {
+    /// The session the publication runs under.
+    pub session_id: i32,
+    /// Its mtu.
+    pub mtu_length: i32,
+    /// The length of one of its terms.
+    pub term_length: i32,
+}
+
 impl PublicationParams {
     /// Read a channel URI into the parameters a publication is created from.
     ///
     /// `config` supplies every default; the URI overrides the ones it names.
+    /// `find_by_tag` answers what `session-id=tag:N` names — the reference
+    /// hands the reader the whole conductor for this one question
+    /// (`aeron_driver_uri.c:163`), so the lookup is a parameter here rather
+    /// than a field.
     ///
     /// # Errors
     ///
@@ -605,6 +628,7 @@ impl PublicationParams {
     pub fn resolve(
         uri: &ChannelUri<'_>,
         config: &DriverConfig,
+        find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
     ) -> Result<Self, PublicationParamsError> {
         // The defaults, in the reference's order and from the same settings
         // (`aeron_driver_uri.c:224-254`). Three of them are chosen by
@@ -650,7 +674,7 @@ impl PublicationParams {
             initial_term_id: 0,
         };
 
-        params.read_session_id(uri)?;
+        params.read_session_id(uri, find_by_tag)?;
         params.read_entity_tag(uri)?;
 
         if let Some(linger) = uri.duration_ns(key::LINGER)? {
@@ -743,24 +767,57 @@ impl PublicationParams {
     }
 
     /// `session-id`, which is a number, or `tag:N` naming a network
-    /// publication's session (`aeron_driver_uri.c:159-205`).
-    fn read_session_id(&mut self, uri: &ChannelUri<'_>) -> Result<(), PublicationParamsError> {
+    /// publication whose session this one shares
+    /// (`aeron_driver_uri.c:162-204`).
+    ///
+    /// `tag:` copies the publication's session **and its two lengths** — the
+    /// mtu and the term — which is what makes a second channel that names a
+    /// tag come out structurally identical to the first, and what
+    /// `shouldMergeStreamsFromMultiplePublicationsWithSameParams` is built on.
+    /// The lookup is the caller's because only the conductor has the
+    /// publications (`aeron_driver_conductor_find_network_publication_by_tag`,
+    /// `aeron_driver_conductor.h:764-778`).
+    fn read_session_id(
+        &mut self,
+        uri: &ChannelUri<'_>,
+        find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
+    ) -> Result<(), PublicationParamsError> {
         let Some(value) = uri.value(key::SESSION_ID) else {
             return Ok(());
         };
 
         if let Some(tag) = value.strip_prefix("tag:") {
-            // The tag is looked up among the network publications, and there
-            // are none: this build's data plane is IPC. The reference's answer
-            // for a tag it cannot find is the same error.
-            let tag = tag.parse::<i64>().map_err(|_| {
+            // `strtoll(&session_id_str[4], &end_ptr, 0)`, and the reference
+            // fails the whole parameter when `errno` is set or any character is
+            // left over (`:166-178`) — the same base-zero reader every other
+            // integer parameter goes through.
+            let not_a_number = || {
                 PublicationParamsError::Uri(UriError::NotANumber {
+                    key: key::SESSION_ID.to_owned(),
+                    value: value.to_owned(),
+                })
+            };
+
+            let Some(number) = parse_base_zero(tag) else {
+                return Err(not_a_number());
+            };
+
+            let tag = i64::try_from(number).map_err(|_| {
+                PublicationParamsError::Uri(UriError::OutOfRange {
                     key: key::SESSION_ID.to_owned(),
                     value: value.to_owned(),
                 })
             })?;
 
-            return Err(PublicationParamsError::UnknownSessionIdTag { tag });
+            let Some(publication) = find_by_tag(tag) else {
+                return Err(PublicationParamsError::UnknownSessionIdTag { tag });
+            };
+
+            self.session_id = Some(publication.session_id);
+            self.mtu_length = publication.mtu_length;
+            self.term_length = publication.term_length;
+
+            return Ok(());
         }
 
         self.session_id = uri.i32(key::SESSION_ID)?;
@@ -948,8 +1005,18 @@ mod tests {
     }
 
     fn resolve(uri: &str) -> Result<PublicationParams, PublicationParamsError> {
+        resolve_with_tag(uri, |_| None)
+    }
+
+    /// The same, for a URI whose `session-id=tag:N` names something — the
+    /// lookup is the conductor's, so a test hands it what a conductor would
+    /// find (`crate::network_publications::NetworkPublications::find_by_tag`).
+    fn resolve_with_tag(
+        uri: &str,
+        find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
+    ) -> Result<PublicationParams, PublicationParamsError> {
         let parsed = ChannelUri::parse(uri.as_bytes()).expect("the URI parses");
-        PublicationParams::resolve(&parsed, &config())
+        PublicationParams::resolve(&parsed, &config(), find_by_tag)
     }
 
     fn resolve_ok(uri: &str) -> PublicationParams {
@@ -1305,6 +1372,81 @@ mod tests {
         // "no entity tag" rather than an error.
         assert_eq!(-1, resolve_ok("aeron:ipc?tags=channel").entity_tag);
         assert_eq!(-1, resolve_ok("aeron:ipc?tags=channel,").entity_tag);
+    }
+
+    /// `session-id=tag:N` takes the named publication's session **and its two
+    /// lengths** (`aeron_driver_uri.c:188-190`), so a channel that names a tag
+    /// comes out the same shape as the publication it names — which is what
+    /// `shouldMergeStreamsFromMultiplePublicationsWithSameParams` leans on:
+    /// two channels that disagree about mtu or term are two publications, not
+    /// one shared stream.
+    #[test]
+    fn a_tagged_session_takes_the_publications_session_and_lengths() {
+        let named = TaggedPublication {
+            session_id: 7_777,
+            mtu_length: 1_408,
+            term_length: 1 << 20,
+        };
+
+        let params = resolve_with_tag(
+            "aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:5",
+            |tag| (5 == tag).then_some(named),
+        )
+        .expect("the tag names a publication");
+
+        assert_eq!(Some(7_777), params.session_id);
+        assert_eq!(1_408, params.mtu_length);
+        assert_eq!(1 << 20, params.term_length);
+
+        // **Taken**, not named: the URI still says nothing about the lengths,
+        // and that is what a publication being shared has to agree about
+        // (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1126-1136`).
+        assert!(!params.mtu_length_named);
+        assert!(!params.term_length_named);
+
+        // The tag is read before `mtu=` and `term-length=`
+        // (`aeron_driver_uri.c:277-300`), so a URI that names them overrides
+        // what the tag gave.
+        let explicit = resolve_with_tag(
+            "aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:5|mtu=2048",
+            |_| Some(named),
+        )
+        .expect("the tag names a publication");
+
+        assert_eq!(2_048, explicit.mtu_length);
+        assert!(explicit.mtu_length_named);
+    }
+
+    /// The two ways a tag can fail to name anything: no publication carries
+    /// it, and the tag is not a number at all.
+    #[test]
+    fn a_tag_that_names_no_publication_is_refused() {
+        let error = resolve("aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:42")
+            .expect_err("no publication carries the tag");
+
+        assert_eq!(
+            "session-id=tag:42 must reference a network publication",
+            error.to_string(),
+            "the reference's words (`aeron_driver_uri.c:184-187`)"
+        );
+
+        assert!(matches!(
+            resolve("aeron:ipc?session-id=tag:seven"),
+            Err(PublicationParamsError::Uri(_))
+        ));
+
+        // Read in base zero, as the reference's `strtoll(..., 0)` reads it, so
+        // a tag written as hex is that tag (`aeron_driver_uri.c:166-178`).
+        let params = resolve_with_tag("aeron:ipc?session-id=tag:0x10", |tag| {
+            (16 == tag).then_some(TaggedPublication {
+                session_id: 4,
+                mtu_length: 1_408,
+                term_length: 1 << 20,
+            })
+        })
+        .expect("0x10 is sixteen");
+
+        assert_eq!(Some(4), params.session_id);
     }
 
     #[test]

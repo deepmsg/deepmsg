@@ -330,7 +330,19 @@ impl NetworkPublication {
 
         // The three tails: the first term begins at offset zero, the two before
         // it hold the wraps a rotation looks for (`aeron_ipc_publication.c:75-103`).
-        log.initialise_tails(params.initial_term_id, None);
+        //
+        // A stream that resumes starts its tails at the term the URI named —
+        // the reference writes the same block on the network path
+        // (`aeron_network_publication.c:163-182`, its own copy of the IPC
+        // code), and it has to be the same block: a publication that names
+        // another's session with `session-id=tag:N` is meant to describe the
+        // *same* stream, so it has to start where that stream is.
+        #[allow(clippy::cast_possible_truncation)] // bounded by a term length
+        let start = params
+            .starting_position
+            .map(|position| (position.term_id, position.term_offset as i32));
+
+        log.initialise_tails(params.initial_term_id, start);
 
         // And then the metadata block, which is what a *client* reads when it
         // maps the file `ON_PUBLICATION_READY` named
@@ -1917,7 +1929,9 @@ mod tests {
     use crate::udp_channel::UdpChannel;
     use deepmsg_cnc::layout::NULL_COUNTER_ID;
     use deepmsg_core::buffer::AtomicBuffer;
+    use deepmsg_core::logbuffer::descriptor;
     use deepmsg_core::logbuffer::frame::{FLAG_UNFRAGMENTED, Frame, TYPE_DATA};
+    use deepmsg_core::logbuffer::position::RawTail;
 
     /// A directory a test's log buffer lands in, removed when the test ends.
     struct TempDir(std::path::PathBuf);
@@ -2080,6 +2094,12 @@ mod tests {
     /// A publication sending to a socket this test owns, so what leaves can be
     /// read back byte for byte.
     fn fixture() -> Fixture {
+        fixture_with(&params(TERM_LENGTH, MTU, 32 * 1024))
+    }
+
+    /// The same, over parameters a test changed — the starting position is the
+    /// one that reaches the log buffer's tails.
+    fn fixture_with(params: &PublicationParams) -> Fixture {
         let dir = TempDir::new();
         let log = dir.log_buffer(TERM_LENGTH);
         let counters = Counters::new();
@@ -2095,8 +2115,6 @@ mod tests {
         let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
         let channel = UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel");
 
-        let params = params(TERM_LENGTH, MTU, 32 * 1024);
-
         let publication = NetworkPublication::create(
             7,
             9,
@@ -2105,7 +2123,7 @@ mod tests {
             1,
             uri.as_bytes(),
             log,
-            &params,
+            params,
             false,
             PublicationCounters {
                 fc_receivers: None,
@@ -2728,6 +2746,64 @@ mod tests {
 
         publish_frame(&fixture.publication.log, 0, 0, 1_000, &[1u8; 100]);
         assert_eq!(Some(160), fixture.publication.producer_position());
+    }
+
+    /// A stream that resumes starts its tails at the term the URI named,
+    /// **offset included** — the reference writes that block on the network
+    /// path (`aeron_network_publication.c:163-182`) exactly as it does on the
+    /// IPC one (`aeron_ipc_publication.c:75-103`).
+    ///
+    /// It is what makes a publication that took another's session with
+    /// `session-id=tag:N` describe the *same* stream rather than a fresh one
+    /// that happens to share an id: the log it publishes into begins where that
+    /// stream is, and the producer position over the tails is what every
+    /// position computation below is measured from.
+    #[test]
+    fn a_resumed_stream_starts_at_the_term_the_uri_named() {
+        let mut resumed = params(TERM_LENGTH, MTU, 32 * 1024);
+        let term_id = resumed.initial_term_id + 5;
+        resumed.starting_position = Some(crate::publication_params::StartingPosition {
+            initial_term_id: resumed.initial_term_id,
+            term_id,
+            term_offset: 4_096,
+        });
+
+        let fixture = fixture_with(&resumed);
+        let bits = deepmsg_core::logbuffer::position::bits_to_shift(TERM_LENGTH).expect("a power");
+        let expected = deepmsg_core::logbuffer::position::Position::new(
+            term_id,
+            4_096,
+            bits,
+            resumed.initial_term_id,
+        )
+        .raw();
+
+        assert_eq!(
+            Some(expected),
+            fixture.publication.producer_position(),
+            "the producer position over the tails is where the URI said"
+        );
+
+        let metadata = fixture.publication.log.metadata().expect("metadata");
+        assert_eq!(
+            Some(5),
+            metadata.load_i32_relaxed(descriptor::ACTIVE_TERM_COUNT_OFFSET),
+            "the active term count is the named term's distance from the initial one"
+        );
+
+        let index = deepmsg_core::logbuffer::position::index_by_term_count(5);
+        let tail = metadata
+            .load_i64_relaxed(
+                descriptor::TERM_TAIL_COUNTERS_OFFSET
+                    + index * descriptor::TERM_TAIL_COUNTER_STRIDE,
+            )
+            .expect("in range");
+
+        assert_eq!(
+            RawTail::new(term_id, 4_096).raw(),
+            tail,
+            "and the term holds the offset the URI named, not zero"
+        );
     }
 
     fn test_endpoint(channel: &UdpChannel) -> SendChannelEndpoint {
