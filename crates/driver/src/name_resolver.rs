@@ -27,7 +27,7 @@ use std::net::{IpAddr, SocketAddr};
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::sys::AddressFamily;
-use crate::udp_channel::{self, UdpChannelError};
+use crate::udp_channel;
 
 /// What a resolver's `resolve` answers (`aeron_name_resolver_resolve_func_t`):
 /// the reference's `0` and `-1`, and **no third answer**.
@@ -48,21 +48,22 @@ pub enum Resolution {
     Failed(String),
 }
 
-impl Resolution {
-    /// The address, or the failure as the channel error a caller of
-    /// [`crate::udp_channel::resolve_host_and_port`] already knows.
-    ///
-    /// # Errors
-    ///
-    /// [`UdpChannelError::Resolution`] for the failure.
-    pub fn into_address(self, channel_text: &str) -> Result<SocketAddr, UdpChannelError> {
-        match self {
-            Self::Found(address) => Ok(address),
-            Self::Failed(what) => Err(UdpChannelError::Resolution(format!(
-                "{channel_text}: {what}"
-            ))),
-        }
-    }
+/// Something a resolver could not do, on its way to the driver's error log
+/// (`aeron_name_resolver_log_and_clear_error`,
+/// `aeron_driver_name_resolver.c:718-723`, which records the thread-local error
+/// and bumps the errors counter beside it).
+///
+/// The reference's resolver writes straight into the shared error log; this
+/// build's log is a process-local structure whose only writer is the conductor,
+/// so a failure is carried out of the resolver the way the agent's other
+/// findings are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolverFault {
+    /// The code the entry is recorded under, the reference's own negation for
+    /// the sites that set one.
+    pub error_code: i32,
+    /// The words, already composed.
+    pub description: String,
 }
 
 /// What a resolver's `lookup` answers (`aeron_name_resolver_lookup_func_t`) —
@@ -160,6 +161,17 @@ pub trait Resolver {
         _regions: &CounterRegions<'_>,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// What this resolver could not do since the last call, for the driver's
+    /// error log.
+    ///
+    /// A drain and not a callback, because the log is the conductor's: the
+    /// agent takes these off the resolver each pass and hands them over
+    /// (`take_faults` is this build's spelling of the reference's direct
+    /// `aeron_distinct_error_log_record`).
+    fn take_faults(&mut self) -> Vec<ResolverFault> {
+        Vec::new()
     }
 
     /// One pass of whatever the resolver does on its own clock (`do_work_func`),
@@ -310,7 +322,16 @@ impl Resolver for DefaultResolver {
             }
         }
 
-        Resolution::Failed(format!("Unable to resolve host=({name}): {failure}"))
+        // The line, and the site that owns it, are the reference's
+        // (`util/aeron_netutil.c:75-76`, inside `aeron_ip_addr_resolver`).
+        // The detail after the colon is this build's wording of the same
+        // failure — `getaddrinfo`'s `(%d) %s` there, Rust's own io error here,
+        // because the resolver reaches the system through `ToSocketAddrs` and
+        // that does not surface the `EAI_*` code. The wrapper above adds the
+        // code line and the `Unresolved - …` line around it.
+        Resolution::Failed(format!(
+            "[aeron_ip_addr_resolver, aeron_netutil.c:75] Unable to resolve host=({name}): {failure}"
+        ))
     }
 }
 
@@ -488,7 +509,14 @@ impl Resolver for CsvTableResolver {
             };
 
             if DISABLE_RESOLUTION == operation {
-                return Resolution::Failed(format!("Unable to resolve host=({name}): (forced)"));
+                // The reference's own words and site for a row switched off
+                // (`aeron_csv_table_name_resolver.c:73`, in
+                // `aeron_csv_table_name_resolver_resolve`), `(forced)` and all.
+                return Resolution::Failed(format!(
+                    "[aeron_csv_table_name_resolver_resolve, \
+                     aeron_csv_table_name_resolver.c:73] \
+                     Unable to resolve host=({name}): (forced)"
+                ));
             } else if USE_RE_RESOLUTION_HOST == operation {
                 hostname = &row.re_resolution_host;
             } else if USE_INITIAL_RESOLUTION_HOST == operation {
@@ -784,9 +812,13 @@ mod tests {
 
         fixture.set(ids[0], DISABLE_RESOLUTION);
         assert_eq!(
-            Resolution::Failed("Unable to resolve host=(server0): (forced)".to_owned()),
+            Resolution::Failed(
+                "[aeron_csv_table_name_resolver_resolve, aeron_csv_table_name_resolver.c:73] \
+                 Unable to resolve host=(server0): (forced)"
+                    .to_owned()
+            ),
             fixture.resolve(&mut resolver, "server0"),
-            "the third operation is a refusal, in the reference's own words"
+            "the third operation is a refusal, in the reference's own words and at its own site"
         );
 
         // A value that is none of the three substitutes nothing, so it is the
@@ -850,20 +882,23 @@ mod tests {
     }
 
     /// The two answers of a `resolve` and the three of a `lookup` are what a
-    /// decorator is built out of, and the port of them is the channel error the
-    /// synchronous path already answers with.
+    /// decorator is built out of, and what a caller does with the failure is
+    /// the wrapper's business — it is the one that knows the URI parameter's
+    /// name and the text the channel named
+    /// (`crate::udp_channel::resolution_failure`), which is why a failure is
+    /// carried here rather than converted here.
     #[test]
     fn a_failure_carries_what_the_resolver_said() {
         assert_eq!(
-            Ok("127.0.0.1:40456".parse().expect("an address")),
+            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
             Resolution::Found("127.0.0.1:40456".parse().expect("an address"))
-                .into_address("endpoint=127.0.0.1:40456")
         );
 
-        let refused = Resolution::Failed("Unable to resolve host=(x): (forced)".to_owned())
-            .into_address("endpoint=x:40456")
-            .expect_err("a refused name is not an address");
-        assert!(refused.to_string().contains("(forced)"), "{refused}");
+        let refused = Resolution::Failed("Unable to resolve host=(x): (forced)".to_owned());
+        let Resolution::Failed(what) = refused else {
+            panic!("a refused name is not an address");
+        };
+        assert!(what.contains("(forced)"), "{what}");
 
         assert_eq!(
             Lookup::Found("elsewhere:40456".to_owned()),

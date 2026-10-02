@@ -48,7 +48,6 @@
 //! lengths claim — is counted separately, because it is a bug or a hostile
 //! client rather than a feature this build has not reached.
 
-use deepmsg_cnc::CounterRegions;
 use deepmsg_cnc::command::{
     ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
     ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
@@ -85,8 +84,7 @@ use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::media::receive_endpoint::ReceiveDestination;
-use crate::name_resolver::Resolver;
-use crate::native_resource_agent::StorageChecks;
+use crate::native_resource_agent::{AgentHandle, ParsedChannel, ResolutionCell, StorageChecks};
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
 use crate::receive_endpoints::ReceiveChannelEndpoints;
@@ -95,7 +93,7 @@ use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
-    IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
+    IPC_PREFIX, UdpChannelError, Unresolved, is_spy_channel, validate_destination_prefix,
     validate_destination_uri_params,
 };
 
@@ -485,6 +483,82 @@ fn malformed_command(
     );
 }
 
+/// A client command that cannot finish until the agent has parsed its channel.
+///
+/// The bytes belong to the command ring and are overwritten by the next read,
+/// so a command that is going to wait has to be **owned** — which is what the
+/// reference does too, `memcpy`-ing the original command into the async one
+/// (`aeron_driver_conductor.c:4097-4106`).
+struct ParkedCommand {
+    /// The command's type id, so it can be decoded again on the way out.
+    type_id: i32,
+    /// The command exactly as it arrived.
+    payload: Vec<u8>,
+    /// Where the agent's parse will land. The slot is only ever entered with
+    /// the request already submitted, so this is not an `Option` for the
+    /// conductor's benefit — it is one because a command can be parked in the
+    /// same pass it is decoded, and the request is sent at the end of that pass
+    /// (the borrows the dispatch holds are not the ones a submission needs).
+    channel: Option<ResolutionCell<ParsedChannel>>,
+}
+
+impl ParkedCommand {
+    /// Park a command whose channel the agent is asked to parse.
+    ///
+    /// A request that cannot be queued leaves the cell empty, and an empty cell
+    /// is answered as a failure when the command comes back — which is the
+    /// honest outcome for a driver whose agent thread has gone.
+    fn new(
+        type_id: i32,
+        payload: &[u8],
+        agent: &AgentHandle,
+        channel: &[u8],
+        unresolved: Unresolved,
+    ) -> Self {
+        Self {
+            type_id,
+            payload: payload.to_vec(),
+            channel: agent.parse_channel(channel, unresolved).ok(),
+        }
+    }
+
+    /// Park a **send destination**: its address is resolved beside its channel,
+    /// because that is what a removal matches it by.
+    fn send_destination(type_id: i32, payload: &[u8], agent: &AgentHandle, channel: &[u8]) -> Self {
+        Self {
+            type_id,
+            payload: payload.to_vec(),
+            channel: agent.parse_send_destination(channel).ok(),
+        }
+    }
+}
+
+/// A send endpoint whose name the sender has asked about again
+/// (`aeron_driver_conductor_on_re_resolve_endpoint`, `:6890-6938`).
+///
+/// The resolution is the **agent's**, like every other one in this build: the
+/// entry is submitted and waits here until its answer lands, which is what
+/// keeps a name that will not answer from stopping the conductor's clock.
+struct PendingReResolution {
+    endpoint_id: u64,
+    endpoint_name: String,
+    /// What the endpoint has now, to compare the answer against
+    /// (`:6932-6938`).
+    existing: Option<SocketAddr>,
+    /// Where the answer will arrive, once it has been asked for.
+    answer: Option<ResolutionCell<SocketAddr>>,
+}
+
+/// The same for a **control** name the receiver has asked about again
+/// (`aeron_driver_conductor_on_re_resolve_control`, `:6957-6990`).
+struct PendingControlReResolution {
+    endpoint_id: u64,
+    destination: crate::media::receive_endpoint::DestinationId,
+    control_name: String,
+    existing: SocketAddr,
+    answer: Option<ResolutionCell<SocketAddr>>,
+}
+
 /// The driver's control plane.
 pub struct Conductor {
     /// The settings every publication's parameters default to, kept because
@@ -500,14 +574,23 @@ pub struct Conductor {
     /// What this driver allocated for itself, so its shutdown gives back
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
-    /// The resolver the settings named (`aeron.name.resolver.supplier`), which
-    /// every channel this driver parses goes through and whose clock runs on
-    /// the driver's own pass.
+    /// The client command that is waiting on the agent, if there is one — the
+    /// reference's `conductor->client_command`
+    /// (`aeron_driver_conductor.c:3293-3320`).
     ///
-    /// `Send` because it is built here and the reference runs it on the native
-    /// resource agent (`aeron_driver_native_resource_agent.c:260`); this build
-    /// keeps it on the conductor thread, which `docs/compat.md` records.
-    resolver: Box<dyn Resolver + Send>,
+    /// One slot, and while it is occupied the conductor reads **no** further
+    /// client commands. What it does not do is stop: its duty cycle, its
+    /// heartbeat and every other client's commands carry on, because the
+    /// resolver is on the agent's thread — which is the whole difference
+    /// between a channel whose name stalls and a driver a client declares dead.
+    parked_command: Option<ParkedCommand>,
+    /// The channel a resumed destination command is waiting to use: the
+    /// destination loop is its state machine, and it re-enters it with this in
+    /// hand.
+    agent_parsed_channel: Option<ParsedChannel>,
+    /// A destination command whose parse has landed, waiting for the pass that
+    /// runs the destination loop.
+    resumed_destination: Option<(i32, Vec<u8>)>,
     /// The process's half of the distinct error log; the region it writes
     /// comes from the CnC file per call, like the counters.
     error_log: DistinctErrorLog,
@@ -590,15 +673,10 @@ pub struct Conductor {
     /// Endpoints whose names the sender has asked about again, waiting for a
     /// pass that holds the counter regions — the resolver reads counters, and a
     /// resolution is measured (`SenderEvent::ReResolveEndpoint`).
-    pending_re_resolutions: Vec<(u64, String, Option<SocketAddr>)>,
+    pending_re_resolutions: Vec<PendingReResolution>,
     /// Destinations whose **control** names the receiver has asked about
     /// again, waiting for a pass that holds the counter regions.
-    pending_control_re_resolutions: Vec<(
-        u64,
-        crate::media::receive_endpoint::DestinationId,
-        String,
-        SocketAddr,
-    )>,
+    pending_control_re_resolutions: Vec<PendingControlReResolution>,
 }
 
 impl Conductor {
@@ -668,7 +746,7 @@ impl Conductor {
         // clock are in hand — the reference builds it in the native resource
         // agent's init, from the context, and runs it on that agent's thread
         // (`aeron_driver_native_resource_agent.c:299-320`, `:260`).
-        let mut resolver = {
+        let resolver = {
             let regions = cnc
                 .counter_regions()
                 .ok_or(ConductorError::NoCounterRegions)?;
@@ -703,15 +781,6 @@ impl Conductor {
                 )
                 .map_err(ConductorError::Resolver)?
         };
-
-        {
-            let regions = cnc
-                .counter_regions()
-                .ok_or(ConductorError::NoCounterRegions)?;
-            resolver
-                .start(&counters, &regions)
-                .map_err(ConductorError::Resolver)?;
-        }
 
         // The id the driver burns at startup belongs to the same counter a
         // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
@@ -769,6 +838,18 @@ impl Conductor {
         // below share it; everything above this line borrowed it directly.
         let cnc = Arc::new(cnc);
 
+        // The resolver goes over now, because it needs the file and the file
+        // could not be shared until the publication above had it mutably.
+        publications
+            .attach_resolver(crate::native_resource_agent::AgentResolver::new(
+                resolver,
+                Arc::clone(&cnc),
+                config.name_resolver_threshold_ns,
+                free_to_reuse_ms(config.counter_free_to_reuse_ns),
+                std::time::Duration::from_millis(config.debug_resolver_delay_ms),
+            ))
+            .map_err(ConductorError::Agent)?;
+
         let sender = Sender::start(
             Arc::clone(&cnc),
             // The counters region's length is what fixes a counter id's meaning
@@ -822,7 +903,9 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
-            resolver,
+            parked_command: None,
+            agent_parsed_channel: None,
+            resumed_destination: None,
             error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
             publications,
@@ -903,14 +986,6 @@ impl Conductor {
 
         self.track_cycle(now_ns);
 
-        // The resolver's own clock, which runs on this driver's pass whether or
-        // not anything else has work: a driver nobody is talking to still has
-        // to answer when someone does, and its gossip is on its own intervals
-        // (`aeron_driver_name_resolver.c:1252-1292`).
-        if let Some(regions) = self.cnc.counter_regions() {
-            work_count += self.resolver.do_work(self.now_ms, &self.counters, &regions);
-        }
-
         if now_ns > self.clock_update_deadline_ns {
             self.now_ms = self.clock.update(clock::epoch_nano_time());
             self.clock_update_deadline_ns = now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS);
@@ -937,6 +1012,7 @@ impl Conductor {
         // the pass can tell the difference, and a window cannot be held twice.
         self.record_pending_faults();
         self.record_storage_warnings();
+        self.record_agent_faults();
         self.flush_broadcast_failures();
         work + self.re_resolve_endpoints() + self.re_resolve_controls()
     }
@@ -1171,12 +1247,14 @@ impl Conductor {
                 } => {
                     // Held rather than resolved here: this method has no
                     // counter regions, and a resolution is measured.
-                    self.pending_control_re_resolutions.push((
-                        endpoint_id,
-                        destination,
-                        control_name,
-                        address,
-                    ));
+                    self.pending_control_re_resolutions
+                        .push(PendingControlReResolution {
+                            endpoint_id,
+                            destination,
+                            control_name,
+                            existing: address,
+                            answer: None,
+                        });
                 }
                 ReceiverEvent::Untethered {
                     registration_id,
@@ -1794,10 +1872,15 @@ impl Conductor {
                     endpoint_name,
                     address,
                 } => {
-                    // Held rather than resolved here: this method has no
-                    // counter regions, and the resolution is measured.
-                    self.pending_re_resolutions
-                        .push((endpoint_id, endpoint_name, address));
+                    // Held rather than resolved here, exactly as the
+                    // reference holds it: this pass has the sender's event and
+                    // the resolution belongs to the agent.
+                    self.pending_re_resolutions.push(PendingReResolution {
+                        endpoint_id,
+                        endpoint_name,
+                        existing: address,
+                        answer: None,
+                    });
                 }
             }
         }
@@ -1904,8 +1987,6 @@ impl Conductor {
     ///
     /// The error from flushing the mapping, if any.
     pub fn close(&mut self) -> std::io::Result<()> {
-        self.close_resolver();
-
         // The counters the driver owns go first (`aeron_system_counters_close`,
         // called at `aeron_driver_conductor.c:3487`), and the heartbeat is
         // nulled after (`:3493`). It is why a driver that stopped on purpose
@@ -1967,7 +2048,279 @@ impl Conductor {
     }
 
     /// Drain at most [`COMMAND_DRAIN_LIMIT`] commands and act on them.
+    /// One step of a parked command: the answer, or another pass of waiting
+    /// (`aeron_driver_conductor.c:3293-3320` — the reference's
+    /// `client_command->execute` returning `RUNNING`).
+    ///
+    /// Nothing here blocks. The answer is either in the cell the agent filled
+    /// or it is not, and a command that has no answer yet goes back into the
+    /// slot with its place in the queue kept.
+    fn advance_parked_command(&mut self, parked: ParkedCommand, now_ns: i64) -> usize {
+        let answer = match &parked.channel {
+            Some(cell) => cell.get().cloned(),
+            // The request could not be queued, which means the agent thread is
+            // gone: fail the command rather than leave a client waiting for a
+            // driver that is already going down.
+            None => Some(Err(UdpChannelError::Resolution(
+                "the native resource agent has stopped".to_owned(),
+            ))),
+        };
+
+        match answer {
+            None => {
+                self.parked_command = Some(parked);
+                0
+            }
+            Some(Ok(parsed)) => {
+                self.complete_parked_command(parked.type_id, &parked.payload, parsed, now_ns)
+            }
+            Some(Err(error)) => {
+                self.fail_parked_command(parked.type_id, &parked.payload, error, now_ns);
+                1
+            }
+        }
+    }
+
+    /// Run a command whose channel the agent has parsed — the state the
+    /// reference calls `ADD_NETWORK_PUBLICATION_STATE_VALIDATE`
+    /// (`aeron_driver_conductor.c:4135`), reached from
+    /// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_SUCCEEDED`.
+    fn complete_parked_command(
+        &mut self,
+        type_id: i32,
+        payload: &[u8],
+        parsed: ParsedChannel,
+        now_ns: i64,
+    ) -> usize {
+        // A destination's state machine is the destination loop, not this one:
+        // the parse is handed to it and the command re-enters there, which is
+        // where its sender and subscription lookups live.
+        if matches!(
+            Command::from_type_id(type_id),
+            Command::AddDestination
+                | Command::RemoveDestination
+                | Command::AddReceiveDestination
+                | Command::RemoveReceiveDestination
+        ) {
+            self.agent_parsed_channel = Some(parsed);
+            self.resumed_destination = Some((type_id, payload.to_vec()));
+            return 0;
+        }
+
+        let Some(region) = self.cnc.to_clients_region_writable() else {
+            return 0;
+        };
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+        let now = Now {
+            ms: self.now_ms,
+            ns: now_ns,
+            client_liveness_timeout_ns: self.liveness_timeout_ns,
+        };
+
+        match Command::from_type_id(type_id) {
+            Command::AddPublication | Command::AddExclusivePublication => {
+                let is_exclusive = matches!(
+                    Command::from_type_id(type_id),
+                    Command::AddExclusivePublication
+                );
+                let Some(request) = decode_add_publication(payload) else {
+                    malformed_command(type_id, payload.len(), &mut self.malformed, &mut transmit);
+                    return 1;
+                };
+
+                let Some(counter_regions) = self.cnc.counter_regions() else {
+                    return 0;
+                };
+
+                let result = self.network_publications.add_publication(
+                    &request,
+                    is_exclusive,
+                    &self.config,
+                    &mut self.counters,
+                    &counter_regions,
+                    parsed.channel,
+                    &mut self.clients,
+                    &mut self.send_endpoints,
+                    self.sender.proxy(),
+                    &self.subscriptions,
+                    &self.images,
+                    self.receiver.proxy(),
+                    now,
+                    &mut transmit,
+                );
+
+                if let Err(error) = result {
+                    self.publication_failures += 1;
+                    let description = match error.uri_parse_failure(request.channel) {
+                        Some(uri_lines) => format!(
+                            "{uri_lines}{}",
+                            channel_parse_append(
+                                "aeron_driver_conductor_on_add_network_publication",
+                                4687,
+                            )
+                        ),
+                        None => error.to_string(),
+                    };
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        description.as_bytes(),
+                    );
+                }
+            }
+            Command::AddSubscription => {
+                let Some(request) = decode_add_subscription(payload) else {
+                    malformed_command(type_id, payload.len(), &mut self.malformed, &mut transmit);
+                    return 1;
+                };
+
+                let Some(counter_regions) = self.cnc.counter_regions() else {
+                    return 0;
+                };
+
+                let result = self.subscriptions.add_network_subscription(
+                    &request,
+                    &self.config,
+                    &mut self.counters,
+                    &counter_regions,
+                    parsed.channel,
+                    &mut self.clients,
+                    &mut self.receive_endpoints,
+                    &mut self.images,
+                    self.receiver.proxy(),
+                    now,
+                    &mut transmit,
+                );
+
+                if let Err(error) = result {
+                    self.subscription_failures += 1;
+                    let description = match error.uri_parse_failure(request.channel) {
+                        Some(uri_lines) => format!(
+                            "{uri_lines}{}",
+                            channel_parse_append(
+                                "aeron_driver_conductor_on_add_network_subscription",
+                                5173,
+                            )
+                        ),
+                        None => error.to_string(),
+                    };
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        description.as_bytes(),
+                    );
+                }
+            }
+            // Nothing else parks: a command whose kind has no state machine
+            // here is a bug in whichever parked it, and it is answered rather
+            // than dropped.
+            _ => {
+                transmit.record_fault(
+                    -ERROR_CODE_GENERIC_ERROR,
+                    compose_description(
+                        -ERROR_CODE_GENERIC_ERROR,
+                        "aeron_driver_conductor_process_commands",
+                        "aeron_driver_conductor.c",
+                        3293,
+                        &format!("command={type_id} was parked and has no completion"),
+                    ),
+                );
+                return 1;
+            }
+        }
+
+        1
+    }
+
+    /// Answer a command whose channel the agent could not parse
+    /// (`aeron_driver_conductor_set_error_from_result`, `:2851`, reached from
+    /// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_FAILED`).
+    fn fail_parked_command(
+        &mut self,
+        type_id: i32,
+        payload: &[u8],
+        error: UdpChannelError,
+        _now_ns: i64,
+    ) {
+        let Some(region) = self.cnc.to_clients_region_writable() else {
+            return;
+        };
+        let mut transmit = Transmit {
+            transmitter: &mut self.transmitter,
+            region: &region,
+            failures: &mut self.pending_broadcast_failures,
+            faults: &mut self.pending_log_errors,
+        };
+
+        // The failure counters are the command's, exactly as they are when the
+        // same refusal comes back from the inline paths.
+        match Command::from_type_id(type_id) {
+            Command::AddPublication | Command::AddExclusivePublication => {
+                self.publication_failures += 1;
+            }
+            Command::AddSubscription => self.subscription_failures += 1,
+            _ => {}
+        }
+
+        let channel = match Command::from_type_id(type_id) {
+            Command::AddPublication | Command::AddExclusivePublication => {
+                decode_add_publication(payload).map(|request| request.channel.to_vec())
+            }
+            Command::AddSubscription => {
+                decode_add_subscription(payload).map(|request| request.channel.to_vec())
+            }
+            _ => decode_destination_command(payload).map(|request| request.channel.to_vec()),
+        };
+        let Some(channel) = channel else {
+            malformed_command(type_id, payload.len(), &mut self.malformed, &mut transmit);
+            return;
+        };
+
+        let correlation_id = match Command::from_type_id(type_id) {
+            Command::AddSubscription => decode_add_subscription(payload).map(|r| r.correlation_id),
+            Command::AddPublication | Command::AddExclusivePublication => {
+                decode_add_publication(payload).map(|r| r.correlation_id)
+            }
+            _ => decode_destination_command(payload).map(|r| r.correlation_id),
+        };
+        let Some(correlation_id) = correlation_id else {
+            return;
+        };
+
+        // The words are the parse's own — which for a name that will not
+        // resolve is the reference's three lines, code line first — and a
+        // channel that would not parse is described by what the parse left
+        // behind plus this command's own site, exactly as the inline paths do
+        // it (`aeron_driver_conductor.c:2344-2352`).
+        let description = match &error {
+            UdpChannelError::Uri(uri_error) => match uri_error.parse_failure(&channel) {
+                Some(uri_lines) => format!(
+                    "{uri_lines}{}",
+                    channel_parse_append("aeron_driver_conductor_on_add_network_publication", 4687,)
+                ),
+                None => error.to_string(),
+            },
+            _ => error.to_string(),
+        };
+
+        transmit.error(correlation_id, error.error_code(), description.as_bytes());
+    }
+
     fn process_commands(&mut self, now_ns: i64) -> usize {
+        // The client command slot (`aeron_driver_conductor.c:3293-3320`):
+        // while one command is parked the conductor reads **no** other — a
+        // slot is one command wide — and the parked one takes its next step
+        // instead. Everything else in the pass carries on, which is what the
+        // slot costs in the reference and all it costs here.
+        if let Some(parked) = self.parked_command.take() {
+            return self.advance_parked_command(parked, now_ns);
+        }
+
         // Borrows split by field rather than through `&mut self`, because the
         // read takes a window from the file while the handler writes state.
         let cnc = &self.cnc;
@@ -1977,8 +2330,13 @@ impl Conductor {
         let clients = &mut self.clients;
         let running = &mut self.running;
         let termination = self.termination;
+        // The agent's handle, taken before the manager is borrowed below:
+        // everything that needs a channel parsed or a name resolved goes
+        // through it, and a parked command carries what it was given.
+        let agent = self.publications.agent_handle();
+        let parked_command = &mut self.parked_command;
+        let agent_parsed_channel = &mut self.agent_parsed_channel;
         let config = &self.config;
-        let resolver = &mut self.resolver;
         let publications = &mut self.publications;
         let network_publications = &mut self.network_publications;
         let send_endpoints = &mut self.send_endpoints;
@@ -2008,7 +2366,12 @@ impl Conductor {
         // puts a destination on a tracker, and the drain's closure cannot reach
         // it. The payloads are kept verbatim, so that what is decoded below is
         // what the client wrote.
-        let mut pending_destination_commands: Vec<(i32, Vec<u8>)> = Vec::new();
+        // A destination command whose parse landed re-enters the destination
+        // loop, which is where its state machine lives — and the conductor
+        // reads nothing new while it is here, the same slot discipline as
+        // everywhere else (`:3293-3320`).
+        let mut pending_destination_commands: Vec<(i32, Vec<u8>)> =
+            self.resumed_destination.take().into_iter().collect();
 
         let Some(region) = cnc.to_driver_region() else {
             return 0;
@@ -2026,7 +2389,11 @@ impl Conductor {
             faults,
         };
 
-        let drained = commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
+        let resumed = !pending_destination_commands.is_empty();
+        let drained = if resumed {
+            0
+        } else {
+            commands.read(&region, COMMAND_DRAIN_LIMIT, |type_id, payload| {
             match Command::from_type_id(type_id) {
                 Command::TerminateDriver => {
                     if TerminationPolicy::Allow == termination {
@@ -2074,24 +2441,27 @@ impl Conductor {
                             // paths (`aeron_driver_conductor.c:4113-4135`), and
                             // a channel this build does not serve is refused by
                             // the collection that would have had it.
+                            //
+                            // A **network** publication is not served here at
+                            // all: the reference's add command is a state
+                            // machine whose first state asks the native resource
+                            // agent to parse the channel and waits for it
+                            // (`:4113-4132`, `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_PENDING`),
+                            // so the command is parked and the conductor reads
+                            // no other client command until the answer is in —
+                            // while its duty cycle, its heartbeat and the
+                            // agent's resolver all carry on.
                             let result = match ChannelUri::parse(request.channel) {
                                 Ok(uri) if uri.transport() == Transport::Udp => {
-                                    network_publications.add_publication(
-                                        &request,
-                                        is_exclusive,
-                                        config,
-                                        counters,
-                                        &counter_regions,
-                                        &mut **resolver,
-                                        clients,
-                                        send_endpoints,
-                                        sender.proxy(),
-                                        subscriptions,
-                                        images,
-                                        receiver.proxy(),
-                                        now,
-                                        &mut transmit,
-                                    )
+                                    *parked_command = Some(ParkedCommand::new(
+                                        type_id,
+                                        payload,
+                                        &agent,
+                                        request.channel,
+                                        Unresolved::Refuse,
+                                    ));
+
+                                    Ok(())
                                 }
                                 _ => publications.add_publication(
                                     &request,
@@ -2318,20 +2688,21 @@ impl Conductor {
                             )
                         } else {
                             match ChannelUri::parse(request.channel) {
-                                Ok(uri) if uri.transport() == Transport::Udp => subscriptions
-                                    .add_network_subscription(
-                                        &request,
-                                        config,
-                                        counters,
-                                        &counter_regions,
-                                        &mut **resolver,
-                                        clients,
-                                        receive_endpoints,
-                                        images,
-                                        receiver.proxy(),
-                                        now,
-                                        &mut transmit,
-                                    ),
+                                // The same parking the publication path does,
+                                // for the same reason
+                                // (`aeron_driver_conductor.c:4741-4824`'s first
+                                // state is the agent's parse).
+                                Ok(uri) if uri.transport() == Transport::Udp => {
+                                    *parked_command = Some(ParkedCommand::new(
+                                        type_id,
+                                        payload,
+                                        &agent,
+                                        request.channel,
+                                        Unresolved::Refuse,
+                                    ));
+
+                                    Ok(())
+                                }
                                 _ => subscriptions.add_subscription(
                                     &request,
                                     config,
@@ -2756,7 +3127,8 @@ impl Conductor {
                     *last_unhandled = Some(command);
                 }
             }
-        });
+            })
+        };
 
         // A publication whose link was released: the network half stops
         // sending it, gives its six counters back, and counts one less reader
@@ -2991,22 +3363,21 @@ impl Conductor {
                     continue;
                 }
 
-                let Ok(channel) = Self::resolve_channel(
-                    &mut **resolver,
-                    counters,
-                    &counter_regions,
-                    config.name_resolver_threshold_ns,
-                    crate::udp_channel::Unresolved::Refuse,
-                    request.channel,
-                    &uri,
-                ) else {
-                    transmit.error(
-                        request.correlation_id,
-                        ERROR_CODE_INVALID_CHANNEL,
-                        b"incorrect URI format for destination",
-                    );
-                    continue;
+                // The channel comes from the agent: this command parked on
+                // its parse, and this is the pass that has the answer. A
+                // command that has not asked yet parks here and the loop stops
+                // — the slot discipline, one command wide.
+                let Some(parsed) = agent_parsed_channel.take() else {
+                    *parked_command = Some(ParkedCommand::new(
+                        type_id,
+                        &payload,
+                        &agent,
+                        request.channel,
+                        Unresolved::Refuse,
+                    ));
+                    break;
                 };
+                let channel = parsed.channel;
 
                 if Command::AddReceiveDestination == command {
                     let Some(entry) = receive_endpoints.get(endpoint_id) else {
@@ -3108,67 +3479,23 @@ impl Conductor {
                 continue;
             }
 
-            // A destination whose name does not resolve is **kept** and the
-            // command still succeeds: the reference sets the address to
-            // `AF_UNSPEC` and falls through on purpose (`:5337-5343`), which is
-            // `None` here. The consequence is in `docs/compat.md`'s
-            // name-resolution row: this build has no re-resolution, so that
-            // destination never recovers.
-            let address = match crate::udp_channel::validate_send_destination_uri(
-                &mut crate::udp_channel::Names::Built {
-                    resolver: &mut **resolver,
-                    counters,
-                    regions: &counter_regions,
-                    threshold_ns: config.name_resolver_threshold_ns,
-                },
-                crate::udp_channel::Unresolved::Keep,
-                request.channel,
-            ) {
-                Ok(address) => Some(address),
-                Err(UdpChannelError::Resolution(_)) => None,
-                Err(error) => {
-                    transmit.error(
-                        request.correlation_id,
-                        error.error_code(),
-                        error.to_string().as_bytes(),
-                    );
-                    continue;
-                }
+            // The address and the channel are the agent's, both: it validated
+            // the destination and resolved its name while the conductor went
+            // on with its pass. The address is `None` for a name that did not
+            // answer — the reference's `AF_UNSPEC`, kept on purpose so that a
+            // name which answers later answers *this* destination
+            // (`:5337-5343`).
+            let Some(parsed) = agent_parsed_channel.take() else {
+                *parked_command = Some(ParkedCommand::send_destination(
+                    type_id,
+                    &payload,
+                    &agent,
+                    request.channel,
+                ));
+                break;
             };
-
-            let Ok(uri) = ChannelUri::parse(request.channel) else {
-                transmit.error(
-                    request.correlation_id,
-                    ERROR_CODE_INVALID_CHANNEL,
-                    b"incorrect URI format for destination",
-                );
-                continue;
-            };
-
-            // A **send** destination whose name does not resolve is kept, so
-            // the parse tolerates one: the reference sets the address to
-            // `AF_UNSPEC` and adds the destination anyway (`:5337-5343`), which
-            // is what makes a name that answers later answer *this*
-            // destination.
-            let channel = match Self::resolve_channel(
-                &mut **resolver,
-                counters,
-                &counter_regions,
-                config.name_resolver_threshold_ns,
-                crate::udp_channel::Unresolved::Keep,
-                request.channel,
-                &uri,
-            ) {
-                Ok(channel) => channel,
-                Err(error) => {
-                    transmit.error(
-                        request.correlation_id,
-                        error.error_code(),
-                        error.to_string().as_bytes(),
-                    );
-                    continue;
-                }
-            };
+            let address = parsed.send_destination_address;
+            let channel = parsed.channel;
 
             let registration_id = request.correlation_id;
             let outcome = if Command::AddDestination == command {
@@ -3452,6 +3779,19 @@ impl Conductor {
     /// as signed, which no real threshold or filesystem can tell apart.
     /// The description carries the reference's composition — the code's own
     /// line, then the recording site — which is what `ErrorStat` prints.
+    /// Take what the agent could not do and record it.
+    ///
+    /// The reference's agent writes these into the shared error log itself
+    /// (`aeron_driver_native_resource_agent.c:233-251` for a resolver that
+    /// would not start); the log is a process-local structure whose only writer
+    /// is the conductor here, so they are handed over the way the storage
+    /// warnings already are — and the difference is invisible in the file.
+    fn record_agent_faults(&mut self) {
+        for fault in self.publications.agent().poll_faults() {
+            self.record_distinct(fault.error_code, &fault.description);
+        }
+    }
+
     fn record_storage_warnings(&mut self) {
         for warning in self.publications.poll_storage_warnings() {
             #[allow(clippy::cast_possible_wrap)] // printed as the reference prints it
@@ -3553,18 +3893,6 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 }
 
 impl Conductor {
-    /// Let the resolver go, counters and all (`aeron_driver_name_resolver_close`,
-    /// `aeron_driver_name_resolver.c:525-536`, which frees its memory and none
-    /// of its counters).
-    fn close_resolver(&mut self) {
-        let Some(regions) = self.cnc.counter_regions() else {
-            return;
-        };
-
-        self.resolver
-            .close(&mut self.counters, &regions, self.now_ms);
-    }
-
     /// Resolve the names the sender asked about again, and tell it what changed
     /// (`aeron_driver_conductor_execute_re_resolve_endpoint`, `:6890-6938`).
     ///
@@ -3588,22 +3916,32 @@ impl Conductor {
             return 0;
         }
 
-        let Some(regions) = self.cnc.counter_regions() else {
+        // One at a time, like the reference's single driver-command slot
+        // (`aeron_driver_conductor.c:3327-3341`): the head is asked for, and
+        // the next one waits until its answer is in.
+        let agent = self.publications.agent_handle();
+        let mut entry = self.pending_re_resolutions.remove(0);
+
+        if entry.answer.is_none() {
+            entry.answer = agent.resolve_address(&entry.endpoint_name, "endpoint").ok();
+        }
+
+        let Some(answer) = entry.answer.as_ref().and_then(|cell| cell.get().cloned()) else {
+            // Still running: it keeps its place and is asked again next pass.
+            self.pending_re_resolutions.insert(0, entry);
             return 0;
         };
 
-        let pending = std::mem::take(&mut self.pending_re_resolutions);
+        let PendingReResolution {
+            endpoint_id,
+            endpoint_name,
+            existing,
+            ..
+        } = entry;
         let mut work = 0;
 
-        for (endpoint_id, endpoint_name, existing) in pending {
-            let resolved = crate::udp_channel::resolve_host_and_port_with(
-                &mut *self.resolver,
-                &self.counters,
-                &regions,
-                self.config.name_resolver_threshold_ns,
-                "endpoint",
-                &endpoint_name,
-            );
+        {
+            let resolved = answer;
 
             match resolved {
                 Ok(address) if Some(address) != existing => {
@@ -3630,14 +3968,20 @@ impl Conductor {
                     // The recording is deferred, like every other error this
                     // pass notices: the regions are held here and
                     // `record_pending_faults` is the pass that has both the log
-                    // and the counter (`log_error`). The words are the
-                    // reference's own (`aeron_name_resolver.c:204-208`,
-                    // `Unresolved - %s=%s, name-and-port=%s`), because a
-                    // deployment reads this line to find which name went wrong.
-                    let description = format!("Unresolved - endpoint={endpoint_name}, {error}");
-
+                    // and the counter (`log_error`). The words come from the
+                    // resolution itself — the wrapper composes the reference's
+                    // `Unresolved - %s=%s, name-and-port=%s` line under the
+                    // code line, because a deployment reads it to find which
+                    // name went wrong — and the code is the one that failure
+                    // carries, not the generic code it used to be recorded
+                    // under: the reference's re-resolve command takes its
+                    // failure's code from the result the agent filled in
+                    // (`aeron_driver_conductor.c:6900-6911`), and a name that
+                    // will not resolve arrives there as `-9`
+                    // (`:2333-2338` turns it back into the positive code the
+                    // client is told and the log records).
                     self.pending_log_errors
-                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                        .push((error.error_code(), error.to_string()));
                 }
             }
         }
@@ -3658,22 +4002,30 @@ impl Conductor {
             return 0;
         }
 
-        let Some(regions) = self.cnc.counter_regions() else {
+        // One at a time, as above.
+        let agent = self.publications.agent_handle();
+        let mut entry = self.pending_control_re_resolutions.remove(0);
+
+        if entry.answer.is_none() {
+            entry.answer = agent.resolve_address(&entry.control_name, "control").ok();
+        }
+
+        let Some(answer) = entry.answer.as_ref().and_then(|cell| cell.get().cloned()) else {
+            self.pending_control_re_resolutions.insert(0, entry);
             return 0;
         };
 
-        let pending = std::mem::take(&mut self.pending_control_re_resolutions);
+        let PendingControlReResolution {
+            endpoint_id,
+            destination,
+            control_name: _,
+            existing,
+            ..
+        } = entry;
         let mut work = 0;
 
-        for (endpoint_id, destination, control_name, existing) in pending {
-            let resolved = crate::udp_channel::resolve_host_and_port_with(
-                &mut *self.resolver,
-                &self.counters,
-                &regions,
-                self.config.name_resolver_threshold_ns,
-                "control",
-                &control_name,
-            );
+        {
+            let resolved = answer;
 
             match resolved {
                 Ok(address) if address != existing => {
@@ -3697,41 +4049,15 @@ impl Conductor {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let description = format!("Unresolved - control={control_name}, {error}");
-
+                    // The same words and the same code as the send side above:
+                    // the wrapper composes the line, this pass only files it.
                     self.pending_log_errors
-                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                        .push((error.error_code(), error.to_string()));
                 }
             }
         }
 
         work
-    }
-
-    /// Resolve a channel through the driver's resolver, which is what times it
-    /// (`crate::udp_channel::resolve_host_and_port_with`, and behind it
-    /// `aeron_time_tracking_name_resolver_resolve`,
-    /// `aeron_driver_native_resource_agent.c:29-60`).
-    fn resolve_channel(
-        resolver: &mut dyn Resolver,
-        counters: &CounterManager,
-        regions: &CounterRegions<'_>,
-        threshold_ns: i64,
-        unresolved: crate::udp_channel::Unresolved,
-        original_uri: &[u8],
-        uri: &crate::channel_uri::ChannelUri<'_>,
-    ) -> Result<UdpChannel, UdpChannelError> {
-        UdpChannel::resolve_with(
-            &mut crate::udp_channel::Names::Built {
-                resolver,
-                counters,
-                regions,
-                threshold_ns,
-            },
-            unresolved,
-            original_uri,
-            uri,
-        )
     }
 }
 
@@ -6814,21 +7140,24 @@ mod tests {
                 &format!("aeron:udp?endpoint=127.0.0.1:{port}|cc=cubic"),
             ),
         );
-        conductor.do_work();
-
-        let events = drain(&cnc, &mut receiver);
+        // The channel is parsed on the agent now, so the answer is a pass or
+        // two later — the reference's own shape, where this command is a state
+        // machine waiting on `PARSE_CHANNEL`.
+        let mut pending = Vec::new();
+        let _ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let events = std::mem::take(&mut pending);
 
         assert!(
             !events
                 .iter()
                 .any(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID),
             "a strategy is named on the channel and decided at the image, so naming one is not an error here"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "the subscription is created"
         );
 
         // And the half that *is* served: a named `nak-delay` is read, and the
@@ -6843,14 +7172,17 @@ mod tests {
                 &format!("aeron:udp?endpoint=127.0.0.1:{port}|nak-delay=2ms"),
             ),
         );
-        conductor.do_work();
-
-        let events = drain(&cnc, &mut receiver);
+        let mut pending = Vec::new();
+        let _ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
         assert!(
-            events
-                .iter()
-                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "a channel this build can serve is served"
+            !pending.iter().any(|(id, _)| *id == ON_ERROR_TYPE_ID),
+            "a channel this build can serve is served: {pending:?}"
         );
     }
 
@@ -6885,14 +7217,20 @@ mod tests {
             ADD_SUBSCRIPTION_TYPE_ID,
             &add_subscription_payload(7, 21, 1002, &unreliable),
         );
-        conductor.do_work();
-
-        let events = drain(&cnc, &mut receiver);
+        // The agent parses this channel, so the ready answer arrives a pass or
+        // two later.
+        let mut pending = Vec::new();
+        let _ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let events = std::mem::take(&mut pending);
         assert!(
-            events
-                .iter()
-                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "the first subscription is served"
+            events.is_empty() || !events.iter().any(|(id, _)| *id == ON_ERROR_TYPE_ID),
+            "the first subscription is served without an error: {events:?}"
         );
 
         // The second asks for the default on the same endpoint, stream and
@@ -6904,14 +7242,14 @@ mod tests {
             ADD_SUBSCRIPTION_TYPE_ID,
             &add_subscription_payload(7, 22, 1002, &channel),
         );
-        conductor.do_work();
-
-        let events = drain(&cnc, &mut receiver);
-        let payload = events
-            .iter()
-            .find(|(type_id, _)| *type_id == ON_ERROR_TYPE_ID)
-            .map(|(_, payload)| payload.clone())
-            .expect("the client is answered rather than left waiting");
+        let mut pending = Vec::new();
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
 
         assert_eq!(22i64.to_le_bytes(), payload[0..8], "on the id that asked");
         assert_eq!(
@@ -6948,14 +7286,17 @@ mod tests {
             ADD_SUBSCRIPTION_TYPE_ID,
             &add_subscription_payload(7, 23, 1002, &unreliable),
         );
-        conductor.do_work();
-
-        let events = drain(&cnc, &mut receiver);
+        let mut pending = Vec::new();
+        let _ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
         assert!(
-            events
-                .iter()
-                .any(|(type_id, _)| *type_id == ON_SUBSCRIPTION_READY_TYPE_ID),
-            "a subscription that agrees about the option is served"
+            !pending.iter().any(|(id, _)| *id == ON_ERROR_TYPE_ID),
+            "a subscription that agrees about the option is served: {pending:?}"
         );
     }
 

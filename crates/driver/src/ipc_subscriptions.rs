@@ -48,7 +48,6 @@ use crate::channel_uri::{ChannelUri, Transport, UriError};
 use crate::clients::{ClientEvents, Clients};
 use crate::config::{DriverConfig, InferableBoolean};
 use crate::ipc_publications::{AddError, IpcPublications};
-use crate::name_resolver::Resolver;
 use crate::network_publications::{NetworkPublicationRecord, NetworkPublications};
 use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
@@ -57,7 +56,7 @@ use crate::receiver::ReceiverProxy;
 use crate::sender::SenderProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
-use crate::udp_channel::{ControlMode, INVALID_TAG, Names, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 use crate::{ipc_publication::IpcPublication, position as counter_position};
 
 /// The channel an IPC image reports as its source
@@ -1543,7 +1542,7 @@ impl IpcSubscriptions {
         config: &DriverConfig,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
-        resolver: &mut dyn Resolver,
+        channel: UdpChannel,
         clients: &mut Clients,
         endpoints: &mut ReceiveChannelEndpoints,
         images: &mut PublicationImages,
@@ -1556,19 +1555,6 @@ impl IpcSubscriptions {
             return Err(AddSubscriptionError::UnsupportedTransport);
         }
 
-        let channel = UdpChannel::resolve_with(
-            &mut Names::Built {
-                resolver,
-                counters,
-                regions,
-                threshold_ns: config.name_resolver_threshold_ns,
-            },
-            crate::udp_channel::Unresolved::Refuse,
-            request.channel,
-            &uri,
-        )
-        .map_err(Box::new)
-        .map_err(AddSubscriptionError::Channel)?;
         let params = SubscriptionParams::resolve(&uri, config)?;
 
         validate_for_subscription(&channel)?;

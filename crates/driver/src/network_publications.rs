@@ -34,7 +34,6 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::ipc_subscriptions::IpcSubscriptions;
-use crate::name_resolver::Resolver;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
@@ -56,7 +55,7 @@ use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::{ControlMode, INVALID_TAG, Names, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -247,6 +246,12 @@ impl NetworkPublications {
     /// (`:4455-4478`), from the publications that exist by then — which is the
     /// point of speculating rather than picking one at the start.
     ///
+    /// The channel arrives **already parsed**, because the reference parses it
+    /// on the native resource agent and its conductor waits for it
+    /// (`AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_TYPE_PARSE_CHANNEL`,
+    /// `aeron_driver_conductor.c:4113-4132`) — a `getaddrinfo` here would be a
+    /// `getaddrinfo` on the control plane.
+    ///
     /// # Errors
     ///
     /// [`AddError`] for everything the reference refuses, in the order it
@@ -259,7 +264,7 @@ impl NetworkPublications {
         config: &DriverConfig,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
-        resolver: &mut dyn Resolver,
+        channel: UdpChannel,
         clients: &mut Clients,
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
@@ -269,24 +274,13 @@ impl NetworkPublications {
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
-        // PARSE_CHANNEL and VALIDATE (`:4113-4160`).
+        // VALIDATE (`:4135-4160`): the parse itself is the agent's and has
+        // happened by the time this is called.
         let uri = ChannelUri::parse(request.channel)?;
         if uri.transport() != Transport::Udp {
             return Err(AddError::UnsupportedTransport);
         }
 
-        let channel = UdpChannel::resolve_with(
-            &mut Names::Built {
-                resolver,
-                counters,
-                regions,
-                threshold_ns: config.name_resolver_threshold_ns,
-            },
-            crate::udp_channel::Unresolved::Refuse,
-            request.channel,
-            &uri,
-        )
-        .map_err(|error| AddError::Channel(Box::new(error)))?;
         let mut params = PublicationParams::resolve(&uri, config, |tag| self.find_by_tag(tag))?;
 
         validate_for_publication(&channel)?;

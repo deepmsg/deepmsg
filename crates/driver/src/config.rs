@@ -663,6 +663,20 @@ pub struct DriverConfig {
     /// and its value is a count rather than a rate: `None` injects nothing.
     /// `docs/compat.md` records the difference.
     pub data_loss_drop_every: Option<u64>,
+    /// Hold every resolution this many milliseconds before it is answered
+    /// (`debug.resolver.delay.millis`), so that a test can put a name that
+    /// stalls under the driver and watch the conductor's own clock while it
+    /// does.
+    ///
+    /// **This has no counterpart in the reference**, and it exists because of
+    /// what it reproduces: a nameserver that does not answer. No setting on a
+    /// driver can make one of those, and the property it is here to pin — that
+    /// the conductor keeps publishing its heartbeat while a channel's names
+    /// are being resolved — is otherwise only observable on a host whose
+    /// resolver happens to be slow, which is a test that passes on the days it
+    /// is not. Zero, the default, delays nothing. `docs/compat.md` records the
+    /// difference, as it does for `data_loss_drop_every`.
+    pub debug_resolver_delay_ms: u64,
     /// Which resolver this driver builds and keeps
     /// (`aeron.name.resolver.supplier`, `AERON_NAME_RESOLVER_SUPPLIER`,
     /// `aeronmd.h:808-809`, whose default is `default`) — `default`,
@@ -793,6 +807,7 @@ impl Default for DriverConfig {
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
             data_loss_drop_every: None,
+            debug_resolver_delay_ms: 0,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
             name_resolver_supplier: NAME_RESOLVER_SUPPLIER_DEFAULT,
             name_resolver_init_args: None,
@@ -1179,6 +1194,21 @@ impl DriverConfig {
             #[allow(clippy::cast_possible_truncation)] // bounded by 256 above
             {
                 config.max_resend = resend as i32;
+            }
+        }
+
+        if let Some(value) = get(&Setting::DEBUG_RESOLVER_DELAY_MILLIS) {
+            // Zero delays nothing, which is what leaving it unset means; the
+            // count is milliseconds, and a negative one fails the conversion
+            // rather than wrapping into a long delay.
+            match u64::try_from(parse_count(&Setting::DEBUG_RESOLVER_DELAY_MILLIS, &value)?) {
+                Ok(delay) => config.debug_resolver_delay_ms = delay,
+                Err(_) => {
+                    return Err(ConfigError::OutOfRange {
+                        name: Setting::DEBUG_RESOLVER_DELAY_MILLIS.property,
+                        value,
+                    });
+                }
             }
         }
 
@@ -1738,6 +1768,17 @@ impl Setting {
     const DATA_LOSS_DROP_EVERY: Self = Self {
         property: "debug.send.data.loss.drop.every",
         env: "DEEPMSG_DEBUG_SEND_DATA_LOSS_DROP_EVERY",
+    };
+    /// `deepmsg.debug.resolver.delay.millis`: hold every resolution this long
+    /// before answering it.
+    ///
+    /// The second setting here with no reference variable to borrow, for the
+    /// reason [`DriverConfig::debug_resolver_delay_ms`] gives — what it
+    /// reproduces is a nameserver that does not answer, which no driver
+    /// setting can make happen.
+    const DEBUG_RESOLVER_DELAY_MILLIS: Self = Self {
+        property: "debug.resolver.delay.millis",
+        env: "DEEPMSG_DEBUG_RESOLVER_DELAY_MILLIS",
     };
 }
 

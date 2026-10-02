@@ -296,5 +296,12 @@ name = "resolver_gossip"
 path = "interop/resolver_gossip.rs"
 required-features = ["interop"]
 
+# The conductor's own clock while the agent is busy: the property
+# `AsyncResourceTest.shouldDetectUnknownHost` is about, pinned without asking a
+# nameserver anything.
+[[test]]
+name = "heartbeat_while_parsing"
+path = "integration/heartbeat.rs"
+
 [lints]
 workspace = true
