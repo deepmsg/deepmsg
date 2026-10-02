@@ -266,6 +266,20 @@ pub struct NetworkPublication {
     /// (`conductor_fields.time_of_last_activity_ns` on the way into the
     /// reference's LINGER state).
     linger_since_ns: Option<i64>,
+    /// Whether the last client has let go, which is what starts the linger
+    /// (`aeron_driver_managed_resource_event_t`'s `DECREF`-to-zero,
+    /// `media/aeron_network_publication.c:1048-1069`: the end-of-stream
+    /// position is written, `is_end_of_stream` is set when everything has been
+    /// sent, and the state goes DRAINING).
+    ///
+    /// A publication is released — and with it the **endpoint** it sends
+    /// through, whose own reference is dropped by that release — only when it
+    /// has finished lingering. That is what makes a channel publishable again
+    /// right after its publication is closed: the endpoint is still there, and
+    /// the reference's own test for it
+    /// (`NameReResolutionTest.shouldReResolveUnicastAddressWhenSendChannelEndpointIsReused`)
+    /// adds the next publication with nothing in between.
+    ending: bool,
     /// A datagram-sized scratch buffer, allocated once, that frames are copied
     /// into on the way out — see the module note.
     scratch: Vec<u8>,
@@ -461,6 +475,7 @@ impl NetworkPublication {
             track_sender_limits: false,
             is_end_of_stream: false,
             linger_since_ns: None,
+            ending: false,
             scratch: vec![0u8; max_messages_per_send * params.mtu_length as usize],
         })
     }
@@ -790,6 +805,12 @@ impl NetworkPublication {
     /// One byte, on the log buffer every reader maps: the heartbeat that
     /// carries `REVOKED`, the image that drains because of it and the readers
     /// that are told are all downstream of this.
+    /// The last client has let go: the publication may end
+    /// (`DECREF`-to-zero, `media/aeron_network_publication.c:1048-1069`).
+    pub const fn request_end(&mut self) {
+        self.ending = true;
+    }
+
     pub fn set_revoked(&self) {
         if let Some(metadata) = self.log.metadata() {
             let _ = metadata.store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1);
@@ -822,27 +843,43 @@ impl NetworkPublication {
         regions: &CounterRegions<'_>,
     ) -> bool {
         let Some(since) = self.linger_since_ns else {
-            if !self.is_revoked() {
+            // Two ways in, and the reference meets them in one place: a
+            // revoked publication says so in its heartbeats
+            // (`:1246-1277`), and one whose last client has let go writes the
+            // end-of-stream position (`:1048-1069`). Both then linger.
+            if !self.is_revoked() && !self.ending {
                 return false;
             }
 
-            let revoked_position = self.producer_position().unwrap_or(0);
+            let end_position = self.producer_position().unwrap_or(0);
 
-            let _ = counters.set_value(regions, self.counters.pub_lmt, revoked_position);
-            self.set_end_of_stream(revoked_position);
-            self.is_end_of_stream = true;
+            let _ = counters.set_value(regions, self.counters.pub_lmt, end_position);
+            self.set_end_of_stream(end_position);
+            // `:1060-1063`: the byte is set when everything the producer wrote
+            // has been sent. A revoked publication is a stream that is over
+            // whether or not that happened.
+            self.is_end_of_stream =
+                self.is_revoked() || self.sender_position(counters, regions) >= end_position;
             self.linger_since_ns = Some(now_ns);
 
-            system.increment(system_counters::id::PUBLICATIONS_REVOKED);
+            if self.is_revoked() {
+                system.increment(system_counters::id::PUBLICATIONS_REVOKED);
+            }
 
             return false;
         };
 
-        if self.has_receivers() && now_ns <= since + linger_timeout_ns {
-            return false;
+        // A **revoked** publication is done as soon as there is nobody left to
+        // tell — that is this build's own shortcut, and `docs/compat.md` says
+        // so. One whose clients have all let go waits the window the reference
+        // waits (`:1329-1341`, whose condition is the linger timeout or an EOS
+        // from a unicast receiver): the endpoint is released with it, and a
+        // client may be about to publish on that channel again.
+        if self.is_revoked() {
+            return !self.has_receivers() || now_ns > since + linger_timeout_ns;
         }
 
-        true
+        now_ns > since + linger_timeout_ns
     }
 
     /// Write where the stream ended, which is how a reader that has not seen
@@ -855,6 +892,14 @@ impl NetworkPublication {
 
     /// Whether the log buffer's metadata says the publication was revoked
     /// (`is_publication_revoked`).
+    /// How far the sender has got, which is what the end-of-stream byte is
+    /// decided against (`snd_pos_position`, `:1060`).
+    fn sender_position(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> i64 {
+        counters
+            .value(regions, self.counters.snd_pos)
+            .unwrap_or_default()
+    }
+
     fn is_revoked(&self) -> bool {
         self.log
             .metadata()

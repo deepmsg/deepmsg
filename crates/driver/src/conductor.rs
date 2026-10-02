@@ -575,8 +575,9 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
-    /// Revoked publications whose release waits for the sender to say they
-    /// have finished saying `REVOKED`
+    /// Publications whose release waits for the sender to say they are done
+    /// with them: a revoked one has to finish saying `REVOKED`, and one whose
+    /// clients have all let go has to finish lingering
     /// ([`SenderEvent::PublicationDrained`](crate::sender::SenderEvent::PublicationDrained)).
     awaiting_drain: std::collections::HashSet<i64>,
     /// The ones the sender has finished with since the last pass, waiting to
@@ -1268,49 +1269,6 @@ impl Conductor {
         work
     }
 
-    /// Let go of a network publication: stop sending it, give its counters
-    /// back, and count one less reader on its endpoint
-    /// (`aeron_network_publication_close`,
-    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-354`).
-    ///
-    /// The IPC path does the same for its own publications
-    /// ([`IpcPublications::release_links`]); this is the half that was missing,
-    /// and its absence was silent: a client could remove a UDP publication and
-    /// the sender would keep sending it.
-    fn release_network_publication(&mut self, registration_id: i64) -> bool {
-        let Some(record) = self.network_publications.remove(registration_id) else {
-            return false;
-        };
-
-        let _ = self.sender.proxy().remove_publication(registration_id);
-
-        self.release_spies_of(registration_id);
-
-        if let Some(region) = self.cnc.counter_regions() {
-            let mut counter_ids = vec![
-                record.counters.pub_pos,
-                record.counters.pub_lmt,
-                record.counters.snd_pos,
-                record.counters.snd_lmt,
-                record.counters.snd_bpe,
-                record.counters.snd_naks_received,
-            ];
-
-            // Only a strategy that keeps receivers was given one
-            // (`aeron_min_flow_control.c:454-470` frees it with the strategy).
-            counter_ids.extend(record.counters.fc_receivers);
-
-            for counter_id in counter_ids {
-                let _ = self.counters.free(&region, counter_id, self.now_ms);
-            }
-        }
-
-        self.send_endpoints.detach_publication(record.endpoint_id);
-        self.try_remove_send_endpoint(record.endpoint_id);
-
-        true
-    }
-
     /// Send what a publication's tether cycle decided to the readers it
     /// decided it about
     /// (`aeron_network_publication_check_untethered_subscriptions`'s three
@@ -1437,42 +1395,6 @@ impl Conductor {
         pending.len()
     }
 
-    /// Tell every spy reading a publication that it is gone, and give their
-    /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
-    ///
-    /// The message goes out **before** the counters come back, which is the
-    /// reference's order and the only one that works: the message names the
-    /// channel the spy read with, and a client told about an image it no longer
-    /// has is a client that stops advancing the position the publication's
-    /// limit is computed from.
-    ///
-    /// Nothing is sent when there is no spy — the common case — because there
-    /// is nothing to send it about; the link walk that finds that out is the
-    /// same walk that would send.
-    fn release_spies_of(&mut self, registration_id: i64) -> usize {
-        let Some(event_region) = self.cnc.to_clients_region_writable() else {
-            return 0;
-        };
-        let Some(counter_regions) = self.cnc.counter_regions() else {
-            return 0;
-        };
-
-        let mut transmit = Transmit {
-            transmitter: &mut self.transmitter,
-            region: &event_region,
-            failures: &mut self.pending_broadcast_failures,
-            faults: &mut self.pending_log_errors,
-        };
-
-        self.subscriptions.unlink_spies_of(
-            registration_id,
-            &mut self.counters,
-            &counter_regions,
-            self.now_ms,
-            &mut transmit,
-        )
-    }
-
     /// Whatever a client left behind: the network publications it was holding
     /// when it stopped being a client this driver knows.
     ///
@@ -1502,27 +1424,18 @@ impl Conductor {
         let mut released = 0;
 
         for registration_id in orphans {
-            released += usize::from(self.release_network_publication(registration_id));
+            // The dead client's holds are gone, so the publication ends the
+            // same way one whose clients left alive does: it lingers while it
+            // has readers, and the release waits for that
+            // (`aeron_driver_conductor.c:1220-1241`, which drops the links and
+            // lets the publication's own `DECREF` do the rest).
+            let _ = self.sender.proxy().end_publication(registration_id);
+            self.awaiting_drain.insert(registration_id);
+
+            released += 1;
         }
 
         released
-    }
-
-    /// An image has finished its life: unlink it, tell its readers, give its
-    /// counters and its log buffer back, and let the endpoint go if nothing
-    /// reads it any more (`aeron_driver_conductor_image_transition_to_linger`
-    /// and the delete that follows it, `aeron_driver_conductor.c:5680-5720`).
-    ///
-    /// This is the receiving side's answer to a publication's revoke: a
-    /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
-    /// message per **subscription** that was reading it, as the reference sends
-    /// them (`:5690-5700`) — and only then is the log buffer unmapped.
-    /// Ask the sender to let an endpoint go, once the last publication on it
-    /// has (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks
-    /// it CLOSING and asks, and the endpoint's own delete is what gives the
-    /// counters back — `:250-266`).
-    fn try_remove_send_endpoint(&mut self, id: u64) {
-        try_remove_send_endpoint(&mut self.send_endpoints, self.sender.proxy(), id);
     }
 
     /// Give back what a send endpoint held, once the sender has let it go
@@ -2055,8 +1968,7 @@ impl Conductor {
         // release itself needs the sender and the endpoint registry, which the
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
-        let mut pending_publication_releases: Vec<i64> =
-            std::mem::take(&mut self.drained_publications);
+        let pending_publication_releases: Vec<i64> = std::mem::take(&mut self.drained_publications);
         // The destination commands, for the same reason: the *sender* is what
         // puts a destination on a tracker, and the drain's closure cannot reach
         // it. The payloads are kept verbatim, so that what is decoded below is
@@ -2249,21 +2161,29 @@ impl Conductor {
 
                                 publications.release_links(&[link], counters, &counter_regions);
 
-                                if !is_draining {
-                                    // The link's own hold goes, and the
-                                    // publication follows only when it was the
-                                    // **last** one: a second publication on one
-                                    // channel shares the publication, and one
-                                    // client closing its own must not take the
-                                    // other's (`aeron_driver_conductor_on_remove_publication`
-                                    // decrements the resource and lets the zero
-                                    // case do the releasing, `:4705-4735`).
-                                    if network_publications
+                                if !is_draining
+                                    && network_publications
                                         .remove_link(link.publication_registration_id, 1)
-                                    {
-                                        pending_publication_releases
-                                            .push(link.publication_registration_id);
-                                    }
+                                {
+                                    // The link's own hold goes, and the
+                                    // publication is released only when it was
+                                    // the **last** one AND has finished
+                                    // lingering: a publication with no clients
+                                    // left writes where its stream stopped and
+                                    // lingers while it still has readers
+                                    // (`DECREF`-to-zero, `:4705-4735` then
+                                    // `media/aeron_network_publication.c:1048-1069`).
+                                    // The end of that linger is what the
+                                    // release waits for, and the **endpoint**
+                                    // is released with it — which is why a
+                                    // channel can be published on again
+                                    // immediately.
+                                    let _ = sender
+                                        .proxy()
+                                        .end_publication(link.publication_registration_id);
+
+                                    self.awaiting_drain
+                                        .insert(link.publication_registration_id);
                                 }
 
                                 transmit.operation_succeeded(request.correlated.correlation_id);
@@ -5768,16 +5688,29 @@ mod tests {
         assert_eq!(32i64.to_le_bytes(), payload[0..8]);
 
         assert!(
-            conductor.network_publications().is_empty(),
-            "the publication is gone from the driver"
+            !conductor.network_publications().is_empty(),
+            "the client is answered at once, but the publication lingers: it has \
+             not been told to end yet"
         );
+
         // Six counters of its own, freed in the pass that answered the client,
         // and the endpoint's `snd-channel` — which was the last one holding
         // that port — once the sender has confirmed it let the endpoint go.
+        //
+        // The release waits for the publication to **linger out**, because the
+        // endpoint goes with it and a client may be about to publish on that
+        // channel again (`media/aeron_network_publication.c:1048-1069`, and
+        // `:1329-1341` for the window). That is the reference's own five
+        // seconds, so this test waits them.
         assert_eq!(
             counters_before + 7,
             await_counter_frees(&mut conductor, counters_before, 7),
             "all seven came back"
+        );
+
+        assert!(
+            conductor.network_publications().is_empty(),
+            "and the publication is gone once it has lingered"
         );
     }
 

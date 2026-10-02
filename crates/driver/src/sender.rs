@@ -85,6 +85,19 @@ pub enum SenderCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// The publication's last client has let go, so it may **end**: write where
+    /// the stream stopped and linger while it still has readers to tell
+    /// (`aeron_driver_managed_resource_event_t`'s `DECREF`-to-zero,
+    /// `media/aeron_network_publication.c:1048-1069`).
+    ///
+    /// Not the same as [`SenderCommand::RemovePublication`], and the difference
+    /// is the whole reason a channel can be published on again right after its
+    /// publication is closed: the endpoint is released with the publication,
+    /// and a publication that lingers holds it.
+    EndPublication {
+        /// Which one.
+        registration_id: i64,
+    },
     /// The name resolved somewhere else: point the endpoint at it
     /// (`aeron_driver_sender_on_resolution_change`,
     /// `aeron-driver/src/main/c/aeron_driver_sender.c:400-415`), which is also
@@ -391,6 +404,17 @@ impl SenderProxy {
             .map_err(|_| stopped())
     }
 
+    /// Tell the sender that a publication's last client has let go.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn end_publication(&self, registration_id: i64) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::EndPublication { registration_id })
+            .map_err(|_| stopped())
+    }
+
     /// Tell the sender that a name resolved somewhere else.
     ///
     /// # Errors
@@ -691,6 +715,15 @@ impl SenderThread {
                             .find(|publication| publication.registration_id == registration_id)
                         {
                             publication.set_revoked();
+                        }
+                    }
+                    SenderCommand::EndPublication { registration_id } => {
+                        if let Some(publication) = self
+                            .publications
+                            .iter_mut()
+                            .find(|publication| publication.registration_id == registration_id)
+                        {
+                            publication.request_end();
                         }
                     }
                     SenderCommand::RemovePublication { registration_id } => {
