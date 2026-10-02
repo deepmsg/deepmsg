@@ -35,6 +35,7 @@ pub mod name_resolver;
 pub mod native_resource_agent;
 pub mod network_publication;
 pub mod network_publications;
+pub mod port_manager;
 pub mod position;
 pub mod protocol;
 pub mod publication_image;
