@@ -836,6 +836,10 @@ impl Conductor {
                 if let Some(drop_every) = config.data_loss_drop_every {
                     endpoints.attach_data_loss_generator(drop_every);
                 }
+                // The range the manager hands ports out of, set once at
+                // start-up (`aeron_wildcard_port_manager_set_range`, called
+                // from the context's own init, `aeron_driver_context.c:1058-1069`).
+                endpoints.set_port_range(config.sender_wildcard_port_range);
                 endpoints
             },
             network_publications,

@@ -139,6 +139,19 @@ pub struct SendChannelEndpoint {
     /// zero, and then the port the kernel chose is readable from nowhere else.
     /// A client that has to tell someone where to reply finds it here.
     local_sockaddr_counter_id: i32,
+    /// The port the wildcard port manager gave this endpoint, and zero when it
+    /// gave none (`aeron_wildcard_port_manager_get_managed_port`,
+    /// `aeron_port_manager.c:121-163`).
+    ///
+    /// Zero is the ordinary case: a channel that named a port keeps it, and a
+    /// channel that named none keeps the kernel's — and the kernel's port is
+    /// not the manager's to take back (`free_managed_port`, `:170-173`). What
+    /// a non-zero port here means is that the manager is holding it for this
+    /// endpoint, and that the endpoint owes it back when it is deleted.
+    ///
+    /// The reference keeps the whole address for this (`endpoint->bind_addr`)
+    /// and hands it back whole; the port is the only part of it the table has.
+    managed_port: u16,
     /// Where data is sent: the channel's remote address, unless a
     /// re-resolution has moved it (`current_data_addr`,
     /// `aeron_send_channel_endpoint.h:52`).
@@ -186,8 +199,10 @@ impl SendChannelEndpoint {
     ///
     /// [`SendEndpointError::NoCounter`] when the manager is full, or the
     /// syscall's error when the socket cannot be opened.
+    #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     pub fn create(
         channel: UdpChannel,
+        port_manager: &mut crate::port_manager::WildcardPortManager,
         params: &TransportParams,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -226,6 +241,15 @@ impl SendChannelEndpoint {
             channel.local_control
         };
 
+        // `:112-120`: the port the channel named, or the one the manager hands
+        // it, or the kernel's — asked **before** the socket is opened, because
+        // this is where a driver that has run out of ports refuses the
+        // publication rather than binding something nobody will find.
+        let bind = port_manager
+            .get_managed_port(&channel, bind)
+            .map_err(SendEndpointError::Port)?;
+        let managed_port = bind.port();
+
         let transport = match super::udp_transport::UdpTransport::open(
             bind,
             Some(channel.local_control),
@@ -237,6 +261,12 @@ impl SendChannelEndpoint {
                 // The counter was allocated for an endpoint that will not
                 // exist; leaving it behind would be a counter nobody owns.
                 counters.free(regions, channel_status_counter_id, now_ms);
+                // And the port, which the manager is holding for an endpoint
+                // that will not exist either: the reference gives it back in
+                // the delete its `goto error` reaches
+                // (`media/aeron_send_channel_endpoint.c:229-232`, whose delete
+                // frees the managed port at `:278-281`).
+                port_manager.free_managed_port(managed_port);
                 // A bind failure is the one the reference composes a chain
                 // for on this side too (`media/aeron_send_channel_endpoint.c:142`
                 // and the two layers above it); anything else keeps its error.
@@ -255,8 +285,10 @@ impl SendChannelEndpoint {
                 Ok(tracker) => tracker,
                 Err(error) => {
                     // The counter was allocated for an endpoint that will not
-                    // exist, exactly as for a socket that would not open.
+                    // exist, exactly as for a socket that would not open — and
+                    // the port goes back with it.
                     counters.free(regions, channel_status_counter_id, now_ms);
+                    port_manager.free_managed_port(managed_port);
                     return Err(error);
                 }
             };
@@ -289,6 +321,7 @@ impl SendChannelEndpoint {
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            managed_port,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -361,6 +394,10 @@ impl SendChannelEndpoint {
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            // A transport a caller built was not bound by the manager, so
+            // there is no port to give back — the tests' seam, and the one
+            // place a zero here is not a kernel-chosen port.
+            managed_port: 0,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -498,6 +535,17 @@ impl SendChannelEndpoint {
     /// this endpoint's socket was bound to.
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// The port the wildcard port manager is holding for this endpoint, and
+    /// zero when it holds none.
+    ///
+    /// The registry reads this to put it on the entry beside the counters, so
+    /// that the port goes back when the sender has let the endpoint go
+    /// (`aeron_send_channel_endpoint_delete`, `:278-281`) — the endpoint itself
+    /// is on the sender's thread by then, and the manager is not.
+    pub const fn managed_port(&self) -> u16 {
+        self.managed_port
     }
 
     /// Add a publication to the dispatch map
@@ -734,6 +782,13 @@ pub enum SendEndpointError {
     Bind(Box<deepmsg_cnc::error_log::ErrorReport>),
     /// The socket could not be opened or connected.
     Socket(io::Error),
+    /// The wildcard port manager had no port left to give
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:93-104`).
+    ///
+    /// The words are the manager's own and they travel as they are: a client
+    /// that has run a driver out of ports reads them in its
+    /// `RegistrationException` (`WildcardPortManagerSystemTest.java:90`).
+    Port(crate::port_manager::PortError),
 }
 
 impl std::fmt::Display for SendEndpointError {
@@ -742,6 +797,7 @@ impl std::fmt::Display for SendEndpointError {
             Self::NoCounter => f.write_str("could not allocate the send channel status counter"),
             Self::Bind(report) => f.write_str(report.text()),
             Self::Socket(error) => write!(f, "{error}"),
+            Self::Port(error) => write!(f, "{error}"),
         }
     }
 }
@@ -870,7 +926,15 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::port_manager::{PortRange, WildcardPortManager};
     use deepmsg_core::buffer::AtomicBuffer;
+
+    /// The manager a test that is not about ports wants: a sender's with no
+    /// range set, which hands nothing out and leaves the kernel to pick — the
+    /// behaviour every endpoint had before the manager existed.
+    fn ports() -> WildcardPortManager {
+        WildcardPortManager::sender()
+    }
 
     #[repr(align(64))]
     struct Region(Vec<u8>);
@@ -936,6 +1000,7 @@ mod tests {
         let build = |counters: &mut CounterManager, regions: &CounterRegions<'_>, uri: &str| {
             SendChannelEndpoint::create(
                 channel(uri),
+                &mut ports(),
                 &TransportParams::default(),
                 counters,
                 regions,
@@ -1021,6 +1086,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1050,6 +1116,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1091,6 +1158,7 @@ mod tests {
 
         let endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1133,6 +1201,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1180,6 +1249,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1248,6 +1318,7 @@ mod tests {
             channel(&format!(
                 "aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
             )),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1295,6 +1366,79 @@ mod tests {
         );
     }
 
+    /// The port the manager names is the port the socket binds, and a socket
+    /// that will not bind gives it back.
+    ///
+    /// Both halves are proved by the same trick: the port is taken first, so a
+    /// `create` that ignored the manager's answer would bind a **free**
+    /// kernel-chosen port and succeed. It does not — it reports `EADDRINUSE`
+    /// for the managed port — and once the port is free again the same manager
+    /// hands it out a second time, which it could only do if the failed
+    /// create had given it back.
+    #[test]
+    fn the_managed_port_is_the_one_the_socket_binds_and_a_failure_gives_it_back() {
+        let taken = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        taken
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        let managed = taken.local_address().expect("a bound address").port();
+
+        let mut manager = WildcardPortManager::sender();
+        manager.set_range(PortRange {
+            low: managed,
+            high: managed,
+        });
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let error = SendChannelEndpoint::create(
+            channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
+            &mut manager,
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+            1_000_000,
+        )
+        .expect_err("the managed port is taken");
+
+        let SendEndpointError::Bind(report) = error else {
+            panic!("a bind failure is a bind report, not {error}");
+        };
+
+        assert!(
+            report.text().contains(&format!(
+                "] failed to bind({}, 127.0.0.1:{managed})\n",
+                report_fd(&report)
+            )),
+            "the socket tried to bind the managed port: {}",
+            report.text()
+        );
+        assert_eq!(98, report.code());
+
+        // The probe goes, and the port comes back round — which is the free in
+        // the create's error path (`aeron_send_channel_endpoint_delete`,
+        // `:278-281`, reached by the create's `goto error`).
+        drop(taken);
+
+        let endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
+            &mut manager,
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            8,
+            2,
+            2_000_000,
+        )
+        .expect("the port came back");
+
+        assert_eq!(managed, endpoint.managed_port());
+    }
+
     /// A unicast endpoint has nowhere to fan out to: it sends to the one
     /// address its channel named
     /// (`aeron_send_channel_endpoint_create`, `:76-88`).
@@ -1305,6 +1449,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1327,6 +1472,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1375,6 +1521,7 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,

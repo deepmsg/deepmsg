@@ -89,6 +89,15 @@ const READ: &[(&str, &str)] = &[
     ("AERON_PUBLICATION_LINGER_TIMEOUT", "1s"),
     ("AERON_RCV_INITIAL_WINDOW_LENGTH", "64k"),
     ("AERON_RCV_STATUS_MESSAGE_TIMEOUT", "1s"),
+    // Two numbers with a **space** between them, which is the shape the
+    // harness forwards untouched (`CTestMediaDriver.java:298-307`, which puts
+    // the context's string straight into the environment) and the shape the
+    // system test writes (`WildcardPortManagerSystemTest.java:68-69`,
+    // `.receiverWildcardPortRange("20700 20701")`). Both were in [`IGNORED`]
+    // below with hyphenated values until G3-3 bound the names — which is what
+    // that table is for, and what it caught.
+    ("AERON_RECEIVER_WILDCARD_PORT_RANGE", "20700 20701"),
+    ("AERON_SENDER_WILDCARD_PORT_RANGE", "20702 20702"),
     ("AERON_SOCKET_SO_RCVBUF", "1m"),
     ("AERON_SOCKET_SO_SNDBUF", "512k"),
     ("AERON_SPIES_SIMULATE_CONNECTION", "true"),
@@ -166,9 +175,7 @@ const IGNORED: &[(&str, &str)] = &[
     ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "15s"),
     ("AERON_RECEIVER_GROUP_TAG", "42"),
     ("AERON_RECEIVER_IDLE_STRATEGY", "sleeping"),
-    ("AERON_RECEIVER_WILDCARD_PORT_RANGE", "30000-30010"),
     ("AERON_SENDER_IDLE_STRATEGY", "sleeping"),
-    ("AERON_SENDER_WILDCARD_PORT_RANGE", "30010-30020"),
     ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
     ("AERON_SHARED_IDLE_STRATEGY", "sleeping"),
     ("AERON_THREADING_MODE", "SHARED"),

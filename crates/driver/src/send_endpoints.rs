@@ -48,6 +48,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 use crate::channel_validation;
 use crate::media::loss_generator::EveryNthDatagram;
 use crate::media::send_endpoint::{self, EndpointStatus, PublicationDispatch, SendChannelEndpoint};
+use crate::port_manager::{PortRange, WildcardPortManager};
 use crate::sys;
 use crate::udp_channel::{INVALID_TAG, UdpChannel};
 
@@ -99,6 +100,14 @@ pub struct SendChannelEndpointEntry {
     pub socket_rcvbuf: usize,
     /// The `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
+    /// The port the wildcard port manager is holding for this endpoint, and
+    /// zero when it holds none
+    /// (`aeron_send_channel_endpoint.managed_port`).
+    ///
+    /// On the entry rather than read back off the endpoint for the same reason
+    /// the two buffer lengths are: the endpoint is on the sender's thread by
+    /// the time the port has to go back.
+    pub managed_port: u16,
 }
 
 /// What `get_or_add` did.
@@ -176,6 +185,15 @@ pub enum EndpointError {
     ChannelValidation(String),
     /// The counter manager is full.
     NoCounter,
+    /// The wildcard port manager had no port to give: every one in the range
+    /// is spoken for (`aeron_wildcard_port_manager_allocate_open_port`,
+    /// `aeron_port_manager.c:93-104`).
+    ///
+    /// The message is the manager's, and it travels verbatim for the same
+    /// reason [`Self::ChannelValidation`]'s does: it is what a client that has
+    /// run the driver out of ports reads in its `RegistrationException`
+    /// (`WildcardPortManagerSystemTest.java:90`).
+    Port(crate::port_manager::PortError),
     /// The socket would not bind, with the chain the reference records for it
     /// (`send_endpoint.rs::bind_report`).
     Bind(Box<deepmsg_cnc::error_log::ErrorReport>),
@@ -207,6 +225,7 @@ impl std::fmt::Display for EndpointError {
             }
             Self::TagMismatch { tag } => write!(f, "matching tag {tag} has mismatched endpoint"),
             Self::ChannelValidation(message) => f.write_str(message),
+            Self::Port(error) => write!(f, "{error}"),
             Self::NoCounter => f.write_str("could not allocate the channel status counter"),
             Self::Bind(report) => f.write_str(report.text()),
             Self::Socket(error) => write!(f, "{error}"),
@@ -217,7 +236,7 @@ impl std::fmt::Display for EndpointError {
 impl std::error::Error for EndpointError {}
 
 /// The endpoints a driver sends through.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SendChannelEndpoints {
     entries: Vec<SendChannelEndpointEntry>,
     next_id: u64,
@@ -232,16 +251,44 @@ pub struct SendChannelEndpoints {
     /// `media/aeron_send_channel_endpoint.c:237-240`); the registry is what
     /// plays that part here.
     data_loss_drop_every: Option<u64>,
+    /// Which ports a publication whose channel named port zero is given
+    /// (`context->sender_port_manager`, `aeron_driver_context.c:428-437`).
+    ///
+    /// The reference hangs it on the driver context because C has one object to
+    /// hang it on; here it belongs to the thing that owns the endpoints the
+    /// ports are for, which is also the only thing that ever touches the table
+    /// — a port is taken when an endpoint is created and given back when the
+    /// conductor has confirmed the sender let it go
+    /// ([`Self::remove`]), both on the conductor's thread.
+    sender_port_manager: WildcardPortManager,
+}
+
+impl Default for SendChannelEndpoints {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SendChannelEndpoints {
     /// No endpoints.
-    pub const fn new() -> Self {
+    ///
+    /// Not `const`, unlike [`ReceiveChannelEndpoints::new`]: the port manager's
+    /// table is a `HashMap`, and a `HashMap` has a random seed to pick.
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
             next_id: 1,
             data_loss_drop_every: None,
+            sender_port_manager: WildcardPortManager::sender(),
         }
+    }
+
+    /// The range a publication whose channel named port zero is given one out
+    /// of (`aeron_wildcard_port_manager_set_range`,
+    /// `aeron_port_manager.c:58-65`), set once at start-up from the driver's
+    /// settings.
+    pub fn set_port_range(&mut self, range: PortRange) {
+        self.sender_port_manager.set_range(range);
     }
 
     /// Withhold one outgoing datagram in every `drop_every` from the
@@ -399,6 +446,7 @@ impl SendChannelEndpoints {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel,
+            &mut self.sender_port_manager,
             params,
             counters,
             regions,
@@ -410,6 +458,7 @@ impl SendChannelEndpoints {
             send_endpoint::SendEndpointError::NoCounter => EndpointError::NoCounter,
             send_endpoint::SendEndpointError::Bind(report) => EndpointError::Bind(report),
             send_endpoint::SendEndpointError::Socket(error) => EndpointError::Socket(error),
+            send_endpoint::SendEndpointError::Port(error) => EndpointError::Port(error),
         })?;
 
         // The supplier's call (`media/aeron_send_channel_endpoint.c:237-240`):
@@ -448,6 +497,7 @@ impl SendChannelEndpoints {
             time_of_last_activity_ns: now_ns,
             socket_rcvbuf,
             socket_sndbuf,
+            managed_port: endpoint.managed_port(),
         });
 
         Ok(EndpointOutcome::Created {
@@ -526,10 +576,24 @@ impl SendChannelEndpoints {
         true
     }
 
-    /// Forget an endpoint once both sides have let it go.
+    /// Forget an endpoint once both sides have let it go, and give its port
+    /// back.
+    ///
+    /// This is where the reference gives it back too, one level down:
+    /// `aeron_send_channel_endpoint_delete` frees the managed port with the
+    /// counters and the socket (`media/aeron_send_channel_endpoint.c:250-281`),
+    /// and the conductor reaches the delete when the sender has confirmed the
+    /// endpoint is gone (`aeron_send_channel_endpoint_entry_has_reached_end_of_life`).
+    /// Giving it back any earlier would hand a port to a second channel while
+    /// the first still has it bound.
     pub fn remove(&mut self, id: u64) -> Option<SendChannelEndpointEntry> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
-        Some(self.entries.swap_remove(index))
+        let entry = self.entries.swap_remove(index);
+
+        self.sender_port_manager
+            .free_managed_port(entry.managed_port);
+
+        Some(entry)
     }
 }
 
@@ -773,6 +837,99 @@ mod tests {
             second.channel_status_counter_id()
         );
         assert_eq!(1, endpoints.entries().len());
+    }
+
+    /// A publication whose channel named port zero is given one out of the
+    /// driver's range, and gives it back when the sender has let it go.
+    ///
+    /// The three moments the oracle walks
+    /// (`WildcardPortManagerSystemTest.java:98-113`, the publication half): a
+    /// channel that named zero gets the range's port, a second one is refused
+    /// while the first holds it, and the port comes round again once the first
+    /// is gone — which is the whole of what makes a managed range a range
+    /// rather than a leak.
+    #[test]
+    fn a_channel_that_named_no_port_is_given_one_until_it_is_gone() {
+        const MANAGED: u16 = 40300;
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+        endpoints.set_port_range(PortRange {
+            low: MANAGED,
+            high: MANAGED,
+        });
+
+        // A dynamic sender names a `control=`, which is the only shape of
+        // sender the manager gives a port to
+        // (`aeron_port_manager.c:142-159`).
+        let first = endpoints
+            .get_or_add(
+                channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
+                &defaults(),
+                &DriverConfig::default(),
+                0,
+                &mut counters,
+                &regions,
+                7,
+                1,
+                1,
+            )
+            .expect("an endpoint");
+
+        let first_id = first.id();
+
+        assert_eq!(
+            Some(MANAGED),
+            endpoints.get(first_id).map(|entry| entry.managed_port)
+        );
+
+        // A *different* channel — a different wildcard address — is a
+        // different endpoint, and the one port in the range is spoken for.
+        let refused = endpoints.get_or_add(
+            channel("aeron:udp?control=0.0.0.0:0|control-mode=dynamic"),
+            &defaults(),
+            &DriverConfig::default(),
+            0,
+            &mut counters,
+            &regions,
+            8,
+            2,
+            2,
+        );
+
+        assert_eq!(
+            "no available ports in range 40300 40300",
+            refused.expect_err("a full range").to_string()
+        );
+        assert_eq!(1, endpoints.entries().len(), "a refusal adds nothing");
+
+        // The sender has let the first one go — the socket with it, which is
+        // the order the conductor is told in (`SenderEvent::EndpointRemoved`,
+        // handled by `release_send_endpoint`) and the reason the port is freed
+        // *there* rather than when the endpoint is first marked CLOSING.
+        drop(first);
+
+        assert!(endpoints.remove(first_id).is_some());
+
+        let second = endpoints
+            .get_or_add(
+                channel("aeron:udp?control=0.0.0.0:0|control-mode=dynamic"),
+                &defaults(),
+                &DriverConfig::default(),
+                0,
+                &mut counters,
+                &regions,
+                9,
+                3,
+                3,
+            )
+            .expect("the port came back");
+
+        assert_eq!(
+            Some(MANAGED),
+            endpoints.get(second.id()).map(|entry| entry.managed_port)
+        );
     }
 
     #[test]
@@ -1386,6 +1543,7 @@ mod tests {
             time_of_last_activity_ns: 1_000,
             socket_rcvbuf: 0,
             socket_sndbuf: 0,
+            managed_port: 0,
         };
 
         assert!(!SendChannelEndpoints::is_collectable(&entry, 2_000, 500));

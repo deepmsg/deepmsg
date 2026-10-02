@@ -1818,6 +1818,7 @@ mod tests {
 
         let endpoint = SendChannelEndpoint::create(
             endpoint,
+            &mut crate::port_manager::WildcardPortManager::sender(),
             &TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
