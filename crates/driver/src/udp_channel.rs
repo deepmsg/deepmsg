@@ -1330,6 +1330,99 @@ pub fn resolve_host_and_port_with(
     }
 }
 
+/// Finish parsing a channel **on the agent**: the URI parse, then every name
+/// in it through the resolver (`aeron_udp_channel_finish_parse`,
+/// `aeron-driver/src/main/c/aeron_udp_channel.c:346-381`).
+///
+/// This is the body of the native resource agent's `PARSE_CHANNEL` command
+/// (`aeron_driver_native_resource_agent_on_parse_udp_channel`, `:381-392`) and
+/// it exists as a function of its own so that the conductor and the agent
+/// cannot drift: the conductor decides *when* a channel is parsed, the agent
+/// does it, and both go through here.
+///
+/// # Errors
+///
+/// [`UdpChannelError`] for everything the parse or a name can fail with —
+/// which is what the agent puts in the result cell, and what the conductor
+/// answers the client with when the command comes back.
+pub fn parse_channel_with(
+    resolver: &mut dyn Resolver,
+    counters: &CounterManager,
+    regions: &CounterRegions<'_>,
+    threshold_ns: i64,
+    unresolved: Unresolved,
+    original_uri: &[u8],
+) -> Result<UdpChannel, UdpChannelError> {
+    let uri = ChannelUri::parse(original_uri).map_err(UdpChannelError::Uri)?;
+
+    UdpChannel::resolve_with(
+        &mut Names::Built {
+            resolver,
+            counters,
+            regions,
+            threshold_ns,
+        },
+        unresolved,
+        original_uri,
+        &uri,
+    )
+}
+
+/// Finish parsing a **send destination** on the agent: the same parse as a
+/// channel's, plus the address the tracker matches on
+/// (`aeron_driver_conductor_execute_add_send_destination`, `:5332-5413`, which
+/// validates the endpoint and resolves it before the channel is built).
+///
+/// Two calls and not one for the reason the conductor made two: the address is
+/// what a **removal** matches a destination by (`:311-350`), and it is `None`
+/// for a name that did not answer — the reference's `AF_UNSPEC`, kept on
+/// purpose so that a name which answers later answers *this* destination
+/// (`:5337-5343`).
+///
+/// # Errors
+///
+/// [`UdpChannelError`] for everything the destination's own rules refuse — a
+/// channel that is not a UDP endpoint, a port of zero, a parameter a
+/// destination may not name.
+pub fn parse_send_destination_with(
+    resolver: &mut dyn Resolver,
+    counters: &CounterManager,
+    regions: &CounterRegions<'_>,
+    threshold_ns: i64,
+    original_uri: &[u8],
+) -> Result<(UdpChannel, Option<SocketAddr>), UdpChannelError> {
+    let uri = ChannelUri::parse(original_uri).map_err(UdpChannelError::Uri)?;
+
+    let address = match validate_send_destination_uri(
+        &mut Names::Built {
+            resolver,
+            counters,
+            regions,
+            threshold_ns,
+        },
+        Unresolved::Keep,
+        original_uri,
+    ) {
+        Ok(address) => Some(address),
+        Err(UdpChannelError::Resolution(_)) => None,
+        Err(error) => return Err(error),
+    };
+
+    let channel = UdpChannel::resolve_with(
+        &mut Names::Built {
+            resolver,
+            counters,
+            regions,
+            threshold_ns,
+        },
+        Unresolved::Keep,
+        original_uri,
+        &uri,
+    )?;
+
+    Ok((channel, address))
+}
+
 /// The words a name that will not resolve leaves behind
 /// (`aeron_name_resolver_resolve_host_and_port`'s `exit` block,
 /// `aeron_name_resolver.c:198-211`).

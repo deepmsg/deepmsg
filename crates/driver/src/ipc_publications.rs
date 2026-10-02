@@ -52,7 +52,7 @@ use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
 use crate::ipc_subscriptions::{IPC_CHANNEL, IpcSubscriptions};
 use crate::native_resource_agent::{
-    Completion, NativeResourceAgent, StorageChecks, StorageWarning,
+    AgentHandle, AgentResolver, Completion, NativeResourceAgent, StorageChecks, StorageWarning,
 };
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError, TaggedPublication};
@@ -429,6 +429,13 @@ impl IpcPublications {
     /// # Errors
     ///
     /// [`io::Error`] if the agent thread cannot be spawned.
+    /// Start the manager, and the agent thread with it.
+    ///
+    /// The agent is the driver's **native resource agent**, and this is the one
+    /// that carries the name resolver: the reference has a single agent and the
+    /// resolver lives on it (`aeron_driver_native_resource_agent.c:224-270`),
+    /// while this build has one per kind of log buffer. Collapsing them is
+    /// G4-1's; until then the resolver goes on the first, which is this one.
     pub fn start(
         reserved_session_id_low: i32,
         reserved_session_id_high: i32,
@@ -440,6 +447,30 @@ impl IpcPublications {
             session_ids: SessionIds::start(reserved_session_id_low, reserved_session_id_high),
             agent: NativeResourceAgent::start(storage)?,
         })
+    }
+
+    /// A handle for the agent's non-log-buffer work, which a caller keeps while
+    /// this manager is borrowed (`aeron_driver_conductor_cluster_...` has no
+    /// counterpart — the reference's conductor holds the agent's command queue
+    /// directly).
+    pub fn agent_handle(&self) -> AgentHandle {
+        self.agent.handle()
+    }
+
+    /// Hand the driver's resolver to the agent thread, once the CnC file can
+    /// be shared.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub fn attach_resolver(&self, resolver: AgentResolver) -> io::Result<()> {
+        self.agent.attach_resolver(resolver)
+    }
+
+    /// The agent thread this manager owns, for the work that is not a log
+    /// buffer: parsing a channel, resolving a name, and what it could not do.
+    pub const fn agent(&self) -> &NativeResourceAgent {
+        &self.agent
     }
 
     /// The publications that exist, in creation order.

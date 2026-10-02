@@ -25,18 +25,36 @@
 //! inline call), and it is why the transfer has to be legal: see the `Send`
 //! impl on `MappedFile`.
 //!
+//! # The name resolver lives here
+//!
+//! A `getaddrinfo` that will not answer is the same problem as `fallocate` and
+//! worse: a host whose nameserver is unreachable takes seconds, and the
+//! conductor that waits is a conductor whose heartbeat stops — which every
+//! client reads as a driver that has died. So the resolver is **built** where
+//! the counters are allocated (the conductor, which owns the allocator) and
+//! **run** here: its own clock turns on this thread's duty cycle, its `start`
+//! resolves the bootstrap neighbours here, and a channel's names are resolved
+//! here, as agent commands (`aeron_driver_native_resource_agent.c:253-270` for
+//! the cycle, `:361-392` for the two commands, `:224-251` for `start`).
+//!
 //! # What it does not do
 //!
-//! The reference's agent also resolves hostnames and runs the asynchronous
-//! error-log and counter-reclaim duties. This one maps and frees log buffers,
-//! which is what P1-2 needs; the rest arrives with the transport that needs it.
+//! The reference's agent also runs the asynchronous error-log and
+//! counter-reclaim duties.
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use deepmsg_cnc::{CncFile, CounterManager};
 use deepmsg_core::logbuffer::logfile::LogFile;
+
+use crate::idle::Backoff;
+use crate::name_resolver::Resolver;
+use crate::udp_channel::{UdpChannel, UdpChannelError, Unresolved};
 
 /// What the conductor asks the agent to do.
 enum Request {
@@ -49,7 +67,108 @@ enum Request {
     FreeLogBuffer {
         log: Box<LogFile>,
     },
+    /// Finish parsing a channel: every name in it goes through the resolver
+    /// (`aeron_driver_native_resource_agent_on_parse_udp_channel`,
+    /// `:381-392`, and behind it `aeron_udp_channel_finish_parse`).
+    ParseChannel {
+        /// The URI as the client wrote it, which is what the parse is handed
+        /// and what its error messages name (`aeron_udp_channel.c:346-381`).
+        original_uri: Vec<u8>,
+        /// What a name that does not answer means for this caller: a channel
+        /// is refused, a send destination is kept (`:5332-5343`).
+        unresolved: Unresolved,
+        /// Whether the command is a **send destination**, whose address is
+        /// validated and resolved beside the channel (`:5332-5413`).
+        send_destination: bool,
+        /// Where the answer goes.
+        result: ResolutionCell<ParsedChannel>,
+    },
+    /// The driver's resolver, handed over once the CnC file has been published
+    /// and can be shared.
+    ///
+    /// It arrives as a request rather than at start because of an ordering the
+    /// driver keeps: the agent thread is up **before** the file is published,
+    /// so that a driver which cannot create log buffers never claims to be
+    /// ready, and the publication needs a mutable borrow of the file that an
+    /// `Arc` would take away. The agent is idle until this arrives, which is
+    /// microseconds inside the driver's construction.
+    AttachResolver(AgentResolver),
+    /// Resolve one `host:port` again, for a name that has gone stale
+    /// (`aeron_driver_native_resource_agent_on_resolve_address`, `:361-379`).
+    ResolveAddress {
+        /// The name and port as the channel wrote them.
+        text: String,
+        /// The URI parameter it came from, which the message names.
+        uri_param_name: String,
+        /// Where the answer goes.
+        result: ResolutionCell<SocketAddr>,
+    },
     Stop,
+}
+
+/// The state cell one agent command answers through, which is the reference's
+/// `aeron_driver_native_resource_agent_command_result_t` (`:120-150`): the
+/// agent fills the payload and then **publishes** it, and the conductor's
+/// command state machine reads it once per duty cycle and stays `RUNNING`
+/// until it is there (`aeron_driver_conductor.c:4113-4121`).
+///
+/// The publish is what the reference's `AERON_SET_RELEASE` on `state` is for,
+/// and [`OnceLock`] is this build's spelling of it: `set` happens once, under a
+/// release, and `get` is the acquire. `PENDING` is `get() == None`, and the two
+/// terminal states are the two arms of the `Result` — which is a state the
+/// reference keeps in the same word and splits only to report an error.
+pub type ResolutionCell<T> = Arc<OnceLock<Result<T, UdpChannelError>>>;
+
+/// What a parsed channel answers with.
+///
+/// The address is the send destination's, and `None` for everything else: a
+/// destination that names a host which does not answer is kept with the address
+/// the reference calls `AF_UNSPEC`, and that `Option` is where it lives
+/// (`aeron_driver_conductor_execute_add_send_destination`, `:5337-5343`).
+#[derive(Clone, Debug)]
+pub struct ParsedChannel {
+    pub channel: UdpChannel,
+    pub send_destination_address: Option<SocketAddr>,
+}
+
+/// A resolver, and everything the agent thread needs to run it.
+///
+/// Built where the counters are, and handed over rather than built here,
+/// because a resolver takes counters out of the allocator and **the allocator
+/// has one owner** — the conductor. The reference builds it from the context
+/// inside the agent's own init (`aeron_driver_native_resource_agent.c:280-310`);
+/// this build cannot copy that arrangement without giving two threads
+/// allocators that can hand out the same id twice.
+pub struct AgentResolver {
+    resolver: Box<dyn Resolver + Send>,
+    /// The file whose counter regions the resolver reads and writes, borrowed
+    /// per call the way every other agent does it.
+    cnc: Arc<CncFile>,
+    /// How long a resolution may take before system counter 33 counts it
+    /// (`aeron.name.resolver.threshold`).
+    threshold_ns: i64,
+    /// The value region's length and reuse window, which an agent-side view of
+    /// the allocator is built from — it never allocates, so the view only has
+    /// to agree about where an id's value lives.
+    free_to_reuse_timeout_ms: i64,
+}
+
+impl AgentResolver {
+    /// Pair a resolver — built where the counters are allocated — with what the
+    /// agent thread needs to run it.
+    pub fn new(
+        resolver: Box<dyn Resolver + Send>,
+        cnc: Arc<CncFile>,
+        threshold_ns: i64,
+        free_to_reuse_timeout_ms: i64,
+    ) -> Self {
+        Self {
+            resolver,
+            cnc,
+            threshold_ns,
+            free_to_reuse_timeout_ms,
+        }
+    }
 }
 
 /// The space check that stands in front of every log buffer this agent
@@ -171,11 +290,28 @@ pub enum Completion {
     },
 }
 
-/// The agent thread and the two ends of the conversation.
+/// Something the agent could not do, for the conductor to record.
+///
+/// The reference's agent writes these straight into the shared error log
+/// (`aeron_driver_distinct_error_log_record`, and its resolver's own failures at
+/// `aeron_driver_name_resolver.c:214-216`, `:718-723`). That log is a
+/// process-local structure here with the conductor as its only writer — the
+/// same arrangement the storage warnings already use — so an agent fault is
+/// handed over rather than recorded.
+#[derive(Debug)]
+pub struct AgentFault {
+    /// The code the entry is recorded under, the reference's own negation.
+    pub error_code: i32,
+    /// The words, already composed.
+    pub description: String,
+}
+
+/// The agent thread and the ends of the conversation.
 pub struct NativeResourceAgent {
     requests: Sender<Request>,
     completions: Receiver<Completion>,
     warnings: Receiver<StorageWarning>,
+    faults: Receiver<AgentFault>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -190,19 +326,142 @@ impl NativeResourceAgent {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
         let (warning_tx, warning_rx) = mpsc::channel::<StorageWarning>();
+        let (fault_tx, fault_rx) = mpsc::channel::<AgentFault>();
 
         let thread = std::thread::Builder::new()
             .name("deepmsg-native-resource-agent".to_string())
-            .spawn(move || Self::run(&request_rx, &completion_tx, &warning_tx, &checks))?;
+            .spawn(move || {
+                Self::run(&request_rx, &completion_tx, &warning_tx, &fault_tx, &checks);
+            })?;
 
         Ok(Self {
             requests: request_tx,
             completions: completion_rx,
             warnings: warning_rx,
+            faults: fault_rx,
             thread: Some(thread),
         })
     }
 
+    /// Hand the driver's resolver to the agent, which starts it and runs it
+    /// from then on.
+    ///
+    /// The reference has **one** native resource agent and the resolver lives
+    /// on it (`aeron_driver_native_resource_agent.c:224-270`); this build has
+    /// three, one per kind of log buffer, and the resolver goes on the first —
+    /// the one this file's own comments call *the* agent thread, and the
+    /// descendant of the reference's. Collapsing the three into one is G4-1's
+    /// business, and this is where the resolver will already be.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub fn attach_resolver(&self, resolver: AgentResolver) -> io::Result<()> {
+        self.requests
+            .send(Request::AttachResolver(resolver))
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// A handle for the requests that are not log buffers.
+    ///
+    /// The manager that owns this agent hands one out so that a caller can keep
+    /// it while that manager is borrowed — the conductor does, because the
+    /// commands it parks are decoded inside a closure that already holds the
+    /// manager mutably.
+    pub fn handle(&self) -> AgentHandle {
+        AgentHandle {
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Ask for a channel to be parsed — every name in it through the resolver
+    /// — and keep the cell the answer will arrive in.
+    ///
+    /// Returns as soon as the request is queued; the command stays `RUNNING`
+    /// until [`ResolutionCell::get`] answers, which is the conductor's job to
+    /// notice.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone. The cell is filled with the
+    /// failure in that case, so a caller that only polls the cell still
+    /// finishes.
+    pub fn parse_channel(
+        &self,
+        original_uri: &[u8],
+        unresolved: Unresolved,
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        self.parse(original_uri, unresolved, false)
+    }
+
+    /// The same for a **send destination**, whose address is resolved beside
+    /// its channel.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`AgentHandle::parse_channel`].
+    pub fn parse_send_destination(
+        &self,
+        original_uri: &[u8],
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        self.parse(original_uri, Unresolved::Keep, true)
+    }
+
+    fn parse(
+        &self,
+        original_uri: &[u8],
+        unresolved: Unresolved,
+        send_destination: bool,
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        let result: ResolutionCell<ParsedChannel> = Arc::new(OnceLock::new());
+        self.requests
+            .send(Request::ParseChannel {
+                original_uri: original_uri.to_vec(),
+                unresolved,
+                send_destination,
+                result: Arc::clone(&result),
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))?;
+
+        Ok(result)
+    }
+
+    /// Ask for one `host:port` to be resolved again, and keep the cell.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`NativeResourceAgent::parse_channel`].
+    pub fn resolve_address(
+        &self,
+        text: &str,
+        uri_param_name: &str,
+    ) -> io::Result<ResolutionCell<SocketAddr>> {
+        let result: ResolutionCell<SocketAddr> = Arc::new(OnceLock::new());
+        self.requests
+            .send(Request::ResolveAddress {
+                text: text.to_owned(),
+                uri_param_name: uri_param_name.to_owned(),
+                result: Arc::clone(&result),
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))?;
+
+        Ok(result)
+    }
+
+    /// Everything the agent could not do since the last call, for the
+    /// conductor's error log.
+    pub fn poll_faults(&self) -> Vec<AgentFault> {
+        let mut raised = Vec::new();
+
+        while let Ok(fault) = self.faults.try_recv() {
+            raised.push(fault);
+        }
+
+        raised
+    }
+}
+
+impl NativeResourceAgent {
     /// Ask for a log buffer to be created and mapped, sparse or dense as
     /// `is_sparse` says — the URI's `sparse=` resolved against the driver's
     /// `term.buffer.sparse.file`.
@@ -293,65 +552,385 @@ impl NativeResourceAgent {
         requests: &Receiver<Request>,
         completions: &Sender<Completion>,
         warnings: &Sender<StorageWarning>,
+        faults: &Sender<AgentFault>,
         checks: &StorageChecks,
     ) {
-        while let Ok(request) = requests.recv() {
-            match request {
-                Request::MapLogBuffer {
-                    path,
-                    term_length,
-                    page_size,
-                    is_sparse,
-                } => {
-                    // The space question first, the file second: a refusal
-                    // here never touches the filesystem, which is the point
-                    // of asking before allocating (`aeron_driver_context.c:1354-1377`).
-                    let (refusal, warning) = checks.assess(term_length, page_size);
-                    let completion = match refusal {
-                        Some(error) => Completion::MapFailed { path, error },
-                        None => {
-                            // A warning is not a refusal: the reference
-                            // records it before it maps and carries on
-                            // (`:1374` inside the check, the create after the
-                            // `return 0`). Dropped rather than fatal if the
-                            // conductor is gone — the completion below is
-                            // what says the loop is over, and it says it.
-                            if let Some(warning) = warning {
-                                let _ = warnings.send(warning);
-                            }
-                            match LogFile::create(&path, term_length, page_size, is_sparse) {
-                                Ok(log) => Completion::Mapped {
-                                    path,
-                                    log: Box::new(log),
-                                },
-                                Err(error) => Completion::MapFailed { path, error },
+        // The resolver arrives with the CnC file, once the driver has published
+        // it, and so does the counters view this thread resolves through: an
+        // allocator view of its own over the conductor's regions, which is how
+        // the sender and the receiver already hold theirs. Safe because **only
+        // the conductor allocates** — this view only has to agree about where
+        // an id's value lives, and it never hands one out.
+        let mut resolver: Option<AgentResolver> = None;
+        let mut counters: Option<CounterManager> = None;
+
+        let mut backoff = Backoff::new();
+
+        loop {
+            // The resolver's own clock, on this thread's duty cycle
+            // (`aeron_driver_native_resource_agent.c:253-270`): a driver nobody
+            // is talking to still has to answer when someone does, and its
+            // gossip runs on its own intervals.
+            let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
+
+            let mut work = if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
+                (resolver.as_mut(), counters.as_ref())
+            {
+                match cnc.counter_regions() {
+                    Some(regions) => resolver.do_work(now_ms, counters, &regions),
+                    None => 0,
+                }
+            } else {
+                0
+            };
+
+            let mut stopped = false;
+            loop {
+                match requests.try_recv() {
+                    Ok(Request::Stop) => {
+                        stopped = true;
+                        break;
+                    }
+                    Ok(Request::AttachResolver(attached)) => {
+                        work += 1;
+                        counters = CounterManager::new(
+                            attached.cnc.layout().counters_values.len(),
+                            attached.free_to_reuse_timeout_ms,
+                        );
+                        resolver = Some(attached);
+
+                        // `start` runs **here**, on the agent, and that is the
+                        // whole point of the move: it resolves the bootstrap
+                        // neighbours, and a nameserver that will not answer
+                        // would otherwise stop the conductor before it has
+                        // published a heartbeat
+                        // (`aeron_driver_native_resource_agent.c:224-251`).
+                        // A failure is recorded and the driver runs on, which
+                        // is what the reference's agent does with it — a driver
+                        // whose resolver is not the one it was configured with
+                        // still resolves something.
+                        if let (Some(agent), Some(counters)) =
+                            (resolver.as_mut(), counters.as_ref())
+                        {
+                            if let Some(regions) = agent.cnc.counter_regions() {
+                                if let Err(what) = agent.resolver.start(counters, &regions) {
+                                    let _ = faults.send(resolver_start_fault(&what));
+                                }
                             }
                         }
-                    };
-
-                    if completions.send(completion).is_err() {
+                    }
+                    Ok(request) => {
+                        work += 1;
+                        if Self::dispatch(
+                            request,
+                            completions,
+                            warnings,
+                            checks,
+                            counters.as_mut(),
+                            resolver.as_mut(),
+                        ) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        stopped = true;
                         break;
                     }
                 }
-                Request::FreeLogBuffer { log } => {
-                    let path = log.path().to_owned();
-                    let _ = log.remove();
+            }
 
-                    if completions.send(Completion::Freed { path }).is_err() {
-                        break;
-                    }
-                }
-                Request::Stop => break,
+            backoff.idle(work);
+
+            if stopped {
+                break;
+            }
+        }
+
+        // The resolver goes with the thread that ran it, counters and all
+        // (`aeron_driver_name_resolver_close`, and `on_close` on the agent).
+        if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
+            (resolver.as_mut(), counters.as_mut())
+        {
+            if let Some(regions) = cnc.counter_regions() {
+                let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
+                resolver.close(counters, &regions, now_ms);
             }
         }
     }
+
+    /// One request, on the agent's thread. `true` when the loop should stop,
+    /// which is a completion the conductor can no longer receive.
+    fn dispatch(
+        request: Request,
+        completions: &Sender<Completion>,
+        warnings: &Sender<StorageWarning>,
+        checks: &StorageChecks,
+        counters: Option<&mut CounterManager>,
+        resolver: Option<&mut AgentResolver>,
+    ) -> bool {
+        match request {
+            Request::ParseChannel {
+                original_uri,
+                unresolved,
+                send_destination,
+                result,
+            } => {
+                // Where a channel's names are resolved, and the reason the
+                // conductor never waits on a nameserver again
+                // (`aeron_udp_channel_finish_parse`,
+                // `aeron-driver/src/main/c/aeron_udp_channel.c:346-381`).
+                let parsed = match (resolver, counters) {
+                    (
+                        Some(AgentResolver {
+                            resolver,
+                            cnc,
+                            threshold_ns,
+                            ..
+                        }),
+                        Some(counters),
+                    ) => match cnc.counter_regions() {
+                        // A send destination is validated and its address
+                        // resolved beside the channel, because the address is
+                        // what a removal matches it by (`:311-350`).
+                        Some(regions) if send_destination => {
+                            crate::udp_channel::parse_send_destination_with(
+                                &mut **resolver,
+                                counters,
+                                &regions,
+                                *threshold_ns,
+                                &original_uri,
+                            )
+                            .map(|(channel, address)| ParsedChannel {
+                                channel,
+                                send_destination_address: address,
+                            })
+                        }
+                        Some(regions) => crate::udp_channel::parse_channel_with(
+                            &mut **resolver,
+                            counters,
+                            &regions,
+                            *threshold_ns,
+                            unresolved,
+                            &original_uri,
+                        )
+                        .map(|channel| ParsedChannel {
+                            channel,
+                            send_destination_address: None,
+                        }),
+                        None => Err(UdpChannelError::Resolution(
+                            "the driver's counters are not mapped".to_owned(),
+                        )),
+                    },
+                    _ => Err(UdpChannelError::Resolution(
+                        "this agent has no resolver".to_owned(),
+                    )),
+                };
+
+                Self::answer(&result, parsed);
+                false
+            }
+            Request::ResolveAddress {
+                text,
+                uri_param_name,
+                result,
+            } => {
+                let resolved = match (resolver, counters) {
+                    (
+                        Some(AgentResolver {
+                            resolver,
+                            cnc,
+                            threshold_ns,
+                            ..
+                        }),
+                        Some(counters),
+                    ) => match cnc.counter_regions() {
+                        Some(regions) => crate::udp_channel::resolve_host_and_port_with(
+                            &mut **resolver,
+                            counters,
+                            &regions,
+                            *threshold_ns,
+                            &uri_param_name,
+                            &text,
+                        ),
+                        None => Err(UdpChannelError::Resolution(
+                            "the driver's counters are not mapped".to_owned(),
+                        )),
+                    },
+                    _ => Err(UdpChannelError::Resolution(
+                        "this agent has no resolver".to_owned(),
+                    )),
+                };
+
+                Self::answer(&result, resolved);
+                false
+            }
+            Request::MapLogBuffer {
+                path,
+                term_length,
+                page_size,
+                is_sparse,
+            } => {
+                // The space question first, the file second: a refusal
+                // here never touches the filesystem, which is the point
+                // of asking before allocating (`aeron_driver_context.c:1354-1377`).
+                let (refusal, warning) = checks.assess(term_length, page_size);
+                let completion = match refusal {
+                    Some(error) => Completion::MapFailed { path, error },
+                    None => {
+                        // A warning is not a refusal: the reference
+                        // records it before it maps and carries on
+                        // (`:1374` inside the check, the create after the
+                        // `return 0`). Dropped rather than fatal if the
+                        // conductor is gone — the completion below is
+                        // what says the loop is over, and it says it.
+                        if let Some(warning) = warning {
+                            let _ = warnings.send(warning);
+                        }
+                        match LogFile::create(&path, term_length, page_size, is_sparse) {
+                            Ok(log) => Completion::Mapped {
+                                path,
+                                log: Box::new(log),
+                            },
+                            Err(error) => Completion::MapFailed { path, error },
+                        }
+                    }
+                };
+
+                completions.send(completion).is_err()
+            }
+            Request::FreeLogBuffer { log } => {
+                let path = log.path().to_owned();
+                let _ = log.remove();
+
+                completions.send(Completion::Freed { path }).is_err()
+            }
+            // Both are handled by the loop itself: `Stop` is what ends it, and
+            // `AttachResolver` is what gives it a resolver to work with.
+            Request::Stop | Request::AttachResolver(_) => true,
+        }
+    }
+
+    /// Publish an answer into the cell a request was carrying.
+    ///
+    /// `OnceLock` cannot fail to be set twice — nothing else ever holds this
+    /// cell, and the command that owns it is dropped with it — so the answer
+    /// is unconditional and the conductor's next duty cycle is what picks it
+    /// up.
+    fn answer<T>(cell: &ResolutionCell<T>, answer: Result<T, UdpChannelError>) {
+        let _ = cell.set(answer);
+    }
 }
+
+/// The entry a resolver that would not start leaves in the error log
+/// (`aeron_driver_native_resource_agent.c:233-251`): the reference records
+/// either what the failure said or, when it said nothing, the words the agent
+/// composes itself — under the negated generic code, because
+/// `AERON_ERROR_CODE_GENERIC_ERROR` is what its `AERON_SET_ERR` was given.
+///
+/// The driver runs on either way, and that is the point of recording rather
+/// than refusing: a driver whose resolver is not the one it was configured with
+/// resolves *something*, and a deployment that reads its error log can see it.
+fn resolver_start_fault(what: &str) -> AgentFault {
+    AgentFault {
+        error_code: -deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+        description: deepmsg_cnc::error_log::compose_description(
+            -deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+            "aeron_driver_native_resource_agent_on_start",
+            "aeron_driver_native_resource_agent.c",
+            233,
+            &format!("failed to start name resolver: {what}"),
+        ),
+    }
+}
+
+/// `AERON_NANOS_PER_MILLI` — the agent's clock is asked for milliseconds.
+const NANOS_PER_MILLI: i64 = 1_000_000;
 
 impl std::fmt::Debug for NativeResourceAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeResourceAgent")
             .field("running", &self.thread.is_some())
             .finish()
+    }
+}
+
+/// The sending half of the conversation with an agent, on its own.
+///
+/// Everything a caller needs to ask the agent for something that is not a log
+/// buffer, without holding the manager that owns the agent.
+#[derive(Clone)]
+pub struct AgentHandle {
+    requests: Sender<Request>,
+}
+
+impl AgentHandle {
+    /// Ask for a channel to be parsed — every name in it through the resolver.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub fn parse_channel(
+        &self,
+        original_uri: &[u8],
+        unresolved: Unresolved,
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        self.parse(original_uri, unresolved, false)
+    }
+
+    /// The same for a **send destination**, whose address is resolved beside
+    /// its channel.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`AgentHandle::parse_channel`].
+    pub fn parse_send_destination(
+        &self,
+        original_uri: &[u8],
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        self.parse(original_uri, Unresolved::Keep, true)
+    }
+
+    fn parse(
+        &self,
+        original_uri: &[u8],
+        unresolved: Unresolved,
+        send_destination: bool,
+    ) -> io::Result<ResolutionCell<ParsedChannel>> {
+        let result: ResolutionCell<ParsedChannel> = Arc::new(OnceLock::new());
+        self.requests
+            .send(Request::ParseChannel {
+                original_uri: original_uri.to_vec(),
+                unresolved,
+                send_destination,
+                result: Arc::clone(&result),
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))?;
+
+        Ok(result)
+    }
+
+    /// Ask for one `host:port` to be resolved again, and keep the cell.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`NativeResourceAgent::parse_channel`].
+    pub fn resolve_address(
+        &self,
+        text: &str,
+        uri_param_name: &str,
+    ) -> io::Result<ResolutionCell<SocketAddr>> {
+        let result: ResolutionCell<SocketAddr> = Arc::new(OnceLock::new());
+        self.requests
+            .send(Request::ResolveAddress {
+                text: text.to_owned(),
+                uri_param_name: uri_param_name.to_owned(),
+                result: Arc::clone(&result),
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))?;
+
+        Ok(result)
     }
 }
 
