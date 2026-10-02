@@ -31,6 +31,7 @@ pub mod ipc_subscriptions;
 pub mod loss;
 pub mod loss_detector;
 pub mod media;
+pub mod name_resolver;
 pub mod native_resource_agent;
 pub mod network_publication;
 pub mod network_publications;
