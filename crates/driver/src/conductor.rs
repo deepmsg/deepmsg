@@ -3638,6 +3638,39 @@ mod tests {
         }
     }
 
+    /// Drive the conductor until `expected` more counters have come back, and
+    /// answer with the count it reached.
+    ///
+    /// A **send endpoint's** release is asynchronous, and that is the driver's
+    /// shape rather than this test's business: the publication's own counters
+    /// come back in the pass that answers the client, while the endpoint
+    /// belongs to the *sender* — `try_remove_send_endpoint` sends it a command
+    /// and the conductor frees the endpoint's `snd-channel` counter when the
+    /// confirmation comes back, a pass or two later
+    /// (`aeron_send_channel_endpoint_delete`, `:250-266`). Asserting the moment
+    /// the client was answered read a count that had not finished moving, which
+    /// is what made this test fail under load and never on its own.
+    fn await_counter_frees(conductor: &mut Conductor, before: usize, expected: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            let free = conductor.counters().free_list_len();
+
+            if free >= before + expected {
+                return free;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the free list grew by {} of the {expected} counters owed",
+                free.saturating_sub(before)
+            );
+
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// `REMOVE_PUBLICATION`'s wire form, in either shape.
     ///
     /// Written here rather than in the `cnc` crate because the client's own
@@ -5348,11 +5381,13 @@ mod tests {
             conductor.network_publications().is_empty(),
             "the publication is gone from the driver"
         );
+        // Six counters of its own, freed in the pass that answered the client,
+        // and the endpoint's `snd-channel` — which was the last one holding
+        // that port — once the sender has confirmed it let the endpoint go.
         assert_eq!(
             counters_before + 7,
-            conductor.counters().free_list_len(),
-            "and its six counters came back — plus the send endpoint's, which \
-             was the last one holding that port"
+            await_counter_frees(&mut conductor, counters_before, 7),
+            "all seven came back"
         );
     }
 
