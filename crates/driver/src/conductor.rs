@@ -48,6 +48,7 @@
 //! lengths claim — is counted separately, because it is a bug or a hostile
 //! client rather than a feature this build has not reached.
 
+use deepmsg_cnc::CounterRegions;
 use deepmsg_cnc::command::{
     ERROR_CODE_GENERIC_ERROR, ERROR_CODE_INVALID_CHANNEL, ERROR_CODE_MALFORMED_COMMAND,
     ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE,
@@ -72,6 +73,7 @@ use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
     ToDriverRingConsumer,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
@@ -83,17 +85,18 @@ use crate::config::{DriverConfig, TerminationPolicy};
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::media::receive_endpoint::ReceiveDestination;
+use crate::name_resolver::Resolver;
 use crate::native_resource_agent::StorageChecks;
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
 use crate::receive_endpoints::ReceiveChannelEndpoints;
-use crate::receiver::{Receiver, ReceiverEvent};
+use crate::receiver::{Receiver, ReceiverEvent, ReleasedDestination};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
     IPC_PREFIX, UdpChannel, UdpChannelError, is_spy_channel, validate_destination_prefix,
-    validate_destination_uri_params, validate_send_destination_uri,
+    validate_destination_uri_params,
 };
 
 /// At most one command per duty cycle
@@ -104,6 +107,11 @@ pub const COMMAND_DRAIN_LIMIT: usize = 1;
 /// (`AERON_DRIVER_CONDUCTOR_CLOCK_UPDATE_INTERNAL_NS` = 1 ms,
 /// `aeron-driver/src/main/c/aeron_driver_conductor.h:38`).
 pub const CLOCK_UPDATE_INTERVAL_NS: i64 = 1_000_000;
+
+/// A millisecond in nanoseconds, for the settings the reference holds in
+/// nanoseconds and the resolver counts in milliseconds
+/// (`aeron_driver_name_resolver.c:455-461`).
+const NANOS_PER_MILLI: i64 = 1_000_000;
 
 /// A command in the control protocol.
 ///
@@ -227,6 +235,14 @@ pub enum ConductorError {
     /// The native resource agent — the thread that creates log buffers — could
     /// not be started. Nothing can be published without it.
     Agent(std::io::Error),
+    /// The name resolver the settings named could not be built or started —
+    /// see [`crate::name_resolver::Supplier`]. The reference fails its context
+    /// init for a name its table does not hold, and its agent records a
+    /// resolver that will not start and carries on
+    /// (`aeron_driver_native_resource_agent.c:233-251`); this build refuses the
+    /// start, because a driver whose resolver is not the one it was configured
+    /// with is a driver that resolves something else.
+    Resolver(String),
 }
 
 impl std::fmt::Display for ConductorError {
@@ -238,6 +254,7 @@ impl std::fmt::Display for ConductorError {
             Self::NoCounterRegions => {
                 f.write_str("the counter regions cannot hold a driver's counters")
             }
+            Self::Resolver(what) => write!(f, "the name resolver could not be built: {what}"),
             Self::SystemCounters(error) => {
                 write!(f, "the system counters were not published: {error}")
             }
@@ -253,7 +270,10 @@ impl std::error::Error for ConductorError {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
             Self::Agent(error) | Self::Sender(error) => Some(error),
-            Self::NoCommandRing | Self::NoEventRing | Self::NoCounterRegions => None,
+            Self::NoCommandRing
+            | Self::NoEventRing
+            | Self::NoCounterRegions
+            | Self::Resolver(_) => None,
         }
     }
 }
@@ -480,6 +500,14 @@ pub struct Conductor {
     /// What this driver allocated for itself, so its shutdown gives back
     /// exactly that (`aeron_system_counters_close`, `:3487`).
     system_counters: SystemCounters,
+    /// The resolver the settings named (`aeron.name.resolver.supplier`), which
+    /// every channel this driver parses goes through and whose clock runs on
+    /// the driver's own pass.
+    ///
+    /// `Send` because it is built here and the reference runs it on the native
+    /// resource agent (`aeron_driver_native_resource_agent.c:260`); this build
+    /// keeps it on the conductor thread, which `docs/compat.md` records.
+    resolver: Box<dyn Resolver + Send>,
     /// The process's half of the distinct error log; the region it writes
     /// comes from the CnC file per call, like the counters.
     error_log: DistinctErrorLog,
@@ -547,8 +575,9 @@ pub struct Conductor {
     /// publication's own set of readers; what it produces is three client
     /// messages, which are the conductor's. The queue is that hand-off.
     pending_untethered: Vec<(i64, Vec<crate::subscribable::UntetheredEvent>)>,
-    /// Revoked publications whose release waits for the sender to say they
-    /// have finished saying `REVOKED`
+    /// Publications whose release waits for the sender to say they are done
+    /// with them: a revoked one has to finish saying `REVOKED`, and one whose
+    /// clients have all let go has to finish lingering
     /// ([`SenderEvent::PublicationDrained`](crate::sender::SenderEvent::PublicationDrained)).
     awaiting_drain: std::collections::HashSet<i64>,
     /// The ones the sender has finished with since the last pass, waiting to
@@ -558,6 +587,18 @@ pub struct Conductor {
     /// client an `ON_PUBLICATION_ERROR`, and the words have to outlive the
     /// datagram they arrived in.
     pending_publication_errors: Vec<deepmsg_cnc::command::OwnedPublicationError>,
+    /// Endpoints whose names the sender has asked about again, waiting for a
+    /// pass that holds the counter regions — the resolver reads counters, and a
+    /// resolution is measured (`SenderEvent::ReResolveEndpoint`).
+    pending_re_resolutions: Vec<(u64, String, Option<SocketAddr>)>,
+    /// Destinations whose **control** names the receiver has asked about
+    /// again, waiting for a pass that holds the counter regions.
+    pending_control_re_resolutions: Vec<(
+        u64,
+        crate::media::receive_endpoint::DestinationId,
+        String,
+        SocketAddr,
+    )>,
 }
 
 impl Conductor {
@@ -612,9 +653,65 @@ impl Conductor {
                 .ok_or(ConductorError::NoCounterRegions)?;
             #[allow(clippy::cast_possible_wrap)] // a file length, far below i64::MAX
             let bytes_mapped = cnc.file_length() as i64;
-            system_counters::allocate_all(&mut counters, &regions, now_ms, bytes_mapped)
-                .map_err(ConductorError::SystemCounters)?
+            system_counters::allocate_all(
+                &mut counters,
+                &regions,
+                now_ms,
+                bytes_mapped,
+                config.resolver_name.as_deref().unwrap_or(""),
+                config.name_resolver_threshold_ns,
+            )
+            .map_err(ConductorError::SystemCounters)?
         };
+
+        // The resolver the settings named, built where the counters and the
+        // clock are in hand — the reference builds it in the native resource
+        // agent's init, from the context, and runs it on that agent's thread
+        // (`aeron_driver_native_resource_agent.c:299-320`, `:260`).
+        let mut resolver = {
+            let regions = cnc
+                .counter_regions()
+                .ok_or(ConductorError::NoCounterRegions)?;
+            let params = crate::name_resolver::driver::Params {
+                name: config.resolver_name.clone().unwrap_or_default(),
+                interface: config.resolver_interface.clone().unwrap_or_default(),
+                bootstrap_neighbor: config.resolver_bootstrap_neighbor.clone(),
+                mtu_length: usize::try_from(config.mtu_length).unwrap_or(1408),
+                socket_rcvbuf: usize::try_from(config.socket_so_rcvbuf).unwrap_or(0),
+                socket_sndbuf: usize::try_from(config.socket_so_sndbuf).unwrap_or(0),
+                // The four intervals are settings in nanoseconds and the
+                // resolver counts milliseconds, which is the reference's own
+                // division (`aeron_driver_name_resolver.c:455-461`).
+                neighbor_timeout_ms: config.resolver_neighbor_timeout_ns / NANOS_PER_MILLI,
+                self_resolution_interval_ms: config.resolver_self_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+                neighbor_resolution_interval_ms: config.resolver_neighbor_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+                bootstrap_neighbor_resolution_interval_ms: config
+                    .resolver_bootstrap_neighbor_resolution_interval_ns
+                    / NANOS_PER_MILLI,
+            };
+
+            config
+                .name_resolver_supplier
+                .build(
+                    &params,
+                    config.name_resolver_init_args.as_deref(),
+                    &mut counters,
+                    &regions,
+                    now_ms,
+                )
+                .map_err(ConductorError::Resolver)?
+        };
+
+        {
+            let regions = cnc
+                .counter_regions()
+                .ok_or(ConductorError::NoCounterRegions)?;
+            resolver
+                .start(&counters, &regions)
+                .map_err(ConductorError::Resolver)?;
+        }
 
         // The id the driver burns at startup belongs to the same counter a
         // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
@@ -681,6 +778,7 @@ impl Conductor {
             usize::try_from(config.mtu_length).unwrap_or(1408),
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
             config.publication_linger_timeout_ns,
+            config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -706,6 +804,7 @@ impl Conductor {
             config.status_message_timeout_ns,
             config.receiver_window_length,
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -723,6 +822,7 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
+            resolver,
             error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
             publications,
@@ -736,11 +836,22 @@ impl Conductor {
                 if let Some(drop_every) = config.data_loss_drop_every {
                     endpoints.attach_data_loss_generator(drop_every);
                 }
+                // The range the manager hands ports out of, set once at
+                // start-up (`aeron_wildcard_port_manager_set_range`, called
+                // from the context's own init, `aeron_driver_context.c:1058-1069`).
+                endpoints.set_port_range(config.sender_wildcard_port_range);
                 endpoints
             },
             network_publications,
             sender,
-            receive_endpoints: ReceiveChannelEndpoints::new(),
+            receive_endpoints: {
+                // The receiver's range, set once at start-up beside the
+                // sender's (`aeron_wildcard_port_manager_set_range`, called
+                // from the context's own init, `aeron_driver_context.c:1071-1081`).
+                let mut endpoints = ReceiveChannelEndpoints::new();
+                endpoints.set_port_range(config.receiver_wildcard_port_range);
+                endpoints
+            },
             images,
             receiver,
             termination: config.termination,
@@ -772,6 +883,8 @@ impl Conductor {
             pending_publication_errors: Vec::new(),
             awaiting_drain: std::collections::HashSet::new(),
             drained_publications: Vec::new(),
+            pending_re_resolutions: Vec::new(),
+            pending_control_re_resolutions: Vec::new(),
         };
 
         Ok(conductor)
@@ -789,6 +902,14 @@ impl Conductor {
         let mut work_count = 0;
 
         self.track_cycle(now_ns);
+
+        // The resolver's own clock, which runs on this driver's pass whether or
+        // not anything else has work: a driver nobody is talking to still has
+        // to answer when someone does, and its gossip is on its own intervals
+        // (`aeron_driver_name_resolver.c:1252-1292`).
+        if let Some(regions) = self.cnc.counter_regions() {
+            work_count += self.resolver.do_work(self.now_ms, &self.counters, &regions);
+        }
 
         if now_ns > self.clock_update_deadline_ns {
             self.now_ms = self.clock.update(clock::epoch_nano_time());
@@ -817,7 +938,7 @@ impl Conductor {
         self.record_pending_faults();
         self.record_storage_warnings();
         self.flush_broadcast_failures();
-        work
+        work + self.re_resolve_endpoints() + self.re_resolve_controls()
     }
 
     /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
@@ -1030,14 +1151,32 @@ impl Conductor {
                             .push((error.recorded_error_code(), error.to_string()));
                     }
                 }
-                ReceiverEvent::EndpointReleased {
-                    id,
-                    destination_counter_ids,
-                } => {
-                    work += self.release_endpoint(id, destination_counter_ids);
+                ReceiverEvent::EndpointReleased { id, destinations } => {
+                    work += self.release_endpoint(id, destinations);
+                }
+                ReceiverEvent::DestinationReleased { destination, .. } => {
+                    work += self.release_destination(destination);
                 }
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
+                }
+                ReceiverEvent::ImageLingering { registration_id } => {
+                    work += self.announce_image_unavailable(registration_id);
+                }
+                ReceiverEvent::ReResolveControl {
+                    endpoint_id,
+                    destination,
+                    control_name,
+                    address,
+                } => {
+                    // Held rather than resolved here: this method has no
+                    // counter regions, and a resolution is measured.
+                    self.pending_control_re_resolutions.push((
+                        endpoint_id,
+                        destination,
+                        control_name,
+                        address,
+                    ));
                 }
                 ReceiverEvent::Untethered {
                     registration_id,
@@ -1139,49 +1278,6 @@ impl Conductor {
         }
 
         work
-    }
-
-    /// Let go of a network publication: stop sending it, give its counters
-    /// back, and count one less reader on its endpoint
-    /// (`aeron_network_publication_close`,
-    /// `aeron-driver/src/main/c/aeron_network_publication.c:326-354`).
-    ///
-    /// The IPC path does the same for its own publications
-    /// ([`IpcPublications::release_links`]); this is the half that was missing,
-    /// and its absence was silent: a client could remove a UDP publication and
-    /// the sender would keep sending it.
-    fn release_network_publication(&mut self, registration_id: i64) -> bool {
-        let Some(record) = self.network_publications.remove(registration_id) else {
-            return false;
-        };
-
-        let _ = self.sender.proxy().remove_publication(registration_id);
-
-        self.release_spies_of(registration_id);
-
-        if let Some(region) = self.cnc.counter_regions() {
-            let mut counter_ids = vec![
-                record.counters.pub_pos,
-                record.counters.pub_lmt,
-                record.counters.snd_pos,
-                record.counters.snd_lmt,
-                record.counters.snd_bpe,
-                record.counters.snd_naks_received,
-            ];
-
-            // Only a strategy that keeps receivers was given one
-            // (`aeron_min_flow_control.c:454-470` frees it with the strategy).
-            counter_ids.extend(record.counters.fc_receivers);
-
-            for counter_id in counter_ids {
-                let _ = self.counters.free(&region, counter_id, self.now_ms);
-            }
-        }
-
-        self.send_endpoints.detach_publication(record.endpoint_id);
-        self.try_remove_send_endpoint(record.endpoint_id);
-
-        true
     }
 
     /// Send what a publication's tether cycle decided to the readers it
@@ -1310,42 +1406,6 @@ impl Conductor {
         pending.len()
     }
 
-    /// Tell every spy reading a publication that it is gone, and give their
-    /// readers back (`aeron_driver_conductor_cleanup_spies`, `:1502-1519`).
-    ///
-    /// The message goes out **before** the counters come back, which is the
-    /// reference's order and the only one that works: the message names the
-    /// channel the spy read with, and a client told about an image it no longer
-    /// has is a client that stops advancing the position the publication's
-    /// limit is computed from.
-    ///
-    /// Nothing is sent when there is no spy — the common case — because there
-    /// is nothing to send it about; the link walk that finds that out is the
-    /// same walk that would send.
-    fn release_spies_of(&mut self, registration_id: i64) -> usize {
-        let Some(event_region) = self.cnc.to_clients_region_writable() else {
-            return 0;
-        };
-        let Some(counter_regions) = self.cnc.counter_regions() else {
-            return 0;
-        };
-
-        let mut transmit = Transmit {
-            transmitter: &mut self.transmitter,
-            region: &event_region,
-            failures: &mut self.pending_broadcast_failures,
-            faults: &mut self.pending_log_errors,
-        };
-
-        self.subscriptions.unlink_spies_of(
-            registration_id,
-            &mut self.counters,
-            &counter_regions,
-            self.now_ms,
-            &mut transmit,
-        )
-    }
-
     /// Whatever a client left behind: the network publications it was holding
     /// when it stopped being a client this driver knows.
     ///
@@ -1354,38 +1414,39 @@ impl Conductor {
     /// sender's proxy and the endpoint registry, and neither belongs in the
     /// client pool.
     fn release_orphaned_network_publications(&mut self) -> usize {
+        // A publication is an orphan when **no live client holds a link on
+        // it**, which is not the same as its first client being gone: a
+        // publication can have several, and the reference releases the links a
+        // dying client held rather than the resource
+        // (`aeron_driver_conductor_client_remove`'s publication links,
+        // `aeron_driver_conductor.c:1220-1241`).
         let orphans: Vec<i64> = self
             .network_publications
             .publications()
             .iter()
-            .filter(|publication| !self.clients.knows(publication.client_id))
+            .filter(|publication| {
+                !self
+                    .clients
+                    .any_holds_publication(publication.registration_id)
+            })
             .map(|publication| publication.registration_id)
             .collect();
 
         let mut released = 0;
 
         for registration_id in orphans {
-            released += usize::from(self.release_network_publication(registration_id));
+            // The dead client's holds are gone, so the publication ends the
+            // same way one whose clients left alive does: it lingers while it
+            // has readers, and the release waits for that
+            // (`aeron_driver_conductor.c:1220-1241`, which drops the links and
+            // lets the publication's own `DECREF` do the rest).
+            let _ = self.sender.proxy().end_publication(registration_id);
+            self.awaiting_drain.insert(registration_id);
+
+            released += 1;
         }
 
         released
-    }
-
-    /// An image has finished its life: unlink it, tell its readers, give its
-    /// counters and its log buffer back, and let the endpoint go if nothing
-    /// reads it any more (`aeron_driver_conductor_image_transition_to_linger`
-    /// and the delete that follows it, `aeron_driver_conductor.c:5680-5720`).
-    ///
-    /// This is the receiving side's answer to a publication's revoke: a
-    /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
-    /// message per **subscription** that was reading it, as the reference sends
-    /// them (`:5690-5700`) — and only then is the log buffer unmapped.
-    /// Ask the sender to let an endpoint go, once the last publication on it
-    /// has (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks
-    /// it CLOSING and asks, and the endpoint's own delete is what gives the
-    /// counters back — `:250-266`).
-    fn try_remove_send_endpoint(&mut self, id: u64) {
-        try_remove_send_endpoint(&mut self.send_endpoints, self.sender.proxy(), id);
     }
 
     /// Give back what a send endpoint held, once the sender has let it go
@@ -1418,16 +1479,16 @@ impl Conductor {
     ///
     /// The counters are the conductor's to free because the region is: the
     /// receiver could only say which numbers were its.
-    fn release_endpoint(&mut self, id: u64, destination_counter_ids: Vec<i32>) -> usize {
+    fn release_endpoint(&mut self, id: u64, destinations: Vec<ReleasedDestination>) -> usize {
         let Some(entry) = self.receive_endpoints.remove(id) else {
             return 0;
         };
 
-        if let Some(region) = self.cnc.counter_regions() {
-            for counter_id in destination_counter_ids {
-                let _ = self.counters.free(&region, counter_id, self.now_ms);
-            }
+        for destination in destinations {
+            self.release_destination(destination);
+        }
 
+        if let Some(region) = self.cnc.counter_regions() {
             let _ = self
                 .counters
                 .free(&region, entry.channel_status_counter_id, self.now_ms);
@@ -1436,15 +1497,40 @@ impl Conductor {
         1
     }
 
-    fn release_image(&mut self, registration_id: i64) -> usize {
+    /// Give back what one destination held: its `rcv-local-sockaddr` counter
+    /// and, when the wildcard port manager is holding one for it, the port.
+    ///
+    /// The port is the part that has to be timed right. This runs when the
+    /// receiver says the destination is gone — the socket closed with it —
+    /// which is where the reference gives it back too
+    /// (`aeron_receive_destination_delete`,
+    /// `media/aeron_receive_destination.c:152-156`). The conductor hears about
+    /// a removal a command earlier than this, when it *asks*; giving the port
+    /// back then would hand it to a second reader while the first still has it
+    /// bound.
+    fn release_destination(&mut self, destination: ReleasedDestination) -> usize {
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, destination.counter_id, self.now_ms);
+        }
+
+        self.receive_endpoints
+            .free_managed_port(destination.managed_port);
+
+        1
+    }
+
+    /// Tell every subscription reading this image that it is gone, and stop
+    /// calling them its readers
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`,
+    /// which is the reference's own **one** announcement — it unlinks as it
+    /// tells, so the release a moment later finds nobody left to tell).
+    fn announce_image_unavailable(&mut self, registration_id: i64) -> usize {
         let Some(image) = self.images.find(registration_id).cloned() else {
             return 0;
         };
 
-        let _ = self.receiver.proxy().remove_image(registration_id);
-
-        // The readers, told — before anything is freed, because the message
-        // names the file they were reading.
         let Some(event_region) = self.cnc.to_clients_region_writable() else {
             return 0;
         };
@@ -1466,10 +1552,27 @@ impl Conductor {
         }
 
         // The transmit borrows the faults list and the ring; it goes out of
-        // scope here so the counter regions can be taken below.
+        // scope here so the link list can be taken below.
         let _ = &transmit;
 
         self.subscriptions.forget_publication(registration_id);
+
+        1
+    }
+
+    fn release_image(&mut self, registration_id: i64) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let _ = self.receiver.proxy().remove_image(registration_id);
+
+        // A reader that has not been told yet is told now: the normal path has
+        // already said so as the image left DRAINING (`:1642-1675`), and a
+        // **revoked** one has not — it goes LINGER→DONE without a linger to
+        // announce on, which is this build's own divergence and the reason this
+        // call is here rather than gone.
+        self.announce_image_unavailable(registration_id);
         self.receive_endpoints.detach_image(image.endpoint_id);
 
         // An endpoint whose last image has just gone is one to try again on:
@@ -1686,6 +1789,16 @@ impl Conductor {
                     // Nothing to do: the conductor's own bookkeeping for a
                     // publication's removal is done where the removal is made.
                 }
+                crate::sender::SenderEvent::ReResolveEndpoint {
+                    endpoint_id,
+                    endpoint_name,
+                    address,
+                } => {
+                    // Held rather than resolved here: this method has no
+                    // counter regions, and the resolution is measured.
+                    self.pending_re_resolutions
+                        .push((endpoint_id, endpoint_name, address));
+                }
             }
         }
 
@@ -1791,6 +1904,8 @@ impl Conductor {
     ///
     /// The error from flushing the mapping, if any.
     pub fn close(&mut self) -> std::io::Result<()> {
+        self.close_resolver();
+
         // The counters the driver owns go first (`aeron_system_counters_close`,
         // called at `aeron_driver_conductor.c:3487`), and the heartbeat is
         // nulled after (`:3493`). It is why a driver that stopped on purpose
@@ -1863,6 +1978,7 @@ impl Conductor {
         let running = &mut self.running;
         let termination = self.termination;
         let config = &self.config;
+        let resolver = &mut self.resolver;
         let publications = &mut self.publications;
         let network_publications = &mut self.network_publications;
         let send_endpoints = &mut self.send_endpoints;
@@ -1887,8 +2003,7 @@ impl Conductor {
         // release itself needs the sender and the endpoint registry, which the
         // drain's closure cannot reach, so the ids are collected here and the
         // work happens below it.
-        let mut pending_publication_releases: Vec<i64> =
-            std::mem::take(&mut self.drained_publications);
+        let pending_publication_releases: Vec<i64> = std::mem::take(&mut self.drained_publications);
         // The destination commands, for the same reason: the *sender* is what
         // puts a destination on a tracker, and the drain's closure cannot reach
         // it. The payloads are kept verbatim, so that what is decoded below is
@@ -1967,6 +2082,7 @@ impl Conductor {
                                         config,
                                         counters,
                                         &counter_regions,
+                                        &mut **resolver,
                                         clients,
                                         send_endpoints,
                                         sender.proxy(),
@@ -2080,9 +2196,29 @@ impl Conductor {
 
                                 publications.release_links(&[link], counters, &counter_regions);
 
-                                if !is_draining {
-                                    pending_publication_releases
-                                        .push(link.publication_registration_id);
+                                if !is_draining
+                                    && network_publications
+                                        .remove_link(link.publication_registration_id, 1)
+                                {
+                                    // The link's own hold goes, and the
+                                    // publication is released only when it was
+                                    // the **last** one AND has finished
+                                    // lingering: a publication with no clients
+                                    // left writes where its stream stopped and
+                                    // lingers while it still has readers
+                                    // (`DECREF`-to-zero, `:4705-4735` then
+                                    // `media/aeron_network_publication.c:1048-1069`).
+                                    // The end of that linger is what the
+                                    // release waits for, and the **endpoint**
+                                    // is released with it — which is why a
+                                    // channel can be published on again
+                                    // immediately.
+                                    let _ = sender
+                                        .proxy()
+                                        .end_publication(link.publication_registration_id);
+
+                                    self.awaiting_drain
+                                        .insert(link.publication_registration_id);
                                 }
 
                                 transmit.operation_succeeded(request.correlated.correlation_id);
@@ -2188,6 +2324,7 @@ impl Conductor {
                                         config,
                                         counters,
                                         &counter_regions,
+                                        &mut **resolver,
                                         clients,
                                         receive_endpoints,
                                         images,
@@ -2854,7 +2991,15 @@ impl Conductor {
                     continue;
                 }
 
-                let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
+                let Ok(channel) = Self::resolve_channel(
+                    &mut **resolver,
+                    counters,
+                    &counter_regions,
+                    config.name_resolver_threshold_ns,
+                    crate::udp_channel::Unresolved::Refuse,
+                    request.channel,
+                    &uri,
+                ) else {
                     transmit.error(
                         request.correlation_id,
                         ERROR_CODE_INVALID_CHANNEL,
@@ -2877,12 +3022,14 @@ impl Conductor {
                     let params = ReceiveChannelEndpoints::transport_params(config, &channel);
                     let destination = match ReceiveDestination::open(
                         channel,
+                        receive_endpoints.port_manager(),
                         &params,
                         counters,
                         &counter_regions,
                         request.registration_id,
                         channel_status_counter_id,
                         now_ms,
+                        now_ns,
                     ) {
                         Ok(destination) => destination,
                         Err(error) => {
@@ -2967,7 +3114,16 @@ impl Conductor {
             // `None` here. The consequence is in `docs/compat.md`'s
             // name-resolution row: this build has no re-resolution, so that
             // destination never recovers.
-            let address = match validate_send_destination_uri(request.channel) {
+            let address = match crate::udp_channel::validate_send_destination_uri(
+                &mut crate::udp_channel::Names::Built {
+                    resolver: &mut **resolver,
+                    counters,
+                    regions: &counter_regions,
+                    threshold_ns: config.name_resolver_threshold_ns,
+                },
+                crate::udp_channel::Unresolved::Keep,
+                request.channel,
+            ) {
                 Ok(address) => Some(address),
                 Err(UdpChannelError::Resolution(_)) => None,
                 Err(error) => {
@@ -2989,13 +3145,29 @@ impl Conductor {
                 continue;
             };
 
-            let Ok(channel) = UdpChannel::resolve(request.channel, &uri) else {
-                transmit.error(
-                    request.correlation_id,
-                    ERROR_CODE_INVALID_CHANNEL,
-                    b"incorrect URI format for destination",
-                );
-                continue;
+            // A **send** destination whose name does not resolve is kept, so
+            // the parse tolerates one: the reference sets the address to
+            // `AF_UNSPEC` and adds the destination anyway (`:5337-5343`), which
+            // is what makes a name that answers later answer *this*
+            // destination.
+            let channel = match Self::resolve_channel(
+                &mut **resolver,
+                counters,
+                &counter_regions,
+                config.name_resolver_threshold_ns,
+                crate::udp_channel::Unresolved::Keep,
+                request.channel,
+                &uri,
+            ) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    transmit.error(
+                        request.correlation_id,
+                        error.error_code(),
+                        error.to_string().as_bytes(),
+                    );
+                    continue;
+                }
             };
 
             let registration_id = request.correlation_id;
@@ -3378,6 +3550,189 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
     }
 
     (nanoseconds / 1_000_000).max(1)
+}
+
+impl Conductor {
+    /// Let the resolver go, counters and all (`aeron_driver_name_resolver_close`,
+    /// `aeron_driver_name_resolver.c:525-536`, which frees its memory and none
+    /// of its counters).
+    fn close_resolver(&mut self) {
+        let Some(regions) = self.cnc.counter_regions() else {
+            return;
+        };
+
+        self.resolver
+            .close(&mut self.counters, &regions, self.now_ms);
+    }
+
+    /// Resolve the names the sender asked about again, and tell it what changed
+    /// (`aeron_driver_conductor_execute_re_resolve_endpoint`, `:6890-6938`).
+    ///
+    /// The resolution is the **wrapper**'s, not the resolver's alone
+    /// (`aeron_name_resolver_resolve_host_and_port`): what a re-resolution
+    /// answers with is an address with the port the channel named, which is
+    /// what the endpoint compares against the one it has (`:6932-6938`) and
+    /// what it reconnects to.
+    ///
+    /// A name that resolves to **the address the endpoint already has** is not
+    /// a change and nothing happens — which is the reference's `memcmp`, and is
+    /// what `shouldReResolveEndpointOnNotConnectedWhenNamePointsBackAtTheOriginalAddress`
+    /// is about.
+    ///
+    /// A name that will not resolve is an **error a deployment can see**: the
+    /// counter and the log entry, both, which is what the reference's
+    /// `set_error_from_result` plus `AERON_APPEND_ERR` do (`:6905-6911`) and
+    /// what `shouldReportErrorOnReResolveFailure` waits for.
+    fn re_resolve_endpoints(&mut self) -> usize {
+        if self.pending_re_resolutions.is_empty() {
+            return 0;
+        }
+
+        let Some(regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let pending = std::mem::take(&mut self.pending_re_resolutions);
+        let mut work = 0;
+
+        for (endpoint_id, endpoint_name, existing) in pending {
+            let resolved = crate::udp_channel::resolve_host_and_port_with(
+                &mut *self.resolver,
+                &self.counters,
+                &regions,
+                self.config.name_resolver_threshold_ns,
+                "endpoint",
+                &endpoint_name,
+            );
+
+            match resolved {
+                Ok(address) if Some(address) != existing => {
+                    if self
+                        .sender
+                        .proxy()
+                        .resolution_change(endpoint_id, endpoint_name, address)
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+
+                    // The conductor's own copy follows, because the sender's
+                    // is on another thread and a tag match has to compare
+                    // against where the endpoint sends **now**
+                    // (`aeron_driver_conductor_find_existing_send_channel_endpoint`
+                    // hands the tag match the endpoint's `current_data_addr`).
+                    if let Some(entry) = self.send_endpoints.get_mut(endpoint_id) {
+                        entry.current_data_addr = address;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // The recording is deferred, like every other error this
+                    // pass notices: the regions are held here and
+                    // `record_pending_faults` is the pass that has both the log
+                    // and the counter (`log_error`). The words are the
+                    // reference's own (`aeron_name_resolver.c:204-208`,
+                    // `Unresolved - %s=%s, name-and-port=%s`), because a
+                    // deployment reads this line to find which name went wrong.
+                    let description = format!("Unresolved - endpoint={endpoint_name}, {error}");
+
+                    self.pending_log_errors
+                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Resolve the **control** names the receiver asked about again, and tell
+    /// it what changed
+    /// (`aeron_driver_conductor_execute_re_resolve_control`, `:6957-6990`).
+    ///
+    /// The same shape as [`Self::re_resolve_endpoints`] with one word changed:
+    /// the name is the channel's `control=`, the wrapper is asked with that
+    /// parameter's own name, and what travels back is a destination rather than
+    /// an endpoint.
+    fn re_resolve_controls(&mut self) -> usize {
+        if self.pending_control_re_resolutions.is_empty() {
+            return 0;
+        }
+
+        let Some(regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let pending = std::mem::take(&mut self.pending_control_re_resolutions);
+        let mut work = 0;
+
+        for (endpoint_id, destination, control_name, existing) in pending {
+            let resolved = crate::udp_channel::resolve_host_and_port_with(
+                &mut *self.resolver,
+                &self.counters,
+                &regions,
+                self.config.name_resolver_threshold_ns,
+                "control",
+                &control_name,
+            );
+
+            match resolved {
+                Ok(address) if address != existing => {
+                    if self
+                        .receiver
+                        .proxy()
+                        .resolution_change(endpoint_id, destination, address)
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+
+                    // The conductor's own copy follows, because the receiver's
+                    // is on another thread and a **tag match** is measured
+                    // against where the endpoint answers control frames now
+                    // (`aeron_receive_channel_endpoint_matches_tag`,
+                    // `media/aeron_receive_channel_endpoint.c:668-689`).
+                    if let Some(entry) = self.receive_endpoints.get_mut(endpoint_id) {
+                        entry.control_addr = Some(address);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let description = format!("Unresolved - control={control_name}, {error}");
+
+                    self.pending_log_errors
+                        .push((ERROR_CODE_GENERIC_ERROR, description));
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Resolve a channel through the driver's resolver, which is what times it
+    /// (`crate::udp_channel::resolve_host_and_port_with`, and behind it
+    /// `aeron_time_tracking_name_resolver_resolve`,
+    /// `aeron_driver_native_resource_agent.c:29-60`).
+    fn resolve_channel(
+        resolver: &mut dyn Resolver,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        threshold_ns: i64,
+        unresolved: crate::udp_channel::Unresolved,
+        original_uri: &[u8],
+        uri: &crate::channel_uri::ChannelUri<'_>,
+    ) -> Result<UdpChannel, UdpChannelError> {
+        UdpChannel::resolve_with(
+            &mut crate::udp_channel::Names::Built {
+                resolver,
+                counters,
+                regions,
+                threshold_ns,
+            },
+            unresolved,
+            original_uri,
+            uri,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -5378,16 +5733,29 @@ mod tests {
         assert_eq!(32i64.to_le_bytes(), payload[0..8]);
 
         assert!(
-            conductor.network_publications().is_empty(),
-            "the publication is gone from the driver"
+            !conductor.network_publications().is_empty(),
+            "the client is answered at once, but the publication lingers: it has \
+             not been told to end yet"
         );
+
         // Six counters of its own, freed in the pass that answered the client,
         // and the endpoint's `snd-channel` — which was the last one holding
         // that port — once the sender has confirmed it let the endpoint go.
+        //
+        // The release waits for the publication to **linger out**, because the
+        // endpoint goes with it and a client may be about to publish on that
+        // channel again (`media/aeron_network_publication.c:1048-1069`, and
+        // `:1329-1341` for the window). That is the reference's own five
+        // seconds, so this test waits them.
         assert_eq!(
             counters_before + 7,
             await_counter_frees(&mut conductor, counters_before, 7),
             "all seven came back"
+        );
+
+        assert!(
+            conductor.network_publications().is_empty(),
+            "and the publication is gone once it has lingered"
         );
     }
 
@@ -8524,5 +8892,85 @@ mod tests {
             producer.offer(reopened, &message),
             deepmsg_core::logbuffer::append::Appended::Ok { .. }
         ));
+    }
+    /// The resolver the settings named is **built and started** by the
+    /// conductor, and it is where its counters come from: the neighbor list and
+    /// the cache, with the labels a reader finds them by
+    /// (`aeron_driver_name_resolver.c:234-243`, `:490-497`).
+    #[test]
+    fn a_driver_resolver_is_built_from_the_settings() {
+        let temp = TempDir::new();
+        let port = free_port();
+
+        let config = DriverConfig {
+            name_resolver_supplier: crate::name_resolver::Supplier::Driver,
+            resolver_name: Some("A".to_owned()),
+            resolver_interface: Some(format!("127.0.0.1:{port}")),
+            ..config_with(&temp.0, 10_000_000_000, 1_000_000_000)
+        };
+
+        let cnc = create(&temp.0);
+        let conductor = Conductor::new(cnc, &config).expect("a conductor");
+
+        let regions = counter_regions(&conductor);
+        let reader = regions.reader();
+
+        assert_eq!(
+            format!("Resolver neighbors: bound 127.0.0.1:{port}"),
+            reader
+                .find_by_type_id(crate::position::type_id::NAME_RESOLVER_NEIGHBORS)
+                .expect("the neighbor counter")
+                .label
+        );
+        assert_eq!(
+            "Resolver cache entries: name=A",
+            reader
+                .find_by_type_id(crate::position::type_id::NAME_RESOLVER_CACHE_ENTRIES)
+                .expect("the cache counter")
+                .label
+        );
+
+        // And the settings' own name reaches the counter a reader tells two
+        // drivers apart by (`aeron_driver_conductor.c:848-856`).
+        assert_eq!(
+            "Resolution changes: driverName=A",
+            reader
+                .get(system_counters::id::RESOLUTION_CHANGES)
+                .expect("the resolution-changes counter")
+                .label
+        );
+    }
+
+    /// A resolver that cannot be built is a driver that does not start, which
+    /// is stricter than the reference — its agent records the failure and runs
+    /// on (`aeron_driver_native_resource_agent.c:233-251`). A driver whose
+    /// resolver is not the one it was configured with resolves something else,
+    /// which is not a state worth starting in. `docs/compat.md` records it.
+    #[test]
+    fn a_resolver_that_cannot_be_built_stops_the_driver() {
+        let temp = TempDir::new();
+
+        let config = DriverConfig {
+            name_resolver_supplier: crate::name_resolver::Supplier::Driver,
+            resolver_name: Some("A".to_owned()),
+            resolver_interface: Some("not an interface".to_owned()),
+            ..config_with(&temp.0, 10_000_000_000, 1_000_000_000)
+        };
+
+        let cnc = create(&temp.0);
+        let Err(error) = Conductor::new(cnc, &config) else {
+            panic!("a resolver that cannot be built must stop the driver");
+        };
+
+        assert!(matches!(error, ConductorError::Resolver(_)), "{error}");
+    }
+
+    /// A port nobody is using, taken by binding and letting go.
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("a port")
+            .local_addr()
+            .expect("an address")
+            .port()
     }
 }

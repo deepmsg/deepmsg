@@ -259,6 +259,30 @@ impl Transport for UdpTransport {
         }
     }
 
+    /// Connect the socket somewhere else (`aeron_udp_channel_transport_reconnect`,
+    /// `aeron_udp_channel_transport.c:376-392`), which is how a name that
+    /// resolved to a new address reaches a transport that was already connected
+    /// to the old one.
+    ///
+    /// A transport with **no** connected address is left alone, and that is the
+    /// reference's own test (`NULL != transport->connected_address`, `:380`):
+    /// an unconnected transport names the address on every send, so there is
+    /// nothing to reconnect.
+    ///
+    /// # Errors
+    ///
+    /// The error from `connect(2)`.
+    fn reconnect(&mut self, address: SocketAddr) -> io::Result<()> {
+        if self.connected_address.is_none() {
+            return Ok(());
+        }
+
+        self.socket.connect(address)?;
+        self.connected_address = Some(address);
+
+        Ok(())
+    }
+
     fn local_address(&self) -> io::Result<SocketAddr> {
         // `:917-930`: the channel-status label reports the **receiving**
         // descriptor's name — which for a multicast transport is the wildcard

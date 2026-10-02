@@ -299,6 +299,87 @@ impl DestinationTracker {
     /// Answers with the channel the destination was added with, so that whoever
     /// removes it can close what it opened. The comparison is the reference's
     /// `address_compare` (`:311-321`): family first, then address **and port**.
+    /// The manual destinations that have gone quiet long enough to have their
+    /// names resolved again
+    /// (`aeron_udp_destination_tracker_check_for_re_resolution`, `:402-428`).
+    ///
+    /// One per destination, and only on a **manual** channel: a dynamic one
+    /// learns its destinations from status messages, so an address it stops
+    /// hearing from is one it drops rather than one it re-resolves (`:409-412`).
+    ///
+    /// The activity time is reset by the caller that acts on this, which is the
+    /// reference's own order — the check stamps `time_of_last_activity_ns` as
+    /// it reports, so a destination is asked about once per timeout and not
+    /// once per pass (`:427`).
+    pub fn destinations_to_re_resolve(&self, now_ns: i64, timeout_ns: i64) -> Vec<(usize, String)> {
+        if !self.is_manual_control_mode {
+            return Vec::new();
+        }
+
+        self.destinations
+            .iter()
+            .enumerate()
+            .filter(|(_, destination)| destination.is_expired(now_ns, timeout_ns))
+            .filter_map(|(index, destination)| {
+                destination
+                    .uri
+                    .as_ref()
+                    .and_then(|channel| channel.endpoint_name.clone())
+                    .map(|name| (index, name))
+            })
+            .collect()
+    }
+
+    /// What one of those destinations is called, for the counter's label and
+    /// for the resolver's question.
+    pub fn destination_name(&self, index: usize) -> Option<&str> {
+        self.destinations
+            .get(index)
+            .and_then(|destination| destination.uri.as_ref())
+            .and_then(|channel| channel.endpoint_name.as_deref())
+    }
+
+    /// Stamp a destination as just checked, which is what keeps the re-resolution
+    /// to one per timeout (`:427`, `update_last_activity_ns`).
+    pub fn mark_re_resolution_checked(&mut self, index: usize, now_ns: i64) {
+        if let Some(destination) = self.destinations.get_mut(index) {
+            destination.time_of_last_activity_ns = now_ns;
+        }
+    }
+
+    /// The address a destination currently sends to, which is what a
+    /// re-resolution's answer is compared against
+    /// (`destination->addr`, `:424`).
+    pub fn destination_addr(&self, index: usize) -> Option<SocketAddr> {
+        self.destinations.get(index).and_then(|entry| entry.addr)
+    }
+
+    /// Take an answer: every manual destination whose channel named that
+    /// endpoint moves to the new address
+    /// (`aeron_udp_destination_tracker_resolution_change`, `:431-445`, which
+    /// matches by **name**).
+    ///
+    /// A destination that is not there is not an error: the answer may arrive
+    /// after the destination was removed, and the reference's loop simply finds
+    /// nothing to move.
+    pub fn on_resolution_change(&mut self, endpoint_name: &str, addr: SocketAddr) {
+        if !self.is_manual_control_mode {
+            return;
+        }
+
+        for destination in &mut self.destinations {
+            let matches = destination
+                .uri
+                .as_ref()
+                .and_then(|channel| channel.endpoint_name.as_deref())
+                .is_some_and(|name| name == endpoint_name);
+
+            if matches {
+                destination.addr = Some(addr);
+            }
+        }
+    }
+
     pub fn remove(
         &mut self,
         counters: &CounterManager,
@@ -507,6 +588,10 @@ mod tests {
             _datagrams: &mut crate::sys::socket::Datagrams,
         ) -> std::io::Result<usize> {
             unreachable!("the tracker never receives")
+        }
+
+        fn reconnect(&mut self, _address: std::net::SocketAddr) -> std::io::Result<()> {
+            Ok(())
         }
 
         fn local_address(&self) -> std::io::Result<SocketAddr> {
@@ -719,6 +804,88 @@ mod tests {
                 "and the counter followed"
             );
         }
+    }
+
+    /// A quiet manual destination is one to resolve again, and an answer moves
+    /// it **by name** — which is why a destination keeps the channel it was
+    /// added with (`aeron_udp_destination_tracker_check_for_re_resolution`,
+    /// `:402-428`, and `..._resolution_change`, `:431-445`).
+    ///
+    /// A dynamic channel has none of this: it learns its destinations from
+    /// status messages, so one it stops hearing from is one it drops.
+    #[test]
+    fn a_quiet_manual_destination_is_resolved_again() {
+        let mut fixture = Fixture::new();
+        let (counters, regions, counter_id) = fixture.open();
+        let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
+
+        tracker.manual_add(&counters, &regions, NOW, channel(40124), None, 42);
+        tracker.manual_add(&counters, &regions, NOW, channel(40125), None, 43);
+
+        let quiet_at = NOW + DESTINATION_TIMEOUT_NS + 1;
+
+        assert!(
+            tracker
+                .destinations_to_re_resolve(NOW + DESTINATION_TIMEOUT_NS, DESTINATION_TIMEOUT_NS)
+                .is_empty(),
+            "five seconds is not enough"
+        );
+
+        let due = tracker.destinations_to_re_resolve(quiet_at, DESTINATION_TIMEOUT_NS);
+        assert_eq!(2, due.len(), "both are quiet");
+        assert_eq!(
+            Some("127.0.0.1:40124"),
+            tracker.destination_name(due[0].0),
+            "and a destination is asked about by the name its channel wrote"
+        );
+        assert_eq!(
+            None,
+            tracker.destination_addr(due[0].0),
+            "which never resolved"
+        );
+
+        // Checking one stamps it, so it is not asked about again until another
+        // timeout has passed (`:427`).
+        tracker.mark_re_resolution_checked(due[0].0, quiet_at);
+        assert_eq!(
+            1,
+            tracker
+                .destinations_to_re_resolve(quiet_at, DESTINATION_TIMEOUT_NS)
+                .len()
+        );
+
+        // The answer moves the destinations whose channel named that endpoint,
+        // and only those.
+        let moved: SocketAddr = "127.0.0.2:40124".parse().expect("an address");
+        tracker.on_resolution_change("127.0.0.1:40124", moved);
+
+        assert_eq!(Some(moved), tracker.destination_addr(due[0].0));
+        assert_eq!(
+            None,
+            tracker.destination_addr(due[1].0),
+            "the other destination's name is not this one's"
+        );
+    }
+
+    /// The same check on a **dynamic** channel finds nothing, which is the
+    /// reference's own `if (tracker->is_manual_control_mode)` (`:409-412`).
+    #[test]
+    fn a_dynamic_channel_has_no_destinations_to_resolve_again() {
+        let mut fixture = Fixture::new();
+        let (counters, regions, counter_id) = fixture.open();
+        let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
+
+        tracker.on_status_message(&counters, &regions, 1, &address(40124), NOW);
+
+        assert!(!tracker.is_empty(), "a dynamic channel did learn one");
+        assert!(
+            tracker
+                .destinations_to_re_resolve(
+                    NOW + DESTINATION_TIMEOUT_NS + 1,
+                    DESTINATION_TIMEOUT_NS
+                )
+                .is_empty()
+        );
     }
 
     /// `manual_add_destination` is a no-op on a dynamic channel (`:302-305`),

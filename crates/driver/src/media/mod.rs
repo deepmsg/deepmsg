@@ -105,6 +105,18 @@ pub trait Transport: Send {
     /// An error the caller should record; nothing queued is `Ok(0)`.
     fn receive(&mut self, buffers: &mut [Vec<u8>], datagrams: &mut Datagrams) -> io::Result<usize>;
 
+    /// Point the socket at a different address, which is what a name that
+    /// resolved somewhere else needs
+    /// (`aeron_udp_channel_transport_reconnect`, `:376-392`).
+    ///
+    /// Deliberately **not** a defaulted method: a transport that quietly
+    /// ignored this would leave a re-resolution looking applied.
+    ///
+    /// # Errors
+    ///
+    /// The error from `connect(2)`.
+    fn reconnect(&mut self, address: SocketAddr) -> io::Result<()>;
+
     /// The local address the socket is bound to, which the channel status
     /// counter reports (`aeron_udp_channel_transport_bind_addr_and_port`,
     /// `aeron_udp_channel_transport.c:917-930`).

@@ -1025,13 +1025,25 @@ fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
         .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
         .expect("a second caller on the same channel is given the publication that exists");
 
-    // Both callers name the *publication*, which is the id the reply carries
-    // (`aeron_client_conductor.c:464` builds the client's publication on
-    // `response->registration_id`, not on its own correlation id), so a shared
-    // publication is one object to both of them.
-    assert_eq!(
+    // Two handles on **one** publication, which is what the reference's reply
+    // carries two ids for (`aeron_publication_buffers_ready_t`,
+    // `aeron_driver_conductor.c:2387-2388`): the `correlation_id` of the add
+    // being answered — the handle a client removes by, and the one the C client
+    // keeps as `resource->registration_id` (`aeron_client_conductor.c:332`) —
+    // and the publication's own `registration_id`, which is what the *log
+    // buffer* is keyed by (`:385`) and what every client on the channel shares.
+    assert_ne!(
         first, second,
-        "the second caller is given the publication that already exists"
+        "each add is its own handle, though both are one publication"
+    );
+
+    let first_publication = publisher.publication(first).expect("the first handle");
+    let second_publication = publisher.publication(second).expect("the second handle");
+
+    assert_eq!(
+        first_publication.position_limit_counter_id(),
+        second_publication.position_limit_counter_id(),
+        "and the handles are two views of one log buffer, which is what `pub-lmt` belongs to"
     );
 
     let payload = b"offered through the second add";

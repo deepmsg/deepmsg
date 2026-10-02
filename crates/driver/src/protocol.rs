@@ -71,11 +71,14 @@
 //!
 //! # What is not here
 //!
-//! RES, ATS and EXT payloads. `aeron_resolution_header_t` and its IPv4/IPv6
-//! forms (`:124-149`) describe a *list* of variable-length entries with a
-//! packed(1) layout, and the resolver that walks it is not written yet; only
-//! their contribution to [`is_frame_valid`] — the 22-byte floor a RES packet
-//! must clear (`:255`) — appears below.
+//! ATS and EXT payloads. RES is — see [`ResolutionFrame`], which is the one
+//! frame in this module whose payload is a *run* of variable-length entries:
+//! `aeron_resolution_header_t` and its IPv4/IPv6 forms (`:124-149`) are
+//! packed(1) structs of eight, fourteen or twenty-six bytes, each padded up to
+//! the next eight-byte boundary so that a reader can walk them
+//! (`aeron_res_header_entry_length_ipv4`, `aeron_udp_protocol.c:52-64`). The
+//! frame header in front of them is what [`is_frame_valid`]'s 22-byte floor for
+//! the type counts (`:255`).
 //!
 //! # No unsafe, no allocation
 //!
@@ -2184,5 +2187,532 @@ mod tests {
         // decision rather than an accident.
         assert_eq!(compute_max_message_length(-8), -1);
         assert_eq!(compute_max_message_length(i32::MIN), i32::MIN >> 3);
+    }
+}
+
+/// A `RES` frame: how one resolver tells another about a name
+/// (`aeron_resolution_header_t` and its two tails,
+/// `aeron-client/src/main/c/protocol/aeron_udp_protocol.h:121-146`).
+///
+/// It wears a frame header like every other datagram on this wire — `type` is
+/// `0x07`, `version` is `0`, `frame_length` is the whole datagram — and behind
+/// that header is a *run* of entries rather than one struct: the reference
+/// packs as many as fit into one datagram and pads each up to the next
+/// eight-byte boundary, so that a reader can walk them without knowing how long
+/// a name is (`aeron_driver_name_resolver.c:1034-1082`,
+/// `aeron_res_header_entry_length_ipv4`, `aeron_udp_protocol.c:52-64`).
+///
+/// Reading the entry structs alone — the packed little struct the type names —
+/// and concluding the wire has no frame header on it is a mistake the
+/// reference's own send *and* receive paths both refuse: a datagram that is not
+/// a `RES` frame of version 0 is counted as an invalid packet and dropped
+/// (`:740-742`), and the reference's dissection test builds its packet as
+/// header-then-entries (`aeron_name_resolver_test.cpp:1004-1032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionFrame<'a> {
+    /// The frame header: `type` is [`frame_type::RES`], `version` is
+    /// [`VERSION`], and `frame_length` counts the entries and their padding
+    /// (`aeron_driver_name_resolver.c:948-953`).
+    pub header: FrameHeader,
+    /// The datagram the header was read from, entries and all.
+    packet: &'a [u8],
+}
+
+impl<'a> ResolutionFrame<'a> {
+    /// Read the frame at the front of `packet`.
+    ///
+    /// `None` when there is no whole header, when its `version` is not
+    /// [`VERSION`], or when its `type` is not [`frame_type::RES`] — the checks
+    /// the reference's receive callback makes before it looks at any entry
+    /// (`aeron_driver_name_resolver.c:737-755`).
+    ///
+    /// The entries run to the end of **the datagram** and not to
+    /// `frame_length`: the reference's receive loop walks
+    /// `length - sizeof(aeron_frame_header_t)` bytes and never reads the length
+    /// it was sent (`:738`, `:746`, `:822`).
+    pub fn read(packet: &'a [u8]) -> Option<Self> {
+        let header = FrameHeader::read(packet)?;
+
+        if header.version != VERSION || header.frame_type != frame_type::RES {
+            return None;
+        }
+
+        Some(Self { header, packet })
+    }
+
+    /// The bytes behind the header: the run of entries and nothing else.
+    ///
+    /// What a caller walks when it has to tell *why* the run ended — the
+    /// reference's receive loop counts a truncated datagram and an entry of an
+    /// unknown type differently (`aeron_driver_name_resolver.c:769-774` versus
+    /// `:794-799`), and an iterator that stops cannot say which happened.
+    pub fn entry_bytes(&self) -> &'a [u8] {
+        self.packet.get(HEADER_LENGTH..).unwrap_or_default()
+    }
+
+    /// The entries, walked the way the reference's receive loop walks them
+    /// (`:748-823`).
+    pub fn entries(&self) -> ResolutionEntries<'a> {
+        ResolutionEntries {
+            remaining: self.entry_bytes(),
+            malformed: false,
+        }
+    }
+}
+
+/// One `RES` frame's entries, in the order they were written.
+///
+/// A walk ends early when it meets something that is not an entry, and that is
+/// not the same thing as reaching the end: the reference counts the datagram as
+/// invalid and returns (`aeron_driver_name_resolver.c:751-756`, `:769-774`), so
+/// [`ResolutionEntries::malformed`] is how a caller tells the two apart — an
+/// iterator's `None` says "no more" either way.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolutionEntries<'a> {
+    remaining: &'a [u8],
+    malformed: bool,
+}
+
+impl<'a> ResolutionEntries<'a> {
+    /// Whether **this** walk stopped on an entry it could not read. The flag
+    /// belongs to the walk, not to the frame: it is only meaningful once the
+    /// iterator has been run to its end.
+    pub const fn malformed(&self) -> bool {
+        self.malformed
+    }
+}
+
+impl<'a> Iterator for ResolutionEntries<'a> {
+    type Item = ResolutionDatagram<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+
+        let Some(entry) = ResolutionDatagram::read(self.remaining) else {
+            self.malformed = true;
+            self.remaining = &[];
+            return None;
+        };
+
+        // An entry is padded up to the boundary the next one starts on, and a
+        // datagram that does not carry that padding is not one the reference
+        // reads: it compares what it received with the *padded* entry length
+        // (`:769-770`, `:783-784`).
+        let Some(rest) = self.remaining.get(entry.entry_length()..) else {
+            self.malformed = true;
+            self.remaining = &[];
+            return None;
+        };
+
+        self.remaining = rest;
+        Some(entry)
+    }
+}
+
+/// One entry of a [`ResolutionFrame`]: a name, the address it stands for, and
+/// how old that answer is (`aeron_resolution_header_ipv4_t` and
+/// `aeron_resolution_header_ipv6_t`, `:135-149`).
+///
+/// The layout is the packed C struct: eight bytes of entry header, then the
+/// address (four or sixteen, **chosen by `res_type`** and written nowhere),
+/// then the name's length as an `int16` and the name. The name is the *channel*
+/// name being resolved — the whole `host:port` text a URI wrote, not the host
+/// alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolutionDatagram<'a> {
+    /// `AERON_RES_HEADER_TYPE_NAME_TO_IP4_MD` or `..._IP6_MD`, which is also
+    /// what says how long the address that follows is.
+    pub res_type: i8,
+    /// `AERON_RES_HEADER_SELF_FLAG` when the sender is resolving its own name
+    /// (`aeron_driver_name_resolver.c:801`, `:941`).
+    pub res_flags: u8,
+    /// The port the name resolves to. The address that follows carries no port
+    /// of its own, so this is where it lives.
+    pub udp_port: u16,
+    /// How old the sender's answer is (`age_in_ms`), so a neighbor can prefer
+    /// the freshest.
+    pub age_in_ms: i32,
+    /// The address that follows the header.
+    pub address: std::net::IpAddr,
+    /// The name this is an answer about.
+    pub name: &'a [u8],
+}
+
+/// `AERON_RES_HEADER_TYPE_NAME_TO_IP4_MD` (`aeron_udp_protocol.h:207`).
+pub const RES_TYPE_NAME_TO_IP4: i8 = 0x01;
+
+/// `AERON_RES_HEADER_TYPE_NAME_TO_IP6_MD` (`:208`).
+pub const RES_TYPE_NAME_TO_IP6: i8 = 0x02;
+
+/// `AERON_RES_HEADER_SELF_FLAG` (`:209`).
+pub const RES_FLAG_SELF: u8 = 0x80;
+
+/// The header itself (`aeron_resolution_header_t`): `int8`, `uint8`, `uint16`,
+/// `int32` — eight bytes, packed.
+const RES_HEADER_LENGTH: usize = 8;
+
+impl<'a> ResolutionDatagram<'a> {
+    /// The entry's own bytes: its header, the address its type sizes, the
+    /// name's length and the name.
+    pub const fn length(&self) -> usize {
+        RES_HEADER_LENGTH + self.address_bytes() + 2 + self.name.len()
+    }
+
+    /// How many bytes the entry takes *in a datagram*, which is
+    /// [`length`](Self::length) rounded up to the boundary the next entry
+    /// starts on (`AERON_ALIGN(sizeof(aeron_resolution_header_ipv4_t) +
+    /// name_length, sizeof(int64_t))`, `aeron_udp_protocol.c:52-64`).
+    ///
+    /// The padding is not decoration: it is what a reader advances by, and the
+    /// reference refuses a datagram that does not carry it (`:769-770`).
+    pub const fn entry_length(&self) -> usize {
+        align_to_eight(self.length())
+    }
+
+    /// How long the address in this entry is, which its type decides.
+    pub const fn address_bytes(&self) -> usize {
+        if self.res_type == RES_TYPE_NAME_TO_IP6 {
+            16
+        } else {
+            4
+        }
+    }
+
+    /// Read the entry at the front of `entry` — which may be a whole datagram
+    /// or the run of bytes a [`ResolutionFrame`] walk is standing on
+    /// (`aeron_driver_name_resolver_receive`, `aeron_driver_name_resolver.c:756-799`,
+    /// which reads the type, then the header, then the address the type names).
+    ///
+    /// `None` when the bytes are shorter than the entry says they are, or when
+    /// its type is not one of the two — a resolver that guessed at the address
+    /// length would read a name out of the middle of something else.
+    pub fn read(entry: &'a [u8]) -> Option<Self> {
+        if entry.len() < RES_HEADER_LENGTH {
+            return None;
+        }
+
+        let res_type = entry[0] as i8;
+        let res_flags = entry[1];
+        let udp_port = u16::from_le_bytes([entry[2], entry[3]]);
+        let age_in_ms = i32::from_le_bytes(entry[4..8].try_into().ok()?);
+
+        let address_bytes = match res_type {
+            RES_TYPE_NAME_TO_IP4 => 4,
+            RES_TYPE_NAME_TO_IP6 => 16,
+            _ => return None,
+        };
+
+        let name_at = RES_HEADER_LENGTH + address_bytes;
+        let name_length = usize::try_from(i16::from_le_bytes(
+            entry.get(name_at..name_at + 2)?.try_into().ok()?,
+        ))
+        .ok()?;
+
+        let address = match address_bytes {
+            4 => std::net::IpAddr::from(
+                <[u8; 4]>::try_from(&entry[RES_HEADER_LENGTH..name_at]).ok()?,
+            ),
+            _ => std::net::IpAddr::from(
+                <[u8; 16]>::try_from(&entry[RES_HEADER_LENGTH..name_at]).ok()?,
+            ),
+        };
+
+        let name = entry.get(name_at + 2..name_at + 2 + name_length)?;
+
+        Some(Self {
+            res_type,
+            res_flags,
+            udp_port,
+            age_in_ms,
+            address,
+            name,
+        })
+    }
+
+    /// Write one entry, answering with how many bytes it took — the **padded**
+    /// [`entry_length`](Self::entry_length), which is what a caller filling a
+    /// datagram advances by.
+    ///
+    /// `None` when the buffer is too small for the entry and its padding: the
+    /// reference answers `0` there and its caller stops filling the datagram,
+    /// leaving the entry for the next one (`aeron_driver_name_resolver.c:1043-1058`).
+    ///
+    /// The bytes between the name and the next boundary are written as **zero**.
+    /// The reference leaves them as whatever the buffer held, because it appends
+    /// into one reused buffer (`:1031-1062`), so nothing about them is a wire
+    /// format and no reader looks at them.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        let length = self.length();
+        let entry_length = self.entry_length();
+
+        if out.len() < entry_length {
+            return None;
+        }
+
+        out[0] = self.res_type as u8;
+        out[1] = self.res_flags;
+        out[2..4].copy_from_slice(&self.udp_port.to_le_bytes());
+        out[4..8].copy_from_slice(&self.age_in_ms.to_le_bytes());
+
+        let address_bytes = self.address_bytes();
+        match self.address {
+            std::net::IpAddr::V4(address) => {
+                if address_bytes != 4 {
+                    return None;
+                }
+
+                out[RES_HEADER_LENGTH..RES_HEADER_LENGTH + 4].copy_from_slice(&address.octets());
+            }
+            std::net::IpAddr::V6(address) => {
+                if address_bytes != 16 {
+                    return None;
+                }
+
+                out[RES_HEADER_LENGTH..RES_HEADER_LENGTH + 16].copy_from_slice(&address.octets());
+            }
+        }
+
+        let name_at = RES_HEADER_LENGTH + address_bytes;
+        let name_length = i16::try_from(self.name.len()).ok()?;
+        out[name_at..name_at + 2].copy_from_slice(&name_length.to_le_bytes());
+        out[name_at + 2..length].copy_from_slice(self.name);
+        out[length..entry_length].fill(0);
+
+        Some(entry_length)
+    }
+}
+
+/// `AERON_ALIGN(value, alignment)` (`aeron-client/src/main/c/util/aeron_bitutil.h:35`)
+/// for the one alignment this module needs: an entry is padded to the eight
+/// bytes of an `int64`, which is where the next entry starts.
+const fn align_to_eight(value: usize) -> usize {
+    (value + 7) & !7
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    /// Write a `RES` frame of these entries the way the reference writes one:
+    /// a frame header, then the entries, then whatever it took.
+    fn frame(entries: &[ResolutionDatagram<'_>]) -> Vec<u8> {
+        let frame_length = HEADER_LENGTH
+            + entries
+                .iter()
+                .map(ResolutionDatagram::entry_length)
+                .sum::<usize>();
+        let mut packet = vec![0u8; frame_length];
+
+        FrameHeader {
+            frame_length: frame_length as i32,
+            version: VERSION,
+            flags: 0,
+            frame_type: frame_type::RES,
+        }
+        .write(&mut packet)
+        .expect("room for a header");
+
+        let mut offset = HEADER_LENGTH;
+        for entry in entries {
+            offset += entry
+                .write(&mut packet[offset..])
+                .expect("room for an entry");
+        }
+        assert_eq!(frame_length, offset);
+
+        packet
+    }
+
+    /// An entry is eight bytes of entry header, the address its type sizes, the
+    /// name's length and the name — and it round-trips through both families,
+    /// which is the whole of what a reader can get wrong: **the address length
+    /// is not written anywhere**, it is the type that says it.
+    #[test]
+    fn an_entry_round_trips_in_both_families() {
+        let name = b"localhost:8051";
+
+        let v4 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: RES_FLAG_SELF,
+            udp_port: 8051,
+            age_in_ms: 17,
+            address: "192.168.0.1".parse().expect("an address"),
+            name,
+        };
+
+        assert_eq!(8 + 4 + 2 + name.len(), v4.length());
+
+        let mut buffer = [0u8; 64];
+        let written = v4.write(&mut buffer).expect("room");
+        assert_eq!(v4.entry_length(), written);
+        assert_eq!(Some(v4), ResolutionDatagram::read(&buffer[..written]));
+
+        let v6 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP6,
+            res_flags: 0,
+            udp_port: 8052,
+            age_in_ms: -3,
+            address: "::1".parse().expect("an address"),
+            name,
+        };
+
+        assert_eq!(8 + 16 + 2 + name.len(), v6.length());
+
+        let mut buffer = [0u8; 64];
+        let written = v6.write(&mut buffer).expect("room");
+        assert_eq!(Some(v6), ResolutionDatagram::read(&buffer[..written]));
+    }
+
+    /// An entry's length in a datagram is its own bytes rounded **up** to the
+    /// next eight-byte boundary, and the bytes in between are zero: they are
+    /// what the next entry starts after, so a writer that did not pad would put
+    /// a name in the middle of the reader's next entry.
+    #[test]
+    fn an_entry_is_padded_to_the_next_boundary() {
+        let entry = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: 0,
+            udp_port: 8051,
+            age_in_ms: 0,
+            address: "127.0.0.1".parse().expect("an address"),
+            name: b"a:1",
+        };
+
+        assert_eq!(8 + 4 + 2 + 3, entry.length());
+        assert_eq!(24, entry.entry_length(), "eighteen bytes up to twenty-four");
+
+        let mut buffer = [0xFFu8; 24];
+        assert_eq!(Some(24), entry.write(&mut buffer));
+        assert_eq!(
+            [0u8; 7],
+            buffer[entry.length()..24],
+            "the padding is written, and it is zero"
+        );
+
+        assert_eq!(
+            None,
+            entry.write(&mut buffer[..23]),
+            "a buffer that holds the entry but not its padding takes neither"
+        );
+    }
+
+    /// A datagram carries a **run** of entries, each starting where the padded
+    /// length of the one before it ended — which is the shape the reference's
+    /// own dissection test builds, an IPv6 entry and an IPv4 entry in one
+    /// packet (`aeron_name_resolver_test.cpp:1004-1032`, whose `res_offset`
+    /// arithmetic is these two numbers).
+    #[test]
+    fn a_frame_carries_a_run_of_entries() {
+        let v6 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP6,
+            res_flags: RES_FLAG_SELF,
+            udp_port: 9872,
+            age_in_ms: 100,
+            address: "::1".parse().expect("an address"),
+            name: b"ABCDEFHG",
+        };
+        let v4 = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: 0b0011_0011,
+            udp_port: 8080,
+            age_in_ms: 333,
+            address: "127.0.0.1".parse().expect("an address"),
+            name: b"test",
+        };
+
+        assert_eq!(40, v6.entry_length(), "the reference's own first length");
+        assert_eq!(24, v4.entry_length(), "and its second");
+
+        let packet = frame(&[v6, v4]);
+
+        assert_eq!(72, packet.len(), "8 + 40 + 24, which is the frame_length");
+        assert_eq!(
+            72,
+            FrameHeader::read(&packet).expect("a header").frame_length
+        );
+
+        let frame = ResolutionFrame::read(&packet).expect("a RES frame");
+        let mut entries = frame.entries();
+        let walked: Vec<_> = entries.by_ref().collect();
+
+        assert_eq!(vec![v6, v4], walked);
+        assert!(
+            !entries.malformed(),
+            "and the walk reached the end of the datagram"
+        );
+    }
+
+    /// The frame header is not optional: the entries on their own are not a
+    /// datagram the reference reads. Its receive callback refuses anything whose
+    /// `version` is not the frame version before it looks at an entry
+    /// (`aeron_driver_name_resolver.c:740-742`).
+    #[test]
+    fn a_bare_entry_is_not_a_frame() {
+        let entry = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: RES_FLAG_SELF,
+            udp_port: 8051,
+            age_in_ms: 0,
+            address: "127.0.0.1".parse().expect("an address"),
+            name: b"localhost:8051",
+        };
+
+        let mut bare = vec![0u8; entry.entry_length()];
+        entry.write(&mut bare).expect("room");
+
+        assert_eq!(None, ResolutionFrame::read(&bare));
+
+        // And the same bytes behind a header of the wrong type are not one
+        // either, which is what makes the type a check rather than a label.
+        let mut wrong_type = frame(&[entry]);
+        wrong_type[6..8].copy_from_slice(&frame_type::DATA.to_le_bytes());
+        assert_eq!(None, ResolutionFrame::read(&wrong_type));
+    }
+
+    /// A type that is neither of the two is not an entry this build reads:
+    /// guessing the address length would take a name out of the middle of an
+    /// address.
+    #[test]
+    fn only_the_two_types_are_read() {
+        let mut packet = [0u8; 32];
+        packet[0] = 0x07;
+
+        assert_eq!(None, ResolutionDatagram::read(&packet));
+        assert_eq!(None, ResolutionDatagram::read(&packet[..4]));
+    }
+
+    /// A name that does not fit the bytes it claims is not an entry either, and
+    /// an entry whose padding the datagram does not carry ends the walk as a
+    /// **malformed** one rather than as the end of the run
+    /// (`aeron_driver_name_resolver.c:769-774`, where that costs a datagram).
+    #[test]
+    fn a_truncated_entry_is_malformed_and_not_the_end() {
+        let entry = ResolutionDatagram {
+            res_type: RES_TYPE_NAME_TO_IP4,
+            res_flags: 0,
+            udp_port: 8051,
+            age_in_ms: 0,
+            address: "127.0.0.1".parse().expect("an address"),
+            name: b"a:1",
+        };
+        let mut long_name = vec![0u8; 8 + 4 + 2 + 4];
+        long_name[0] = RES_TYPE_NAME_TO_IP4 as u8;
+        long_name[12..14].copy_from_slice(&100i16.to_le_bytes());
+        assert_eq!(None, ResolutionDatagram::read(&long_name));
+
+        let packet = frame(&[entry]);
+        let frame = ResolutionFrame::read(&packet).expect("a RES frame");
+        assert_eq!(1, frame.entries().count(), "the whole entry is there");
+
+        // One byte short of the padded entry length, which is what a datagram
+        // that wrote the entry and not its padding looks like.
+        let short = &packet[..packet.len() - 1];
+        let frame = ResolutionFrame::read(short).expect("still a frame header");
+        let mut entries = frame.entries();
+
+        assert_eq!(0, entries.by_ref().count(), "the entry is not handed out");
+        assert!(entries.malformed(), "and the walk is not the clean end");
     }
 }

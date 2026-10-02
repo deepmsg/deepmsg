@@ -139,10 +139,32 @@ pub struct SendChannelEndpoint {
     /// zero, and then the port the kernel chose is readable from nowhere else.
     /// A client that has to tell someone where to reply finds it here.
     local_sockaddr_counter_id: i32,
-    /// Where data is sent. The channel's remote address; nothing here
-    /// re-resolves it, and `docs/compat.md`'s name-resolution row is where that
-    /// absence is recorded.
+    /// The port the wildcard port manager gave this endpoint, and zero when it
+    /// gave none (`aeron_wildcard_port_manager_get_managed_port`,
+    /// `aeron_port_manager.c:121-163`).
+    ///
+    /// Zero is the ordinary case: a channel that named a port keeps it, and a
+    /// channel that named none keeps the kernel's — and the kernel's port is
+    /// not the manager's to take back (`free_managed_port`, `:170-173`). What
+    /// a non-zero port here means is that the manager is holding it for this
+    /// endpoint, and that the endpoint owes it back when it is deleted.
+    ///
+    /// The reference keeps the whole address for this (`endpoint->bind_addr`)
+    /// and hands it back whole; the port is the only part of it the table has.
+    managed_port: u16,
+    /// Where data is sent: the channel's remote address, unless a
+    /// re-resolution has moved it (`current_data_addr`,
+    /// `aeron_send_channel_endpoint.h:52`).
     current_data_addr: SocketAddr,
+    /// When the last status message for one of this endpoint's publications
+    /// arrived (`time_of_last_sm_ns`, `:232` at creation, `:658` on a status
+    /// message).
+    ///
+    /// It is how "this endpoint has no connection" is spelled: a channel with
+    /// an explicit endpoint that has heard nothing for
+    /// [`DESTINATION_TIMEOUT_NS`] has its name resolved again
+    /// (`:754-774`).
+    time_of_last_sm_ns: i64,
     /// Where this endpoint sends, when its channel has several destinations
     /// (`destination_tracker`, `aeron_send_channel_endpoint.h:62`).
     ///
@@ -177,13 +199,16 @@ impl SendChannelEndpoint {
     ///
     /// [`SendEndpointError::NoCounter`] when the manager is full, or the
     /// syscall's error when the socket cannot be opened.
+    #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     pub fn create(
         channel: UdpChannel,
+        port_manager: &mut crate::port_manager::WildcardPortManager,
         params: &TransportParams,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
+        now_ns: i64,
     ) -> Result<Self, SendEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -216,6 +241,15 @@ impl SendChannelEndpoint {
             channel.local_control
         };
 
+        // `:112-120`: the port the channel named, or the one the manager hands
+        // it, or the kernel's — asked **before** the socket is opened, because
+        // this is where a driver that has run out of ports refuses the
+        // publication rather than binding something nobody will find.
+        let bind = port_manager
+            .get_managed_port(&channel, bind)
+            .map_err(SendEndpointError::Port)?;
+        let managed_port = bind.port();
+
         let transport = match super::udp_transport::UdpTransport::open(
             bind,
             Some(channel.local_control),
@@ -227,6 +261,12 @@ impl SendChannelEndpoint {
                 // The counter was allocated for an endpoint that will not
                 // exist; leaving it behind would be a counter nobody owns.
                 counters.free(regions, channel_status_counter_id, now_ms);
+                // And the port, which the manager is holding for an endpoint
+                // that will not exist either: the reference gives it back in
+                // the delete its `goto error` reaches
+                // (`media/aeron_send_channel_endpoint.c:229-232`, whose delete
+                // frees the managed port at `:278-281`).
+                port_manager.free_managed_port(managed_port);
                 // A bind failure is the one the reference composes a chain
                 // for on this side too (`media/aeron_send_channel_endpoint.c:142`
                 // and the two layers above it); anything else keeps its error.
@@ -245,8 +285,10 @@ impl SendChannelEndpoint {
                 Ok(tracker) => tracker,
                 Err(error) => {
                     // The counter was allocated for an endpoint that will not
-                    // exist, exactly as for a socket that would not open.
+                    // exist, exactly as for a socket that would not open — and
+                    // the port goes back with it.
                     counters.free(regions, channel_status_counter_id, now_ms);
+                    port_manager.free_managed_port(managed_port);
                     return Err(error);
                 }
             };
@@ -272,12 +314,14 @@ impl SendChannelEndpoint {
 
         Ok(Self {
             current_data_addr: channel.remote_data,
+            time_of_last_sm_ns: now_ns,
             channel,
             transport: Box::new(transport),
             data_loss_generator: None,
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            managed_port,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -291,6 +335,7 @@ impl SendChannelEndpoint {
     /// # Errors
     ///
     /// [`SendEndpointError::NoCounter`] when the manager is full.
+    #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     pub fn with_transport(
         channel: UdpChannel,
         transport: Box<dyn Transport>,
@@ -299,6 +344,7 @@ impl SendChannelEndpoint {
         regions: &CounterRegions<'_>,
         registration_id: i64,
         now_ms: i64,
+        now_ns: i64,
     ) -> Result<Self, SendEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -341,12 +387,17 @@ impl SendChannelEndpoint {
 
         Ok(Self {
             current_data_addr: channel.remote_data,
+            time_of_last_sm_ns: now_ns,
             channel,
             transport,
             data_loss_generator: None,
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            // A transport a caller built was not bound by the manager, so
+            // there is no port to give back — the tests' seam, and the one
+            // place a zero here is not a kernel-chosen port.
+            managed_port: 0,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
@@ -356,6 +407,75 @@ impl SendChannelEndpoint {
     /// The channel-status counter a client reads.
     pub const fn channel_status_counter_id(&self) -> i32 {
         self.channel_status_counter_id
+    }
+
+    /// A status message arrived for one of this endpoint's publications, which
+    /// is the whole of what "this endpoint has a connection" means
+    /// (`aeron_send_channel_endpoint.c:658`).
+    pub const fn on_status_message(&mut self, now_ns: i64) {
+        self.time_of_last_sm_ns = now_ns;
+    }
+
+    /// Whether this endpoint's channel has to be resolved again
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    ///
+    /// Three conditions and a clock, in the reference's order:
+    ///
+    /// * a **manual** channel is the destination tracker's business, not this
+    ///   endpoint's — it has no single address to reconnect (`:757-761`);
+    /// * a multicast channel is left alone: its endpoint is a group, and a name
+    ///   that resolved to a group is not re-resolved at all;
+    /// * only a channel that **named** an endpoint has a name to ask about
+    ///   (`:763`), and a response channel is not one of them (`:764`);
+    /// * and only when nothing has been heard from the other side for
+    ///   [`DESTINATION_TIMEOUT_NS`] (`:765`) — which is "this endpoint has no
+    ///   connection", spelled as a clock.
+    pub fn needs_re_resolution(&self, now_ns: i64) -> bool {
+        self.channel.control_mode != ControlMode::Manual
+            && !self.channel.is_multicast
+            && self.channel.has_explicit_endpoint
+            && self.channel.control_mode != ControlMode::Response
+            && now_ns > self.time_of_last_sm_ns + DESTINATION_TIMEOUT_NS
+    }
+
+    /// What this endpoint's name is, for the resolver to be asked about it
+    /// (`endpoint_name`, `:768`).
+    pub fn endpoint_name(&self) -> Option<&str> {
+        self.channel.endpoint_name.as_deref()
+    }
+
+    /// The address a re-resolution is measured against, so that an answer that
+    /// is the same address is not a change (`:6932-6938`, the `memcmp` that
+    /// decides whether anything happens at all).
+    pub const fn remote_data_addr(&self) -> SocketAddr {
+        self.current_data_addr
+    }
+
+    /// Take the answer (`aeron_send_channel_endpoint_resolution_change`,
+    /// `:776-800`).
+    ///
+    /// A channel with several destinations hands it to the tracker, which
+    /// matches destinations by name; a channel with one **reconnects** its
+    /// transport, because that is the only thing its address was.
+    ///
+    /// # Errors
+    ///
+    /// The syscall's error when the transport cannot be reconnected.
+    pub fn on_resolution_change(
+        &mut self,
+        endpoint_name: &str,
+        new_addr: SocketAddr,
+    ) -> std::io::Result<()> {
+        if let Some(tracker) = self.destination_tracker.as_mut() {
+            tracker.on_resolution_change(endpoint_name, new_addr);
+
+            return Ok(());
+        }
+
+        self.transport.reconnect(new_addr)?;
+        self.current_data_addr = new_addr;
+
+        Ok(())
     }
 
     /// Where this endpoint sends when its channel has several destinations, so
@@ -415,6 +535,17 @@ impl SendChannelEndpoint {
     /// this endpoint's socket was bound to.
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// The port the wildcard port manager is holding for this endpoint, and
+    /// zero when it holds none.
+    ///
+    /// The registry reads this to put it on the entry beside the counters, so
+    /// that the port goes back when the sender has let the endpoint go
+    /// (`aeron_send_channel_endpoint_delete`, `:278-281`) — the endpoint itself
+    /// is on the sender's thread by then, and the manager is not.
+    pub const fn managed_port(&self) -> u16 {
+        self.managed_port
     }
 
     /// Add a publication to the dispatch map
@@ -651,6 +782,13 @@ pub enum SendEndpointError {
     Bind(Box<deepmsg_cnc::error_log::ErrorReport>),
     /// The socket could not be opened or connected.
     Socket(io::Error),
+    /// The wildcard port manager had no port left to give
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:93-104`).
+    ///
+    /// The words are the manager's own and they travel as they are: a client
+    /// that has run a driver out of ports reads them in its
+    /// `RegistrationException` (`WildcardPortManagerSystemTest.java:90`).
+    Port(crate::port_manager::PortError),
 }
 
 impl std::fmt::Display for SendEndpointError {
@@ -659,6 +797,7 @@ impl std::fmt::Display for SendEndpointError {
             Self::NoCounter => f.write_str("could not allocate the send channel status counter"),
             Self::Bind(report) => f.write_str(report.text()),
             Self::Socket(error) => write!(f, "{error}"),
+            Self::Port(error) => write!(f, "{error}"),
         }
     }
 }
@@ -787,7 +926,15 @@ mod tests {
     use super::*;
 
     use crate::channel_uri::ChannelUri;
+    use crate::port_manager::{PortRange, WildcardPortManager};
     use deepmsg_core::buffer::AtomicBuffer;
+
+    /// The manager a test that is not about ports wants: a sender's with no
+    /// range set, which hands nothing out and leaves the kernel to pick — the
+    /// behaviour every endpoint had before the manager existed.
+    fn ports() -> WildcardPortManager {
+        WildcardPortManager::sender()
+    }
 
     #[repr(align(64))]
     struct Region(Vec<u8>);
@@ -818,6 +965,10 @@ mod tests {
         }
     }
 
+    /// When the endpoints below were created, so that the five-second timeout
+    /// is a number and not a wall clock.
+    const TIMEOUT_START_NS: i64 = 1_000_000_000;
+
     fn channel(uri: &str) -> UdpChannel {
         let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
         UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
@@ -831,6 +982,133 @@ mod tests {
         }
     }
 
+    /// An endpoint's own clock: only a **unicast** channel that named an
+    /// endpoint, is not a response channel, and has heard nothing for five
+    /// seconds has a name to resolve again
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    ///
+    /// The four other shapes are the reference's own exclusions, and each one is
+    /// a different reason: a manual channel's addresses are its destinations'
+    /// (which have their own check), a multicast channel's endpoint is a group,
+    /// a channel that named no endpoint has no name, and a response channel's
+    /// address belongs to the stream that asked for it.
+    #[test]
+    fn only_a_quiet_unicast_endpoint_is_resolved_again() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let build = |counters: &mut CounterManager, regions: &CounterRegions<'_>, uri: &str| {
+            SendChannelEndpoint::create(
+                channel(uri),
+                &mut ports(),
+                &TransportParams::default(),
+                counters,
+                regions,
+                7,
+                1_000_000,
+                TIMEOUT_START_NS,
+            )
+            .expect("an endpoint")
+        };
+
+        let mut unicast = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40123",
+        );
+        let manual = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40124|control-mode=manual",
+        );
+        let multicast = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=224.0.1.1:40125",
+        );
+        let response = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?endpoint=127.0.0.1:40126|control-mode=response",
+        );
+        let unaddressed = build(
+            &mut counters,
+            &regions,
+            "aeron:udp?control=127.0.0.1:40127|control-mode=manual",
+        );
+
+        let just_inside = TIMEOUT_START_NS + DESTINATION_TIMEOUT_NS;
+        let just_past = TIMEOUT_START_NS + DESTINATION_TIMEOUT_NS + 1;
+
+        assert!(
+            !unicast.needs_re_resolution(just_inside),
+            "five seconds is not enough"
+        );
+        assert!(
+            unicast.needs_re_resolution(just_past),
+            "and five seconds and a nanosecond is"
+        );
+
+        assert!(
+            !manual.needs_re_resolution(just_past),
+            "manual is the tracker's"
+        );
+        assert!(
+            !multicast.needs_re_resolution(just_past),
+            "a group has no name to ask about"
+        );
+        assert!(
+            !response.needs_re_resolution(just_past),
+            "a response channel is not one"
+        );
+        assert!(
+            !unaddressed.needs_re_resolution(just_past),
+            "a channel with destinations is the tracker's business too"
+        );
+
+        // And a status message is what "it is connected" means: the clock
+        // starts again from it (`aeron_send_channel_endpoint.c:658`).
+        unicast.on_status_message(just_past);
+        assert!(
+            !unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS),
+            "ten seconds after a status message is five seconds after one"
+        );
+        assert!(unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS + 1));
+    }
+
+    /// The answer to a re-resolution reaches a **unicast** endpoint by
+    /// reconnecting its transport, which is a thing a socket can be asked about
+    /// (`aeron_send_channel_endpoint_resolution_change`, `:776-800`).
+    #[test]
+    fn an_answer_moves_a_unicast_endpoint() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1_000_000,
+            TIMEOUT_START_NS,
+        )
+        .expect("an endpoint");
+
+        let moved: SocketAddr = "127.0.0.2:40123".parse().expect("an address");
+        endpoint
+            .on_resolution_change("somewhere:40123", moved)
+            .expect("the transport reconnects");
+
+        assert_eq!(moved, endpoint.remote_data_addr());
+        assert_eq!(
+            Some("127.0.0.1:40123"),
+            endpoint.endpoint_name(),
+            "and the name it was parsed with is kept, which is what a re-resolution asks about"
+        );
+    }
+
     #[test]
     fn a_publication_is_reachable_by_its_stream_and_session() {
         let mut fixture = Fixture::new();
@@ -838,11 +1116,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -878,11 +1158,13 @@ mod tests {
 
         let endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -919,11 +1201,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -965,11 +1249,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1032,11 +1318,13 @@ mod tests {
             channel(&format!(
                 "aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
             )),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect_err("the address is taken");
 
@@ -1078,6 +1366,79 @@ mod tests {
         );
     }
 
+    /// The port the manager names is the port the socket binds, and a socket
+    /// that will not bind gives it back.
+    ///
+    /// Both halves are proved by the same trick: the port is taken first, so a
+    /// `create` that ignored the manager's answer would bind a **free**
+    /// kernel-chosen port and succeed. It does not — it reports `EADDRINUSE`
+    /// for the managed port — and once the port is free again the same manager
+    /// hands it out a second time, which it could only do if the failed
+    /// create had given it back.
+    #[test]
+    fn the_managed_port_is_the_one_the_socket_binds_and_a_failure_gives_it_back() {
+        let taken = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        taken
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        let managed = taken.local_address().expect("a bound address").port();
+
+        let mut manager = WildcardPortManager::sender();
+        manager.set_range(PortRange {
+            low: managed,
+            high: managed,
+        });
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let error = SendChannelEndpoint::create(
+            channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
+            &mut manager,
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            1,
+            1_000_000,
+        )
+        .expect_err("the managed port is taken");
+
+        let SendEndpointError::Bind(report) = error else {
+            panic!("a bind failure is a bind report, not {error}");
+        };
+
+        assert!(
+            report.text().contains(&format!(
+                "] failed to bind({}, 127.0.0.1:{managed})\n",
+                report_fd(&report)
+            )),
+            "the socket tried to bind the managed port: {}",
+            report.text()
+        );
+        assert_eq!(98, report.code());
+
+        // The probe goes, and the port comes back round — which is the free in
+        // the create's error path (`aeron_send_channel_endpoint_delete`,
+        // `:278-281`, reached by the create's `goto error`).
+        drop(taken);
+
+        let endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
+            &mut manager,
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            8,
+            2,
+            2_000_000,
+        )
+        .expect("the port came back");
+
+        assert_eq!(managed, endpoint.managed_port());
+    }
+
     /// A unicast endpoint has nowhere to fan out to: it sends to the one
     /// address its channel named
     /// (`aeron_send_channel_endpoint_create`, `:76-88`).
@@ -1088,11 +1449,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1109,11 +1472,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1156,11 +1521,13 @@ mod tests {
 
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            &mut ports(),
             &TransportParams::default(),
             &mut counters,
             &regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 

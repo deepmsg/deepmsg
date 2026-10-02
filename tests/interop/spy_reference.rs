@@ -45,7 +45,18 @@ fn free_udp_port() -> u16 {
 /// Compile the probe against the reference's client library, or answer `None`
 /// when the checkout is not there — which is a skip, as it is for every other
 /// interop test.
+///
+/// **Once per process**: two `cc` runs writing one probe while a test thread is
+/// `exec`ing it is `ETXTBSY`, which is what `destination_probe` was losing runs
+/// to before it learned the same lesson.
 fn build_probe() -> Option<PathBuf> {
+    static BUILT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+    BUILT.get_or_init(compile_probe).clone()
+}
+
+/// The compile itself, which [`build_probe`] runs once.
+fn compile_probe() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = manifest.join("fixtures/spy_probe.c");
     let include = manifest.join(REFERENCE_INCLUDE);

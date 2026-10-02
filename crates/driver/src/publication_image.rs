@@ -286,6 +286,15 @@ pub struct PublicationImage {
     /// an image is created by a `SETUP`, so the subscription that reads it
     /// inherits these rather than setting them).
     pub untethered_window_limit_timeout_ns: i64,
+    /// Whether the readers still have to be told this image is gone
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`,
+    /// which runs as the image leaves DRAINING for LINGER).
+    ///
+    /// A flag rather than a question about the state, because it is about a
+    /// **transition**: an image that has already said so does not say it again,
+    /// and one that reached LINGER the other way — a revoked image — leaves
+    /// this false and is told when it is released instead.
+    linger_notice: bool,
     /// Whether this image asks its sender for the frames it is missing.
     ///
     /// `reliable=false` is the one channel parameter that changes what an image
@@ -506,6 +515,7 @@ impl PublicationImage {
             time_of_last_packet_ns: now_ns,
             has_been_linked: false,
             is_end_of_stream: false,
+            linger_notice: false,
             is_sending_eos_sm: false,
             is_revoked: false,
             eos_position: initial_position,
@@ -1670,6 +1680,10 @@ impl PublicationImage {
                         self.is_sending_eos_sm = true;
                     }
 
+                    // The transition a reader hears about, and only the
+                    // ordinary one: a revoked image says so by its heartbeats
+                    // and is announced when it is released.
+                    self.linger_notice = !self.is_revoked;
                     self.state = ImageState::Linger;
                     self.time_of_last_state_change_ns = now_ns;
                     return true;
@@ -1692,6 +1706,12 @@ impl PublicationImage {
         }
 
         false
+    }
+
+    /// Whether this image has just left DRAINING for LINGER, once
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`).
+    pub fn take_linger_notice(&mut self) -> bool {
+        std::mem::take(&mut self.linger_notice)
     }
 
     /// Reject the image, with the reason (`aeron_publication_image_invalidate`,

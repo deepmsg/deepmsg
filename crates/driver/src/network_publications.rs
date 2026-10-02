@@ -34,6 +34,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::name_resolver::Resolver;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
@@ -55,7 +56,7 @@ use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, Names, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -258,6 +259,7 @@ impl NetworkPublications {
         config: &DriverConfig,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
+        resolver: &mut dyn Resolver,
         clients: &mut Clients,
         endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
@@ -273,8 +275,18 @@ impl NetworkPublications {
             return Err(AddError::UnsupportedTransport);
         }
 
-        let channel = UdpChannel::resolve(request.channel, &uri)
-            .map_err(|error| AddError::Channel(Box::new(error)))?;
+        let channel = UdpChannel::resolve_with(
+            &mut Names::Built {
+                resolver,
+                counters,
+                regions,
+                threshold_ns: config.name_resolver_threshold_ns,
+            },
+            crate::udp_channel::Unresolved::Refuse,
+            request.channel,
+            &uri,
+        )
+        .map_err(|error| AddError::Channel(Box::new(error)))?;
         let mut params = PublicationParams::resolve(&uri, config, |tag| self.find_by_tag(tag))?;
 
         validate_for_publication(&channel)?;
@@ -903,6 +915,11 @@ impl NetworkPublications {
         // (`aeron_driver_conductor.c:4195-4196`, which answers with the
         // publication's `log_file_name` on this path too).
         let log_file = publication.path_bytes();
+        // The two ids the reference's wire carries
+        // (`aeron_driver_conductor.c:2387-2388`): `correlation_id` is **this
+        // link's** — the id the client removes by, and the one it matches the
+        // answer to — and `registration_id` is the publication's own, shared by
+        // every client on this channel.
         let ready = PublicationBuffersReady {
             correlation_id: request.correlation_id,
             registration_id: publication.registration_id,
@@ -923,6 +940,31 @@ impl NetworkPublications {
         }
 
         events.publication_ready(&ready, is_exclusive);
+    }
+
+    /// A client's hold on a publication goes
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_DECREF`, `media/aeron_network_publication.c:...`,
+    /// reached from `aeron_driver_conductor_on_remove_publication`,
+    /// `aeron_driver_conductor.c:4705-4735`), answering whether that was the
+    /// **last** one — which is when the publication itself may be released.
+    ///
+    /// `count` is how many links the caller is giving up at once, which is what
+    /// a client that timed out gives up: every link it held.
+    pub fn remove_link(&mut self, publication_registration_id: i64, count: i32) -> bool {
+        let Some(publication) = self
+            .publications
+            .iter_mut()
+            .find(|publication| publication.registration_id == publication_registration_id)
+        else {
+            // Not a network publication at all — an IPC one, whose own release
+            // has already happened — or one that is already gone. Either way
+            // there is nothing here to decrement.
+            return false;
+        };
+
+        publication.refcount -= count.max(1);
+
+        publication.refcount <= 0
     }
 
     /// Take a publication's record out of the collection, for a caller that is

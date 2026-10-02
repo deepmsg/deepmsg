@@ -431,6 +431,23 @@ impl Clients {
     /// already went out with the timeout, which is why this one does not repeat
     /// it.
     #[allow(clippy::too_many_arguments)] // one per collaborator
+    /// Whether any client this driver still knows about holds a link on that
+    /// publication.
+    ///
+    /// The question a reaping sweep has to ask: a publication outlives the
+    /// client that made it when another client holds a link on it, and the
+    /// reference answers it the same way — by walking the links
+    /// (`aeron_driver_conductor.c:1220-1241`).
+    pub fn any_holds_publication(&self, publication_registration_id: i64) -> bool {
+        self.records.iter().any(|record| {
+            record
+                .publication_links
+                .iter()
+                .any(|link| link.publication_registration_id == publication_registration_id)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
     fn reap(
         &mut self,
         index: usize,

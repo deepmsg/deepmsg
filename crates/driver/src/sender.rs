@@ -48,6 +48,7 @@ use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
 use crate::idle::Backoff;
+use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
 use crate::protocol::{
@@ -83,6 +84,32 @@ pub enum SenderCommand {
     RemovePublication {
         /// Which one.
         registration_id: i64,
+    },
+    /// The publication's last client has let go, so it may **end**: write where
+    /// the stream stopped and linger while it still has readers to tell
+    /// (`aeron_driver_managed_resource_event_t`'s `DECREF`-to-zero,
+    /// `media/aeron_network_publication.c:1048-1069`).
+    ///
+    /// Not the same as [`SenderCommand::RemovePublication`], and the difference
+    /// is the whole reason a channel can be published on again right after its
+    /// publication is closed: the endpoint is released with the publication,
+    /// and a publication that lingers holds it.
+    EndPublication {
+        /// Which one.
+        registration_id: i64,
+    },
+    /// The name resolved somewhere else: point the endpoint at it
+    /// (`aeron_driver_sender_on_resolution_change`,
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:400-415`), which is also
+    /// where `Resolution changes` is counted.
+    ResolutionChange {
+        /// Which endpoint, by the id the conductor knows it by.
+        endpoint_id: u64,
+        /// The name that resolved — what a multi-destination endpoint matches
+        /// its destinations by.
+        endpoint_name: String,
+        /// Where it resolved to.
+        new_addr: SocketAddr,
     },
     /// Cut a publication's stream off, telling its readers why
     /// (`AERON_DRIVER_MANAGED_RESOURCE_EVENT_REVOKE`, which
@@ -210,6 +237,25 @@ pub enum SenderEvent {
     PublicationRemoved {
         /// Which publication.
         registration_id: i64,
+    },
+    /// An endpoint has heard nothing for its destination timeout, so its
+    /// channel's name has to be resolved again
+    /// (`aeron_driver_conductor_proxy_on_re_resolve_endpoint`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor_proxy.c:73-89`).
+    ///
+    /// The conductor resolves it and answers with
+    /// [`SenderCommand::ResolutionChange`] — or with nothing at all, when the
+    /// name resolves to the address the endpoint already has, which is the
+    /// reference's `memcmp` (`aeron_driver_conductor.c:6932-6938`).
+    ReResolveEndpoint {
+        /// Which endpoint, by the id the conductor knows it by.
+        endpoint_id: u64,
+        /// The name the channel named, which is what is resolved again.
+        endpoint_name: String,
+        /// The address it has now, which the answer is compared against —
+        /// [`None`] for a destination that never resolved, which is the
+        /// reference's `AF_UNSPEC` and is always a change once it does.
+        address: Option<SocketAddr>,
     },
     /// A responder answered a publication that asked for a response channel
     /// (`aeron_driver_conductor_proxy_on_response_setup`,
@@ -358,6 +404,37 @@ impl SenderProxy {
             .map_err(|_| stopped())
     }
 
+    /// Tell the sender that a publication's last client has let go.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn end_publication(&self, registration_id: i64) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::EndPublication { registration_id })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the sender that a name resolved somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn resolution_change(
+        &self,
+        endpoint_id: u64,
+        endpoint_name: String,
+        new_addr: SocketAddr,
+    ) -> io::Result<()> {
+        self.commands
+            .send(SenderCommand::ResolutionChange {
+                endpoint_id,
+                endpoint_name,
+                new_addr,
+            })
+            .map_err(|_| stopped())
+    }
+
     /// Ask the sender to put a destination on an endpoint's tracker.
     ///
     /// # Errors
@@ -484,6 +561,7 @@ impl Sender {
         mtu_length: usize,
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
+        re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -502,6 +580,8 @@ impl Sender {
                     mtu_length,
                     cycle_threshold_ns,
                     linger_timeout_ns,
+                    re_resolution_interval_ns,
+                    deepmsg_core::clock::monotonic_nano_time(),
                     event_tx,
                 );
                 sender.run(&command_rx);
@@ -554,6 +634,15 @@ struct SenderThread {
     linger_timeout_ns: i64,
     events: Channel<SenderEvent>,
     endpoints: Vec<(u64, Box<SendChannelEndpoint>)>,
+    /// Answers to re-resolutions, waiting for a pass that has the counter
+    /// regions — the same hand-off the destination commands make, and for the
+    /// same reason: `Resolution changes` is a counter.
+    pending_resolutions: Vec<(u64, String, SocketAddr)>,
+    /// How often to look, and when to look next
+    /// (`aeron_driver_sender.c:183-188`). Zero is a driver that does not look
+    /// at all.
+    re_resolution_interval_ns: i64,
+    re_resolution_deadline_ns: i64,
     publications: Vec<NetworkPublication>,
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
@@ -575,12 +664,15 @@ struct SenderThread {
 }
 
 impl SenderThread {
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     fn new(
         cnc: Arc<CncFile>,
         counters: CounterManager,
         mtu_length: usize,
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
+        re_resolution_interval_ns: i64,
+        now_ns: i64,
         events: Channel<SenderEvent>,
     ) -> Self {
         Self {
@@ -588,8 +680,11 @@ impl SenderThread {
             counters,
             cycle_threshold_ns,
             linger_timeout_ns,
+            re_resolution_interval_ns,
+            re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
             events,
             endpoints: Vec::new(),
+            pending_resolutions: Vec::new(),
             publications: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
@@ -622,6 +717,15 @@ impl SenderThread {
                             publication.set_revoked();
                         }
                     }
+                    SenderCommand::EndPublication { registration_id } => {
+                        if let Some(publication) = self
+                            .publications
+                            .iter_mut()
+                            .find(|publication| publication.registration_id == registration_id)
+                        {
+                            publication.request_end();
+                        }
+                    }
                     SenderCommand::RemovePublication { registration_id } => {
                         self.publications
                             .retain(|publication| publication.registration_id != registration_id);
@@ -632,6 +736,14 @@ impl SenderThread {
                     SenderCommand::RemoveEndpoint { id } => {
                         self.endpoints.retain(|(endpoint_id, _)| *endpoint_id != id);
                         let _ = self.events.send(SenderEvent::EndpointRemoved { id });
+                    }
+                    SenderCommand::ResolutionChange {
+                        endpoint_id,
+                        endpoint_name,
+                        new_addr,
+                    } => {
+                        self.pending_resolutions
+                            .push((endpoint_id, endpoint_name, new_addr));
                     }
                     command @ (SenderCommand::AddDestination { .. }
                     | SenderCommand::RemoveDestination { .. }
@@ -689,6 +801,21 @@ impl SenderThread {
 
         let system = System::new(&self.counters, &regions);
 
+        // The answers to re-resolutions first, so that a name that just moved
+        // is the address this pass sends to.
+        let mut resolved = Self::apply_resolution_changes(
+            &mut self.endpoints,
+            &mut self.pending_resolutions,
+            &system,
+        );
+
+        // And the question, on its own deadline (`aeron_driver_sender.c:183-188`):
+        // a zero interval is a driver that never asks.
+        if self.re_resolution_interval_ns > 0 && now_ns > self.re_resolution_deadline_ns {
+            self.re_resolution_deadline_ns = now_ns + self.re_resolution_interval_ns;
+            resolved += Self::check_for_re_resolution(&mut self.endpoints, &self.events, now_ns);
+        }
+
         let mut work = Self::receive_control_frames(
             &mut self.endpoints,
             &mut self.publications,
@@ -716,7 +843,8 @@ impl SenderThread {
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
         );
-        work
+
+        work + resolved
     }
 
     /// Apply the destination changes the conductor asked for
@@ -861,6 +989,116 @@ impl SenderThread {
                 });
             }
         }
+    }
+
+    /// Ask about the names of the endpoints that have gone quiet
+    /// (`aeron_udp_transport_poller_check_send_endpoint_re_resolutions`,
+    /// `media/aeron_udp_transport_poller.c:295-310`, which the sender calls on
+    /// its own deadline, `aeron_driver_sender.c:183-188`).
+    ///
+    /// One **event** per endpoint that needs it, because the resolution is the
+    /// conductor's: it is the one holding the resolver, and a name resolved on
+    /// this thread would be a name resolved twice if there were two senders.
+    /// The endpoint is not touched here — the answer comes back as a command
+    /// and is applied by [`Self::apply_resolution_changes`].
+    fn check_for_re_resolution(
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        events: &Channel<SenderEvent>,
+        now_ns: i64,
+    ) -> usize {
+        let mut work = 0;
+
+        for (id, endpoint) in endpoints.iter_mut() {
+            // The endpoint's own address, for the channel that has one
+            // (`:763-773`).
+            if endpoint.needs_re_resolution(now_ns) {
+                if let Some(name) = endpoint.endpoint_name() {
+                    if events
+                        .send(SenderEvent::ReResolveEndpoint {
+                            endpoint_id: *id,
+                            endpoint_name: name.to_owned(),
+                            address: Some(endpoint.remote_data_addr()),
+                        })
+                        .is_ok()
+                    {
+                        work += 1;
+                    }
+                }
+
+                continue;
+            }
+
+            // And its **destinations**, for the manual channel that has those
+            // instead (`:757-761`, which hands the check to the tracker —
+            // `aeron_udp_destination_tracker.c:402-428`). Each one is asked
+            // about once per timeout, because asking stamps it.
+            let Some(tracker) = endpoint.destination_tracker_mut() else {
+                continue;
+            };
+
+            let due = tracker.destinations_to_re_resolve(now_ns, DESTINATION_TIMEOUT_NS);
+
+            for (index, name) in due {
+                let address = tracker.destination_addr(index);
+                tracker.mark_re_resolution_checked(index, now_ns);
+
+                if events
+                    .send(SenderEvent::ReResolveEndpoint {
+                        endpoint_id: *id,
+                        endpoint_name: name,
+                        address,
+                    })
+                    .is_ok()
+                {
+                    work += 1;
+                }
+            }
+        }
+
+        work
+    }
+
+    /// Apply the answers the conductor sent back
+    /// (`aeron_driver_sender_on_resolution_change`,
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:400-415`).
+    ///
+    /// The endpoint may be gone — a client can close the publication while a
+    /// name is being resolved — and a command for an endpoint that is not there
+    /// is **not** counted: the reference's handler is handed the endpoint
+    /// pointer and would crash on one it had lost, which this build cannot do
+    /// and does not need to (the lookup is by id, and a missing id is a no-op).
+    ///
+    /// `Resolution changes` is counted **here**, on the thread that made the
+    /// change, which is the reference's own arrangement: the counter is the
+    /// sender's (`sender->resolution_changes_counter`,
+    /// `aeron_driver_sender.c:110-111`), and a receiver counts its own.
+    fn apply_resolution_changes(
+        endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
+        pending: &mut Vec<(u64, String, SocketAddr)>,
+        system: &System<'_>,
+    ) -> usize {
+        let mut work = 0;
+
+        for (endpoint_id, endpoint_name, new_addr) in pending.drain(..) {
+            let Some((_, endpoint)) = endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+            else {
+                continue;
+            };
+
+            if endpoint
+                .on_resolution_change(&endpoint_name, new_addr)
+                .is_err()
+            {
+                // A transport that will not reconnect is the reference's own
+                // failure here (`:408-414`, which logs and counts nothing).
+                continue;
+            }
+
+            system.increment(system_counters::id::RESOLUTION_CHANGES);
+            work += 1;
+        }
+
+        work
     }
 
     /// Read everything the endpoints' sockets hold and hand each frame to the
@@ -1041,6 +1279,11 @@ impl SenderThread {
                     publications[index].trigger_send_setup_frame(source, frame.group_tag(bytes));
                     return;
                 }
+
+                // The endpoint remembers when it last heard from anyone at all,
+                // which is what its own re-resolution measures
+                // (`aeron_send_channel_endpoint.c:658`, the line `:765` reads).
+                endpoints[endpoint_index].1.on_status_message(now_ns);
 
                 if let Some(response_correlation_id) = publications[index].on_status_message(
                     &frame,
@@ -1575,11 +1818,13 @@ mod tests {
 
         let endpoint = SendChannelEndpoint::create(
             endpoint,
+            &mut crate::port_manager::WildcardPortManager::sender(),
             &TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
             7,
             1,
+            1_000_000,
         )
         .expect("an endpoint");
 
@@ -1689,6 +1934,7 @@ mod tests {
             1408,
             100_000_000,
             crate::config::PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT,
+            0,
         )
         .expect("a sender");
 

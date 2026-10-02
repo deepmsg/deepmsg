@@ -116,6 +116,15 @@ pub mod id {
     pub const RECEIVER_MAX_CYCLE_TIME: i32 = 30;
     /// `AERON_SYSTEM_COUNTER_ID_RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED`.
     pub const RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED: i32 = 31;
+    /// `AERON_SYSTEM_COUNTER_ID_RESOLUTION_CHANGES` (`aeron_system_counters.h:29`),
+    /// which carries the resolver's own name in its label.
+    pub const RESOLUTION_CHANGES: i32 = 25;
+    /// `AERON_SYSTEM_COUNTER_ID_NAME_RESOLVER_MAX_TIME` (`aeron_system_counters.h:34`):
+    /// the longest a single resolution has taken, which is what the driver's
+    /// own resolver is measured by (`aeron_driver_native_resource_agent.c:39-60`).
+    pub const NAME_RESOLVER_MAX_TIME: i32 = 32;
+    /// `AERON_SYSTEM_COUNTER_ID_NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED` (`:35`).
+    pub const NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED: i32 = 33;
     /// `AERON_SYSTEM_COUNTER_ID_RETRANSMITTED_BYTES`.
     pub const RETRANSMITTED_BYTES: i32 = 36;
     /// `AERON_SYSTEM_COUNTER_ID_RETRANSMIT_OVERFLOW`.
@@ -209,14 +218,18 @@ pub const THREADING_MODE: &str = "DEDICATED";
 /// The runtime suffixes this build appends, and to which counters
 /// (`aeron_driver_conductor.c:848-951`).
 ///
-/// Every counter the reference appends a threading mode to is here, because
-/// this driver now runs the agents those counters measure. The name-resolver
-/// pair (32 and 33) is the exception: resolution is synchronous in this build
-/// and there is no resolver to name a threshold for — a label describing a
-/// thread that does not exist would be worse than its absence, and
-/// `docs/compat.md` carries the divergence.
-const RUNTIME_SUFFIXES: [(i32, &str); 7] = [
-    (25, ": driverName="),
+/// Every counter the reference appends a *fixed* suffix to is here. Two are
+/// not, because what they carry is a value rather than a word: counter 25
+/// (Resolution changes) gets `: driverName=<name>`, and counter 33 gets
+/// `: threshold=<duration>` — both from the settings, so both are appended by
+/// [`allocate_all`] where the settings are in hand
+/// (`aeron_driver_conductor.c:848-856`, `:938-951`).
+///
+/// The name-resolver pair gets **no** threading mode, and that is the
+/// reference's own shape: a resolver runs on the native resource agent, which
+/// is an `INVOKER`, and the reference appends `DEDICATED` only to the three
+/// counters of the threads that have one (`:857-935`).
+const RUNTIME_SUFFIXES: [(i32, &str); 6] = [
     (id::CONDUCTOR_MAX_CYCLE_TIME, ": DEDICATED"),
     (
         id::CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED,
@@ -349,6 +362,8 @@ pub fn allocate_all(
     regions: &CounterRegions<'_>,
     now_ms: i64,
     bytes_mapped: i64,
+    resolver_name: &str,
+    name_resolver_threshold_ns: i64,
 ) -> Result<SystemCounters, SystemCounterError> {
     let mut allocated = Vec::with_capacity(COUNT);
 
@@ -377,6 +392,29 @@ pub fn allocate_all(
     }
 
     for (counter_id, suffix) in RUNTIME_SUFFIXES {
+        manager
+            .append_to_label(regions, counter_id, suffix.as_bytes())
+            .ok_or(SystemCounterError::RegionTooSmall { counter_id })?;
+    }
+
+    // The two suffixes that are values rather than words. The resolver's name
+    // is what a reader uses to tell one driver's `Resolution changes` from
+    // another's in a shared `AeronStat`, and the threshold is how a reader
+    // knows what the count beside it means
+    // (`aeron_driver_conductor.c:848-856`, `:938-951`).
+    for (counter_id, suffix) in [
+        (
+            id::RESOLUTION_CHANGES,
+            format!(": driverName={resolver_name}"),
+        ),
+        (
+            id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED,
+            format!(
+                ": threshold={}",
+                format_duration_ns(name_resolver_threshold_ns)
+            ),
+        ),
+    ] {
         manager
             .append_to_label(regions, counter_id, suffix.as_bytes())
             .ok_or(SystemCounterError::RegionTooSmall { counter_id })?;
@@ -420,6 +458,23 @@ pub fn increment(
     let value = manager.value(regions, counter_id)?;
     manager.set_value(regions, counter_id, value + 1)?;
     Some(value)
+}
+
+/// A duration as the reference writes one into a label
+/// (`aeron_format_duration_ns`,
+/// `aeron-client/src/main/c/util/aeron_parse_util.c:270-333`): the largest
+/// unit that divides it **exactly**, and nanoseconds when none does.
+///
+/// Exact is the whole of it: five seconds is `5s` and 1500 milliseconds is
+/// `1500000000ns`, not `1.5s`.
+pub fn format_duration_ns(duration_ns: i64) -> String {
+    for (unit_ns, suffix) in [(1_000_000_000, "s"), (1_000_000, "ms"), (1_000, "us")] {
+        if duration_ns >= unit_ns && duration_ns % unit_ns == 0 {
+            return format!("{}{suffix}", duration_ns / unit_ns);
+        }
+    }
+
+    format!("{duration_ns}ns")
 }
 
 /// Store `candidate` if it is greater than what is there
@@ -481,6 +536,9 @@ impl<'a> System<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The threshold the labels below quote, which is the reference's default.
+    const NAME_RESOLVER_THRESHOLD: i64 = 5 * 1000 * 1000 * 1000;
     use deepmsg_cnc::{CounterDescriptor, layout};
     use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 
@@ -560,7 +618,15 @@ mod tests {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
 
-        allocate_all(&mut manager, &regions, 5, 48_238_592).expect("a fresh file");
+        allocate_all(
+            &mut manager,
+            &regions,
+            5,
+            48_238_592,
+            "",
+            NAME_RESOLVER_THRESHOLD,
+        )
+        .expect("a fresh file");
 
         for index in 0..COUNT as i32 {
             let descriptor = counter(&regions, index);
@@ -579,7 +645,8 @@ mod tests {
     fn the_labels_are_the_references_plus_this_builds_runtime_suffixes() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0).expect("a fresh file");
+        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
+            .expect("a fresh file");
 
         assert_eq!("Bytes sent", label(&regions, 0));
         assert_eq!("Client liveness timeouts", label(&regions, 24));
@@ -618,11 +685,22 @@ mod tests {
             label(&regions, 31)
         );
 
-        // The one pair this build leaves alone, because it has no resolver
-        // agent to name: resolution is synchronous here, and a threshold label
-        // describes a thread that does not exist.
-        assert_eq!("NameResolver exceeded threshold count", label(&regions, 33));
+        // The resolver's pair carries no threading mode — a resolver runs on
+        // the native resource agent, which is an `INVOKER`, and the reference
+        // appends `DEDICATED` only to the three threads that have one
+        // (`aeron_driver_conductor.c:857-935`) — but the threshold it counts
+        // past is a value, so it goes in the label
+        // (`:938-951`, formatted by `aeron_format_duration_ns`).
+        assert_eq!(
+            "NameResolver exceeded threshold count: threshold=5s",
+            label(&regions, 33)
+        );
         assert_eq!("NameResolver max time in ns", label(&regions, 32));
+
+        // And a `Resolution changes` counter names the resolver it counts for,
+        // which is how two drivers in one `AeronStat` are told apart
+        // (`:848-856`).
+        assert_eq!("Resolution changes: driverName=", label(&regions, 25));
     }
 
     #[test]
@@ -641,7 +719,15 @@ mod tests {
     fn the_initial_values_are_the_versions_and_the_mapped_bytes() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 48_238_592).expect("a fresh file");
+        allocate_all(
+            &mut manager,
+            &regions,
+            0,
+            48_238_592,
+            "",
+            NAME_RESOLVER_THRESHOLD,
+        )
+        .expect("a fresh file");
 
         assert_eq!(
             Some(79_106),
@@ -675,7 +761,7 @@ mod tests {
                 expected: 0,
                 got: Some(1),
             }),
-            allocate_all(&mut manager, &regions, 0, 0)
+            allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
         );
     }
 
@@ -683,7 +769,8 @@ mod tests {
     fn increment_reads_adds_and_stores() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0).expect("a fresh file");
+        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
+            .expect("a fresh file");
 
         assert_eq!(
             Some(0),
@@ -699,7 +786,8 @@ mod tests {
     fn propose_max_only_ever_moves_up() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0).expect("a fresh file");
+        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
+            .expect("a fresh file");
 
         assert_eq!(Some(()), propose_max(&manager, &regions, 26, 500));
         assert_eq!(Some(500), value(&regions, 26));

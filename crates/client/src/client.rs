@@ -1760,9 +1760,20 @@ impl Client {
                 // The decoder answers both ids with this one shape, because the
                 // payload is the same; which command it was is the *id*, and it
                 // is the only thing that says which handle to build.
+                //
+                // The handle is the **correlation id**, which is this client's
+                // own id for this `ADD_PUBLICATION` and the one the driver
+                // matches a removal by — the reference's Java client does the
+                // same (`ClientConductor` keeps the correlation id as the
+                // registration id and the message's `registration_id` as the
+                // publication's own, `AERON_PUBLICATION_BUFFERS_READY`'s two
+                // ids, `aeron_control_protocol.h`). Taking the message's field
+                // instead would give two publications on one channel the *same*
+                // handle, and closing one would close the other's channel.
+                let _ = registration_id;
                 let log_file = path_from_bytes(log_file);
                 let fields = (
-                    registration_id,
+                    correlation_id,
                     session_id,
                     stream_id,
                     position_limit_counter_id,
