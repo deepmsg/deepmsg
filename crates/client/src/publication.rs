@@ -102,8 +102,13 @@ impl Publication {
     }
 
     /// Whether the driver says a subscriber is attached.
+    ///
+    /// The byte is the driver's, in the log's own metadata
+    /// (`LogBufferDescriptor.IS_CONNECTED_OFFSET`), and it is the same byte for
+    /// both kinds of publication — the append view reads it, but an
+    /// **exclusive** publication has no append view and still has the byte.
     pub fn is_connected(&self) -> Option<bool> {
-        self.appender().and_then(|appender| appender.is_connected())
+        self.log().is_connected()
     }
 
     /// Append `payload` as one frame, if `position_limit` allows it.
@@ -275,8 +280,11 @@ impl ExclusivePublication {
     }
 
     /// Whether the driver says a subscriber is attached.
+    ///
+    /// Read from the log's metadata, as the concurrent one is: the byte is the
+    /// driver's and both kinds of publication have it.
     pub fn is_connected(&self) -> Option<bool> {
-        self.appender().and_then(|appender| appender.is_connected())
+        self.log().is_connected()
     }
 
     /// The largest payload one frame can carry on this log.

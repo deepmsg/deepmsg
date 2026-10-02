@@ -34,7 +34,7 @@ use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
 use crate::idle::Backoff;
 
-use crate::media::dispatcher::Interest;
+use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
 use crate::media::receive_endpoint::ReceiveDestination;
 use crate::protocol::{FrameHeader, SetupFrame, frame_type, is_frame_valid};
@@ -177,6 +177,16 @@ pub enum ReceiverCommand {
         /// The destination itself.
         destination: Box<ReceiveDestination>,
     },
+    /// Let an endpoint go: it has no subscriptions and no images left
+    /// (`aeron_driver_receiver_on_remove_endpoint`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:322-…`).
+    ///
+    /// The endpoint lives here, so this is the only place its socket can be
+    /// closed — and closing it is what a port being free again means.
+    RemoveEndpoint {
+        /// Which endpoint.
+        id: u64,
+    },
     /// Take a destination off (`aeron_driver_receiver_on_remove_destination`).
     RemoveDestination {
         /// Which endpoint read from it.
@@ -199,6 +209,14 @@ pub enum ReceiverEvent {
     CreateImage {
         /// Which endpoint it arrived on.
         endpoint_id: u64,
+        /// Which of that endpoint's destinations carried it. The image answers
+        /// through this one and no other — the reference carries the
+        /// `aeron_receive_destination_t` the `SETUP` came off all the way into
+        /// the create command (`aeron_receive_channel_endpoint_on_setup`,
+        /// `media/aeron_receive_channel_endpoint.c:610-637`, then
+        /// `aeron_data_packet_dispatcher.c:457-470`, whose last argument is
+        /// that destination).
+        destination: crate::media::receive_endpoint::DestinationId,
         /// The stream it names.
         stream_id: i32,
         /// The session it names.
@@ -239,6 +257,20 @@ pub enum ReceiverEvent {
         /// What happened, per reader.
         events: Vec<crate::publication_image::UntetheredEvent>,
     },
+    /// The endpoint is let go, and the counters it held go with it
+    /// (`aeron_receive_channel_endpoint_has_receiver_released`, which is what
+    /// the conductor waits for before it reclaims them —
+    /// `aeron_driver_conductor.c:1560`).
+    ///
+    /// The destination counters travel with the news because the destinations
+    /// lived here: the conductor owns the counter region, but this is the only
+    /// place that knows which numbers were the released endpoint's.
+    EndpointReleased {
+        /// Which endpoint.
+        id: u64,
+        /// The `rcv-local-sockaddr` counters of its destinations.
+        destination_counter_ids: Vec<i32>,
+    },
     /// Something for the conductor to record.
     Fault {
         /// The protocol error code to record it under.
@@ -265,6 +297,17 @@ impl ReceiverProxy {
     pub fn add_endpoint(&self, id: u64, endpoint: Box<ReceiveChannelEndpoint>) -> io::Result<()> {
         self.commands
             .send(ReceiverCommand::AddEndpoint { id, endpoint })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the receiver to let an endpoint go.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_endpoint(&self, id: u64) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RemoveEndpoint { id })
             .map_err(|_| stopped())
     }
 
@@ -554,10 +597,15 @@ fn stopped() -> io::Error {
 /// (`aeron_driver_receiver_pending_setup_entry_t`,
 /// `aeron-driver/src/main/c/aeron_driver_receiver.h:60-70`).
 #[derive(Clone, Copy, Debug)]
-struct PendingSetup {
-    endpoint_id: u64,
-    stream_id: i32,
-    session_id: i32,
+pub(crate) struct PendingSetup {
+    pub(crate) endpoint_id: u64,
+    /// Which of that endpoint's destinations the ask belongs to, and so which
+    /// socket every repeat of it leaves through
+    /// (`aeron_driver_receiver_pending_setup_entry_t.destination`,
+    /// `aeron_driver_receiver.h:35-45`).
+    pub(crate) destination: crate::media::receive_endpoint::DestinationId,
+    pub(crate) stream_id: i32,
+    pub(crate) session_id: i32,
     /// Where the eliciting status message goes, or [`None`] when it goes to
     /// wherever the packets came from.
     ///
@@ -567,9 +615,9 @@ struct PendingSetup {
     /// entry is asked again every [`PENDING_SETUP_TIMEOUT_NS`]; one that is not
     /// periodic is **given up on** after that long, and the session's interest
     /// is dropped so that the next frame from it asks again.
-    control_address: Option<std::net::SocketAddr>,
+    pub(crate) control_address: Option<std::net::SocketAddr>,
     /// When it was last sent.
-    time_of_status_message_ns: i64,
+    pub(crate) time_of_status_message_ns: i64,
 }
 
 /// What the thread owns.
@@ -629,7 +677,54 @@ impl ReceiverThread {
 
             for command in commands.try_iter() {
                 match command {
+                    ReceiverCommand::RemoveEndpoint { id } => {
+                        // The pending setups first: an ask for an endpoint that
+                        // is going away is a question nobody will answer
+                        // (`aeron_driver_receiver.c:334-348`, which drops them
+                        // before it lets the endpoint go).
+                        self.pending_setups.retain(|setup| setup.endpoint_id != id);
+
+                        if let Some(index) =
+                            self.endpoints.iter().position(|(entry, _)| *entry == id)
+                        {
+                            let (_, endpoint) = self.endpoints.swap_remove(index);
+
+                            let _ = self.events.send(ReceiverEvent::EndpointReleased {
+                                id,
+                                destination_counter_ids: endpoint
+                                    .destinations()
+                                    .iter()
+                                    .map(|(_, destination)| destination.local_sockaddr_counter_id())
+                                    .collect(),
+                            });
+                        }
+                    }
                     ReceiverCommand::AddEndpoint { id, endpoint } => {
+                        // An endpoint whose channel named a `control=` asks
+                        // **first**, and asks as soon as it exists
+                        // (`aeron_driver_receiver_on_add_endpoint`,
+                        // `aeron-driver/src/main/c/aeron_driver_receiver.c:305-320`,
+                        // whose `add_pending_setup` is the endpoint's half of
+                        // what the destination path below does for a client's).
+                        //
+                        // It is the whole of who speaks on a dynamic channel:
+                        // the sender has nowhere to send until it is asked, so
+                        // a subscription whose own channel named the control
+                        // address that stayed silent would be a session neither
+                        // side could start.
+                        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+                        let mut endpoint = endpoint;
+
+                        for index in 0..endpoint.destination_count() {
+                            let Some(destination) = endpoint.destination_id(index) else {
+                                continue;
+                            };
+
+                            if let Some(setup) = endpoint.ask_for_setup(id, destination, now_ns) {
+                                self.pending_setups.push(setup);
+                            }
+                        }
+
                         self.endpoints.push((id, endpoint));
                     }
                     ReceiverCommand::AddDestination {
@@ -641,63 +736,38 @@ impl ReceiverThread {
                         // ask, and has to keep asking until it is answered
                         // (`aeron_driver_receiver.c:475-486`, which adds a
                         // periodic pending setup for exactly these).
-                        //
-                        // Session and stream are zero, as they are there: the
-                        // ask is not about a stream yet. What it is for is the
-                        // answer — a `SETUP` describing whatever the far end
-                        // publishes — and that is what brings the stream into
-                        // being.
                         let now_ns = deepmsg_core::clock::monotonic_nano_time();
-                        let setup = destination.setup_address().map(|address| PendingSetup {
-                            endpoint_id,
-                            stream_id: 0,
-                            session_id: 0,
-                            control_address: Some(address),
-                            time_of_status_message_ns: now_ns,
-                        });
                         let setup_address = destination.setup_address();
+
+                        let mut added = None;
 
                         if let Some((_, endpoint)) =
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
-                            endpoint.add_destination(*destination);
+                            // The endpoint mints the handle, and everything that
+                            // will answer through this socket is told it: the
+                            // periodic ask below, and the images just after.
+                            let destination = endpoint.add_destination(*destination);
+                            added = Some(destination);
 
-                            // The periodic entry asks a second from now and keeps
-                            // asking; this is the *first* ask, so that a source
-                            // with nothing to wait for hears it at once
-                            // (`aeron_receive_channel_endpoint.c:1145-1147`,
-                            // which sends one beside adding the entry).
-                            //
-                            // It goes to the same address the entry does: for a
-                            // channel that is not multicast and did name a
-                            // control, `current_control_addr` and `local_control`
-                            // are the same value (`media/aeron_receive_destination.c:117-124`).
-                            if let Some(address) = setup_address {
-                                let index = endpoint.destination_count() - 1;
-                                let _ = endpoint.send_sm_from(
-                                    index,
-                                    address,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    ReceiveChannelEndpoint::send_setup_flag(),
-                                );
+                            if let Some(setup) =
+                                endpoint.ask_for_setup(endpoint_id, destination, now_ns)
+                            {
+                                self.pending_setups.push(setup);
                             }
                         }
 
-                        if let Some(setup) = setup {
-                            self.pending_setups.push(setup);
-                        }
-
                         // And every image already running on that endpoint hears
-                        // from it too (`aeron_driver_receiver.c:483-486`): a
+                        // from it too (`aeron_driver_receiver.c:489-495`): a
                         // stream that is already up has to send its status
-                        // messages and NAKs to the new source as well.
-                        for image in self.images.iter_mut() {
-                            if image.endpoint_id == endpoint_id {
-                                image.add_destination(setup_address, now_ns);
+                        // messages and NAKs to the new source as well — through
+                        // the new destination, which is what the handle it is
+                        // given says.
+                        if let Some(destination) = added {
+                            for image in self.images.iter_mut() {
+                                if image.endpoint_id == endpoint_id {
+                                    image.add_destination(setup_address, destination, now_ns);
+                                }
                             }
                         }
                     }
@@ -705,6 +775,8 @@ impl ReceiverThread {
                         endpoint_id,
                         channel,
                     } => {
+                        let mut removed = None;
+
                         if let Some((_, endpoint)) =
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
@@ -712,7 +784,22 @@ impl ReceiverThread {
                             // here: the conductor allocated it, and giving a
                             // counter back is the conductor's to do — the
                             // receiver only stops reading.
-                            let _ = endpoint.remove_destination(&channel);
+                            removed = endpoint.remove_destination(&channel).map(|(id, _)| id);
+                        }
+
+                        // And the images stop answering it
+                        // (`aeron_publication_image_remove_destination`, called
+                        // from `aeron_driver_receiver.c:527`): a connection
+                        // whose socket has gone is one that would otherwise send
+                        // to a handle nothing answers to, and — before the
+                        // handle was a handle — through whichever socket moved
+                        // into the slot.
+                        if let Some(destination) = removed {
+                            for image in self.images.iter_mut() {
+                                if image.endpoint_id == endpoint_id {
+                                    image.remove_destination(destination);
+                                }
+                            }
                         }
                     }
                     ReceiverCommand::AddSubscription {
@@ -1001,14 +1088,17 @@ impl ReceiverThread {
             // destination — which is every channel until a client adds another —
             // this is the single poll it always was.
             //
-            // Which destination a datagram arrived on is *not* passed on yet.
-            // Its only reader is the reply path — an answer has to leave through
-            // the socket it arrived on, not through the first one — and that
-            // arrives with the commands that create a second destination. The
-            // compiler objected to the parameter existing before then, correctly:
-            // a parameter nothing reads is not a fact about the wire.
+            // Which destination a datagram arrived on is what the reply path
+            // needs: an answer has to leave through the socket it arrived on,
+            // not through the first one. The position below is only the cursor
+            // for this pass — what is passed on is the destination's own
+            // handle, because that is what an image keeps.
             for destination_index in 0..endpoint.destination_count() {
-                let received = match endpoint.receive_from(destination_index, buffers, datagrams) {
+                let Some(destination) = endpoint.destination_id(destination_index) else {
+                    continue;
+                };
+
+                let received = match endpoint.receive_from(destination, buffers, datagrams) {
                     Ok(received) => received,
                     Err(error) => {
                         let _ = events.send(ReceiverEvent::Fault {
@@ -1037,7 +1127,7 @@ impl ReceiverThread {
                     let packet = &buffers[slot][..datagram.length];
                     Self::dispatch(
                         *endpoint_id,
-                        destination_index,
+                        destination,
                         endpoint,
                         images,
                         pending_setups,
@@ -1064,7 +1154,7 @@ impl ReceiverThread {
     #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         endpoint_id: u64,
-        destination_index: usize,
+        destination: crate::media::receive_endpoint::DestinationId,
         endpoint: &mut ReceiveChannelEndpoint,
         images: &mut [PublicationImage],
         pending_setups: &mut Vec<PendingSetup>,
@@ -1110,6 +1200,7 @@ impl ReceiverThread {
                                 frame.term_offset,
                                 packet,
                                 source,
+                                destination,
                                 system,
                                 counters,
                                 regions,
@@ -1123,9 +1214,9 @@ impl ReceiverThread {
                         // (`elicit_setup_from_source`, `:616-659`).
                         if endpoint.elicit_setup(frame.stream_id, frame.session_id)
                             && endpoint
-                                .send_sm_from(
-                                    destination_index,
-                                    endpoint.control_address(destination_index, source),
+                                .send_sm(
+                                    destination,
+                                    endpoint.control_address(destination, source),
                                     frame.stream_id,
                                     frame.session_id,
                                     0,
@@ -1151,6 +1242,7 @@ impl ReceiverThread {
                         // the first request was never asked a second time.
                         pending_setups.push(PendingSetup {
                             endpoint_id,
+                            destination,
                             stream_id: frame.stream_id,
                             session_id: frame.session_id,
                             control_address: None,
@@ -1165,19 +1257,44 @@ impl ReceiverThread {
                     return;
                 };
                 let setup_flags = header.flags;
+                let control_address = endpoint.control_address(destination, source);
 
-                if !endpoint
+                match endpoint
                     .dispatcher_mut()
                     .on_setup(setup.stream_id, setup.session_id)
                 {
-                    return;
+                    // An image is already serving this session, and the one
+                    // thing it has not seen is the destination this `SETUP`
+                    // came in on: a session two publications share arrives on
+                    // two destinations, and the second one is answered — or
+                    // not — through the connection taken here
+                    // (`aeron_data_packet_dispatcher.c:499-502`). Without it
+                    // the image keeps one socket and the second sender waits
+                    // for a status message that goes to the first.
+                    SetupInterest::Image { registration_id } => {
+                        if let Some(image) = images
+                            .iter_mut()
+                            .find(|image| image.registration_id == registration_id)
+                        {
+                            image.add_connection_if_unknown(
+                                control_address,
+                                source,
+                                destination,
+                                now_ns,
+                            );
+                        }
+
+                        return;
+                    }
+                    SetupInterest::None => return,
+                    SetupInterest::CreateImage => {}
                 }
 
-                let control_address = endpoint.control_address(destination_index, source);
                 let _ = endpoint_id;
 
                 let _ = events.send(ReceiverEvent::CreateImage {
                     endpoint_id,
+                    destination,
                     stream_id: setup.stream_id,
                     session_id: setup.session_id,
                     initial_term_id: setup.initial_term_id,
@@ -1268,6 +1385,7 @@ impl ReceiverThread {
 
                         if endpoint
                             .send_nak(
+                                connection.destination,
                                 control_address,
                                 image.stream_id,
                                 image.session_id,
@@ -1361,6 +1479,7 @@ impl ReceiverThread {
             };
 
             let sent = endpoint.send_sm(
+                pending.destination,
                 control_address,
                 pending.stream_id,
                 pending.session_id,

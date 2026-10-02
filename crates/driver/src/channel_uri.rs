@@ -504,7 +504,7 @@ fn scan_params<'a>(text: &'a str) -> Result<Vec<Param<'a>>, UriError> {
 /// characters. The reference's reader checks the same way round: it requires
 /// `*end_ptr == '\0'` after the call
 /// (`aeron-client/src/main/c/uri/aeron_uri.c:365-370`).
-fn parse_base_zero(value: &str) -> Option<i128> {
+pub(crate) fn parse_base_zero(value: &str) -> Option<i128> {
     let (negative, magnitude) = match value.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, value.strip_prefix('+').unwrap_or(value)),

@@ -390,6 +390,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
     ) -> usize {
@@ -411,6 +412,7 @@ impl Clients {
                 events,
                 publications,
                 subscriptions,
+                endpoints,
                 receiver,
                 sender,
             );
@@ -438,6 +440,7 @@ impl Clients {
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
         subscriptions: &mut IpcSubscriptions,
+        endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
         sender: &SenderProxy,
     ) {
@@ -459,6 +462,7 @@ impl Clients {
             manager,
             regions,
             publications,
+            endpoints,
             receiver,
             sender,
             now_ms,
@@ -745,6 +749,7 @@ mod tests {
         assert_eq!(1, clients.len(), "and nothing was reclaimed either");
 
         // One millisecond past the deadline: phase one announces…
+        let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         clients.on_time_event(NOW + 11_001, &manager, &regions, &mut events);
         assert_eq!(1, clients.len(), "…and phase two is what reclaims");
         assert_eq!(
@@ -756,6 +761,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                &mut endpoints,
                 None,
                 &SenderProxy::disconnected()
             )
@@ -778,6 +784,7 @@ mod tests {
 
     #[test]
     fn a_client_that_closed_itself_is_reaped_without_a_timeout_announcement() {
+        let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
         let (mut publications, mut subscriptions) = managers();
@@ -799,6 +806,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                &mut endpoints,
                 None,
                 &SenderProxy::disconnected()
             ),
@@ -839,6 +847,7 @@ mod tests {
             });
         events.0.clear();
 
+        let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         clients.on_time_event(NOW + 20_000, &manager, &regions, &mut events);
         clients.reap_expired(
             NOW + 20_000,
@@ -847,6 +856,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            &mut endpoints,
             None,
             &SenderProxy::disconnected(),
         );
@@ -865,6 +875,7 @@ mod tests {
 
     #[test]
     fn a_heartbeat_at_the_top_of_the_range_expires_instead_of_never() {
+        let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         // The comparison wraps, as the reference's does
         // (`aeron_driver_conductor.c:1042`): `i64::MAX + anything` is negative,
         // so the client is expired on the spot. Saturating instead would make
@@ -897,6 +908,7 @@ mod tests {
                 &mut events,
                 &mut publications,
                 &mut subscriptions,
+                &mut endpoints,
                 None,
                 &SenderProxy::disconnected()
             )
@@ -906,6 +918,7 @@ mod tests {
 
     #[test]
     fn every_announcement_precedes_every_reclamation() {
+        let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         // Two clients expiring in the same tick, which is when the reference's
         // two-phase pass is visible on the ring: both timeouts, then both
         // reclamations. An interleaved loop emits A's counters going away
@@ -954,6 +967,7 @@ mod tests {
             &mut events,
             &mut publications,
             &mut subscriptions,
+            &mut endpoints,
             None,
             &SenderProxy::disconnected(),
         );

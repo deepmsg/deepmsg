@@ -334,6 +334,29 @@ impl ReceiveChannelEndpoints {
         entry.refcount <= 0 && entry.image_refcount <= 0
     }
 
+    /// Mark an endpoint as on its way out, and say whether *this* call is the
+    /// one that did it (`aeron_receive_channel_endpoint_try_remove_endpoint`,
+    /// `media/aeron_receive_channel_endpoint.c:691-702`).
+    ///
+    /// The condition is the reference's: every stream count at zero — which is
+    /// what [`Self::detach_subscription`] has just answered — and no images.
+    /// A second call on the same endpoint answers `false`, so the receiver is
+    /// asked once.
+    pub fn begin_release(&mut self, id: u64) -> bool {
+        let Some(entry) = self.get_mut(id) else {
+            return false;
+        };
+
+        if entry.status != EndpointStatus::Active || entry.refcount > 0 || entry.image_refcount > 0
+        {
+            return false;
+        }
+
+        entry.status = EndpointStatus::Closing;
+
+        true
+    }
+
     /// An image was added to an endpoint.
     pub fn attach_image(&mut self, id: u64) {
         if let Some(entry) = self.get_mut(id) {

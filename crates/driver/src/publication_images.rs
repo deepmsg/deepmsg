@@ -92,6 +92,12 @@ impl PublicationImageRecord {
 struct PendingImage {
     registration_id: i64,
     endpoint_id: u64,
+    /// The destination the `SETUP` arrived on, which the image answers through
+    /// — it is what the create command carries and what the image gives its
+    /// first connection
+    /// (`aeron_command_create_publication_image_t.destination`,
+    /// `aeron_driver_conductor_proxy.h:57`).
+    destination: crate::media::receive_endpoint::DestinationId,
     session_id: i32,
     stream_id: i32,
     channel: Vec<u8>,
@@ -234,6 +240,7 @@ impl PublicationImages {
         registration_id: i64,
         client_id: i64,
         endpoint_id: u64,
+        destination: crate::media::receive_endpoint::DestinationId,
         channel: &[u8],
         setup: &SetupFrame,
         setup_flags: u8,
@@ -334,6 +341,7 @@ impl PublicationImages {
         self.pending.push(PendingImage {
             registration_id,
             endpoint_id,
+            destination,
             session_id: setup.session_id,
             stream_id: setup.stream_id,
             channel: channel.to_vec(),
@@ -438,6 +446,7 @@ impl PublicationImages {
         let mut image = PublicationImage::create(
             pending.registration_id,
             pending.endpoint_id,
+            pending.destination,
             &pending.channel,
             Box::new(log),
             &pending.setup,

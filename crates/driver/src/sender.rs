@@ -969,7 +969,12 @@ impl SenderThread {
                 // term length when a publication here answers to it, and the
                 // largest a term may be otherwise
                 // (`aeron_send_channel_endpoint.c:589-596`, `:613-617`).
-                let index = index_of_publication(publications, frame.stream_id, frame.session_id);
+                let index = index_of_publication(
+                    publications,
+                    endpoints[endpoint_index].0,
+                    frame.stream_id,
+                    frame.session_id,
+                );
                 let term_length =
                     index.map_or(TERM_MAX_LENGTH, |index| publications[index].term_length);
 
@@ -1058,9 +1063,12 @@ impl SenderThread {
                 // A gap report is only checked when a publication answers to it,
                 // because the term length it is measured against is that
                 // publication's (`:549-552`).
-                let Some(index) =
-                    index_of_publication(publications, frame.stream_id, frame.session_id)
-                else {
+                let Some(index) = index_of_publication(
+                    publications,
+                    endpoints[endpoint_index].0,
+                    frame.stream_id,
+                    frame.session_id,
+                ) else {
                     return;
                 };
 
@@ -1099,9 +1107,12 @@ impl SenderThread {
                 // error that arrived (`:686`).
                 system.increment(system_counters::id::ERROR_FRAMES_RECEIVED);
 
-                let Some(index) =
-                    index_of_publication(publications, frame.stream_id, frame.session_id)
-                else {
+                let Some(index) = index_of_publication(
+                    publications,
+                    endpoints[endpoint_index].0,
+                    frame.stream_id,
+                    frame.session_id,
+                ) else {
                     return;
                 };
 
@@ -1159,9 +1170,12 @@ impl SenderThread {
                 // measurements is the peer's, and the one here has nothing to
                 // do with the answer (`aeron_send_channel_endpoint.c:709-728`).
                 if let Some(frame) = RttmFrame::read(bytes) {
-                    let Some(index) =
-                        index_of_publication(publications, frame.stream_id, frame.session_id)
-                    else {
+                    let Some(index) = index_of_publication(
+                        publications,
+                        endpoints[endpoint_index].0,
+                        frame.stream_id,
+                        frame.session_id,
+                    ) else {
                         return;
                     };
 
@@ -1306,13 +1320,28 @@ impl SenderThread {
 
 /// The publication a control frame names, as an index — for a caller that
 /// needs another field beside it and so cannot hold the borrow.
+///
+/// The lookup is the **arriving endpoint's**, which is what the reference's is:
+/// every control frame is answered out of `endpoint->publication_dispatch_map`,
+/// keyed by stream and session, on the endpoint the datagram came in on
+/// (`media/aeron_send_channel_endpoint.c:560`, `:616`, `:697`, `:722`, `:740`).
+///
+/// It has to be, because (stream, session, endpoint) is not a unique key across
+/// a driver: a publication that names another's session with
+/// `session-id=tag:N` shares both ids and differs only in where it sends from.
+/// Search the whole list and the second one never hears anything — its status
+/// messages are answered by whichever publication was created first, and its
+/// own `pub-lmt` stays at zero for ever.
 fn index_of_publication(
     publications: &[NetworkPublication],
+    endpoint_id: u64,
     stream_id: i32,
     session_id: i32,
 ) -> Option<usize> {
     publications.iter().position(|publication| {
-        publication.stream_id == stream_id && publication.session_id == session_id
+        publication.endpoint_id == endpoint_id
+            && publication.stream_id == stream_id
+            && publication.session_id == session_id
     })
 }
 

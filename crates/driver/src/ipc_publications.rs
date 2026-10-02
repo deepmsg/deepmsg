@@ -55,7 +55,7 @@ use crate::native_resource_agent::{
     Completion, NativeResourceAgent, StorageChecks, StorageWarning,
 };
 use crate::position as counter_position;
-use crate::publication_params::{PublicationParams, PublicationParamsError};
+use crate::publication_params::{PublicationParams, PublicationParamsError, TaggedPublication};
 use crate::subscribable::UntetheredEvent;
 use crate::sys;
 
@@ -510,13 +510,19 @@ impl IpcPublications {
         subscriptions: &mut IpcSubscriptions,
         now: Now,
         events: &mut impl ClientEvents,
+        find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
     ) -> Result<(), AddError> {
         // VALIDATE (`:3963-3981`).
         let uri = ChannelUri::parse(request.channel)?;
         if uri.transport() != Transport::Ipc {
             return Err(AddError::UnsupportedTransport);
         }
-        let params = PublicationParams::resolve(&uri, config)?;
+
+        // A tag is looked up among the **network** publications even here: the
+        // reference's reader is given the conductor, not the IPC half of it
+        // (`aeron_driver_uri.c:163`), and both add-publication paths call it
+        // (`aeron_driver_conductor.c:3984-3988`).
+        let params = PublicationParams::resolve(&uri, config, find_by_tag)?;
 
         // The client is registered before anything else happens for this
         // command — the reference's `get_or_add_client` is the first thing the

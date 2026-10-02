@@ -412,6 +412,19 @@ impl ClientEvents for Transmit<'_> {
 
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
+/// Ask the sender to let an endpoint go once the last publication on it has
+/// (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks it
+/// CLOSING and asks, and the endpoint's own delete gives the counters back).
+fn try_remove_send_endpoint(
+    endpoints: &mut crate::send_endpoints::SendChannelEndpoints,
+    sender: &crate::sender::SenderProxy,
+    id: u64,
+) {
+    if endpoints.begin_release(id) {
+        let _ = sender.remove_endpoint(id);
+    }
+}
+
 /// The line the reference's conductor appends when a channel will not parse
 /// (`aeron_driver_conductor.c:4686-4687` for a publication, `:5173-5174` for a
 /// subscription), with the **empty message** its `AERON_APPEND_ERR("%s", "")`
@@ -913,6 +926,7 @@ impl Conductor {
             match event {
                 ReceiverEvent::CreateImage {
                     endpoint_id,
+                    destination,
                     stream_id,
                     session_id,
                     initial_term_id,
@@ -988,6 +1002,7 @@ impl Conductor {
                         registration_id,
                         client_id,
                         endpoint_id,
+                        destination,
                         &channel,
                         &setup,
                         setup_flags,
@@ -1014,6 +1029,12 @@ impl Conductor {
                         self.pending_log_errors
                             .push((error.recorded_error_code(), error.to_string()));
                     }
+                }
+                ReceiverEvent::EndpointReleased {
+                    id,
+                    destination_counter_ids,
+                } => {
+                    work += self.release_endpoint(id, destination_counter_ids);
                 }
                 ReceiverEvent::ImageDone { registration_id } => {
                     work += self.release_image(registration_id);
@@ -1158,6 +1179,7 @@ impl Conductor {
         }
 
         self.send_endpoints.detach_publication(record.endpoint_id);
+        self.try_remove_send_endpoint(record.endpoint_id);
 
         true
     }
@@ -1358,6 +1380,62 @@ impl Conductor {
     /// subscriber is told the image is gone with `ON_UNAVAILABLE_IMAGE` — one
     /// message per **subscription** that was reading it, as the reference sends
     /// them (`:5690-5700`) — and only then is the log buffer unmapped.
+    /// Ask the sender to let an endpoint go, once the last publication on it
+    /// has (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks
+    /// it CLOSING and asks, and the endpoint's own delete is what gives the
+    /// counters back — `:250-266`).
+    fn try_remove_send_endpoint(&mut self, id: u64) {
+        try_remove_send_endpoint(&mut self.send_endpoints, self.sender.proxy(), id);
+    }
+
+    /// Give back what a send endpoint held, once the sender has let it go
+    /// (`aeron_send_channel_endpoint_delete`, `:250-266`, which is where the
+    /// counters go back in the reference — the sender owns the endpoint, the
+    /// conductor owns the region).
+    ///
+    /// The two counters the endpoint's *destinations* hold
+    /// (`local_sockaddr_indicator` and `tracker_num_destinations`) are not here
+    /// yet: they live in the sender's copy, and getting at them needs the same
+    /// thing the receive side needed — the numbers travelling back with the
+    /// confirmation.
+    fn release_send_endpoint(&mut self, id: u64) -> usize {
+        let Some(entry) = self.send_endpoints.remove(id) else {
+            return 0;
+        };
+
+        if let Some(region) = self.cnc.counter_regions() {
+            let _ = self
+                .counters
+                .free(&region, entry.channel_status_counter_id, self.now_ms);
+        }
+
+        1
+    }
+
+    /// Give back everything a receive endpoint held, once the receiver has let
+    /// it go (`aeron_receive_channel_endpoint_has_receiver_released`, which is
+    /// what the conductor waits for — `aeron_driver_conductor.c:1560`).
+    ///
+    /// The counters are the conductor's to free because the region is: the
+    /// receiver could only say which numbers were its.
+    fn release_endpoint(&mut self, id: u64, destination_counter_ids: Vec<i32>) -> usize {
+        let Some(entry) = self.receive_endpoints.remove(id) else {
+            return 0;
+        };
+
+        if let Some(region) = self.cnc.counter_regions() {
+            for counter_id in destination_counter_ids {
+                let _ = self.counters.free(&region, counter_id, self.now_ms);
+            }
+
+            let _ = self
+                .counters
+                .free(&region, entry.channel_status_counter_id, self.now_ms);
+        }
+
+        1
+    }
+
     fn release_image(&mut self, registration_id: i64) -> usize {
         let Some(image) = self.images.find(registration_id).cloned() else {
             return 0;
@@ -1393,6 +1471,19 @@ impl Conductor {
 
         self.subscriptions.forget_publication(registration_id);
         self.receive_endpoints.detach_image(image.endpoint_id);
+
+        // An endpoint whose last image has just gone is one to try again on:
+        // the reference asks both times — here, and where a subscription
+        // leaves (`aeron_publication_image.c:1380`).
+        if let Some(region) = self.cnc.counter_regions() {
+            crate::ipc_subscriptions::try_remove_endpoint(
+                image.endpoint_id,
+                &mut self.counters,
+                &region,
+                &mut self.receive_endpoints,
+                self.receiver.proxy(),
+            );
+        }
 
         // The counters and the log buffer. The image is gone from the
         // receiver, so nothing is reading either of them.
@@ -1576,12 +1667,12 @@ impl Conductor {
                         );
                     }
                 }
-                crate::sender::SenderEvent::EndpointRemoved { .. }
-                | crate::sender::SenderEvent::PublicationRemoved { .. } => {
-                    // The conductor's own bookkeeping for a removal arrives
-                    // with the removal path (P1-4's last slice): an endpoint
-                    // outlives its publications only until the reference
-                    // count reaches zero, and that is the conductor's count.
+                crate::sender::SenderEvent::EndpointRemoved { id } => {
+                    work += self.release_send_endpoint(id);
+                }
+                crate::sender::SenderEvent::PublicationRemoved { .. } => {
+                    // Nothing to do: the conductor's own bookkeeping for a
+                    // publication's removal is done where the removal is made.
                 }
             }
         }
@@ -1884,6 +1975,11 @@ impl Conductor {
                                     subscriptions,
                                     now,
                                     &mut transmit,
+                                    // The IPC path resolves a tag against the
+                                    // network publications all the same
+                                    // (`aeron_driver_uri.c:163` is handed the
+                                    // conductor, and both paths call it).
+                                    |tag| network_publications.find_by_tag(tag),
                                 ),
                             };
 
@@ -2017,6 +2113,7 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                receive_endpoints,
                                 Some(receiver.proxy()),
                                 sender.proxy(),
                                 now_ms,
@@ -2517,6 +2614,10 @@ impl Conductor {
         // on its endpoint. The IPC half did its own release inside the drain.
         let mut released = 0usize;
 
+        // Endpoints whose last publication has just gone, to be tried after the
+        // loop: `send_endpoints` is borrowed as a whole inside it.
+        let mut to_try: Vec<u64> = Vec::new();
+
         for registration_id in pending_publication_releases {
             if let Some(record) = network_publications.remove(registration_id) {
                 let _ = sender.proxy().remove_publication(registration_id);
@@ -2545,8 +2646,13 @@ impl Conductor {
                 }
 
                 send_endpoints.detach_publication(record.endpoint_id);
+                to_try.push(record.endpoint_id);
                 released += 1;
             }
+        }
+
+        for id in to_try {
+            try_remove_send_endpoint(&mut self.send_endpoints, sender.proxy(), id);
         }
 
         // The destination commands.
@@ -2566,11 +2672,6 @@ impl Conductor {
             // names (`aeron_driver_conductor.c:3051-3065`): `aeron:ipc` is one
             // kind of destination, `aeron-spy:` another, and everything else is
             // a network one.
-            //
-            // `aeron:ipc` is the one this build refuses **by name** — a client
-            // told nothing waits out its timeout, and this is not a command
-            // this driver is going to get to later. The refusal is recorded in
-            // `docs/compat.md`.
             if Command::AddReceiveDestination == command
                 || Command::RemoveReceiveDestination == command
             {
@@ -2580,11 +2681,55 @@ impl Conductor {
                 };
 
                 if request.channel.starts_with(IPC_PREFIX.as_bytes()) {
-                    transmit.error(
-                        request.correlation_id,
-                        ERROR_CODE_NOT_SUPPORTED,
-                        b"aeron:ipc destinations are not served by this driver",
-                    );
+                    let now = Now {
+                        ms: now_ms,
+                        ns: now_ns,
+                        client_liveness_timeout_ns: liveness_timeout_ns,
+                    };
+
+                    if Command::AddReceiveDestination == command {
+                        let added = subscriptions.add_ipc_destination(
+                            &request,
+                            config,
+                            counters,
+                            &counter_regions,
+                            receive_endpoints,
+                            publications,
+                            now,
+                            &mut transmit,
+                        );
+
+                        if let Err(error) = added {
+                            *subscription_failures += 1;
+                            transmit.error(
+                                request.correlation_id,
+                                error.error_code(),
+                                error.to_string().as_bytes(),
+                            );
+                        }
+                    } else if subscriptions.remove_ipc_destination(
+                        request.registration_id,
+                        request.channel,
+                        counters,
+                        &counter_regions,
+                        publications,
+                        now_ms,
+                        &mut transmit,
+                    ) {
+                        transmit.operation_succeeded(request.correlation_id);
+                    } else {
+                        *subscription_failures += 1;
+                        let unknown = format!(
+                            "unknown subscription client_id={} registration_id={}",
+                            request.client_id, request.registration_id,
+                        );
+                        transmit.error(
+                            request.correlation_id,
+                            ERROR_CODE_UNKNOWN_SUBSCRIPTION,
+                            unknown.as_bytes(),
+                        );
+                    }
+
                     continue;
                 }
 
@@ -3012,6 +3157,7 @@ impl Conductor {
             &mut transmit,
             &mut self.publications,
             &mut self.subscriptions,
+            &mut self.receive_endpoints,
             Some(self.receiver.proxy()),
             self.sender.proxy(),
         );
@@ -3733,17 +3879,20 @@ mod tests {
     /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
     /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel.
     ///
-    /// Only the first is refused by name — a client told nothing waits out its
-    /// timeout, and this is not a command this driver will get to later. The
-    /// other two are **served**: a spy destination is a local read added to a
-    /// multi-destination subscription (`:5704-5806`) and a network one is a
-    /// socket added to any network subscription (`:5879-5910`), and both reach
-    /// the subscription first. The registration id here names no subscription,
+    /// All three are **served** and each is its own branch: `aeron:ipc` and
+    /// `aeron-spy:` are local reads added to a multi-destination subscription
+    /// (`:5617-5700`, `:5808-5870`) and a network one is a socket added to any
+    /// network subscription (`:5924-5960`) — and all three reach the
+    /// subscription first, because a destination is something a subscription
+    /// has, not a subscription. The registration id here names no subscription,
     /// so what this covers is the triage — each prefix reaching its own branch,
     /// with each branch's own answer for a subscription that is not there.
-    /// What a destination does once it is attached is `media::receive_endpoint`'s
-    /// tests, and a spy destination against a real subscription is
-    /// `tests/integration/spy_subscription.rs`.
+    ///
+    /// `aeron:ipc` used to be answered here with a refusal of its own, which is
+    /// what this test pinned; both the refusal and that row of `docs/compat.md`
+    /// are gone. What a destination does once it is attached is
+    /// `media::receive_endpoint`'s tests, and a spy destination against a real
+    /// subscription is `tests/integration/spy_subscription.rs`.
     #[test]
     fn a_receive_destination_is_triaged_by_the_prefix_it_names() {
         use deepmsg_cnc::command::{
@@ -3751,12 +3900,10 @@ mod tests {
         };
 
         let channels = [
-            (
-                "aeron:ipc",
-                "aeron:ipc destinations are not served by this driver",
-            ),
-            // A spy names a subscription it cannot find, which is the
-            // reference's own unknown-subscription error (`:6053-6062`).
+            // An IPC destination names a subscription it cannot find, which is
+            // the reference's own unknown-subscription error (`:5630-5635`).
+            ("aeron:ipc", "unknown subscription"),
+            // And so does a spy (`:6053-6062`).
             (
                 "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
                 "unknown subscription",
@@ -5190,9 +5337,10 @@ mod tests {
             "the publication is gone from the driver"
         );
         assert_eq!(
-            counters_before + 6,
+            counters_before + 7,
             conductor.counters().free_list_len(),
-            "and its six counters came back"
+            "and its six counters came back — plus the send endpoint's, which \
+             was the last one holding that port"
         );
     }
 

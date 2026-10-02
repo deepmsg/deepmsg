@@ -48,6 +48,18 @@ path = "integration/cnc_terminate.rs"
 # interop suite cannot.
 # A client giving a publication or a subscription back — the three ways it can,
 # against a real driver of ours. Runs in CI.
+# The port a subscription listened on coming back when it goes — the receive
+# endpoint's lifecycle, from the outside. Runs in CI.
+# A destination added to a manual subscription connecting the far end's
+# publisher. Runs in CI.
+[[test]]
+name = "mds_added_destination"
+path = "integration/mds_added_destination.rs"
+
+[[test]]
+name = "receive_endpoint_lifecycle"
+path = "integration/receive_endpoint_lifecycle.rs"
+
 [[test]]
 name = "resource_lifecycle"
 path = "integration/resource_lifecycle.rs"
@@ -70,6 +82,12 @@ path = "integration/udp_term_boundary.rs"
 [[test]]
 name = "spy_subscription"
 path = "integration/spy_subscription.rs"
+
+# An IPC publication added to a manual subscription as a source — the same third
+# way a link is made, reading a buffer rather than a socket. Runs in CI.
+[[test]]
+name = "ipc_destination"
+path = "integration/ipc_destination.rs"
 
 # A publication with one producer, from our client to our driver over IPC.
 # Runs in CI: it needs our own driver, not the reference's.

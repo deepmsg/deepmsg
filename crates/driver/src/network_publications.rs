@@ -49,13 +49,13 @@ use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
 use crate::network_publication::{NetworkPublication, PublicationCounters};
 use crate::publication_images::PublicationImages;
 use crate::publication_params::{
-    PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError,
+    PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError, TaggedPublication,
 };
 use crate::receiver::ReceiverProxy;
 use crate::retransmit_handler::RetransmitHandler;
 use crate::send_endpoints::{EndpointOutcome, SendChannelEndpoints};
 use crate::sender::SenderProxy;
-use crate::udp_channel::{ControlMode, UdpChannel};
+use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
 use crate::{position as counter_position, sys};
 
 /// A publication whose log buffer is being created.
@@ -211,6 +211,26 @@ impl NetworkPublications {
             .find(|publication| publication.registration_id == registration_id)
     }
 
+    /// The publication an entity tag names, as the `session-id=tag:N` reader
+    /// wants it (`aeron_driver_conductor_find_network_publication_by_tag`,
+    /// `aeron_driver_conductor.h:764-778`).
+    ///
+    /// A tag no publication carries — **including the invalid tag itself**,
+    /// which is what a channel that named no `tags=` has — is no answer at all,
+    /// and that is the reference's own condition: it will not match a
+    /// publication on the tag `INVALID_TAG` however many channels
+    /// left it at that.
+    pub fn find_by_tag(&self, tag: i64) -> Option<TaggedPublication> {
+        self.publications
+            .iter()
+            .find(|publication| publication.params.entity_tag == tag && tag != INVALID_TAG)
+            .map(|publication| TaggedPublication {
+                session_id: publication.session_id,
+                mtu_length: publication.params.mtu_length,
+                term_length: publication.params.term_length,
+            })
+    }
+
     /// How many publications are waiting for a log buffer.
     pub fn pending(&self) -> usize {
         self.pending.len()
@@ -255,7 +275,7 @@ impl NetworkPublications {
 
         let channel = UdpChannel::resolve(request.channel, &uri)
             .map_err(|error| AddError::Channel(Box::new(error)))?;
-        let mut params = PublicationParams::resolve(&uri, config)?;
+        let mut params = PublicationParams::resolve(&uri, config, |tag| self.find_by_tag(tag))?;
 
         validate_for_publication(&channel)?;
         validate_response_subscription(&channel, &params, subscriptions)?;
@@ -301,9 +321,33 @@ impl NetworkPublications {
                 now.ns,
                 now.ms,
             )
-            .map_err(|error| AddError::Endpoint {
-                error_code: error.error_code(),
-                message: error.to_string(),
+            .map_err(|error| {
+                let mut message = error.to_string();
+
+                // Two layers above the endpoint, and the reference appends one
+                // line for each (`aeron_driver_conductor.c:2008` where the
+                // endpoint is made, `:4433` where the publication's) — with the
+                // **empty message** its `AERON_APPEND_ERR("%s", "")` writes,
+                // which is why each ends in a space. Probed against a live
+                // reference driver for a send endpoint's `EADDRINUSE`.
+                if matches!(
+                    error,
+                    crate::send_endpoints::EndpointError::Bind(_)
+                ) {
+                    message.push_str(
+                        "[aeron_driver_conductor_get_or_add_send_channel_endpoint, \
+                         aeron_driver_conductor.c:2008] \n",
+                    );
+                    message.push_str(
+                        "[aeron_driver_conductor_execute_add_network_publication_create_publication, \
+                         aeron_driver_conductor.c:4433] \n",
+                    );
+                }
+
+                AddError::Endpoint {
+                    error_code: error.error_code(),
+                    message,
+                }
             })?;
 
         let (endpoint_id, channel_status_counter_id, new_endpoint) = match outcome {
@@ -649,6 +693,41 @@ impl NetworkPublications {
                 .unwrap_or(1)
                 .max(1),
         );
+
+        // A stream that resumes starts its four counters where the URI said
+        // (`aeron_driver_conductor.c:4550-4560`, all four together): the
+        // producer's `pub-pos` and `pub-lmt`, the sender's `snd-pos` and
+        // `snd-lmt`.
+        //
+        // It is not cosmetic. `pub-lmt` only ever moves to `snd-pos +
+        // term-window-length` for a publication whose readers are receivers
+        // rather than spies (`aeron_network_publication.c:982`), so a start
+        // that was never seeded leaves the limit a whole window *below* where
+        // the stream is: the producer publishes one message and is then back
+        // pressured for ever, with `pub-lmt - pub-pos` looking healthy to
+        // every counter reader.
+        if let Some(position) = pending.params.starting_position {
+            if let Some(bits_to_shift) =
+                deepmsg_core::logbuffer::position::bits_to_shift(pending.params.term_length)
+            {
+                let start = deepmsg_core::logbuffer::position::Position::new(
+                    position.term_id,
+                    i32::try_from(position.term_offset).unwrap_or(i32::MAX),
+                    bits_to_shift,
+                    pending.params.initial_term_id,
+                )
+                .raw();
+
+                for id in [
+                    pending.counters.pub_pos,
+                    pending.counters.pub_lmt,
+                    pending.counters.snd_pos,
+                    pending.counters.snd_lmt,
+                ] {
+                    let _ = counters.set_value(regions, id, start);
+                }
+            }
+        }
 
         let publication = NetworkPublication::create(
             pending.registration_id,
@@ -1250,7 +1329,9 @@ pub fn resolve_params<'a>(
     uri: &ChannelUri<'a>,
     config: &DriverConfig,
 ) -> Result<PublicationParams, PublicationParamsError> {
-    PublicationParams::resolve(uri, config)
+    // A caller outside the conductor has no publications to name, so a
+    // `session-id=tag:N` channel is one no tag can answer for here.
+    PublicationParams::resolve(uri, config, |_| None)
 }
 
 /// The default socket buffer lengths a driver starts from, for a caller that

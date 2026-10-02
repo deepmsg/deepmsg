@@ -159,7 +159,10 @@ pub enum EndpointError {
     ChannelValidation(String),
     /// The counter manager is full.
     NoCounter,
-    /// The socket could not be opened.
+    /// The socket would not bind, with the chain the reference records for it
+    /// (`send_endpoint.rs::bind_report`).
+    Bind(Box<deepmsg_cnc::error_log::ErrorReport>),
+    /// The socket could not be opened or connected.
     Socket(std::io::Error),
 }
 
@@ -188,6 +191,7 @@ impl std::fmt::Display for EndpointError {
             Self::TagMismatch { tag } => write!(f, "matching tag {tag} has mismatched endpoint"),
             Self::ChannelValidation(message) => f.write_str(message),
             Self::NoCounter => f.write_str("could not allocate the channel status counter"),
+            Self::Bind(report) => f.write_str(report.text()),
             Self::Socket(error) => write!(f, "{error}"),
         }
     }
@@ -386,6 +390,7 @@ impl SendChannelEndpoints {
         )
         .map_err(|error| match error {
             send_endpoint::SendEndpointError::NoCounter => EndpointError::NoCounter,
+            send_endpoint::SendEndpointError::Bind(report) => EndpointError::Bind(report),
             send_endpoint::SendEndpointError::Socket(error) => EndpointError::Socket(error),
         })?;
 
@@ -481,6 +486,25 @@ impl SendChannelEndpoints {
         timeout_ns: i64,
     ) -> bool {
         entry.refcount <= 0 && now_ns - entry.time_of_last_activity_ns >= timeout_ns
+    }
+
+    /// Mark an endpoint as on its way out, and say whether *this* call is the
+    /// one that did it
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_EVENT_DECREF`'s zero case,
+    /// `media/aeron_send_channel_endpoint.c:323-330`: the last publication
+    /// leaving marks it CLOSING and asks the sender to remove it).
+    pub fn begin_release(&mut self, id: u64) -> bool {
+        let Some(entry) = self.get_mut(id) else {
+            return false;
+        };
+
+        if entry.status != EndpointStatus::Active || entry.refcount > 0 {
+            return false;
+        }
+
+        entry.status = EndpointStatus::Closing;
+
+        true
     }
 
     /// Forget an endpoint once both sides have let it go.
