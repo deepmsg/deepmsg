@@ -191,9 +191,17 @@ pub const RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 10 *
 /// resolution is microseconds.
 pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
-/// The smallest a duration in this group may be
+/// The smallest one of the resolver's four **intervals** may be
 /// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
-/// every one of them is read, `aeron_driver_context.c:609-636`): a millisecond.
+/// each of them is read, `aeron_driver_context.c:609-636`): a millisecond, so
+/// that a resolver cannot gossip in a busy loop.
+///
+/// The **threshold** beside them has no floor at all — it is read with `0` as
+/// its minimum (`:1049-1055`), and the reference's own re-resolution test sets
+/// it to a single nanosecond to make every resolution count
+/// (`NameReResolutionTest.java`'s `nameResolverThresholdNs(1)`). A floor here
+/// would not be strictness: it would be a driver that will not start for a
+/// configuration the reference serves.
 pub const RESOLVER_INTERVAL_NS_MIN: i64 = 1000 * 1000;
 
 /// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`aeron_driver_context.c:201`):
@@ -1194,16 +1202,11 @@ impl DriverConfig {
                 &Setting::DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL,
                 &mut config.resolver_bootstrap_neighbor_resolution_interval_ns,
             ),
-            (
-                &Setting::DRIVER_NAME_RESOLVER_THRESHOLD,
-                &mut config.name_resolver_threshold_ns,
-            ),
         ] {
             if let Some(value) = get(setting) {
                 let parsed = parse_duration_ns(setting, &value)?;
 
-                // Every one of the four intervals and the threshold is read
-                // with a floor of a millisecond in the reference
+                // The four intervals are read with a floor of a millisecond
                 // (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`,
                 // `aeron_driver_context.c:609-636`), which is what stops a
                 // resolver that gossips in a busy loop.
@@ -1216,6 +1219,15 @@ impl DriverConfig {
 
                 *field = parsed;
             }
+        }
+
+        // The threshold is read with **no** floor (`:1049-1055`), which is not
+        // an oversight in the reference: the test that counts what a slow
+        // resolution costs sets it to one nanosecond
+        // (`NameReResolutionTest.java`, `nameResolverThresholdNs(1)`).
+        if let Some(value) = get(&Setting::DRIVER_NAME_RESOLVER_THRESHOLD) {
+            config.name_resolver_threshold_ns =
+                parse_duration_ns(&Setting::DRIVER_NAME_RESOLVER_THRESHOLD, &value)?;
         }
 
         // A resolver that gossips needs a name: its own name is what it
@@ -2051,6 +2063,15 @@ mod tests {
             config.resolver_bootstrap_neighbor_resolution_interval_ns
         );
         assert_eq!(1_000_000_000, config.name_resolver_threshold_ns);
+
+        // The threshold has **no** floor, unlike the four intervals beside it:
+        // the reference's own re-resolution test runs one at a nanosecond.
+        let threshold = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[("AERON_DRIVER_NAME_RESOLVER_THRESHOLD", "1")],
+        )
+        .expect("a config");
+        assert_eq!(1, threshold.name_resolver_threshold_ns);
         assert_eq!(Some("a,b,c".to_owned()), config.name_resolver_init_args);
 
         // A name no table has is a driver that does not start — for this
