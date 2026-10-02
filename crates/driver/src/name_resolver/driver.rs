@@ -70,6 +70,12 @@ use crate::sys::socket::MAX_BATCH;
 use crate::system_counters;
 use crate::udp_channel::{format_source_identity, resolve_host_and_port, resolve_interface};
 
+/// `EINVAL`: the code the reference sets at the sites below that are not a name
+/// failing — an invalid resolution type on the wire, a wildcard it cannot
+/// replace, an entry it cannot take
+/// (`aeron_driver_name_resolver.c:797`, `:808`, `:819`, `:1069`).
+const EINVAL: i32 = libc::EINVAL;
+
 /// `AERON_NAME_RESOLVER_DRIVER_DUTY_CYCLE_MS` (`:54`): how often the resolver
 /// does anything at all.
 pub const DUTY_CYCLE_MS: i64 = 10;
@@ -198,6 +204,10 @@ pub struct DriverResolver {
     invalid_packets_counter: i32,
     short_sends_counter: i32,
     error_counter: i32,
+    /// What this resolver could not do, waiting for the agent to carry it out
+    /// to the driver's error log (`aeron_name_resolver_log_and_clear_error`,
+    /// `:718-723`).
+    faults: Vec<crate::name_resolver::ResolverFault>,
     /// The buffers one receive batch fills. Taken out of `self` for the
     /// duration of a poll so that a datagram can be handled while the socket is
     /// borrowed — the reference's single receive buffer (`:55`, `:828-843`)
@@ -364,6 +374,7 @@ impl DriverResolver {
             invalid_packets_counter: system_counters::id::INVALID_PACKETS,
             short_sends_counter: system_counters::id::SHORT_SENDS,
             error_counter: system_counters::id::ERRORS,
+            faults: Vec::new(),
             receive_buffers: (0..MAX_BATCH)
                 .map(|_| vec![0u8; MAX_UDP_PAYLOAD_LENGTH as usize])
                 .collect(),
@@ -466,7 +477,15 @@ impl DriverResolver {
             Ok(received) => received,
             Err(error) => {
                 if error.kind() != std::io::ErrorKind::WouldBlock {
-                    self.record_error(counters, regions);
+                    // The reference reaches this through its receive and names
+                    // the same failure (`:858`).
+                    self.record_error(
+                        counters,
+                        regions,
+                        -EINVAL,
+                        858,
+                        &format!("failed to receive: {error}"),
+                    );
                 }
 
                 self.receive_buffers = buffers;
@@ -532,7 +551,13 @@ impl DriverResolver {
                 if is_known_res_type(remaining[0] as i8) {
                     system_counters::increment(counters, regions, self.invalid_packets_counter);
                 } else {
-                    self.record_error(counters, regions);
+                    self.record_error(
+                        counters,
+                        regions,
+                        EINVAL,
+                        797,
+                        &format!("Invalid res type on entry: {}", remaining[0] as i8),
+                    );
                 }
 
                 return;
@@ -553,7 +578,13 @@ impl DriverResolver {
             // (`:803-812`).
             if is_self && cache_addr.is_wildcard() {
                 let Some(source) = source else {
-                    self.record_error(counters, regions);
+                    self.record_error(
+                        counters,
+                        regions,
+                        EINVAL,
+                        808,
+                        "Failed to replace wildcard with source addr",
+                    );
 
                     return;
                 };
@@ -565,7 +596,13 @@ impl DriverResolver {
                 .on_resolution_entry(&entry, cache_addr, is_self, counters, regions)
                 .is_err()
             {
-                self.record_error(counters, regions);
+                self.record_error(
+                    counters,
+                    regions,
+                    EINVAL,
+                    819,
+                    "Failed to handle resolution entry",
+                );
             }
 
             remaining = &remaining[entry.entry_length()..];
@@ -707,8 +744,18 @@ impl DriverResolver {
             let name = self.bootstrap_neighbors[index].name.clone();
             let address = match resolve_host_and_port(&name) {
                 Ok(address) => Some(address),
-                Err(_) => {
-                    self.record_error(counters, regions);
+                // `:214`: the reference records the *resolution's* own failure
+                // here — `aeron_errcode()` and `aeron_errmsg()`, which for a
+                // name no one answers for is the unknown-host pair — and leaves
+                // the neighbour with no address rather than the whole list.
+                Err(error) => {
+                    self.record_error(
+                        counters,
+                        regions,
+                        -deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+                        214,
+                        &format!("Unable to resolve bootstrap neighbour ({name}): {error}"),
+                    );
 
                     None
                 }
@@ -899,19 +946,50 @@ impl DriverResolver {
                 true
             }
             Ok(_) => true,
-            Err(_) => {
-                self.record_error(counters, regions);
+            Err(error) => {
+                self.record_error(
+                    counters,
+                    regions,
+                    -EINVAL,
+                    1073,
+                    &format!("failed to send: {error}"),
+                );
 
                 false
             }
         }
     }
 
-    /// Count a failure (`aeron_name_resolver_log_and_clear_error`, `:718-723`,
-    /// which also records it in the distinct error log — that part needs the
-    /// driver's log, which arrives with the conductor wiring).
-    fn record_error(&self, counters: &CounterManager, regions: &CounterRegions<'_>) {
+    /// Count a failure and leave it for the driver's error log
+    /// (`aeron_name_resolver_log_and_clear_error`, `:718-723`): the reference
+    /// records the thread-local error and bumps the errors counter, and both
+    /// halves happen here.
+    ///
+    /// The words are per site, because this build has no thread-local error to
+    /// read — the reference's `aeron_errmsg()` is whatever the failing call
+    /// set, and each call site below names its own failure the way that call
+    /// did. `line` is the reference's own recording site, which is what a
+    /// reader of the entry is being pointed at.
+    fn record_error(
+        &mut self,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        error_code: i32,
+        line: u32,
+        message: &str,
+    ) {
         system_counters::increment(counters, regions, self.error_counter);
+
+        self.faults.push(crate::name_resolver::ResolverFault {
+            error_code,
+            description: deepmsg_cnc::error_log::compose_description(
+                error_code,
+                "aeron_name_resolver_log_and_clear_error",
+                "aeron_driver_name_resolver.c",
+                line,
+                message,
+            ),
+        });
     }
 }
 
@@ -1100,6 +1178,13 @@ impl Resolver for DriverResolver {
         self.work(now_ms, counters, regions)
     }
 
+    /// Hand the agent what could not be done, and forget it
+    /// (`aeron_distinct_error_log_record` plus `aeron_err_clear`, which is what
+    /// the reference's own logger ends with).
+    fn take_faults(&mut self) -> Vec<crate::name_resolver::ResolverFault> {
+        std::mem::take(&mut self.faults)
+    }
+
     /// Let the socket go (`aeron_driver_name_resolver_close`, `:525-536`).
     ///
     /// The counters stay: the reference gives none of them back (`:245-262`),
@@ -1215,6 +1300,44 @@ mod tests {
             .expect("bootstrap neighbors resolve");
 
         resolver
+    }
+
+    /// A bootstrap neighbour that will not resolve leaves an entry for the
+    /// driver's error log (`:214`: the reference records the resolve's own
+    /// failure there and leaves that one neighbour without an address).
+    ///
+    /// The name is one the resolver refuses by **syntax** — an empty label —
+    /// so the test asks no nameserver anything and takes microseconds on every
+    /// host, which is the same discipline `tests/integration/unresolved_endpoint.rs`
+    /// follows.
+    #[test]
+    fn a_bootstrap_neighbour_that_will_not_resolve_leaves_a_fault() {
+        let mut fixture = Fixture::new();
+        let port = free_port();
+        let mut resolver = resolver(&mut fixture, "A", port, Some("nothing..invalid:8050"));
+
+        let faults = resolver.take_faults();
+        assert_eq!(1, faults.len(), "one neighbour, one fault: {faults:?}");
+        assert_eq!(
+            -deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
+            faults[0].error_code,
+            "recorded under the resolution's own code"
+        );
+        assert!(
+            faults[0].description.contains("unknown host"),
+            "and its own text, which is what a reader filters on: {}",
+            faults[0].description
+        );
+        assert!(
+            faults[0].description.contains("nothing..invalid"),
+            "naming the neighbour that failed: {}",
+            faults[0].description
+        );
+
+        assert!(
+            resolver.take_faults().is_empty(),
+            "a fault is handed over once, which is what a drain is for"
+        );
     }
 
     /// A resolver takes three kinds of counter and every one of them is a byte

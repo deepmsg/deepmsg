@@ -48,6 +48,24 @@ pub enum Resolution {
     Failed(String),
 }
 
+/// Something a resolver could not do, on its way to the driver's error log
+/// (`aeron_name_resolver_log_and_clear_error`,
+/// `aeron_driver_name_resolver.c:718-723`, which records the thread-local error
+/// and bumps the errors counter beside it).
+///
+/// The reference's resolver writes straight into the shared error log; this
+/// build's log is a process-local structure whose only writer is the conductor,
+/// so a failure is carried out of the resolver the way the agent's other
+/// findings are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolverFault {
+    /// The code the entry is recorded under, the reference's own negation for
+    /// the sites that set one.
+    pub error_code: i32,
+    /// The words, already composed.
+    pub description: String,
+}
+
 /// What a resolver's `lookup` answers (`aeron_name_resolver_lookup_func_t`) —
 /// the three-valued one.
 ///
@@ -143,6 +161,17 @@ pub trait Resolver {
         _regions: &CounterRegions<'_>,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// What this resolver could not do since the last call, for the driver's
+    /// error log.
+    ///
+    /// A drain and not a callback, because the log is the conductor's: the
+    /// agent takes these off the resolver each pass and hands them over
+    /// (`take_faults` is this build's spelling of the reference's direct
+    /// `aeron_distinct_error_log_record`).
+    fn take_faults(&mut self) -> Vec<ResolverFault> {
+        Vec::new()
     }
 
     /// One pass of whatever the resolver does on its own clock (`do_work_func`),

@@ -846,6 +846,7 @@ impl Conductor {
                 Arc::clone(&cnc),
                 config.name_resolver_threshold_ns,
                 free_to_reuse_ms(config.counter_free_to_reuse_ns),
+                std::time::Duration::from_millis(config.debug_resolver_delay_ms),
             ))
             .map_err(ConductorError::Agent)?;
 

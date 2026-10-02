@@ -151,6 +151,10 @@ pub struct AgentResolver {
     /// the allocator is built from — it never allocates, so the view only has
     /// to agree about where an id's value lives.
     free_to_reuse_timeout_ms: i64,
+    /// How long every resolution is held before it is answered
+    /// (`debug.resolver.delay.millis`): zero on every driver but a test's, and
+    /// what it stands in for is a nameserver that does not answer.
+    debug_delay: std::time::Duration,
 }
 
 impl AgentResolver {
@@ -161,12 +165,14 @@ impl AgentResolver {
         cnc: Arc<CncFile>,
         threshold_ns: i64,
         free_to_reuse_timeout_ms: i64,
+        debug_delay: std::time::Duration,
     ) -> Self {
         Self {
             resolver,
             cnc,
             threshold_ns,
             free_to_reuse_timeout_ms,
+            debug_delay,
         }
     }
 }
@@ -641,6 +647,20 @@ impl NativeResourceAgent {
                 }
             }
 
+            // What the resolver itself could not do, on its way to the
+            // driver's error log (`aeron_name_resolver_log_and_clear_error`,
+            // `aeron_driver_name_resolver.c:718-723`): the reference's resolver
+            // writes into that log directly, and this one hands the entries
+            // over because the log is the conductor's.
+            if let Some(AgentResolver { resolver, .. }) = resolver.as_mut() {
+                for fault in resolver.take_faults() {
+                    let _ = faults.send(AgentFault {
+                        error_code: fault.error_code,
+                        description: fault.description,
+                    });
+                }
+            }
+
             backoff.idle(work);
 
             if stopped {
@@ -681,6 +701,14 @@ impl NativeResourceAgent {
                 // conductor never waits on a nameserver again
                 // (`aeron_udp_channel_finish_parse`,
                 // `aeron-driver/src/main/c/aeron_udp_channel.c:346-381`).
+                //
+                // The delay is a test's, and it stands where a nameserver that
+                // does not answer would.
+                if let Some(AgentResolver { debug_delay, .. }) = resolver.as_ref() {
+                    if !debug_delay.is_zero() {
+                        std::thread::sleep(*debug_delay);
+                    }
+                }
                 let parsed = match (resolver, counters) {
                     (
                         Some(AgentResolver {
