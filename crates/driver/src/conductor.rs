@@ -3503,15 +3503,10 @@ impl Conductor {
             .close(&mut self.counters, &regions, self.now_ms);
     }
 
-    /// Resolve a channel through the driver's resolver, and **measure** it
-    /// (`aeron_time_tracking_name_resolver_resolve`,
-    /// `aeron_driver_native_resource_agent.c:29-60`): system counter 32 takes
-    /// the longest resolution so far and 33 counts the ones that ran past the
-    /// configured threshold.
-    ///
-    /// The measurement is per **call**, not per pass: what the reference times
-    /// is the resolver being asked, which is why the tracker is updated at the
-    /// start of the call and measured at the end of it.
+    /// Resolve a channel through the driver's resolver, which is what times it
+    /// (`crate::udp_channel::resolve_host_and_port_with`, and behind it
+    /// `aeron_time_tracking_name_resolver_resolve`,
+    /// `aeron_driver_native_resource_agent.c:29-60`).
     fn resolve_channel(
         resolver: &mut dyn Resolver,
         counters: &CounterManager,
@@ -3520,35 +3515,16 @@ impl Conductor {
         original_uri: &[u8],
         uri: &crate::channel_uri::ChannelUri<'_>,
     ) -> Result<UdpChannel, UdpChannelError> {
-        let begin_ns = clock::monotonic_nano_time();
-
-        let channel = UdpChannel::resolve_with(
+        UdpChannel::resolve_with(
             &mut crate::udp_channel::Names::Built {
                 resolver,
                 counters,
                 regions,
+                threshold_ns,
             },
             original_uri,
             uri,
-        );
-
-        let elapsed_ns = clock::monotonic_nano_time().saturating_sub(begin_ns);
-
-        system_counters::propose_max(
-            counters,
-            regions,
-            system_counters::id::NAME_RESOLVER_MAX_TIME,
-            elapsed_ns,
-        );
-        if elapsed_ns > threshold_ns {
-            system_counters::increment(
-                counters,
-                regions,
-                system_counters::id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED,
-            );
-        }
-
-        channel
+        )
     }
 }
 

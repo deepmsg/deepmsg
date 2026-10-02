@@ -369,9 +369,21 @@ impl CsvTableResolver {
     /// (`aeron_csv_table_name_resolver_init`, `:110-228`).
     ///
     /// The configuration is rows separated by `|`, each row three
-    /// comma-separated columns written **in reverse**: `reResolutionHost`,
-    /// `initialResolutionHost`, `name` (`:150-156`). A row that is not three
-    /// columns is skipped, as the reference's `if` does.
+    /// comma-separated columns: **`name`, `initialResolutionHost`,
+    /// `reResolutionHost`** (`AERON_NAME_RESOLVER_CSV_TABLE_COLUMNS`,
+    /// `:150-156`). A row that is not three columns is skipped, as the
+    /// reference's `if` does.
+    ///
+    /// The reference's own comment on those three lines says *"fields are in
+    /// reverse order"*, and that is true of the **array it reads**, not of the
+    /// text: its `aeron_tokenise` fills backwards (`util/aeron_strutil.c:112-161`),
+    /// so `columns[0]` is the last field and the assignments
+    /// `re = columns[0]; initial = columns[1]; name = columns[2]` come out in
+    /// the order the text is written. Reading the comment instead of the
+    /// tokeniser reverses every row — a name becomes a host and a host becomes
+    /// a name — and the reference's own configuration is the proof:
+    /// `"ReResTestEndpoint,127.0.0.1,127.0.0.2"` (`NameReResolutionTest.java:79`)
+    /// and `"server0,127.0.0.1,127.0.0.2"` (`aeron_name_resolver_test.cpp:465`).
     ///
     /// # Errors
     ///
@@ -398,7 +410,7 @@ impl CsvTableResolver {
                 continue;
             }
 
-            let (re_resolution_host, initial_resolution_host, name) =
+            let (name, initial_resolution_host, re_resolution_host) =
                 (columns[0], columns[1], columns[2]);
 
             // The key is the name's length as a `u32` and then the name bytes
@@ -611,7 +623,7 @@ mod tests {
         let mut table = Supplier::CsvTable
             .build(
                 &driver_params,
-                Some("127.0.0.2,127.0.0.1,server0"),
+                Some("server0,127.0.0.1,127.0.0.2"),
                 &mut fixture.counters,
                 &regions,
                 0,
@@ -753,7 +765,7 @@ mod tests {
     #[test]
     fn a_rows_counter_is_the_operation() {
         let mut fixture = Fixture::new();
-        let mut resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
+        let mut resolver = fixture.resolver("server0,127.0.0.1,127.0.0.2");
         let ids = resolver.counter_ids();
 
         assert_eq!(1, ids.len());
@@ -794,7 +806,7 @@ mod tests {
     #[test]
     fn a_name_the_table_does_not_know_goes_through_it() {
         let mut fixture = Fixture::new();
-        let mut resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
+        let mut resolver = fixture.resolver("server0,127.0.0.1,127.0.0.2");
 
         assert_eq!(
             Resolution::Found("127.0.0.1:0".parse().expect("an address")),
@@ -823,7 +835,7 @@ mod tests {
     #[test]
     fn a_rows_counter_is_named_the_way_a_reader_finds_it() {
         let mut fixture = Fixture::new();
-        let resolver = fixture.resolver("127.0.0.2,127.0.0.1,server0");
+        let resolver = fixture.resolver("server0,127.0.0.1,127.0.0.2");
         let ids = resolver.counter_ids();
 
         let regions = fixture.holder.open();

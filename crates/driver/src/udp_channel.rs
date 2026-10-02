@@ -1115,7 +1115,15 @@ fn resolve_name(
             resolver,
             counters,
             regions,
-        } => resolve_host_and_port_with(&mut **resolver, counters, regions, uri_param_name, text),
+            threshold_ns,
+        } => resolve_host_and_port_with(
+            &mut **resolver,
+            counters,
+            regions,
+            *threshold_ns,
+            uri_param_name,
+            text,
+        ),
     }
 }
 
@@ -1141,6 +1149,9 @@ pub enum Names<'a> {
         counters: &'a CounterManager,
         /// The region those counter ids are offsets into.
         regions: &'a CounterRegions<'a>,
+        /// How long a resolution may take before system counter 33 counts it
+        /// (`aeron.name.resolver.threshold`).
+        threshold_ns: i64,
     },
 }
 
@@ -1167,6 +1178,7 @@ pub fn resolve_host_and_port_with(
     resolver: &mut dyn Resolver,
     counters: &CounterManager,
     regions: &CounterRegions<'_>,
+    threshold_ns: i64,
     uri_param_name: &str,
     text: &str,
 ) -> Result<SocketAddr, UdpChannelError> {
@@ -1180,8 +1192,32 @@ pub fn resolve_host_and_port_with(
         }
     }
 
-    resolver
-        .resolve(host, uri_param_name, false, family, counters, regions)
+    // The resolver being asked is what a driver measures
+    // (`aeron_time_tracking_name_resolver_resolve`,
+    // `aeron_driver_native_resource_agent.c:29-60`): system counter 32 takes
+    // the longest call so far, and 33 counts the ones past the threshold. A
+    // literal never reaches here, so a channel that names an address is not
+    // measured — which is the reference's shape too, because its wrapper
+    // returns before `resolve_func` for a literal.
+    let begin_ns = deepmsg_core::clock::monotonic_nano_time();
+    let resolution = resolver.resolve(host, uri_param_name, false, family, counters, regions);
+    let elapsed_ns = deepmsg_core::clock::monotonic_nano_time().saturating_sub(begin_ns);
+
+    crate::system_counters::propose_max(
+        counters,
+        regions,
+        crate::system_counters::id::NAME_RESOLVER_MAX_TIME,
+        elapsed_ns,
+    );
+    if elapsed_ns > threshold_ns {
+        crate::system_counters::increment(
+            counters,
+            regions,
+            crate::system_counters::id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED,
+        );
+    }
+
+    resolution
         .into_address(text)
         .map(|address| SocketAddr::new(address.ip(), port))
 }
@@ -2094,6 +2130,9 @@ mod tests {
                 resolver: &mut stub,
                 counters: &counters,
                 regions: &regions,
+                // A threshold of zero, so that the counters below are the
+                // measurement's own and not a race with a clock.
+                threshold_ns: 0,
             },
             uri,
             &parsed,
@@ -2121,6 +2160,9 @@ mod tests {
                 resolver: &mut stub,
                 counters: &counters,
                 regions: &regions,
+                // A threshold of zero, so that the counters below are the
+                // measurement's own and not a race with a clock.
+                threshold_ns: 0,
             },
             uri,
             &parsed,
@@ -2129,6 +2171,25 @@ mod tests {
 
         assert_eq!(ipv4("127.0.0.1:40456"), channel.remote_data);
         assert_eq!(1, stub.asked.borrow().len(), "still just the one question");
+
+        // And the call was **measured**, which is what the reference's
+        // time-tracking wrapper does around its delegate
+        // (`aeron_driver_native_resource_agent.c:29-60`). The threshold here is
+        // zero, so the count beside the maximum is the count of calls.
+        let reader = regions.reader();
+        assert_eq!(
+            1,
+            reader
+                .value(crate::system_counters::id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED)
+                .expect("the counter"),
+            "one resolution, one count"
+        );
+        assert!(
+            0 < reader
+                .value(crate::system_counters::id::NAME_RESOLVER_MAX_TIME)
+                .expect("the counter"),
+            "and it took some time"
+        );
     }
 
     #[test]

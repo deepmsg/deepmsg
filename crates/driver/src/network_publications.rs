@@ -280,6 +280,7 @@ impl NetworkPublications {
                 resolver,
                 counters,
                 regions,
+                threshold_ns: config.name_resolver_threshold_ns,
             },
             request.channel,
             &uri,
