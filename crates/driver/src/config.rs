@@ -160,6 +160,42 @@ pub const FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000
 /// than an image's own.
 pub const IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
 
+/// `AERON_NAME_RESOLVER_SUPPLIER_DEFAULT` (`aeronmd.h:809`): `default`, which
+/// is the synchronous resolver this build has always had.
+pub const NAME_RESOLVER_SUPPLIER_DEFAULT: crate::name_resolver::Supplier =
+    crate::name_resolver::Supplier::Default;
+
+/// `AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT_NS_DEFAULT`
+/// (`aeron_driver_context.c:231`): how long a neighbor, and a cached name, are
+/// believed after the moment they were last about.
+pub const RESOLVER_NEIGHBOR_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
+
+/// `AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT` (`:232`).
+pub const RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
+
+/// `AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT` (`:233`).
+pub const RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 2 * 1000 * 1000 * 1000;
+
+/// `AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT`
+/// (`:234`).
+pub const RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
+
+/// `AERON_DRIVER_NAME_RESOLVER_THRESHOLD_NS_DEFAULT` (`:239`): how long a
+/// single resolution may take before system counter 33 counts it.
+///
+/// Five **seconds**, which reads like a typo for milliseconds and is not one:
+/// the reference writes `5 * 1000 * 1000 * INT64_C(1000)`, and the Java
+/// `Configuration` default is the same five seconds
+/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:1118-1124`).
+/// A threshold that only a name server on fire can cross is the point: ordinary
+/// resolution is microseconds.
+pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
+
+/// The smallest a duration in this group may be
+/// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
+/// every one of them is read, `aeron_driver_context.c:609-636`): a millisecond.
+pub const RESOLVER_INTERVAL_NS_MIN: i64 = 1000 * 1000;
+
 /// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`aeron_driver_context.c:201`):
 /// `max`.
 pub const MULTICAST_FLOW_CONTROL_SUPPLIER_DEFAULT: Supplier = Supplier::Max;
@@ -608,6 +644,58 @@ pub struct DriverConfig {
     /// and its value is a count rather than a rate: `None` injects nothing.
     /// `docs/compat.md` records the difference.
     pub data_loss_drop_every: Option<u64>,
+    /// Which resolver this driver builds and keeps
+    /// (`aeron.name.resolver.supplier`, `AERON_NAME_RESOLVER_SUPPLIER`,
+    /// `aeronmd.h:808-809`, whose default is `default`) — `default`,
+    /// `csv_table` or `driver`.
+    ///
+    /// A name that is not one of the three fails the driver's start-up, which
+    /// is what the reference's `aeron_name_resolver_supplier_load` returning
+    /// `NULL` does to its context init
+    /// (`aeron_driver_context.c:588-594`).
+    pub name_resolver_supplier: crate::name_resolver::Supplier,
+    /// The raw `AERON_NAME_RESOLVER_INIT_ARGS` (`aeronmd.h:818`), which is the
+    /// CSV table's configuration and nothing else's — read into the context by
+    /// the reference (`aeron_driver_context.c:599`) and handed to whichever
+    /// supplier was named.
+    ///
+    /// A string here rather than a parsed table, because who parses it depends
+    /// on the supplier: the CSV table's own `init` does
+    /// (`aeron_csv_table_name_resolver.c:110-160`), which is also why a table
+    /// that will not parse fails the *resolver* and not the driver.
+    pub name_resolver_init_args: Option<String>,
+    /// What this driver answers to (`aeron.driver.resolver.name`,
+    /// `AERON_DRIVER_RESOLVER_NAME`, `aeronmd.h:780`).
+    ///
+    /// Required as soon as an interface is named
+    /// (`aeron_driver_context.c:601-608`), because a resolver that gossips
+    /// without a name has nothing to announce.
+    pub resolver_name: Option<String>,
+    /// What the driver's resolver binds and announces
+    /// (`aeron.driver.resolver.interface`, `AERON_DRIVER_RESOLVER_INTERFACE`,
+    /// `aeronmd.h:790`).
+    pub resolver_interface: Option<String>,
+    /// Who to start gossiping with, comma-separated
+    /// (`aeron.driver.resolver.bootstrap.neighbor`,
+    /// `AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR`, `aeronmd.h:800`).
+    pub resolver_bootstrap_neighbor: Option<String>,
+    /// `aeron.driver.resolver.neighbor.timeout` (`AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT`),
+    /// which is both how long a neighbor may go unheard-from and how long a
+    /// cached name lives (`aeron_driver_name_resolver.c:463`).
+    pub resolver_neighbor_timeout_ns: i64,
+    /// `aeron.driver.resolver.self.resolution.interval`
+    /// (`AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL`).
+    pub resolver_self_resolution_interval_ns: i64,
+    /// `aeron.driver.resolver.neighbor.resolution.interval`
+    /// (`AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL`).
+    pub resolver_neighbor_resolution_interval_ns: i64,
+    /// `aeron.driver.resolver.bootstrap.neighbor.resolution.interval`
+    /// (`AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL`).
+    pub resolver_bootstrap_neighbor_resolution_interval_ns: i64,
+    /// `aeron.name.resolver.threshold` (`AERON_DRIVER_NAME_RESOLVER_THRESHOLD`,
+    /// `aeronmd.h:932`): how long one resolution may take before system counter
+    /// 33 counts it (`aeron_driver_native_resource_agent.c:39-60`).
+    pub name_resolver_threshold_ns: i64,
 }
 
 impl Default for DriverConfig {
@@ -673,6 +761,18 @@ impl Default for DriverConfig {
             max_resend: MAX_RESEND_DEFAULT,
             data_loss_drop_every: None,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
+            name_resolver_supplier: NAME_RESOLVER_SUPPLIER_DEFAULT,
+            name_resolver_init_args: None,
+            resolver_name: None,
+            resolver_interface: None,
+            resolver_bootstrap_neighbor: None,
+            resolver_neighbor_timeout_ns: RESOLVER_NEIGHBOR_TIMEOUT_NS_DEFAULT,
+            resolver_self_resolution_interval_ns: RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT,
+            resolver_neighbor_resolution_interval_ns:
+                RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
+            resolver_bootstrap_neighbor_resolution_interval_ns:
+                RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
+            name_resolver_threshold_ns: NAME_RESOLVER_THRESHOLD_NS_DEFAULT,
         }
     }
 }
@@ -1059,6 +1159,79 @@ impl DriverConfig {
             }
         }
 
+        if let Some(value) = get(&Setting::NAME_RESOLVER_SUPPLIER) {
+            config.name_resolver_supplier = crate::name_resolver::Supplier::from_name(&value)
+                .ok_or_else(|| ConfigError::UnknownSupplier {
+                    name: Setting::NAME_RESOLVER_SUPPLIER.property,
+                    value: value.clone(),
+                })?;
+        }
+
+        // Carried as it was written, not parsed: the CSV table's own `init`
+        // reads it (`aeron_csv_table_name_resolver.c:110-160`), and a table
+        // that will not parse is a resolver that will not build rather than a
+        // driver that will not start (`aeron_driver_context.c:599` reads the
+        // string and nothing else).
+        config.name_resolver_init_args = get(&Setting::NAME_RESOLVER_INIT_ARGS);
+        config.resolver_name = get(&Setting::DRIVER_RESOLVER_NAME);
+        config.resolver_interface = get(&Setting::DRIVER_RESOLVER_INTERFACE);
+        config.resolver_bootstrap_neighbor = get(&Setting::DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR);
+
+        for (setting, field) in [
+            (
+                &Setting::DRIVER_RESOLVER_NEIGHBOR_TIMEOUT,
+                &mut config.resolver_neighbor_timeout_ns,
+            ),
+            (
+                &Setting::DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL,
+                &mut config.resolver_self_resolution_interval_ns,
+            ),
+            (
+                &Setting::DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL,
+                &mut config.resolver_neighbor_resolution_interval_ns,
+            ),
+            (
+                &Setting::DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL,
+                &mut config.resolver_bootstrap_neighbor_resolution_interval_ns,
+            ),
+            (
+                &Setting::DRIVER_NAME_RESOLVER_THRESHOLD,
+                &mut config.name_resolver_threshold_ns,
+            ),
+        ] {
+            if let Some(value) = get(setting) {
+                let parsed = parse_duration_ns(setting, &value)?;
+
+                // Every one of the four intervals and the threshold is read
+                // with a floor of a millisecond in the reference
+                // (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`,
+                // `aeron_driver_context.c:609-636`), which is what stops a
+                // resolver that gossips in a busy loop.
+                if parsed < RESOLVER_INTERVAL_NS_MIN {
+                    return Err(ConfigError::OutOfRange {
+                        name: setting.property,
+                        value,
+                    });
+                }
+
+                *field = parsed;
+            }
+        }
+
+        // A resolver that gossips needs a name: its own name is what it
+        // announces, and the reference refuses the start-up rather than
+        // running one that can only answer other people's questions
+        // (`aeron_driver_context.c:601-608`, the only cross-field check in
+        // this group).
+        if config.resolver_interface.is_some()
+            && config
+                .resolver_name
+                .as_ref()
+                .is_none_or(|name| name.is_empty())
+        {
+            return Err(ConfigError::ResolverNameRequired);
+        }
+
         // The one setting that is not read from anywhere: the kernel is asked.
         // It is here rather than in the conductor because it belongs with the
         // values a log buffer is written from, and it is asked once.
@@ -1278,6 +1451,62 @@ impl Setting {
         property: "congestioncontrol.supplier",
         env: "AERON_CONGESTIONCONTROL_SUPPLIER",
     };
+    /// `aeron.name.resolver.supplier` (`aeronmd.h:808`): `default`,
+    /// `csv_table` or `driver`.
+    const NAME_RESOLVER_SUPPLIER: Self = Self {
+        property: "name.resolver.supplier",
+        env: "AERON_NAME_RESOLVER_SUPPLIER",
+    };
+    /// `aeron.name.resolver.init.args` (`aeronmd.h:818`), the CSV table's
+    /// configuration — **environment only**, and deliberately: the reference
+    /// reads it into the context with `getenv` and never a property
+    /// (`aeron_driver_context.c:599`), and this build's `Setting` table answers
+    /// to both names for every other setting.
+    const NAME_RESOLVER_INIT_ARGS: Self = Self {
+        property: "name.resolver.init.args",
+        env: "AERON_NAME_RESOLVER_INIT_ARGS",
+    };
+    /// `aeron.driver.resolver.name` (`aeronmd.h:780`).
+    const DRIVER_RESOLVER_NAME: Self = Self {
+        property: "driver.resolver.name",
+        env: "AERON_DRIVER_RESOLVER_NAME",
+    };
+    /// `aeron.driver.resolver.interface` (`aeronmd.h:790`).
+    const DRIVER_RESOLVER_INTERFACE: Self = Self {
+        property: "driver.resolver.interface",
+        env: "AERON_DRIVER_RESOLVER_INTERFACE",
+    };
+    /// `aeron.driver.resolver.bootstrap.neighbor` (`aeronmd.h:800`).
+    const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR: Self = Self {
+        property: "driver.resolver.bootstrap.neighbor",
+        env: "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR",
+    };
+    /// `aeron.driver.resolver.neighbor.timeout` (`aeronmd.h:827`).
+    const DRIVER_RESOLVER_NEIGHBOR_TIMEOUT: Self = Self {
+        property: "driver.resolver.neighbor.timeout",
+        env: "AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT",
+    };
+    /// `aeron.driver.resolver.self.resolution.interval` (`aeronmd.h:834`).
+    const DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL: Self = Self {
+        property: "driver.resolver.self.resolution.interval",
+        env: "AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL",
+    };
+    /// `aeron.driver.resolver.neighbor.resolution.interval` (`aeronmd.h:842`).
+    const DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL: Self = Self {
+        property: "driver.resolver.neighbor.resolution.interval",
+        env: "AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL",
+    };
+    /// `aeron.driver.resolver.bootstrap.neighbor.resolution.interval`
+    /// (`aeronmd.h:848`).
+    const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL: Self = Self {
+        property: "driver.resolver.bootstrap.neighbor.resolution.interval",
+        env: "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
+    };
+    /// `aeron.name.resolver.threshold` (`aeronmd.h:932`).
+    const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {
+        property: "name.resolver.threshold",
+        env: "AERON_DRIVER_NAME_RESOLVER_THRESHOLD",
+    };
     /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:351`).
     const CUBIC_INITIAL_RTT: Self = Self {
         property: "cubiccongestioncontrol.initialrtt",
@@ -1455,14 +1684,19 @@ pub enum ConfigError {
         /// What it was set to.
         value: String,
     },
-    /// A flow-control supplier name the reference's symbol table does not
-    /// know, which for the reference is a driver that does not start.
+    /// A supplier name the reference's symbol table does not know — flow
+    /// control, congestion control or name resolution — which for the
+    /// reference is a driver that does not start.
     UnknownSupplier {
         /// The setting, by property name.
         name: &'static str,
         /// What it was set to.
         value: String,
     },
+    /// An interface was named for the driver's own resolver without a name for
+    /// the driver to answer to, which the reference refuses
+    /// (`aeron_driver_context.c:601-608`).
+    ResolverNameRequired,
     /// A validator name the reference's symbol table does not know.
     UnknownValidator {
         /// What it was set to.
@@ -1493,8 +1727,12 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "{name} is {value}, outside the range the driver holds")
             }
             Self::UnknownSupplier { name, value } => {
-                write!(f, "{name} is {value}, which names no flow control supplier")
+                write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::ResolverNameRequired => write!(
+                f,
+                "`resolverName` is required when `resolverInterface` is set"
+            ),
             Self::UnknownValidator { value } => {
                 write!(
                     f,
@@ -1516,6 +1754,7 @@ impl std::error::Error for ConfigError {
             | Self::NotANumber { .. }
             | Self::OutOfRange { .. }
             | Self::UnknownSupplier { .. }
+            | Self::ResolverNameRequired
             | Self::UnknownValidator { .. } => None,
         }
     }
@@ -1765,6 +2004,84 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         })
+    }
+
+    /// The resolver settings, under both of the names every setting answers
+    /// to — and the two cross-field rules the reference has for them.
+    #[test]
+    fn the_resolver_settings_are_read_and_the_pair_that_must_agree_is_checked() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[
+                ("AERON_NAME_RESOLVER_SUPPLIER", "driver"),
+                ("AERON_DRIVER_RESOLVER_NAME", "A"),
+                ("AERON_DRIVER_RESOLVER_INTERFACE", "0.0.0.0:8050"),
+                ("AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR", "localhost:8051"),
+                ("AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT", "3s"),
+                ("AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL", "250ms"),
+                (
+                    "AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL",
+                    "500ms",
+                ),
+                (
+                    "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
+                    "4s",
+                ),
+                ("AERON_DRIVER_NAME_RESOLVER_THRESHOLD", "1s"),
+                ("AERON_NAME_RESOLVER_INIT_ARGS", "a,b,c"),
+            ],
+        )
+        .expect("a config");
+
+        assert_eq!(
+            crate::name_resolver::Supplier::Driver,
+            config.name_resolver_supplier
+        );
+        assert_eq!(Some("A".to_owned()), config.resolver_name);
+        assert_eq!(Some("0.0.0.0:8050".to_owned()), config.resolver_interface);
+        assert_eq!(
+            Some("localhost:8051".to_owned()),
+            config.resolver_bootstrap_neighbor
+        );
+        assert_eq!(3_000_000_000, config.resolver_neighbor_timeout_ns);
+        assert_eq!(250_000_000, config.resolver_self_resolution_interval_ns);
+        assert_eq!(500_000_000, config.resolver_neighbor_resolution_interval_ns);
+        assert_eq!(
+            4_000_000_000,
+            config.resolver_bootstrap_neighbor_resolution_interval_ns
+        );
+        assert_eq!(1_000_000_000, config.name_resolver_threshold_ns);
+        assert_eq!(Some("a,b,c".to_owned()), config.name_resolver_init_args);
+
+        // A name no table has is a driver that does not start — for this
+        // supplier as for the two flow-control ones, which is why they share
+        // an error.
+        let unknown = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("aeron.name.resolver.supplier", "dns"),
+        ])
+        .expect_err("no such supplier");
+        assert!(matches!(unknown, ConfigError::UnknownSupplier { .. }));
+
+        // An interface with no name is the reference's own refusal
+        // (`aeron_driver_context.c:601-608`): a resolver that gossips has to
+        // say what it is called.
+        let nameless = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[("AERON_DRIVER_RESOLVER_INTERFACE", "0.0.0.0:8050")],
+        )
+        .expect_err("a name is required");
+        assert!(matches!(nameless, ConfigError::ResolverNameRequired));
+
+        // And every interval has a floor of a millisecond, because a resolver
+        // that gossips faster than that is a busy loop
+        // (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`).
+        let too_fast = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[("AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL", "1us")],
+        )
+        .expect_err("below the floor");
+        assert!(matches!(too_fast, ConfigError::OutOfRange { .. }));
     }
 
     /// The three cubic settings are the only ones this driver carries as

@@ -173,6 +173,82 @@ pub trait Resolver {
     }
 }
 
+/// The three resolvers the reference's supplier table maps names to
+/// (`aeron_name_resolver.c:214-229`, whose entries are `default`, `csv_table`
+/// and `driver`), and what a driver picks one with
+/// (`aeron.name.resolver.supplier`, `aeronmd.h:808-809`).
+///
+/// The name is checked where the setting is read, so a name that is none of the
+/// three fails the driver's start-up — which is what the reference's
+/// `aeron_name_resolver_supplier_load` returning `NULL` does to its context
+/// init (`aeron_driver_context.c:588-594`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Supplier {
+    /// `aeron_default_name_resolver_supplier`: the system's own lookup.
+    #[default]
+    Default,
+    /// `aeron_csv_table_name_resolver_supplier`: the table the reference's own
+    /// tests steer a name with.
+    CsvTable,
+    /// `aeron_driver_name_resolver_supplier`: the gossip resolver.
+    Driver,
+}
+
+impl Supplier {
+    /// The supplier a name stands for (`aeron_name_resolver_supplier_load`,
+    /// `aeron_name_resolver.c:214-229`), or `None` for a name that is not in
+    /// the table.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            "csv_table" => Some(Self::CsvTable),
+            "driver" => Some(Self::Driver),
+            _ => None,
+        }
+    }
+
+    /// The name it answers to, which is what the reference compares.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::CsvTable => "csv_table",
+            Self::Driver => "driver",
+        }
+    }
+
+    /// Build the resolver (`aeron_default_name_resolver_supplier`,
+    /// `aeron_csv_table_name_resolver_supplier` and
+    /// `aeron_driver_name_resolver_supplier`, each of which takes the same
+    /// `(resolver, args, context)`).
+    ///
+    /// `driver` is the parameters the gossip resolver needs — read from the
+    /// settings either way, and ignored by the two that do not gossip.
+    ///
+    /// # Errors
+    ///
+    /// What the resolver could not do at construction: the CSV table's own
+    /// parse of `args` (`aeron_csv_table_name_resolver.c:110-160`), or the
+    /// driver's interface, socket or counters.
+    pub fn build(
+        self,
+        driver: &driver::Params,
+        args: Option<&str>,
+        counters: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+    ) -> Result<Box<dyn Resolver>, String> {
+        match self {
+            Self::Default => Ok(Box::new(DefaultResolver)),
+            Self::CsvTable => Ok(Box::new(CsvTableResolver::new(
+                args, counters, regions, now_ms,
+            )?)),
+            Self::Driver => Ok(Box::new(driver::DriverResolver::new(
+                driver, counters, regions, now_ms,
+            )?)),
+        }
+    }
+}
+
 /// The resolver this build has always had: the system's own lookup, in the
 /// caller's thread (`aeron_default_name_resolver_resolve`,
 /// `aeron_name_resolver.c:117-215`).
@@ -450,6 +526,103 @@ mod tests {
                 &regions,
             )
         }
+    }
+
+    /// A port nobody is using, taken by binding and letting go.
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("a port")
+            .local_addr()
+            .expect("an address")
+            .port()
+    }
+
+    /// The three names the reference's supplier table has
+    /// (`aeron_name_resolver.c:214-229`), each building a resolver that
+    /// answers — and a fourth name that builds nothing, because a driver that
+    /// names it does not start.
+    #[test]
+    fn a_supplier_name_builds_the_resolver_it_names() {
+        let mut fixture = Fixture::new();
+        let regions = fixture.holder.open();
+
+        let port = free_port();
+        let driver_params = driver::Params {
+            name: "A".to_owned(),
+            interface: format!("127.0.0.1:{port}"),
+            ..driver::Params::default()
+        };
+
+        assert_eq!(None, Supplier::from_name("dns"));
+        assert_eq!("driver", Supplier::Driver.name());
+
+        let mut default = Supplier::Default
+            .build(&driver_params, None, &mut fixture.counters, &regions, 0)
+            .expect("a default resolver");
+        assert_eq!(
+            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
+            default.resolve(
+                "127.0.0.1:40456",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &fixture.counters,
+                &regions
+            )
+        );
+
+        let mut table = Supplier::CsvTable
+            .build(
+                &driver_params,
+                Some("127.0.0.1:40457,127.0.0.1:40456,somewhere:40456"),
+                &mut fixture.counters,
+                &regions,
+                0,
+            )
+            .expect("a csv table");
+        assert_eq!(
+            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
+            table.resolve(
+                "somewhere:40456",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &fixture.counters,
+                &regions
+            ),
+            "the table steers a name only it knows"
+        );
+
+        let mut gossip = Supplier::Driver
+            .build(&driver_params, None, &mut fixture.counters, &regions, 0)
+            .expect("a driver resolver");
+        assert_eq!(
+            Resolution::Found(
+                format!(
+                    "127.0.0.1:{}",
+                    driver_params.interface.rsplit(':').next().expect("a port")
+                )
+                .parse()
+                .expect("an address")
+            ),
+            gossip.resolve(
+                "A",
+                "endpoint",
+                false,
+                AddressFamily::Inet,
+                &fixture.counters,
+                &regions
+            ),
+            "and the driver's own resolver knows its own name"
+        );
+
+        // The CSV table without its configuration is the reference's own
+        // error, and it is the *resolver* that fails rather than the driver.
+        assert!(
+            Supplier::CsvTable
+                .build(&driver_params, None, &mut fixture.counters, &regions, 0)
+                .is_err()
+        );
     }
 
     /// The default resolver is the system's own lookup, and it needs nothing
