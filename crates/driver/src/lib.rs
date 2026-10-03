@@ -26,6 +26,7 @@ pub mod clients;
 pub mod conductor;
 pub mod config;
 pub mod congestion_control;
+pub mod cpuset;
 pub mod dir;
 pub mod driver;
 pub mod flowcontrol;
