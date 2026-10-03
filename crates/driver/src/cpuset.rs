@@ -60,6 +60,19 @@ pub enum CpusetError {
     InvalidLocation(PathBuf),
     /// No `cpuset.cpus.effective` anywhere up the cgroup path.
     NotFound(PathBuf),
+    /// A slot asked for a position in the cpuset that it does not have
+    /// (`aeron_driver_context.c:3545-3550`).
+    AffinityOutOfRange {
+        /// The role whose setting it was.
+        role: &'static str,
+        /// The position it named.
+        affinity: i32,
+        /// How many CPUs the cpuset has.
+        count: usize,
+    },
+    /// The topology checks complained and `cpuset.warnings.as.errors` is on
+    /// (`aeron_driver.c:1190-1194`).
+    WarningsAsErrors(usize),
 }
 
 impl std::fmt::Display for CpusetError {
@@ -74,6 +87,17 @@ impl std::fmt::Display for CpusetError {
             Self::Io(error) => write!(f, "{error}"),
             Self::InvalidLocation(path) => {
                 write!(f, "file {} is from an invalid location", path.display())
+            }
+            Self::AffinityOutOfRange {
+                role,
+                affinity,
+                count,
+            } => write!(
+                f,
+                "{role} affinity {affinity} must be less than cpuset count {count}"
+            ),
+            Self::WarningsAsErrors(count) => {
+                write!(f, "cpuset warnings as errors, {count} warnings")
             }
             Self::NotFound(mount) => write!(
                 f,
@@ -238,6 +262,106 @@ pub fn cgroup_read_v2(proc_cgroup_file: &Path, mount_root: &Path) -> Result<Vec<
     }
 }
 
+/// Where each of the driver's agents should run, as **CPU ids**, or `None` for
+/// one that is left where the scheduler put it.
+///
+/// The reference keeps the same four numbers in its context — an index into the
+/// cpuset that [`apply`] turns into a CPU id (`aeron_driver.c:1196-1207`) — and
+/// every agent thread reads its own on start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuAssignment {
+    /// The conductor's CPU, which is the process's own thread under
+    /// `manual_main_loop`.
+    pub conductor: Option<i32>,
+    /// The receiver's.
+    pub receiver: Option<i32>,
+    /// The sender's.
+    pub sender: Option<i32>,
+    /// The native resource agent's.
+    pub native_resource_agent: Option<i32>,
+}
+
+/// What `aeron_driver_apply_cpuset_affinity` decides
+/// (`aeron-driver/src/main/c/aeron_driver.c:1138-1209`).
+///
+/// With `aeron.driver.cpuset.affinity` off — which is the default — this reads
+/// nothing and assigns nothing: the whole path is an operator's choice, and a
+/// driver that never asked for it does not look at the machine's topology at
+/// all.
+///
+/// With it on, in the reference's order: read the cpuset, run the three topology
+/// checks (their warnings go to **stderr**, which is where the reference's
+/// `fprintf(output, ...)` points when `aeronmd` passes `stderr`, `:1160-1178`),
+/// refuse if `cpuset.warnings.as.errors` is set and there were any, and finally
+/// turn each slot's position into a CPU id.
+///
+/// # Errors
+///
+/// [`CpusetError`] for a cgroup that cannot be read, an affinity position the
+/// cpuset does not have, and the warnings-as-errors refusal.
+pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, CpusetError> {
+    if !config.cpuset_affinity {
+        return Ok(CpuAssignment::default());
+    }
+
+    let cpus = cgroup_read_v2(Path::new(PROC_SELF_CGROUP), Path::new(CGROUP_MOUNT_V2))?;
+
+    let root = Path::new(crate::topology::SYS_CPU_PATH);
+    let mut warnings = crate::topology::check_alignment(root, &cpus)
+        .map_err(|error| CpusetError::Io(io::Error::other(error.to_string())))?;
+
+    for check in [
+        crate::topology::check_die_locality
+            as fn(&Path, &[i32]) -> Result<Vec<String>, crate::topology::TopologyError>,
+        crate::topology::check_l3_locality,
+    ] {
+        let found = check(root, &cpus)
+            .map_err(|error| CpusetError::Io(io::Error::other(error.to_string())))?;
+        warnings.extend(found);
+    }
+
+    for warning in &warnings {
+        // stderr, and on the clean path too: this is a diagnostic about the
+        // machine the driver was given, and the reference writes it where an
+        // operator will see it without asking.
+        eprintln!("{warning}");
+    }
+
+    if config.cpuset_warnings_as_errors && !warnings.is_empty() {
+        return Err(CpusetError::WarningsAsErrors(warnings.len()));
+    }
+
+    Ok(CpuAssignment {
+        conductor: slot("conductor", config.conductor_cpu_affinity, &cpus)?,
+        receiver: slot("receiver", config.receiver_cpu_affinity, &cpus)?,
+        sender: slot("sender", config.sender_cpu_affinity, &cpus)?,
+        native_resource_agent: slot(
+            "aeron-md-nra",
+            config.native_resource_agent_cpu_affinity,
+            &cpus,
+        )?,
+    })
+}
+
+/// One slot's position in the cpuset as a CPU id, or `None` for `-1` — the
+/// reference's own `-1 < affinity` test (`aeron_driver_context.c:3553`).
+fn slot(role: &'static str, affinity: i32, cpus: &[i32]) -> Result<Option<i32>, CpusetError> {
+    if affinity < 0 {
+        return Ok(None);
+    }
+
+    let index = usize::try_from(affinity).unwrap_or(usize::MAX);
+    let Some(cpu) = cpus.get(index) else {
+        return Err(CpusetError::AffinityOutOfRange {
+            role,
+            affinity,
+            count: cpus.len(),
+        });
+    };
+
+    Ok(Some(*cpu))
+}
+
 /// The cgroup path this process is in, from `/proc/self/cgroup`'s v2 line.
 ///
 /// The line is `id:controllers:path` and the v2 one is the line with an empty
@@ -400,6 +524,21 @@ mod tests {
             .expect_err("there is no such file");
 
         assert!(matches!(error, CpusetError::NotFound(_)), "{error}");
+    }
+
+    /// With `aeron.driver.cpuset.affinity` off — which is the default — the
+    /// whole path is skipped: no cgroup is read, no topology is looked at, and
+    /// no agent is pinned (`aeron_driver.c:1140-1143`).
+    #[test]
+    fn a_driver_that_did_not_ask_for_affinity_reads_nothing() {
+        let config = crate::config::DriverConfig::default();
+
+        assert!(!config.cpuset_affinity, "the default");
+        assert_eq!(
+            Ok(CpuAssignment::default()),
+            apply(&config),
+            "and nothing is assigned"
+        );
     }
 
     /// The path check is the reference's: a file that resolves outside `/sys/`

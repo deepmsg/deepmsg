@@ -101,10 +101,19 @@ pub(crate) fn run_agent(
     name: &str,
     mut agent: impl Agent,
     mut idle: Strategy,
+    affinity: Option<i32>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(thread_name(name))
         .spawn(move || {
+            // The reference pins each agent as it starts, from the runner's
+            // `on_start` (`aeronmd.c:137-141`), and a failure there is a
+            // warning rather than a refusal — the thread runs, just not where
+            // it was asked to.
+            if let Some(cpu) = affinity {
+                let _ = sys::set_current_thread_affinity(cpu);
+            }
+
             while let Some(work) = agent.do_work() {
                 idle.idle(work);
             }
@@ -276,6 +285,9 @@ pub struct Driver {
     agents: Option<AgentStates>,
     mode: ThreadingMode,
     naming: ThreadNaming,
+    /// Where each agent should run, from `aeron.driver.cpuset.affinity`
+    /// (`cpuset::apply`). All `None` for a driver that never asked.
+    affinity: crate::cpuset::CpuAssignment,
     idle: IdleStrategies,
     /// The runners this driver started, which its close stops and joins. Kept
     /// as they start, so a failure part-way through still leaves them to the
@@ -292,7 +304,11 @@ impl Driver {
     ///
     /// [`ConductorError`] if the file cannot hold the counters, the rings are
     /// not rings, the resolver will not start, or the file cannot be published.
-    pub fn new(cnc: CncFile, config: &DriverConfig) -> Result<Self, ConductorError> {
+    pub fn new(
+        cnc: CncFile,
+        config: &DriverConfig,
+        affinity: crate::cpuset::CpuAssignment,
+    ) -> Result<Self, ConductorError> {
         let mut conductor = Conductor::without_agents(cnc, config)?;
         let agents = conductor.take_agents();
 
@@ -301,6 +317,7 @@ impl Driver {
             agents,
             mode: config.threading_mode,
             naming: config.thread_naming,
+            affinity,
             idle: IdleStrategies::new(config),
             threads: Vec::new(),
         })
@@ -367,6 +384,13 @@ impl Driver {
             // are the ones `ps` shows a process by, and the platform's own
             // thread keeps the process's name there.
             let _ = sys::set_current_thread_name(self.runner_zero_role().name(self.naming));
+        }
+
+        // Slot 0 runs on **this** thread, so its affinity is set here rather
+        // than by a runner (`aeronmd.c:137-141` pins every agent from its own
+        // `on_start`, and this one's is the process's).
+        if let Some(cpu) = self.affinity.conductor {
+            let _ = sys::set_current_thread_affinity(cpu);
         }
 
         self.start_runners()?;
@@ -456,16 +480,22 @@ impl Driver {
                 };
 
                 let sender = strategy(&self.idle.sender)?;
-                self.spawn(Role::Sender, states.sender, sender)?;
+                self.spawn(Role::Sender, states.sender, sender, self.affinity.sender)?;
 
                 let receiver = strategy(&self.idle.receiver)?;
-                self.spawn(Role::Receiver, states.receiver, receiver)?;
+                self.spawn(
+                    Role::Receiver,
+                    states.receiver,
+                    receiver,
+                    self.affinity.receiver,
+                )?;
 
                 let native_resource_agent = strategy(&self.idle.native_resource_agent)?;
                 self.spawn(
                     Role::NativeResourceAgent,
                     states.native_resource_agent,
                     native_resource_agent,
+                    self.affinity.native_resource_agent,
                 )?;
             }
             ThreadingMode::SharedNetwork => {
@@ -481,6 +511,10 @@ impl Driver {
                         receiver: states.receiver,
                     },
                     shared,
+                    // A shared runner is one thread for two agents, so it takes
+                    // the receiver's CPU — the one the datagrams arrive on —
+                    // and the sender's setting is not reachable in this mode.
+                    self.affinity.receiver,
                 )?;
 
                 let native_resource_agent = strategy(&self.idle.native_resource_agent)?;
@@ -488,6 +522,7 @@ impl Driver {
                     Role::NativeResourceAgent,
                     states.native_resource_agent,
                     native_resource_agent,
+                    self.affinity.native_resource_agent,
                 )?;
             }
             // `INVOKER` and `SHARED` build the same single runner
@@ -505,8 +540,14 @@ impl Driver {
     /// Handles are kept as they arrive, so a failure after some have started
     /// leaves them to [`Driver::close`] rather than detaching a thread that
     /// would spin for ever on a queue nothing else will stop.
-    fn spawn(&mut self, role: Role, agent: impl Agent, idle: Strategy) -> io::Result<()> {
-        let thread = run_agent(role.name(self.naming), agent, idle)?;
+    fn spawn(
+        &mut self,
+        role: Role,
+        agent: impl Agent,
+        idle: Strategy,
+        affinity: Option<i32>,
+    ) -> io::Result<()> {
+        let thread = run_agent(role.name(self.naming), agent, idle, affinity)?;
         self.threads.push(thread);
 
         Ok(())
@@ -537,16 +578,19 @@ pub(crate) fn spawn_dedicated(
         Role::Sender.name(naming),
         states.sender,
         strategy(&config.sender_idle)?,
+        None,
     )?);
     threads.push(run_agent(
         Role::Receiver.name(naming),
         states.receiver,
         strategy(&config.receiver_idle)?,
+        None,
     )?);
     threads.push(run_agent(
         Role::NativeResourceAgent.name(naming),
         states.native_resource_agent,
         strategy(&config.native_resource_agent_idle)?,
+        None,
     )?);
 
     Ok(())

@@ -673,6 +673,7 @@ impl Receiver {
             Role::Receiver.classic_name(),
             agent,
             crate::driver::default_strategy(),
+            None,
         )?;
 
         Ok(Self {

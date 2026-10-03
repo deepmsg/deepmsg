@@ -109,7 +109,12 @@ fn an_invoker_driver_is_driven_by_its_caller() {
     )
     .expect("create the CnC file");
 
-    let mut driver = Driver::new(cnc, &config).expect("the driver takes the file over");
+    let mut driver = Driver::new(
+        cnc,
+        &config,
+        deepmsg_driver::cpuset::CpuAssignment::default(),
+    )
+    .expect("the driver takes the file over");
 
     let client = std::thread::spawn({
         let dir = config.aeron_dir.clone();

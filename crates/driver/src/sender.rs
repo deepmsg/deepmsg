@@ -597,6 +597,7 @@ impl Sender {
             Role::Sender.classic_name(),
             agent,
             crate::driver::default_strategy(),
+            None,
         )?;
 
         Ok(Self {

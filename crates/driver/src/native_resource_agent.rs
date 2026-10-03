@@ -393,6 +393,7 @@ impl NativeResourceAgent {
             Role::NativeResourceAgent.classic_name(),
             state,
             crate::driver::default_strategy(),
+            None,
         )?;
 
         Ok(Self {

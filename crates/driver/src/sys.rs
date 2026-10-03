@@ -100,6 +100,84 @@ extern "C" fn handle_stop(signal: libc::c_int) {
     STOP_SIGNAL.store(signal, Ordering::SeqCst);
 }
 
+/// Pin the calling thread to one CPU (`sched_setaffinity`).
+///
+/// This is how an agent that was given a CPU by `aeron.driver.cpuset.affinity`
+/// gets there: the thread sets it on itself as it starts, which is what the
+/// reference's `aeron_set_thread_affinity_on_start` does from every runner's
+/// `on_start` (`aeronmd.c:137-141`).
+///
+/// # Errors
+///
+/// The error from `sched_setaffinity(2)` — `EINVAL` for a CPU that is not on
+/// this machine, `EPERM` for one this process may not use.
+pub fn set_current_thread_affinity(cpu: i32) -> io::Result<()> {
+    // SAFETY: `cpu_set_t` is a plain bit array; zeroing it and setting one bit
+    // is what the kernel expects, and `sched_setaffinity` reads only that.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    if !(0..=libc::CPU_SETSIZE).contains(&cpu) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a CPU number no mask can hold",
+        ));
+    }
+
+    // SAFETY: the index was just bounds-checked against the mask's size.
+    unsafe { libc::CPU_SET(usize::try_from(cpu).unwrap_or(0), &mut set) };
+
+    // SAFETY: pid 0 is the calling thread, the mask is a live local, and its
+    // length is the size of the type it points at.
+    let result = unsafe {
+        libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            std::ptr::addr_of!(set),
+        )
+    };
+
+    if 0 != result {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// The CPUs the calling thread may run on (`sched_getaffinity`) — the only way
+/// to see what [`set_current_thread_affinity`] did, since the kernel keeps the
+/// answer.
+///
+/// # Errors
+///
+/// The error from `sched_getaffinity(2)`.
+pub fn current_thread_affinity() -> io::Result<Vec<i32>> {
+    // SAFETY: as above; this one is written by the kernel.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: the mask is a live local and its length is passed with it.
+    let result = unsafe {
+        libc::sched_getaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            std::ptr::addr_of_mut!(set),
+        )
+    };
+
+    if 0 != result {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut cpus = Vec::new();
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        // SAFETY: the index is inside the mask's size.
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            cpus.push(i32::try_from(cpu).unwrap_or(i32::MAX));
+        }
+    }
+
+    Ok(cpus)
+}
+
 /// How long the loss report file is: the configured length rounded up to the
 /// file page size (`aeron-driver/src/main/c/aeron_driver.c:329-330`).
 ///
@@ -684,6 +762,27 @@ mod tests {
         assert!(
             values.iter().any(|value| *value != values[0]),
             "eight draws from a random source should not agree: {values:?}"
+        );
+    }
+
+    /// The pair of syscalls G4-2's affinity is built on, which is also the only
+    /// way to see that it did anything: the kernel keeps the mask, so the test
+    /// reads it back rather than trusting the return value.
+    ///
+    /// Pinning the **calling** thread is what an agent does to itself when it
+    /// starts, and this test's thread is one.
+    #[test]
+    fn a_thread_can_be_pinned_and_asked_where_it_is() {
+        let allowed = current_thread_affinity().expect("this thread's mask");
+        assert!(!allowed.is_empty(), "a thread runs somewhere");
+
+        let cpu = allowed[0];
+        set_current_thread_affinity(cpu).expect("a CPU this thread may use");
+
+        assert_eq!(
+            vec![cpu],
+            current_thread_affinity().expect("the mask again"),
+            "the kernel now has this thread on one CPU"
         );
     }
 }

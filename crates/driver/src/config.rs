@@ -212,6 +212,11 @@ pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 /// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
 pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
 
+/// `AERON_CPU_AFFINITY_DEFAULT` (`aeron_driver_context.c:244`): the index a
+/// slot's affinity setting starts at, meaning **no affinity** — the thread is
+/// left where the scheduler put it.
+pub const CPU_AFFINITY_DEFAULT: i32 = -1;
+
 /// `AERON_DRIVER_CONNECT_DEFAULT` (`aeron_driver_context.c:247`): whether a
 /// send endpoint whose channel names an explicit endpoint **connects** its
 /// socket to it.
@@ -792,6 +797,28 @@ pub struct DriverConfig {
     /// whether a send endpoint connects its socket to the endpoint its channel
     /// names (`media/aeron_send_channel_endpoint.c:89`).
     pub connect_enabled: bool,
+    /// `aeron.driver.cpuset.affinity` (`AERON_DRIVER_CPUSET_AFFINITY`,
+    /// `aeronmd.h:969`): whether the driver pins its agents to the CPUs its
+    /// cgroup allows (`aeron_driver.c:1138-1209`). **Off by default**, which is
+    /// what makes that whole path an operator's choice.
+    pub cpuset_affinity: bool,
+    /// `aeron.driver.cpuset.warnings.as.errors`
+    /// (`AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS`, `aeronmd.h:973`): whether a
+    /// cpuset the topology checks complain about stops the driver instead of
+    /// being printed (`aeron_driver.c:1190-1194`).
+    pub cpuset_warnings_as_errors: bool,
+    /// `aeron.conductor.cpu.affinity` (`AERON_CONDUCTOR_CPU_AFFINITY`,
+    /// `aeronmd.h:953`): which CPU **of the cpuset** the conductor takes, by
+    /// position — and `-1` to leave it alone
+    /// (`aeron_driver_context.c:3540-3552`).
+    pub conductor_cpu_affinity: i32,
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`), likewise.
+    pub receiver_cpu_affinity: i32,
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`), likewise.
+    pub sender_cpu_affinity: i32,
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`),
+    /// likewise.
+    pub native_resource_agent_cpu_affinity: i32,
     /// How the driver's work is spread over threads (`aeron.threading.mode`).
     pub threading_mode: ThreadingMode,
     /// Which set of names those threads are given (`aeron.thread.naming`).
@@ -896,6 +923,12 @@ impl Default for DriverConfig {
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
             loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
             connect_enabled: DRIVER_CONNECT_DEFAULT,
+            cpuset_affinity: false,
+            cpuset_warnings_as_errors: false,
+            conductor_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            receiver_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            sender_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            native_resource_agent_cpu_affinity: CPU_AFFINITY_DEFAULT,
             threading_mode: ThreadingMode::Dedicated,
             thread_naming: ThreadNaming::Classic,
             conductor_idle: IdleStrategySetting::default(),
@@ -1119,6 +1152,40 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::ERROR_BUFFER_LENGTH) {
             config.layout.error_log_length = parse_size64(&Setting::ERROR_BUFFER_LENGTH, &value)?;
+        }
+        if let Some(value) = get(&Setting::DRIVER_CPUSET_AFFINITY) {
+            config.cpuset_affinity = parse_bool(&Setting::DRIVER_CPUSET_AFFINITY, &value)?;
+        }
+        if let Some(value) = get(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS) {
+            config.cpuset_warnings_as_errors =
+                parse_bool(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS, &value)?;
+        }
+        for (setting, field) in [
+            (
+                Setting::CONDUCTOR_CPU_AFFINITY,
+                &mut config.conductor_cpu_affinity,
+            ),
+            (
+                Setting::RECEIVER_CPU_AFFINITY,
+                &mut config.receiver_cpu_affinity,
+            ),
+            (
+                Setting::SENDER_CPU_AFFINITY,
+                &mut config.sender_cpu_affinity,
+            ),
+            (
+                Setting::NATIVE_RESOURCE_AGENT_CPU_AFFINITY,
+                &mut config.native_resource_agent_cpu_affinity,
+            ),
+        ] {
+            if let Some(value) = get(&setting) {
+                *field = parse_count(&setting, &value).and_then(|count| {
+                    i32::try_from(count).map_err(|_| ConfigError::OutOfRange {
+                        name: setting.property,
+                        value: value.clone(),
+                    })
+                })?;
+            }
         }
         if let Some(value) = get(&Setting::DRIVER_CONNECT) {
             config.connect_enabled = parse_bool(&Setting::DRIVER_CONNECT, &value)?;
@@ -1943,6 +2010,36 @@ impl Setting {
     const DRIVER_CONNECT: Self = Self {
         property: "driver.connect",
         env: "AERON_DRIVER_CONNECT",
+    };
+    /// `aeron.driver.cpuset.affinity` (`aeronmd.h:969`).
+    const DRIVER_CPUSET_AFFINITY: Self = Self {
+        property: "driver.cpuset.affinity",
+        env: "AERON_DRIVER_CPUSET_AFFINITY",
+    };
+    /// `aeron.driver.cpuset.warnings.as.errors` (`aeronmd.h:973`).
+    const DRIVER_CPUSET_WARNINGS_AS_ERRORS: Self = Self {
+        property: "driver.cpuset.warnings.as.errors",
+        env: "AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS",
+    };
+    /// `aeron.conductor.cpu.affinity` (`aeronmd.h:953`).
+    const CONDUCTOR_CPU_AFFINITY: Self = Self {
+        property: "conductor.cpu.affinity",
+        env: "AERON_CONDUCTOR_CPU_AFFINITY",
+    };
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`).
+    const RECEIVER_CPU_AFFINITY: Self = Self {
+        property: "receiver.cpu.affinity",
+        env: "AERON_RECEIVER_CPU_AFFINITY",
+    };
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`).
+    const SENDER_CPU_AFFINITY: Self = Self {
+        property: "sender.cpu.affinity",
+        env: "AERON_SENDER_CPU_AFFINITY",
+    };
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`).
+    const NATIVE_RESOURCE_AGENT_CPU_AFFINITY: Self = Self {
+        property: "driver.native.resource.agent.cpu.affinity",
+        env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_CPU_AFFINITY",
     };
     /// `aeron.driver.dynamic.libraries` (`aeronmd.h:980`): the libraries the
     /// reference `dlopen`s at context init. This build refuses it — see
