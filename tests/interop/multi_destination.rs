@@ -122,6 +122,48 @@ fn client_view(client: &Client, subscription_id: i64) -> String {
     }
 }
 
+/// Which of the sample's offers it reported as published, from what it wrote
+/// to stdout.
+///
+/// **Not line by line.** The sample prints its publication's status footer —
+/// `4104:-1586784077` — with no newline after it, so its first offer lands on
+/// the same line as that footer, and the record is split by a newline in the
+/// middle of it:
+///
+/// ```text
+/// 4104:-1586784077offering 0/
+/// 5 - yay!
+/// ```
+///
+/// A reader that took each line for a record would drop exactly the first
+/// message the publisher did publish — which reads as a driver that delivered
+/// something nobody sent. The records have no newlines of their own, so the
+/// newlines go first and the records are found by their own shape.
+///
+/// An offer that failed says what it failed with instead of `yay!`, and is
+/// left out for the same reason the test's comment gives: a message the
+/// publisher never published is not ours to deliver.
+fn scan_offers(output: &str) -> Vec<u64> {
+    let flattened: String = output
+        .chars()
+        .filter(|character| *character != '\n')
+        .collect();
+
+    flattened
+        .split("offering ")
+        .skip(1)
+        .filter_map(|record| {
+            let (index, rest) = record.split_once('/')?;
+            let (_, result) = rest.split_once(" - ")?;
+
+            result
+                .starts_with("yay!")
+                .then(|| index.trim().parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
 #[test]
 fn a_reference_publishers_messages_reach_our_receive_destination() {
     let Some(publisher_binary) = samples::locate("BasicPublisher") else {
@@ -224,17 +266,7 @@ fn a_reference_publishers_messages_reach_our_receive_destination() {
     // came back "not connected" is a message the reference never published —
     // not ours to deliver. What has to hold is that *everything it did
     // publish* arrived.
-    let published: Vec<u64> = publisher_said
-        .lines()
-        .filter(|line| line.ends_with("yay!"))
-        .filter_map(|line| {
-            line.strip_prefix("offering ")?
-                .split_once('/')?
-                .0
-                .parse()
-                .ok()
-        })
-        .collect();
+    let published: Vec<u64> = scan_offers(&publisher_said);
 
     assert!(
         !published.is_empty(),
