@@ -20,6 +20,19 @@
 //! And both are asserted **against a control**: the same driver, the same
 //! hand-built `SETUP`, the same stream, sent at a subscription that is an
 //! ordinary reader. The control forms an image and elicits nothing.
+//!
+//! One thing both channels do is ask, and it is not an answer to anything: a
+//! channel that named a `control=` is asked for a `SETUP` as soon as its
+//! endpoint exists — one status message carrying `SEND_SETUP` with the stream,
+//! the session and every position left at zero
+//! (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
+//! `media/aeron_receive_channel_endpoint.c:1127-1152`). The far end's socket is
+//! therefore bound **before** its subscription, and the ask is drained before
+//! the `SETUP` goes out: an ask sent to a port nobody has bound yet is lost,
+//! and a test that only *sometimes* loses it measures the race rather than the
+//! contract. What is asserted after the drain is silence — the periodic re-ask
+//! is gated on the endpoint having registered a stream at all, and a response
+//! subscription registers none (`aeron_data_packet_dispatcher.h:171-174`).
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -292,8 +305,84 @@ fn watch_for(
     outcome
 }
 
+/// Whether `bytes` is the ask a receiver makes of a channel that named a
+/// `control=`: a status message with `SEND_SETUP` in its flags and the stream,
+/// the session and every position left at zero, because there is no stream yet
+/// — the ask is for a `SETUP` describing whatever the far end publishes
+/// (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
+/// `media/aeron_receive_channel_endpoint.c:1127-1152`).
+fn is_ask_for_setup(bytes: &[u8]) -> bool {
+    StatusMessageFrame::read(bytes).is_some_and(|sm| {
+        sm.stream_id == 0 && sm.session_id == 0 && bytes[5] & header_flags::SM_SEND_SETUP != 0
+    })
+}
+
+/// The first datagram the far end hears in `within`, or `None` if it hears
+/// nothing at all.
+///
+/// It is the *first* one rather than the first matching one on purpose: at this
+/// point nothing has been sent to the driver yet, so the only thing that can
+/// arrive is the ask — and a caller that asserted on a filtered stream would
+/// pass for a driver that opened with something else.
+///
+/// The caller's socket has to be bound before the subscription for this to be
+/// deterministic, which is why every channel here opens its `FarEnd` first.
+fn hear_one(far_end: &mut FarEnd, within: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + within;
+
+    while Instant::now() < deadline {
+        if let Some((bytes, _)) = far_end.take() {
+            return Some(bytes);
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    None
+}
+
+/// The response half of the test below, run against whichever driver the
+/// caller started: a `control-mode=response` subscription on a channel that
+/// named a `control=`, whose endpoint registers no stream at all.
+///
+/// The ask is drained first and returned; what comes back beside it is what the
+/// far end heard *after* the `SETUP` went out. The window is long enough to
+/// hold a periodic re-ask, which is the whole point: this build used to send
+/// one every second for a stream nobody had registered, and the reference sends
+/// **one, ever** (`aeron_driver_receiver.c:227`'s gate).
+///
+/// `ports` seeds the two ports it needs, two apart. Two callers in one process
+/// must not share one.
+fn a_response_channel_asked_once(client: &mut Client, ports: u16) -> (Option<Vec<u8>>, Outcome) {
+    let endpoint = free_udp_port(ports);
+    let control = free_udp_port(ports + 2);
+
+    // Bound before the subscription: the driver asks the moment the endpoint
+    // exists, and an ask that arrives first is lost rather than delayed.
+    let mut far = FarEnd::open(control);
+    let id = client
+        .add_subscription(
+            &format!(
+                "aeron:udp?endpoint=127.0.0.1:{endpoint}|control=127.0.0.1:{control}\
+                 |control-mode=response"
+            ),
+            STREAM_ID,
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a response channel is one this driver serves");
+
+    let ask = hear_one(&mut far, Duration::from_secs(1));
+    far.send_a_setup(endpoint, STREAM_ID, READER_SESSION);
+
+    (ask, watch_for(client, &mut far, id, Duration::from_secs(3)))
+}
+
 /// ⑨: two subscriptions that differ only in their control mode, sent the same
 /// `SETUP` for the same stream, read it and do not.
+///
+/// Both halves now also pin what happens *before* the `SETUP`: the ask each
+/// channel gets for one, and — on the response side — that it is the only one,
+/// three seconds and two re-ask intervals later.
 #[test]
 fn a_response_subscription_is_not_a_reader() {
     let Some(mut own) = OwnDriver::start("response-channel") else {
@@ -312,6 +401,7 @@ fn a_response_subscription_is_not_a_reader() {
     // answer is ordinary position reports.
     let reader_endpoint = free_udp_port(61);
     let reader_control = free_udp_port(62);
+    let mut reader_far = FarEnd::open(reader_control);
     let reader_id = client
         .add_subscription(
             &format!(
@@ -322,7 +412,6 @@ fn a_response_subscription_is_not_a_reader() {
         )
         .expect("our driver must confirm the UDP subscription");
 
-    let mut reader_far = FarEnd::open(reader_control);
     reader_far.send_a_setup(reader_endpoint, STREAM_ID, READER_SESSION);
 
     let ordinary = watch_for(
@@ -344,27 +433,13 @@ fn a_response_subscription_is_not_a_reader() {
     // The same channel with `control-mode=response`, which is the only
     // difference between the two phases. It is *served* rather than refused,
     // which is what this slice changed.
-    let response_endpoint = free_udp_port(63);
-    let response_control = free_udp_port(64);
-    let response_id = client
-        .add_subscription(
-            &format!(
-                "aeron:udp?endpoint=127.0.0.1:{response_endpoint}\
-                 |control=127.0.0.1:{response_control}|control-mode=response"
-            ),
-            STREAM_ID,
-            DEFAULT_TIMEOUT,
-        )
-        .expect("a response channel is one this driver serves");
+    let (asked, responded) = a_response_channel_asked_once(&mut client, 63);
 
-    let mut responder_far = FarEnd::open(response_control);
-    responder_far.send_a_setup(response_endpoint, STREAM_ID, READER_SESSION);
-
-    let responded = watch_for(
-        &mut client,
-        &mut responder_far,
-        response_id,
-        Duration::from_secs(1),
+    let asked = asked.expect("a channel with a control address is asked for a SETUP");
+    assert!(
+        is_ask_for_setup(&asked),
+        "and it is the ask and nothing else: a SETUP is what it wants, so it \
+         names no stream and carries no position: {asked:02x?}"
     );
 
     assert!(
@@ -375,11 +450,60 @@ fn a_response_subscription_is_not_a_reader() {
     assert_eq!(
         0, responded.answers,
         "and nothing answers the SETUP at all — a stream no subscription is \
-         registered for is silence, not an image that failed to link"
+         registered for is silence, not an image that failed to link. Three \
+         seconds is two re-ask intervals, so a driver that kept asking an \
+         endpoint nobody registered a stream on would answer here"
     );
 
     drop(client);
     let _ = own.stop();
+}
+
+/// The ask-once half against the **reference** driver, which is the only way
+/// to know that "silence" is the contract rather than this build's invention:
+/// an assertion against this build alone would pass just as well if the
+/// reference kept asking.
+///
+/// Same channel, same hand-built `SETUP`, and the reference's own answer is
+/// `should_elicit_setup_message` over an empty dispatcher — a `control-mode=response`
+/// subscription puts its stream in the endpoint's *response* refcount instead
+/// (`aeron_receive_channel_endpoint_incref_to_response_stream`,
+/// `media/aeron_receive_channel_endpoint.c:746-756`), so nothing is registered
+/// and nothing is ever re-asked.
+#[test]
+fn the_reference_asks_a_response_subscription_once_too() {
+    let Some(binary) = driver::locate_verified() else {
+        driver::announce_skip();
+        return;
+    };
+
+    let mut reference = driver::ReferenceDriver::start(&binary, "response-channel-ask-once")
+        .expect("the reference driver must start");
+
+    reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference must publish a readable CnC file");
+
+    let mut client = Client::connect(reference.aeron_dir()).expect("connect our client");
+
+    // Ports past every other test's here: this one runs beside them in the
+    // same process, and two of them must not want the same socket.
+    let (asked, responded) = a_response_channel_asked_once(&mut client, 131);
+
+    assert!(
+        asked.is_some_and(|bytes| is_ask_for_setup(&bytes)),
+        "the reference asks a response channel for a SETUP too — the ask is the \
+         handshake's first move, not a defect of this build's"
+    );
+    assert!(!responded.image, "and forms no image for it: {responded:?}");
+    assert_eq!(
+        0, responded.answers,
+        "and has nothing more to say three seconds later, which is what the \
+         test above asserts of this build: {responded:?}"
+    );
+
+    drop(client);
+    let _ = reference.stop();
 }
 
 /// ⑨: a `RSP_SETUP` is what makes a response subscription readable, and what
