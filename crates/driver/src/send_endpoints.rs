@@ -47,7 +47,7 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::channel_validation;
 use crate::media::loss_generator::EveryNthDatagram;
-use crate::media::send_endpoint::{self, EndpointStatus, PublicationDispatch, SendChannelEndpoint};
+use crate::media::send_endpoint::{self, EndpointStatus, SendChannelEndpoint};
 use crate::port_manager::{PortRange, WildcardPortManager};
 use crate::sys;
 use crate::udp_channel::{INVALID_TAG, UdpChannel};
@@ -524,20 +524,25 @@ impl SendChannelEndpoints {
         })
     }
 
-    /// Attach a publication to an endpoint
-    /// (`aeron_send_channel_endpoint_add_publication` on the sender side, and
-    /// the reference count the conductor keeps beside it).
+    /// Count a publication against the endpoint it sends through
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_INCREF` on the endpoint,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4591`, once per
+    /// network publication created).
     ///
-    /// Returns whether the `(stream, session)` pair was free.
-    pub fn attach_publication(
-        &mut self,
-        id: u64,
-        endpoint: &mut SendChannelEndpoint,
-        dispatch: PublicationDispatch,
-        now_ns: i64,
-    ) -> bool {
-        let added = endpoint.add_publication(dispatch);
-
+    /// The count is the whole of what keeps an endpoint alive while something
+    /// still publishes through it: [`Self::begin_release`] refuses an endpoint
+    /// whose count is above zero, and the reference collects one only when the
+    /// count has reached zero *and* its last activity is older than the linger
+    /// timeout (`:1533-1586`).
+    ///
+    /// This build had the matching decrement and no increment, which made the
+    /// count negative on the first removal and tore a shared endpoint down —
+    /// its socket, its `snd-channel` counter and the label on it — while other
+    /// publications were still sending through it. The reference's own
+    /// `aeron_send_channel_endpoint_add_publication` (`:440-452`) is the other
+    /// half of this: it is the *sender's* dispatch map, and the sender owns
+    /// that object here, so there is nothing for the conductor to do with it.
+    pub fn attach_publication(&mut self, id: u64, now_ns: i64) {
         if let Some(entry) = self.get_mut(id) {
             #[allow(clippy::cast_possible_wrap)] // a publication count is small
             {
@@ -545,8 +550,6 @@ impl SendChannelEndpoints {
             }
             entry.time_of_last_activity_ns = now_ns;
         }
-
-        added
     }
 
     /// Detach a publication from an endpoint's count. The publication itself
@@ -1569,5 +1572,61 @@ mod tests {
         idle.refcount = 0;
         assert!(!SendChannelEndpoints::is_collectable(&idle, 1_200, 500));
         assert!(SendChannelEndpoints::is_collectable(&idle, 1_500, 500));
+    }
+
+    /// The count a publication puts on the endpoint it sends through, and the
+    /// whole reason it is there: an endpoint something still publishes through
+    /// is not collected, however many publications have already left it
+    /// (`AERON_DRIVER_MANAGED_RESOURCE_INCREF` on the endpoint,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4591`, against
+    /// `begin_release`'s zero case,
+    /// `media/aeron_send_channel_endpoint.c:323-330`).
+    ///
+    /// This build had the decrement and not the increment: the count went
+    /// negative at the first removal, so the endpoint went out from under the
+    /// publications still on it — its socket, its `snd-channel` counter, and
+    /// the label a reader finds the channel and the bound port in
+    /// (`io.aeron.ResponseChannelsTest::shouldCreateNewSendChannelWithoutPrototype`).
+    #[test]
+    fn an_endpoint_lives_until_the_last_publication_on_it_has_gone() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let mut endpoints = SendChannelEndpoints::new();
+
+        let id = endpoints
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                &defaults(),
+                &DriverConfig::default(),
+                0,
+                &mut counters,
+                &regions,
+                77,
+                1,
+                1,
+            )
+            .expect("an endpoint")
+            .id();
+
+        // Two publications on one endpoint, which is the shape a response
+        // channel has: a prototype and the session publication that follows it.
+        endpoints.attach_publication(id, 2);
+        endpoints.attach_publication(id, 2);
+
+        // The first leaves, and the endpoint is not a candidate — once for the
+        // one still on it, and once more because the count did not move.
+        assert!(endpoints.detach_publication(id));
+        assert!(!endpoints.begin_release(id), "one publication is on it");
+        assert!(
+            !endpoints.begin_release(id),
+            "and the count is still above zero"
+        );
+
+        // The second leaves, and now it is.
+        assert!(endpoints.detach_publication(id));
+        assert!(
+            endpoints.begin_release(id),
+            "nothing is publishing through it"
+        );
     }
 }

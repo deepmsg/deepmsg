@@ -1083,174 +1083,242 @@ fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
 /// those is a *decision the conductor makes about someone else's memory*, and
 /// the only place to see one is a running driver with a real image.
 ///
-/// The arrangement is three subscriptions on one image, because all three
-/// outcomes have the same precondition and it is not obvious:
-/// **"behind" is relative to the fastest reader**
+/// The arrangement is three subscriptions on one image — one that keeps up and
+/// one that stalls — because **"behind" is relative to the fastest reader**
 /// (`untethered_window_limit = (max_sub_pos - window) + window / 4`,
 /// `aeron_publication_image.c:1199-1215`), so a lone subscriber is never put
 /// aside however slowly it reads. One reader that keeps up is what makes the
-/// other two late at all.
+/// other late at all.
 ///
 /// The channel is our own driver's on both ends — one driver publishing and
 /// subscribing, which is the only arrangement in which the *receive* side of a
 /// network publication exists in a test without a second process.
+///
+/// **`rejoin` is the image's and not a reader's**, which is why the two outcomes
+/// are two tests rather than one image with a rejoining reader and a closing one
+/// on it. The reference refuses two subscriptions on one endpoint and stream
+/// that disagree about it (`aeron_driver_conductor_has_clashing_subscription`,
+/// `aeron_driver_conductor.c:334-346` — probed against a live reference driver,
+/// which answers with the same `option conflicts with existing subscription:
+/// rejoin=false` this build does), and every position takes the value the image
+/// was created with (`aeron_publication_image.c:279`). An earlier version of
+/// this test had the two readers differ on it, and passed only because this
+/// build did not check.
+struct Untethered {
+    own: OwnDriver,
+    cnc: deepmsg_cnc::CncFile,
+    client: Client,
+    keeper: i64,
+    staller: i64,
+    publication: i64,
+}
+
+impl Untethered {
+    /// Start the driver, add the two subscriptions and the publication, and
+    /// stop reading on one of them.
+    ///
+    /// `rejoin` goes on **both** subscriptions: they share an image, so they
+    /// have to agree. The keeper stays tethered and so is never put aside,
+    /// which is what makes the stall measurable at all.
+    fn stall(rejoin: bool, port_offset: u16, name: &str) -> Option<Self> {
+        // The three stage timeouts are the driver's, not the channel's — and that
+        // is not a shortcut: the image reads them from the **endpoint's** URI
+        // (`aeron_publication_image.c:243`, `aeron_driver_uri_subscription_params`,
+        // which starts from the context's defaults), so a subscription that names
+        // them on a channel another subscription already created an endpoint for
+        // is naming them at nobody. Configuring the driver is what the image
+        // actually inherits.
+        let mut own = OwnDriver::start_with(
+            name,
+            &[
+                "-Daeron.untethered.window.limit.timeout=200ms",
+                "-Daeron.untethered.linger.timeout=200ms",
+                "-Daeron.untethered.resting.timeout=200ms",
+                // The window the machine measures a reader's lag against — three
+                // quarters of it before a reader is late
+                // (`aeron_publication_image.c:1180-1181`). The 128 KiB default takes
+                // a hundred-odd round trips through the reference driver to fill;
+                // eight kibibytes is the same test with one.
+                "-Daeron.rcv.initial.window.length=8k",
+            ],
+        )?;
+
+        let cnc = own
+            .await_cnc(READY_TIMEOUT)
+            .expect("this driver must publish a readable CnC file");
+
+        // Each test takes its own port offset: the tests in this file run in
+        // parallel and the port is derived from the process, which they share.
+        let port = free_udp_port(port_offset);
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        let untethered = format!("{channel}|tether=false|rejoin={rejoin}");
+
+        let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+
+        let keeper = client
+            .add_subscription(
+                &format!("{channel}|rejoin={rejoin}"),
+                STREAM_ID,
+                DEFAULT_TIMEOUT,
+            )
+            .expect("our driver must confirm the reading subscription");
+        let staller = client
+            .add_subscription(&untethered, STREAM_ID, DEFAULT_TIMEOUT)
+            .expect("our driver must confirm the stalling subscription");
+
+        // The publication last, so both subscriptions join where the image
+        // starts: the lag this test needs has to come from the data, not from
+        // the order the commands were sent in.
+        let publication = client
+            .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+            .expect("our driver must confirm the UDP publication");
+
+        let mut fixture = Self {
+            own,
+            cnc,
+            client,
+            keeper,
+            staller,
+            publication,
+        };
+
+        let both = |client: &mut Client| {
+            images_of(client, fixture.keeper) > 0 && images_of(client, fixture.staller) > 0
+        };
+        assert!(
+            wait_for(&mut fixture.client, CONNECT_TIMEOUT, both),
+            "both subscriptions read one image: keeper {}, staller {}",
+            images_of(&fixture.client, keeper),
+            images_of(&fixture.client, staller)
+        );
+
+        fixture.stall_the_reader();
+
+        Some(fixture)
+    }
+
+    /// Hold the publication one window ahead of the staller and no further.
+    ///
+    /// A window's worth of messages, read by the keeper and not by the staller.
+    /// The publisher is held one window ahead of the *slowest* reader, so a
+    /// window is all the lag the image can be made to show — and three quarters
+    /// of it is what makes a reader late.
+    fn stall_the_reader(&mut self) {
+        const MESSAGES: usize = 8;
+
+        let mut offered = 0;
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+
+        while offered < MESSAGES && Instant::now() < deadline {
+            self.client.poll();
+
+            // Only the keeper reads. `poll_subscription` is what moves a
+            // subscription's position, so leaving the other out of this loop
+            // *is* the stall the test is about.
+            let _ = drain_messages(&mut self.client, self.keeper, Duration::from_millis(1), 16);
+
+            if let Some(Appended::Ok { .. }) =
+                self.client.offer(self.publication, &bulk_payload(offered))
+            {
+                offered += 1;
+            }
+        }
+
+        // Seven of eight: the eighth frame is past the window the staller is
+        // still holding shut. It is the *bytes* that matter, not the count.
+        assert!(
+            offered >= MESSAGES - 1,
+            "the publication has to take a window's worth before anything can be late: {offered} of {MESSAGES}"
+        );
+        assert!(
+            sub_position(&self.cnc, self.keeper)
+                .zip(sub_position(&self.cnc, self.staller))
+                .is_some_and(|(keeper, lagging)| keeper.1 - lagging.1 > IMAGE_WINDOW / 4 * 3),
+            "the keeper has to be three quarters of a window ahead: keeper {:?}, staller {:?}",
+            sub_position(&self.cnc, self.keeper),
+            sub_position(&self.cnc, self.staller)
+        );
+    }
+
+    /// The staller is told its image is gone, and the keeper is untouched: the
+    /// machine moved a reader, not the image.
+    fn assert_put_aside(&mut self) {
+        let (keeper, staller) = (self.keeper, self.staller);
+        assert!(
+            wait_for(
+                &mut self.client,
+                Duration::from_secs(20),
+                |client| images_of(client, staller) == 0
+            ),
+            "the late reader is told its image is gone: staller {}",
+            images_of(&self.client, staller)
+        );
+        assert_eq!(
+            1,
+            images_of(&self.client, keeper),
+            "the reader that kept up is untouched"
+        );
+    }
+}
+
 #[test]
-fn an_untethered_subscriber_is_put_aside_woken_or_closed() {
-    // The three stage timeouts are the driver's, not the channel's — and that
-    // is not a shortcut: the image reads them from the **endpoint's** URI
-    // (`aeron_publication_image.c:243`, `aeron_driver_uri_subscription_params`,
-    // which starts from the context's defaults), so a subscription that names
-    // them on a channel another subscription already created an endpoint for
-    // is naming them at nobody. Configuring the driver is what the image
-    // actually inherits.
-    let Some(mut own) = OwnDriver::start_with(
-        "udp-untethered",
-        &[
-            "-Daeron.untethered.window.limit.timeout=200ms",
-            "-Daeron.untethered.linger.timeout=200ms",
-            "-Daeron.untethered.resting.timeout=200ms",
-            // The window the machine measures a reader's lag against — three
-            // quarters of it before a reader is late
-            // (`aeron_publication_image.c:1180-1181`). The 128 KiB default takes
-            // a hundred-odd round trips through the reference driver to fill;
-            // eight kibibytes is the same test with one.
-            "-Daeron.rcv.initial.window.length=8k",
-        ],
-    ) else {
+fn an_untethered_subscriber_that_rejoins_is_put_aside_and_woken() {
+    let Some(mut fixture) = Untethered::stall(true, 6, "udp-untethered-rejoin") else {
         driver::announce_own_skip();
         return;
     };
 
-    let own_cnc = own
-        .await_cnc(READY_TIMEOUT)
-        .expect("this driver must publish a readable CnC file");
+    fixture.assert_put_aside();
 
-    // Offset six: the tests in this file run in parallel and each offset is a
-    // port.
-    let port = free_udp_port(6);
-    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
-
-    // Two subscriptions that may be put aside, and they differ in one thing:
-    // whether they are rejoining the stream. A rejoining reader is woken when
-    // its time comes; one that is not is closed, and closing means its
-    // counter is freed — which is why that subscription needs no event.
-    let untethered = |rejoin: bool| format!("{channel}|tether=false|rejoin={rejoin}");
-
-    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
-
-    let reader = client
-        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
-        .expect("our driver must confirm the reading subscription");
-    let rejoining = client
-        .add_subscription(&untethered(true), STREAM_ID, DEFAULT_TIMEOUT)
-        .expect("our driver must confirm the rejoining subscription");
-    let leaving = client
-        .add_subscription(&untethered(false), STREAM_ID, DEFAULT_TIMEOUT)
-        .expect("our driver must confirm the leaving subscription");
-
-    // The publication last, so every subscription joins where the image
-    // starts: the lag this test needs has to come from the data, not from the
-    // order the commands were sent in.
-    let publication = client
-        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
-        .expect("our driver must confirm the UDP publication");
-
-    let all_three = |client: &mut Client| {
-        images_of(client, reader) > 0
-            && images_of(client, rejoining) > 0
-            && images_of(client, leaving) > 0
-    };
-
+    // And then woken at the join position, which is the whole of what
+    // `is_rejoin` buys: the image comes back for the reader that asked.
+    let staller = fixture.staller;
     assert!(
-        wait_for(&mut client, CONNECT_TIMEOUT, all_three),
-        "all three subscriptions read one image: reader {}, rejoining {}, leaving {}",
-        images_of(&client, reader),
-        images_of(&client, rejoining),
-        images_of(&client, leaving)
-    );
-
-    // A window's worth of messages, read by one subscriber and not by the
-    // other two. The publisher is held one window ahead of the *slowest*
-    // reader, so a window is all the lag the image can be made to show — and
-    // three quarters of it is what makes a reader late.
-    const MESSAGES: usize = 8;
-    let mut offered = 0;
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-
-    while offered < MESSAGES && Instant::now() < deadline {
-        client.poll();
-
-        // Only the reader reads. `poll_subscription` is what moves a
-        // subscription's position, so leaving the other two out of this loop
-        // *is* the stall the test is about.
-        let _ = drain_messages(&mut client, reader, Duration::from_millis(1), 16);
-
-        if let Some(Appended::Ok { .. }) = client.offer(publication, &bulk_payload(offered)) {
-            offered += 1;
-        }
-    }
-
-    // Seven of eight: the eighth frame is past the window the two stallers are
-    // still holding shut. It is the *bytes* that matter, not the count.
-    assert!(
-        offered >= MESSAGES - 1,
-        "the publication has to take a window's worth before anything can be late: {offered} of {MESSAGES}"
-    );
-    assert!(
-        sub_position(&own_cnc, reader)
-            .zip(sub_position(&own_cnc, leaving))
-            .is_some_and(|(reader, lagging)| reader.1 - lagging.1 > IMAGE_WINDOW / 4 * 3),
-        "the reader has to be three quarters of a window ahead: reader {:?}, leaving {:?}",
-        sub_position(&own_cnc, reader),
-        sub_position(&own_cnc, leaving)
-    );
-
-    // First outcome: both stallers are put aside, and the client is told its
-    // image is gone.
-    assert!(
-        wait_for(&mut client, Duration::from_secs(20), |client| images_of(
-            client, rejoining
-        ) == 0
-            && images_of(client, leaving) == 0),
-        "both late readers are told their image is gone: rejoining {}, leaving {}, reader {}",
-        images_of(&client, rejoining),
-        images_of(&client, leaving),
-        images_of(&client, reader)
-    );
-    assert_eq!(
-        1,
-        images_of(&client, reader),
-        "the reader that kept up is untouched: the machine moved two readers, not the image"
-    );
-
-    // Second and third: the rejoining one is woken at the join position, and
-    // the one that is not rejoining does not come back — its counter is gone,
-    // which is the whole of what "closed" means to a client that was already
-    // told the image went away.
-    assert!(
-        wait_for(&mut client, Duration::from_secs(10), |client| images_of(
-            client, rejoining
-        ) > 0),
+        wait_for(
+            &mut fixture.client,
+            Duration::from_secs(10),
+            |client| images_of(client, staller) > 0
+        ),
         "the rejoining reader is woken and told its image is back"
     );
+
+    let counter = sub_position(&fixture.cnc, staller).map(|(counter_id, _)| counter_id);
+
+    let _ = fixture.own.stop();
+
+    assert!(
+        counter.is_some(),
+        "the one that was woken keeps the counter it came back with"
+    );
+}
+
+#[test]
+fn an_untethered_subscriber_that_does_not_rejoin_is_put_aside_and_closed() {
+    let Some(mut fixture) = Untethered::stall(false, 13, "udp-untethered-close") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    fixture.assert_put_aside();
+
+    // The other half: no wake-up, and "closed" means the position counter goes
+    // back to the manager rather than sitting idle. The linger and resting
+    // timeouts are both 200 ms, so a second is several of them.
+    let staller = fixture.staller;
+    let cnc = &fixture.cnc;
+    assert!(
+        wait_for(&mut fixture.client, Duration::from_secs(10), |_| {
+            sub_position(cnc, staller).is_none()
+        }),
+        "a closing reader's position counter goes back to the manager"
+    );
+
+    let _ = fixture.own.stop();
+
     assert_eq!(
         0,
-        images_of(&client, leaving),
+        images_of(&fixture.client, staller),
         "the reader that is not rejoining is never told anything again"
-    );
-
-    let leaving_counter = sub_position(&own_cnc, leaving).map(|(counter_id, _)| counter_id);
-    let rejoining_counter = sub_position(&own_cnc, rejoining).map(|(counter_id, _)| counter_id);
-
-    let _ = own.stop();
-
-    assert_eq!(
-        None, leaving_counter,
-        "a closed reader's position counter goes back to the manager"
-    );
-    assert!(
-        rejoining_counter.is_some(),
-        "the one that was woken keeps the counter it came back with"
     );
 }
 
