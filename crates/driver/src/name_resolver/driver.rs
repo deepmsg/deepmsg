@@ -1277,7 +1277,21 @@ mod tests {
         fn allocate_system_counters(&mut self) {
             let regions = self.holder.open();
             self.system = Some(
-                allocate_all(&mut self.counters, &regions, 0, 0, "", 5_000_000_000).expect("room"),
+                allocate_all(
+                    &mut self.counters,
+                    &regions,
+                    0,
+                    0,
+                    &crate::system_counters::LabelSuffixes {
+                        resolver_name: "",
+                        threading_mode: "DEDICATED",
+                        conductor_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+                        sender_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+                        receiver_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+                        name_resolver_threshold_ns: 5_000_000_000,
+                    },
+                )
+                .expect("room"),
             );
         }
 

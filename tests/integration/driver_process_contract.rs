@@ -103,6 +103,16 @@ const READ: &[(&str, &str)] = &[
     // (`aeronmd.h:441`): `SHAREDNETWORK`, not `SHARED_NETWORK`.
     ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
     ("AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "sleeping"),
+    // The four duty-cycle thresholds, which the driver puts in eight counter
+    // labels and counts against (`aeron_driver_conductor.c:889-935`). The
+    // harness sends them as **bare nanosecond counts**
+    // (`CTestMediaDriver.java:294-297`), which is the spelling the receiver's
+    // value below uses; the other three are durations, which is what a
+    // deployment writes by hand.
+    ("AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD", "250ms"),
+    ("AERON_DRIVER_SENDER_CYCLE_THRESHOLD", "250ms"),
+    ("AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD", "250000000"),
+    ("AERON_DRIVER_NAME_RESOLVER_THRESHOLD", "1s"),
     ("AERON_DIR_DELETE_ON_START", "true"),
     ("AERON_DIR_DELETE_ON_SHUTDOWN", "true"),
     ("AERON_DRIVER_TERMINATION_VALIDATOR", "allow"),
@@ -159,13 +169,10 @@ const READ: &[(&str, &str)] = &[
 ///   clause requires; what its absence means for the baseline is a separate
 ///   question with its own answer in G0-2.
 const IGNORED: &[(&str, &str)] = &[
-    ("AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD", "1ms"),
     (
         "AERON_DRIVER_DYNAMIC_LIBRARIES",
         "/nonexistent/libaeron_ats.so",
     ),
-    ("AERON_DRIVER_NAME_RESOLVER_THRESHOLD", "1ms"),
-    ("AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD", "1ms"),
     ("AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR", "127.0.0.1:5000"),
     (
         "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
@@ -176,7 +183,6 @@ const IGNORED: &[(&str, &str)] = &[
     ("AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL", "5s"),
     ("AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT", "5s"),
     ("AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL", "5s"),
-    ("AERON_DRIVER_SENDER_CYCLE_THRESHOLD", "1ms"),
     ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_ENABLE_EXPERIMENTAL_FEATURES", "true"),
     ("AERON_EVENT_LOG", "admin"),

@@ -51,17 +51,34 @@ tool that *parses* the field (none in the reference does; `AeronStat` prints
 it) would take `deepmsg-0.1.0` for a commit, which is the one honest thing it
 could say.
 
+It is also the one divergence here with a **known cost**, and the cost is
+worth stating plainly: `io.aeron.driver.SystemCountersTest::verifySystemCounters`
+asserts every label starts with the Java `SystemCounterDescriptor`'s, and the
+`Errors` descriptor carries the Java build's own `MediaDriverVersion.GIT_SHA` —
+`664f58e705+guilty` for this checkout, dirty marker included. The reference's C
+driver passes that assertion because both halves were built from the same tree,
+not because the string is a contract a driver can implement; satisfying it means
+writing down an environment fact. The test therefore stops there for this
+driver, and the labels after id 15 are covered by the golden comparison
+below instead.
+
 The other labels the reference suffixes at runtime — the driver's threading
 mode, the resolver's name, the duty-cycle thresholds
 (`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
-reference's own text changes with its settings. deepmsg appends `DEDICATED` to
-the conductor's, the sender's and the receiver's cycle-time counters, matching
-the reference's word for a driver whose agents are threads of their own — which
-is what this build's three are. The name-resolver pair (32 and 33) is left
-unsuffixed, which is a gap rather than a decision: the resolver does run on an
-agent thread here now, so the reference's suffix has something to name and this
-build simply does not append it yet — the duty-cycle suffixes are the slice
-that owns the runtime labels (`aeron_driver_conductor.c:848-951`).
+reference's own text changes with its settings, and deepmsg's now follows its
+own. All eight suffixes are built from the settings at allocation
+(`crates/driver/src/system_counters.rs`): `: driverName=<name>` on 25, the
+configured `aeron.threading.mode` on 26/28/30, `: threshold=<duration> <mode>`
+on 27/29/31 out of the three `*.cycle.threshold` settings — the same numbers
+those counters count against — and `: threshold=<duration>` on 33, which is the
+one suffix the reference prints without a mode, because a resolver runs on the
+native resource agent and has no duty cycle of its own to name. Counter 32
+keeps its bare label, which is also what the reference does. Durations are
+printed the reference's way: the largest unit that divides them exactly, `s`,
+`ms`, `us`, and nanoseconds otherwise (`aeron_format_duration_ns`,
+`util/aeron_parse_util.c:270-330`).
+`io.aeron.driver.DutyCycleLabelFormatTest` is the oracle, over all four
+threading modes.
 
 The consequence for testing: a golden comparison of the two catalogues
 compares each label up to its first colon, and

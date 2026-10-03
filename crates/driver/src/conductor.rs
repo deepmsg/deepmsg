@@ -776,8 +776,14 @@ impl Conductor {
                 &regions,
                 now_ms,
                 bytes_mapped,
-                config.resolver_name.as_deref().unwrap_or(""),
-                config.name_resolver_threshold_ns,
+                &system_counters::LabelSuffixes {
+                    resolver_name: config.resolver_name.as_deref().unwrap_or(""),
+                    threading_mode: config.threading_mode.as_str(),
+                    conductor_cycle_threshold_ns: config.conductor_cycle_threshold_ns,
+                    sender_cycle_threshold_ns: config.sender_cycle_threshold_ns,
+                    receiver_cycle_threshold_ns: config.receiver_cycle_threshold_ns,
+                    name_resolver_threshold_ns: config.name_resolver_threshold_ns,
+                },
             )
             .map_err(ConductorError::SystemCounters)?
         };
@@ -912,7 +918,7 @@ impl Conductor {
             cnc.layout().counters_values.len(),
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
-            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.sender_cycle_threshold_ns,
             config.publication_linger_timeout_ns,
             config.re_resolution_check_interval_ns,
             config.status_message_timeout_ns,
@@ -936,7 +942,7 @@ impl Conductor {
             usize::try_from(config.mtu_length).unwrap_or(1408),
             config.status_message_timeout_ns,
             config.receiver_window_length,
-            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.receiver_cycle_threshold_ns,
             config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
@@ -3999,7 +4005,7 @@ impl Conductor {
             system_counters::id::CONDUCTOR_MAX_CYCLE_TIME,
             cycle_ns,
         );
-        if cycle_ns > system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS {
+        if cycle_ns > self.config.conductor_cycle_threshold_ns {
             system_counters::increment(
                 &self.counters,
                 &regions,

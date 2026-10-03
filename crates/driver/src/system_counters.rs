@@ -30,12 +30,12 @@
 //!
 //! The reference adds a suffix to eight labels right after allocating them
 //! (`aeron-driver/src/main/c/aeron_driver_conductor.c:848-951`): the resolver's
-//! name, the driver's threading mode and the duty-cycle thresholds. This build
-//! appends to three — the conductor's own two and the resolver's empty name —
-//! and leaves the sender, receiver and name-resolver counters at their base
-//! labels. Those agents do not exist here yet (P1-4); a suffix naming a duty
-//! cycle for something that never runs would describe nothing, and the hex
-//! digits it changed are not worth that.
+//! name, the driver's threading mode and the four duty-cycle thresholds. All
+//! eight are here, built from [`LabelSuffixes`], because every one of them is a
+//! setting a deployment can move: the mode from `aeron.threading.mode` and the
+//! thresholds from their own names, which are also what the three
+//! `*_CYCLE_TIME_THRESHOLD_EXCEEDED` counters count against. The label and the
+//! counting are the same number in the reference, and they are here.
 
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{CounterManager, CounterRegions};
@@ -145,11 +145,6 @@ pub mod id {
 /// (`AERON_SYSTEM_COUNTER_DUMMY_LAST`, `aeron_system_counters.h:73`).
 pub const COUNT: usize = 46;
 
-/// The conductor's duty-cycle threshold, from the reference's default
-/// (`aeron-driver/src/main/c/aeron_driver_context.c:213`,
-/// `AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD_NS_DEFAULT` = 100 ms).
-pub const CONDUCTOR_CYCLE_THRESHOLD_NS: i64 = 100_000_000;
-
 /// The table, in id order (`aeron_system_counters.c:24-71`), verbatim.
 ///
 /// Entries 15 and 34 are the two that carry a build identity; the test
@@ -204,48 +199,33 @@ const LABELS: [&str; COUNT] = [
     "Failed offers to NativeResourceAgentProxy",
 ];
 
-/// The name of this driver's threading mode, in the reference's vocabulary
-/// (`aeron_driver_threading_mode_to_string`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:53-61`).
+/// The settings the runtime label suffixes are built from
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:848-951`).
 ///
-/// `DEDICATED` is the mode this driver runs in from P1-4 on: the conductor, the
-/// sender and the receiver are three threads
-/// (`aeron_driver_context.h:174`, whose default it is). The label says so
-/// because that is what the label is *for* — a reader of `AeronStat` uses it to
-/// know what it is looking at.
-pub const THREADING_MODE: &str = "DEDICATED";
-
-/// The runtime suffixes this build appends, and to which counters
-/// (`aeron_driver_conductor.c:848-951`).
-///
-/// Every counter the reference appends a *fixed* suffix to is here. Two are
-/// not, because what they carry is a value rather than a word: counter 25
-/// (Resolution changes) gets `: driverName=<name>`, and counter 33 gets
-/// `: threshold=<duration>` — both from the settings, so both are appended by
-/// [`allocate_all`] where the settings are in hand
-/// (`aeron_driver_conductor.c:848-856`, `:938-951`).
-///
-/// The name-resolver pair gets **no** threading mode, and that is the
-/// reference's own shape: a resolver runs on the native resource agent, which
-/// is an `INVOKER`, and the reference appends `DEDICATED` only to the three
-/// counters of the threads that have one (`:857-935`).
-const RUNTIME_SUFFIXES: [(i32, &str); 6] = [
-    (id::CONDUCTOR_MAX_CYCLE_TIME, ": DEDICATED"),
-    (
-        id::CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED,
-        ": threshold=100ms DEDICATED",
-    ),
-    (id::SENDER_MAX_CYCLE_TIME, ": DEDICATED"),
-    (
-        id::SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED,
-        ": threshold=100ms DEDICATED",
-    ),
-    (id::RECEIVER_MAX_CYCLE_TIME, ": DEDICATED"),
-    (
-        id::RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED,
-        ": threshold=100ms DEDICATED",
-    ),
-];
+/// The reference reads all of them off its context at one point, right after
+/// the counters are allocated; this is that point in this build's terms, so
+/// nothing here can be written before the settings are known and nothing after
+/// them can read a stale label.
+pub struct LabelSuffixes<'a> {
+    /// The name the resolver was configured with, or `""` — the reference
+    /// prints an empty one rather than skipping the suffix (`:852-856`).
+    pub resolver_name: &'a str,
+    /// The mode this driver runs in, spelled the reference's way
+    /// (`aeron_driver_threading_mode_to_string`, `aeron_driver_context.c:53-61`).
+    pub threading_mode: &'a str,
+    /// The duty-cycle thresholds of the three threads that have one
+    /// (`aeron_driver_context.c:1031-1043`), each printed as a duration.
+    pub conductor_cycle_threshold_ns: i64,
+    /// The sender's, for counter 29.
+    pub sender_cycle_threshold_ns: i64,
+    /// The receiver's, for counter 31.
+    pub receiver_cycle_threshold_ns: i64,
+    /// The resolver's threshold (`:1049-1055`), and the one suffix the
+    /// reference prints **without** a threading mode: a resolver runs on the
+    /// native resource agent, which has no duty cycle of its own to name
+    /// (`:937-951`).
+    pub name_resolver_threshold_ns: i64,
+}
 
 /// The counters a driver allocated for itself, in the order it allocated them.
 ///
@@ -362,8 +342,7 @@ pub fn allocate_all(
     regions: &CounterRegions<'_>,
     now_ms: i64,
     bytes_mapped: i64,
-    resolver_name: &str,
-    name_resolver_threshold_ns: i64,
+    suffixes: &LabelSuffixes<'_>,
 ) -> Result<SystemCounters, SystemCounterError> {
     let mut allocated = Vec::with_capacity(COUNT);
 
@@ -391,28 +370,40 @@ pub fn allocate_all(
         allocated.push(expected);
     }
 
-    for (counter_id, suffix) in RUNTIME_SUFFIXES {
-        manager
-            .append_to_label(regions, counter_id, suffix.as_bytes())
-            .ok_or(SystemCounterError::RegionTooSmall { counter_id })?;
-    }
+    // The eight runtime suffixes, in the reference's own four shapes: the
+    // resolver's name, the mode alone, the threshold and the mode, and the
+    // resolver's threshold alone. Appending is what the reference does —
+    // `aeron_counters_manager_append_to_label` (`:848-951`) — so what a reader
+    // sees is the base label above plus this.
+    let mode = suffixes.threading_mode;
+    let conductor = format_duration_ns(suffixes.conductor_cycle_threshold_ns);
+    let sender = format_duration_ns(suffixes.sender_cycle_threshold_ns);
+    let receiver = format_duration_ns(suffixes.receiver_cycle_threshold_ns);
+    let name_resolver = format_duration_ns(suffixes.name_resolver_threshold_ns);
 
-    // The two suffixes that are values rather than words. The resolver's name
-    // is what a reader uses to tell one driver's `Resolution changes` from
-    // another's in a shared `AeronStat`, and the threshold is how a reader
-    // knows what the count beside it means
-    // (`aeron_driver_conductor.c:848-856`, `:938-951`).
     for (counter_id, suffix) in [
         (
             id::RESOLUTION_CHANGES,
-            format!(": driverName={resolver_name}"),
+            format!(": driverName={}", suffixes.resolver_name),
+        ),
+        (id::CONDUCTOR_MAX_CYCLE_TIME, format!(": {mode}")),
+        (id::SENDER_MAX_CYCLE_TIME, format!(": {mode}")),
+        (id::RECEIVER_MAX_CYCLE_TIME, format!(": {mode}")),
+        (
+            id::CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED,
+            format!(": threshold={conductor} {mode}"),
+        ),
+        (
+            id::SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+            format!(": threshold={sender} {mode}"),
+        ),
+        (
+            id::RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED,
+            format!(": threshold={receiver} {mode}"),
         ),
         (
             id::NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED,
-            format!(
-                ": threshold={}",
-                format_duration_ns(name_resolver_threshold_ns)
-            ),
+            format!(": threshold={name_resolver}"),
         ),
     ] {
         manager
@@ -539,6 +530,19 @@ mod tests {
 
     /// The threshold the labels below quote, which is the reference's default.
     const NAME_RESOLVER_THRESHOLD: i64 = 5 * 1000 * 1000 * 1000;
+
+    /// The label settings a test driver runs with: no resolver name, the
+    /// default mode and the default thresholds.
+    fn suffixes<'a>(resolver_name: &'a str, name_resolver_threshold_ns: i64) -> LabelSuffixes<'a> {
+        LabelSuffixes {
+            resolver_name,
+            threading_mode: "DEDICATED",
+            conductor_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+            sender_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+            receiver_cycle_threshold_ns: crate::config::CYCLE_THRESHOLD_NS_DEFAULT,
+            name_resolver_threshold_ns,
+        }
+    }
     use deepmsg_cnc::{CounterDescriptor, layout};
     use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 
@@ -623,8 +627,7 @@ mod tests {
             &regions,
             5,
             48_238_592,
-            "",
-            NAME_RESOLVER_THRESHOLD,
+            &suffixes("", NAME_RESOLVER_THRESHOLD),
         )
         .expect("a fresh file");
 
@@ -645,8 +648,14 @@ mod tests {
     fn the_labels_are_the_references_plus_this_builds_runtime_suffixes() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
-            .expect("a fresh file");
+        allocate_all(
+            &mut manager,
+            &regions,
+            0,
+            0,
+            &suffixes("", NAME_RESOLVER_THRESHOLD),
+        )
+        .expect("a fresh file");
 
         assert_eq!("Bytes sent", label(&regions, 0));
         assert_eq!("Client liveness timeouts", label(&regions, 24));
@@ -655,7 +664,8 @@ mod tests {
             label(&regions, 45)
         );
 
-        // The three this build appends to.
+        // Every one of the eight suffixes the reference appends is here
+        // (`aeron_driver_conductor.c:848-951`), built from the settings.
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
         assert_eq!(
             "Conductor max cycle time doing its work in ns: DEDICATED",
@@ -666,7 +676,7 @@ mod tests {
             label(&regions, 27)
         );
 
-        // The two agents P1-4 runs say which mode they run in, as the
+        // The sender and the receiver say which mode they run in too, as the
         // reference's do (`aeron_driver_conductor.c:867-888`).
         assert_eq!(
             "Sender max cycle time doing its work in ns: DEDICATED",
@@ -703,6 +713,83 @@ mod tests {
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
     }
 
+    /// The suffixes are the **settings**, not constants: the mode a driver was
+    /// configured with, the threshold each slot was configured with, and the
+    /// resolver's name.
+    ///
+    /// The values are the ones `DutyCycleLabelFormatTest` sets, which is what
+    /// that oracle asks for word for word: `conductorCycleThresholdNs(2h)`,
+    /// `senderCycleThresholdNs(321us)`, `receiverCycleThresholdNs(250ms)`,
+    /// `nameResolverThresholdNs(15s)`.
+    #[test]
+    fn the_runtime_suffixes_follow_the_settings() {
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+
+        allocate_all(
+            &mut manager,
+            &regions,
+            0,
+            0,
+            &LabelSuffixes {
+                resolver_name: "aeron:net-driver",
+                threading_mode: "SHARED_NETWORK",
+                conductor_cycle_threshold_ns: 2 * 60 * 60 * 1_000_000_000,
+                sender_cycle_threshold_ns: 321_000,
+                receiver_cycle_threshold_ns: 250_000_000,
+                name_resolver_threshold_ns: 15 * 1_000_000_000,
+            },
+        )
+        .expect("a fresh file");
+
+        assert_eq!(
+            "Resolution changes: driverName=aeron:net-driver",
+            label(&regions, 25)
+        );
+        assert_eq!(
+            "Conductor max cycle time doing its work in ns: SHARED_NETWORK",
+            label(&regions, 26)
+        );
+        assert_eq!(
+            "Conductor work cycle exceeded threshold count: threshold=7200s SHARED_NETWORK",
+            label(&regions, 27)
+        );
+        assert_eq!(
+            "Sender work cycle exceeded threshold count: threshold=321us SHARED_NETWORK",
+            label(&regions, 29)
+        );
+        assert_eq!(
+            "Receiver work cycle exceeded threshold count: threshold=250ms SHARED_NETWORK",
+            label(&regions, 31)
+        );
+        assert_eq!(
+            "NameResolver exceeded threshold count: threshold=15s",
+            label(&regions, 33)
+        );
+        assert_eq!("NameResolver max time in ns", label(&regions, 32));
+    }
+
+    /// Durations are printed in the largest unit that divides them exactly, and
+    /// in nanoseconds when none does — `aeron_format_duration_ns`
+    /// (`util/aeron_parse_util.c:270-330`), whose four arms this is.
+    #[test]
+    fn a_duration_takes_the_largest_unit_that_divides_it() {
+        assert_eq!("7200s", format_duration_ns(2 * 60 * 60 * 1_000_000_000));
+        assert_eq!("15s", format_duration_ns(15 * 1_000_000_000));
+        assert_eq!("250ms", format_duration_ns(250_000_000));
+        assert_eq!("100ms", format_duration_ns(100_000_000));
+        assert_eq!("321us", format_duration_ns(321_000));
+        assert_eq!("5s", format_duration_ns(5_000_000_000));
+
+        // Not a whole millisecond, but a whole microsecond: it falls through
+        // one unit at a time rather than printing a fraction, because there is
+        // no decimal arm.
+        assert_eq!("1500us", format_duration_ns(1_500_000));
+        assert_eq!("1234567ns", format_duration_ns(1_234_567));
+        assert_eq!("999ns", format_duration_ns(999));
+        assert_eq!("0ns", format_duration_ns(0));
+    }
+
     #[test]
     fn the_two_build_identity_labels_name_this_build() {
         let expected = format!(
@@ -724,8 +811,7 @@ mod tests {
             &regions,
             0,
             48_238_592,
-            "",
-            NAME_RESOLVER_THRESHOLD,
+            &suffixes("", NAME_RESOLVER_THRESHOLD),
         )
         .expect("a fresh file");
 
@@ -761,7 +847,13 @@ mod tests {
                 expected: 0,
                 got: Some(1),
             }),
-            allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
+            allocate_all(
+                &mut manager,
+                &regions,
+                0,
+                0,
+                &suffixes("", NAME_RESOLVER_THRESHOLD)
+            )
         );
     }
 
@@ -769,8 +861,14 @@ mod tests {
     fn increment_reads_adds_and_stores() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
-            .expect("a fresh file");
+        allocate_all(
+            &mut manager,
+            &regions,
+            0,
+            0,
+            &suffixes("", NAME_RESOLVER_THRESHOLD),
+        )
+        .expect("a fresh file");
 
         assert_eq!(
             Some(0),
@@ -786,8 +884,14 @@ mod tests {
     fn propose_max_only_ever_moves_up() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        allocate_all(&mut manager, &regions, 0, 0, "", NAME_RESOLVER_THRESHOLD)
-            .expect("a fresh file");
+        allocate_all(
+            &mut manager,
+            &regions,
+            0,
+            0,
+            &suffixes("", NAME_RESOLVER_THRESHOLD),
+        )
+        .expect("a fresh file");
 
         assert_eq!(Some(()), propose_max(&manager, &regions, 26, 500));
         assert_eq!(Some(500), value(&regions, 26));

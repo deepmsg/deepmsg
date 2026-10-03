@@ -202,6 +202,16 @@ pub const RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
 /// resolution is microseconds.
 pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
+/// `AERON_DRIVER_{CONDUCTOR,SENDER,RECEIVER}_CYCLE_THRESHOLD_NS_DEFAULT`
+/// (`aeron_driver_context.c:236-238`, all three `100 * 1000 * INT64_C(1000)`).
+///
+/// One per thread that has a duty cycle, and they do two jobs with one number:
+/// a pass longer than its slot's threshold is counted in
+/// `*_CYCLE_TIME_THRESHOLD_EXCEEDED`, and the threshold is what that counter's
+/// **label** says it is
+/// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
+pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
+
 /// The smallest one of the resolver's four **intervals** may be
 /// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
 /// each of them is read, `aeron_driver_context.c:609-636`): a millisecond, so
@@ -729,6 +739,18 @@ pub struct DriverConfig {
     /// `aeronmd.h:932`): how long one resolution may take before system counter
     /// 33 counts it (`aeron_driver_native_resource_agent.c:39-60`).
     pub name_resolver_threshold_ns: i64,
+    /// `aeron.driver.conductor.cycle.threshold`
+    /// (`AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD`, `aeronmd.h:908`): how long one
+    /// conductor pass may take before counter 27 counts it
+    /// (`aeron_driver_conductor.c:3401-3404`), and the number counter 27's
+    /// label carries (`:889-905`).
+    pub conductor_cycle_threshold_ns: i64,
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`), for counter 29
+    /// and the sender's own pass (`aeron_driver_sender.c:262-276`).
+    pub sender_cycle_threshold_ns: i64,
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`), for counter
+    /// 31 and the receiver's own pass (`aeron_driver_receiver.c:411-425`).
+    pub receiver_cycle_threshold_ns: i64,
     /// `aeron.driver.reresolution.check.interval`
     /// (`AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL`, `aeronmd.h:857`): how often
     /// the sender and the receiver look for names that need resolving again,
@@ -835,6 +857,9 @@ impl Default for DriverConfig {
             resolver_bootstrap_neighbor_resolution_interval_ns:
                 RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
             name_resolver_threshold_ns: NAME_RESOLVER_THRESHOLD_NS_DEFAULT,
+            conductor_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
+            sender_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
+            receiver_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
             re_resolution_check_interval_ns: RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT,
             // Both default to the kernel's wildcard, which is the state
             // `aeron_wildcard_port_manager_init` leaves them in
@@ -1494,6 +1519,31 @@ impl DriverConfig {
                 parse_duration_ns(&Setting::DRIVER_NAME_RESOLVER_THRESHOLD, &value)?;
         }
 
+        // The three duty-cycle thresholds, read the same way and with no floor
+        // of their own (`aeron_driver_context.c:1031-1053`). The harness sends
+        // them as **bare nanosecond counts** — `String.valueOf(
+        // context.conductorCycleThresholdNs())` (`CTestMediaDriver.java:294-296`)
+        // — which is what a suffix-less duration means here (and in
+        // `aeron_parse_duration_ns`).
+        for (setting, field) in [
+            (
+                Setting::DRIVER_CONDUCTOR_CYCLE_THRESHOLD,
+                &mut config.conductor_cycle_threshold_ns,
+            ),
+            (
+                Setting::DRIVER_SENDER_CYCLE_THRESHOLD,
+                &mut config.sender_cycle_threshold_ns,
+            ),
+            (
+                Setting::DRIVER_RECEIVER_CYCLE_THRESHOLD,
+                &mut config.receiver_cycle_threshold_ns,
+            ),
+        ] {
+            if let Some(value) = get(&setting) {
+                *field = parse_duration_ns(&setting, &value)?;
+            }
+        }
+
         // And so is the re-resolution interval, whose minimum is zero for the
         // same reason (`:1024-1028`): zero is how a deployment turns the whole
         // feature off, and the reference's two loops test for it
@@ -1834,6 +1884,22 @@ impl Setting {
     const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {
         property: "name.resolver.threshold",
         env: "AERON_DRIVER_NAME_RESOLVER_THRESHOLD",
+    };
+    /// `aeron.driver.conductor.cycle.threshold` (`aeronmd.h:908`; the property
+    /// name is the Java `Configuration`'s, `:1070`).
+    const DRIVER_CONDUCTOR_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.conductor.cycle.threshold",
+        env: "AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD",
+    };
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`, `:1085`).
+    const DRIVER_SENDER_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.sender.cycle.threshold",
+        env: "AERON_DRIVER_SENDER_CYCLE_THRESHOLD",
+    };
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`, `:1100`).
+    const DRIVER_RECEIVER_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.receiver.cycle.threshold",
+        env: "AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD",
     };
     /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:351`).
     const CUBIC_INITIAL_RTT: Self = Self {
@@ -2669,6 +2735,52 @@ mod tests {
         )
         .expect_err("below the floor");
         assert!(matches!(too_fast, ConfigError::OutOfRange { .. }));
+    }
+
+    /// The three duty-cycle thresholds: one number doing two jobs. A pass longer
+    /// than its slot's threshold is counted by `*_CYCLE_TIME_THRESHOLD_EXCEEDED`
+    /// (`aeron_driver_context.c:1031-1043`), and the same number is what that
+    /// counter's **label** says it is (`aeron_driver_conductor.c:889-935`).
+    ///
+    /// The value the harness sends is a **bare nanosecond count** —
+    /// `String.valueOf(context.conductorCycleThresholdNs())`
+    /// (`CTestMediaDriver.java:294-296`) — so that spelling is pinned here
+    /// beside the duration one, and the property names are the Java
+    /// `Configuration`'s (`:1070`, `:1085`, `:1100`).
+    #[test]
+    fn the_cycle_thresholds_are_durations_under_their_own_names() {
+        let config = resolve_with_env(
+            &[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("aeron.driver.conductor.cycle.threshold", "7200s"),
+                ("aeron.driver.sender.cycle.threshold", "321us"),
+            ],
+            &[("AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD", "250000000")],
+        )
+        .expect("a config");
+
+        assert_eq!(7_200_000_000_000, config.conductor_cycle_threshold_ns);
+        assert_eq!(321_000, config.sender_cycle_threshold_ns);
+        assert_eq!(
+            250_000_000, config.receiver_cycle_threshold_ns,
+            "a bare count is nanoseconds, which is what the harness sends"
+        );
+
+        // Unset, each is the reference's own hundred milliseconds
+        // (`aeron_driver_context.c:236-238`).
+        let defaults = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.conductor_cycle_threshold_ns
+        );
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.sender_cycle_threshold_ns
+        );
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.receiver_cycle_threshold_ns
+        );
     }
 
     /// The three cubic settings are the only ones this driver carries as
