@@ -569,6 +569,7 @@ impl Sender {
     /// # Errors
     ///
     /// [`io::Error`] if the thread cannot be spawned.
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     pub fn start(
         cnc: Arc<CncFile>,
         values_length: usize,
@@ -577,6 +578,8 @@ impl Sender {
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
+        status_message_timeout_ns: i64,
+        send_to_sm_poll_ratio: u8,
     ) -> io::Result<Self> {
         let SenderParts { proxy, agent } = Self::split(
             cnc,
@@ -586,6 +589,8 @@ impl Sender {
             cycle_threshold_ns,
             linger_timeout_ns,
             re_resolution_interval_ns,
+            status_message_timeout_ns,
+            send_to_sm_poll_ratio,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -607,6 +612,7 @@ impl Sender {
     ///
     /// [`io::Error`] if the counters region is too small for a sender's own
     /// view of it.
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     pub(crate) fn split(
         cnc: Arc<CncFile>,
         values_length: usize,
@@ -615,6 +621,8 @@ impl Sender {
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
+        status_message_timeout_ns: i64,
+        send_to_sm_poll_ratio: u8,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -637,6 +645,8 @@ impl Sender {
                 cycle_threshold_ns,
                 linger_timeout_ns,
                 re_resolution_interval_ns,
+                status_message_timeout_ns,
+                send_to_sm_poll_ratio,
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -708,6 +718,8 @@ pub(crate) struct SenderThread {
     /// needs the counter regions.
     pending_subscribers: Vec<SenderCommand>,
     last_cycle_ns: i64,
+    /// When this sender reads its control sockets, and how often.
+    duty_cycle: DutyCycle,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Receiver<SenderCommand>,
 }
@@ -721,6 +733,8 @@ impl SenderThread {
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
+        status_message_timeout_ns: i64,
+        send_to_sm_poll_ratio: u8,
         now_ns: i64,
         events: Channel<SenderEvent>,
         commands: Receiver<SenderCommand>,
@@ -733,6 +747,7 @@ impl SenderThread {
             linger_timeout_ns,
             re_resolution_interval_ns,
             re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
+            duty_cycle: DutyCycle::new(send_to_sm_poll_ratio, status_message_timeout_ns),
             events,
             endpoints: Vec::new(),
             pending_resolutions: Vec::new(),
@@ -826,9 +841,17 @@ impl SenderThread {
         Some(self.do_send())
     }
 
-    /// Read the control frames, then send each publication's share
-    /// (`aeron_driver_sender_do_send`,
-    /// `aeron-driver/src/main/c/aeron_driver_sender.c:132-260`).
+    /// Send each publication's share, and then — when the duty cycle says it is
+    /// due — read the control sockets
+    /// (`aeron_driver_sender_do_work`,
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:132-190`: the send is
+    /// `aeron_driver_sender_do_send` at `:416-458`, and the decision below is
+    /// `:149-152`).
+    ///
+    /// The order is the reference's and it is load-bearing: what a status
+    /// message says about a publication's window takes effect on the **next**
+    /// pass, because the send that this pass was going to do has already
+    /// happened.
     ///
     /// The body is written against the fields rather than through methods so
     /// that the counter view's borrow and the mutable borrows of the two lists
@@ -875,18 +898,11 @@ impl SenderThread {
             resolved += Self::check_for_re_resolution(&mut self.endpoints, &self.events, now_ns);
         }
 
-        let mut work = Self::receive_control_frames(
-            &mut self.endpoints,
-            &mut self.publications,
-            &mut self.buffers,
-            &mut self.datagrams,
-            &system,
-            &self.counters,
-            &regions,
-            &self.events,
-        );
+        // Read before the send, because a short send this pass is one of the
+        // four things that asks for the poll below (`:145-155`).
+        let short_sends_before = system.value(system_counters::id::SHORT_SENDS);
 
-        work += Self::send_publications(
+        let mut work = Self::send_publications(
             &mut self.endpoints,
             &mut self.publications,
             &system,
@@ -895,6 +911,32 @@ impl SenderThread {
             self.linger_timeout_ns,
             &self.events,
         );
+
+        let short_sends_after = system.value(system_counters::id::SHORT_SENDS);
+
+        // The decision needs the two counter readings and nothing else, so the
+        // view over them can go out of scope before it — which is what lets it
+        // take the sender's own duty-cycle state mutably. It is `Copy`; the
+        // poll below makes another.
+        if self
+            .duty_cycle
+            .is_due(work, short_sends_before, short_sends_after, now_ns)
+        {
+            let system = System::new(&self.counters, &regions);
+
+            work += Self::receive_control_frames(
+                &mut self.endpoints,
+                &mut self.publications,
+                &mut self.buffers,
+                &mut self.datagrams,
+                &system,
+                &self.counters,
+                &regions,
+                &self.events,
+            );
+
+            self.duty_cycle.polled(now_ns);
+        }
 
         Self::track_cycle(
             &self.counters,
@@ -1546,7 +1588,11 @@ impl SenderThread {
         events: &Channel<SenderEvent>,
     ) -> usize {
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
-        let mut work = 0;
+        // Bytes, not publications: the reference's `do_send` returns
+        // `bytes_sent` and its duty cycle keys on that (`:150`, `:455`), so a
+        // pass that walked ten publications and sent nothing is a pass that
+        // sent nothing.
+        let mut bytes_sent = 0;
 
         for publication in publications.iter_mut() {
             let endpoint_id = publication.endpoint_id;
@@ -1573,8 +1619,9 @@ impl SenderThread {
                             system_counters::id::BYTES_SENT,
                             i64::try_from(bytes).unwrap_or(i64::MAX),
                         );
-                        work += 1;
                     }
+
+                    bytes_sent += bytes;
                 }
                 Err(error) => {
                     let _ = events.send(SenderEvent::Fault {
@@ -1587,7 +1634,7 @@ impl SenderThread {
             }
         }
 
-        work
+        bytes_sent
     }
 
     /// Measure the pass that just ended, and count it if it ran long — the
@@ -1617,6 +1664,84 @@ impl SenderThread {
                 system_counters::id::SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED,
             );
         }
+    }
+}
+
+/// When the sender reads its control sockets, and how often — the reference's
+/// duty cycle for the poll (`aeron_driver_sender.c:94-98` sets it up, `:149-152`
+/// is the decision, `:179-180` is the poll).
+///
+/// A sender that read its control sockets on every pass would spend a syscall
+/// per pass on a stream that is usually sending: the sockets carry status
+/// messages, NAKs and errors, and one read in every `ratio` passes that
+/// **sent** something is the reference's answer. Three things cut the wait
+/// short, and all four are in [`DutyCycle::is_due`].
+#[derive(Debug)]
+struct DutyCycle {
+    /// `aeron.send.to.status.poll.ratio`, six by default.
+    ratio: u8,
+    /// Passes that sent something since the last read. It does **not** advance
+    /// on a pass that sent nothing, because such a pass reads anyway.
+    counter: u8,
+    /// The longest the sender may go without reading at all: half the
+    /// status-message timeout (`:97`, whose `/ 2` is the reference's own).
+    read_timeout_ns: i64,
+    /// When the next read is due by time. Zero at startup, so the first pass
+    /// reads.
+    deadline_ns: i64,
+}
+
+impl DutyCycle {
+    /// The cycle a sender configured with these two settings runs.
+    fn new(ratio: u8, status_message_timeout_ns: i64) -> Self {
+        Self {
+            ratio,
+            counter: 0,
+            read_timeout_ns: status_message_timeout_ns / 2,
+            deadline_ns: 0,
+        }
+    }
+
+    /// Whether this pass is one that reads the control sockets.
+    ///
+    /// `bytes_sent` is what the send just did, and the two short-send readings
+    /// bracket it — a short send is one of the four things that asks for the
+    /// read, and it can only be seen by comparing before with after.
+    ///
+    /// The reference's `||` short-circuits, and that is load-bearing: the
+    /// counter only advances where the first condition was false, which is what
+    /// keeps a stream of quiet passes from counting towards the ratio.
+    fn is_due(
+        &mut self,
+        bytes_sent: usize,
+        short_sends_before: i64,
+        short_sends_after: i64,
+        now_ns: i64,
+    ) -> bool {
+        if 0 == bytes_sent {
+            return true;
+        }
+
+        // `is_due` returns at the comparison below at the latest, and the
+        // largest ratio the configuration accepts is `u8::MAX`, so this cannot
+        // wrap.
+        self.counter += 1;
+
+        if self.counter >= self.ratio {
+            return true;
+        }
+
+        if now_ns > self.deadline_ns {
+            return true;
+        }
+
+        short_sends_before < short_sends_after
+    }
+
+    /// The read happened: the passes start over and the deadline moves out.
+    fn polled(&mut self, now_ns: i64) {
+        self.counter = 0;
+        self.deadline_ns = now_ns + self.read_timeout_ns;
     }
 }
 
@@ -1742,6 +1867,97 @@ mod tests {
     }
 
     const TERM_LENGTH: i32 = 64 * 1024;
+
+    /// `aeron.send.to.status.poll.ratio` is the passes-between-reads knob, and
+    /// the count only advances on a pass that **sent** something
+    /// (`aeron_driver_sender.c:149-152`, whose `||` short-circuits).
+    #[test]
+    fn the_control_read_waits_for_its_share_of_passes() {
+        let mut duty = DutyCycle::new(6, 1_000_000);
+        duty.polled(1);
+
+        for pass in 1..6 {
+            assert!(
+                !duty.is_due(64, 0, 0, 1 + pass),
+                "pass {pass} of six is not the read"
+            );
+        }
+
+        assert!(duty.is_due(64, 0, 0, 7), "the sixth pass is");
+
+        // And the count starts over, so the read is every sixth pass and not
+        // every sixth *sending* pass.
+        duty.polled(7);
+        assert!(!duty.is_due(64, 0, 0, 8));
+    }
+
+    /// A ratio of one is a read on every sending pass, which is what this build
+    /// did before the setting was acted on.
+    #[test]
+    fn a_ratio_of_one_reads_every_pass() {
+        let mut duty = DutyCycle::new(1, 1_000_000);
+        duty.polled(0);
+
+        assert!(duty.is_due(64, 0, 0, 1));
+        duty.polled(1);
+        assert!(duty.is_due(64, 0, 0, 2));
+    }
+
+    /// Zero is `++counter >= ratio` being true on the first pass — every pass
+    /// reads. The configuration refuses the value (`config.rs`, because the
+    /// reference's `uint8_t` cast makes `256` arrive as it), so this is the
+    /// arithmetic and not a reachable setting.
+    #[test]
+    fn a_ratio_of_zero_reads_every_pass_too() {
+        let mut duty = DutyCycle::new(0, 1_000_000);
+        duty.polled(0);
+
+        assert!(duty.is_due(64, 0, 0, 1));
+    }
+
+    /// A pass that sent nothing reads, and does not count towards the ratio:
+    /// the reference returns before its `++`, so a stream of quiet passes is a
+    /// stream of reads.
+    #[test]
+    fn a_pass_that_sent_nothing_reads_and_does_not_count() {
+        let mut duty = DutyCycle::new(6, 1_000_000);
+        duty.polled(0);
+
+        for _ in 0..8 {
+            assert!(duty.is_due(0, 0, 0, 1), "a quiet pass reads");
+            duty.polled(1);
+        }
+    }
+
+    /// The deadline is `status_message_timeout_ns / 2`, and it asks for a read
+    /// on its own (`aeron_driver_sender.c:97`).
+    #[test]
+    fn the_read_timeout_asks_for_a_read_by_itself() {
+        let mut duty = DutyCycle::new(6, 1_000_000);
+        duty.polled(0);
+        assert_eq!(500_000, duty.read_timeout_ns, "half of the timeout");
+
+        // One pass, well inside the ratio and well inside the deadline.
+        assert!(!duty.is_due(64, 0, 0, 1));
+
+        // And the same pass once the deadline has gone by.
+        assert!(duty.is_due(64, 0, 0, 500_001));
+    }
+
+    /// A short send asks for a read on the pass it happened, whatever the
+    /// counter and the deadline say — the counter is read before the send and
+    /// compared after it.
+    #[test]
+    fn a_short_send_asks_for_a_read() {
+        let mut duty = DutyCycle::new(6, 1_000_000);
+        duty.polled(0);
+
+        assert!(
+            duty.is_due(64, 3, 4, 1),
+            "the short-send counter moved during the pass"
+        );
+        assert!(!duty.is_due(64, 4, 4, 1), "and it did not move here");
+    }
 
     #[test]
     fn a_nak_names_a_frame_a_term_can_hold() {
@@ -1994,6 +2210,8 @@ mod tests {
             100_000_000,
             crate::config::PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT,
             0,
+            crate::config::RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
+            crate::config::SEND_TO_STATUS_POLL_RATIO_DEFAULT,
         )
         .expect("a sender");
 

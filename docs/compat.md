@@ -465,15 +465,28 @@ The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
 
-One setting is **read and not acted on**, which is not the same thing as
-being unknown:
+`aeron.send.to.status.poll.ratio` is read **and acted on** (`aeronmd.h:257`,
+the reference's sending-to-polling ratio, `aeron_driver_context.c:199` for its
+six and `:806-811` for where it is read). The decision is the reference's
+(`aeron_driver_sender.c:149-152`): a pass reads the control sockets when the
+send sent nothing, or when `ratio` passes that did send have gone by, or when
+half the status-message timeout has elapsed since the last read (`:97`), or
+when a short send happened during the pass. The pass counter only advances on a
+pass that **sent** something, because a pass that did not reads anyway — which
+is what the reference's short-circuiting `||` does. The four conditions are one
+unit test each —
+`crates/driver/src/sender.rs::tests::the_control_read_waits_for_its_share_of_passes`,
+`::the_read_timeout_asks_for_a_read_by_itself`, `::a_short_send_asks_for_a_read`
+and `::a_pass_that_sent_nothing_reads_and_does_not_count` — and the flow
+control the poll exists for — status messages, NAKs, error frames — is the
+interop suite's, which runs against this sender on every CI run.
 
-- `aeron.send.to.status.poll.ratio` (`aeronmd.h:257`, the reference's
-  sender idle-strategy duty-cycle ratio, `aeron_driver_sender.c:96`). This
-  build's sender polls its control sockets on every pass, which is the
-  strongest setting of the same knob; a value below `1` is refused and
-  anything else is accepted and has no effect. Acting on it means the sender's
-  idle strategy, which this build does not have.
+One divergence remains, and it is in the configuration rather than the sender:
+the reference parses `1..=INT32_MAX` and then casts through a `uint8_t`, so
+`256` arrives as *zero* reads between passes, and `0` is out of its own range
+and falls back to the six with a warning. This refuses everything outside
+`1..=255` (`crates/driver/src/config.rs`) rather than letting a value mean a
+value it does not spell.
 
 `aeron.threading.mode` is read, and all four of its values are served —
 dedicated, shared-network, shared and invoker

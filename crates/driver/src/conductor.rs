@@ -915,6 +915,8 @@ impl Conductor {
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
             config.publication_linger_timeout_ns,
             config.re_resolution_check_interval_ns,
+            config.status_message_timeout_ns,
+            config.send_to_sm_poll_ratio,
         )
         .map_err(ConductorError::Sender)?;
 
