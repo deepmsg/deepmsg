@@ -520,18 +520,23 @@ mod tests {
         }
     }
 
-    use crate::native_resource_agent::StorageChecks;
+    use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
 
     use std::path::PathBuf;
 
     /// The publication and subscription managers a teardown needs, with no
     /// publications in them: what these tests are about is the client pool.
-    fn managers() -> (IpcPublications, IpcSubscriptions) {
-        (
-            IpcPublications::start(-1, 1000, StorageChecks::new(false, 0, PathBuf::new()))
-                .expect("an agent thread"),
-            IpcSubscriptions::new(),
-        )
+    ///
+    /// The agent is the driver's — the conductor owns it — so these tests start
+    /// one and keep it alive for the manager's lifetime, which is what the
+    /// conductor does too.
+    fn managers() -> (NativeResourceAgent, IpcPublications, IpcSubscriptions) {
+        let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
+            .expect("an agent thread");
+
+        let publications = IpcPublications::start(-1, 1000, agent.handle());
+
+        (agent, publications, IpcSubscriptions::new())
     }
 
     /// A recording sink: the events, in the order they were raised.
@@ -745,7 +750,7 @@ mod tests {
     fn a_silent_client_is_reaped_and_announced_in_the_references_order() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -804,7 +809,7 @@ mod tests {
         let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -840,7 +845,7 @@ mod tests {
     fn a_clients_counters_go_before_its_heartbeat() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -900,7 +905,7 @@ mod tests {
         // record and its counters for the driver's whole life.
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -943,7 +948,7 @@ mod tests {
         // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 

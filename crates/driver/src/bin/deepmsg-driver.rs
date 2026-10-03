@@ -8,10 +8,16 @@
 //! 2. install the signal handlers, before anything can take a long time,
 //! 3. settle the aeron directory — somebody else may already own it,
 //! 4. create the CnC file (not published yet),
-//! 5. start the conductor, which writes the first heartbeat and then publishes
-//!    the ready version,
-//! 6. loop until a termination command or a signal,
+//! 5. start the driver, which writes the first heartbeat, publishes the ready
+//!    version, and then puts its runners on the threads
+//!    `aeron.threading.mode` asks for,
+//! 6. drive slot 0 on this thread until a termination command or a signal,
 //! 7. publish the stop signal, flush, and delete the directory if configured.
+//!
+//! Step 6 is `aeronmd`'s own loop (`aeron-driver/src/main/c/aeronmd.c:165-168`):
+//! the process's thread is the conductor's (or, under `SHARED` and `INVOKER`,
+//! the composite's), which is why `aeron_driver_start` is called with
+//! `manual_main_loop` true there (`:153`).
 //!
 //! Step 3 before step 4 is the reference's order too, and it is the one that
 //! cannot be swapped: creating a file over a live driver's is not something a
@@ -48,9 +54,8 @@ use std::process::ExitCode;
 
 use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
 use deepmsg_core::clock;
-use deepmsg_driver::conductor::Conductor;
 use deepmsg_driver::config::DriverConfig;
-use deepmsg_driver::idle::Backoff;
+use deepmsg_driver::driver::Driver;
 use deepmsg_driver::{dir, sys};
 
 fn main() -> ExitCode {
@@ -135,8 +140,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut conductor = match Conductor::new(cnc, &config) {
-        Ok(conductor) => conductor,
+    let mut driver = match Driver::new(cnc, &config) {
+        Ok(driver) => driver,
         Err(error) => {
             eprintln!("deepmsg-driver: {error}");
             let _ = prepared.remove();
@@ -153,17 +158,24 @@ fn main() -> ExitCode {
         std::process::id()
     );
 
-    let mut idle = Backoff::new();
-    while conductor.is_running() && sys::stop_signal().is_none() {
-        idle.idle(conductor.do_work());
+    // The mode's runners go on threads, and this thread becomes slot 0: the
+    // conductor under `DEDICATED` and `SHARED_NETWORK`, the four-piece composite
+    // under `SHARED` and `INVOKER` (`aeronmd.c:153,165-168`).
+    if let Err(error) = driver.run() {
+        eprintln!("deepmsg-driver: {error}");
     }
 
-    shutdown(&mut conductor, prepared)
+    shutdown(&mut driver, prepared)
 }
 
 /// Stop the driver the way the reference does, and report how it stopped.
-fn shutdown(conductor: &mut Conductor, prepared: dir::PreparedDir) -> ExitCode {
-    if let Err(error) = conductor.close() {
+fn shutdown(driver: &mut Driver, prepared: dir::PreparedDir) -> ExitCode {
+    // The close stops every runner the mode started, waits for it, and closes
+    // the conductor (`aeron_driver_close`, `aeron_driver.c:1274-1296`). The
+    // order inside it is the one that matters: every log buffer it hands back
+    // goes back *through* the agent, and a free sent to an agent that has
+    // already stopped is a file nobody removes.
+    if let Err(error) = driver.close() {
         eprintln!("deepmsg-driver: the shutdown signal could not be published: {error}");
     }
 
@@ -174,15 +186,15 @@ fn shutdown(conductor: &mut Conductor, prepared: dir::PreparedDir) -> ExitCode {
         eprintln!("deepmsg-driver: {error}");
     }
 
-    let unhandled = conductor.unhandled_commands();
-    let unknown = conductor.unknown_commands();
+    let unhandled = driver.unhandled_commands();
+    let unknown = driver.unknown_commands();
     if 0 != unhandled || 0 != unknown {
         // stdout: a summary of what was *not* done, which every client that
         // asked was already told — not a failure of this process.
         println!(
             "deepmsg-driver: {unhandled} commands were not implemented and {unknown} were not in the \
              protocol; {last:?} was the last, and the clients that sent one have timed out",
-            last = conductor.last_unhandled(),
+            last = driver.last_unhandled(),
         );
     }
 

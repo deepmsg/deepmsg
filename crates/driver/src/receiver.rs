@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
-use crate::idle::Backoff;
+use crate::driver::Role;
 
 use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
@@ -607,10 +607,25 @@ impl ReceiverProxy {
     }
 }
 
+/// The receiver's two halves, before either has a thread.
+pub(crate) struct ReceiverParts {
+    /// The conductor's end: commands in, events out.
+    pub proxy: ReceiverProxy,
+    /// The work, which a runner drives one pass at a time.
+    pub agent: ReceiverThread,
+}
+
 /// The thread itself, with its proxy.
 pub struct Receiver {
     proxy: ReceiverProxy,
     thread: Option<JoinHandle<()>>,
+}
+
+/// One pass of the receiver, for the runner that drives it.
+impl crate::driver::Agent for ReceiverThread {
+    fn do_work(&mut self) -> Option<usize> {
+        Self::do_work(self)
+    }
 }
 
 impl Receiver {
@@ -630,37 +645,73 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
+        let ReceiverParts { proxy, agent } = Self::split(
+            cnc,
+            values_length,
+            free_to_reuse_timeout_ms,
+            mtu_length,
+            status_message_timeout_ns,
+            initial_window_length,
+            cycle_threshold_ns,
+            re_resolution_interval_ns,
+        )?;
+
+        let thread = crate::driver::run_agent(
+            Role::Receiver.classic_name(),
+            agent,
+            crate::driver::default_strategy(),
+        )?;
+
+        Ok(Self {
+            proxy,
+            thread: Some(thread),
+        })
+    }
+
+    /// The two halves this is made of, **without** a thread: the end the
+    /// conductor holds and the work a runner drives.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the counters region is too small for a receiver's own
+    /// view of it.
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
+    pub(crate) fn split(
+        cnc: Arc<CncFile>,
+        values_length: usize,
+        free_to_reuse_timeout_ms: i64,
+        mtu_length: usize,
+        status_message_timeout_ns: i64,
+        initial_window_length: i32,
+        cycle_threshold_ns: i64,
+        re_resolution_interval_ns: i64,
+    ) -> io::Result<ReceiverParts> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
         let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
 
-        let thread = std::thread::Builder::new()
-            .name("deepmsg-receiver".to_owned())
-            .spawn(move || {
-                let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms)
-                else {
-                    return;
-                };
+        let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms) else {
+            return Err(io::Error::other(
+                "the counters region is too small for the receiver's view of it",
+            ));
+        };
 
-                let mut receiver = ReceiverThread::new(
-                    cnc,
-                    counters,
-                    mtu_length,
-                    status_message_timeout_ns,
-                    initial_window_length,
-                    cycle_threshold_ns,
-                    re_resolution_interval_ns,
-                    deepmsg_core::clock::monotonic_nano_time(),
-                    event_tx,
-                );
-                receiver.run(&command_rx);
-            })?;
-
-        Ok(Self {
+        Ok(ReceiverParts {
             proxy: ReceiverProxy {
                 commands: command_tx,
                 events: event_rx,
             },
-            thread: Some(thread),
+            agent: ReceiverThread::new(
+                cnc,
+                counters,
+                mtu_length,
+                status_message_timeout_ns,
+                initial_window_length,
+                cycle_threshold_ns,
+                re_resolution_interval_ns,
+                deepmsg_core::clock::monotonic_nano_time(),
+                event_tx,
+                command_rx,
+            ),
         })
     }
 
@@ -719,7 +770,7 @@ pub(crate) struct PendingSetup {
 }
 
 /// What the thread owns.
-struct ReceiverThread {
+pub(crate) struct ReceiverThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
     #[allow(dead_code)]
@@ -748,7 +799,8 @@ struct ReceiverThread {
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
     last_cycle_ns: i64,
-    idle: Backoff,
+    /// The commands the conductor sends, which this drains one pass at a time.
+    commands: Inbox<ReceiverCommand>,
 }
 
 impl ReceiverThread {
@@ -763,8 +815,10 @@ impl ReceiverThread {
         re_resolution_interval_ns: i64,
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
+        commands: Inbox<ReceiverCommand>,
     ) -> Self {
         Self {
+            commands,
             cnc,
             counters,
             mtu_length,
@@ -781,15 +835,25 @@ impl ReceiverThread {
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
-            idle: Backoff::new(),
         }
     }
 
-    fn run(&mut self, commands: &Inbox<ReceiverCommand>) {
-        loop {
+    /// One pass: the commands that arrived, then the work
+    /// (`aeron_driver_receiver_do_work`, which drains the proxy queue and then
+    /// polls every transport).
+    ///
+    /// `None` when a `Stop` was among them — the reference's `running` flag,
+    /// cleared and checked after the pass, which is why the pass that stops
+    /// does no work. `Some(work)` is what the idle strategy is given.
+    ///
+    /// This is the reference's agent loop body (`aeron_agent.c:395-412`)
+    /// separated from the loop, so that a `SHARED_NETWORK` or `SHARED` runner
+    /// can drive it on a thread other agents are on too.
+    pub fn do_work(&mut self) -> Option<usize> {
+        {
             let mut stop = false;
 
-            for command in commands.try_iter() {
+            for command in self.commands.try_iter() {
                 match command {
                     ReceiverCommand::ResolutionChange {
                         endpoint_id,
@@ -1138,18 +1202,17 @@ impl ReceiverThread {
                 }
             }
 
-            let work = if stop { 0 } else { self.do_work() };
-            self.idle.idle(work);
-
             if stop {
-                break;
+                return None;
             }
         }
+
+        Some(self.do_receive())
     }
 
-    /// One pass (`aeron_driver_receiver_do_work`,
+    /// The work of one pass (`aeron_driver_receiver_do_work`'s second half,
     /// `aeron-driver/src/main/c/aeron_driver_receiver.c:130-260`).
-    fn do_work(&mut self) -> usize {
+    fn do_receive(&mut self) -> usize {
         let cnc = Arc::clone(&self.cnc);
         let Some(regions) = cnc.counter_regions() else {
             return 0;

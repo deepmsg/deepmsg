@@ -51,9 +51,7 @@ use crate::config::DriverConfig;
 use crate::dir::PUBLICATIONS_DIR;
 use crate::ipc_publication::{IpcPublication, PublicationIdentity, ShareMismatch, State};
 use crate::ipc_subscriptions::{IPC_CHANNEL, IpcSubscriptions};
-use crate::native_resource_agent::{
-    AgentHandle, AgentResolver, Completion, NativeResourceAgent, StorageChecks, StorageWarning,
-};
+use crate::native_resource_agent::{AgentHandle, Completion};
 use crate::position as counter_position;
 use crate::publication_params::{PublicationParams, PublicationParamsError, TaggedPublication};
 use crate::subscribable::UntetheredEvent;
@@ -413,64 +411,64 @@ struct PendingPublication {
     path: PathBuf,
 }
 
-/// The publications a driver owns, and the thread that maps their log buffers.
+/// The publications a driver owns.
 #[derive(Debug)]
 pub struct IpcPublications {
     publications: Vec<IpcPublication>,
     pending: Vec<PendingPublication>,
     session_ids: SessionIds,
-    agent: NativeResourceAgent,
+    /// The driver's one native resource agent, through which log buffers are
+    /// asked for. The **conductor** owns the agent and the thread behind it;
+    /// this is only the end that speaks to it.
+    agent: AgentHandle,
+    /// What the conductor took off the agent and routed here.
+    completed: Vec<Completion>,
 }
 
 impl IpcPublications {
-    /// Start the manager, and the thread that will create log buffers —
-    /// asking `storage`'s filesystem first, when the checks are on.
+    /// Start the manager, speaking to `agent` for its log buffers.
     ///
-    /// # Errors
-    ///
-    /// [`io::Error`] if the agent thread cannot be spawned.
-    /// Start the manager, and the agent thread with it.
-    ///
-    /// The agent is the driver's **native resource agent**, and this is the one
-    /// that carries the name resolver: the reference has a single agent and the
-    /// resolver lives on it (`aeron_driver_native_resource_agent.c:224-270`),
-    /// while this build has one per kind of log buffer. Collapsing them is
-    /// G4-1's; until then the resolver goes on the first, which is this one.
+    /// The agent is the driver's **native resource agent** — one for the whole
+    /// driver, as the reference has it, with the name resolver on it
+    /// (`aeron_driver_native_resource_agent.c:224-270`).
     pub fn start(
         reserved_session_id_low: i32,
         reserved_session_id_high: i32,
-        storage: StorageChecks,
-    ) -> io::Result<Self> {
-        Ok(Self {
+        agent: AgentHandle,
+    ) -> Self {
+        Self {
             publications: Vec::new(),
             pending: Vec::new(),
             session_ids: SessionIds::start(reserved_session_id_low, reserved_session_id_high),
-            agent: NativeResourceAgent::start(storage)?,
-        })
+            agent,
+            completed: Vec::new(),
+        }
     }
 
-    /// A handle for the agent's non-log-buffer work, which a caller keeps while
-    /// this manager is borrowed (`aeron_driver_conductor_cluster_...` has no
-    /// counterpart — the reference's conductor holds the agent's command queue
-    /// directly).
-    pub fn agent_handle(&self) -> AgentHandle {
-        self.agent.handle()
-    }
-
-    /// Hand the driver's resolver to the agent thread, once the CnC file can
-    /// be shared.
+    /// Take a completion the **conductor** routed here, or hand it back.
     ///
-    /// # Errors
+    /// There is one agent for the whole driver and the conductor owns it, so
+    /// nothing here drains it: the conductor takes its completions once and
+    /// asks each manager in turn whose pending list names the path. `Some`
+    /// back means "not mine", and the conductor passes it to the next one.
     ///
-    /// [`io::Error`] if the agent thread is gone.
-    pub fn attach_resolver(&self, resolver: AgentResolver) -> io::Result<()> {
-        self.agent.attach_resolver(resolver)
-    }
+    /// A `Freed` is nobody's: the mapping is already gone and the path left
+    /// `pending` when the publication was created, so it is never claimed and
+    /// the conductor drops it.
+    pub fn receive_completion(&mut self, completion: Completion) -> Option<Completion> {
+        let mine = match &completion {
+            Completion::Mapped { path, .. } | Completion::MapFailed { path, .. } => {
+                self.pending.iter().any(|entry| entry.path == *path)
+            }
+            Completion::Freed { .. } => false,
+        };
 
-    /// The agent thread this manager owns, for the work that is not a log
-    /// buffer: parsing a channel, resolving a name, and what it could not do.
-    pub const fn agent(&self) -> &NativeResourceAgent {
-        &self.agent
+        if mine {
+            self.completed.push(completion);
+            None
+        } else {
+            Some(completion)
+        }
     }
 
     /// The publications that exist, in creation order.
@@ -742,7 +740,9 @@ impl IpcPublications {
         now: Now,
         events: &mut impl ClientEvents,
     ) -> usize {
-        let completions = self.agent.poll();
+        // What the conductor routed here, not what the agent has: the agent is
+        // the driver's and the conductor drains it.
+        let completions = std::mem::take(&mut self.completed);
         let mut work = 0;
 
         for completion in completions {
@@ -752,10 +752,10 @@ impl IpcPublications {
                 Completion::Mapped { path, log } => {
                     let Some(index) = self.pending.iter().position(|entry| entry.path == path)
                     else {
-                        // The agent only answers requests, so this cannot
-                        // happen; dropping the mapping (which is what this
-                        // does) is still better than leaking it, and the
-                        // removal is the agent's job.
+                        // `receive_completion` only hands over a path that is
+                        // in `pending`, so this cannot happen; dropping the
+                        // mapping (which is what this does) is still better
+                        // than leaking it, and the removal is the agent's job.
                         let _ = self.agent.free_log_buffer(*log);
                         continue;
                     };
@@ -791,13 +791,6 @@ impl IpcPublications {
         }
 
         work
-    }
-
-    /// Every storage warning the agent raised since the last call. Not this
-    /// pool's to answer — a warning never stopped a create — so they pass
-    /// straight through to the conductor, which owns the log they go to.
-    pub fn poll_storage_warnings(&self) -> Vec<StorageWarning> {
-        self.agent.poll_warnings()
     }
 
     /// Let go of the publications a client held, as its death or its
@@ -1098,13 +1091,16 @@ impl IpcPublications {
         }
 
         // A log buffer still being created when the driver stops is one the
-        // agent finishes and nobody collects: `shutdown` waits for the queue
-        // to drain, so the file exists and is removed by nothing. The
-        // reference has the same shape — its commands are freed without their
-        // mappings being deleted (`:3415-3425`) — and a restarted driver
+        // agent finishes and nobody collects: the conductor's `shutdown` waits
+        // for the queue to drain, so the file exists and is removed by nothing.
+        // The reference has the same shape — its commands are freed without
+        // their mappings being deleted (`:3415-3425`) — and a restarted driver
         // removes a stale log buffer by name.
+        //
+        // The agent's own thread is stopped by the **conductor**, after every
+        // manager has let go of its publications: a free sent to an agent that
+        // has already stopped is a log file nobody removes.
         self.pending.clear();
-        self.agent.shutdown();
     }
 
     /// The create: speculate a session id, allocate the counters, write the

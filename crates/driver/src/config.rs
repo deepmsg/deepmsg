@@ -743,6 +743,20 @@ pub struct DriverConfig {
     /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`), likewise, for
     /// the destinations a subscription listens on (`:1071-1081`).
     pub receiver_wildcard_port_range: PortRange,
+    /// How the driver's work is spread over threads (`aeron.threading.mode`).
+    pub threading_mode: ThreadingMode,
+    /// Which set of names those threads are given (`aeron.thread.naming`).
+    pub thread_naming: ThreadNaming,
+    /// The conductor slot's idle strategy, and the five others beside it.
+    /// Each is read when its runner is built, and a name that is not one of the
+    /// six is refused there — the reference refuses at the same point
+    /// (`aeron_driver_context.c:1152-1158`).
+    pub conductor_idle: IdleStrategySetting,
+    pub sender_idle: IdleStrategySetting,
+    pub receiver_idle: IdleStrategySetting,
+    pub shared_idle: IdleStrategySetting,
+    pub shared_network_idle: IdleStrategySetting,
+    pub native_resource_agent_idle: IdleStrategySetting,
 }
 
 impl Default for DriverConfig {
@@ -828,6 +842,145 @@ impl Default for DriverConfig {
             // not a driver that named `0 0`, but it behaves as one.
             sender_wildcard_port_range: PortRange::OS_WILDCARD,
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
+            threading_mode: ThreadingMode::Dedicated,
+            thread_naming: ThreadNaming::Classic,
+            conductor_idle: IdleStrategySetting::default(),
+            sender_idle: IdleStrategySetting::default(),
+            receiver_idle: IdleStrategySetting::default(),
+            shared_idle: IdleStrategySetting::default(),
+            shared_network_idle: IdleStrategySetting::default(),
+            native_resource_agent_idle: IdleStrategySetting::sleeping_default(),
+        }
+    }
+}
+
+/// How the driver's work is spread over threads
+/// (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`).
+///
+/// The four values are the reference's, and each names a set of runners
+/// (`aeron_driver.c:1003-1122`): four threads, three, one, or none at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadingMode {
+    /// One thread each, which is the reference's default.
+    Dedicated,
+    /// The sender and the receiver share one thread, which is what the
+    /// reference's own system tests ask for.
+    SharedNetwork,
+    /// One thread for everything the driver does.
+    Shared,
+    /// No threads of the driver's own: the caller drives them, and the medium
+    /// driver process **refuses to start with it**
+    /// (`aeron_driver_start`, `aeron_driver.c:1225-1230`).
+    Invoker,
+}
+
+impl ThreadingMode {
+    pub const DEFAULT: Self = Self::Dedicated;
+
+    /// The mode `value` names, or `None` for one the reference does not know —
+    /// which it treats as a typo worth a warning and its default, and this
+    /// build refuses, as it does every unparsable value.
+    ///
+    /// The match is the reference's own: exact and case-sensitive, because its
+    /// `strncmp` compares the terminating byte too
+    /// (`aeron_driver_context.c:49-68`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "DEDICATED" => Some(Self::Dedicated),
+            "SHARED_NETWORK" => Some(Self::SharedNetwork),
+            "SHARED" => Some(Self::Shared),
+            "INVOKER" => Some(Self::Invoker),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode leaves the driver's work to the process's own threads.
+    pub const fn is_invoker(self) -> bool {
+        matches!(self, Self::Invoker)
+    }
+
+    /// The name the reference prints for it (`aeron_driver_threading_mode_to_string`,
+    /// `aeron_driver.c:487-503`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dedicated => "DEDICATED",
+            Self::SharedNetwork => "SHARED_NETWORK",
+            Self::Shared => "SHARED",
+            Self::Invoker => "INVOKER",
+        }
+    }
+}
+
+/// The two spellings of the driver's thread names
+/// (`aeron_driver_context.h:37-48`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadNaming {
+    /// `conductor`, `receiver`, `sender`, `aeron-md-nra`, and the two bracketed
+    /// names a shared runner uses — the reference's default.
+    Classic,
+    /// The same roles under the short `aeron-md-*` names.
+    New,
+}
+
+impl ThreadNaming {
+    pub const DEFAULT: Self = Self::Classic;
+
+    /// The naming `value` names, or `None` for one the reference does not know
+    /// (`aeron_config_parse_thread_naming`, `aeron_driver_context.c:76-99`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "classic" => Some(Self::Classic),
+            "new" => Some(Self::New),
+            _ => None,
+        }
+    }
+}
+
+/// One slot's idle strategy: the name it answers to and the init args beside
+/// it, which the reference reads as two separate settings
+/// (`aeron_driver_context.c:1150-1200`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleStrategySetting {
+    /// The name, one of the six `aeron_idle_strategy_load` knows
+    /// (`aeron_agent.c:286-294`).
+    pub name: String,
+    /// What that strategy's initialiser is given, if anything.
+    pub init_args: Option<String>,
+}
+
+impl IdleStrategySetting {
+    /// What five of the driver's six slots default to
+    /// (`aeron_driver_context.c:1143-1147`).
+    pub const BACKOFF_DEFAULT: &'static str = "backoff";
+    /// What the native resource agent defaults to (`:1148`) — it maps files and
+    /// resolves names on its own thread, and spinning there is a core nobody
+    /// can use.
+    pub const NATIVE_RESOURCE_AGENT_DEFAULT_NAME: &'static str = "sleep-ns";
+
+    /// The strategy this setting names, or `None` when the name is not one of
+    /// the six — which the reference refuses to start over
+    /// (`aeron_driver_context.c:1152-1158`).
+    pub fn strategy(&self) -> Option<crate::idle::Strategy> {
+        crate::idle::Strategy::by_name(&self.name, self.init_args.as_deref())
+    }
+}
+
+/// The native resource agent's default, which is the one slot that is not
+/// backoff (`aeron_driver_context.c:1148`).
+impl IdleStrategySetting {
+    pub fn sleeping_default() -> Self {
+        Self {
+            name: Self::NATIVE_RESOURCE_AGENT_DEFAULT_NAME.to_owned(),
+            init_args: None,
+        }
+    }
+}
+
+impl Default for IdleStrategySetting {
+    fn default() -> Self {
+        Self {
+            name: Self::BACKOFF_DEFAULT.to_owned(),
+            init_args: None,
         }
     }
 }
@@ -1122,6 +1275,55 @@ impl DriverConfig {
             config.image_liveness_timeout_ns =
                 parse_duration_ns(&Setting::IMAGE_LIVENESS_TIMEOUT, &value)?;
         }
+        if let Some(value) = get(&Setting::THREADING_MODE) {
+            config.threading_mode =
+                ThreadingMode::parse(&value).ok_or(ConfigError::UnknownThreadingMode {
+                    value: value.clone(),
+                })?;
+        }
+        if let Some(value) = get(&Setting::THREAD_NAMING) {
+            config.thread_naming =
+                ThreadNaming::parse(&value).ok_or(ConfigError::UnknownThreadNaming {
+                    value: value.clone(),
+                })?;
+        }
+
+        config.conductor_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::BACKOFF_DEFAULT,
+            &Setting::CONDUCTOR_IDLE_STRATEGY,
+            &Setting::CONDUCTOR_IDLE_STRATEGY_INIT_ARGS,
+        )?;
+        config.sender_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::BACKOFF_DEFAULT,
+            &Setting::SENDER_IDLE_STRATEGY,
+            &Setting::SENDER_IDLE_STRATEGY_INIT_ARGS,
+        )?;
+        config.receiver_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::BACKOFF_DEFAULT,
+            &Setting::RECEIVER_IDLE_STRATEGY,
+            &Setting::RECEIVER_IDLE_STRATEGY_INIT_ARGS,
+        )?;
+        config.shared_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::BACKOFF_DEFAULT,
+            &Setting::SHARED_IDLE_STRATEGY,
+            &Setting::SHARED_IDLE_STRATEGY_INIT_ARGS,
+        )?;
+        config.shared_network_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::BACKOFF_DEFAULT,
+            &Setting::SHARED_NETWORK_IDLE_STRATEGY,
+            &Setting::SHARED_NETWORK_IDLE_STRATEGY_INIT_ARGS,
+        )?;
+        config.native_resource_agent_idle = idle_strategy(
+            &get,
+            IdleStrategySetting::NATIVE_RESOURCE_AGENT_DEFAULT_NAME,
+            &Setting::NATIVE_RESOURCE_AGENT_IDLE_STRATEGY,
+            &Setting::NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS,
+        )?;
         if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_TAG) {
             config.flow_control_group_tag = parse_count(&Setting::FLOW_CONTROL_GROUP_TAG, &value)?;
         }
@@ -1653,6 +1855,81 @@ impl Setting {
         property: "image.liveness.timeout",
         env: "AERON_IMAGE_LIVENESS_TIMEOUT",
     };
+    /// `aeron.threading.mode` (`aeronmd.h:54`).
+    const THREADING_MODE: Self = Self {
+        property: "threading.mode",
+        env: "AERON_THREADING_MODE",
+    };
+    /// `aeron.thread.naming` (`aeronmd.h:68`).
+    const THREAD_NAMING: Self = Self {
+        property: "thread.naming",
+        env: "AERON_THREAD_NAMING",
+    };
+    /// `aeron.conductor.idle.strategy` (`aeronmd.h:425`).
+    const CONDUCTOR_IDLE_STRATEGY: Self = Self {
+        property: "conductor.idle.strategy",
+        env: "AERON_CONDUCTOR_IDLE_STRATEGY",
+    };
+    /// `aeron.conductor.idle.strategy.init.args` (`aeronmd.h:465`).
+    const CONDUCTOR_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "conductor.idle.strategy.init.args",
+        env: "AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS",
+    };
+    /// `aeron.sender.idle.strategy` (`aeronmd.h:417`).
+    const SENDER_IDLE_STRATEGY: Self = Self {
+        property: "sender.idle.strategy",
+        env: "AERON_SENDER_IDLE_STRATEGY",
+    };
+    /// `aeron.sender.idle.strategy.init.args` (`aeronmd.h:457`).
+    const SENDER_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "sender.idle.strategy.init.args",
+        env: "AERON_SENDER_IDLE_STRATEGY_INIT_ARGS",
+    };
+    /// `aeron.receiver.idle.strategy` (`aeronmd.h:433`).
+    const RECEIVER_IDLE_STRATEGY: Self = Self {
+        property: "receiver.idle.strategy",
+        env: "AERON_RECEIVER_IDLE_STRATEGY",
+    };
+    /// `aeron.receiver.idle.strategy.init.args` (`aeronmd.h:473`).
+    const RECEIVER_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "receiver.idle.strategy.init.args",
+        env: "AERON_RECEIVER_IDLE_STRATEGY_INIT_ARGS",
+    };
+    /// `aeron.shared.idle.strategy` (`aeronmd.h:449`).
+    const SHARED_IDLE_STRATEGY: Self = Self {
+        property: "shared.idle.strategy",
+        env: "AERON_SHARED_IDLE_STRATEGY",
+    };
+    /// `aeron.shared.idle.strategy.init.args` (`aeronmd.h:489`).
+    const SHARED_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "shared.idle.strategy.init.args",
+        env: "AERON_SHARED_IDLE_STRATEGY_INIT_ARGS",
+    };
+    /// `aeron.sharednetwork.idle.strategy` (`aeronmd.h:441`) — the reference
+    /// spells this one without the underscore between the two words, and its
+    /// env var is what a deployment writes.
+    const SHARED_NETWORK_IDLE_STRATEGY: Self = Self {
+        property: "sharednetwork.idle.strategy",
+        env: "AERON_SHAREDNETWORK_IDLE_STRATEGY",
+    };
+    /// `aeron.sharednetwork.idle.strategy.init.args` (`aeronmd.h:481`).
+    const SHARED_NETWORK_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "sharednetwork.idle.strategy.init.args",
+        env: "AERON_SHAREDNETWORK_IDLE_STRATEGY_INIT_ARGS",
+    };
+    /// `aeron.driver.native.resource.agent.idle.strategy` (`aeronmd.h:497`) —
+    /// the one slot whose names carry the `driver.` infix, which is what its
+    /// environment variable spells.
+    const NATIVE_RESOURCE_AGENT_IDLE_STRATEGY: Self = Self {
+        property: "driver.native.resource.agent.idle.strategy",
+        env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY",
+    };
+    /// `aeron.driver.native.resource.agent.idle.strategy.init.args`
+    /// (`aeronmd.h:505`).
+    const NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS: Self = Self {
+        property: "driver.native.resource.agent.idle.strategy.init.args",
+        env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS",
+    };
     /// `aeron.receiver.group.tag` (`aeronmd.h:558`).
     const RECEIVER_GROUP_TAG: Self = Self {
         property: "receiver.group.tag",
@@ -1834,6 +2111,30 @@ pub enum ConfigError {
     /// the driver to answer to, which the reference refuses
     /// (`aeron_driver_context.c:601-608`).
     ResolverNameRequired,
+    /// An `aeron.threading.mode` the reference does not know
+    /// (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`).
+    ///
+    /// The reference warns and keeps its default; this refuses, which is the
+    /// stance `docs/compat.md` records for every value it cannot parse.
+    UnknownThreadingMode {
+        /// What it was set to.
+        value: String,
+    },
+    /// An `aeron.thread.naming` the reference does not know
+    /// (`aeron_config_parse_thread_naming`, `:76-99`).
+    UnknownThreadNaming {
+        /// What it was set to.
+        value: String,
+    },
+    /// An idle strategy name the reference's own table does not have, which
+    /// for the reference is a driver that does not start
+    /// (`aeron_driver_context.c:1152-1158`).
+    UnknownIdleStrategy {
+        /// The slot, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+    },
     /// A validator name the reference's symbol table does not know.
     UnknownValidator {
         /// What it was set to.
@@ -1878,6 +2179,16 @@ impl std::fmt::Display for ConfigError {
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::UnknownThreadingMode { value } => write!(
+                f,
+                "{value} is not a threading mode: DEDICATED, SHARED_NETWORK, SHARED or INVOKER"
+            ),
+            Self::UnknownThreadNaming { value } => {
+                write!(f, "{value} is not a thread naming: classic or new")
+            }
+            Self::UnknownIdleStrategy { name, value } => {
+                write!(f, "{name} is {value}, which names no idle strategy")
+            }
             Self::PortRange {
                 name,
                 value,
@@ -1910,7 +2221,10 @@ impl std::error::Error for ConfigError {
             | Self::OutOfRange { .. }
             | Self::UnknownSupplier { .. }
             | Self::ResolverNameRequired
-            | Self::UnknownValidator { .. } => None,
+            | Self::UnknownValidator { .. }
+            | Self::UnknownThreadingMode { .. }
+            | Self::UnknownThreadNaming { .. }
+            | Self::UnknownIdleStrategy { .. } => None,
         }
     }
 }
@@ -2105,19 +2419,68 @@ pub(crate) fn cubic_duration(value: &str) -> Option<i64> {
     parse_duration_ns(&Setting::CUBIC_INITIAL_RTT, value).ok()
 }
 
-fn parse_duration_ns(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
+/// One slot's idle strategy from its two settings — the name and the init args
+/// beside it, which the reference reads separately
+/// (`aeron_driver_context.c:1150-1200`).
+///
+/// The name is checked **here**, at resolve time, because the reference checks
+/// it at the same point and refuses to start over it: an unknown name makes its
+/// loader return null and its context jump to the error arm (`:1152-1158`). A
+/// typo in an idle strategy name is not a driver that idles differently.
+fn idle_strategy(
+    get: &impl Fn(&Setting) -> Option<String>,
+    default_name: &str,
+    name_setting: &Setting,
+    args_setting: &Setting,
+) -> Result<IdleStrategySetting, ConfigError> {
+    let setting = IdleStrategySetting {
+        name: get(name_setting).unwrap_or_else(|| default_name.to_owned()),
+        init_args: get(args_setting),
+    };
+
+    match setting.strategy() {
+        Some(_) => Ok(setting),
+        None => Err(ConfigError::UnknownIdleStrategy {
+            name: name_setting.property,
+            value: setting.name,
+        }),
+    }
+}
+
+/// The same parse, without a setting to blame: `None` when the value is not a
+/// duration. Used by the idle strategies' init args, which the reference reads
+/// with this very function (`aeron_idle_strategy_sleeping_init_args`,
+/// `aeron_agent.c:47-66`).
+pub(crate) fn duration_ns(value: &str) -> Option<i64> {
     let lower = value.to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(head) = lower.strip_suffix("ns") {
-        (head, 1i64)
-    } else if let Some(head) = lower.strip_suffix("us") {
+    let (digits, multiplier) = split_duration(&lower);
+
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
+/// A duration's digits and the multiplier its suffix asks for
+/// (`aeron_parse_duration_ns`, `util/aeron_parse_util.c:193-266`).
+///
+/// No suffix at all is nanoseconds — and a suffix that is not one of these
+/// leaves the letters in the digits, which is what makes the caller's parse
+/// fail on `1m` or `1x` rather than read them as a number.
+fn split_duration(value: &str) -> (&str, i64) {
+    if let Some(head) = value.strip_suffix("ns") {
+        (head, 1)
+    } else if let Some(head) = value.strip_suffix("us") {
         (head, 1_000)
-    } else if let Some(head) = lower.strip_suffix("ms") {
+    } else if let Some(head) = value.strip_suffix("ms") {
         (head, 1_000_000)
-    } else if let Some(head) = lower.strip_suffix('s') {
+    } else if let Some(head) = value.strip_suffix('s') {
         (head, 1_000_000_000)
     } else {
-        (lower.as_str(), 1)
-    };
+        (value, 1)
+    }
+}
+
+fn parse_duration_ns(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
+    let lower = value.to_ascii_lowercase();
+    let (digits, multiplier) = split_duration(&lower);
 
     let count: i64 = digits.parse().map_err(|_| ConfigError::NotANumber {
         name: setting.property,
@@ -2980,12 +3343,164 @@ mod tests {
     fn unknown_properties_are_ignored_because_a_reference_config_has_them() {
         let config = resolve(&[
             ("deepmsg.dir", "/tmp/x"),
-            ("aeron.threading.mode", "SHARED"),
-            ("aeron.conductor.idle.strategy", "backoff"),
+            ("aeron.threading.mode.typo", "SHARED"),
             ("aeron.term.buffer.length", "64m"),
         ])
         .expect("resolve");
 
         assert_eq!(PathBuf::from("/tmp/x"), config.aeron_dir);
+    }
+
+    /// The four modes, by the names the reference's parser compares
+    /// case-sensitively and exactly (`aeron_driver_context.c:45-71`).
+    #[test]
+    fn the_threading_modes_are_the_references_four() {
+        assert_eq!(
+            ThreadingMode::Dedicated,
+            DriverConfig::default().threading_mode
+        );
+
+        for (value, expected) in [
+            ("DEDICATED", ThreadingMode::Dedicated),
+            ("SHARED_NETWORK", ThreadingMode::SharedNetwork),
+            ("SHARED", ThreadingMode::Shared),
+            ("INVOKER", ThreadingMode::Invoker),
+        ] {
+            let config = resolve(&[("deepmsg.dir", "/tmp/x"), ("aeron.threading.mode", value)])
+                .expect("resolve");
+
+            assert_eq!(expected, config.threading_mode, "{value}");
+            assert_eq!(value, expected.as_str(), "and it prints back as it came");
+        }
+
+        // `SHARED` is a prefix of `SHARED_NETWORK`, and the reference's
+        // `strncmp` compares the terminating byte — so the two do not collide.
+        // Anything else is a typo the reference warns about and this refuses.
+        for value in ["shared", "SHARED_NETWORK_", "SHARE", "DEDICATED "] {
+            let error = resolve(&[("deepmsg.dir", "/tmp/x"), ("aeron.threading.mode", value)])
+                .expect_err("not a mode");
+
+            assert!(
+                matches!(error, ConfigError::UnknownThreadingMode { .. }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_thread_naming_is_classic_or_new() {
+        assert_eq!(ThreadNaming::Classic, DriverConfig::default().thread_naming);
+
+        let new =
+            resolve(&[("deepmsg.dir", "/tmp/x"), ("aeron.thread.naming", "new")]).expect("resolve");
+        assert_eq!(ThreadNaming::New, new.thread_naming);
+
+        let error = resolve(&[("deepmsg.dir", "/tmp/x"), ("aeron.thread.naming", "New")])
+            .expect_err("case matters");
+        assert!(matches!(error, ConfigError::UnknownThreadNaming { .. }));
+    }
+
+    /// Five slots default to `backoff` and the native resource agent to
+    /// `sleep-ns` (`aeron_driver_context.c:1143-1148`), which is the one place
+    /// the reference's defaults differ between slots.
+    #[test]
+    fn every_slot_has_its_own_idle_strategy_and_its_own_default() {
+        let config = DriverConfig::default();
+
+        for setting in [
+            &config.conductor_idle,
+            &config.sender_idle,
+            &config.receiver_idle,
+            &config.shared_idle,
+            &config.shared_network_idle,
+        ] {
+            assert_eq!("backoff", setting.name);
+            assert_eq!(None, setting.init_args);
+        }
+
+        assert_eq!("sleep-ns", config.native_resource_agent_idle.name);
+        assert!(matches!(
+            config.native_resource_agent_idle.strategy(),
+            Some(crate::idle::Strategy::Sleeping(_))
+        ));
+    }
+
+    /// The names are the reference's environment variables, two of which are
+    /// not what the slot is called: the shared-network slot has no underscore
+    /// between the words, and the native resource agent's carries a `DRIVER_`
+    /// infix (`aeronmd.h:441`, `:497`).
+    #[test]
+    fn the_idle_strategy_names_are_the_references_even_where_they_are_odd() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/x")],
+            &[
+                ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "spin"),
+                ("AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "yield"),
+                (
+                    "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS",
+                    "ignored",
+                ),
+                ("AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS", "2-3-10us-1ms"),
+            ],
+        )
+        .expect("resolve");
+
+        assert_eq!("spin", config.shared_network_idle.name);
+        assert_eq!("yield", config.native_resource_agent_idle.name);
+        assert_eq!(
+            Some("ignored".to_owned()),
+            config.native_resource_agent_idle.init_args,
+            "the args are read even where the strategy ignores them, as the \
+             reference reads both"
+        );
+        assert_eq!(
+            Some("2-3-10us-1ms".to_owned()),
+            config.conductor_idle.init_args
+        );
+
+        // And the property spelling, which is the environment variable's name
+        // in lower case with its dots back.
+        let by_property = resolve(&[
+            ("deepmsg.dir", "/tmp/x"),
+            ("aeron.sharednetwork.idle.strategy", "noop"),
+            ("aeron.sender.idle.strategy", "sleep-ns"),
+        ])
+        .expect("resolve");
+
+        assert_eq!("noop", by_property.shared_network_idle.name);
+        assert_eq!("sleep-ns", by_property.sender_idle.name);
+    }
+
+    /// An idle strategy name the reference's table does not have is a driver
+    /// that does not start, on both sides (`aeron_driver_context.c:1152-1158`),
+    /// and malformed init args are the same kind of refusal
+    /// (`aeron_agent.c:186-248`).
+    #[test]
+    fn an_idle_strategy_that_does_not_exist_or_will_not_parse_is_refused() {
+        // An empty value is not one of these: this build reads it as unset, as
+        // it does everywhere (`an_empty_value_is_an_unset_value`), so the slot
+        // keeps its default rather than becoming a nameless strategy.
+        for (property, value) in [
+            ("aeron.conductor.idle.strategy", "busy-wait"),
+            ("aeron.sender.idle.strategy", "Sleeping"),
+            ("aeron.receiver.idle.strategy", "backoff "),
+        ] {
+            let error = resolve(&[("deepmsg.dir", "/tmp/x"), (property, value)])
+                .expect_err("not a strategy");
+
+            assert!(
+                matches!(error, ConfigError::UnknownIdleStrategy { .. }),
+                "{value}"
+            );
+        }
+
+        let error = resolve(&[
+            ("deepmsg.dir", "/tmp/x"),
+            ("aeron.conductor.idle.strategy", "backoff"),
+            ("aeron.conductor.idle.strategy.init.args", "3-4"),
+        ])
+        .expect_err("four values are required");
+
+        assert!(matches!(error, ConfigError::UnknownIdleStrategy { .. }));
     }
 }

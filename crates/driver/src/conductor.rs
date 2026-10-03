@@ -81,16 +81,22 @@ use deepmsg_core::clock::{self, CachedClock};
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, CounterLink};
 use crate::config::{DriverConfig, TerminationPolicy};
+use crate::driver::AgentStates;
 use crate::ipc_publications::{IpcPublications, Now};
 use crate::ipc_subscriptions::IpcSubscriptions;
 use crate::media::receive_endpoint::ReceiveDestination;
-use crate::native_resource_agent::{AgentHandle, ParsedChannel, ResolutionCell, StorageChecks};
+use crate::native_resource_agent::{
+    AgentHandle, AgentQueues, Completion, NativeResourceAgent, ParsedChannel, ResolutionCell,
+    StorageChecks,
+};
 use crate::network_publications::NetworkPublications;
 use crate::publication_images::PublicationImages;
 use crate::receive_endpoints::ReceiveChannelEndpoints;
+use crate::receiver::ReceiverProxy;
 use crate::receiver::{Receiver, ReceiverEvent, ReleasedDestination};
 use crate::send_endpoints::SendChannelEndpoints;
 use crate::sender::Sender;
+use crate::sender::SenderProxy;
 use crate::system_counters::{self, SystemCounterError, SystemCounters};
 use crate::udp_channel::{
     IPC_PREFIX, UdpChannelError, Unresolved, is_spy_channel, validate_destination_prefix,
@@ -595,27 +601,39 @@ pub struct Conductor {
     /// comes from the CnC file per call, like the counters.
     error_log: DistinctErrorLog,
     clients: Clients,
-    /// The publications this driver owns, and the thread that maps their log
-    /// buffers.
+    /// The end every manager asks the native resource agent through — the
+    /// driver's **one** agent, which creates log buffers, parses channels and
+    /// resolves names. The reference has one too, driven from its conductor's
+    /// duty cycle (`aeron_driver_conductor.c:4042-4067`).
+    agent_handle: AgentHandle,
+    /// What that agent has finished, raised or failed: this is where its
+    /// completions are taken off and routed.
+    agent_queues: AgentQueues,
+    /// The three agents' own work, which the conductor does **not** run: who
+    /// runs them is `aeron.threading.mode`'s to decide, so a driver takes them
+    /// with [`Conductor::take_agents`] before it starts anything.
+    agents: Option<AgentStates>,
+    /// The threads those agents were put on, when they were: the driver that
+    /// started them is the one that waits for them.
+    agent_threads: Option<Vec<std::thread::JoinHandle<()>>>,
+    /// The publications this driver owns.
     publications: IpcPublications,
     /// The subscriptions reading them.
     subscriptions: IpcSubscriptions,
     /// The send endpoints a network publication shares, one per canonical
     /// channel (`aeron_driver_conductor.c:1961-2030`).
     send_endpoints: SendChannelEndpoints,
-    /// The publications that send over UDP, and the thread that maps their log
-    /// buffers.
+    /// The publications that send over UDP.
     network_publications: NetworkPublications,
-    /// The sender thread, whose proxy is how anything reaches it.
-    sender: Sender,
+    /// How anything reaches the sender, whose work the driver runs.
+    sender: SenderProxy,
     /// The receive endpoints a subscription listens on, one per canonical
     /// channel (`aeron_driver_conductor.c:2046-2115`).
     receive_endpoints: ReceiveChannelEndpoints,
-    /// The images built from datagrams, and the thread that maps their log
-    /// buffers.
+    /// The images built from datagrams.
     images: PublicationImages,
-    /// The receiver thread.
-    receiver: Receiver,
+    /// How anything reaches the receiver, whose work the driver runs.
+    receiver: ReceiverProxy,
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
@@ -695,6 +713,28 @@ impl Conductor {
     /// [`ConductorError`] if the file cannot hold the counters, the rings are
     /// not rings, or the file cannot be published.
     pub fn new(cnc: CncFile, config: &DriverConfig) -> Result<Self, ConductorError> {
+        let mut conductor = Self::without_agents(cnc, config)?;
+        conductor.start_agents().map_err(ConductorError::Agent)?;
+
+        Ok(conductor)
+    }
+
+    /// The same, **without** starting anything: the caller takes the agents
+    /// ([`Conductor::take_agents`]) and decides who runs them.
+    ///
+    /// That decision is `aeron.threading.mode`'s (`aeron_driver.c:1003-1122`) —
+    /// one thread each, one for the network pair, one for everything, or none
+    /// at all — so a driver that reads the setting builds its conductor here
+    /// and places the work itself.
+    ///
+    /// # Errors
+    ///
+    /// [`ConductorError`] if the file cannot hold the counters, the rings are
+    /// not rings, or the file cannot be published.
+    pub(crate) fn without_agents(
+        cnc: CncFile,
+        config: &DriverConfig,
+    ) -> Result<Self, ConductorError> {
         let commands = {
             let region = cnc
                 .to_driver_region()
@@ -800,19 +840,34 @@ impl Conductor {
             .and_then(|region| commands.consume_position(&region))
             .unwrap_or(0);
 
-        // The agent thread comes up before the CnC file is published: a driver
-        // that cannot create log buffers is a driver that must not claim to be
-        // ready.
+        // The driver's **one** native resource agent. Every manager below asks
+        // it for its log buffers through a handle, and this is where its
+        // completions are taken and routed — the reference has one agent for
+        // the whole driver as well (`aeron_driver_native_resource_agent.c`), and
+        // its conductor drives it (`aeron_driver_conductor.c:4042-4067`).
+        //
+        // Its thread is **not** started here any more: the three agents go to
+        // whoever runs them, and the caller decides that. The reference draws
+        // the same line — `aeron_driver_create` signals the CnC ready
+        // (`aeron_driver.c:972`) and `aeron_driver_start` starts the runners
+        // (`:1206`) — so a client may see a ready file a moment before the work
+        // behind it is running, which is a window both drivers have.
+        let crate::native_resource_agent::AgentParts {
+            handle: agent_handle,
+            queues: agent_queues,
+            state: agent_state,
+        } = NativeResourceAgent::split(StorageChecks::new(
+            config.perform_storage_checks,
+            config.low_file_store_warning_threshold,
+            config.aeron_dir.clone(),
+        ))
+        .map_err(ConductorError::Agent)?;
+
         let publications = IpcPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
-            StorageChecks::new(
-                config.perform_storage_checks,
-                config.low_file_store_warning_threshold,
-                config.aeron_dir.clone(),
-            ),
-        )
-        .map_err(ConductorError::Agent)?;
+            agent_handle.clone(),
+        );
 
         // The network side: the sender thread first, because the publications
         // manager hands it what it creates, then the manager itself (which is
@@ -840,7 +895,7 @@ impl Conductor {
 
         // The resolver goes over now, because it needs the file and the file
         // could not be shared until the publication above had it mutably.
-        publications
+        agent_handle
             .attach_resolver(crate::native_resource_agent::AgentResolver::new(
                 resolver,
                 Arc::clone(&cnc),
@@ -850,7 +905,7 @@ impl Conductor {
             ))
             .map_err(ConductorError::Agent)?;
 
-        let sender = Sender::start(
+        let sender = Sender::split(
             Arc::clone(&cnc),
             // The counters region's length is what fixes a counter id's meaning
             // on both sides of the handover.
@@ -860,24 +915,21 @@ impl Conductor {
             system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
             config.publication_linger_timeout_ns,
             config.re_resolution_check_interval_ns,
+            config.status_message_timeout_ns,
+            config.send_to_sm_poll_ratio,
         )
         .map_err(ConductorError::Sender)?;
 
         let network_publications = NetworkPublications::start(
             config.publication_reserved_session_id_low,
             config.publication_reserved_session_id_high,
-            StorageChecks::new(
-                config.perform_storage_checks,
-                config.low_file_store_warning_threshold,
-                config.aeron_dir.clone(),
-            ),
-        )
-        .map_err(ConductorError::Agent)?;
+            agent_handle.clone(),
+        );
 
         // The receive side: the receiver thread first (it owns the sockets and
         // the images), then the images manager, which is the other agent thread
         // — the one that maps an *image's* log buffer.
-        let receiver = Receiver::start(
+        let receiver = Receiver::split(
             Arc::clone(&cnc),
             cnc.layout().counters_values.len(),
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
@@ -889,12 +941,7 @@ impl Conductor {
         )
         .map_err(ConductorError::Sender)?;
 
-        let images = PublicationImages::start(StorageChecks::new(
-            config.perform_storage_checks,
-            config.low_file_store_warning_threshold,
-            config.aeron_dir.clone(),
-        ))
-        .map_err(ConductorError::Agent)?;
+        let images = PublicationImages::start(agent_handle.clone());
 
         let conductor = Self {
             config: config.clone(),
@@ -908,6 +955,14 @@ impl Conductor {
             resumed_destination: None,
             error_log: DistinctErrorLog::new(),
             clients: Clients::new(),
+            agent_handle,
+            agent_queues,
+            agent_threads: None,
+            agents: Some(AgentStates {
+                sender: sender.agent,
+                receiver: receiver.agent,
+                native_resource_agent: agent_state,
+            }),
             publications,
             subscriptions: IpcSubscriptions::new(),
             send_endpoints: {
@@ -926,7 +981,7 @@ impl Conductor {
                 endpoints
             },
             network_publications,
-            sender,
+            sender: sender.proxy,
             receive_endpoints: {
                 // The receiver's range, set once at start-up beside the
                 // sender's (`aeron_wildcard_port_manager_set_range`, called
@@ -936,7 +991,7 @@ impl Conductor {
                 endpoints
             },
             images,
-            receiver,
+            receiver: receiver.proxy,
             termination: config.termination,
             timer_interval_ns: config.timer_interval_ns,
             liveness_timeout_ns: config.client_liveness_timeout_ns,
@@ -1000,6 +1055,10 @@ impl Conductor {
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
 
+        // Off the one agent and into the manager that asked, before any of them
+        // is polled this pass.
+        self.route_agent_completions();
+
         let work = work_count
             + self.process_commands(now_ns)
             + self.poll_publications()
@@ -1015,6 +1074,65 @@ impl Conductor {
         self.record_agent_faults();
         self.flush_broadcast_failures();
         work + self.re_resolve_endpoints() + self.re_resolve_controls()
+    }
+
+    /// Run the driver's agents on threads of their own — the shape
+    /// `DEDICATED` has, and the one this build has always had.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] if a thread cannot be started.
+    pub fn start_agents(&mut self) -> std::io::Result<()> {
+        let Some(states) = self.agents.take() else {
+            return Ok(());
+        };
+
+        let mut threads = Vec::new();
+
+        match crate::driver::spawn_dedicated(states, &self.config, &mut threads) {
+            Ok(()) => {
+                self.agent_threads = Some(threads);
+                Ok(())
+            }
+            // Some of them did start, and a `std::thread` nobody stops runs for
+            // ever: ask each end to send its `Stop` before this gives up, and
+            // wait for the ones that are there.
+            Err(error) => {
+                let _ = self.sender.stop();
+                let _ = self.receiver.stop();
+                let _ = self.agent_handle.stop();
+
+                for thread in threads {
+                    let _ = thread.join();
+                }
+
+                Err(error)
+            }
+        }
+    }
+
+    /// Give up the three agents, for a caller that will place them itself.
+    ///
+    /// That is `aeron.threading.mode`'s decision and not the conductor's, so a
+    /// driver takes them here before it starts anything (`aeron_driver.c:1003-1122`
+    /// is the placement, `aeron_driver_init` above it is this).
+    pub(crate) fn take_agents(&mut self) -> Option<AgentStates> {
+        self.agents.take()
+    }
+
+    /// Wait for them, **after** [`Conductor::close`] has asked them to stop:
+    /// every log buffer close handed back was handed back *through* the agent,
+    /// and a free sent to an agent that has already gone is a file nobody
+    /// removes.
+    ///
+    /// A driver that never started them — an embedded one, or a mode that
+    /// shares a thread — has nothing to wait for.
+    pub fn join_agents(&mut self) {
+        if let Some(threads) = self.agent_threads.take() {
+            for thread in threads {
+                let _ = thread.join();
+            }
+        }
     }
 
     /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
@@ -1035,14 +1153,51 @@ impl Conductor {
             .update_limits(&mut self.counters, &counter_regions)
     }
 
-    /// Take the native resource agent's completions: this is where a
-    /// publication whose log buffer was still being created becomes one, and
-    /// where its client is answered.
+    /// Take the native resource agent's completions — **all** of them, once —
+    /// and hand each to the manager that asked for it.
     ///
-    /// The reference polls its agent from the same duty cycle
-    /// (`aeron_driver_conductor.c:4042-4067` calls it from `do_work`'s main
-    /// sequence), and for the same reason: the create has to happen on the
-    /// conductor's thread, where the command ring and the counters are.
+    /// The reference drives one agent from its conductor's duty cycle
+    /// (`aeron_driver_conductor.c:4042-4067`), which is the shape this is: the
+    /// agent is the driver's, so nobody else drains it. Which manager a
+    /// completion belongs to is the **path** it names — the create was asked
+    /// for with that path, and the asking manager's pending list still has it.
+    ///
+    /// A `Freed` names a path that belongs to nobody: the mapping is already
+    /// gone and it left `pending` when the publication was created, so it is
+    /// dropped. A `Mapped` nobody claims cannot happen — the agent answers
+    /// requests and nothing else — and its mapping is released rather than
+    /// leaked, which is what a manager used to do for the same case.
+    ///
+    /// Nothing is counted as this pass's work: each manager counts the
+    /// completions it is handed, as it counted them when it drained the agent
+    /// itself.
+    fn route_agent_completions(&mut self) {
+        for completion in self.agent_queues.poll() {
+            let completion = match self.publications.receive_completion(completion) {
+                None => continue,
+                Some(completion) => completion,
+            };
+            let completion = match self.network_publications.receive_completion(completion) {
+                None => continue,
+                Some(completion) => completion,
+            };
+            let completion = match self.images.receive_completion(completion) {
+                None => continue,
+                Some(completion) => completion,
+            };
+
+            if let Completion::Mapped { log, .. } = completion {
+                let _ = self.agent_handle.free_log_buffer(*log);
+            }
+        }
+    }
+
+    /// Take what the publications managers made of those completions: this is
+    /// where a publication whose log buffer was still being created becomes
+    /// one, and where its client is answered.
+    ///
+    /// The create has to happen on the conductor's thread, where the command
+    /// ring and the counters are.
     fn poll_publications(&mut self) -> usize {
         // The order matters and is left to right: the events are taken off the
         // sender first, and what was taken is what the flushes send.
@@ -1093,8 +1248,8 @@ impl Conductor {
             &counter_regions,
             &mut self.clients,
             &mut self.subscriptions,
-            self.sender.proxy(),
-            self.receiver.proxy(),
+            &self.sender,
+            &self.receiver,
             now,
             &mut transmit,
         );
@@ -1114,7 +1269,7 @@ impl Conductor {
     /// registration id, asks the agent for a log buffer off-thread, and the
     /// image is built when the buffer lands (`poll_images`).
     fn poll_receiver(&mut self, now_ns: i64) -> usize {
-        let events = self.receiver.proxy().poll();
+        let events = self.receiver.poll();
         let mut work = 0;
 
         for event in events {
@@ -1518,7 +1673,7 @@ impl Conductor {
             // has readers, and the release waits for that
             // (`aeron_driver_conductor.c:1220-1241`, which drops the links and
             // lets the publication's own `DECREF` do the rest).
-            let _ = self.sender.proxy().end_publication(registration_id);
+            let _ = self.sender.end_publication(registration_id);
             self.awaiting_drain.insert(registration_id);
 
             released += 1;
@@ -1643,7 +1798,7 @@ impl Conductor {
             return 0;
         };
 
-        let _ = self.receiver.proxy().remove_image(registration_id);
+        let _ = self.receiver.remove_image(registration_id);
 
         // A reader that has not been told yet is told now: the normal path has
         // already said so as the image left DRAINING (`:1642-1675`), and a
@@ -1662,7 +1817,7 @@ impl Conductor {
                 &mut self.counters,
                 &region,
                 &mut self.receive_endpoints,
-                self.receiver.proxy(),
+                &self.receiver,
             );
         }
 
@@ -1712,7 +1867,6 @@ impl Conductor {
             client_liveness_timeout_ns: self.liveness_timeout_ns,
         };
 
-        let mut warnings = Vec::new();
         let mut transmit = Transmit {
             transmitter: &mut self.transmitter,
             region: &event_region,
@@ -1725,9 +1879,8 @@ impl Conductor {
             &mut self.counters,
             &counter_regions,
             &mut self.receive_endpoints,
-            self.receiver.proxy(),
+            &self.receiver,
             now,
-            &mut warnings,
             // The same sink the receiver's own faults go into
             // (`Transmit::faults`), which is where a create that failed
             // belongs: there is no client waiting on an image's correlation
@@ -1750,7 +1903,7 @@ impl Conductor {
                     &mut self.images,
                     &mut self.counters,
                     &counter_regions,
-                    self.receiver.proxy(),
+                    &self.receiver,
                     now,
                     &mut transmit,
                 )
@@ -1765,21 +1918,12 @@ impl Conductor {
             }
         }
 
-        for warning in warnings {
-            // The words are the reference's own shape for a low-space warning
-            // (`aeron_driver_context_run_storage_checks`), recorded where every
-            // other fault this pass noticed is.
-            transmit.record_fault(
-                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
-                format!(
-                    "usable fs space of {} bytes is below the {} byte threshold for {}",
-                    warning.usable,
-                    warning.threshold,
-                    warning.dir.display()
-                ),
-            );
-        }
-
+        // A low-space warning an image's create raised is not recorded here any
+        // more: with one agent they all reach `record_storage_warnings`, which
+        // is where the reference puts them — its own words, under
+        // `-STORAGE_SPACE` (`aeron_driver_context.c:1368-1377`). This block used
+        // to say the same thing as a `GENERIC_ERROR` fault, because an image's
+        // warning had no other way out of its manager.
         created.len()
     }
 
@@ -1793,7 +1937,7 @@ impl Conductor {
     /// keeps every writer of that log on one thread, which is why the fault
     /// travels here first.
     fn poll_sender_events(&mut self) -> usize {
-        let events = self.sender.proxy().poll();
+        let events = self.sender.poll();
         let mut work = 0;
 
         for event in events {
@@ -1832,7 +1976,7 @@ impl Conductor {
                     if let Some((error_code, description)) = self.subscriptions.on_response_setup(
                         response_correlation_id,
                         response_session_id,
-                        self.receiver.proxy(),
+                        &self.receiver,
                     ) {
                         self.pending_log_errors.push((error_code, description));
                     }
@@ -1854,7 +1998,7 @@ impl Conductor {
                     // different id space from an image's, so an id that names
                     // both would clear the wrong image's session.
                     if self.images.find(response_correlation_id).is_some() {
-                        let _ = self.receiver.proxy().set_response_session_id(
+                        let _ = self.receiver.set_response_session_id(
                             response_correlation_id,
                             crate::publication_image::RESPONSE_NULL_SESSION_ID,
                         );
@@ -2017,15 +2161,22 @@ impl Conductor {
         // buffers, and a log buffer unmapped while a sender is reading it is
         // the one failure mode this ordering exists to prevent — then the
         // publications' own bookkeeping.
-        let _ = self.sender.close();
+        let _ = self.sender.stop();
         let _ = self.network_publications.close();
         // And the receive side, in the same order and for the same reason: the
         // thread that owns the sockets and the log buffers goes first.
-        let _ = self.receiver.close();
+        let _ = self.receiver.stop();
         self.images.close();
         // The subscriptions own no counters: a reader's `sub-pos` is in the
         // publication's set, and the line above has already given it back.
         self.subscriptions.close();
+
+        // And the agent itself, last: every log buffer above was handed back
+        // through it, and a free sent to an agent that has already stopped is a
+        // log file nobody removes. This asks it to stop; **waiting** for it is
+        // the driver's, because the thread it is on is not the conductor's to
+        // join.
+        let _ = self.agent_handle.stop();
 
         let released = self
             .system_counters
@@ -2146,10 +2297,10 @@ impl Conductor {
                     parsed.channel,
                     &mut self.clients,
                     &mut self.send_endpoints,
-                    self.sender.proxy(),
+                    &self.sender,
                     &self.subscriptions,
                     &self.images,
-                    self.receiver.proxy(),
+                    &self.receiver,
                     now,
                     &mut transmit,
                 );
@@ -2192,7 +2343,7 @@ impl Conductor {
                     &mut self.clients,
                     &mut self.receive_endpoints,
                     &mut self.images,
-                    self.receiver.proxy(),
+                    &self.receiver,
                     now,
                     &mut transmit,
                 );
@@ -2333,7 +2484,7 @@ impl Conductor {
         // The agent's handle, taken before the manager is borrowed below:
         // everything that needs a channel parsed or a name resolved goes
         // through it, and a parked command carries what it was given.
-        let agent = self.publications.agent_handle();
+        let agent = self.agent_handle.clone();
         let parked_command = &mut self.parked_command;
         let agent_parsed_channel = &mut self.agent_parsed_channel;
         let config = &self.config;
@@ -2549,7 +2700,7 @@ impl Conductor {
 
                                     if network_publications.find(registration_id).is_some() {
                                         let _ =
-                                            sender.proxy().revoke_publication(registration_id);
+                                            sender.revoke_publication(registration_id);
 
                                         self.awaiting_drain.insert(registration_id);
                                         is_draining = true;
@@ -2584,7 +2735,6 @@ impl Conductor {
                                     // channel can be published on again
                                     // immediately.
                                     let _ = sender
-                                        .proxy()
                                         .end_publication(link.publication_registration_id);
 
                                     self.awaiting_drain
@@ -2632,8 +2782,8 @@ impl Conductor {
                                 &counter_regions,
                                 publications,
                                 receive_endpoints,
-                                Some(receiver.proxy()),
-                                sender.proxy(),
+                                Some(receiver),
+                                sender,
                                 now_ms,
                             );
 
@@ -2682,7 +2832,7 @@ impl Conductor {
                                 &counter_regions,
                                 clients,
                                 network_publications,
-                                sender.proxy(),
+                                sender,
                                 now,
                                 &mut transmit,
                             )
@@ -2892,7 +3042,6 @@ impl Conductor {
                             // `aeron_driver_receiver_proxy.c:252-274`).
                             let _ =
                                 receiver
-                                    .proxy()
                                     .invalidate_image(image_correlation_id, request.reason.to_vec());
 
                             true
@@ -3141,7 +3290,7 @@ impl Conductor {
 
         for registration_id in pending_publication_releases {
             if let Some(record) = network_publications.remove(registration_id) {
-                let _ = sender.proxy().remove_publication(registration_id);
+                let _ = sender.remove_publication(registration_id);
 
                 // The spies first, and for the same reason the other release
                 // path gives: a client told its image is gone stops advancing
@@ -3173,7 +3322,7 @@ impl Conductor {
         }
 
         for id in to_try {
-            try_remove_send_endpoint(&mut self.send_endpoints, sender.proxy(), id);
+            try_remove_send_endpoint(&mut self.send_endpoints, sender, id);
         }
 
         // The destination commands.
@@ -3274,7 +3423,7 @@ impl Conductor {
                             &counter_regions,
                             receive_endpoints,
                             network_publications,
-                            sender.proxy(),
+                            sender,
                             now,
                             &mut transmit,
                         );
@@ -3292,7 +3441,7 @@ impl Conductor {
                         request.channel,
                         counters,
                         &counter_regions,
-                        sender.proxy(),
+                        sender,
                         now_ms,
                         &mut transmit,
                     ) {
@@ -3413,18 +3562,14 @@ impl Conductor {
                         }
                     };
 
-                    let _ = receiver
-                        .proxy()
-                        .add_destination(endpoint_id, Box::new(destination));
+                    let _ = receiver.add_destination(endpoint_id, Box::new(destination));
                     // The endpoint's destination list is on the receiver's
                     // thread; the agreement check that reads it is here, so
                     // the count is kept here too (`aeron_driver_conductor.c:2184`
                     // asks `1 == endpoint->destinations.length`).
                     receive_endpoints.attach_destination(endpoint_id);
                 } else {
-                    let _ = receiver
-                        .proxy()
-                        .remove_destination(endpoint_id, Box::new(channel));
+                    let _ = receiver.remove_destination(endpoint_id, Box::new(channel));
                     receive_endpoints.detach_destination(endpoint_id);
                 }
 
@@ -3443,7 +3588,7 @@ impl Conductor {
                     continue;
                 };
 
-                let _ = sender.proxy().remove_destination_by_id(
+                let _ = sender.remove_destination_by_id(
                     record.endpoint_id,
                     request.destination_registration_id,
                 );
@@ -3499,7 +3644,7 @@ impl Conductor {
 
             let registration_id = request.correlation_id;
             let outcome = if Command::AddDestination == command {
-                sender.proxy().add_destination(
+                sender.add_destination(
                     record.endpoint_id,
                     Box::new(channel),
                     address,
@@ -3510,9 +3655,7 @@ impl Conductor {
                 // that identifies one is the one it was added with — so the
                 // address is what the tracker matches on (`:311-350`).
                 address.map_or(Ok(()), |address| {
-                    sender
-                        .proxy()
-                        .remove_destination(record.endpoint_id, address)
+                    sender.remove_destination(record.endpoint_id, address)
                 })
             };
 
@@ -3669,8 +3812,8 @@ impl Conductor {
             &mut self.publications,
             &mut self.subscriptions,
             &mut self.receive_endpoints,
-            Some(self.receiver.proxy()),
-            self.sender.proxy(),
+            Some(&self.receiver),
+            &self.sender,
         );
 
         self.release_orphaned_network_publications() + reaped
@@ -3787,13 +3930,17 @@ impl Conductor {
     /// is the conductor here, so they are handed over the way the storage
     /// warnings already are — and the difference is invisible in the file.
     fn record_agent_faults(&mut self) {
-        for fault in self.publications.agent().poll_faults() {
+        for fault in self.agent_queues.poll_faults() {
             self.record_distinct(fault.error_code, &fault.description);
         }
     }
 
+    /// Every warning the one agent raised, whichever manager it was creating
+    /// for. Before there was one agent this drained the IPC manager's only,
+    /// because the resolver lived on that one — so a warning from an image or a
+    /// network publication's create had nobody to read it.
     fn record_storage_warnings(&mut self) {
-        for warning in self.publications.poll_storage_warnings() {
+        for warning in self.agent_queues.poll_warnings() {
             #[allow(clippy::cast_possible_wrap)] // printed as the reference prints it
             let message = format!(
                 "WARNING: space is running low: threshold={} usable={} in {}",
@@ -3919,7 +4066,7 @@ impl Conductor {
         // One at a time, like the reference's single driver-command slot
         // (`aeron_driver_conductor.c:3327-3341`): the head is asked for, and
         // the next one waits until its answer is in.
-        let agent = self.publications.agent_handle();
+        let agent = self.agent_handle.clone();
         let mut entry = self.pending_re_resolutions.remove(0);
 
         if entry.answer.is_none() {
@@ -3947,7 +4094,6 @@ impl Conductor {
                 Ok(address) if Some(address) != existing => {
                     if self
                         .sender
-                        .proxy()
                         .resolution_change(endpoint_id, endpoint_name, address)
                         .is_ok()
                     {
@@ -4003,7 +4149,7 @@ impl Conductor {
         }
 
         // One at a time, as above.
-        let agent = self.publications.agent_handle();
+        let agent = self.agent_handle.clone();
         let mut entry = self.pending_control_re_resolutions.remove(0);
 
         if entry.answer.is_none() {
@@ -4031,7 +4177,6 @@ impl Conductor {
                 Ok(address) if address != existing => {
                     if self
                         .receiver
-                        .proxy()
                         .resolution_change(endpoint_id, destination, address)
                         .is_ok()
                     {
@@ -8313,6 +8458,7 @@ mod tests {
 
             let thread = std::thread::spawn(move || {
                 let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+                conductor.start_agents().expect("the agent threads");
 
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) && conductor.is_running() {
                     conductor.do_work();
@@ -8323,6 +8469,7 @@ mod tests {
                 // reads as "the driver meant to go" rather than letting its
                 // heartbeat go stale.
                 let _ = conductor.close();
+                conductor.join_agents();
             });
 
             Self {

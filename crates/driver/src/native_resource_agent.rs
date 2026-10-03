@@ -49,10 +49,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use crate::driver::Role;
+
 use deepmsg_cnc::{CncFile, CounterManager};
 use deepmsg_core::logbuffer::logfile::LogFile;
 
-use crate::idle::Backoff;
 use crate::name_resolver::Resolver;
 use crate::udp_channel::{UdpChannel, UdpChannelError, Unresolved};
 
@@ -312,13 +313,66 @@ pub struct AgentFault {
     pub description: String,
 }
 
-/// The agent thread and the ends of the conversation.
-pub struct NativeResourceAgent {
-    requests: Sender<Request>,
+/// The native resource agent in three pieces, before any of them has a thread.
+pub(crate) struct AgentParts {
+    /// The end every manager asks through.
+    pub handle: AgentHandle,
+    /// What the conductor reads.
+    pub queues: AgentQueues,
+    /// The work, which a runner drives one pass at a time.
+    pub state: AgentLoop,
+}
+
+/// The three queues the conductor drains.
+///
+/// They are the agent's own ends, held apart from its work so that a manager
+/// can hand the work to a runner without giving up the answers it reads.
+pub(crate) struct AgentQueues {
     completions: Receiver<Completion>,
     warnings: Receiver<StorageWarning>,
     faults: Receiver<AgentFault>,
+}
+
+/// The agent thread and the ends of the conversation.
+pub struct NativeResourceAgent {
+    requests: Sender<Request>,
+    queues: AgentQueues,
     thread: Option<JoinHandle<()>>,
+}
+
+impl AgentQueues {
+    /// Everything the agent finished since the last call.
+    pub fn poll(&self) -> Vec<Completion> {
+        let mut done = Vec::new();
+
+        while let Ok(completion) = self.completions.try_recv() {
+            done.push(completion);
+        }
+
+        done
+    }
+
+    /// Every storage warning raised since the last call.
+    pub fn poll_warnings(&self) -> Vec<StorageWarning> {
+        let mut raised = Vec::new();
+
+        while let Ok(warning) = self.warnings.try_recv() {
+            raised.push(warning);
+        }
+
+        raised
+    }
+
+    /// Everything the agent could not do since the last call.
+    pub fn poll_faults(&self) -> Vec<AgentFault> {
+        let mut faults = Vec::new();
+
+        while let Ok(fault) = self.faults.try_recv() {
+            faults.push(fault);
+        }
+
+        faults
+    }
 }
 
 impl NativeResourceAgent {
@@ -329,23 +383,49 @@ impl NativeResourceAgent {
     ///
     /// [`io::Error`] if the thread cannot be spawned.
     pub fn start(checks: StorageChecks) -> io::Result<Self> {
+        let AgentParts {
+            handle,
+            queues,
+            state,
+        } = Self::split(checks)?;
+
+        let thread = crate::driver::run_agent(
+            Role::NativeResourceAgent.classic_name(),
+            state,
+            crate::driver::default_strategy(),
+        )?;
+
+        Ok(Self {
+            requests: handle.requests,
+            queues,
+            thread: Some(thread),
+        })
+    }
+
+    /// The three pieces this is made of, **without** a thread: the handle every
+    /// manager asks through, the queues the conductor drains, and the work a
+    /// runner drives.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the channels cannot be made, which is a failure of the
+    /// process rather than of a setting.
+    pub(crate) fn split(checks: StorageChecks) -> io::Result<AgentParts> {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
         let (warning_tx, warning_rx) = mpsc::channel::<StorageWarning>();
         let (fault_tx, fault_rx) = mpsc::channel::<AgentFault>();
 
-        let thread = std::thread::Builder::new()
-            .name("deepmsg-native-resource-agent".to_string())
-            .spawn(move || {
-                Self::run(&request_rx, &completion_tx, &warning_tx, &fault_tx, &checks);
-            })?;
-
-        Ok(Self {
-            requests: request_tx,
-            completions: completion_rx,
-            warnings: warning_rx,
-            faults: fault_rx,
-            thread: Some(thread),
+        Ok(AgentParts {
+            handle: AgentHandle {
+                requests: request_tx,
+            },
+            queues: AgentQueues {
+                completions: completion_rx,
+                warnings: warning_rx,
+                faults: fault_rx,
+            },
+            state: AgentLoop::new(checks, request_rx, completion_tx, warning_tx, fault_tx),
         })
     }
 
@@ -353,11 +433,9 @@ impl NativeResourceAgent {
     /// from then on.
     ///
     /// The reference has **one** native resource agent and the resolver lives
-    /// on it (`aeron_driver_native_resource_agent.c:224-270`); this build has
-    /// three, one per kind of log buffer, and the resolver goes on the first —
-    /// the one this file's own comments call *the* agent thread, and the
-    /// descendant of the reference's. Collapsing the three into one is G4-1's
-    /// business, and this is where the resolver will already be.
+    /// on it (`aeron_driver_native_resource_agent.c:224-270`), and so does this
+    /// build: the three that were one per kind of log buffer were collapsed
+    /// into this one, and the resolver came with them.
     ///
     /// # Errors
     ///
@@ -457,13 +535,7 @@ impl NativeResourceAgent {
     /// Everything the agent could not do since the last call, for the
     /// conductor's error log.
     pub fn poll_faults(&self) -> Vec<AgentFault> {
-        let mut raised = Vec::new();
-
-        while let Ok(fault) = self.faults.try_recv() {
-            raised.push(fault);
-        }
-
-        raised
+        self.queues.poll_faults()
     }
 }
 
@@ -509,13 +581,7 @@ impl NativeResourceAgent {
 
     /// Everything the agent finished since the last call.
     pub fn poll(&self) -> Vec<Completion> {
-        let mut done = Vec::new();
-
-        while let Ok(completion) = self.completions.try_recv() {
-            done.push(completion);
-        }
-
-        done
+        self.queues.poll()
     }
 
     /// Every storage warning raised since the last call — filesystems that
@@ -524,13 +590,7 @@ impl NativeResourceAgent {
     /// create they accompanied went ahead, and the warning is for the
     /// driver's error log.
     pub fn poll_warnings(&self) -> Vec<StorageWarning> {
-        let mut raised = Vec::new();
-
-        while let Ok(warning) = self.warnings.try_recv() {
-            raised.push(warning);
-        }
-
-        raised
+        self.queues.poll_warnings()
     }
 
     /// Stop the thread and wait for it.
@@ -552,27 +612,78 @@ impl NativeResourceAgent {
             let _ = thread.join();
         }
     }
+}
 
-    /// The agent's own loop.
-    fn run(
-        requests: &Receiver<Request>,
-        completions: &Sender<Completion>,
-        warnings: &Sender<StorageWarning>,
-        faults: &Sender<AgentFault>,
-        checks: &StorageChecks,
-    ) {
-        // The resolver arrives with the CnC file, once the driver has published
-        // it, and so does the counters view this thread resolves through: an
-        // allocator view of its own over the conductor's regions, which is how
-        // the sender and the receiver already hold theirs. Safe because **only
-        // the conductor allocates** — this view only has to agree about where
-        // an id's value lives, and it never hands one out.
-        let mut resolver: Option<AgentResolver> = None;
-        let mut counters: Option<CounterManager> = None;
+/// One pass of the agent, for the runner that drives it — and the close that
+/// lets the resolver go with the thread that ran it.
+impl crate::driver::Agent for AgentLoop {
+    fn do_work(&mut self) -> Option<usize> {
+        Self::do_work(self)
+    }
 
-        let mut backoff = Backoff::new();
+    fn close(&mut self) {
+        Self::close(self);
+    }
+}
 
-        loop {
+/// What the agent owns **between passes**: the resolver it was handed and the
+/// allocator view it resolves through.
+///
+/// The reference keeps the same two things in its agent's own state
+/// (`aeron_driver_native_resource_agent_t`), and they are a struct here rather
+/// than the loop's locals so that the loop body can be driven a pass at a time.
+pub(crate) struct AgentLoop {
+    /// What the storage checks were built from, kept because every create asks
+    /// them again.
+    checks: StorageChecks,
+    /// The requests every manager sends through its [`AgentHandle`].
+    requests: Receiver<Request>,
+    /// The three queues the conductor drains.
+    completions: Sender<Completion>,
+    warnings: Sender<StorageWarning>,
+    faults: Sender<AgentFault>,
+    /// The resolver arrives with the CnC file, once the driver has published
+    /// it, and so does the counters view this thread resolves through: an
+    /// allocator view of its own over the conductor's regions, which is how the
+    /// sender and the receiver already hold theirs. Safe because **only the
+    /// conductor allocates** — this view only has to agree about where an id's
+    /// value lives, and it never hands one out.
+    resolver: Option<AgentResolver>,
+    counters: Option<CounterManager>,
+}
+
+impl AgentLoop {
+    /// The work, with the queues it reads and writes.
+    ///
+    /// It is a struct rather than a set of loop locals because a runner has to
+    /// be able to drive it: in `DEDICATED` that runner owns a thread of its
+    /// own, and in `SHARED` it is the thread the conductor, the sender and the
+    /// receiver are on.
+    const fn new(
+        checks: StorageChecks,
+        requests: Receiver<Request>,
+        completions: Sender<Completion>,
+        warnings: Sender<StorageWarning>,
+        faults: Sender<AgentFault>,
+    ) -> Self {
+        Self {
+            checks,
+            requests,
+            completions,
+            warnings,
+            faults,
+            resolver: None,
+            counters: None,
+        }
+    }
+
+    /// One pass: the resolver's duty cycle, then the requests that have arrived.
+    ///
+    /// `None` when a `Stop` came in — or when the handle that sends requests is
+    /// gone — which is the reference's `running` flag cleared. `Some(work)` is
+    /// what the idle strategy is given.
+    fn do_work(&mut self) -> Option<usize> {
+        {
             // The resolver's own clock, on this thread's duty cycle
             // (`aeron_driver_native_resource_agent.c:253-270`): a driver nobody
             // is talking to still has to answer when someone does, and its
@@ -580,7 +691,7 @@ impl NativeResourceAgent {
             let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
 
             let mut work = if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
-                (resolver.as_mut(), counters.as_ref())
+                (self.resolver.as_mut(), self.counters.as_ref())
             {
                 match cnc.counter_regions() {
                     Some(regions) => resolver.do_work(now_ms, counters, &regions),
@@ -592,18 +703,18 @@ impl NativeResourceAgent {
 
             let mut stopped = false;
             loop {
-                match requests.try_recv() {
+                match self.requests.try_recv() {
                     Ok(Request::Stop) => {
                         stopped = true;
                         break;
                     }
                     Ok(Request::AttachResolver(attached)) => {
                         work += 1;
-                        counters = CounterManager::new(
+                        self.counters = CounterManager::new(
                             attached.cnc.layout().counters_values.len(),
                             attached.free_to_reuse_timeout_ms,
                         );
-                        resolver = Some(attached);
+                        self.resolver = Some(attached);
 
                         // `start` runs **here**, on the agent, and that is the
                         // whole point of the move: it resolves the bootstrap
@@ -616,25 +727,18 @@ impl NativeResourceAgent {
                         // whose resolver is not the one it was configured with
                         // still resolves something.
                         if let (Some(agent), Some(counters)) =
-                            (resolver.as_mut(), counters.as_ref())
+                            (self.resolver.as_mut(), self.counters.as_ref())
                         {
                             if let Some(regions) = agent.cnc.counter_regions() {
                                 if let Err(what) = agent.resolver.start(counters, &regions) {
-                                    let _ = faults.send(resolver_start_fault(&what));
+                                    let _ = self.faults.send(resolver_start_fault(&what));
                                 }
                             }
                         }
                     }
                     Ok(request) => {
                         work += 1;
-                        if Self::dispatch(
-                            request,
-                            completions,
-                            warnings,
-                            checks,
-                            counters.as_mut(),
-                            resolver.as_mut(),
-                        ) {
+                        if self.dispatch(request) {
                             stopped = true;
                             break;
                         }
@@ -652,26 +756,28 @@ impl NativeResourceAgent {
             // `aeron_driver_name_resolver.c:718-723`): the reference's resolver
             // writes into that log directly, and this one hands the entries
             // over because the log is the conductor's.
-            if let Some(AgentResolver { resolver, .. }) = resolver.as_mut() {
+            if let Some(AgentResolver { resolver, .. }) = self.resolver.as_mut() {
                 for fault in resolver.take_faults() {
-                    let _ = faults.send(AgentFault {
+                    let _ = self.faults.send(AgentFault {
                         error_code: fault.error_code,
                         description: fault.description,
                     });
                 }
             }
 
-            backoff.idle(work);
-
             if stopped {
-                break;
+                return None;
             }
-        }
 
-        // The resolver goes with the thread that ran it, counters and all
-        // (`aeron_driver_name_resolver_close`, and `on_close` on the agent).
+            Some(work)
+        }
+    }
+
+    /// Let the resolver go, counters and all
+    /// (`aeron_driver_name_resolver_close`, and `on_close` on the agent).
+    fn close(&mut self) {
         if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
-            (resolver.as_mut(), counters.as_mut())
+            (self.resolver.as_mut(), self.counters.as_mut())
         {
             if let Some(regions) = cnc.counter_regions() {
                 let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
@@ -682,14 +788,11 @@ impl NativeResourceAgent {
 
     /// One request, on the agent's thread. `true` when the loop should stop,
     /// which is a completion the conductor can no longer receive.
-    fn dispatch(
-        request: Request,
-        completions: &Sender<Completion>,
-        warnings: &Sender<StorageWarning>,
-        checks: &StorageChecks,
-        counters: Option<&mut CounterManager>,
-        resolver: Option<&mut AgentResolver>,
-    ) -> bool {
+    fn dispatch(&mut self, request: Request) -> bool {
+        let checks = &self.checks;
+        let completions = &self.completions;
+        let warnings = &self.warnings;
+
         match request {
             Request::ParseChannel {
                 original_uri,
@@ -704,12 +807,12 @@ impl NativeResourceAgent {
                 //
                 // The delay is a test's, and it stands where a nameserver that
                 // does not answer would.
-                if let Some(AgentResolver { debug_delay, .. }) = resolver.as_ref() {
+                if let Some(AgentResolver { debug_delay, .. }) = self.resolver.as_ref() {
                     if !debug_delay.is_zero() {
                         std::thread::sleep(*debug_delay);
                     }
                 }
-                let parsed = match (resolver, counters) {
+                let parsed = match (self.resolver.as_mut(), self.counters.as_mut()) {
                     (
                         Some(AgentResolver {
                             resolver,
@@ -764,7 +867,7 @@ impl NativeResourceAgent {
                 uri_param_name,
                 result,
             } => {
-                let resolved = match (resolver, counters) {
+                let resolved = match (self.resolver.as_mut(), self.counters.as_mut()) {
                     (
                         Some(AgentResolver {
                             resolver,
@@ -893,7 +996,79 @@ pub struct AgentHandle {
     requests: Sender<Request>,
 }
 
+/// The queue, not the thread: a handle that is only printed is still a handle.
+impl std::fmt::Debug for AgentHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHandle").finish_non_exhaustive()
+    }
+}
+
 impl AgentHandle {
+    /// Hand the driver's resolver to the agent, which starts it and runs it
+    /// from then on.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub(crate) fn attach_resolver(&self, resolver: AgentResolver) -> io::Result<()> {
+        self.requests
+            .send(Request::AttachResolver(resolver))
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// Tell the agent to stop, without waiting for it.
+    ///
+    /// Waiting is the driver's: in `SHARED` the agent shares its thread with
+    /// the conductor, so the conductor cannot be the one to join it.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone already.
+    pub(crate) fn stop(&self) -> io::Result<()> {
+        self.requests
+            .send(Request::Stop)
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// Ask for a log buffer to be created and mapped, sparse or dense as
+    /// `is_sparse` says — the URI's `sparse=` resolved against the driver's
+    /// `term.buffer.sparse.file`.
+    ///
+    /// The answer is a [`Completion`] taken off the agent by the **conductor**
+    /// (it drains [`AgentQueues`]) and routed to the manager that asked.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub fn map_log_buffer(
+        &self,
+        path: &Path,
+        term_length: i32,
+        page_size: usize,
+        is_sparse: bool,
+    ) -> io::Result<()> {
+        self.requests
+            .send(Request::MapLogBuffer {
+                path: path.to_owned(),
+                term_length,
+                page_size,
+                is_sparse,
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// Hand a log buffer back to be unmapped and removed.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone — in which case the mapping is
+    /// dropped here, on the caller's thread, which is slower but correct.
+    pub fn free_log_buffer(&self, log: LogFile) -> io::Result<()> {
+        self.requests
+            .send(Request::FreeLogBuffer { log: Box::new(log) })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
     /// Ask for a channel to be parsed — every name in it through the resolver.
     ///
     /// # Errors
