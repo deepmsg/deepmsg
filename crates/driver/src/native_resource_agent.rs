@@ -893,7 +893,53 @@ pub struct AgentHandle {
     requests: Sender<Request>,
 }
 
+/// The queue, not the thread: a handle that is only printed is still a handle.
+impl std::fmt::Debug for AgentHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHandle").finish_non_exhaustive()
+    }
+}
+
 impl AgentHandle {
+    /// Ask for a log buffer to be created and mapped, sparse or dense as
+    /// `is_sparse` says — the URI's `sparse=` resolved against the driver's
+    /// `term.buffer.sparse.file`.
+    ///
+    /// The answer is a [`Completion`] taken off the agent by the **conductor**
+    /// ([`NativeResourceAgent::poll`]) and routed to the manager that asked.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub fn map_log_buffer(
+        &self,
+        path: &Path,
+        term_length: i32,
+        page_size: usize,
+        is_sparse: bool,
+    ) -> io::Result<()> {
+        self.requests
+            .send(Request::MapLogBuffer {
+                path: path.to_owned(),
+                term_length,
+                page_size,
+                is_sparse,
+            })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// Hand a log buffer back to be unmapped and removed.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone — in which case the mapping is
+    /// dropped here, on the caller's thread, which is slower but correct.
+    pub fn free_log_buffer(&self, log: LogFile) -> io::Result<()> {
+        self.requests
+            .send(Request::FreeLogBuffer { log: Box::new(log) })
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
     /// Ask for a channel to be parsed — every name in it through the resolver.
     ///
     /// # Errors

@@ -539,6 +539,58 @@ fn the_harness_shaped_terminate_command_stops_the_driver() {
     assert_eq!(0, fixture.stderr_len());
 }
 
+/// Every thread the process is running, by the name the kernel holds for it.
+///
+/// `/proc/<pid>/task/*/comm` is the only place a thread's name is visible from
+/// outside the process, and it is truncated to fifteen characters — which the
+/// reference's own role names (`conductor`, `sender`, `receiver`, `aeron-md-nra`)
+/// fit inside and this build's long ones do not.
+fn threads(pid: u32) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("the driver's own task directory")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            std::fs::read_to_string(entry.path().join("comm")).ok()
+        })
+        .map(|name| name.trim().to_owned())
+        .collect();
+
+    names.sort();
+    names
+}
+
+/// **One** native resource agent for the whole driver, not one per kind of log
+/// buffer.
+///
+/// A client cannot see which thread mapped its log buffer — they are all
+/// threads that map files — but the *count* is visible from outside, and it is
+/// what `docs/compat.md` used to record as a divergence ("Two native resource
+/// agents, not one") until this landed. The reference has a single agent and
+/// runs it as one of its four runners
+/// (`aeron-driver/src/main/c/aeron_driver.c:1038-1050`, the DEDICATED arm).
+#[test]
+fn the_driver_runs_one_native_resource_agent() {
+    let Some(fixture) = Fixture::start("one-native-resource-agent", &[]) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _ = fixture.await_cnc();
+
+    let names = threads(fixture.child.id());
+    let agents: Vec<&String> = names
+        .iter()
+        .filter(|name| name.starts_with("deepmsg-native"))
+        .collect();
+
+    assert_eq!(
+        1,
+        agents.len(),
+        "the driver runs one native resource agent, not one per kind of log \
+         buffer; its threads are {names:?}"
+    );
+}
+
 #[test]
 fn the_driver_stops_well_inside_the_harness_budget() {
     let Some(mut fixture) = Fixture::start("terminate-budget", READ) else {

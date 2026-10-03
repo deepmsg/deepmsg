@@ -25,7 +25,6 @@
 //! is sent to the client in `ON_AVAILABLE_IMAGE`. The registration id is
 //! therefore not an internal detail: it is in a file name a client maps.
 
-use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -34,7 +33,7 @@ use crate::ipc_subscriptions::SubscriptionLink;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::{AddError, Now};
-use crate::native_resource_agent::{Completion, NativeResourceAgent, StorageWarning};
+use crate::native_resource_agent::{AgentHandle, Completion};
 use crate::protocol::SetupFrame;
 use crate::publication_image::{ImageCounters, ImageState, PublicationImage};
 use crate::receiver::ReceiverProxy;
@@ -172,21 +171,49 @@ fn image_group_semantics(
 pub struct PublicationImages {
     images: Vec<PublicationImageRecord>,
     pending: Vec<PendingImage>,
-    agent: NativeResourceAgent,
+    /// The driver's one native resource agent, through which log buffers are
+    /// asked for. The **conductor** owns the agent and the thread behind it;
+    /// this is only the end that speaks to it.
+    agent: AgentHandle,
+    /// What the conductor took off the agent and routed here.
+    completed: Vec<Completion>,
 }
 
 impl PublicationImages {
-    /// Start the manager and the thread that maps log buffers.
-    ///
-    /// # Errors
-    ///
-    /// [`io::Error`] if the agent thread cannot be spawned.
-    pub fn start(storage: crate::native_resource_agent::StorageChecks) -> io::Result<Self> {
-        Ok(Self {
+    /// Start the manager, speaking to `agent` for its log buffers.
+    pub fn start(agent: AgentHandle) -> Self {
+        Self {
             images: Vec::new(),
             pending: Vec::new(),
-            agent: NativeResourceAgent::start(storage)?,
-        })
+            agent,
+            completed: Vec::new(),
+        }
+    }
+
+    /// Take a completion the **conductor** routed here, or hand it back.
+    ///
+    /// There is one agent for the whole driver and the conductor owns it, so
+    /// nothing here drains it: the conductor takes its completions once and
+    /// asks each manager in turn whose pending list names the path. `Some`
+    /// back means "not mine", and the conductor passes it to the next one.
+    ///
+    /// A `Freed` is nobody's: the mapping is already gone and the path left
+    /// `pending` when the image was created, so it is never claimed and the
+    /// conductor drops it.
+    pub fn receive_completion(&mut self, completion: Completion) -> Option<Completion> {
+        let mine = match &completion {
+            Completion::Mapped { path, .. } | Completion::MapFailed { path, .. } => {
+                self.pending.iter().any(|entry| entry.path == *path)
+            }
+            Completion::Freed { .. } => false,
+        };
+
+        if mine {
+            self.completed.push(completion);
+            None
+        } else {
+            Some(completion)
+        }
     }
 
     /// The images, in creation order.
@@ -399,13 +426,12 @@ impl PublicationImages {
         endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: &ReceiverProxy,
         now: Now,
-        storage_warnings: &mut Vec<StorageWarning>,
         faults: &mut Vec<(i32, String)>,
     ) -> Vec<i64> {
-        let completions = self.agent.poll();
+        // What the conductor routed here, not what the agent has: the agent is
+        // the driver's and the conductor drains it.
+        let completions = std::mem::take(&mut self.completed);
         let mut created = Vec::new();
-
-        storage_warnings.extend(self.agent.poll_warnings());
 
         for completion in completions {
             match completion {
@@ -675,15 +701,11 @@ impl PublicationImages {
         Some(self.images.swap_remove(index))
     }
 
-    /// Close everything: the agent's thread, and the images with it.
+    /// Let go of every image. The agent is the conductor's, so its thread is
+    /// not this manager's to stop.
     pub fn close(&mut self) {
         self.images.clear();
         self.pending.clear();
-    }
-
-    /// Every storage warning the agent raised since the last call.
-    pub fn poll_storage_warnings(&self) -> Vec<StorageWarning> {
-        self.agent.poll_warnings()
     }
 }
 

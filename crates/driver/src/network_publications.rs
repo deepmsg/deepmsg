@@ -45,7 +45,7 @@ use crate::config::DriverConfig;
 use crate::ipc_publication::ShareMismatch;
 use crate::ipc_publications::{AddError, Now, SessionIds};
 use crate::media::TransportParams;
-use crate::native_resource_agent::{NativeResourceAgent, StorageChecks};
+use crate::native_resource_agent::{AgentHandle, Completion};
 use crate::network_publication::{NetworkPublication, PublicationCounters};
 use crate::publication_images::PublicationImages;
 use crate::publication_params::{
@@ -177,26 +177,54 @@ pub struct NetworkPublications {
     publications: Vec<NetworkPublicationRecord>,
     pending: Vec<PendingNetworkPublication>,
     session_ids: SessionIds,
-    agent: NativeResourceAgent,
+    /// The driver's one native resource agent, through which log buffers are
+    /// asked for. The **conductor** owns the agent and the thread behind it;
+    /// this is only the end that speaks to it.
+    agent: AgentHandle,
+    /// What the conductor took off the agent and routed here.
+    completed: Vec<Completion>,
 }
 
 impl NetworkPublications {
-    /// Start the manager and the thread that maps log buffers.
-    ///
-    /// # Errors
-    ///
-    /// [`io::Error`] if the agent thread cannot be spawned.
+    /// Start the manager, speaking to `agent` for its log buffers.
     pub fn start(
         reserved_session_id_low: i32,
         reserved_session_id_high: i32,
-        storage: StorageChecks,
-    ) -> io::Result<Self> {
-        Ok(Self {
+        agent: AgentHandle,
+    ) -> Self {
+        Self {
             publications: Vec::new(),
             pending: Vec::new(),
             session_ids: SessionIds::start(reserved_session_id_low, reserved_session_id_high),
-            agent: NativeResourceAgent::start(storage)?,
-        })
+            agent,
+            completed: Vec::new(),
+        }
+    }
+
+    /// Take a completion the **conductor** routed here, or hand it back.
+    ///
+    /// There is one agent for the whole driver and the conductor owns it, so
+    /// nothing here drains it: the conductor takes its completions once and
+    /// asks each manager in turn whose pending list names the path. `Some`
+    /// back means "not mine", and the conductor passes it to the next one.
+    ///
+    /// A `Freed` is nobody's: the mapping is already gone and the path left
+    /// `pending` when the publication was created, so it is never claimed and
+    /// the conductor drops it.
+    pub fn receive_completion(&mut self, completion: Completion) -> Option<Completion> {
+        let mine = match &completion {
+            Completion::Mapped { path, .. } | Completion::MapFailed { path, .. } => {
+                self.pending.iter().any(|entry| entry.path == *path)
+            }
+            Completion::Freed { .. } => false,
+        };
+
+        if mine {
+            self.completed.push(completion);
+            None
+        } else {
+            Some(completion)
+        }
     }
 
     /// The publications, in the order they were created.
@@ -546,14 +574,16 @@ impl NetworkPublications {
         now: Now,
         events: &mut impl ClientEvents,
     ) -> usize {
-        let completions = self.agent.poll();
+        // What the conductor routed here, not what the agent has: the agent is
+        // the driver's and the conductor drains it.
+        let completions = std::mem::take(&mut self.completed);
         let mut work = 0;
 
         for completion in completions {
             work += 1;
 
             match completion {
-                crate::native_resource_agent::Completion::Mapped { path, log } => {
+                Completion::Mapped { path, log } => {
                     let Some(index) = self.pending.iter().position(|entry| entry.path == path)
                     else {
                         let _ = self.agent.free_log_buffer(*log);
@@ -574,7 +604,7 @@ impl NetworkPublications {
                         events,
                     );
                 }
-                crate::native_resource_agent::Completion::MapFailed { path, error } => {
+                Completion::MapFailed { path, error } => {
                     let Some(index) = self.pending.iter().position(|entry| entry.path == path)
                     else {
                         continue;
@@ -587,16 +617,11 @@ impl NetworkPublications {
                         format!("could not create the log buffer: {error}").as_bytes(),
                     );
                 }
-                crate::native_resource_agent::Completion::Freed { .. } => {}
+                Completion::Freed { .. } => {}
             }
         }
 
         work
-    }
-
-    /// Every storage warning the agent raised since the last call.
-    pub fn poll_storage_warnings(&self) -> Vec<crate::native_resource_agent::StorageWarning> {
-        self.agent.poll_warnings()
     }
 
     /// Create the publication whose log buffer arrived, announce it, and hand
