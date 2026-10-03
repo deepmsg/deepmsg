@@ -7361,6 +7361,147 @@ mod tests {
         );
     }
 
+    /// A port nothing is listening on, for a test that wants a channel of its
+    /// own rather than one of the shared fixtures'.
+    fn unused_udp_port() -> u16 {
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        probe
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        probe.local_address().expect("an address").port()
+    }
+
+    /// The other two arms of the same loop: `rejoin` and `isResponse`
+    /// (`aeron_driver_conductor_has_clashing_subscription`, `:334-346` and
+    /// `:348-360`).
+    ///
+    /// `isResponse` is the one a client can lose more by: a subscription that
+    /// did not ask to be a response channel, served by one that is, is a
+    /// subscription whose `SETUP`s are answered on a channel it never opened.
+    /// `io.aeron.ResponseChannelsTest::shouldRejectSubscriptionIfResponseConfigurationDoesNotMatch`
+    /// is the oracle.
+    ///
+    /// The last block pins the **order**: the reference reports the first of
+    /// its three that disagrees and returns (`:325` ahead of `:339` ahead of
+    /// `:353`), so a client that got two wrong hears about one.
+    #[test]
+    fn two_subscriptions_that_disagree_about_rejoin_or_response_cannot_share_a_channel() {
+        let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
+        drain(&cnc, &mut receiver);
+
+        for (index, (addition, named)) in [
+            ("|control-mode=response", "isResponse=true"),
+            // `rejoin` is the driver's default **true** (`REJOIN_STREAM_DEFAULT`,
+            // `aeron_driver_context.c:462`), so it is the `false` that clashes.
+            ("|rejoin=false", "rejoin=false"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let correlation_id = 31 + 2 * i64::try_from(index).expect("two of them");
+            let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", unused_udp_port());
+            let second = format!("{channel}{addition}");
+
+            send(
+                &conductor,
+                ADD_SUBSCRIPTION_TYPE_ID,
+                &add_subscription_payload(7, correlation_id, 1002, &channel),
+            );
+            let mut pending = Vec::new();
+            let _ready = await_event(
+                &mut conductor,
+                &cnc,
+                &mut receiver,
+                &mut pending,
+                ON_SUBSCRIPTION_READY_TYPE_ID,
+            );
+            let events = std::mem::take(&mut pending);
+            assert!(
+                !events.iter().any(|(id, _)| *id == ON_ERROR_TYPE_ID),
+                "the first subscription is served: {events:?}"
+            );
+
+            send(
+                &conductor,
+                ADD_SUBSCRIPTION_TYPE_ID,
+                &add_subscription_payload(7, correlation_id + 1, 1002, &second),
+            );
+            let mut pending = Vec::new();
+            let payload = await_event(
+                &mut conductor,
+                &cnc,
+                &mut receiver,
+                &mut pending,
+                ON_ERROR_TYPE_ID,
+            );
+
+            let text = String::from_utf8_lossy(&payload[16..]).to_string();
+            assert!(
+                text.contains(&format!(
+                    "option conflicts with existing subscription: {named}"
+                )),
+                "the option that disagreed, for {addition}: {text}"
+            );
+            assert!(
+                text.contains(&format!("existingChannel={channel}")),
+                "and the channel already there: {text}"
+            );
+            assert!(
+                text.contains(&format!("channel={second}")),
+                "and the one that arrived: {text}"
+            );
+        }
+
+        // Two disagreements at once, and the reference's order is what says
+        // which one is reported.
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", unused_udp_port());
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 41, 1002, &channel),
+        );
+        let mut pending = Vec::new();
+        let _ready = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+        let events = std::mem::take(&mut pending);
+        assert!(
+            !events.iter().any(|(id, _)| *id == ON_ERROR_TYPE_ID),
+            "the first subscription is served: {events:?}"
+        );
+
+        let both_wrong = format!("{channel}|reliable=false|control-mode=response");
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 42, 1002, &both_wrong),
+        );
+        let mut pending = Vec::new();
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+        let text = String::from_utf8_lossy(&payload[16..]).to_string();
+        assert!(
+            text.contains("option conflicts with existing subscription: reliable=false"),
+            "`reliable` is checked before `isResponse`: {text}"
+        );
+        assert!(
+            !text.contains("isResponse"),
+            "and only the first disagreement is reported: {text}"
+        );
+    }
+
     /// Two subscriptions that one image would serve have to agree about
     /// `reliable`, and the reference refuses the second rather than serving it
     /// the first one's answer
@@ -7372,17 +7513,7 @@ mod tests {
 
         // A channel of this test's own: the fixtures are shared, and a
         // subscription on theirs would be a clash with theirs.
-        let port = {
-            use crate::sys::AddressFamily;
-            use crate::sys::socket::DatagramSocket;
-
-            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
-            probe
-                .bind("127.0.0.1:0".parse().expect("an address"))
-                .expect("a bind");
-            probe.local_address().expect("an address").port()
-        };
-        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}");
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{}", unused_udp_port());
         let unreliable = format!("{channel}|reliable=false");
 
         // The first one names it, and is served: nothing about the value itself

@@ -402,11 +402,14 @@ pub enum PublicationParamsError {
         /// And the term length.
         term_length: i32,
     },
-    /// `response-correlation-id` is below `-1` (`aeron_driver_uri.c:206-235`).
-    ResponseCorrelationId {
-        /// What the URI said.
-        value: i64,
-    },
+    /// `response-correlation-id` is not an `int64`, or is below `-1`
+    /// (`aeron_driver_uri.c:655-683`).
+    ///
+    /// The reference reaches **one** label for both — a value its
+    /// `aeron_uri_get_int64` cannot read and one it reads but finds below `-1`
+    /// `goto` the same place — so this carries no value and says the same
+    /// sentence either way. A client reads this message.
+    ResponseCorrelationId,
     /// The three position parameters were not a usable set.
     Position(PositionError),
     /// `entity-tag` is not a decimal number (`aeron_driver_uri.c:256-273`).
@@ -484,9 +487,9 @@ impl std::fmt::Display for PublicationParamsError {
                 "pub-wnd={value} must be at least the mtu={mtu_length} and at most half the \
                  term-length={term_length}"
             ),
-            Self::ResponseCorrelationId { value } => write!(
-                f,
-                "response-correlation-id={value} must be a number at least -1, or `prototype`"
+            Self::ResponseCorrelationId => f.write_str(
+                "invalid response-correlation-id, must be a number greater than or equal to -1, \
+                 or 'prototype'",
             ),
             Self::EntityTag { value } => write!(f, "entity tag `{value}` is not a number"),
             Self::UnknownSessionIdTag { tag } => write!(
@@ -916,7 +919,12 @@ fn read_position(
 }
 
 /// `response-correlation-id`, including `prototype`
-/// (`aeron_driver_uri.c:206-235`).
+/// (`aeron_driver_uri.c:655-683`).
+///
+/// The read goes through [`ChannelUri::i64`] rather than a plain `parse` for
+/// the reference's own reason: it asks `aeron_uri_get_int64`, whose `strtoll`
+/// is **base zero** (`aeron-client/src/main/c/uri/aeron_uri.c:397`), so `0x10`
+/// is sixteen there and must be here too.
 fn read_response_correlation_id(uri: &ChannelUri<'_>) -> Result<i64, PublicationParamsError> {
     let Some(value) = uri.value(key::RESPONSE_CORRELATION_ID) else {
         return Ok(-1);
@@ -926,17 +934,15 @@ fn read_response_correlation_id(uri: &ChannelUri<'_>) -> Result<i64, Publication
         return Ok(PROTOTYPE_CORRELATION_ID);
     }
 
-    let correlation_id: i64 = value.parse().map_err(|_| {
-        PublicationParamsError::Uri(UriError::NotANumber {
-            key: key::RESPONSE_CORRELATION_ID.to_owned(),
-            value: value.to_owned(),
-        })
-    })?;
+    // Both arms end at the reference's single label, so both errors are the
+    // same value; `aeron_driver_uri.c:676-682` is one `goto`.
+    let correlation_id = uri
+        .i64(key::RESPONSE_CORRELATION_ID)
+        .map_err(|_| PublicationParamsError::ResponseCorrelationId)?
+        .expect("the value was read above");
 
     if correlation_id < -1 {
-        return Err(PublicationParamsError::ResponseCorrelationId {
-            value: correlation_id,
-        });
+        return Err(PublicationParamsError::ResponseCorrelationId);
     }
 
     Ok(correlation_id)
@@ -1296,8 +1302,20 @@ mod tests {
         ));
         assert!(matches!(
             resolve("aeron:ipc?response-correlation-id=-2"),
-            Err(PublicationParamsError::ResponseCorrelationId { value: -2 })
+            Err(PublicationParamsError::ResponseCorrelationId)
         ));
+        // Not a number takes the same arm: the reference has one `goto` for
+        // both (`aeron_driver_uri.c:676-682`), and its message names neither
+        // the key's value nor which of the two it was.
+        assert!(matches!(
+            resolve("aeron:ipc?response-correlation-id=what"),
+            Err(PublicationParamsError::ResponseCorrelationId)
+        ));
+        // `aeron_uri_get_int64` reads base zero, so `0x10` is sixteen.
+        assert_eq!(
+            16,
+            resolve_ok("aeron:ipc?response-correlation-id=0x10").response_correlation_id
+        );
         assert_eq!(
             Ok(PROTOTYPE_CORRELATION_ID),
             read_response_correlation_id(
