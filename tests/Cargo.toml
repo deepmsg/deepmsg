@@ -26,6 +26,15 @@ path = "integration/basic_roundtrip.rs"
 name = "termination_handshake"
 path = "integration/termination_handshake.rs"
 
+[[test]]
+name = "loss_report"
+path = "integration/loss_report.rs"
+
+[[test]]
+name = "loss_report_reference"
+path = "interop/loss_report.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]

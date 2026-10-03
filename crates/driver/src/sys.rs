@@ -100,6 +100,40 @@ extern "C" fn handle_stop(signal: libc::c_int) {
     STOP_SIGNAL.store(signal, Ordering::SeqCst);
 }
 
+/// How long the loss report file is: the configured length rounded up to the
+/// file page size (`aeron-driver/src/main/c/aeron_driver.c:329-330`).
+///
+/// The alignment is the reference's and it is why a driver configured with the
+/// default megabyte gets exactly that: 1 MiB is already a multiple of every
+/// page size it runs with. A configuration that is not gets a file that is one
+/// page bigger, which is visible to anyone who looks at the directory.
+///
+/// # Errors
+///
+/// [`io::Error`] if the length is not a positive number this build can align.
+pub fn loss_report_length(config: &crate::config::DriverConfig) -> io::Result<usize> {
+    let length = usize::try_from(config.loss_report_buffer_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "loss report length"))?;
+
+    if 0 == length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a loss report of no bytes",
+        ));
+    }
+
+    let page_size = config.layout.page_size;
+
+    if 0 == page_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a file page size of no bytes",
+        ));
+    }
+
+    Ok(length.div_ceil(page_size) * page_size)
+}
+
 /// Give the calling thread a name, the way the reference does
 /// (`aeron_thread_set_name`, `concurrent/aeron_thread.c:141-159`).
 ///

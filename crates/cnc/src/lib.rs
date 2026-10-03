@@ -39,6 +39,7 @@ pub mod error;
 pub mod error_log;
 pub mod file;
 pub mod layout;
+pub mod loss_report;
 pub mod metadata;
 pub mod ring;
 

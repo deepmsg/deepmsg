@@ -212,6 +212,15 @@ pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 /// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
 pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
 
+/// `AERON_LOSS_REPORT_BUFFER_LENGTH_DEFAULT` (`aeronmd.h:385`, the Java
+/// `Configuration`'s `LOSS_REPORT_BUFFER_LENGTH_DEFAULT`): the length of the
+/// loss report file the driver creates in the aeron directory.
+///
+/// One mebibyte, and the driver **creates it whether or not anything is ever
+/// lost** — it is a file a client may map at any time, and the reference's own
+/// system tests assert it exists after connecting.
+pub const LOSS_REPORT_BUFFER_LENGTH_DEFAULT: i64 = 1024 * 1024;
+
 /// The smallest one of the resolver's four **intervals** may be
 /// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
 /// each of them is read, `aeron_driver_context.c:609-636`): a millisecond, so
@@ -765,6 +774,10 @@ pub struct DriverConfig {
     /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`), likewise, for
     /// the destinations a subscription listens on (`:1071-1081`).
     pub receiver_wildcard_port_range: PortRange,
+    /// `aeron.loss.report.buffer.length` (`AERON_LOSS_REPORT_BUFFER_LENGTH`,
+    /// `aeronmd.h:385`): how long the loss report file is, before it is aligned
+    /// up to the file page size (`aeron_driver.c:329-330`).
+    pub loss_report_buffer_length: i64,
     /// How the driver's work is spread over threads (`aeron.threading.mode`).
     pub threading_mode: ThreadingMode,
     /// Which set of names those threads are given (`aeron.thread.naming`).
@@ -867,6 +880,7 @@ impl Default for DriverConfig {
             // not a driver that named `0 0`, but it behaves as one.
             sender_wildcard_port_range: PortRange::OS_WILDCARD,
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
+            loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
             threading_mode: ThreadingMode::Dedicated,
             thread_naming: ThreadNaming::Classic,
             conductor_idle: IdleStrategySetting::default(),
@@ -1090,6 +1104,15 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::ERROR_BUFFER_LENGTH) {
             config.layout.error_log_length = parse_size64(&Setting::ERROR_BUFFER_LENGTH, &value)?;
+        }
+        if let Some(value) = get(&Setting::LOSS_REPORT_BUFFER_LENGTH) {
+            config.loss_report_buffer_length =
+                i64::try_from(parse_size64(&Setting::LOSS_REPORT_BUFFER_LENGTH, &value)?).map_err(
+                    |_| ConfigError::OutOfRange {
+                        name: Setting::LOSS_REPORT_BUFFER_LENGTH.property,
+                        value,
+                    },
+                )?;
         }
         if let Some(value) = get(&Setting::FILE_PAGE_SIZE) {
             config.layout.page_size = parse_size64(&Setting::FILE_PAGE_SIZE, &value)?;
@@ -1879,6 +1902,11 @@ impl Setting {
     const DRIVER_RERESOLUTION_CHECK_INTERVAL: Self = Self {
         property: "driver.reresolution.check.interval",
         env: "AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL",
+    };
+    /// `aeron.loss.report.buffer.length` (`aeronmd.h:385`).
+    const LOSS_REPORT_BUFFER_LENGTH: Self = Self {
+        property: "loss.report.buffer.length",
+        env: "AERON_LOSS_REPORT_BUFFER_LENGTH",
     };
     /// `aeron.name.resolver.threshold` (`aeronmd.h:932`).
     const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {

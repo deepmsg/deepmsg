@@ -191,6 +191,47 @@ pinned by configuration's own tests, and the warning's shape by the
 conductor's
 `a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands`.
 
+## The loss report
+
+The driver creates `loss-report.dat` in the aeron directory at startup and
+appends one record per stream that loses data; clients map it and walk the
+records. The name, the record layout and the write order are the reference's,
+because what reads this file is not this build's code:
+`crates/cnc/src/loss_report.rs` is the format, and the reference's own
+`LossStat` reads what this driver wrote in
+`tests/interop/loss_report.rs` (see below for the one thing that does not line
+up).
+
+| Fact | Where |
+|---|---|
+| `loss-report.dat`, created by the driver before the conductor starts | `aeron-driver/src/main/c/aeron_driver.c:888`, `:324-345` |
+| Length = the configured length aligned up to the file page size; 1 MiB by default | `:329-330`; `aeron_driver_context.c:490`; `aeron.loss.report.buffer.length` at `:841` |
+| Counted in `Bytes currently mapped` | `:948` |
+| A 40-byte `#pragma pack(4)` header, then channel and source behind four-byte lengths, the record rounded up to a 64-byte cache line | `reports/aeron_loss_reporter.h:30-44` |
+| `observation_count` written **last**, with a release: a reader stops at the first non-positive one | `reports/aeron_loss_reporter.c:44-68`, `:120-126` |
+| The first report creates the record (channel and source included), later ones only add | `aeron_publication_image.c:123-155` |
+| A hole found again is only counted past what was already reported | `:452-479` |
+| A record that does not fit gives up for that image — no retry | `:145-150` |
+
+The one divergence is inside the reference, between its own writer and its own
+**C** reader. The stride a record takes is
+`40 + align4(4 + channel) + 4 + source`, rounded up to 64 — the writer's
+arithmetic (`aeron_loss_reporter.c:44-46`) and Java's reader's
+(`LossReportReader.java:143-147`). The C reader computes
+`40 + 8 + channel + source` and rounds that (`:157-159`), which is the same
+number unless the channel's four-byte padding pushes the record across a
+64-byte boundary. deepmsg writes what the writer writes and reads with the
+writer's arithmetic; the C reader's difference is the reference's and does not
+appear for the lengths a real channel URI and source identity have, which is
+why `LossStat` reads this driver's file in the interop test.
+
+`io.aeron.GapFillLossTest` and `PubAndSubTest` call
+`SystemTests.verifyLossOccurredForStream`, which asserts this file exists and
+names the stream — but they **cannot** go green against an external driver for
+a reason that has nothing to do with the file: they inject their loss through
+`TestMediaDriver.enableRandomLoss`, a Java object in the test's own process
+(`GapFillLossTest.java:76-83`), so the driver never sees a lost datagram.
+
 ## The distinct error log
 
 An entry this driver records carries the reference's composition — the

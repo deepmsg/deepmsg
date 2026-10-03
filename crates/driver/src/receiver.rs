@@ -27,10 +27,12 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver as Inbox, Sender as Outbox};
 use std::thread::JoinHandle;
 
+use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
 use crate::driver::Role;
@@ -645,8 +647,19 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
+        // A test-only constructor: it puts the loss report beside the CnC file
+        // it was handed, which is where a driver puts it too.
+        let loss_report = Arc::new(
+            LossReportFile::create(
+                cnc.path().parent().unwrap_or_else(|| Path::new(".")),
+                64 * 1024,
+            )
+            .map_err(|error| io::Error::other(format!("a loss report file: {error}")))?,
+        );
+
         let ReceiverParts { proxy, agent } = Self::split(
             cnc,
+            loss_report,
             values_length,
             free_to_reuse_timeout_ms,
             mtu_length,
@@ -678,6 +691,7 @@ impl Receiver {
     #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     pub(crate) fn split(
         cnc: Arc<CncFile>,
+        loss_report: Arc<LossReportFile>,
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
@@ -702,6 +716,7 @@ impl Receiver {
             },
             agent: ReceiverThread::new(
                 cnc,
+                loss_report,
                 counters,
                 mtu_length,
                 status_message_timeout_ns,
@@ -784,6 +799,14 @@ pub(crate) struct ReceiverThread {
     events: Outbox<ReceiverEvent>,
     endpoints: Vec<(u64, Box<ReceiveChannelEndpoint>)>,
     images: Vec<PublicationImage>,
+    /// The driver's loss report file, which this thread writes: the image's
+    /// state machine runs here, and the record is written where the gap is
+    /// found (`aeron_publication_image.c:452-479`).
+    loss_report: Arc<LossReportFile>,
+    /// Where the next record goes. The file has no header and no index — the
+    /// writer's cursor and the readers' zero-terminated walk are the whole
+    /// protocol (`crates/cnc/src/loss_report.rs`).
+    loss_report_cursor: usize,
     pending_setups: Vec<PendingSetup>,
     /// Answers to control-name re-resolutions, waiting for a pass that has the
     /// counter regions — the same hand-off the destination commands make.
@@ -807,6 +830,7 @@ impl ReceiverThread {
     #[allow(clippy::too_many_arguments)]
     fn new(
         cnc: Arc<CncFile>,
+        loss_report: Arc<LossReportFile>,
         counters: CounterManager,
         mtu_length: usize,
         status_message_timeout_ns: i64,
@@ -820,6 +844,8 @@ impl ReceiverThread {
         Self {
             commands,
             cnc,
+            loss_report,
+            loss_report_cursor: 0,
             counters,
             mtu_length,
             status_message_timeout_ns,
@@ -1256,6 +1282,8 @@ impl ReceiverThread {
             &system,
             &self.counters,
             &regions,
+            &self.loss_report,
+            &mut self.loss_report_cursor,
             now_ns,
         );
 
@@ -1703,6 +1731,8 @@ impl ReceiverThread {
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
+        loss_report: &LossReportFile,
+        loss_report_cursor: &mut usize,
         now_ns: i64,
     ) -> usize {
         let mut work = 0;
@@ -1721,6 +1751,17 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
+                // The report comes first and is the same on both paths: what
+                // happens next (a NAK, or a gap fill) is about *repairing* the
+                // hole, and the reference reports the hole itself before either
+                // (`aeron_publication_image_on_gap_detected`, `:452-479`).
+                work += image.report_loss(
+                    loss_report,
+                    loss_report_cursor,
+                    &gap,
+                    deepmsg_core::clock::epoch_millis(),
+                );
+
                 if image.is_reliable() {
                     // A NAK goes to every connection this image hears from, like
                     // a status message: each receiver has its own view of what is
