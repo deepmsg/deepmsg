@@ -597,6 +597,7 @@ impl Sender {
             Role::Sender.classic_name(),
             agent,
             crate::driver::default_strategy(),
+            None,
         )?;
 
         Ok(Self {
@@ -705,6 +706,11 @@ pub(crate) struct SenderThread {
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
+    /// Which endpoints have control frames waiting (G4-3). The sender's own
+    /// poller, as the reference has one per sender
+    /// (`aeron_driver_sender.c:150-180` polls through `sender->poller`).
+    poller: crate::media::poller::TransportPoller,
+    readable: Vec<usize>,
     /// Destination changes waiting for a pass that has the counters.
     ///
     /// The command loop has none — they arrive with [`SenderThread::do_work`] —
@@ -754,6 +760,8 @@ impl SenderThread {
             publications: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
+            poller: crate::media::poller::TransportPoller::new(),
+            readable: Vec::new(),
             pending_destinations: Vec::new(),
             pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
@@ -933,6 +941,8 @@ impl SenderThread {
                 &self.counters,
                 &regions,
                 &self.events,
+                &mut self.poller,
+                &mut self.readable,
             );
 
             self.duty_cycle.polled(now_ns);
@@ -1215,10 +1225,37 @@ impl SenderThread {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         events: &Channel<SenderEvent>,
+        poller: &mut crate::media::poller::TransportPoller,
+        readable: &mut Vec<usize>,
     ) -> usize {
         let mut work = 0;
 
-        for index in 0..endpoints.len() {
+        // Which endpoints have control frames waiting (G4-3). At or below the
+        // poller's threshold that is all of them, in order; above it, only the
+        // ones the kernel says are ready
+        // (`media/aeron_udp_transport_poller.c:190-206`). An endpoint whose
+        // transport has no descriptor — a test's — makes the pass read every
+        // one, because a poller that cannot see a socket must not be the reason
+        // it is skipped.
+        let descriptors: Vec<Option<crate::sys::socket::Descriptor>> = endpoints
+            .iter()
+            .map(|(_, endpoint)| endpoint.descriptor())
+            .collect();
+
+        if descriptors.iter().all(Option::is_some) {
+            let present: Vec<crate::sys::socket::Descriptor> =
+                descriptors.into_iter().flatten().collect();
+
+            if poller.ready(&present, readable).is_err() {
+                readable.clear();
+                readable.extend(0..endpoints.len());
+            }
+        } else {
+            readable.clear();
+            readable.extend(0..endpoints.len());
+        }
+
+        for index in readable.iter().copied() {
             // The borrow of this endpoint ends before the datagrams are
             // dispatched, because a dispatch may need to *send* through any of
             // them (a resend answers a NAK on the endpoint it arrived at).
@@ -2098,6 +2135,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )

@@ -75,6 +75,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Where the agents should run, before anything touches the file system:
+    // the reference applies the cpuset in `aeronmd`'s own order, ahead of the
+    // driver's context (`aeronmd.c:129`), so a cpuset it refuses to accept is
+    // refused before a directory is claimed.
+    let affinity = match deepmsg_driver::cpuset::apply(&config) {
+        Ok(affinity) => affinity,
+        Err(error) => return fail(&format_args!("{error}")),
+    };
+
     let now_ms = clock::epoch_millis();
 
     // Holding this is what makes the directory this process's to delete: every
@@ -140,7 +149,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut driver = match Driver::new(cnc, &config) {
+    let mut driver = match Driver::new(cnc, &config, affinity) {
         Ok(driver) => driver,
         Err(error) => {
             eprintln!("deepmsg-driver: {error}");

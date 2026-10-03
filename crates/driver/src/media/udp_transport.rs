@@ -247,6 +247,14 @@ impl Transport for UdpTransport {
         }
     }
 
+    fn descriptor(&self) -> Option<crate::sys::socket::Descriptor> {
+        // The **receiving** socket: a multicast transport binds one to hear
+        // the group and sends by another, and it is the first that a poller
+        // can say anything about (`aeron_udp_channel_transport.c:917-930`
+        // makes the same distinction for the local address).
+        Some(self.receiving().descriptor())
+    }
+
     fn receive(&mut self, buffers: &mut [Vec<u8>], datagrams: &mut Datagrams) -> io::Result<usize> {
         // The reference's `recvmmsg` path (`:549-644`), with one difference
         // worth naming: it does *not* count a failed receive as an error when

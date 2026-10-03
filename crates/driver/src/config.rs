@@ -202,6 +202,40 @@ pub const RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
 /// resolution is microseconds.
 pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
+/// `AERON_DRIVER_{CONDUCTOR,SENDER,RECEIVER}_CYCLE_THRESHOLD_NS_DEFAULT`
+/// (`aeron_driver_context.c:236-238`, all three `100 * 1000 * INT64_C(1000)`).
+///
+/// One per thread that has a duty cycle, and they do two jobs with one number:
+/// a pass longer than its slot's threshold is counted in
+/// `*_CYCLE_TIME_THRESHOLD_EXCEEDED`, and the threshold is what that counter's
+/// **label** says it is
+/// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
+pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
+
+/// `AERON_CPU_AFFINITY_DEFAULT` (`aeron_driver_context.c:244`): the index a
+/// slot's affinity setting starts at, meaning **no affinity** — the thread is
+/// left where the scheduler put it.
+pub const CPU_AFFINITY_DEFAULT: i32 = -1;
+
+/// `AERON_DRIVER_CONNECT_DEFAULT` (`aeron_driver_context.c:247`): whether a
+/// send endpoint whose channel names an explicit endpoint **connects** its
+/// socket to it.
+///
+/// True by default. Read at `:668`, used at
+/// `media/aeron_send_channel_endpoint.c:89` — the reference's `else if` puts
+/// the connect on the branch a multi-destination channel is *not* on, and this
+/// setting is the second half of that condition.
+pub const DRIVER_CONNECT_DEFAULT: bool = true;
+
+/// `AERON_LOSS_REPORT_BUFFER_LENGTH_DEFAULT` (`aeronmd.h:385`, the Java
+/// `Configuration`'s `LOSS_REPORT_BUFFER_LENGTH_DEFAULT`): the length of the
+/// loss report file the driver creates in the aeron directory.
+///
+/// One mebibyte, and the driver **creates it whether or not anything is ever
+/// lost** — it is a file a client may map at any time, and the reference's own
+/// system tests assert it exists after connecting.
+pub const LOSS_REPORT_BUFFER_LENGTH_DEFAULT: i64 = 1024 * 1024;
+
 /// The smallest one of the resolver's four **intervals** may be
 /// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
 /// each of them is read, `aeron_driver_context.c:609-636`): a millisecond, so
@@ -729,6 +763,18 @@ pub struct DriverConfig {
     /// `aeronmd.h:932`): how long one resolution may take before system counter
     /// 33 counts it (`aeron_driver_native_resource_agent.c:39-60`).
     pub name_resolver_threshold_ns: i64,
+    /// `aeron.driver.conductor.cycle.threshold`
+    /// (`AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD`, `aeronmd.h:908`): how long one
+    /// conductor pass may take before counter 27 counts it
+    /// (`aeron_driver_conductor.c:3401-3404`), and the number counter 27's
+    /// label carries (`:889-905`).
+    pub conductor_cycle_threshold_ns: i64,
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`), for counter 29
+    /// and the sender's own pass (`aeron_driver_sender.c:262-276`).
+    pub sender_cycle_threshold_ns: i64,
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`), for counter
+    /// 31 and the receiver's own pass (`aeron_driver_receiver.c:411-425`).
+    pub receiver_cycle_threshold_ns: i64,
     /// `aeron.driver.reresolution.check.interval`
     /// (`AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL`, `aeronmd.h:857`): how often
     /// the sender and the receiver look for names that need resolving again,
@@ -743,6 +789,36 @@ pub struct DriverConfig {
     /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`), likewise, for
     /// the destinations a subscription listens on (`:1071-1081`).
     pub receiver_wildcard_port_range: PortRange,
+    /// `aeron.loss.report.buffer.length` (`AERON_LOSS_REPORT_BUFFER_LENGTH`,
+    /// `aeronmd.h:385`): how long the loss report file is, before it is aligned
+    /// up to the file page size (`aeron_driver.c:329-330`).
+    pub loss_report_buffer_length: i64,
+    /// `aeron.driver.connect` (`AERON_DRIVER_CONNECT`, `aeronmd.h:723`):
+    /// whether a send endpoint connects its socket to the endpoint its channel
+    /// names (`media/aeron_send_channel_endpoint.c:89`).
+    pub connect_enabled: bool,
+    /// `aeron.driver.cpuset.affinity` (`AERON_DRIVER_CPUSET_AFFINITY`,
+    /// `aeronmd.h:969`): whether the driver pins its agents to the CPUs its
+    /// cgroup allows (`aeron_driver.c:1138-1209`). **Off by default**, which is
+    /// what makes that whole path an operator's choice.
+    pub cpuset_affinity: bool,
+    /// `aeron.driver.cpuset.warnings.as.errors`
+    /// (`AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS`, `aeronmd.h:973`): whether a
+    /// cpuset the topology checks complain about stops the driver instead of
+    /// being printed (`aeron_driver.c:1190-1194`).
+    pub cpuset_warnings_as_errors: bool,
+    /// `aeron.conductor.cpu.affinity` (`AERON_CONDUCTOR_CPU_AFFINITY`,
+    /// `aeronmd.h:953`): which CPU **of the cpuset** the conductor takes, by
+    /// position — and `-1` to leave it alone
+    /// (`aeron_driver_context.c:3540-3552`).
+    pub conductor_cpu_affinity: i32,
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`), likewise.
+    pub receiver_cpu_affinity: i32,
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`), likewise.
+    pub sender_cpu_affinity: i32,
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`),
+    /// likewise.
+    pub native_resource_agent_cpu_affinity: i32,
     /// How the driver's work is spread over threads (`aeron.threading.mode`).
     pub threading_mode: ThreadingMode,
     /// Which set of names those threads are given (`aeron.thread.naming`).
@@ -835,6 +911,9 @@ impl Default for DriverConfig {
             resolver_bootstrap_neighbor_resolution_interval_ns:
                 RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT,
             name_resolver_threshold_ns: NAME_RESOLVER_THRESHOLD_NS_DEFAULT,
+            conductor_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
+            sender_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
+            receiver_cycle_threshold_ns: CYCLE_THRESHOLD_NS_DEFAULT,
             re_resolution_check_interval_ns: RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT,
             // Both default to the kernel's wildcard, which is the state
             // `aeron_wildcard_port_manager_init` leaves them in
@@ -842,6 +921,14 @@ impl Default for DriverConfig {
             // not a driver that named `0 0`, but it behaves as one.
             sender_wildcard_port_range: PortRange::OS_WILDCARD,
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
+            loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
+            connect_enabled: DRIVER_CONNECT_DEFAULT,
+            cpuset_affinity: false,
+            cpuset_warnings_as_errors: false,
+            conductor_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            receiver_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            sender_cpu_affinity: CPU_AFFINITY_DEFAULT,
+            native_resource_agent_cpu_affinity: CPU_AFFINITY_DEFAULT,
             threading_mode: ThreadingMode::Dedicated,
             thread_naming: ThreadNaming::Classic,
             conductor_idle: IdleStrategySetting::default(),
@@ -1065,6 +1152,70 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::ERROR_BUFFER_LENGTH) {
             config.layout.error_log_length = parse_size64(&Setting::ERROR_BUFFER_LENGTH, &value)?;
+        }
+        if let Some(value) = get(&Setting::DRIVER_CPUSET_AFFINITY) {
+            config.cpuset_affinity = parse_bool(&Setting::DRIVER_CPUSET_AFFINITY, &value)?;
+        }
+        if let Some(value) = get(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS) {
+            config.cpuset_warnings_as_errors =
+                parse_bool(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS, &value)?;
+        }
+        for (setting, field) in [
+            (
+                Setting::CONDUCTOR_CPU_AFFINITY,
+                &mut config.conductor_cpu_affinity,
+            ),
+            (
+                Setting::RECEIVER_CPU_AFFINITY,
+                &mut config.receiver_cpu_affinity,
+            ),
+            (
+                Setting::SENDER_CPU_AFFINITY,
+                &mut config.sender_cpu_affinity,
+            ),
+            (
+                Setting::NATIVE_RESOURCE_AGENT_CPU_AFFINITY,
+                &mut config.native_resource_agent_cpu_affinity,
+            ),
+        ] {
+            if let Some(value) = get(&setting) {
+                *field = parse_count(&setting, &value).and_then(|count| {
+                    i32::try_from(count).map_err(|_| ConfigError::OutOfRange {
+                        name: setting.property,
+                        value: value.clone(),
+                    })
+                })?;
+            }
+        }
+        if let Some(value) = get(&Setting::DRIVER_CONNECT) {
+            config.connect_enabled = parse_bool(&Setting::DRIVER_CONNECT, &value)?;
+        }
+
+        // The two settings whose value is **code**: the reference loads a
+        // library or looks up a symbol and fails its context init when it
+        // cannot (`aeron_driver_context.c:539-546`, `:555-561`). This build
+        // does neither — ADR-0002 keeps FFI out — so a deployment that names
+        // one gets the failure the reference would give it, with the reason
+        // said out loud rather than the setting quietly dropped.
+        for setting in [
+            Setting::DRIVER_DYNAMIC_LIBRARIES,
+            Setting::AGENT_ON_START_FUNCTION,
+        ] {
+            if get(&setting).is_some_and(|value| !value.is_empty()) {
+                return Err(ConfigError::DynamicLoadingNotSupported {
+                    property: setting.property,
+                });
+            }
+        }
+
+        if let Some(value) = get(&Setting::LOSS_REPORT_BUFFER_LENGTH) {
+            config.loss_report_buffer_length =
+                i64::try_from(parse_size64(&Setting::LOSS_REPORT_BUFFER_LENGTH, &value)?).map_err(
+                    |_| ConfigError::OutOfRange {
+                        name: Setting::LOSS_REPORT_BUFFER_LENGTH.property,
+                        value,
+                    },
+                )?;
         }
         if let Some(value) = get(&Setting::FILE_PAGE_SIZE) {
             config.layout.page_size = parse_size64(&Setting::FILE_PAGE_SIZE, &value)?;
@@ -1494,6 +1645,31 @@ impl DriverConfig {
                 parse_duration_ns(&Setting::DRIVER_NAME_RESOLVER_THRESHOLD, &value)?;
         }
 
+        // The three duty-cycle thresholds, read the same way and with no floor
+        // of their own (`aeron_driver_context.c:1031-1053`). The harness sends
+        // them as **bare nanosecond counts** — `String.valueOf(
+        // context.conductorCycleThresholdNs())` (`CTestMediaDriver.java:294-296`)
+        // — which is what a suffix-less duration means here (and in
+        // `aeron_parse_duration_ns`).
+        for (setting, field) in [
+            (
+                Setting::DRIVER_CONDUCTOR_CYCLE_THRESHOLD,
+                &mut config.conductor_cycle_threshold_ns,
+            ),
+            (
+                Setting::DRIVER_SENDER_CYCLE_THRESHOLD,
+                &mut config.sender_cycle_threshold_ns,
+            ),
+            (
+                Setting::DRIVER_RECEIVER_CYCLE_THRESHOLD,
+                &mut config.receiver_cycle_threshold_ns,
+            ),
+        ] {
+            if let Some(value) = get(&setting) {
+                *field = parse_duration_ns(&setting, &value)?;
+            }
+        }
+
         // And so is the re-resolution interval, whose minimum is zero for the
         // same reason (`:1024-1028`): zero is how a deployment turns the whole
         // feature off, and the reference's two loops test for it
@@ -1830,10 +2006,80 @@ impl Setting {
         property: "driver.reresolution.check.interval",
         env: "AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL",
     };
+    /// `aeron.driver.connect` (`aeronmd.h:723`).
+    const DRIVER_CONNECT: Self = Self {
+        property: "driver.connect",
+        env: "AERON_DRIVER_CONNECT",
+    };
+    /// `aeron.driver.cpuset.affinity` (`aeronmd.h:969`).
+    const DRIVER_CPUSET_AFFINITY: Self = Self {
+        property: "driver.cpuset.affinity",
+        env: "AERON_DRIVER_CPUSET_AFFINITY",
+    };
+    /// `aeron.driver.cpuset.warnings.as.errors` (`aeronmd.h:973`).
+    const DRIVER_CPUSET_WARNINGS_AS_ERRORS: Self = Self {
+        property: "driver.cpuset.warnings.as.errors",
+        env: "AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS",
+    };
+    /// `aeron.conductor.cpu.affinity` (`aeronmd.h:953`).
+    const CONDUCTOR_CPU_AFFINITY: Self = Self {
+        property: "conductor.cpu.affinity",
+        env: "AERON_CONDUCTOR_CPU_AFFINITY",
+    };
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`).
+    const RECEIVER_CPU_AFFINITY: Self = Self {
+        property: "receiver.cpu.affinity",
+        env: "AERON_RECEIVER_CPU_AFFINITY",
+    };
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`).
+    const SENDER_CPU_AFFINITY: Self = Self {
+        property: "sender.cpu.affinity",
+        env: "AERON_SENDER_CPU_AFFINITY",
+    };
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`).
+    const NATIVE_RESOURCE_AGENT_CPU_AFFINITY: Self = Self {
+        property: "driver.native.resource.agent.cpu.affinity",
+        env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_CPU_AFFINITY",
+    };
+    /// `aeron.driver.dynamic.libraries` (`aeronmd.h:980`): the libraries the
+    /// reference `dlopen`s at context init. This build refuses it — see
+    /// [`ConfigError::DynamicLoadingNotSupported`].
+    const DRIVER_DYNAMIC_LIBRARIES: Self = Self {
+        property: "driver.dynamic.libraries",
+        env: "AERON_DRIVER_DYNAMIC_LIBRARIES",
+    };
+    /// `aeron.agent.on.start.function` (`aeronmd.h:513`): the symbol the
+    /// reference `dlsym`s and calls on every agent's start. Refused, like the
+    /// libraries above.
+    const AGENT_ON_START_FUNCTION: Self = Self {
+        property: "agent.on.start.function",
+        env: "AERON_AGENT_ON_START_FUNCTION",
+    };
+    /// `aeron.loss.report.buffer.length` (`aeronmd.h:385`).
+    const LOSS_REPORT_BUFFER_LENGTH: Self = Self {
+        property: "loss.report.buffer.length",
+        env: "AERON_LOSS_REPORT_BUFFER_LENGTH",
+    };
     /// `aeron.name.resolver.threshold` (`aeronmd.h:932`).
     const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {
         property: "name.resolver.threshold",
         env: "AERON_DRIVER_NAME_RESOLVER_THRESHOLD",
+    };
+    /// `aeron.driver.conductor.cycle.threshold` (`aeronmd.h:908`; the property
+    /// name is the Java `Configuration`'s, `:1070`).
+    const DRIVER_CONDUCTOR_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.conductor.cycle.threshold",
+        env: "AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD",
+    };
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`, `:1085`).
+    const DRIVER_SENDER_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.sender.cycle.threshold",
+        env: "AERON_DRIVER_SENDER_CYCLE_THRESHOLD",
+    };
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`, `:1100`).
+    const DRIVER_RECEIVER_CYCLE_THRESHOLD: Self = Self {
+        property: "driver.receiver.cycle.threshold",
+        env: "AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD",
     };
     /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:351`).
     const CUBIC_INITIAL_RTT: Self = Self {
@@ -2062,6 +2308,19 @@ impl Setting {
 /// Why a configuration could not be resolved.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// A setting whose value is **code** — a library to load, or a symbol to
+    /// call — was named, and this build loads no code (ADR-0002).
+    ///
+    /// The reference loads it and fails its context init when it cannot
+    /// (`aeron_driver_context.c:539-546`, `:555-561`), so a deployment that
+    /// names one of these gets a driver that does not start there either. What
+    /// is different here is that it can never start, and saying so is the
+    /// point: a setting that is quietly dropped is a deployment that believes
+    /// its interceptors or its agent hooks are running.
+    DynamicLoadingNotSupported {
+        /// The property name, as the reference spells it.
+        property: &'static str,
+    },
     /// An argument that is not `-Dname=value`.
     MalformedArgument {
         /// The argument as it arrived.
@@ -2179,6 +2438,13 @@ impl std::fmt::Display for ConfigError {
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::DynamicLoadingNotSupported { property } => write!(
+                f,
+                "{property} names code for this driver to load, and this build loads none: \
+                 it has no FFI and no dynamic libraries (ADR-0002). The reference would \
+                 load it at context init and refuse to start if it could not, which is \
+                 what this refusal is"
+            ),
             Self::UnknownThreadingMode { value } => write!(
                 f,
                 "{value} is not a threading mode: DEDICATED, SHARED_NETWORK, SHARED or INVOKER"
@@ -2224,7 +2490,8 @@ impl std::error::Error for ConfigError {
             | Self::UnknownValidator { .. }
             | Self::UnknownThreadingMode { .. }
             | Self::UnknownThreadNaming { .. }
-            | Self::UnknownIdleStrategy { .. } => None,
+            | Self::UnknownIdleStrategy { .. }
+            | Self::DynamicLoadingNotSupported { .. } => None,
         }
     }
 }
@@ -2669,6 +2936,120 @@ mod tests {
         )
         .expect_err("below the floor");
         assert!(matches!(too_fast, ConfigError::OutOfRange { .. }));
+    }
+
+    /// `aeron.driver.connect` is a boolean like any other, and its default is
+    /// the reference's own `true` (`aeron_driver_context.c:247`).
+    #[test]
+    fn the_driver_connect_setting_is_a_boolean_defaulting_to_true() {
+        let unset = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
+        assert!(unset.connect_enabled, "the reference's default");
+
+        for (value, expected) in [("false", false), ("true", true)] {
+            let config = resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[("AERON_DRIVER_CONNECT", value)],
+            )
+            .expect("a config");
+            assert_eq!(expected, config.connect_enabled, "{value}");
+        }
+    }
+
+    /// The two settings whose value is **code** are refused, and the refusal
+    /// says which one: this build loads no libraries and looks up no symbols
+    /// (ADR-0002), and the reference would not start over an unloadable one
+    /// either (`aeron_driver_context.c:539-546`, `:555-561`).
+    ///
+    /// Quietly dropping them is the failure this prevents: a deployment that
+    /// named interceptors or an agent hook would run without them and never
+    /// find out.
+    #[test]
+    fn a_setting_that_names_code_is_refused_by_name() {
+        for (property, env) in [
+            ("driver.dynamic.libraries", "AERON_DRIVER_DYNAMIC_LIBRARIES"),
+            ("agent.on.start.function", "AERON_AGENT_ON_START_FUNCTION"),
+        ] {
+            let error = resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[(env, "/nonexistent/libaeron_ats.so")],
+            )
+            .expect_err("this build loads no code");
+
+            match error {
+                ConfigError::DynamicLoadingNotSupported { property: named } => {
+                    assert_eq!(property, named);
+                }
+                other => panic!("{property} must be refused by name, got {other}"),
+            }
+
+            // And the property spelling is refused too, not only the
+            // environment variable.
+            let spelled = format!("aeron.{property}");
+            let error = resolve(&[("deepmsg.dir", "/tmp/aeron"), (&spelled, "something")])
+                .expect_err("likewise");
+            assert!(matches!(
+                error,
+                ConfigError::DynamicLoadingNotSupported { .. }
+            ));
+        }
+
+        // Empty is not naming one: the harness sets `AERON_EVENT_LOG_DISABLE`
+        // to nothing and expects a driver that starts.
+        let empty = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[
+                ("AERON_DRIVER_DYNAMIC_LIBRARIES", ""),
+                ("AERON_AGENT_ON_START_FUNCTION", ""),
+            ],
+        )
+        .expect("an empty value names no library");
+        assert!(empty.connect_enabled);
+    }
+
+    /// The three duty-cycle thresholds: one number doing two jobs. A pass longer
+    /// than its slot's threshold is counted by `*_CYCLE_TIME_THRESHOLD_EXCEEDED`
+    /// (`aeron_driver_context.c:1031-1043`), and the same number is what that
+    /// counter's **label** says it is (`aeron_driver_conductor.c:889-935`).
+    ///
+    /// The value the harness sends is a **bare nanosecond count** —
+    /// `String.valueOf(context.conductorCycleThresholdNs())`
+    /// (`CTestMediaDriver.java:294-296`) — so that spelling is pinned here
+    /// beside the duration one, and the property names are the Java
+    /// `Configuration`'s (`:1070`, `:1085`, `:1100`).
+    #[test]
+    fn the_cycle_thresholds_are_durations_under_their_own_names() {
+        let config = resolve_with_env(
+            &[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("aeron.driver.conductor.cycle.threshold", "7200s"),
+                ("aeron.driver.sender.cycle.threshold", "321us"),
+            ],
+            &[("AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD", "250000000")],
+        )
+        .expect("a config");
+
+        assert_eq!(7_200_000_000_000, config.conductor_cycle_threshold_ns);
+        assert_eq!(321_000, config.sender_cycle_threshold_ns);
+        assert_eq!(
+            250_000_000, config.receiver_cycle_threshold_ns,
+            "a bare count is nanoseconds, which is what the harness sends"
+        );
+
+        // Unset, each is the reference's own hundred milliseconds
+        // (`aeron_driver_context.c:236-238`).
+        let defaults = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.conductor_cycle_threshold_ns
+        );
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.sender_cycle_threshold_ns
+        );
+        assert_eq!(
+            CYCLE_THRESHOLD_NS_DEFAULT,
+            defaults.receiver_cycle_threshold_ns
+        );
     }
 
     /// The three cubic settings are the only ones this driver carries as

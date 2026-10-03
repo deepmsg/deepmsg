@@ -26,6 +26,7 @@ pub mod clients;
 pub mod conductor;
 pub mod config;
 pub mod congestion_control;
+pub mod cpuset;
 pub mod dir;
 pub mod driver;
 pub mod flowcontrol;
@@ -57,4 +58,5 @@ pub mod subscribable;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod system_counters;
+pub mod topology;
 pub mod udp_channel;

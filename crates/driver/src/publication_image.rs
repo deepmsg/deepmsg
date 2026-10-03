@@ -213,6 +213,30 @@ pub struct PublicationImage {
     pub connections: Vec<Connection>,
     /// When a packet was last seen, which is what decides draining.
     pub time_of_last_packet_ns: i64,
+    /// Who sends this stream, formatted the way a source identity is
+    /// (`aeron_publication_image.c:336-343`). It is what a loss report record
+    /// carries beside the channel, so a reader of `LossStat` can tell which
+    /// sender's packets went missing.
+    pub source_identity: Vec<u8>,
+    /// Where this image's record is in the loss report file, or `None` when
+    /// none has been made yet or the file refused one
+    /// (`aeron_publication_image.c:123-155`).
+    ///
+    /// The file is a fixed length and never wraps: a record that would not fit
+    /// leaves the image with [`PublicationImage::loss_report_given_up`] set
+    /// and **no** further attempts, which is what the reference does when
+    /// `create_entry` fails.
+    loss_report_entry_offset: Option<usize>,
+    /// Whether the record was refused — the reference's
+    /// `loss_report = NULL`, and the point at which this image stops being a
+    /// reporter at all.
+    loss_report_given_up: bool,
+    /// The span of the last report made, which is what keeps a hole that is
+    /// found again and again from being counted again and again
+    /// (`:452-479`).
+    loss_report_term_id: i32,
+    loss_report_term_offset: i32,
+    loss_report_length: usize,
     /// Whether a subscription has ever been linked to this image.
     ///
     /// The reference links a subscription to the image **before** the receiver
@@ -376,7 +400,7 @@ impl PublicationImage {
         channel: &[u8],
         log: Box<LogFile>,
         setup: &crate::protocol::SetupFrame,
-        _source: SocketAddr,
+        source: SocketAddr,
         control_address: SocketAddr,
         counters: ImageCounters,
         congestion_control: CongestionControl,
@@ -513,6 +537,17 @@ impl PublicationImage {
                 eos_position: 0,
             }],
             time_of_last_packet_ns: now_ns,
+            // The source identity is the reference's own formatting of the
+            // address the first packet came from — the same string
+            // `ON_AVAILABLE_IMAGE` carries (`aeron_publication_image.c:336-343`).
+            source_identity: crate::udp_channel::format_source_identity(source)
+                .unwrap_or_default()
+                .into_bytes(),
+            loss_report_entry_offset: None,
+            loss_report_given_up: false,
+            loss_report_term_id: 0,
+            loss_report_term_offset: 0,
+            loss_report_length: 0,
             has_been_linked: false,
             is_end_of_stream: false,
             linger_notice: false,
@@ -695,6 +730,106 @@ impl PublicationImage {
             gap.term_id,
         )
         .is_some()
+    }
+
+    /// Report loss to the driver's loss report file
+    /// (`aeron_publication_image_report_loss`, `aeron_driver_publication_image.c:123-155`
+    /// — the file itself is `crates/cnc/src/loss_report.rs`).
+    ///
+    /// Two things here are the reference's and neither is obvious:
+    ///
+    /// * the **first** report creates the record, with the channel and the
+    ///   source, and every later one only adds to it — so a reader sees one
+    ///   row per stream, not one per hole;
+    /// * a hole that is found again is only counted for the part that is
+    ///   **new**: the reference remembers the span it last reported and
+    ///   subtracts the overlap (`:470-478`), which is what keeps a hole the
+    ///   loss detector keeps rediscovering from inflating the total.
+    ///
+    /// A file that refuses the record — it is a fixed length and never wraps —
+    /// is the end of it for this image: [`PublicationImage::loss_report_given_up`]
+    /// goes up and nothing is tried again, which is the reference's
+    /// `loss_report = NULL`.
+    ///
+    /// # Returns
+    ///
+    /// The bytes this call added to the report, which is what the caller adds
+    /// to its work count.
+    pub fn report_loss(
+        &mut self,
+        file: &deepmsg_cnc::loss_report::LossReportFile,
+        cursor: &mut usize,
+        gap: &Gap,
+        timestamp_ms: i64,
+    ) -> usize {
+        if self.loss_report_given_up {
+            return 0;
+        }
+
+        let gap_length = i64::try_from(gap.length).unwrap_or(i64::MAX);
+        let gap_offset = i64::from(gap.term_offset);
+        let end_offset = i64::from(self.loss_report_term_offset)
+            + i64::try_from(self.loss_report_length).unwrap_or(i64::MAX);
+
+        let bytes_lost = if gap.term_id != self.loss_report_term_id || gap_offset >= end_offset {
+            gap_length
+        } else if gap_offset + gap_length > end_offset {
+            // Only the part past the span already reported.
+            gap_offset + gap_length - end_offset
+        } else {
+            // Inside what was already reported: nothing new, and the reference
+            // does not call its reporter at all.
+            return 0;
+        };
+
+        let Some(buffer) = file.writable() else {
+            self.loss_report_given_up = true;
+            return 0;
+        };
+
+        let reported = match self.loss_report_entry_offset {
+            Some(offset) => deepmsg_cnc::loss_report::record_observation(
+                &buffer,
+                offset,
+                bytes_lost,
+                timestamp_ms,
+            )
+            .is_some(),
+            None => {
+                let entry = deepmsg_cnc::loss_report::LossReportEntry {
+                    observation_count: 1,
+                    total_bytes_lost: bytes_lost,
+                    first_observation_timestamp: timestamp_ms,
+                    last_observation_timestamp: timestamp_ms,
+                    session_id: self.session_id,
+                    stream_id: self.stream_id,
+                    channel: self.channel.clone(),
+                    source: self.source_identity.clone(),
+                };
+
+                match entry.encode(&buffer, *cursor) {
+                    Some(()) => {
+                        self.loss_report_entry_offset = Some(*cursor);
+                        *cursor += entry.record_length();
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
+
+        if !reported {
+            // Full, or the offset was not in the file: the reference gives up
+            // on this image rather than retrying.
+            self.loss_report_given_up = true;
+            return 0;
+        }
+
+        self.loss_report_term_id = gap.term_id;
+        self.loss_report_term_offset = gap.term_offset;
+        self.loss_report_length = gap.length;
+
+        usize::try_from(bytes_lost).unwrap_or(0)
     }
 
     /// How far the reader has been moved, as the counters hold it.

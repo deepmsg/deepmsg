@@ -68,6 +68,7 @@ use deepmsg_cnc::command::{
 };
 use deepmsg_cnc::error_log::compose_description;
 use deepmsg_cnc::layout;
+use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{
     CncCreateError, CncFile, CounterManager, DistinctErrorLog, ToClientsTransmitter,
     ToDriverRingConsumer,
@@ -222,6 +223,9 @@ impl Command {
 pub enum ConductorError {
     /// The sender thread could not be started.
     Sender(std::io::Error),
+    /// The loss report file could not be created or mapped — the reference
+    /// fails its driver init for the same reason (`aeron_driver.c:888`).
+    LossReport(std::io::Error),
     /// The ready version could not be stored.
     Publish(CncCreateError),
     /// The to-driver region is not a ring this build can consume. Validation
@@ -264,6 +268,7 @@ impl std::fmt::Display for ConductorError {
             }
             Self::Agent(error) => write!(f, "the native resource agent did not start: {error}"),
             Self::Sender(error) => write!(f, "the sender thread did not start: {error}"),
+            Self::LossReport(error) => write!(f, "the loss report file could not be made: {error}"),
         }
     }
 }
@@ -273,7 +278,7 @@ impl std::error::Error for ConductorError {
         match self {
             Self::Publish(error) => Some(error),
             Self::SystemCounters(error) => Some(error),
-            Self::Agent(error) | Self::Sender(error) => Some(error),
+            Self::Agent(error) | Self::Sender(error) | Self::LossReport(error) => Some(error),
             Self::NoCommandRing
             | Self::NoEventRing
             | Self::NoCounterRegions
@@ -749,6 +754,17 @@ impl Conductor {
             ToClientsTransmitter::new(&region).ok_or(ConductorError::NoEventRing)?
         };
 
+        // The loss report file, before the counters are allocated: the
+        // reference creates it between the CnC file and the conductor's init
+        // (`aeron-driver/src/main/c/aeron_driver.c:888` then `:913`) and counts
+        // its length in `Bytes currently mapped` (`:948`) — which is a counter,
+        // so it has to be known first.
+        let loss_report = Arc::new(
+            crate::sys::loss_report_length(config)
+                .and_then(|length| LossReportFile::create(&config.aeron_dir, length))
+                .map_err(ConductorError::LossReport)?,
+        );
+
         // Two readings with two jobs, and they cannot be the same one: `now_ms`
         // is a date that goes into shared memory, while `now_ns` seeds the duty
         // cycle's deadlines, which are only ever compared against other
@@ -771,13 +787,23 @@ impl Conductor {
                 .ok_or(ConductorError::NoCounterRegions)?;
             #[allow(clippy::cast_possible_wrap)] // a file length, far below i64::MAX
             let bytes_mapped = cnc.file_length() as i64;
+            // The loss report is mapped too, and the counter says what this
+            // driver has mapped — both files (`aeron_driver.c:948`).
+            #[allow(clippy::cast_possible_wrap)]
+            let bytes_mapped = bytes_mapped + loss_report.length() as i64;
             system_counters::allocate_all(
                 &mut counters,
                 &regions,
                 now_ms,
                 bytes_mapped,
-                config.resolver_name.as_deref().unwrap_or(""),
-                config.name_resolver_threshold_ns,
+                &system_counters::LabelSuffixes {
+                    resolver_name: config.resolver_name.as_deref().unwrap_or(""),
+                    threading_mode: config.threading_mode.as_str(),
+                    conductor_cycle_threshold_ns: config.conductor_cycle_threshold_ns,
+                    sender_cycle_threshold_ns: config.sender_cycle_threshold_ns,
+                    receiver_cycle_threshold_ns: config.receiver_cycle_threshold_ns,
+                    name_resolver_threshold_ns: config.name_resolver_threshold_ns,
+                },
             )
             .map_err(ConductorError::SystemCounters)?
         };
@@ -912,7 +938,7 @@ impl Conductor {
             cnc.layout().counters_values.len(),
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
-            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.sender_cycle_threshold_ns,
             config.publication_linger_timeout_ns,
             config.re_resolution_check_interval_ns,
             config.status_message_timeout_ns,
@@ -931,12 +957,13 @@ impl Conductor {
         // — the one that maps an *image's* log buffer.
         let receiver = Receiver::split(
             Arc::clone(&cnc),
+            Arc::clone(&loss_report),
             cnc.layout().counters_values.len(),
             free_to_reuse_ms(config.counter_free_to_reuse_ns),
             usize::try_from(config.mtu_length).unwrap_or(1408),
             config.status_message_timeout_ns,
             config.receiver_window_length,
-            system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS,
+            config.receiver_cycle_threshold_ns,
             config.re_resolution_check_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
@@ -978,6 +1005,9 @@ impl Conductor {
                 // start-up (`aeron_wildcard_port_manager_set_range`, called
                 // from the context's own init, `aeron_driver_context.c:1058-1069`).
                 endpoints.set_port_range(config.sender_wildcard_port_range);
+                // And whether its endpoints connect their sockets, which is
+                // the context's too (`:527`).
+                endpoints.set_connect_enabled(config.connect_enabled);
                 endpoints
             },
             network_publications,
@@ -3999,7 +4029,7 @@ impl Conductor {
             system_counters::id::CONDUCTOR_MAX_CYCLE_TIME,
             cycle_ns,
         );
-        if cycle_ns > system_counters::CONDUCTOR_CYCLE_THRESHOLD_NS {
+        if cycle_ns > self.config.conductor_cycle_threshold_ns {
             system_counters::increment(
                 &self.counters,
                 &regions,

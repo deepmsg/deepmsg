@@ -27,10 +27,12 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver as Inbox, Sender as Outbox};
 use std::thread::JoinHandle;
 
+use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
 use crate::driver::Role;
@@ -645,8 +647,19 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
+        // A test-only constructor: it puts the loss report beside the CnC file
+        // it was handed, which is where a driver puts it too.
+        let loss_report = Arc::new(
+            LossReportFile::create(
+                cnc.path().parent().unwrap_or_else(|| Path::new(".")),
+                64 * 1024,
+            )
+            .map_err(|error| io::Error::other(format!("a loss report file: {error}")))?,
+        );
+
         let ReceiverParts { proxy, agent } = Self::split(
             cnc,
+            loss_report,
             values_length,
             free_to_reuse_timeout_ms,
             mtu_length,
@@ -660,6 +673,7 @@ impl Receiver {
             Role::Receiver.classic_name(),
             agent,
             crate::driver::default_strategy(),
+            None,
         )?;
 
         Ok(Self {
@@ -678,6 +692,7 @@ impl Receiver {
     #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
     pub(crate) fn split(
         cnc: Arc<CncFile>,
+        loss_report: Arc<LossReportFile>,
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
@@ -702,6 +717,7 @@ impl Receiver {
             },
             agent: ReceiverThread::new(
                 cnc,
+                loss_report,
                 counters,
                 mtu_length,
                 status_message_timeout_ns,
@@ -784,6 +800,14 @@ pub(crate) struct ReceiverThread {
     events: Outbox<ReceiverEvent>,
     endpoints: Vec<(u64, Box<ReceiveChannelEndpoint>)>,
     images: Vec<PublicationImage>,
+    /// The driver's loss report file, which this thread writes: the image's
+    /// state machine runs here, and the record is written where the gap is
+    /// found (`aeron_publication_image.c:452-479`).
+    loss_report: Arc<LossReportFile>,
+    /// Where the next record goes. The file has no header and no index — the
+    /// writer's cursor and the readers' zero-terminated walk are the whole
+    /// protocol (`crates/cnc/src/loss_report.rs`).
+    loss_report_cursor: usize,
     pending_setups: Vec<PendingSetup>,
     /// Answers to control-name re-resolutions, waiting for a pass that has the
     /// counter regions — the same hand-off the destination commands make.
@@ -798,6 +822,15 @@ pub(crate) struct ReceiverThread {
     re_resolution_deadline_ns: i64,
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
+    /// Which destinations have something to read (G4-3): the reference's
+    /// transport poller, per receiver (`aeron_driver_receiver.c:130-260` polls
+    /// through it).
+    poller: crate::media::poller::TransportPoller,
+    /// The indices `poller` answered with, reused across passes.
+    readable: Vec<usize>,
+    /// The (endpoint, destination) each index refers to, rebuilt each pass
+    /// because the lists change as channels come and go.
+    transports: Vec<(usize, usize)>,
     last_cycle_ns: i64,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Inbox<ReceiverCommand>,
@@ -807,6 +840,7 @@ impl ReceiverThread {
     #[allow(clippy::too_many_arguments)]
     fn new(
         cnc: Arc<CncFile>,
+        loss_report: Arc<LossReportFile>,
         counters: CounterManager,
         mtu_length: usize,
         status_message_timeout_ns: i64,
@@ -820,6 +854,8 @@ impl ReceiverThread {
         Self {
             commands,
             cnc,
+            loss_report,
+            loss_report_cursor: 0,
             counters,
             mtu_length,
             status_message_timeout_ns,
@@ -834,6 +870,9 @@ impl ReceiverThread {
             pending_resolutions: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
+            poller: crate::media::poller::TransportPoller::new(),
+            readable: Vec::new(),
+            transports: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
         }
     }
@@ -1241,6 +1280,9 @@ impl ReceiverThread {
             &mut self.images,
             &mut self.buffers,
             &mut self.datagrams,
+            &mut self.poller,
+            &mut self.readable,
+            &mut self.transports,
             &mut self.pending_setups,
             &system,
             &self.counters,
@@ -1256,6 +1298,8 @@ impl ReceiverThread {
             &system,
             &self.counters,
             &regions,
+            &self.loss_report,
+            &mut self.loss_report_cursor,
             now_ns,
         );
 
@@ -1371,11 +1415,15 @@ impl ReceiverThread {
     /// Read every endpoint's socket and give each datagram to the thing that
     /// wants it (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // one per thing the pass carries
     fn receive_datagrams(
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
+        poller: &mut crate::media::poller::TransportPoller,
+        readable: &mut Vec<usize>,
+        transports: &mut Vec<(usize, usize)>,
         pending_setups: &mut Vec<PendingSetup>,
         system: &System<'_>,
         counters: &CounterManager,
@@ -1387,7 +1435,54 @@ impl ReceiverThread {
         let _ = cnc;
         let mut work = 0;
 
-        for (endpoint_id, endpoint) in endpoints.iter_mut() {
+        // Which destinations have something to read this pass (G4-3). At or
+        // below the poller's threshold this is every one of them, in order —
+        // the behaviour this driver has always had — and above it only the ones
+        // the kernel says are ready (`media/aeron_udp_transport_poller.c:190-206`).
+        //
+        // A destination whose transport has no descriptor of its own — a test's
+        // — makes the pass read everything, because a poller that cannot see a
+        // socket must not be the reason it is skipped.
+        transports.clear();
+        let mut descriptors: Vec<crate::sys::socket::Descriptor> = Vec::new();
+        let mut every_transport_has_one = true;
+
+        for (endpoint_index, (_, endpoint)) in endpoints.iter().enumerate() {
+            for destination_index in 0..endpoint.destination_count() {
+                transports.push((endpoint_index, destination_index));
+
+                match endpoint.destination_descriptor(destination_index) {
+                    Some(descriptor) => descriptors.push(descriptor),
+                    None => every_transport_has_one = false,
+                }
+            }
+        }
+
+        if every_transport_has_one {
+            if poller.ready(&descriptors, readable).is_err() {
+                // A poller that cannot answer is not a reason to read nothing:
+                // the pass reads everything, which is the branch below the
+                // threshold and always correct.
+                readable.clear();
+                readable.extend(0..transports.len());
+            }
+        } else {
+            readable.clear();
+            readable.extend(0..transports.len());
+        }
+
+        for readable_index in readable.iter() {
+            let Some((endpoint_index, destination_index)) =
+                transports.get(*readable_index).copied()
+            else {
+                continue;
+            };
+
+            let Some((endpoint_id, endpoint)) = endpoints.get_mut(endpoint_index) else {
+                continue;
+            };
+
+            let endpoint_id = *endpoint_id;
             // Every destination, not just the first: a multi-destination channel
             // has one socket per destination and a datagram that arrives on any
             // of them is a datagram this endpoint has to read
@@ -1400,7 +1495,7 @@ impl ReceiverThread {
             // not through the first one. The position below is only the cursor
             // for this pass — what is passed on is the destination's own
             // handle, because that is what an image keeps.
-            for destination_index in 0..endpoint.destination_count() {
+            {
                 let Some(destination) = endpoint.destination_id(destination_index) else {
                     continue;
                 };
@@ -1433,7 +1528,7 @@ impl ReceiverThread {
 
                     let packet = &buffers[slot][..datagram.length];
                     Self::dispatch(
-                        *endpoint_id,
+                        endpoint_id,
                         destination,
                         endpoint,
                         images,
@@ -1703,6 +1798,8 @@ impl ReceiverThread {
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
+        loss_report: &LossReportFile,
+        loss_report_cursor: &mut usize,
         now_ns: i64,
     ) -> usize {
         let mut work = 0;
@@ -1721,6 +1818,17 @@ impl ReceiverThread {
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
+                // The report comes first and is the same on both paths: what
+                // happens next (a NAK, or a gap fill) is about *repairing* the
+                // hole, and the reference reports the hole itself before either
+                // (`aeron_publication_image_on_gap_detected`, `:452-479`).
+                work += image.report_loss(
+                    loss_report,
+                    loss_report_cursor,
+                    &gap,
+                    deepmsg_core::clock::epoch_millis(),
+                );
+
                 if image.is_reliable() {
                     // A NAK goes to every connection this image hears from, like
                     // a status message: each receiver has its own view of what is

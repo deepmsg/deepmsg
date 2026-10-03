@@ -51,17 +51,34 @@ tool that *parses* the field (none in the reference does; `AeronStat` prints
 it) would take `deepmsg-0.1.0` for a commit, which is the one honest thing it
 could say.
 
+It is also the one divergence here with a **known cost**, and the cost is
+worth stating plainly: `io.aeron.driver.SystemCountersTest::verifySystemCounters`
+asserts every label starts with the Java `SystemCounterDescriptor`'s, and the
+`Errors` descriptor carries the Java build's own `MediaDriverVersion.GIT_SHA` —
+`664f58e705+guilty` for this checkout, dirty marker included. The reference's C
+driver passes that assertion because both halves were built from the same tree,
+not because the string is a contract a driver can implement; satisfying it means
+writing down an environment fact. The test therefore stops there for this
+driver, and the labels after id 15 are covered by the golden comparison
+below instead.
+
 The other labels the reference suffixes at runtime — the driver's threading
 mode, the resolver's name, the duty-cycle thresholds
 (`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
-reference's own text changes with its settings. deepmsg appends `DEDICATED` to
-the conductor's, the sender's and the receiver's cycle-time counters, matching
-the reference's word for a driver whose agents are threads of their own — which
-is what this build's three are. The name-resolver pair (32 and 33) is left
-unsuffixed, which is a gap rather than a decision: the resolver does run on an
-agent thread here now, so the reference's suffix has something to name and this
-build simply does not append it yet — the duty-cycle suffixes are the slice
-that owns the runtime labels (`aeron_driver_conductor.c:848-951`).
+reference's own text changes with its settings, and deepmsg's now follows its
+own. All eight suffixes are built from the settings at allocation
+(`crates/driver/src/system_counters.rs`): `: driverName=<name>` on 25, the
+configured `aeron.threading.mode` on 26/28/30, `: threshold=<duration> <mode>`
+on 27/29/31 out of the three `*.cycle.threshold` settings — the same numbers
+those counters count against — and `: threshold=<duration>` on 33, which is the
+one suffix the reference prints without a mode, because a resolver runs on the
+native resource agent and has no duty cycle of its own to name. Counter 32
+keeps its bare label, which is also what the reference does. Durations are
+printed the reference's way: the largest unit that divides them exactly, `s`,
+`ms`, `us`, and nanoseconds otherwise (`aeron_format_duration_ns`,
+`util/aeron_parse_util.c:270-330`).
+`io.aeron.driver.DutyCycleLabelFormatTest` is the oracle, over all four
+threading modes.
 
 The consequence for testing: a golden comparison of the two catalogues
 compares each label up to its first colon, and
@@ -174,6 +191,47 @@ pinned by configuration's own tests, and the warning's shape by the
 conductor's
 `a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands`.
 
+## The loss report
+
+The driver creates `loss-report.dat` in the aeron directory at startup and
+appends one record per stream that loses data; clients map it and walk the
+records. The name, the record layout and the write order are the reference's,
+because what reads this file is not this build's code:
+`crates/cnc/src/loss_report.rs` is the format, and the reference's own
+`LossStat` reads what this driver wrote in
+`tests/interop/loss_report.rs` (see below for the one thing that does not line
+up).
+
+| Fact | Where |
+|---|---|
+| `loss-report.dat`, created by the driver before the conductor starts | `aeron-driver/src/main/c/aeron_driver.c:888`, `:324-345` |
+| Length = the configured length aligned up to the file page size; 1 MiB by default | `:329-330`; `aeron_driver_context.c:490`; `aeron.loss.report.buffer.length` at `:841` |
+| Counted in `Bytes currently mapped` | `:948` |
+| A 40-byte `#pragma pack(4)` header, then channel and source behind four-byte lengths, the record rounded up to a 64-byte cache line | `reports/aeron_loss_reporter.h:30-44` |
+| `observation_count` written **last**, with a release: a reader stops at the first non-positive one | `reports/aeron_loss_reporter.c:44-68`, `:120-126` |
+| The first report creates the record (channel and source included), later ones only add | `aeron_publication_image.c:123-155` |
+| A hole found again is only counted past what was already reported | `:452-479` |
+| A record that does not fit gives up for that image — no retry | `:145-150` |
+
+The one divergence is inside the reference, between its own writer and its own
+**C** reader. The stride a record takes is
+`40 + align4(4 + channel) + 4 + source`, rounded up to 64 — the writer's
+arithmetic (`aeron_loss_reporter.c:44-46`) and Java's reader's
+(`LossReportReader.java:143-147`). The C reader computes
+`40 + 8 + channel + source` and rounds that (`:157-159`), which is the same
+number unless the channel's four-byte padding pushes the record across a
+64-byte boundary. deepmsg writes what the writer writes and reads with the
+writer's arithmetic; the C reader's difference is the reference's and does not
+appear for the lengths a real channel URI and source identity have, which is
+why `LossStat` reads this driver's file in the interop test.
+
+`io.aeron.GapFillLossTest` and `PubAndSubTest` call
+`SystemTests.verifyLossOccurredForStream`, which asserts this file exists and
+names the stream — but they **cannot** go green against an external driver for
+a reason that has nothing to do with the file: they inject their loss through
+`TestMediaDriver.enableRandomLoss`, a Java object in the test's own process
+(`GapFillLossTest.java:76-83`), so the driver never sees a lost datagram.
+
 ## The distinct error log
 
 An entry this driver records carries the reference's composition — the
@@ -249,6 +307,75 @@ than that, and answers the cursor's own id rather than failing when even that
 window is full. Covered by
 `crates/driver/src/ipc_publications.rs::a_speculated_session_is_the_first_one_the_stream_is_not_using`
 and `::a_speculation_always_answers_even_when_every_id_is_in_use`.
+
+## Settings that name code
+
+Two settings exist to **load code into the driver**, and this build refuses both
+by name rather than dropping them:
+
+| Setting | What the reference does | Where |
+|---|---|---|
+| `aeron.driver.dynamic.libraries` | `aeron_dl_load_libs` at context init; an unloadable library stops the driver | `aeronmd.h:980`; `aeron_driver_context.c:539-546` |
+| `aeron.agent.on.start.function` | `aeron_dlsym(RTLD_DEFAULT, name)`; a symbol that is not there prints `could not find agent on_start func …: dlsym - …` and stops the driver | `aeronmd.h:513`; `aeron_driver_context.c:555-561`; `aeron-client/src/main/c/aeron_agent.c:337-348` |
+
+Neither can be served: ADR-0002 keeps FFI out of this build, so there is no
+`dlopen` and no `dlsym` to point at anything. Refusing is the same *outcome* the
+reference has for a library or symbol that will not load — a driver that does
+not start — and it is better than accepting them, which would be a deployment
+running without the interceptors or the agent hook it asked for and never being
+told. The refusal names the setting and says why
+(`ConfigError::DynamicLoadingNotSupported`), with the reference's own
+behaviour as the reason. An empty value names nothing and is not a refusal.
+
+This is the one exception to the process contract's rule that a name this
+driver has never heard of must not stop it
+(`tests/integration/driver_process_contract.rs`, the module docs and
+`::the_settings_that_name_code_stop_the_driver_with_a_reason`).
+
+The three **suppliers** are the same kind of setting — the reference `dlsym`s
+the name it is given — and they are not refused wholesale: this build serves the
+names in the reference's own table and refuses the ones that are not in it,
+which is recorded above under the flow-control settings. The ATS channel
+interceptors (`AERON_UDP_CHANNEL_{INCOMING,OUTGOING}_INTERCEPTORS`) are accepted
+and ignored, because the channel parameters that would use them are refused when
+a client names them, which is where a deployment would notice.
+
+`aeron.driver.connect` is **not** one of these, though an earlier plan filed it
+here: it is a boolean (`aeron_driver_context.c:247,668`) that decides whether a
+send endpoint whose channel names an explicit endpoint connects its socket to it
+(`media/aeron_send_channel_endpoint.c:89`). It is read and acted on —
+`crates/driver/src/media/send_endpoint.rs`, with the two outcomes pinned by
+`::an_endpoint_that_is_not_connected_can_send_somewhere_else` and
+`::a_connected_endpoint_sends_only_where_its_channel_points`.
+
+## The event log
+
+`AERON_EVENT_LOG` and the three names beside it are **accepted and ignored**:
+this driver writes no event log, and creates no file for one.
+
+The reference has two mechanisms under that name and neither is a contract a
+replacement driver can meet. Its **C** driver starts a log-reader thread when
+the variable is set and writes events to stdout, or to the file
+`AERON_EVENT_LOG_FILENAME` names, exiting outright if that file will not open
+(`aeron-driver/src/main/c/agent/aeron_driver_agent.c:499-540`) — nothing in the
+tree asserts on that output, and the only test that sets the variable
+(`aeron-driver/src/test/c/aeron_name_resolver_test.cpp:1034`) merely turns it
+on. Its **Java** driver writes into a ring buffer that a Java agent in the same
+JVM reads (`driver/logging/DriverEventLogger.java:46`,
+`logging/CollectingEventLogReaderAgent.java:76-78`), which is what
+`io.aeron.driver.DriverLoggingSystemTest` asserts on — a test the harness
+excludes from its `test` task and runs in one of its own that points at no
+external driver (`build.gradle:1145`, `:1148-1156`).
+
+So there is nothing to be compatible *with*, and refusing the names is not an
+option either: `CTestMediaDriver` sets `AERON_EVENT_LOG` and
+`AERON_EVENT_LOG_DISABLE` on every driver it starts
+(`CTestMediaDriver.java:459-466`). Accepting them and doing nothing is the only
+position left, and it is the one this driver takes.
+`tests/integration/driver_process_contract.rs::the_event_log_names_are_accepted_and_make_no_log`
+pins both halves: the driver serves with all four names set, stops cleanly,
+keeps stderr empty, and — the half a test can forget — does **not** create the
+file the filename name points at.
 
 ## The channel URIs this driver refuses
 

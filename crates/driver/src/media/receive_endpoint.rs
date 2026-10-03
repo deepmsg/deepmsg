@@ -142,6 +142,11 @@ fn bind_report(
 
 /// A receive channel endpoint and its socket.
 impl ReceiveDestination {
+    /// The descriptor the poller watches for this destination (G4-3).
+    pub fn descriptor(&self) -> Option<crate::sys::socket::Descriptor> {
+        self.transport.descriptor()
+    }
+
     /// A destination with a socket of its own
     /// (`aeron_receive_destination_create`,
     /// `media/aeron_receive_destination.c:30-139`).
@@ -1103,6 +1108,15 @@ impl ReceiveChannelEndpoint {
     /// poller — every transport in it).
     pub fn destination_count(&self) -> usize {
         self.destinations.len()
+    }
+
+    /// The descriptor of the destination at `index`, for the poller that says
+    /// which of them have anything (G4-3), or `None` for a destination whose
+    /// transport has no socket of its own.
+    pub fn destination_descriptor(&self, index: usize) -> Option<crate::sys::socket::Descriptor> {
+        self.destinations
+            .get(index)
+            .and_then(|(_, destination)| destination.descriptor())
     }
 
     /// The handle of the destination at `index`, for a caller walking the list.
