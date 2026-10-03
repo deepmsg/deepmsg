@@ -267,6 +267,35 @@ window is full. Covered by
 `crates/driver/src/ipc_publications.rs::a_speculated_session_is_the_first_one_the_stream_is_not_using`
 and `::a_speculation_always_answers_even_when_every_id_is_in_use`.
 
+## The event log
+
+`AERON_EVENT_LOG` and the three names beside it are **accepted and ignored**:
+this driver writes no event log, and creates no file for one.
+
+The reference has two mechanisms under that name and neither is a contract a
+replacement driver can meet. Its **C** driver starts a log-reader thread when
+the variable is set and writes events to stdout, or to the file
+`AERON_EVENT_LOG_FILENAME` names, exiting outright if that file will not open
+(`aeron-driver/src/main/c/agent/aeron_driver_agent.c:499-540`) — nothing in the
+tree asserts on that output, and the only test that sets the variable
+(`aeron-driver/src/test/c/aeron_name_resolver_test.cpp:1034`) merely turns it
+on. Its **Java** driver writes into a ring buffer that a Java agent in the same
+JVM reads (`driver/logging/DriverEventLogger.java:46`,
+`logging/CollectingEventLogReaderAgent.java:76-78`), which is what
+`io.aeron.driver.DriverLoggingSystemTest` asserts on — a test the harness
+excludes from its `test` task and runs in one of its own that points at no
+external driver (`build.gradle:1145`, `:1148-1156`).
+
+So there is nothing to be compatible *with*, and refusing the names is not an
+option either: `CTestMediaDriver` sets `AERON_EVENT_LOG` and
+`AERON_EVENT_LOG_DISABLE` on every driver it starts
+(`CTestMediaDriver.java:459-466`). Accepting them and doing nothing is the only
+position left, and it is the one this driver takes.
+`tests/integration/driver_process_contract.rs::the_event_log_names_are_accepted_and_make_no_log`
+pins both halves: the driver serves with all four names set, stops cleanly,
+keeps stderr empty, and — the half a test can forget — does **not** create the
+file the filename name points at.
+
 ## The channel URIs this driver refuses
 
 Three shapes the reference *serves*, this driver refuses, because in each one

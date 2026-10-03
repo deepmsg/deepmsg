@@ -163,11 +163,12 @@ const READ: &[(&str, &str)] = &[
 /// - `AERON_IMAGE_LIVENESS_TIMEOUT` is set by **39 of the system tests**, more
 ///   than any other name this driver does not read. If the baseline has a
 ///   cluster of timeouts, this is the first name to suspect.
-/// - `AERON_EVENT_LOG` is set **unconditionally** to `"admin"` (`:459-462`),
-///   so the reference's instrumentation layer is on in every single test
-///   whether the test asked for it or not. Accepting the name is what this
-///   clause requires; what its absence means for the baseline is a separate
-///   question with its own answer in G0-2.
+/// - `AERON_EVENT_LOG` is set **unconditionally** to `"admin"` (`:459-466`,
+///   with `AERON_EVENT_LOG_DISABLE` beside it), so the reference's
+///   instrumentation layer is on in every single test whether the test asked
+///   for it or not. Accepting the names is what this clause requires, and
+///   [`the_event_log_names_are_accepted_and_make_no_log`] is the test that says
+///   what this driver does with them: nothing, and no log file.
 const IGNORED: &[(&str, &str)] = &[
     (
         "AERON_DRIVER_DYNAMIC_LIBRARIES",
@@ -187,6 +188,14 @@ const IGNORED: &[(&str, &str)] = &[
     ("AERON_ENABLE_EXPERIMENTAL_FEATURES", "true"),
     ("AERON_EVENT_LOG", "admin"),
     ("AERON_EVENT_LOG_DISABLE", ""),
+    // The C driver's agent has two more names of its own, which the harness
+    // does not send but a deployment copying a reference configuration might.
+    // The filename is deliberately one the reference **could not** use — its
+    // agent exits when the file will not open
+    // (`agent/aeron_driver_agent.c:499-540`) — which is the divergence in one
+    // line: this driver ignores the name, so a value like this one is harmless.
+    ("AERON_EVENT_LOG_FILENAME", "/nonexistent/driver.log"),
+    ("AERON_EVENT_LOG_FILE_MAX_LENGTH", "1m"),
     ("AERON_FLOW_CONTROL_GROUP_MIN_SIZE", "3"),
     ("AERON_FLOW_CONTROL_GROUP_TAG", "7"),
     ("AERON_IMAGE_LIVENESS_TIMEOUT", "15s"),
@@ -257,6 +266,18 @@ struct Fixture {
 impl Fixture {
     /// Start a driver with `env` on top of the configuration every test needs.
     fn start(name: &str, env: &[(&str, &str)]) -> Option<Self> {
+        Self::start_with(name, |_| {
+            env.iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        })
+    }
+
+    /// The same, for a test whose environment has to **name a path inside this
+    /// fixture's own directory** — the event log's filename is one, and a path
+    /// computed before the fixture exists would be a path the fixture cannot
+    /// remove.
+    fn start_with(name: &str, env: impl FnOnce(&Path) -> Vec<(String, String)>) -> Option<Self> {
         let binary = driver::locate_own()?;
         let dir = TempDir::new(&format!("deepmsg-g0-1-{name}"));
         let aeron_dir = dir.path().join("aeron");
@@ -268,7 +289,7 @@ impl Fixture {
         let mut command = Command::new(binary);
         command
             .env("AERON_DIR", &aeron_dir)
-            .envs(env.iter().copied())
+            .envs(env(dir.path()))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
 
@@ -507,6 +528,84 @@ fn every_variable_the_reference_harness_can_send_is_accepted() {
         fixture.stderr_len(),
         "one of the {} variables produced a diagnostic",
         all.len()
+    );
+}
+
+/// The event log: the four `AERON_EVENT_LOG*` names are **accepted and
+/// ignored**, and this driver makes no log.
+///
+/// The reference's C driver starts a log-reader thread when `AERON_EVENT_LOG`
+/// is set and writes events to **stdout**, or to the file
+/// `AERON_EVENT_LOG_FILENAME` names
+/// (`aeron-driver/src/main/c/agent/aeron_driver_agent.c:499-540`). None of that
+/// is implemented here, and the harness leaves no choice about accepting the
+/// names: `CTestMediaDriver` sets `AERON_EVENT_LOG` and `AERON_EVENT_LOG_DISABLE`
+/// on **every** driver it starts (`CTestMediaDriver.java:459-466`), so refusing
+/// them would fail every system test at once.
+///
+/// The other half of the clause is the file. A driver that took the filename
+/// and then created it would be claiming a log it never writes, so the
+/// assertion is that it is not there.
+///
+/// `io.aeron.driver.DriverLoggingSystemTest` is **not** the oracle for this: it
+/// is excluded from the harness's `test` task (`build.gradle:1145`) and run by a
+/// task of its own that points at no external driver (`:1148-1156`), because
+/// what it asserts is the content of a ring buffer the Java driver writes and a
+/// Java agent reads **in one JVM** (`driver/logging/DriverEventLogger.java:46`,
+/// `logging/CollectingEventLogReaderAgent.java:76-78`). `docs/compat.md` holds
+/// the divergence.
+#[test]
+fn the_event_log_names_are_accepted_and_make_no_log() {
+    let Some(mut fixture) = Fixture::start_with("event-log", |dir| {
+        vec![
+            // The default validator refuses `TERMINATE_DRIVER`, and this test
+            // wants the clean shutdown path (`TerminationPolicy::Allow`).
+            (
+                "AERON_DRIVER_TERMINATION_VALIDATOR".to_owned(),
+                "allow".to_owned(),
+            ),
+            ("AERON_EVENT_LOG".to_owned(), "all".to_owned()),
+            ("AERON_EVENT_LOG_DISABLE".to_owned(), "FRAME_IN".to_owned()),
+            (
+                "AERON_EVENT_LOG_FILENAME".to_owned(),
+                dir.join("driver.log").display().to_string(),
+            ),
+            (
+                "AERON_EVENT_LOG_FILE_MAX_LENGTH".to_owned(),
+                "1m".to_owned(),
+            ),
+        ]
+    }) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let log = fixture
+        .aeron_dir()
+        .parent()
+        .expect("the aeron directory is inside the fixture's own")
+        .join("driver.log");
+
+    let _ = fixture.await_cnc();
+    publish_and_read(&fixture);
+
+    fixture.terminate();
+
+    assert_eq!(
+        0,
+        fixture.stderr_len(),
+        "and it said nothing about it either"
+    );
+    assert_eq!(
+        Some(0),
+        fixture.exit().code(),
+        "asked to stop, so it stopped"
+    );
+    assert!(
+        !log.exists(),
+        "{} was created: this driver writes no event log, and a file there \
+         would say it does",
+        log.display()
     );
 }
 
