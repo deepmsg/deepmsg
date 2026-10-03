@@ -140,9 +140,25 @@ fn client_view(client: &Client, subscription_id: i64) -> String {
 /// something nobody sent. The records have no newlines of their own, so the
 /// newlines go first and the records are found by their own shape.
 ///
-/// An offer that failed says what it failed with instead of `yay!`, and is
-/// left out for the same reason the test's comment gives: a message the
-/// publisher never published is not ours to deliver.
+/// **And not by shape alone**, because a second writer shares the file: the
+/// C++ wrapper reports the new publication from the client's *conductor*
+/// thread (`newPublicationHandler`, which `BasicPublisher` writes as
+/// `Publication: <channel> <correlationId>:<streamId>:<sessionId>`), and that
+/// line can land inside one of the sample's own records. A chain of `<<` is
+/// not atomic — each insertion is, the chain is not — so the notice can be
+/// interleaved between any two of the record's own pieces, and the record then
+/// reads as garbage that a shape check throws away:
+///
+/// ```text
+/// offering Publication: aeron:udp?endpoint=localhost:20111 2:4104:-489833525 0/5 - yay!
+/// ```
+///
+/// Two things make that readable anyway, and [`read_offer`] is built on them:
+/// the notice carries **no `/`** and **no `yay!`**, so the first `/` in a
+/// record's window is the record's own, and a `yay!` before the next `offering `
+/// is this record's. An offer that failed says what it failed with instead of
+/// `yay!`, and is left out for the same reason the test's comment gives: a
+/// message the publisher never published is not ours to deliver.
 fn scan_offers(output: &str) -> Vec<u64> {
     let flattened: String = output
         .chars()
@@ -152,16 +168,72 @@ fn scan_offers(output: &str) -> Vec<u64> {
     flattened
         .split("offering ")
         .skip(1)
-        .filter_map(|record| {
-            let (index, rest) = record.split_once('/')?;
-            let (_, result) = rest.split_once(" - ")?;
-
-            result
-                .starts_with("yay!")
-                .then(|| index.trim().parse().ok())
-                .flatten()
-        })
+        .filter_map(read_offer)
         .collect()
+}
+
+/// One record's index, when the record says the offer succeeded.
+///
+/// `window` is everything from the record's own `offering ` to the next one,
+/// which is where the interleaved notice would be if it landed inside this
+/// record — and it can land between **any** two of the pieces the record was
+/// printed in. This is the shape a loaded machine produced:
+///
+/// ```text
+/// offering 0/Publication: aeron:udp?endpoint=localhost:24715 5 - 2:4104:-974814455
+/// yay!
+/// ```
+///
+/// The notice is the `Publication: …` in the middle of it — the sample's `/`
+/// and its index are on one side of it, its count and its ` - ` on the other.
+/// So the reader takes the pieces the notice cannot imitate:
+///
+/// * the `/` is the record's, because the notice never prints one;
+/// * the ` - ` and the `yay!` are the record's, for the same reason (`yay!` is
+///   the sample's word for an offer that worked);
+/// * the index is the digits on one side of that `/`: the window's leading
+///   digits when the notice landed after the index, and the digits just before
+///   the `/` when it landed before it.
+///
+/// The count is read when it is legible, and used as the sample's own bound —
+/// it prints `i/numberOfMessages` for an `i` its own loop keeps below that
+/// (`aeron-samples/src/main/cpp/BasicPublisher.cpp:118-127`), so an index at or
+/// above it is a number that came from somewhere else. When the notice split
+/// the count off too, there is nothing to check against and the index stands
+/// on its own.
+fn read_offer(window: &str) -> Option<u64> {
+    if !window.contains(" - ") || !window.contains("yay!") {
+        return None;
+    }
+
+    let slash = window.find('/')?;
+    let index: u64 = leading_digits(window)
+        .or_else(|| trailing_digits(&window[..slash]))?
+        .parse()
+        .ok()?;
+
+    match leading_digits(&window[slash + 1..]).and_then(|count| count.parse::<u64>().ok()) {
+        Some(count) => (index < count).then_some(index),
+        None => Some(index),
+    }
+}
+
+/// The digits `text` begins with, if it begins with any.
+fn leading_digits(text: &str) -> Option<&str> {
+    let end = text
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(text.len());
+
+    (end > 0).then(|| &text[..end])
+}
+
+/// The digits `text` ends with, if it ends with any.
+fn trailing_digits(text: &str) -> Option<&str> {
+    let start = text
+        .rfind(|character: char| !character.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+
+    (start < text.len()).then(|| &text[start..])
 }
 
 #[test]
@@ -289,8 +361,11 @@ fn a_reference_publishers_messages_reach_our_receive_destination() {
         "every message that arrived is one of the sample's own: {received_text:?}"
     );
     assert_eq!(
-        published, received_index,
-        "every message the reference published arrived, once, in order"
+        published,
+        received_index,
+        "every message the reference published arrived, once, in order.\n\
+         the publisher said:\n{publisher_said}\nour driver said:\n{}",
+        own.log_tail(60)
     );
 
     // And the window did not close again afterwards. A failure to publish
@@ -1192,4 +1267,102 @@ fn the_address_a_send_endpoint_is_bound_to_is_what_a_reader_finds() {
         "the counter says {label}, and the bytes that reached the subscriber \
          came from port {wire_port}\nour driver said:\n{log}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sample's own output, as the reference build writes it when the two
+    /// threads do not interleave (`aeron-samples/src/main/cpp/BasicPublisher.cpp:53-75`
+    /// for the banner, `:117-135` for the offers).
+    const UNDISTURBED: &str = "\
+Publishing to channel aeron:udp?endpoint=localhost:22669 on Stream ID 4104
+Publication: aeron:udp?endpoint=localhost:22669 2:4104:-489833525
+Publication channel status (id=46) ACTIVE
+offering 0/5 - yay!
+offering 1/5 - yay!
+offering 2/5 - yay!
+offering 3/5 - yay!
+offering 4/5 - yay!
+Done sending.
+";
+
+    #[test]
+    fn the_offers_are_read_when_nothing_interleaves() {
+        assert_eq!(vec![0, 1, 2, 3, 4], scan_offers(UNDISTURBED));
+    }
+
+    /// The notice landing **inside** a record, which is the shape that made
+    /// this test fail about one run in three under load: the index parses as
+    /// part of the notice's own text, so the record is dropped and the
+    /// publisher looks like it never published message 0.
+    #[test]
+    fn an_offer_is_still_read_when_the_notice_lands_inside_it() {
+        let written = UNDISTURBED.replace(
+            "offering 0/5 - yay!",
+            "offering Publication: aeron:udp?endpoint=localhost:22669 2:4104:-489833525 0/5 - yay!",
+        );
+
+        assert_eq!(vec![0, 1, 2, 3, 4], scan_offers(&written));
+    }
+
+    /// The other direction: a record landing inside the notice, which splits
+    /// the notice's own line in two.
+    #[test]
+    fn an_offer_inside_the_notice_is_still_read() {
+        // The notice's own line split around two of the sample's own prints:
+        // the banner and the first offer.
+        let written = UNDISTURBED.replace(
+            "Publication: aeron:udp?endpoint=localhost:22669 2:4104:-489833525\n\
+             Publication channel status (id=46) ACTIVE\noffering 0/5 - yay!\n",
+            "Publication: aeron:udp?endpoint=localhost:22669 2:4104:\n\
+             Publication channel status (id=46) ACTIVE\noffering 0/5 - yay!\n-489833525\n",
+        );
+
+        assert!(
+            written.contains("2:4104:\nPublication channel status (id=46) ACTIVE\noffering 0/5 - yay!\n-489833525"),
+            "the arrangement has the offer inside the notice"
+        );
+        assert_eq!(vec![0, 1, 2, 3, 4], scan_offers(&written));
+    }
+
+    /// The shape the earlier fix was written for: the sample's first offer on
+    /// the same line as the client's status banner, split by the notice's
+    /// newline (`a7b56d3`).
+    #[test]
+    fn an_offer_split_by_the_notices_newline_is_read() {
+        let written = UNDISTURBED.replace(
+            "offering 0/5 - yay!",
+            "4104:-489833525offering 0/\n5 - yay!",
+        );
+
+        assert_eq!(vec![0, 1, 2, 3, 4], scan_offers(&written));
+    }
+
+    /// The shape a loaded machine actually produced (`fixed-1.log`): the
+    /// notice landed between the record's `/` and its count, so the index and
+    /// the slash are on one side of it and everything else on the other.
+    #[test]
+    fn an_offer_split_around_the_notice_is_read() {
+        let written = UNDISTURBED.replace(
+            "offering 0/5 - yay!",
+            "offering 0/Publication: aeron:udp?endpoint=localhost:24715 5 - 2:4104:-974814455\nyay!",
+        );
+
+        assert_eq!(vec![0, 1, 2, 3, 4], scan_offers(&written));
+    }
+
+    /// An offer that failed is not one the publisher published, and a notice
+    /// interleaved into a failure must not turn it into one.
+    #[test]
+    fn a_failed_offer_is_left_out_however_it_is_interleaved() {
+        let written = UNDISTURBED.replace(
+            "offering 2/5 - yay!",
+            "offering 2/5 - Publication: aeron:udp?endpoint=localhost:22669 2:4104:-489833525\n\
+             Offer failed because publisher is not connected to a subscriber",
+        );
+
+        assert_eq!(vec![0, 1, 3, 4], scan_offers(&written));
+    }
 }
