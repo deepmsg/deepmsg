@@ -389,7 +389,11 @@ impl NativeResourceAgent {
             state,
         } = Self::split(checks)?;
 
-        let thread = crate::driver::run_agent(Role::NativeResourceAgent.classic_name(), state)?;
+        let thread = crate::driver::run_agent(
+            Role::NativeResourceAgent.classic_name(),
+            state,
+            crate::driver::default_strategy(),
+        )?;
 
         Ok(Self {
             requests: handle.requests,

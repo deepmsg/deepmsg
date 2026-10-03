@@ -8,6 +8,10 @@
 //! - a sender and a receiver thread for the data plane (M10 / M11),
 //! - name-resolution offload and asynchronous resource reclamation.
 //!
+//! How many threads that is, and which piece is on which, is
+//! `aeron.threading.mode`'s to say — see [`driver`], which is the reference's
+//! `aeron_driver_t` and the runner table it builds from the setting.
+//!
 //! Unsafe is denied at crate root, and exactly one module carries the
 //! documented allow ADR-0002 zone 4 provides for: [`sys`], which holds the
 //! kernel seam — signals, the socket probe a log buffer's metadata is written
@@ -23,7 +27,7 @@ pub mod conductor;
 pub mod config;
 pub mod congestion_control;
 pub mod dir;
-pub(crate) mod driver;
+pub mod driver;
 pub mod flowcontrol;
 pub mod idle;
 pub mod ipc_publication;

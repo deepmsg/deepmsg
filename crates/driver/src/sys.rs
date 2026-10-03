@@ -5,8 +5,8 @@
 //! (`sendmmsg`, `recvmmsg`) and is amended here to cover the rest of what a
 //! driver process needs from the kernel.
 //!
-//! Three things live here, and they have nothing in common but the reason they
-//! cannot be expressed in safe Rust or belong to a protocol module:
+//! The things that live here have nothing in common but the reason they cannot
+//! be expressed in safe Rust or belong to a protocol module:
 //!
 //! * **Signals.** The reference installs a handler for `SIGINT` and `SIGTERM`
 //!   and records the signal number (`aeron-driver/src/main/c/aeronmd.c:37-42`,
@@ -30,6 +30,12 @@
 //!   one, by address or by name, and the kernel is the only thing that knows
 //!   which addresses are local and what their indices are
 //!   (`aeron-client/src/main/c/util/aeron_netutil.c:634-787`).
+//! * **A thread's name.** `aeron.thread.naming` names the driver's threads, and
+//!   the runner threads are named by the `std::thread` that starts them — but
+//!   the process's own thread is already running by then, and renaming it means
+//!   `pthread_setname_np` (`aeron_thread_set_name`,
+//!   `aeron-client/src/main/c/concurrent/aeron_thread.c:141-159`), which is the
+//!   one thing here that is neither a syscall nor a signal.
 //!
 //! # Why this is `unsafe`, and why it is small
 //!
@@ -92,6 +98,45 @@ pub fn stop_signal() -> Option<i32> {
 /// Record the signal and return.
 extern "C" fn handle_stop(signal: libc::c_int) {
     STOP_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+/// Give the calling thread a name, the way the reference does
+/// (`aeron_thread_set_name`, `concurrent/aeron_thread.c:141-159`).
+///
+/// Only the process's **own** thread needs this: every runner is a
+/// `std::thread` that names itself at birth. The reference renames its own
+/// thread to slot 0's role name when `aeron.thread.naming` is `new`
+/// (`aeronmd.c:160-163`), and under the classic naming leaves it the name the
+/// kernel already gave it — the process's.
+///
+/// The name is cut to fifteen bytes first, because `pthread_setname_np`
+/// **refuses** a longer name rather than truncating it, and two of the
+/// reference's classic names are longer than that.
+///
+/// # Errors
+///
+/// What `pthread_setname_np` reports: `ERANGE` for a name that is still too
+/// long (which [`crate::driver::thread_name`] prevents), or `ENOSYS` on a
+/// kernel without the call.
+pub fn set_current_thread_name(name: &str) -> io::Result<()> {
+    let name = crate::driver::thread_name(name);
+
+    let name = std::ffi::CString::new(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a thread name cannot hold a zero byte",
+        )
+    })?;
+
+    // SAFETY: `pthread_self` is this thread's own handle, and `name` is a
+    // NUL-terminated string that outlives the call. The call only reads it.
+    let result = unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()) };
+
+    if 0 == result {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
 }
 
 /// What a bare socket reports as its receive and send buffer sizes.

@@ -32,11 +32,20 @@
 //!    but it costs ten seconds per test and throws away the only evidence that
 //!    the driver shut down rather than was killed.
 //!
-//! What is deliberately *not* here: `AERON_THREADING_MODE`. The harness sends
-//! it and 58 of the 82 tests set `SHARED`, which this driver does not have. It
-//! is in [`IGNORED`] like the rest, and the consequence — the baseline runs
-//! under `DEDICATED` and is therefore a weaker signal than it looks — belongs
-//! with the baseline, not here.
+//! 5. **The threads the driver runs are the ones `aeron.threading.mode` and
+//!    `aeron.thread.naming` ask for.** The harness sends `AERON_THREADING_MODE`
+//!    — 58 of the 82 tests set `SHARED` — and until G4-1 this driver did not
+//!    read it, so the baseline ran under `DEDICATED` and was a weaker signal
+//!    than it looked. [`every_threading_mode_runs_the_references_threads`] is
+//!    where that stops being a claim.
+//!
+//! The process's own thread is part of every set: it is slot 0 — the conductor
+//! under `DEDICATED` and `SHARED_NETWORK`, the composite under `SHARED` and
+//! `INVOKER` — because that is what `aeronmd` does with `manual_main_loop` true
+//! (`aeron-driver/src/main/c/aeronmd.c:153,165-168`). It carries the process's
+//! name under the classic naming and slot 0's role name under `new`
+//! (`:160-163`), which is the one thread the driver renames rather than starts
+//! with a name.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -80,6 +89,20 @@ const EXIT_BUDGET: Duration = Duration::from_secs(2);
 /// `CTestMediaDriver` sets `publicationTermBufferLength()` and no MTU at all.
 const READ: &[(&str, &str)] = &[
     ("AERON_CLIENT_LIVENESS_TIMEOUT", "15s"),
+    // The threading set, bound by G4-1a and acted on by G4-1b. `SHARED` is the
+    // value 58 of the harness's 82 tests send, which makes it the one worth
+    // running every clause of this file under; the four modes' thread sets have
+    // a test of their own below, which needs no configuration to be honest
+    // about `DEDICATED`.
+    ("AERON_THREADING_MODE", "SHARED"),
+    ("AERON_CONDUCTOR_IDLE_STRATEGY", "sleeping"),
+    ("AERON_SENDER_IDLE_STRATEGY", "sleeping"),
+    ("AERON_RECEIVER_IDLE_STRATEGY", "sleeping"),
+    ("AERON_SHARED_IDLE_STRATEGY", "sleeping"),
+    // The reference's own environment name for this slot has no underscore
+    // (`aeronmd.h:441`): `SHAREDNETWORK`, not `SHARED_NETWORK`.
+    ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
+    ("AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "sleeping"),
     ("AERON_DIR_DELETE_ON_START", "true"),
     ("AERON_DIR_DELETE_ON_SHUTDOWN", "true"),
     ("AERON_DRIVER_TERMINATION_VALIDATOR", "allow"),
@@ -113,12 +136,14 @@ const READ: &[(&str, &str)] = &[
 /// values that say so.
 ///
 /// The values are deliberately unhelpful — a name-resolution table that does
-/// not exist, cycle thresholds in a unit nothing here consults, a threading
-/// mode this build does not have. That is the point: if a later slice binds one
-/// of these names, the value below becomes wrong and this test is where it
-/// shows up.
+/// not exist, cycle thresholds in a unit nothing here consults, a resolver this
+/// build will not load. That is the point: if a later slice binds one of these
+/// names, the value below becomes wrong and this test is where it shows up.
+/// That is how the threading set moved to [`READ`]: `G4-1` bound
+/// `AERON_THREADING_MODE` and the six idle strategy names, and the values here
+/// — `SHARED`, `sleeping` — stopped being values the driver ignores.
 ///
-/// Four are worth naming, because each is a place a reader might expect a
+/// Three are worth naming, because each is a place a reader might expect a
 /// different answer:
 ///
 /// - `AERON_PUBLICATION_CONNECTION_TIMEOUT` is a **real gap**: the driver has
@@ -133,10 +158,7 @@ const READ: &[(&str, &str)] = &[
 ///   whether the test asked for it or not. Accepting the name is what this
 ///   clause requires; what its absence means for the baseline is a separate
 ///   question with its own answer in G0-2.
-/// - `AERON_THREADING_MODE` is the one whose *absence* is a known weakness of
-///   the baseline rather than of this driver — see the module docs.
 const IGNORED: &[(&str, &str)] = &[
-    ("AERON_CONDUCTOR_IDLE_STRATEGY", "sleeping"),
     ("AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD", "1ms"),
     (
         "AERON_DRIVER_DYNAMIC_LIBRARIES",
@@ -168,17 +190,11 @@ const IGNORED: &[(&str, &str)] = &[
     ),
     ("AERON_NAME_RESOLVER_INIT_ARGS", "/nonexistent/resolver.csv"),
     ("AERON_NAME_RESOLVER_SUPPLIER", "csv_table"),
-    ("AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "sleeping"),
     ("AERON_NAK_UNICAST_DELAY", "0"),
     ("AERON_PRINT_CONFIGURATION", "true"),
     ("AERON_PUBLICATION_CONNECTION_TIMEOUT", "5s"),
     ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "15s"),
     ("AERON_RECEIVER_GROUP_TAG", "42"),
-    ("AERON_RECEIVER_IDLE_STRATEGY", "sleeping"),
-    ("AERON_SENDER_IDLE_STRATEGY", "sleeping"),
-    ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
-    ("AERON_SHARED_IDLE_STRATEGY", "sleeping"),
-    ("AERON_THREADING_MODE", "SHARED"),
     ("AERON_TRANSPORT_SECURITY_CONF_DIR", "/nonexistent/ats-conf"),
     (
         "AERON_TRANSPORT_SECURITY_CONF_FILE",
@@ -559,53 +575,136 @@ fn threads(pid: u32) -> Vec<String> {
     names
 }
 
-/// The threads a `DEDICATED` driver runs, by the reference's own names.
+/// The threads a driver in `mode`, under `naming`, runs — by the names the
+/// kernel holds for them.
 ///
-/// Three, and the conductor is not one of them: it runs on the process's main
-/// thread, which is where `main` drives it. The reference spawns it as a fourth
-/// (`aeron-driver/src/main/c/aeron_driver.c:1064-1122`, the `DEDICATED` arm),
-/// and that is the runner commit's.
+/// The process's own thread is in every set: it is slot 0
+/// (`aeron_driver.h:26`), which is the conductor under `DEDICATED` and
+/// `SHARED_NETWORK` and the four-piece composite under `SHARED` and `INVOKER`
+/// (`aeron_driver.c:1003-1064`). `aeronmd` drives that slot from its own thread
+/// rather than giving it one (`aeronmd.c:153,165-168`), which is why the counts
+/// here are one less than the runner counts in the reference's `switch` — and
+/// why the process's name is one of them under the classic naming.
 ///
-/// The names are the classic `aeron.thread.naming` set
-/// (`aeron_driver_context.h:37-42`), which is also the default — `conductor` is
-/// absent with `conductor`'s thread, and the two shared ones belong to modes
-/// this build does not have yet.
-///
-/// One agent, not three: a client cannot see which thread mapped its log
-/// buffer — they are all threads that map files — but the count is visible from
-/// outside, and `docs/compat.md` used to record it as a divergence ("Two native
-/// resource agents, not one") until the three became one.
-#[test]
-fn a_dedicated_driver_runs_the_references_threads() {
-    let Some(fixture) = Fixture::start("dedicated-threads", &[]) else {
-        driver::announce_own_skip();
-        return;
+/// The kernel keeps fifteen bytes of a name and refuses more, which is why two
+/// of the reference's classic names are asserted as the truncations they are:
+/// `[sender, receiver]` is eighteen bytes and `[conductor, sender, receiver]`
+/// is thirty. The reference cuts them itself before asking
+/// (`concurrent/aeron_thread.c:141-159`), so this is the same string it would
+/// see.
+fn expected_threads(mode: &str, naming: &str) -> Vec<String> {
+    let new = "new" == naming;
+
+    let mut names: Vec<&str> = match (mode, new) {
+        ("DEDICATED", false) => vec!["deepmsg-driver", "sender", "receiver", "aeron-md-nra"],
+        ("DEDICATED", true) => vec![
+            "aeron-md-cnd",
+            "aeron-md-snd",
+            "aeron-md-rcv",
+            "aeron-md-nra",
+        ],
+        ("SHARED_NETWORK", false) => vec!["deepmsg-driver", "[sender, receiv", "aeron-md-nra"],
+        ("SHARED_NETWORK", true) => vec!["aeron-md-cnd", "aeron-md-net", "aeron-md-nra"],
+        // No runner above slot 0 exists, so the process's own thread is the
+        // whole of it: the reference inits one runner and, under a manual main
+        // loop, starts no thread at all.
+        ("SHARED" | "INVOKER", false) => vec!["deepmsg-driver"],
+        ("SHARED" | "INVOKER", true) => vec!["aeron-md-shd"],
+        _ => panic!("{mode} is one of the four threading modes"),
     };
 
-    let _ = fixture.await_cnc();
+    names.sort_unstable();
+    names.into_iter().map(str::to_owned).collect()
+}
 
-    let mut expected = vec!["aeron-md-nra", "receiver", "sender"];
-    // The main thread's own name is the process's, which the kernel truncates.
-    expected.push("deepmsg-driver");
-    expected.sort_unstable();
-
-    // Waiting, rather than reading once: the threads are started after the CnC
-    // file is published, which is the order the reference has too
-    // (`aeron_driver.c:972` signals the file ready, `:1206` starts the runners).
-    // A client may reach a ready file a moment before the work behind it runs.
+/// Wait for the process to have exactly `expected` threads, and give back what
+/// it had when it did — or when the wait ran out, which is the failure.
+///
+/// Waiting, rather than reading once: the runners are started after the CnC
+/// file is published, which is the order the reference has too
+/// (`aeron_driver.c:972` signals the file ready, `:1206` starts the runners). A
+/// client may reach a ready file a moment before the work behind it runs.
+fn await_threads(pid: u32, expected: &[String]) -> Vec<String> {
     let deadline = Instant::now() + READY_TIMEOUT;
-    let mut names = threads(fixture.child.id());
+    let mut names = threads(pid);
 
     while names != expected && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
-        names = threads(fixture.child.id());
+        names = threads(pid);
     }
 
-    assert_eq!(
-        expected, names,
-        "the agent, the sender and the receiver, under the reference's classic \
-         names"
-    );
+    names
+}
+
+/// Every `aeron.threading.mode`, and the threads its driver process runs.
+///
+/// This is the clause the whole of G4-1 exists for: the harness sets
+/// `AERON_THREADING_MODE` and 58 of its 82 tests set `SHARED`, so a driver that
+/// read the name and did nothing would answer those tests with a `DEDICATED`
+/// driver and nobody would see it from the outside. `DEDICATED` runs without
+/// the variable at all, because that is the shape the tests that do not set it
+/// get.
+///
+/// `INVOKER` is in the list because in this process it is not a refusal:
+/// `aeronmd` starts its driver with `manual_main_loop` true (`aeronmd.c:153`),
+/// which is the condition the reference's `EINVAL` is the *other* side of
+/// (`aeron_driver.c:1225-1230`), and `SHARED` and `INVOKER` build the same
+/// runner there (`:1003-1022` is one `case` arm for both). So an `INVOKER`
+/// driver process is a `SHARED` one, which is what this asserts.
+#[test]
+fn every_threading_mode_runs_the_references_threads() {
+    for mode in ["DEDICATED", "SHARED_NETWORK", "SHARED", "INVOKER"] {
+        let env: &[(&str, &str)] = match mode {
+            "DEDICATED" => &[],
+            other => &[("AERON_THREADING_MODE", other)],
+        };
+
+        let Some(fixture) = Fixture::start(&format!("mode-{}", mode.to_lowercase()), env) else {
+            driver::announce_own_skip();
+            return;
+        };
+
+        let _ = fixture.await_cnc();
+
+        let expected = expected_threads(mode, "classic");
+        assert_eq!(
+            expected,
+            await_threads(fixture.child.id(), &expected),
+            "{mode}: the threads the reference's {mode} arm starts, by its classic names"
+        );
+    }
+}
+
+/// `aeron.thread.naming`, both spellings: the classic set and the short
+/// `aeron-md-*` one (`aeron_driver_context.h:37-48`).
+///
+/// The process's own thread is the only one the driver has to *rename* rather
+/// than start with a name, and the reference renames it only under `new`
+/// (`aeronmd.c:160-163`) — under the classic naming it keeps the name the
+/// kernel gave the process, which is what the mode test above asserts.
+#[test]
+fn the_thread_names_follow_aeron_thread_naming() {
+    for mode in ["DEDICATED", "SHARED_NETWORK", "SHARED"] {
+        let Some(fixture) = Fixture::start(
+            &format!("naming-{}", mode.to_lowercase()),
+            &[
+                ("AERON_THREADING_MODE", mode),
+                ("AERON_THREAD_NAMING", "new"),
+            ],
+        ) else {
+            driver::announce_own_skip();
+            return;
+        };
+
+        let _ = fixture.await_cnc();
+
+        let expected = expected_threads(mode, "new");
+        assert_eq!(
+            expected,
+            await_threads(fixture.child.id(), &expected),
+            "{mode} under the new naming"
+        );
+    }
 }
 
 #[test]

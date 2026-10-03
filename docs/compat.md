@@ -315,7 +315,6 @@ be falsified.
 | **An image's `sparse` byte is its channel's, not the oldest matching subscription's** | Both of the metadata bytes an image copies from a subscription (`aeron_publication_image.c:280-281`) are read here off the channel the `SETUP` carried (`crates/driver/src/publication_images.rs::begin_create`). The reference reads `reliable` off the link being linked and `sparse` off the **oldest** subscription matching the image (`aeron_driver_conductor_is_oldest_subscription_sparse`, `aeron_driver_conductor.c:6715-6717`). The channel that created the image is one of those subscriptions, so the two agree until two subscriptions that name different `sparse` share one image — a byte nothing in this build reads, and the only one of the pair where they can differ. Covered by `crates/driver/src/publication_image.rs::an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse`. |
 | **A clashing subscription is refused on `reliable` alone** | The reference refuses a subscription whose options disagree with one already reading the same endpoint and stream, and checks three of them — `reliable`, `rejoin` and `isResponse` (`aeron_driver_conductor_has_clashing_subscription`, `aeron_driver_conductor.c:307-361`). This build checks the first, because it is the one that changes what an image *does* rather than what it advertises; the other two are read by nothing here yet. Covered by `crates/driver/src/conductor.rs::two_subscriptions_that_disagree_about_reliability_cannot_share_a_channel`. |
 | **A gap on an unreliable stream is filled, not asked for** | Not a divergence but the opposite — it is the reference's behaviour, absent until now: `reliable=false` was parsed and dropped, so a client that named it got a reliable stream. An image whose channel said `false` now takes the reference's zero delay generator, which it returns **before** reading `nak-delay=` (`aeron_publication_image.c:92-95`), and covers each hole with a padding frame instead of sending a NAK, counting `loss-gap-fills` (`:1053-1066`). The data in the hole is gone, which is what the parameter means. Covered by `tests/integration/unreliable_stream.rs`; the reader half of it is `crates/client/src/image.rs`'s `Step::Padding`, which used to end the term at a padding frame where the reference steps over it (`aeron_image.c:375-379`) — invisible until an image started leaving padding **mid-term**. |
-| **Two native resource agents, not one** | `IpcPublications` and `PublicationsImages` each own one, because each maps its own log buffers. Invisible to a client (both are threads that map files); unifying them is a cleanup, not a contract. |
 
 The first row is the one a client can see from outside, and it is the reason
 the refusal exists: `NOT_SUPPORTED` is an answer, silence is not.
@@ -476,15 +475,23 @@ being unknown:
   anything else is accepted and has no effect. Acting on it means the sender's
   idle strategy, which this build does not have.
 
-`aeron.threading.mode` is the one setting of the reference's that this build
-does not read at all: its four values choose between dedicated, shared,
-shared-network and invoker threads
+`aeron.threading.mode` is read, and all four of its values are served —
+dedicated, shared-network, shared and invoker
 (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`, applied
-at `:447`), and this build has exactly one of them — dedicated, which is the
-reference's default, so a deployment that leaves it alone is served the same
-way. One that names another gets a driver that runs with the mode it named
-having no effect: worth a line here rather than a silent difference, and the
-honest place for the other three is a slice that wants them.
+at `:447`; the runner set each one builds is `aeron_driver.c:1003-1122`). The
+shape is **`aeronmd`'s**, which is the process this driver stands in for: slot
+0 — the conductor under the first two modes, all four pieces under the last
+two (`:723-755`) — runs on the process's own thread, because `aeronmd` starts
+its driver with `manual_main_loop` true (`aeronmd.c:153`) and drives it itself
+(`:165-168`). So `INVOKER` here is a working driver rather than the `EINVAL`
+`aeron_driver.c:1225-1230` is the other side of, and `SHARED` and `INVOKER`
+run the same runner, which is what the reference's `switch` does with them
+(`:1003-1022`). `aeron.thread.naming` gives the threads the reference's two
+sets of names (`aeron_driver_context.h:37-48`), with the process's own thread
+renamed only under `new` — also what `aeronmd` does (`:160-163`).
+`tests/integration/driver_process_contract.rs::every_threading_mode_runs_the_references_threads`
+pins each mode's thread set off `/proc`, and
+`::the_thread_names_follow_aeron_thread_naming` the two namings.
 
 `aeron.counters.free.to.reuse.timeout` follows the same rule and is one more
 name whose environment variable is not the property name in capitals

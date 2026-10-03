@@ -588,7 +588,11 @@ impl Sender {
             re_resolution_interval_ns,
         )?;
 
-        let thread = crate::driver::run_agent(Role::Sender.classic_name(), agent)?;
+        let thread = crate::driver::run_agent(
+            Role::Sender.classic_name(),
+            agent,
+            crate::driver::default_strategy(),
+        )?;
 
         Ok(Self {
             proxy,

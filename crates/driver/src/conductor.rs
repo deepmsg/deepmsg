@@ -615,7 +615,7 @@ pub struct Conductor {
     agents: Option<AgentStates>,
     /// The threads those agents were put on, when they were: the driver that
     /// started them is the one that waits for them.
-    agent_threads: Option<crate::driver::AgentThreads>,
+    agent_threads: Option<Vec<std::thread::JoinHandle<()>>>,
     /// The publications this driver owns.
     publications: IpcPublications,
     /// The subscriptions reading them.
@@ -1081,11 +1081,41 @@ impl Conductor {
     ///
     /// [`std::io::Error`] if a thread cannot be started.
     pub fn start_agents(&mut self) -> std::io::Result<()> {
-        if let Some(states) = self.agents.take() {
-            self.agent_threads = Some(crate::driver::AgentThreads::spawn(states)?);
-        }
+        let Some(states) = self.agents.take() else {
+            return Ok(());
+        };
 
-        Ok(())
+        let mut threads = Vec::new();
+
+        match crate::driver::spawn_dedicated(states, &self.config, &mut threads) {
+            Ok(()) => {
+                self.agent_threads = Some(threads);
+                Ok(())
+            }
+            // Some of them did start, and a `std::thread` nobody stops runs for
+            // ever: ask each end to send its `Stop` before this gives up, and
+            // wait for the ones that are there.
+            Err(error) => {
+                let _ = self.sender.stop();
+                let _ = self.receiver.stop();
+                let _ = self.agent_handle.stop();
+
+                for thread in threads {
+                    let _ = thread.join();
+                }
+
+                Err(error)
+            }
+        }
+    }
+
+    /// Give up the three agents, for a caller that will place them itself.
+    ///
+    /// That is `aeron.threading.mode`'s decision and not the conductor's, so a
+    /// driver takes them here before it starts anything (`aeron_driver.c:1003-1122`
+    /// is the placement, `aeron_driver_init` above it is this).
+    pub(crate) fn take_agents(&mut self) -> Option<AgentStates> {
+        self.agents.take()
     }
 
     /// Wait for them, **after** [`Conductor::close`] has asked them to stop:
@@ -1097,7 +1127,9 @@ impl Conductor {
     /// shares a thread — has nothing to wait for.
     pub fn join_agents(&mut self) {
         if let Some(threads) = self.agent_threads.take() {
-            threads.join();
+            for thread in threads {
+                let _ = thread.join();
+            }
         }
     }
 
