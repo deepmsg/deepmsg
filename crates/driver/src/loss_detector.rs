@@ -262,6 +262,7 @@ impl LossDetector {
         is_reliable: bool,
         treat_as_multicast: bool,
         nak_delay_ns: Option<i64>,
+        default_delay_ns: i64,
         multicast_backoff: MulticastBackoff,
     ) -> Self {
         if !is_reliable {
@@ -288,7 +289,11 @@ impl LossDetector {
                 delay_ns,
                 delay_ns.saturating_mul(NAK_UNICAST_RETRY_RATIO),
             ),
-            None => Self::new(registration_id),
+            None => Self::with_delays(
+                registration_id,
+                default_delay_ns,
+                default_delay_ns.saturating_mul(NAK_UNICAST_RETRY_RATIO),
+            ),
         }
     }
 
@@ -872,7 +877,8 @@ mod tests {
         // The parameter's whole effect, and the argument order that is easy to
         // get backwards: the *first* delay is what the channel named, and the
         // retry is that times the driver's ratio.
-        let named = LossDetector::for_channel(7, true, false, Some(5_000), backoff());
+        let named =
+            LossDetector::for_channel(7, true, false, Some(5_000), NAK_UNICAST_DELAY_NS, backoff());
 
         assert_eq!(5_000, named.delay_ns, "the delay the channel named");
         assert_eq!(
@@ -882,7 +888,8 @@ mod tests {
         );
 
         // A channel that named nothing keeps the driver's own.
-        let default = LossDetector::for_channel(7, true, false, None, backoff());
+        let default =
+            LossDetector::for_channel(7, true, false, None, NAK_UNICAST_DELAY_NS, backoff());
         assert_eq!(NAK_UNICAST_DELAY_NS, default.delay_ns);
         assert_eq!(
             NAK_UNICAST_DELAY_NS * NAK_UNICAST_RETRY_RATIO,
@@ -891,7 +898,14 @@ mod tests {
 
         // And a delay big enough to overflow the multiplication saturates
         // instead: a retry *before* the first ask is not a thing.
-        let absurd = LossDetector::for_channel(7, true, false, Some(i64::MAX), backoff());
+        let absurd = LossDetector::for_channel(
+            7,
+            true,
+            false,
+            Some(i64::MAX),
+            NAK_UNICAST_DELAY_NS,
+            backoff(),
+        );
         assert_eq!(i64::MAX, absurd.delay_ns);
         assert_eq!(i64::MAX, absurd.retry_ns);
     }
@@ -903,14 +917,22 @@ mod tests {
         // zero generator *before* it reads `nak-delay=`
         // (`aeron_publication_image.c:92-95`), so a channel that names both
         // gets zero — the parameter it typed is not read at all.
-        let unreliable = LossDetector::for_channel(7, false, false, Some(5_000), backoff());
+        let unreliable = LossDetector::for_channel(
+            7,
+            false,
+            false,
+            Some(5_000),
+            NAK_UNICAST_DELAY_NS,
+            backoff(),
+        );
 
         assert_eq!(0, unreliable.delay_ns);
         assert_eq!(0, unreliable.retry_ns, "and no backoff before the next try");
 
         // The contrast, so that the test above cannot pass by the delays being
         // zero for every channel.
-        let reliable = LossDetector::for_channel(7, true, false, Some(5_000), backoff());
+        let reliable =
+            LossDetector::for_channel(7, true, false, Some(5_000), NAK_UNICAST_DELAY_NS, backoff());
         assert_eq!(5_000, reliable.delay_ns);
     }
 }

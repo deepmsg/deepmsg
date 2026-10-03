@@ -422,7 +422,11 @@ impl NetworkPublications {
         // (`:4350-4360`), rather than starting a second log buffer on the same
         // stream.
         if !is_exclusive {
-            if let Some(index) = self.find_shareable(endpoint_id, request.stream_id) {
+            if let Some(index) = self.find_shareable(
+                endpoint_id,
+                request.stream_id,
+                params.response_correlation_id,
+            ) {
                 publication_matches(&self.publications[index], &params).map_err(AddError::Share)?;
 
                 // The image comes after the agreement and not before it
@@ -569,6 +573,7 @@ impl NetworkPublications {
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
         subscriptions: &mut IpcSubscriptions,
+        endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
         receiver: &ReceiverProxy,
         now: Now,
@@ -598,6 +603,7 @@ impl NetworkPublications {
                         regions,
                         clients,
                         subscriptions,
+                        endpoints,
                         sender,
                         receiver,
                         now,
@@ -642,6 +648,7 @@ impl NetworkPublications {
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
         subscriptions: &mut IpcSubscriptions,
+        endpoints: &mut SendChannelEndpoints,
         sender: &SenderProxy,
         receiver: &ReceiverProxy,
         now: Now,
@@ -802,6 +809,15 @@ impl NetworkPublications {
             return;
         }
 
+        // The endpoint now owes its life to this publication too
+        // (`AERON_DRIVER_MANAGED_RESOURCE_INCREF`, `:4591`), counted here
+        // because the pair is: the release path decrements once per record it
+        // takes out of this list, so the two are the same set by construction.
+        // A shared *publication* does not come through here — a second client
+        // on one that exists is a link, not a create — and neither does the
+        // reference count it.
+        endpoints.attach_publication(pending.endpoint_id, now.ns);
+
         self.publications.push(NetworkPublicationRecord {
             registration_id: pending.registration_id,
             client_id: pending.client_id,
@@ -880,16 +896,29 @@ impl NetworkPublications {
     }
 
     /// A publication a second `ADD_PUBLICATION` might share: same endpoint,
-    /// same stream, and not exclusive
+    /// same stream, the same `response-correlation-id`, and not exclusive
     /// (`find_shared_network_publication_by_endpoint`, `:1851-1875`).
+    ///
+    /// The correlation id is the clause a reader would leave out and the one
+    /// that decides what a response channel *is*: two response publications on
+    /// one endpoint and stream are two answers to two different requests, and
+    /// only the id tells them apart. Without it the second client is handed the
+    /// first one's publication and its messages go to the wrong subscriber —
+    /// `io.aeron.ResponseChannelsTest::shouldUseResponseCorrelationIdAsAPublicationMatchingCriteria2`.
     ///
     /// Whether the two actually *agree* is [`publication_matches`]'s question,
     /// asked by the caller — the same split the reference has, and the reason a
     /// mismatch is an error rather than a fall-through to a create.
-    fn find_shareable(&self, endpoint_id: u64, stream_id: i32) -> Option<usize> {
+    fn find_shareable(
+        &self,
+        endpoint_id: u64,
+        stream_id: i32,
+        response_correlation_id: i64,
+    ) -> Option<usize> {
         self.publications.iter().position(|publication| {
             publication.endpoint_id == endpoint_id
                 && publication.stream_id == stream_id
+                && publication.params.response_correlation_id == response_correlation_id
                 && !publication.is_exclusive
         })
     }

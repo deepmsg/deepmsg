@@ -94,6 +94,14 @@ const EXIT_BUDGET: Duration = Duration::from_secs(2);
 /// `AERON_MTU_LENGTH` is absent on purpose and would be a mistake to add:
 /// `CTestMediaDriver` sets `publicationTermBufferLength()` and no MTU at all.
 const READ: &[(&str, &str)] = &[
+    // The NAK delay and the channel's interceptors, which the harness sets on
+    // the tests that inject loss (`CTestMediaDriver.java:383-447`,
+    // `:449-452`) and which G5's scan had as names with a field and no
+    // binding. `loss` at `rate=0` is served and drops nothing, which is what
+    // lets the read-and-publish below still work with an interceptor in place.
+    ("AERON_NAK_UNICAST_DELAY", "0"),
+    ("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "loss"),
+    ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS", "rate=0"),
     ("AERON_CLIENT_LIVENESS_TIMEOUT", "15s"),
     // The threading set, bound by G4-1a and acted on by G4-1b. `SHARED` is the
     // value 58 of the harness's 82 tests send, which makes it the one worth
@@ -108,6 +116,34 @@ const READ: &[(&str, &str)] = &[
     // The reference's own environment name for this slot has no underscore
     // (`aeronmd.h:441`): `SHAREDNETWORK`, not `SHARED_NETWORK`.
     ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
+    // The reference's own name for this slot carries a `driver.` infix
+    // (`aeronmd.h:497`) and that is the one this driver reads; the harness
+    // sends `AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY`, which the reference's
+    // own C driver ignores too (`CTestMediaDriver.java:248` against
+    // `aeronmd.h:497`) — see the ignored half.
+    (
+        "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY",
+        "sleeping",
+    ),
+    // Bound since the slices that built them — the resolver family (G3-3, and
+    // the agent that runs it from G3-9), the flow-control group parameters
+    // (G3-2), the receiver's group tag (G3-2), the image liveness timeout, and
+    // the name resolver's supplier and its init args. They sat in the ignored
+    // half long after they stopped belonging there; G5 moved them.
+    ("AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR", "127.0.0.1:5000"),
+    ("AERON_DRIVER_RESOLVER_INTERFACE", "lo"),
+    ("AERON_DRIVER_RESOLVER_NAME", "aeron:net-driver"),
+    ("AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL", "5s"),
+    ("AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT", "5s"),
+    ("AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL", "5s"),
+    ("AERON_FLOW_CONTROL_GROUP_MIN_SIZE", "3"),
+    ("AERON_FLOW_CONTROL_GROUP_TAG", "7"),
+    ("AERON_IMAGE_LIVENESS_TIMEOUT", "15s"),
+    ("AERON_NAME_RESOLVER_SUPPLIER", "csv_table"),
+    ("AERON_NAME_RESOLVER_INIT_ARGS", "/nonexistent/resolver.csv"),
+    ("AERON_RECEIVER_GROUP_TAG", "42"),
+    // And the harness's spelling of the native resource agent's idle strategy,
+    // which neither driver reads (`aeronmd.h:497`).
     ("AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "sleeping"),
     // The four duty-cycle thresholds, which the driver puts in eight counter
     // labels and counts against (`aeron_driver_conductor.c:889-935`). The
@@ -167,8 +203,9 @@ const READ: &[(&str, &str)] = &[
 ///   to it — so the harness's value is silently dropped. It is listed here
 ///   rather than in [`READ`] because that is the truth today.
 /// - `AERON_IMAGE_LIVENESS_TIMEOUT` is set by **39 of the system tests**, more
-///   than any other name this driver does not read. If the baseline has a
-///   cluster of timeouts, this is the first name to suspect.
+///   than any other name here — and it is no longer one this driver ignores:
+///   it is bound and read (`config.rs`'s `Setting::IMAGE_LIVENESS_TIMEOUT`),
+///   and G5 moved it to [`READ`] where it should have been.
 /// - `AERON_EVENT_LOG` is set **unconditionally** to `"admin"` (`:459-466`,
 ///   with `AERON_EVENT_LOG_DISABLE` beside it), so the reference's
 ///   instrumentation layer is on in every single test whether the test asked
@@ -176,16 +213,10 @@ const READ: &[(&str, &str)] = &[
 ///   [`the_event_log_names_are_accepted_and_make_no_log`] is the test that says
 ///   what this driver does with them: nothing, and no log file.
 const IGNORED: &[(&str, &str)] = &[
-    ("AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR", "127.0.0.1:5000"),
     (
         "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
         "5s",
     ),
-    ("AERON_DRIVER_RESOLVER_INTERFACE", "lo"),
-    ("AERON_DRIVER_RESOLVER_NAME", "aeron:net-driver"),
-    ("AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL", "5s"),
-    ("AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT", "5s"),
-    ("AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL", "5s"),
     ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_ENABLE_EXPERIMENTAL_FEATURES", "true"),
     ("AERON_EVENT_LOG", "admin"),
@@ -198,40 +229,24 @@ const IGNORED: &[(&str, &str)] = &[
     // line: this driver ignores the name, so a value like this one is harmless.
     ("AERON_EVENT_LOG_FILENAME", "/nonexistent/driver.log"),
     ("AERON_EVENT_LOG_FILE_MAX_LENGTH", "1m"),
-    ("AERON_FLOW_CONTROL_GROUP_MIN_SIZE", "3"),
-    ("AERON_FLOW_CONTROL_GROUP_TAG", "7"),
-    ("AERON_IMAGE_LIVENESS_TIMEOUT", "15s"),
     (
         "AERON_MULTICAST_FLOWCONTROL_SUPPLIER",
         "aeron_max_multicast_flow_control_strategy_supplier",
     ),
-    ("AERON_NAME_RESOLVER_INIT_ARGS", "/nonexistent/resolver.csv"),
-    ("AERON_NAME_RESOLVER_SUPPLIER", "csv_table"),
-    ("AERON_NAK_UNICAST_DELAY", "0"),
     ("AERON_PRINT_CONFIGURATION", "true"),
     ("AERON_PUBLICATION_CONNECTION_TIMEOUT", "5s"),
     ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "15s"),
-    ("AERON_RECEIVER_GROUP_TAG", "42"),
     ("AERON_TRANSPORT_SECURITY_CONF_DIR", "/nonexistent/ats-conf"),
     (
         "AERON_TRANSPORT_SECURITY_CONF_FILE",
         "/nonexistent/ats.conf",
     ),
-    (
-        "AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS",
-        "aeron_transport_security_channel_interceptor_load",
-    ),
-    (
-        "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
-        "aeron_transport_security_channel_interceptor_load",
-    ),
+    // The three `…_ARGS` names are read by the interceptor that names them and
+    // by nothing else, so with `loss` selected only one of them is live; the
+    // other two are here because the harness sets them together.
     (
         "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_FIXED_LOSS_ARGS",
         "term-id=0|term-offset=0|length=1024",
-    ),
-    (
-        "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS",
-        "rate=0.1|seed=7",
     ),
     (
         "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MULTI_GAP_LOSS_ARGS",
@@ -634,6 +649,15 @@ fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
         (
             "AERON_AGENT_ON_START_FUNCTION",
             "a_symbol_that_is_not_there",
+        ),
+        // The outgoing half of the interceptor lists: none of the three the
+        // reference compiles in has one (`outgoing_init_func` is `NULL` in all
+        // three `_load` functions), so every name here is one its table cannot
+        // resolve and its context init fails on
+        // (`aeron_driver_context.c:1274-1281`).
+        (
+            "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
+            "aeron_transport_security_channel_interceptor_load",
         ),
     ] {
         let Some(mut fixture) = Fixture::start("refused-code", &[(name, value)]) else {

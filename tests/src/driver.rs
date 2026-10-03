@@ -288,9 +288,22 @@ impl OwnDriver {
     /// purpose: a property list written for one is a property list for the
     /// other, so a test can configure both drivers the same way.
     pub fn start_with(test_name: &str, extra_properties: &[&str]) -> Option<Self> {
+        Self::start_with_env(test_name, extra_properties, &[])
+    }
+
+    /// Start our driver with `-D` properties **and** environment variables.
+    ///
+    /// The environment is what the harness reaches for when it injects loss
+    /// ([`ReferenceDriver::start_with_env`]), and the interceptors are the case
+    /// that needs it.
+    pub fn start_with_env(
+        test_name: &str,
+        extra_properties: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Option<Self> {
         let binary = locate_own()?;
 
-        ReferenceDriver::start_with(&binary, test_name, extra_properties)
+        ReferenceDriver::start_with_env(&binary, test_name, extra_properties, extra_env)
             .ok()
             .map(Self)
     }
@@ -357,6 +370,31 @@ impl ReferenceDriver {
         test_name: &str,
         extra_properties: &[&str],
     ) -> Result<Self, DriverError> {
+        Self::start_with_env(binary, test_name, extra_properties, &[])
+    }
+
+    /// The same, with environment variables as well as `-D` properties.
+    ///
+    /// The environment is the **only** spelling some settings have: the
+    /// interceptors' arguments are `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_*_ARGS`
+    /// (`media/aeron_udp_channel_transport_loss.c:42` and its two siblings) and
+    /// the reference reads no property for any of them. It is also the spelling
+    /// the harness itself uses — `CTestMediaDriver` puts them in the environment
+    /// map it hands the driver process (`CTestMediaDriver.java:409-447`, `:449-452`)
+    /// — so a test that wants to do what a system test does needs this door.
+    ///
+    /// The variables are set **after** the inherited `AERON_*` are removed, so a
+    /// caller's value wins rather than going out with the ambient ones.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReferenceDriver::start_with`].
+    pub fn start_with_env(
+        binary: &Path,
+        test_name: &str,
+        extra_properties: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, DriverError> {
         let aeron_dir = temp_aeron_dir(test_name);
         let _ = std::fs::remove_dir_all(&aeron_dir);
 
@@ -385,6 +423,11 @@ impl ReferenceDriver {
             if key.to_string_lossy().starts_with("AERON_") {
                 command.env_remove(key);
             }
+        }
+
+        // After the removals, so these are the ones that stand.
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
 
         let child = command.spawn().map_err(DriverError::Spawn)?;

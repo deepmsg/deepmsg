@@ -1106,6 +1106,74 @@ impl IpcSubscriptions {
         }
     }
 
+    /// Point a response **subscription** at the session of the response
+    /// publication that has just been created for it
+    /// (`aeron_driver_conductor_find_and_update_ipc_response_subscription`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1711-1760`, reached
+    /// from `execute_add_ipc_publication_create_publication`, `:3895`).
+    ///
+    /// The chain is three links long and each is a registration id, which is
+    /// why none of it crosses the wire: the response publication's
+    /// `response-correlation-id` names the **request** publication, and that
+    /// publication's own `response-correlation-id` names the **response
+    /// subscription**. Anything the chain does not reach is not an error — a
+    /// publication whose correlation id names nothing is an ordinary one, and
+    /// so is a response publication whose subscription has since gone.
+    ///
+    /// Why it matters: a response subscription that named no session is
+    /// deliberately not a wildcard ([`SubscriptionLink::matches`] — it is
+    /// waiting to be told which stream it is), so without this it reads
+    /// nothing, ever. And one that *named* a session has already chosen: a
+    /// publication that would answer it under another is refused, with the
+    /// reference's words, rather than being told apart later on a channel the
+    /// subscriber never opened.
+    ///
+    /// # Errors
+    ///
+    /// The reference's message for the mismatch, which a client reads as a
+    /// `RegistrationException`.
+    pub fn attach_response_publication(
+        &mut self,
+        publications: &[IpcPublication],
+        response_correlation_id: i64,
+        response_registration_id: i64,
+        response_channel: &[u8],
+        response_session_id: i32,
+    ) -> Result<(), String> {
+        let Some(request) = publications
+            .iter()
+            .find(|publication| publication.registration_id == response_correlation_id)
+        else {
+            return Ok(());
+        };
+
+        let Some(link) = self
+            .links
+            .iter_mut()
+            .find(|link| link.registration_id == request.response_correlation_id)
+        else {
+            return Ok(());
+        };
+
+        if let Some(named) = link.session_id {
+            if named != response_session_id {
+                return Err(format!(
+                    "failed to create response publication (registrationId={response_registration_id}, \
+                     channel={}), because response subscription (registrationId={}, channel={}) \
+                     uses `session-id` parameter that does not match `session-id={response_session_id}` \
+                     of the response publication",
+                    String::from_utf8_lossy(response_channel),
+                    link.registration_id,
+                    String::from_utf8_lossy(&link.channel),
+                ));
+            }
+        }
+
+        link.session_id = Some(response_session_id);
+
+        Ok(())
+    }
+
     /// The subscriptions reading a publication, for the caller that has to tell
     /// them it is going away (`aeron_driver_conductor_unlink_ipc_subscriptions`,
     /// `:6453-6475`, which sends one message per reader).
@@ -1473,52 +1541,70 @@ impl IpcSubscriptions {
         None
     }
 
-    /// Refuse a subscription whose `reliable` disagrees with one already
-    /// reading the same endpoint and stream
+    /// Refuse a subscription whose `reliable`, `rejoin` or `is_response`
+    /// disagrees with one already reading the same endpoint and stream
     /// (`aeron_driver_conductor_has_clashing_subscription`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:286-366`; the arm is
-    /// `:320-332`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:286-366`; the three
+    /// arms are `:320-332`, `:334-346` and `:348-360`).
     ///
     /// Two subscriptions that one image would serve have to agree about the
     /// options that decide how it behaves. Without this the second is served by
     /// the first one's image and reads a stream whose rules it did not choose —
-    /// a client that asked for `reliable=false` silently getting retransmissions
-    /// — with nothing raised and no counter moved.
+    /// a client that asked for `reliable=false` silently getting retransmissions,
+    /// or one that asked for a response channel reading an ordinary one — with
+    /// nothing raised and no counter moved.
     ///
-    /// The reference checks three options in this loop; this is the one of the
-    /// three that changes behaviour here, because `rejoin` and `is_response` are
-    /// read by nothing yet (see `docs/compat.md`).
+    /// The three are checked **in the reference's order and only the first
+    /// disagreement is reported**: it `return true`s out of the loop, so a
+    /// subscription that differs in two ways hears about `reliable=` and not
+    /// about the other. `isResponse` is last, and the test that needed it is
+    /// `io.aeron.ResponseChannelsTest::shouldRejectSubscriptionIfResponseConfigurationDoesNotMatch`.
     ///
     /// The match is the reference's own: same endpoint, same stream, and the
     /// same session *including* both being wildcards — a subscription that named
     /// a session and one that did not are two subscriptions the reference does
     /// not call clashing, whatever image they later end up sharing
     /// (`aeron_driver_conductor_network_subscription_link_matches`, `:62-70`).
-    fn refuse_a_clashing_reliability(
+    ///
+    /// One thing the reference checks before this loop is **not** here:
+    /// `aeron_driver_conductor_receive_endpoint_has_clashing_timestamp_offsets`
+    /// (`:299`), which is about the timestamp offsets this build refuses at the
+    /// channel instead (`docs/compat.md`, "ATS and the timestamp-offset
+    /// parameters are refused").
+    fn refuse_a_clashing_options(
         &self,
         endpoint_id: u64,
         stream_id: i32,
         session_id: Option<i32>,
-        is_reliable: bool,
+        params: &crate::publication_params::SubscriptionParams,
         channel: &[u8],
     ) -> Result<(), AddSubscriptionError> {
         let Some(existing) = self.links.iter().find(|link| {
             link.endpoint_id == Some(endpoint_id)
                 && link.stream_id == stream_id
                 && link.session_id == session_id
-                && link.is_reliable != is_reliable
         }) else {
             return Ok(());
         };
 
-        Err(AddSubscriptionError::Clashing {
-            message: format!(
-                "option conflicts with existing subscription: reliable={} existingChannel={} channel={}",
-                is_reliable,
-                String::from_utf8_lossy(&existing.channel),
-                String::from_utf8_lossy(channel),
-            ),
-        })
+        for (name, requested, held) in [
+            ("reliable", params.is_reliable, existing.is_reliable),
+            ("rejoin", params.is_rejoin, existing.is_rejoin),
+            ("isResponse", params.is_response, existing.is_response),
+        ] {
+            if requested != held {
+                return Err(AddSubscriptionError::Clashing {
+                    message: format!(
+                        "option conflicts with existing subscription: {name}={requested} \
+                         existingChannel={} channel={}",
+                        String::from_utf8_lossy(&existing.channel),
+                        String::from_utf8_lossy(channel),
+                    ),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
@@ -1565,11 +1651,11 @@ impl IpcSubscriptions {
         // cannot be served, because the image they would share can only behave
         // one way.
         if let Some(existing) = endpoints.find(&channel) {
-            self.refuse_a_clashing_reliability(
+            self.refuse_a_clashing_options(
                 existing,
                 request.stream_id,
                 params.session_id,
-                params.is_reliable,
+                &params,
                 request.channel,
             )?;
         }
@@ -2272,6 +2358,19 @@ mod tests {
     /// A publication to match against, built through the real constructor so
     /// that the fields the rule reads are the ones a driver would have.
     fn publication(session_id: i32, stream_id: i32, is_exclusive: bool) -> IpcPublication {
+        publication_answering(session_id, stream_id, is_exclusive, -1)
+    }
+
+    /// The same, for a publication that names what it answers: its
+    /// `response-correlation-id` is the registration id of the **request**
+    /// publication, which is the first link of the chain
+    /// [`IpcSubscriptions::attach_response_publication`] walks.
+    fn publication_answering(
+        session_id: i32,
+        stream_id: i32,
+        is_exclusive: bool,
+        response_correlation_id: i64,
+    ) -> IpcPublication {
         // A counter as well as the ids: two tests run at once in one process,
         // and a log buffer is created *exclusively* — the second one to ask
         // for the same path fails rather than sharing it.
@@ -2294,7 +2393,11 @@ mod tests {
             publication_window_length: 32 * 1024,
             max_resend: 0,
             entity_tag: -1,
-            response_correlation_id: -1,
+            response_correlation_id,
+            // The **request** side, which is what the chain's first link is: a
+            // publication that names an `response-correlation-id` without a
+            // `control-mode=response` is the one a response is *owed* to, and
+            // it is its registration id the answering publication quotes.
             is_response: false,
             session_id: Some(session_id),
             linger_timeout_ns: 5_000_000_000,
@@ -2527,6 +2630,115 @@ mod tests {
 
         assert!(completed.matches_image(3, 1001, 100));
         assert!(!completed.matches_image(3, 1001, 101), "a named session");
+    }
+
+    /// The three links of the chain, built the way a driver would meet them:
+    /// a request publication whose `response-correlation-id` is the response
+    /// subscription's registration id, and an answering publication whose own
+    /// names the request's.
+    ///
+    /// `io.aeron.ResponseChannelsTest::shouldErrorAddingResponseIpcPublicationOnSessionMismatch`
+    /// is the oracle for the refusal; the pinning it does on the way past is
+    /// what makes an IPC response subscription read at all
+    /// ([`SubscriptionLink::matches`]).
+    fn response_chain(
+        subscription_registration_id: i64,
+        sub_session_id: Option<i32>,
+    ) -> (IpcSubscriptions, IpcPublication, i64) {
+        let request = publication_answering(100, 1001, false, subscription_registration_id);
+        let request_registration_id = request.registration_id;
+
+        let mut subscriptions = IpcSubscriptions::new();
+        let mut response_sub = link(1001, sub_session_id, true);
+        response_sub.registration_id = subscription_registration_id;
+        subscriptions.links.push(response_sub);
+
+        (subscriptions, request, request_registration_id)
+    }
+
+    #[test]
+    fn a_response_publication_pins_its_subscription_to_its_own_session() {
+        let (mut subscriptions, request, request_registration_id) = response_chain(9, None);
+
+        assert!(
+            !subscriptions.links()[0].matches(&publication(555, 1001, false)),
+            "a response subscription with no session reads nothing until one is named"
+        );
+
+        subscriptions
+            .attach_response_publication(
+                &[request],
+                request_registration_id,
+                77,
+                b"aeron:ipc?control-mode=response",
+                555,
+            )
+            .expect("it named no session, so there is nothing to disagree with");
+
+        assert_eq!(Some(555), subscriptions.links()[0].session_id);
+        assert!(
+            subscriptions.links()[0].matches(&publication(555, 1001, false)),
+            "and now it reads the stream it was told to answer"
+        );
+        assert!(
+            !subscriptions.links()[0].matches(&publication(556, 1001, false)),
+            "and no other"
+        );
+    }
+
+    #[test]
+    fn a_response_publication_that_would_answer_under_another_session_is_refused() {
+        let (mut subscriptions, request, request_registration_id) = response_chain(9, Some(42));
+
+        let error = subscriptions
+            .attach_response_publication(
+                &[request],
+                request_registration_id,
+                77,
+                b"aeron:ipc?control-mode=response",
+                555,
+            )
+            .expect_err("42 is not 555");
+
+        assert!(
+            error.starts_with("failed to create response publication (registrationId=77,"),
+            "the reference's words, which a client reads as a `RegistrationException`: {error}"
+        );
+        assert!(
+            error.contains("uses `session-id` parameter that does not match `session-id=555`"),
+            "and both sessions, so the reader can see which is which: {error}"
+        );
+        assert_eq!(
+            Some(42),
+            subscriptions.links()[0].session_id,
+            "and the subscription keeps the session it chose"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_reaches_no_subscription_is_not_an_error() {
+        // An ordinary publication names no correlation id, and a response
+        // publication whose request publication has gone names one that is not
+        // there. Neither is a client's mistake, so neither is refused
+        // (`aeron_driver_conductor.c:1714-1716` guards the whole walk).
+        let mut subscriptions = IpcSubscriptions::new();
+        let mut response_sub = link(1001, Some(42), true);
+        response_sub.registration_id = 9;
+        subscriptions.links.push(response_sub);
+
+        let ordinary = publication(100, 1001, false);
+
+        subscriptions
+            .attach_response_publication(&[ordinary], -1, 77, b"aeron:ipc", 555)
+            .expect("an ordinary publication");
+        assert_eq!(Some(42), subscriptions.links()[0].session_id);
+
+        // A request publication that is there, with no subscription behind it.
+        let orphan = publication_answering(100, 1001, false, 404);
+        subscriptions
+            .attach_response_publication(&[orphan], 100, 77, b"aeron:ipc", 555)
+            .expect("a request publication nobody is waiting on");
+        assert_eq!(Some(42), subscriptions.links()[0].session_id);
     }
 
     #[test]

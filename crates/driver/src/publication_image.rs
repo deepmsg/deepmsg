@@ -411,6 +411,7 @@ impl PublicationImage {
         untethered: SubscriptionParams,
         group_semantics: bool,
         multicast_backoff: crate::loss_detector::MulticastBackoff,
+        nak_unicast_delay_ns: i64,
         now_ns: i64,
     ) -> Self {
         let (initial_position, bits) = stream_start(setup);
@@ -591,6 +592,7 @@ impl PublicationImage {
                 untethered.is_reliable,
                 group_semantics,
                 untethered.nak_delay_ns,
+                nak_unicast_delay_ns,
                 multicast_backoff,
             ),
             is_reliable: untethered.is_reliable,
@@ -2256,6 +2258,7 @@ mod tests {
                     crate::config::NAK_MULTICAST_GROUP_SIZE_DEFAULT,
                     crate::config::NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT,
                 ),
+                crate::loss_detector::NAK_UNICAST_DELAY_NS,
                 0,
             );
 

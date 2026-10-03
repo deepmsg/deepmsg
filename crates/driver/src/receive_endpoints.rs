@@ -390,6 +390,7 @@ impl ReceiveChannelEndpoints {
             registration_id,
             now_ms,
             now_ns,
+            &config.incoming_interceptors,
         )
         .map_err(|error| match error {
             ReceiveEndpointError::NoCounter => ReceiveEndpointErrorKind::NoCounter,

@@ -1133,6 +1133,26 @@ impl IpcPublications {
         };
         pending.identity.session_id = session_id;
 
+        // A response publication's subscription is pointed at this session, or
+        // refused if it named another
+        // (`aeron_driver_conductor_find_and_update_ipc_response_subscription`,
+        // `:1711-1760`). The reference runs this one state later, after the
+        // publication object exists and its counters are allocated, and
+        // unwinds all of that on the error; here it runs before any of it is
+        // made, which is the same answer to the client with less to undo. The
+        // session it compares against is the same either way — the
+        // publication's own, decided immediately above.
+        if let Err(message) = subscriptions.attach_response_publication(
+            &self.publications,
+            pending.params.response_correlation_id,
+            pending.identity.registration_id,
+            &pending.identity.channel,
+            session_id,
+        ) {
+            self.failed(pending, log, &message, events);
+            return;
+        }
+
         // The two counters, allocated before anything can see the publication
         // so that a client which reads the reply finds them.
         let Some(pub_pos_counter_id) = counter_position::allocate_publisher_position(

@@ -566,6 +566,7 @@ impl PublicationImages {
                 config.nak_multicast_group_size,
                 config.nak_multicast_max_backoff_ns,
             ),
+            config.nak_unicast_delay_ns,
             now.ns,
         );
 
