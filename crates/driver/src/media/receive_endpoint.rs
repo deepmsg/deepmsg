@@ -852,6 +852,19 @@ impl ReceiveChannelEndpoint {
         &self.dispatcher
     }
 
+    /// Whether a periodic ask for a `SETUP` is worth sending again
+    /// (`aeron_receive_channel_endpoint_should_elicit_setup_message`,
+    /// `media/aeron_receive_channel_endpoint.h:311-314`, which is the
+    /// dispatcher's own answer).
+    ///
+    /// The receiver asks this before it re-sends, and only before it
+    /// **re**-sends: the first ask a destination with a `control=` gets is
+    /// unconditional (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
+    /// `:1127-1152`).
+    pub fn should_elicit_setup_message(&self) -> bool {
+        self.dispatcher.should_elicit_setup_message()
+    }
+
     /// The dispatcher, mutably.
     pub const fn dispatcher_mut(&mut self) -> &mut DataPacketDispatcher {
         &mut self.dispatcher
@@ -2303,6 +2316,28 @@ mod tests {
                 .is_none()
         );
         assert!(sent.frames().is_empty(), "and nothing went out");
+    }
+
+    /// The receiver's gate reaches the dispatcher through the endpoint, and it
+    /// is the *registration* that opens it — not the ask that has already gone
+    /// out (`media/aeron_receive_channel_endpoint.h:311-314`).
+    #[test]
+    fn an_endpoint_no_subscription_registered_on_is_never_asked_again() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+        let (mut endpoint, _sent) = endpoint_that_records(&mut counters, &regions);
+
+        assert!(
+            !endpoint.should_elicit_setup_message(),
+            "a fresh endpoint has registered no stream, so a second ask would \
+             be addressed to nobody"
+        );
+
+        endpoint.dispatcher_mut().add_subscription(1_001);
+        assert!(
+            endpoint.should_elicit_setup_message(),
+            "and a subscription that registers one opens it"
+        );
     }
 
     /// The eight optional bytes a group tag travels in

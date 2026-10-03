@@ -1769,6 +1769,17 @@ impl ReceiverThread {
                 continue;
             };
 
+            // The gate the reference puts on the periodic half alone
+            // (`:227`: `else if (aeron_receive_channel_endpoint_should_elicit_setup_message(entry->endpoint))`).
+            // An endpoint no subscription registered interest on has nobody to
+            // ask for, and the reference leaves the entry exactly where it is —
+            // **without** moving its timestamp, so the next pass asks the same
+            // question again. The ask that was sent when the endpoint was
+            // created is the only one it ever sends.
+            if !endpoint.should_elicit_setup_message() {
+                continue;
+            }
+
             let sent = endpoint.send_sm(
                 pending.destination,
                 control_address,
