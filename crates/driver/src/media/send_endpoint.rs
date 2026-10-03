@@ -762,6 +762,12 @@ impl SendChannelEndpoint {
     }
 
     /// The transport, for the sender's poller.
+    /// The descriptor the poller watches for this endpoint's control frames
+    /// (G4-3), or `None` for a transport with no socket of its own.
+    pub fn descriptor(&self) -> Option<crate::sys::socket::Descriptor> {
+        self.transport.descriptor()
+    }
+
     pub fn transport_mut(&mut self) -> &mut Box<dyn Transport> {
         &mut self.transport
     }

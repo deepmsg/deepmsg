@@ -1010,3 +1010,157 @@ mod tests {
         assert!(size > 0, "a kernel hands every socket a buffer");
     }
 }
+
+/// A descriptor the poller can watch: a socket, as the kernel names it.
+///
+/// Opaque on purpose — nothing outside this module has any business with the
+/// number, and the reference's poller keeps the same distinction (it holds
+/// transports, and asks them for their `recv_fd`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Descriptor(libc::c_int);
+
+impl DatagramSocket {
+    /// The descriptor to register with a [`Poller`].
+    pub const fn descriptor(&self) -> Descriptor {
+        Descriptor(self.fd)
+    }
+}
+
+/// An `epoll` instance over datagram sockets — the reference's
+/// `aeron_udp_transport_poller` for the half that needs readiness rather than a
+/// syscall per socket (`media/aeron_udp_transport_poller.c`).
+///
+/// One call per pass asks the kernel **which** sockets have something, and only
+/// those are read. Below the transport-count threshold the reference does not
+/// bother — it calls `recvmmsg` on each in turn (`:190-206`) — because at that
+/// size the bookkeeping costs more than the syscalls it saves. The choice is the
+/// caller's; this type is only the mechanism.
+pub struct Poller {
+    fd: libc::c_int,
+    /// One `epoll_event` per registered descriptor is what the reference
+    /// allocates (`:150-160`); here the events buffer is filled by
+    /// [`Poller::ready`] into the caller's list.
+    _private: (),
+}
+
+impl Poller {
+    /// A new `epoll` instance.
+    ///
+    /// # Errors
+    ///
+    /// The error from `epoll_create1(2)`.
+    pub fn new() -> io::Result<Self> {
+        // SAFETY: `epoll_create1` takes flags and returns a descriptor or -1;
+        // `EPOLL_CLOEXEC` is the only flag this build wants, so a driver that
+        // execs something does not leak its poller.
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self { fd, _private: () })
+    }
+
+    /// Watch `descriptor` for readability.
+    ///
+    /// # Errors
+    ///
+    /// The error from `epoll_ctl(EPOLL_CTL_ADD)`.
+    pub fn add(&self, descriptor: Descriptor) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: u32::try_from(libc::EPOLLIN).unwrap_or(0),
+            u64: u64::try_from(descriptor.0).unwrap_or(0),
+        };
+
+        // SAFETY: the descriptor is this poller's, the event is a live local,
+        // and `EPOLL_CTL_ADD` is the documented way to register one.
+        let result =
+            unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, descriptor.0, &mut event) };
+        if 0 != result {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Stop watching `descriptor`.
+    ///
+    /// # Errors
+    ///
+    /// The error from `epoll_ctl(EPOLL_CTL_DEL)`.
+    pub fn remove(&self, descriptor: Descriptor) -> io::Result<()> {
+        let mut event = libc::epoll_event { events: 0, u64: 0 };
+
+        // SAFETY: as `add`, with the deletion operation.
+        let result =
+            unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_DEL, descriptor.0, &mut event) };
+        if 0 != result {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// The descriptors that have something to read, appended to `ready`. At
+    /// most `max` of them are taken — the caller knows how many transports it
+    /// has, and asking for more events than that is asking the kernel to fill
+    /// a buffer nobody is waiting for.
+    ///
+    /// The timeout is **zero** — the reference's own (`:208`) — so a pass never
+    /// waits: whatever is there now is what this pass reads, and the next pass
+    /// asks again. `EINTR` and `EAGAIN` are "nothing this pass" rather than
+    /// errors, which is also the reference's reading of them (`:211-216`).
+    ///
+    /// # Returns
+    ///
+    /// How many descriptors were appended.
+    ///
+    /// # Errors
+    ///
+    /// The error from `epoll_wait(2)`, other than the two above.
+    pub fn ready(&self, max: usize, ready: &mut Vec<Descriptor>) -> io::Result<usize> {
+        let capacity = max.max(1);
+        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; capacity];
+
+        // SAFETY: `events` is a live buffer of exactly `capacity` entries and
+        // the count matches it; the poller's descriptor is this type's.
+        let result = unsafe {
+            libc::epoll_wait(
+                self.fd,
+                events.as_mut_ptr(),
+                i32::try_from(capacity).unwrap_or(i32::MAX),
+                0,
+            )
+        };
+
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if io::ErrorKind::Interrupted == error.kind()
+                || io::ErrorKind::WouldBlock == error.kind()
+            {
+                return Ok(0);
+            }
+
+            return Err(error);
+        }
+
+        let count = usize::try_from(result).unwrap_or(0);
+        for event in &events[..count] {
+            if 0 != event.events & u32::try_from(libc::EPOLLIN).unwrap_or(0) {
+                #[allow(clippy::cast_possible_truncation)] // a descriptor is a c_int
+                ready.push(Descriptor(event.u64 as libc::c_int));
+            }
+        }
+
+        Ok(count)
+    }
+}
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor came from `epoll_create1` and is closed once.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}

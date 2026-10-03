@@ -821,6 +821,15 @@ pub(crate) struct ReceiverThread {
     re_resolution_deadline_ns: i64,
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
+    /// Which destinations have something to read (G4-3): the reference's
+    /// transport poller, per receiver (`aeron_driver_receiver.c:130-260` polls
+    /// through it).
+    poller: crate::media::poller::TransportPoller,
+    /// The indices `poller` answered with, reused across passes.
+    readable: Vec<usize>,
+    /// The (endpoint, destination) each index refers to, rebuilt each pass
+    /// because the lists change as channels come and go.
+    transports: Vec<(usize, usize)>,
     last_cycle_ns: i64,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Inbox<ReceiverCommand>,
@@ -860,6 +869,9 @@ impl ReceiverThread {
             pending_resolutions: Vec::new(),
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
+            poller: crate::media::poller::TransportPoller::new(),
+            readable: Vec::new(),
+            transports: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
         }
     }
@@ -1267,6 +1279,9 @@ impl ReceiverThread {
             &mut self.images,
             &mut self.buffers,
             &mut self.datagrams,
+            &mut self.poller,
+            &mut self.readable,
+            &mut self.transports,
             &mut self.pending_setups,
             &system,
             &self.counters,
@@ -1399,11 +1414,15 @@ impl ReceiverThread {
     /// Read every endpoint's socket and give each datagram to the thing that
     /// wants it (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // one per thing the pass carries
     fn receive_datagrams(
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
+        poller: &mut crate::media::poller::TransportPoller,
+        readable: &mut Vec<usize>,
+        transports: &mut Vec<(usize, usize)>,
         pending_setups: &mut Vec<PendingSetup>,
         system: &System<'_>,
         counters: &CounterManager,
@@ -1415,7 +1434,54 @@ impl ReceiverThread {
         let _ = cnc;
         let mut work = 0;
 
-        for (endpoint_id, endpoint) in endpoints.iter_mut() {
+        // Which destinations have something to read this pass (G4-3). At or
+        // below the poller's threshold this is every one of them, in order —
+        // the behaviour this driver has always had — and above it only the ones
+        // the kernel says are ready (`media/aeron_udp_transport_poller.c:190-206`).
+        //
+        // A destination whose transport has no descriptor of its own — a test's
+        // — makes the pass read everything, because a poller that cannot see a
+        // socket must not be the reason it is skipped.
+        transports.clear();
+        let mut descriptors: Vec<crate::sys::socket::Descriptor> = Vec::new();
+        let mut every_transport_has_one = true;
+
+        for (endpoint_index, (_, endpoint)) in endpoints.iter().enumerate() {
+            for destination_index in 0..endpoint.destination_count() {
+                transports.push((endpoint_index, destination_index));
+
+                match endpoint.destination_descriptor(destination_index) {
+                    Some(descriptor) => descriptors.push(descriptor),
+                    None => every_transport_has_one = false,
+                }
+            }
+        }
+
+        if every_transport_has_one {
+            if poller.ready(&descriptors, readable).is_err() {
+                // A poller that cannot answer is not a reason to read nothing:
+                // the pass reads everything, which is the branch below the
+                // threshold and always correct.
+                readable.clear();
+                readable.extend(0..transports.len());
+            }
+        } else {
+            readable.clear();
+            readable.extend(0..transports.len());
+        }
+
+        for readable_index in readable.iter() {
+            let Some((endpoint_index, destination_index)) =
+                transports.get(*readable_index).copied()
+            else {
+                continue;
+            };
+
+            let Some((endpoint_id, endpoint)) = endpoints.get_mut(endpoint_index) else {
+                continue;
+            };
+
+            let endpoint_id = *endpoint_id;
             // Every destination, not just the first: a multi-destination channel
             // has one socket per destination and a datagram that arrives on any
             // of them is a datagram this endpoint has to read
@@ -1428,7 +1494,7 @@ impl ReceiverThread {
             // not through the first one. The position below is only the cursor
             // for this pass — what is passed on is the destination's own
             // handle, because that is what an image keeps.
-            for destination_index in 0..endpoint.destination_count() {
+            {
                 let Some(destination) = endpoint.destination_id(destination_index) else {
                     continue;
                 };
@@ -1461,7 +1527,7 @@ impl ReceiverThread {
 
                     let packet = &buffers[slot][..datagram.length];
                     Self::dispatch(
-                        *endpoint_id,
+                        endpoint_id,
                         destination,
                         endpoint,
                         images,

@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 pub mod destination_tracker;
 pub mod dispatcher;
 pub mod loss_generator;
+pub mod poller;
 pub mod receive_endpoint;
 pub mod send_endpoint;
 pub mod udp_transport;
@@ -96,6 +97,16 @@ pub trait Transport: Send {
     /// full socket buffer reads as `Ok(0)`, because a datagram that did not
     /// leave is a datagram the publication still has to send.
     fn send(&mut self, address: Option<SocketAddr>, buffers: &[&[u8]]) -> io::Result<usize>;
+
+    /// The descriptor a [`crate::media::poller::TransportPoller`] watches for
+    /// this transport's readability, or `None` for a transport that has no
+    /// socket of its own — a test's, or one that is a buffer.
+    ///
+    /// The reference's poller keeps the same thing per transport
+    /// (`transport->recv_fd`, `media/aeron_udp_transport_poller.c:157`).
+    fn descriptor(&self) -> Option<crate::sys::socket::Descriptor> {
+        None
+    }
 
     /// Receive everything queued into `buffers`, up to their number, and
     /// describe what arrived in `datagrams`.
