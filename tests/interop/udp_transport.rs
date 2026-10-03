@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::logbuffer::append::Appended;
+use deepmsg_driver::position::type_id::RECEIVER_NAKS_SENT;
 use deepmsg_driver::protocol::{SetupFrame, StatusMessageFrame};
 use deepmsg_driver::sys::AddressFamily;
 use deepmsg_driver::sys::socket::{DatagramSocket, Datagrams};
@@ -2069,5 +2070,103 @@ fn a_late_subscriber_meets_a_reference_publisher_where_the_stream_is() {
             && matches!(sub_pos, Some(position) if position > 0),
         "an image built from a `SETUP` naming a position must take that position, not zero \
          (`aeron_publication_image.c:391-392`).\n{evidence}"
+    );
+}
+
+/// The UDP channel's incoming interceptors, end to end — the setting
+/// `CTestMediaDriver` injects loss with, which `docs/compat.md` said this build
+/// accepted and ignored.
+///
+/// The arrangement is the harness's own: `enableFixedLoss` names `fixed-loss`
+/// and hands it a range of one term (`CTestMediaDriver.java:409-426`), and the
+/// driver drops exactly that range, **once per stream and session**. The two
+/// assertions are the pair that says the drop was real and not a skipped test:
+/// the stream still arrives whole — which it can only do by retransmission —
+/// and the image sent at least one NAK, which it can only do after seeing a
+/// hole.
+///
+/// `AERON_NAK_UNICAST_DELAY` is set the way the harness sets it
+/// (`CTestMediaDriver.java:449-452`), so the NAK is not coalesced into a delay
+/// this test would have to wait out.
+#[test]
+fn a_channel_that_names_an_interceptor_loses_exactly_what_it_names() {
+    let Some(mut own) = OwnDriver::start_with_env(
+        "udp-fixed-loss",
+        &[],
+        &[
+            ("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "fixed-loss"),
+            // The first two kibibytes of term 0, which is where a stream
+            // starts: the frame at offset 0 is the one the rule reaches.
+            (
+                "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_FIXED_LOSS_ARGS",
+                "term-id=0|term-offset=0|length=2048",
+            ),
+            ("AERON_NAK_UNICAST_DELAY", "0"),
+        ],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver must publish a readable CnC file");
+
+    // Offset fourteen: the tests in this file run in parallel and each offset
+    // is a port.
+    let port = free_udp_port(14);
+    // The term the interceptor names has to be the term the stream starts in,
+    // and a publication that names no position picks a **random** initial term
+    // id — so the position triple is what pins `term-id=0` to a real term. The
+    // reference's own loss tests do the same (`DataLossAndRecoverySystemTest`
+    // passes `init-term-id=0|term-id=0|term-offset=0`).
+    let channel = format!(
+        "aeron:udp?endpoint=127.0.0.1:{port}|term-length=64k|init-term-id=0|term-id=0|term-offset=0"
+    );
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the publication");
+    let subscription = client
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver must confirm the subscription");
+
+    // A term's worth, so the hole at the start is well behind the reader by the
+    // time the last message arrives.
+    const MESSAGES: usize = 64;
+    let payload = [0x5Au8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut offered, mut received) = (0usize, 0usize);
+
+    while received < MESSAGES && Instant::now() < deadline {
+        if offered < MESSAGES
+            && let Some(Appended::Ok { .. }) = client.offer(publication, &payload)
+        {
+            offered += 1;
+        }
+
+        client.poll();
+        client.poll_subscription(subscription, 10, |_| received += 1);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        MESSAGES, received,
+        "the stream arrives whole, which the drop cannot prevent: a lost frame is what a NAK \
+         is for (offered {offered})"
+    );
+
+    let reader = client.counters_reader().expect("the counter regions");
+    let naks = reader
+        .find_by_type_id(RECEIVER_NAKS_SENT)
+        .and_then(|counter| reader.value(counter.counter_id))
+        .expect("the image's `receiver-naks-sent` counter");
+
+    assert!(
+        naks > 0,
+        "the hole the interceptor made was seen and asked for: receiver-naks-sent={naks}. \
+         A zero here with every message delivered means nothing was dropped — the \
+         setting went unread, which is exactly what this test is for"
     );
 }

@@ -335,10 +335,37 @@ driver has never heard of must not stop it
 The three **suppliers** are the same kind of setting — the reference `dlsym`s
 the name it is given — and they are not refused wholesale: this build serves the
 names in the reference's own table and refuses the ones that are not in it,
-which is recorded above under the flow-control settings. The ATS channel
-interceptors (`AERON_UDP_CHANNEL_{INCOMING,OUTGOING}_INTERCEPTORS`) are accepted
-and ignored, because the channel parameters that would use them are refused when
-a client names them, which is where a deployment would notice.
+which is recorded above under the flow-control settings.
+
+The UDP channel interceptors
+(`AERON_UDP_CHANNEL_{INCOMING,OUTGOING}_INTERCEPTORS`) are **not** one of these,
+though an earlier version of this section filed them here and called them
+"accepted and ignored". They name no code to load: the reference resolves each
+name against a table it **compiles in** —
+`media/aeron_udp_channel_transport_bindings.c:71-93` holds `loss`, `fixed-loss`
+and `multi-gap-loss`, and `aeron_udp_channel_interceptor_bindings_load`
+(`:123-184`) has no `dlopen` fallback — so serving them is not a departure from
+ADR-0002 and has nothing to do with it. All three are served
+(`crates/driver/src/media/interceptor.rs`), which is what the harness's loss
+injection needs: `CTestMediaDriver` sets these variables on the tests that ask
+for loss (`CTestMediaDriver.java:383-447`), and a driver that accepted and
+dropped them was a driver reporting loss that never happened — the system tests
+it broke assert on the NAK counter, which stayed at zero.
+
+A name outside that table still stops the driver, as it stops the reference's
+(`aeron_driver_context.c:1283-1290` is a `goto error`), and so does **any**
+outgoing name: none of the three has an outgoing half (`outgoing_init_func` is
+`NULL` in all three `_load` functions), so every value
+`AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS` can hold is one the table cannot
+resolve. `tests/interop/udp_transport.rs::a_channel_that_names_an_interceptor_loses_exactly_what_it_names`
+is the two-way case: with the setting served, a stream whose first frame the
+interceptor drops still arrives whole and its image's `receiver-naks-sent` is
+above zero; with the setting dropped — which is what this build did before — the
+same run delivers every message and the counter is zero.
+`tests/integration/driver_process_contract.rs::the_settings_that_name_code_stop_the_driver_with_a_reason`
+covers the two refusals, and
+`crates/driver/src/config.rs::the_loss_the_harness_injects_is_the_loss_the_driver_reads`
+the binding of `AERON_NAK_UNICAST_DELAY` beside them.
 
 `aeron.driver.connect` is **not** one of these, though an earlier plan filed it
 here: it is a boolean (`aeron_driver_context.c:247,668`) that decides whether a
@@ -440,7 +467,7 @@ be falsified.
 | **A channel-status counter's key is zero-filled past the channel** | The reference `memcpy`s the channel into an uninitialized struct, so the key's tail is whatever was on its stack (`aeron_position.c:220-222`). The bytes here are the same for the same channel every time, which is what a key is for. |
 | **Loss injection is configured by this build's own property, and a datagram it withholds is reported as sent** | Two differences in one seam. The reference's debug loss surface is eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}` variables (`media/aeron_debug_channel_endpoint_configuration.h:22-29`) read by an installer the driver context never calls — only a C++ test does (`aeron-driver/src/test/c/media/aeron_test_loss_generators_test.cpp:467`, `media/aeron_debug_channel_endpoint_configuration.c:126-172`) — so a driver started as a process has no way in, and every interop test here starts one. This build reads `deepmsg.debug.send.data.loss.drop.every` instead: a count, not a rate, over outgoing datagrams, on the send endpoint's data slot only. The second difference is what a withheld call reports: the reference answers `0` (`media/aeron_send_channel_endpoint.c:391-403`), so its sender never advances `snd-pos` and the frames go out on a later pass — no gap, nothing retransmitted. Here the withheld datagram counts as handed over, which is the only way a gap, a NAK and a retransmission become observable on a wire that does not lose anything. Covered by `tests/interop/udp_transport.rs::a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it`; the generator itself is `crates/driver/src/media/loss_generator.rs`. |
 | **An image's `sparse` byte is its channel's, not the oldest matching subscription's** | Both of the metadata bytes an image copies from a subscription (`aeron_publication_image.c:280-281`) are read here off the channel the `SETUP` carried (`crates/driver/src/publication_images.rs::begin_create`). The reference reads `reliable` off the link being linked and `sparse` off the **oldest** subscription matching the image (`aeron_driver_conductor_is_oldest_subscription_sparse`, `aeron_driver_conductor.c:6715-6717`). The channel that created the image is one of those subscriptions, so the two agree until two subscriptions that name different `sparse` share one image — a byte nothing in this build reads, and the only one of the pair where they can differ. Covered by `crates/driver/src/publication_image.rs::an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse`. |
-| **A clashing subscription is refused on `reliable` alone** | The reference refuses a subscription whose options disagree with one already reading the same endpoint and stream, and checks three of them — `reliable`, `rejoin` and `isResponse` (`aeron_driver_conductor_has_clashing_subscription`, `aeron_driver_conductor.c:307-361`). This build checks the first, because it is the one that changes what an image *does* rather than what it advertises; the other two are read by nothing here yet. Covered by `crates/driver/src/conductor.rs::two_subscriptions_that_disagree_about_reliability_cannot_share_a_channel`. |
+| **A `loss` interceptor draws from its own generator, not the process's** | The reference has one process-wide `erand48` state — `static unsigned short data_loss_xsubi[3]` (`media/aeron_udp_channel_transport_loss.c:47`) — so which frames it drops depends on what every other transport has received, in order. Here each channel's interceptor keeps its own, seeded the same way, because the alternative is a global the receive threads would have to synchronise on. The **rate** and the **message-type mask** are the same either way; the frames are a different draw from the same distribution. `crates/driver/src/media/interceptor.rs::the_generator_is_the_one_the_reference_draws_from` pins the generator against values taken from `erand48` itself — the three shorts are in glibc's order, least significant first, and getting that backwards still yields numbers in `[0, 1)` — and `::the_loss_interceptor_drops_only_what_the_mask_names` the mask. |
 | **A gap on an unreliable stream is filled, not asked for** | Not a divergence but the opposite — it is the reference's behaviour, absent until now: `reliable=false` was parsed and dropped, so a client that named it got a reliable stream. An image whose channel said `false` now takes the reference's zero delay generator, which it returns **before** reading `nak-delay=` (`aeron_publication_image.c:92-95`), and covers each hole with a padding frame instead of sending a NAK, counting `loss-gap-fills` (`:1053-1066`). The data in the hole is gone, which is what the parameter means. Covered by `tests/integration/unreliable_stream.rs`; the reader half of it is `crates/client/src/image.rs`'s `Step::Padding`, which used to end the term at a padding frame where the reference steps over it (`aeron_image.c:375-379`) — invisible until an image started leaving padding **mid-term**. |
 
 The first row is the one a client can see from outside, and it is the reason
