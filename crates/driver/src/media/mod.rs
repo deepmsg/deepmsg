@@ -39,6 +39,7 @@ use std::net::SocketAddr;
 
 pub mod destination_tracker;
 pub mod dispatcher;
+pub mod interceptor;
 pub mod loss_generator;
 pub mod poller;
 pub mod receive_endpoint;

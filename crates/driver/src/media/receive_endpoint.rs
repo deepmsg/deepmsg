@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use super::interceptor::Incoming;
 use crate::protocol::{
     ErrorFrame, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame,
     header_flags,
@@ -167,6 +168,7 @@ impl ReceiveDestination {
         channel_status_counter_id: i32,
         now_ms: i64,
         now_ns: i64,
+        interceptors: &[super::interceptor::Interceptor],
     ) -> Result<Self, ReceiveEndpointError> {
         // `aeron_receive_destination.c:47-56`: the manager is asked for the
         // port **before** the socket is opened, on the address the channel
@@ -214,6 +216,7 @@ impl ReceiveDestination {
             channel_status_counter_id,
             now_ms,
             now_ns,
+            interceptors,
         )
     }
 
@@ -235,6 +238,7 @@ impl ReceiveDestination {
         channel_status_counter_id: i32,
         now_ms: i64,
         now_ns: i64,
+        interceptors: &[super::interceptor::Interceptor],
     ) -> Result<Self, ReceiveEndpointError> {
         let local_sockaddr_counter_id = destination_local_sockaddr_counter(
             &*transport,
@@ -261,6 +265,7 @@ impl ReceiveDestination {
         Ok(Self {
             channel,
             transport,
+            interceptors: Incoming::new(interceptors),
             local_sockaddr_counter_id,
             managed_port,
             has_explicit_control,
@@ -454,6 +459,15 @@ pub struct ReceiveDestination {
     pub channel: UdpChannel,
     /// The socket it reads from and answers through.
     transport: Box<dyn Transport>,
+    /// What this transport's datagrams pass through before the endpoint sees
+    /// them ([`crate::media::interceptor`]).
+    ///
+    /// Per destination and not per driver, which is the reference's own
+    /// granularity: it builds the chain in `aeron_udp_channel_data_paths_init`
+    /// (`media/aeron_udp_channel_transport_bindings.c:186-260`), called from
+    /// each transport's init, and two of the three built-in interceptors keep
+    /// per-stream state that must not be shared between two sockets.
+    interceptors: Incoming,
     /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
     /// bound, which is not what the channel said when it named port zero.
     local_sockaddr_counter_id: i32,
@@ -639,6 +653,7 @@ impl ReceiveChannelEndpoint {
         registration_id: i64,
         now_ms: i64,
         now_ns: i64,
+        interceptors: &[super::interceptor::Interceptor],
     ) -> Result<Self, ReceiveEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -676,6 +691,7 @@ impl ReceiveChannelEndpoint {
                 channel_status_counter_id,
                 now_ms,
                 now_ns,
+                interceptors,
             ) {
                 Ok(destination) => vec![(DestinationId::FIRST, destination)],
                 Err(error) => {
@@ -739,6 +755,7 @@ impl ReceiveChannelEndpoint {
         registration_id: i64,
         now_ms: i64,
         now_ns: i64,
+        interceptors: &[super::interceptor::Interceptor],
     ) -> Result<Self, ReceiveEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -769,6 +786,7 @@ impl ReceiveChannelEndpoint {
                 channel_status_counter_id,
                 now_ms,
                 now_ns,
+                interceptors,
             ) {
                 Ok(destination) => vec![(DestinationId::FIRST, destination)],
                 Err(error) => {
@@ -991,6 +1009,21 @@ impl ReceiveChannelEndpoint {
     /// # Errors
     ///
     /// The transport's error; an empty socket is `Ok(0)`.
+    /// Whether this destination's interceptors drop a datagram that has just
+    /// come off its socket
+    /// (`aeron_udp_channel_incoming_interceptor_recv_func`,
+    /// `media/aeron_udp_channel_transport_bindings.c:172-185`).
+    ///
+    /// Asked **after** the read and before the dispatcher, which is where the
+    /// reference asks it too: the interceptor chain is what the transport hands
+    /// each datagram to, and a dropped one never reaches the endpoint — so it
+    /// moves no counter and wakes nobody, and the peer's loss detection is what
+    /// notices.
+    pub fn drops(&mut self, id: DestinationId, datagram: &[u8]) -> bool {
+        self.destination_mut(id)
+            .is_some_and(|destination| destination.interceptors.drops(datagram))
+    }
+
     pub fn receive_from(
         &mut self,
         id: DestinationId,
@@ -1776,6 +1809,7 @@ mod tests {
             0,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("a destination");
 
@@ -1789,6 +1823,7 @@ mod tests {
             0,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("a destination");
 
@@ -1831,6 +1866,7 @@ mod tests {
             0,
             1_000,
             ACTIVITY_START_NS,
+            &[],
         )
         .expect("a destination");
 
@@ -1844,6 +1880,7 @@ mod tests {
             0,
             1_000,
             ACTIVITY_START_NS,
+            &[],
         )
         .expect("a destination");
 
@@ -1907,6 +1944,7 @@ mod tests {
             0,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("a destination");
 
@@ -1930,6 +1968,7 @@ mod tests {
             0,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("a destination");
 
@@ -1965,6 +2004,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2014,6 +2054,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2033,6 +2074,7 @@ mod tests {
             endpoint.channel_status_counter_id(),
             1_000,
             1_000_000,
+            &[],
         )
         .expect("a destination");
 
@@ -2085,6 +2127,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2101,6 +2144,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );
@@ -2118,6 +2162,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );
@@ -2169,6 +2214,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2186,6 +2232,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );
@@ -2201,6 +2248,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );
@@ -2258,6 +2306,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2291,6 +2340,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2589,6 +2639,7 @@ mod tests {
             7,
             1_000,
             1_000_000,
+            &[],
         )
         .expect("an endpoint");
 
@@ -2604,6 +2655,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );
@@ -2628,6 +2680,7 @@ mod tests {
                 endpoint.channel_status_counter_id(),
                 1_000,
                 1_000_000,
+                &[],
             )
             .expect("a destination"),
         );

@@ -3581,6 +3581,7 @@ impl Conductor {
                         channel_status_counter_id,
                         now_ms,
                         now_ns,
+                        &self.config.incoming_interceptors,
                     ) {
                         Ok(destination) => destination,
                         Err(error) => {

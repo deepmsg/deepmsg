@@ -451,7 +451,10 @@ impl TerminationPolicy {
 }
 
 /// Everything the driver needs to know before it touches the file system.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Eq` is not derived: a `loss` interceptor's rate is an `f64`
+// (`media/aeron_udp_channel_transport_loss.c:24`), and that is the reference's
+// type for it too.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DriverConfig {
     /// Where the CnC file, the term buffers and the subdirectories live.
     /// Mandatory: the reference has no default for it either.
@@ -793,6 +796,26 @@ pub struct DriverConfig {
     /// `aeronmd.h:385`): how long the loss report file is, before it is aligned
     /// up to the file page size (`aeron_driver.c:329-330`).
     pub loss_report_buffer_length: i64,
+    /// `aeron.nak.unicast.delay` (`AERON_NAK_UNICAST_DELAY`, `aeronmd.h:661`):
+    /// how long an image waits before asking for a gap it has seen, where its
+    /// channel named no `nak-delay=`.
+    ///
+    /// Clamped up to [`crate::loss_detector::NAK_UNICAST_DELAY_NS`], which is
+    /// the reference's own floor (`AERON_NAK_UNICAST_DELAY_NS_MIN`,
+    /// `aeron_driver_context.c:222`) — a zero here would be a driver that
+    /// asked for every gap the instant it saw it.
+    pub nak_unicast_delay_ns: i64,
+    /// The incoming interceptors every channel's transports read through, from
+    /// `AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS`
+    /// ([`crate::media::interceptor`]).
+    ///
+    /// Resolved once, here, so that a name the reference's own table does not
+    /// hold stops the driver at start rather than at the first channel that
+    /// would have used it — which is the reference's behaviour too
+    /// (`aeron_driver_context.c:1283-1290` is a `goto error`). One
+    /// [`crate::media::interceptor::Incoming`] is built from this per
+    /// transport, because two of the three keep per-stream state.
+    pub incoming_interceptors: Vec<crate::media::interceptor::Interceptor>,
     /// `aeron.driver.connect` (`AERON_DRIVER_CONNECT`, `aeronmd.h:723`):
     /// whether a send endpoint connects its socket to the endpoint its channel
     /// names (`media/aeron_send_channel_endpoint.c:89`).
@@ -841,6 +864,8 @@ impl Default for DriverConfig {
     fn default() -> Self {
         Self {
             aeron_dir: PathBuf::new(),
+            nak_unicast_delay_ns: crate::loss_detector::NAK_UNICAST_DELAY_NS,
+            incoming_interceptors: Vec::new(),
             dirs_delete_on_start: false,
             dirs_delete_on_shutdown: false,
             warn_if_dirs_exist: false,
@@ -1219,6 +1244,10 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::FILE_PAGE_SIZE) {
             config.layout.page_size = parse_size64(&Setting::FILE_PAGE_SIZE, &value)?;
+        }
+        if let Some(value) = get(&Setting::NAK_UNICAST_DELAY) {
+            config.nak_unicast_delay_ns = parse_duration_ns(&Setting::NAK_UNICAST_DELAY, &value)?
+                .max(crate::loss_detector::NAK_UNICAST_DELAY_NS);
         }
         if let Some(value) = get(&Setting::CLIENT_LIVENESS_TIMEOUT) {
             config.client_liveness_timeout_ns =
@@ -1765,6 +1794,16 @@ impl DriverConfig {
             });
         }
 
+        // The UDP channel's interceptors. The reference reads both lists here
+        // too, and **fails its context init** on a name its table does not hold
+        // (`aeron_driver_context.c:1274-1290`): a driver that came up without
+        // the loss injection a deployment asked for would report losses that
+        // never happened. None of the three it compiles in has an outgoing
+        // half, so an outgoing list is always such a name.
+        config.incoming_interceptors =
+            crate::media::interceptor::resolve_incoming(env).map_err(ConfigError::Interceptor)?;
+        crate::media::interceptor::refuse_outgoing(env).map_err(ConfigError::Interceptor)?;
+
         Ok(config)
     }
 }
@@ -2254,6 +2293,12 @@ impl Setting {
         property: "client.liveness.timeout",
         env: "AERON_CLIENT_LIVENESS_TIMEOUT",
     };
+    /// `aeron.nak.unicast.delay` (`AERON_NAK_UNICAST_DELAY`,
+    /// `aeronmd.h:661`; read at `aeron_driver_context.c:952-956`).
+    const NAK_UNICAST_DELAY: Self = Self {
+        property: "nak.unicast.delay",
+        env: "AERON_NAK_UNICAST_DELAY",
+    };
     /// `aeron.file.page.size` (`:185`).
     const FILE_PAGE_SIZE: Self = Self {
         property: "file.page.size",
@@ -2308,6 +2353,9 @@ impl Setting {
 /// Why a configuration could not be resolved.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// A UDP channel interceptor list the reference would not load
+    /// ([`crate::media::interceptor::InterceptorError`]).
+    Interceptor(crate::media::interceptor::InterceptorError),
     /// A setting whose value is **code** — a library to load, or a symbol to
     /// call — was named, and this build loads no code (ADR-0002).
     ///
@@ -2421,6 +2469,7 @@ impl std::fmt::Display for ConfigError {
             Self::MalformedArgument { argument } => {
                 write!(f, "expected -Dname=value, got {argument}")
             }
+            Self::Interceptor(error) => write!(f, "{error}"),
             Self::MissingAeronDir { property, env } => write!(
                 f,
                 "no aeron directory: set -Ddeepmsg.{property}, -Daeron.{property}, {env} or DEEPMSG_{}",
@@ -2491,6 +2540,7 @@ impl std::error::Error for ConfigError {
             | Self::UnknownThreadingMode { .. }
             | Self::UnknownThreadNaming { .. }
             | Self::UnknownIdleStrategy { .. }
+            | Self::Interceptor(..)
             | Self::DynamicLoadingNotSupported { .. } => None,
         }
     }
@@ -2963,6 +3013,90 @@ mod tests {
     /// Quietly dropping them is the failure this prevents: a deployment that
     /// named interceptors or an agent hook would run without them and never
     /// find out.
+    /// The NAK delay and the two interceptor lists, which are the settings the
+    /// reference reads for the test harness and which this build used to
+    /// ignore — `AERON_NAK_UNICAST_DELAY` was one of the five names a field
+    /// existed for and nothing bound, and the interceptor lists were accepted
+    /// and dropped, which is a deployment injecting no loss and being told
+    /// nothing about it.
+    #[test]
+    fn the_loss_the_harness_injects_is_the_loss_the_driver_reads() {
+        use crate::media::interceptor::{Interceptor, LossParams};
+
+        // `dontCoalesceNaksOnReceiverByDefault` sends a bare `0`
+        // (`CTestMediaDriver.java:449-452`), which is microseconds and below
+        // the reference's floor: `AERON_NAK_UNICAST_DELAY_NS_MIN` is 1000
+        // (`aeron_driver_context.c:222`).
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[("AERON_NAK_UNICAST_DELAY", "0")],
+        )
+        .expect("a config");
+        assert_eq!(1_000, config.nak_unicast_delay_ns, "the floor, not zero");
+
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[("AERON_NAK_UNICAST_DELAY", "10us")],
+        )
+        .expect("a config");
+        assert_eq!(10_000, config.nak_unicast_delay_ns);
+
+        // Nothing named is the driver's own delay, which is the same 1000 ns.
+        let config = resolve_with_env(&[("deepmsg.dir", "/tmp/aeron")], &[]).expect("a config");
+        assert_eq!(
+            crate::loss_detector::NAK_UNICAST_DELAY_NS,
+            config.nak_unicast_delay_ns
+        );
+
+        // The incoming list, and the arguments that go with it.
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[
+                ("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "loss"),
+                (
+                    "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS",
+                    "rate=0.1|seed=3405691582|recv-msg-mask=0x9",
+                ),
+            ],
+        )
+        .expect("a config");
+        assert_eq!(
+            vec![Interceptor::Loss(LossParams {
+                rate: 0.1,
+                seed: 3_405_691_582,
+                message_type_mask: 0x9,
+            })],
+            config.incoming_interceptors
+        );
+
+        // A name the reference's table does not hold stops the driver, which is
+        // its own `goto error` (`aeron_driver_context.c:1283-1290`).
+        assert!(matches!(
+            resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[(
+                    "AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS",
+                    "aeron_ats_interceptor"
+                )],
+            ),
+            Err(ConfigError::Interceptor(
+                crate::media::interceptor::InterceptorError::Unknown { .. }
+            ))
+        ));
+
+        // And so does an outgoing one: none of the three it compiles in has an
+        // outgoing half, so every name here is one it cannot resolve.
+        assert!(matches!(
+            resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[("AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS", "loss")],
+            ),
+            Err(ConfigError::Interceptor(
+                crate::media::interceptor::InterceptorError::Unknown { .. }
+            ))
+        ));
+    }
+
     #[test]
     fn a_setting_that_names_code_is_refused_by_name() {
         for (property, env) in [

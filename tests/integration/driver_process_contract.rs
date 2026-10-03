@@ -94,6 +94,14 @@ const EXIT_BUDGET: Duration = Duration::from_secs(2);
 /// `AERON_MTU_LENGTH` is absent on purpose and would be a mistake to add:
 /// `CTestMediaDriver` sets `publicationTermBufferLength()` and no MTU at all.
 const READ: &[(&str, &str)] = &[
+    // The NAK delay and the channel's interceptors, which the harness sets on
+    // the tests that inject loss (`CTestMediaDriver.java:383-447`,
+    // `:449-452`) and which G5's scan had as names with a field and no
+    // binding. `loss` at `rate=0` is served and drops nothing, which is what
+    // lets the read-and-publish below still work with an interceptor in place.
+    ("AERON_NAK_UNICAST_DELAY", "0"),
+    ("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "loss"),
+    ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS", "rate=0"),
     ("AERON_CLIENT_LIVENESS_TIMEOUT", "15s"),
     // The threading set, bound by G4-1a and acted on by G4-1b. `SHARED` is the
     // value 58 of the harness's 82 tests send, which makes it the one worth
@@ -225,7 +233,6 @@ const IGNORED: &[(&str, &str)] = &[
         "AERON_MULTICAST_FLOWCONTROL_SUPPLIER",
         "aeron_max_multicast_flow_control_strategy_supplier",
     ),
-    ("AERON_NAK_UNICAST_DELAY", "0"),
     ("AERON_PRINT_CONFIGURATION", "true"),
     ("AERON_PUBLICATION_CONNECTION_TIMEOUT", "5s"),
     ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "15s"),
@@ -234,21 +241,12 @@ const IGNORED: &[(&str, &str)] = &[
         "AERON_TRANSPORT_SECURITY_CONF_FILE",
         "/nonexistent/ats.conf",
     ),
-    (
-        "AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS",
-        "aeron_transport_security_channel_interceptor_load",
-    ),
-    (
-        "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
-        "aeron_transport_security_channel_interceptor_load",
-    ),
+    // The three `…_ARGS` names are read by the interceptor that names them and
+    // by nothing else, so with `loss` selected only one of them is live; the
+    // other two are here because the harness sets them together.
     (
         "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_FIXED_LOSS_ARGS",
         "term-id=0|term-offset=0|length=1024",
-    ),
-    (
-        "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS",
-        "rate=0.1|seed=7",
     ),
     (
         "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MULTI_GAP_LOSS_ARGS",
@@ -651,6 +649,15 @@ fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
         (
             "AERON_AGENT_ON_START_FUNCTION",
             "a_symbol_that_is_not_there",
+        ),
+        // The outgoing half of the interceptor lists: none of the three the
+        // reference compiles in has one (`outgoing_init_func` is `NULL` in all
+        // three `_load` functions), so every name here is one its table cannot
+        // resolve and its context init fails on
+        // (`aeron_driver_context.c:1274-1281`).
+        (
+            "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
+            "aeron_transport_security_channel_interceptor_load",
         ),
     ] {
         let Some(mut fixture) = Fixture::start("refused-code", &[(name, value)]) else {

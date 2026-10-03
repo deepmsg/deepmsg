@@ -1527,6 +1527,15 @@ impl ReceiverThread {
                     };
 
                     let packet = &buffers[slot][..datagram.length];
+
+                    // The channel's interceptors see it first, and one that
+                    // drops it ends the pass for this datagram — nothing below
+                    // this line happens, which is what makes the loss real
+                    // rather than reported.
+                    if endpoint.drops(destination, packet) {
+                        continue;
+                    }
+
                     Self::dispatch(
                         endpoint_id,
                         destination,
