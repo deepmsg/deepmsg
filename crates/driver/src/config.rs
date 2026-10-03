@@ -2105,19 +2105,40 @@ pub(crate) fn cubic_duration(value: &str) -> Option<i64> {
     parse_duration_ns(&Setting::CUBIC_INITIAL_RTT, value).ok()
 }
 
-fn parse_duration_ns(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
+/// The same parse, without a setting to blame: `None` when the value is not a
+/// duration. Used by the idle strategies' init args, which the reference reads
+/// with this very function (`aeron_idle_strategy_sleeping_init_args`,
+/// `aeron_agent.c:47-66`).
+pub(crate) fn duration_ns(value: &str) -> Option<i64> {
     let lower = value.to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(head) = lower.strip_suffix("ns") {
-        (head, 1i64)
-    } else if let Some(head) = lower.strip_suffix("us") {
+    let (digits, multiplier) = split_duration(&lower);
+
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
+/// A duration's digits and the multiplier its suffix asks for
+/// (`aeron_parse_duration_ns`, `util/aeron_parse_util.c:193-266`).
+///
+/// No suffix at all is nanoseconds — and a suffix that is not one of these
+/// leaves the letters in the digits, which is what makes the caller's parse
+/// fail on `1m` or `1x` rather than read them as a number.
+fn split_duration(value: &str) -> (&str, i64) {
+    if let Some(head) = value.strip_suffix("ns") {
+        (head, 1)
+    } else if let Some(head) = value.strip_suffix("us") {
         (head, 1_000)
-    } else if let Some(head) = lower.strip_suffix("ms") {
+    } else if let Some(head) = value.strip_suffix("ms") {
         (head, 1_000_000)
-    } else if let Some(head) = lower.strip_suffix('s') {
+    } else if let Some(head) = value.strip_suffix('s') {
         (head, 1_000_000_000)
     } else {
-        (lower.as_str(), 1)
-    };
+        (value, 1)
+    }
+}
+
+fn parse_duration_ns(setting: &Setting, value: &str) -> Result<i64, ConfigError> {
+    let lower = value.to_ascii_lowercase();
+    let (digits, multiplier) = split_duration(&lower);
 
     let count: i64 = digits.parse().map_err(|_| ConfigError::NotANumber {
         name: setting.property,
