@@ -19,6 +19,12 @@
 //!    deployment this driver is meant to slot into carries settings it has no
 //!    use for, and a driver that refused to start over one would be worse than
 //!    useless. Forty of the harness's names are in that position today.
+//!
+//!    One exception, and it is a deliberate one: the two names whose value is
+//!    **code** — a library to load, a symbol to call — stop the driver, because
+//!    it has heard of them and cannot do what they ask (ADR-0002), and the
+//!    reference would not start over an unloadable one either. See
+//!    [`the_settings_that_name_code_stop_the_driver_with_a_reason`].
 //! 3. **stderr is empty on a clean run.** Every test not annotated
 //!    `@IgnoreStdErr` asserts the driver's stderr file is zero bytes long
 //!    (`MediaDriverTestUtil.java:128-132`, from `:95-99`), so one diagnostic
@@ -170,10 +176,6 @@ const READ: &[(&str, &str)] = &[
 ///   [`the_event_log_names_are_accepted_and_make_no_log`] is the test that says
 ///   what this driver does with them: nothing, and no log file.
 const IGNORED: &[(&str, &str)] = &[
-    (
-        "AERON_DRIVER_DYNAMIC_LIBRARIES",
-        "/nonexistent/libaeron_ats.so",
-    ),
     ("AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR", "127.0.0.1:5000"),
     (
         "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
@@ -607,6 +609,57 @@ fn the_event_log_names_are_accepted_and_make_no_log() {
          would say it does",
         log.display()
     );
+}
+
+/// The settings whose value is **code** do not start a driver — and they do
+/// not start one in the reference either, where the library or the symbol that
+/// cannot be loaded fails its context init
+/// (`aeron_driver_context.c:539-546`, `:555-561`).
+///
+/// This is the one **exception** to the clause above: a name this driver has
+/// never heard of must not stop it, and these two are names it has heard of
+/// that ask for something it cannot do — load code (ADR-0002). The exception is
+/// deliberate and the alternative is worse: a deployment that named
+/// interceptors or an agent hook would run without them and never be told.
+///
+/// stderr is where it goes, and the empty-stderr clause does not apply: this is
+/// not a clean run, it is a driver saying why it will not start.
+#[test]
+fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
+    for (name, value) in [
+        (
+            "AERON_DRIVER_DYNAMIC_LIBRARIES",
+            "/nonexistent/libaeron_ats.so",
+        ),
+        (
+            "AERON_AGENT_ON_START_FUNCTION",
+            "a_symbol_that_is_not_there",
+        ),
+    ] {
+        let Some(mut fixture) = Fixture::start("refused-code", &[(name, value)]) else {
+            driver::announce_own_skip();
+            return;
+        };
+
+        // It exits on its own, and the wait is the assertion: a driver that
+        // kept running would be one that ignored the setting.
+        let status = fixture
+            .child
+            .wait()
+            .expect("the driver either starts or says why it will not");
+        fixture.exit = Some(status);
+
+        assert!(
+            !status.success(),
+            "{name} must stop the driver, not be ignored"
+        );
+
+        let said = std::fs::read_to_string(&fixture.stderr).expect("the stderr file");
+        assert!(
+            said.contains(name) || said.contains("dynamic.libraries") || said.contains("code"),
+            "{name} must be named in the reason; the driver said:\n{said}"
+        );
+    }
 }
 
 #[test]

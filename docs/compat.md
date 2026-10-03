@@ -308,6 +308,46 @@ window is full. Covered by
 `crates/driver/src/ipc_publications.rs::a_speculated_session_is_the_first_one_the_stream_is_not_using`
 and `::a_speculation_always_answers_even_when_every_id_is_in_use`.
 
+## Settings that name code
+
+Two settings exist to **load code into the driver**, and this build refuses both
+by name rather than dropping them:
+
+| Setting | What the reference does | Where |
+|---|---|---|
+| `aeron.driver.dynamic.libraries` | `aeron_dl_load_libs` at context init; an unloadable library stops the driver | `aeronmd.h:980`; `aeron_driver_context.c:539-546` |
+| `aeron.agent.on.start.function` | `aeron_dlsym(RTLD_DEFAULT, name)`; a symbol that is not there prints `could not find agent on_start func …: dlsym - …` and stops the driver | `aeronmd.h:513`; `aeron_driver_context.c:555-561`; `aeron-client/src/main/c/aeron_agent.c:337-348` |
+
+Neither can be served: ADR-0002 keeps FFI out of this build, so there is no
+`dlopen` and no `dlsym` to point at anything. Refusing is the same *outcome* the
+reference has for a library or symbol that will not load — a driver that does
+not start — and it is better than accepting them, which would be a deployment
+running without the interceptors or the agent hook it asked for and never being
+told. The refusal names the setting and says why
+(`ConfigError::DynamicLoadingNotSupported`), with the reference's own
+behaviour as the reason. An empty value names nothing and is not a refusal.
+
+This is the one exception to the process contract's rule that a name this
+driver has never heard of must not stop it
+(`tests/integration/driver_process_contract.rs`, the module docs and
+`::the_settings_that_name_code_stop_the_driver_with_a_reason`).
+
+The three **suppliers** are the same kind of setting — the reference `dlsym`s
+the name it is given — and they are not refused wholesale: this build serves the
+names in the reference's own table and refuses the ones that are not in it,
+which is recorded above under the flow-control settings. The ATS channel
+interceptors (`AERON_UDP_CHANNEL_{INCOMING,OUTGOING}_INTERCEPTORS`) are accepted
+and ignored, because the channel parameters that would use them are refused when
+a client names them, which is where a deployment would notice.
+
+`aeron.driver.connect` is **not** one of these, though an earlier plan filed it
+here: it is a boolean (`aeron_driver_context.c:247,668`) that decides whether a
+send endpoint whose channel names an explicit endpoint connects its socket to it
+(`media/aeron_send_channel_endpoint.c:89`). It is read and acted on —
+`crates/driver/src/media/send_endpoint.rs`, with the two outcomes pinned by
+`::an_endpoint_that_is_not_connected_can_send_somewhere_else` and
+`::a_connected_endpoint_sends_only_where_its_channel_points`.
+
 ## The event log
 
 `AERON_EVENT_LOG` and the three names beside it are **accepted and ignored**:

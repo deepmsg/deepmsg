@@ -251,6 +251,11 @@ pub struct SendChannelEndpoints {
     /// `media/aeron_send_channel_endpoint.c:237-240`); the registry is what
     /// plays that part here.
     data_loss_drop_every: Option<u64>,
+    /// `aeron.driver.connect`, set once at start-up: whether a send endpoint
+    /// whose channel names an explicit endpoint connects its socket to it
+    /// (`aeron_driver_context.c:527,668` read into `context->connect_enabled`,
+    /// used at `media/aeron_send_channel_endpoint.c:89`).
+    connect_enabled: bool,
     /// Which ports a publication whose channel named port zero is given
     /// (`context->sender_port_manager`, `aeron_driver_context.c:428-437`).
     ///
@@ -279,6 +284,7 @@ impl SendChannelEndpoints {
             entries: Vec::new(),
             next_id: 1,
             data_loss_drop_every: None,
+            connect_enabled: crate::config::DRIVER_CONNECT_DEFAULT,
             sender_port_manager: WildcardPortManager::sender(),
         }
     }
@@ -302,6 +308,16 @@ impl SendChannelEndpoints {
     /// what the reference's per-endpoint attach does too.
     pub fn attach_data_loss_generator(&mut self, drop_every: u64) {
         self.data_loss_drop_every = Some(drop_every);
+    }
+
+    /// Whether the endpoints made from here on connect their sockets to the
+    /// endpoint their channel names (`aeron.driver.connect`).
+    ///
+    /// Set once at start-up, like the port range beside it: it is the context's
+    /// (`aeron_driver_context.c:527`), and an endpoint made before it changed
+    /// would have been made with the old answer.
+    pub fn set_connect_enabled(&mut self, connect_enabled: bool) {
+        self.connect_enabled = connect_enabled;
     }
 
     /// The endpoints, in the order they were created.
@@ -451,6 +467,7 @@ impl SendChannelEndpoints {
             counters,
             regions,
             registration_id,
+            self.connect_enabled,
             now_ms,
             now_ns,
         )

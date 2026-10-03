@@ -212,6 +212,16 @@ pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 /// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
 pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
 
+/// `AERON_DRIVER_CONNECT_DEFAULT` (`aeron_driver_context.c:247`): whether a
+/// send endpoint whose channel names an explicit endpoint **connects** its
+/// socket to it.
+///
+/// True by default. Read at `:668`, used at
+/// `media/aeron_send_channel_endpoint.c:89` — the reference's `else if` puts
+/// the connect on the branch a multi-destination channel is *not* on, and this
+/// setting is the second half of that condition.
+pub const DRIVER_CONNECT_DEFAULT: bool = true;
+
 /// `AERON_LOSS_REPORT_BUFFER_LENGTH_DEFAULT` (`aeronmd.h:385`, the Java
 /// `Configuration`'s `LOSS_REPORT_BUFFER_LENGTH_DEFAULT`): the length of the
 /// loss report file the driver creates in the aeron directory.
@@ -778,6 +788,10 @@ pub struct DriverConfig {
     /// `aeronmd.h:385`): how long the loss report file is, before it is aligned
     /// up to the file page size (`aeron_driver.c:329-330`).
     pub loss_report_buffer_length: i64,
+    /// `aeron.driver.connect` (`AERON_DRIVER_CONNECT`, `aeronmd.h:723`):
+    /// whether a send endpoint connects its socket to the endpoint its channel
+    /// names (`media/aeron_send_channel_endpoint.c:89`).
+    pub connect_enabled: bool,
     /// How the driver's work is spread over threads (`aeron.threading.mode`).
     pub threading_mode: ThreadingMode,
     /// Which set of names those threads are given (`aeron.thread.naming`).
@@ -881,6 +895,7 @@ impl Default for DriverConfig {
             sender_wildcard_port_range: PortRange::OS_WILDCARD,
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
             loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
+            connect_enabled: DRIVER_CONNECT_DEFAULT,
             threading_mode: ThreadingMode::Dedicated,
             thread_naming: ThreadNaming::Classic,
             conductor_idle: IdleStrategySetting::default(),
@@ -1105,6 +1120,27 @@ impl DriverConfig {
         if let Some(value) = get(&Setting::ERROR_BUFFER_LENGTH) {
             config.layout.error_log_length = parse_size64(&Setting::ERROR_BUFFER_LENGTH, &value)?;
         }
+        if let Some(value) = get(&Setting::DRIVER_CONNECT) {
+            config.connect_enabled = parse_bool(&Setting::DRIVER_CONNECT, &value)?;
+        }
+
+        // The two settings whose value is **code**: the reference loads a
+        // library or looks up a symbol and fails its context init when it
+        // cannot (`aeron_driver_context.c:539-546`, `:555-561`). This build
+        // does neither — ADR-0002 keeps FFI out — so a deployment that names
+        // one gets the failure the reference would give it, with the reason
+        // said out loud rather than the setting quietly dropped.
+        for setting in [
+            Setting::DRIVER_DYNAMIC_LIBRARIES,
+            Setting::AGENT_ON_START_FUNCTION,
+        ] {
+            if get(&setting).is_some_and(|value| !value.is_empty()) {
+                return Err(ConfigError::DynamicLoadingNotSupported {
+                    property: setting.property,
+                });
+            }
+        }
+
         if let Some(value) = get(&Setting::LOSS_REPORT_BUFFER_LENGTH) {
             config.loss_report_buffer_length =
                 i64::try_from(parse_size64(&Setting::LOSS_REPORT_BUFFER_LENGTH, &value)?).map_err(
@@ -1903,6 +1939,25 @@ impl Setting {
         property: "driver.reresolution.check.interval",
         env: "AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL",
     };
+    /// `aeron.driver.connect` (`aeronmd.h:723`).
+    const DRIVER_CONNECT: Self = Self {
+        property: "driver.connect",
+        env: "AERON_DRIVER_CONNECT",
+    };
+    /// `aeron.driver.dynamic.libraries` (`aeronmd.h:980`): the libraries the
+    /// reference `dlopen`s at context init. This build refuses it — see
+    /// [`ConfigError::DynamicLoadingNotSupported`].
+    const DRIVER_DYNAMIC_LIBRARIES: Self = Self {
+        property: "driver.dynamic.libraries",
+        env: "AERON_DRIVER_DYNAMIC_LIBRARIES",
+    };
+    /// `aeron.agent.on.start.function` (`aeronmd.h:513`): the symbol the
+    /// reference `dlsym`s and calls on every agent's start. Refused, like the
+    /// libraries above.
+    const AGENT_ON_START_FUNCTION: Self = Self {
+        property: "agent.on.start.function",
+        env: "AERON_AGENT_ON_START_FUNCTION",
+    };
     /// `aeron.loss.report.buffer.length` (`aeronmd.h:385`).
     const LOSS_REPORT_BUFFER_LENGTH: Self = Self {
         property: "loss.report.buffer.length",
@@ -2156,6 +2211,19 @@ impl Setting {
 /// Why a configuration could not be resolved.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// A setting whose value is **code** — a library to load, or a symbol to
+    /// call — was named, and this build loads no code (ADR-0002).
+    ///
+    /// The reference loads it and fails its context init when it cannot
+    /// (`aeron_driver_context.c:539-546`, `:555-561`), so a deployment that
+    /// names one of these gets a driver that does not start there either. What
+    /// is different here is that it can never start, and saying so is the
+    /// point: a setting that is quietly dropped is a deployment that believes
+    /// its interceptors or its agent hooks are running.
+    DynamicLoadingNotSupported {
+        /// The property name, as the reference spells it.
+        property: &'static str,
+    },
     /// An argument that is not `-Dname=value`.
     MalformedArgument {
         /// The argument as it arrived.
@@ -2273,6 +2341,13 @@ impl std::fmt::Display for ConfigError {
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::DynamicLoadingNotSupported { property } => write!(
+                f,
+                "{property} names code for this driver to load, and this build loads none: \
+                 it has no FFI and no dynamic libraries (ADR-0002). The reference would \
+                 load it at context init and refuse to start if it could not, which is \
+                 what this refusal is"
+            ),
             Self::UnknownThreadingMode { value } => write!(
                 f,
                 "{value} is not a threading mode: DEDICATED, SHARED_NETWORK, SHARED or INVOKER"
@@ -2318,7 +2393,8 @@ impl std::error::Error for ConfigError {
             | Self::UnknownValidator { .. }
             | Self::UnknownThreadingMode { .. }
             | Self::UnknownThreadNaming { .. }
-            | Self::UnknownIdleStrategy { .. } => None,
+            | Self::UnknownIdleStrategy { .. }
+            | Self::DynamicLoadingNotSupported { .. } => None,
         }
     }
 }
@@ -2763,6 +2839,74 @@ mod tests {
         )
         .expect_err("below the floor");
         assert!(matches!(too_fast, ConfigError::OutOfRange { .. }));
+    }
+
+    /// `aeron.driver.connect` is a boolean like any other, and its default is
+    /// the reference's own `true` (`aeron_driver_context.c:247`).
+    #[test]
+    fn the_driver_connect_setting_is_a_boolean_defaulting_to_true() {
+        let unset = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
+        assert!(unset.connect_enabled, "the reference's default");
+
+        for (value, expected) in [("false", false), ("true", true)] {
+            let config = resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[("AERON_DRIVER_CONNECT", value)],
+            )
+            .expect("a config");
+            assert_eq!(expected, config.connect_enabled, "{value}");
+        }
+    }
+
+    /// The two settings whose value is **code** are refused, and the refusal
+    /// says which one: this build loads no libraries and looks up no symbols
+    /// (ADR-0002), and the reference would not start over an unloadable one
+    /// either (`aeron_driver_context.c:539-546`, `:555-561`).
+    ///
+    /// Quietly dropping them is the failure this prevents: a deployment that
+    /// named interceptors or an agent hook would run without them and never
+    /// find out.
+    #[test]
+    fn a_setting_that_names_code_is_refused_by_name() {
+        for (property, env) in [
+            ("driver.dynamic.libraries", "AERON_DRIVER_DYNAMIC_LIBRARIES"),
+            ("agent.on.start.function", "AERON_AGENT_ON_START_FUNCTION"),
+        ] {
+            let error = resolve_with_env(
+                &[("deepmsg.dir", "/tmp/aeron")],
+                &[(env, "/nonexistent/libaeron_ats.so")],
+            )
+            .expect_err("this build loads no code");
+
+            match error {
+                ConfigError::DynamicLoadingNotSupported { property: named } => {
+                    assert_eq!(property, named);
+                }
+                other => panic!("{property} must be refused by name, got {other}"),
+            }
+
+            // And the property spelling is refused too, not only the
+            // environment variable.
+            let spelled = format!("aeron.{property}");
+            let error = resolve(&[("deepmsg.dir", "/tmp/aeron"), (&spelled, "something")])
+                .expect_err("likewise");
+            assert!(matches!(
+                error,
+                ConfigError::DynamicLoadingNotSupported { .. }
+            ));
+        }
+
+        // Empty is not naming one: the harness sets `AERON_EVENT_LOG_DISABLE`
+        // to nothing and expects a driver that starts.
+        let empty = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/aeron")],
+            &[
+                ("AERON_DRIVER_DYNAMIC_LIBRARIES", ""),
+                ("AERON_AGENT_ON_START_FUNCTION", ""),
+            ],
+        )
+        .expect("an empty value names no library");
+        assert!(empty.connect_enabled);
     }
 
     /// The three duty-cycle thresholds: one number doing two jobs. A pass longer

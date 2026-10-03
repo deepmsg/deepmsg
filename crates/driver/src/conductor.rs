@@ -1005,6 +1005,9 @@ impl Conductor {
                 // start-up (`aeron_wildcard_port_manager_set_range`, called
                 // from the context's own init, `aeron_driver_context.c:1058-1069`).
                 endpoints.set_port_range(config.sender_wildcard_port_range);
+                // And whether its endpoints connect their sockets, which is
+                // the context's too (`:527`).
+                endpoints.set_connect_enabled(config.connect_enabled);
                 endpoints
             },
             network_publications,

@@ -2098,6 +2098,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )

@@ -2393,6 +2393,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -2472,6 +2473,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -2541,6 +2543,7 @@ mod tests {
             )
             .expect("four-to-one"),
             7,
+            true,
             1,
             1_000_000,
         )
@@ -2605,6 +2608,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -2752,6 +2756,7 @@ mod tests {
             &mut endpoint_manager,
             &endpoint_regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -2878,6 +2883,7 @@ mod tests {
             &mut manager,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )

@@ -200,6 +200,7 @@ impl SendChannelEndpoint {
     /// [`SendEndpointError::NoCounter`] when the manager is full, or the
     /// syscall's error when the socket cannot be opened.
     #[allow(clippy::too_many_arguments)] // one per collaborator, not one per decision
+    #[allow(clippy::too_many_arguments)] // one per setting the endpoint is built with
     pub fn create(
         channel: UdpChannel,
         port_manager: &mut crate::port_manager::WildcardPortManager,
@@ -207,6 +208,7 @@ impl SendChannelEndpoint {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         registration_id: i64,
+        connect_enabled: bool,
         now_ms: i64,
         now_ns: i64,
     ) -> Result<Self, SendEndpointError> {
@@ -227,8 +229,15 @@ impl SendChannelEndpoint {
         // has to be there — a connected UDP socket has one peer, and a send to
         // any other address is refused by the kernel, which would leave every
         // destination but the channel's own address unreachable.
-        let connect_to = (channel.has_explicit_endpoint && !channel.is_multi_destination())
-            .then_some(channel.remote_data);
+        //
+        // The second half of that `else if` is `aeron.driver.connect`
+        // (`:89`): a deployment can turn the connect off, and then the socket
+        // stays unconnected and every send names its address. Same packets,
+        // different socket — which is a thing a system with a firewall or a
+        // strange route between the two ends wants to be able to say.
+        let connect_to =
+            (channel.has_explicit_endpoint && !channel.is_multi_destination() && connect_enabled)
+                .then_some(channel.remote_data);
 
         // `aeron_send_channel_endpoint.c:115-135`: a multicast endpoint binds
         // the group's **control** twin — it is the group it joins and hears
@@ -1005,6 +1014,7 @@ mod tests {
                 counters,
                 regions,
                 7,
+                true,
                 1_000_000,
                 TIMEOUT_START_NS,
             )
@@ -1091,6 +1101,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1_000_000,
             TIMEOUT_START_NS,
         )
@@ -1121,6 +1132,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1163,6 +1175,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1181,6 +1194,18 @@ mod tests {
             Some(counter_position::channel_status::ACTIVE),
             counters.value(&regions, endpoint.channel_status_counter_id())
         );
+    }
+
+    /// A socket bound to a port the kernel picked, with the address it got.
+    fn bound_listener() -> crate::sys::socket::DatagramSocket {
+        let socket = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+            .expect("a socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        socket.set_nonblocking().expect("non-blocking");
+
+        socket
     }
 
     #[test]
@@ -1206,6 +1231,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1227,6 +1253,115 @@ mod tests {
                 .expect("a receive")
         );
         assert_eq!(b"setup", &buffers[0][..5]);
+    }
+
+    /// `aeron.driver.connect=false`: the socket is **not** connected, so a
+    /// datagram can be sent somewhere the channel never named — which is what
+    /// the setting is for (`aeron_send_channel_endpoint.c:89`) and what a
+    /// connected socket refuses.
+    #[test]
+    fn an_endpoint_that_is_not_connected_can_send_somewhere_else() {
+        let named = bound_listener().local_address().expect("a bound address");
+        let elsewhere = bound_listener();
+        let elsewhere_address = elsewhere.local_address().expect("a bound address");
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel(&format!("aeron:udp?endpoint={named}")),
+            &mut ports(),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            false,
+            1,
+            1_000_000,
+        )
+        .expect("an endpoint");
+
+        assert_eq!(
+            1,
+            endpoint
+                .send_to(elsewhere_address, &[b"elsewhere"])
+                .expect("a send")
+        );
+
+        let mut buffers = vec![vec![0_u8; 1408]];
+        let mut datagrams = crate::sys::socket::Datagrams::new();
+        assert_eq!(
+            1,
+            elsewhere
+                .receive_batch(&mut buffers, &mut datagrams)
+                .expect("a receive"),
+            "an unconnected socket reaches an address the channel did not name"
+        );
+        assert_eq!(b"elsewhere", &buffers[0][..9]);
+    }
+
+    /// The same send with `aeron.driver.connect` left at its default: the
+    /// socket is connected to the one address the channel named, and a
+    /// datagram does not arrive anywhere else.
+    ///
+    /// Not asserted as an error: what the kernel does with an address handed
+    /// to `sendto` on a connected socket is its business — it may refuse it or
+    /// hand it to the connected peer — and what the setting is *for* is where
+    /// the packets can go.
+    #[test]
+    fn a_connected_endpoint_sends_only_where_its_channel_points() {
+        let named = bound_listener();
+        let named_address = named.local_address().expect("a bound address");
+        let elsewhere = bound_listener();
+        let elsewhere_address = elsewhere.local_address().expect("a bound address");
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = SendChannelEndpoint::create(
+            channel(&format!("aeron:udp?endpoint={named_address}")),
+            &mut ports(),
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            true,
+            1,
+            1_000_000,
+        )
+        .expect("an endpoint");
+
+        assert_eq!(
+            1,
+            endpoint
+                .send(&[b"where it points"], &counters, &regions, 0)
+                .expect("a send"),
+            "the channel's own address is where this goes"
+        );
+
+        let mut buffers = vec![vec![0_u8; 1408]];
+        let mut datagrams = crate::sys::socket::Datagrams::new();
+        assert_eq!(
+            1,
+            named
+                .receive_batch(&mut buffers, &mut datagrams)
+                .expect("a receive")
+        );
+        assert_eq!(b"where it points", &buffers[0][..15]);
+
+        let _ = endpoint.send_to(elsewhere_address, &[b"elsewhere"]);
+        let mut buffers = vec![vec![0_u8; 1408]];
+        let mut datagrams = crate::sys::socket::Datagrams::new();
+        let arrived = elsewhere.receive_batch(&mut buffers, &mut datagrams);
+
+        assert!(
+            matches!(arrived, Ok(0))
+                || arrived
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| io::ErrorKind::WouldBlock == error.kind()),
+            "nothing reaches an address the channel did not name: {arrived:?}"
+        );
     }
 
     #[test]
@@ -1254,6 +1389,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1323,6 +1459,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1400,6 +1537,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1431,6 +1569,7 @@ mod tests {
             &mut counters,
             &regions,
             8,
+            true,
             2,
             2_000_000,
         )
@@ -1454,6 +1593,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1477,6 +1617,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
@@ -1526,6 +1667,7 @@ mod tests {
             &mut counters,
             &regions,
             7,
+            true,
             1,
             1_000_000,
         )
