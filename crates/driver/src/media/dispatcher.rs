@@ -157,6 +157,21 @@ impl DataPacketDispatcher {
         self.streams.len()
     }
 
+    /// Whether asking a source for a `SETUP` again could be answered by anyone
+    /// (`aeron_data_packet_dispatcher_should_elicit_setup_message`,
+    /// `aeron_data_packet_dispatcher.h:171-174`).
+    ///
+    /// The reference asks it of the *map*'s size — "does this dispatcher hold
+    /// any stream interest at all" — and the receiver asks it of an endpoint
+    /// before it re-sends a periodic ask. One that holds none has nobody to ask
+    /// for: a `control-mode=response` subscription registers its stream in the
+    /// endpoint's *response* refcount instead (`aeron_receive_channel_endpoint_incref_to_response_stream`,
+    /// `media/aeron_receive_channel_endpoint.c:746-756`), so the ask it makes
+    /// when its endpoint is created is the only one it ever makes.
+    pub fn should_elicit_setup_message(&self) -> bool {
+        0 != self.stream_count()
+    }
+
     /// Whether a stream has any interest at all.
     pub fn has_stream(&self, stream_id: i32) -> bool {
         self.streams.iter().any(|(id, _)| *id == stream_id)
@@ -446,6 +461,35 @@ mod tests {
         assert!(!dispatcher.has_stream(1001));
         assert!(!dispatcher.has_interest_in(1001, 7));
         assert_eq!(0, dispatcher.stream_count());
+    }
+
+    /// The receiver's periodic ask is gated on this, and the gate is the
+    /// *map's* size: an endpoint with no registered stream has nobody to ask
+    /// for, which is every `control-mode=response` subscription's endpoint —
+    /// its stream goes in the endpoint's response refcount instead
+    /// (`aeron_data_packet_dispatcher.h:171-174`).
+    #[test]
+    fn only_an_endpoint_with_a_registered_stream_is_worth_asking_again() {
+        let mut dispatcher = DataPacketDispatcher::new(16);
+        assert!(
+            !dispatcher.should_elicit_setup_message(),
+            "nothing is registered, so there is nothing a SETUP could be for"
+        );
+
+        dispatcher.add_subscription(1001);
+        assert!(dispatcher.should_elicit_setup_message());
+
+        let mut named = DataPacketDispatcher::new(16);
+        named.add_subscription_by_session(1001, 7);
+        assert!(
+            named.should_elicit_setup_message(),
+            "a session that named itself counts too"
+        );
+
+        // And it goes back to silent when the last subscription does, which is
+        // what the reference's map entry does (`remove_subscription`, `:246-275`).
+        named.remove_subscription_by_session(1001, 7);
+        assert!(!named.should_elicit_setup_message());
     }
 
     #[test]
