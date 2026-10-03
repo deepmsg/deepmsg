@@ -49,10 +49,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use crate::driver::Role;
+
 use deepmsg_cnc::{CncFile, CounterManager};
 use deepmsg_core::logbuffer::logfile::LogFile;
 
-use crate::idle::Backoff;
 use crate::name_resolver::Resolver;
 use crate::udp_channel::{UdpChannel, UdpChannelError, Unresolved};
 
@@ -375,10 +376,6 @@ impl AgentQueues {
 }
 
 impl NativeResourceAgent {
-    /// What this build calls the agent's thread — the reference's classic
-    /// `aeron-md-nra` is shorter, and the two namings are a later commit's.
-    const THREAD_NAME: &'static str = "deepmsg-native-resource-agent";
-
     /// Start the thread, with the storage checks `checks` describes standing
     /// in front of every log buffer it creates.
     ///
@@ -392,9 +389,7 @@ impl NativeResourceAgent {
             state,
         } = Self::split(checks)?;
 
-        let thread = std::thread::Builder::new()
-            .name(Self::THREAD_NAME.to_string())
-            .spawn(move || Self::run(state))?;
+        let thread = crate::driver::run_agent(Role::NativeResourceAgent.classic_name(), state)?;
 
         Ok(Self {
             requests: handle.requests,
@@ -613,20 +608,17 @@ impl NativeResourceAgent {
             let _ = thread.join();
         }
     }
+}
 
-    /// The agent's own loop, around a state it owns.
-    fn run(mut agent: AgentLoop) {
-        let mut backoff = Backoff::new();
+/// One pass of the agent, for the runner that drives it — and the close that
+/// lets the resolver go with the thread that ran it.
+impl crate::driver::Agent for AgentLoop {
+    fn do_work(&mut self) -> Option<usize> {
+        Self::do_work(self)
+    }
 
-        // The reference's agent loop (`aeron_agent.c:395-412`): one pass, then
-        // idle with what it did. The loop lives outside the agent so that a
-        // `SHARED` runner can drive the same pass on a thread the conductor,
-        // the sender and the receiver are on too.
-        while let Some(work) = agent.do_work() {
-            backoff.idle(work);
-        }
-
-        agent.close();
+    fn close(&mut self) {
+        Self::close(self);
     }
 }
 
@@ -1008,12 +1000,38 @@ impl std::fmt::Debug for AgentHandle {
 }
 
 impl AgentHandle {
+    /// Hand the driver's resolver to the agent, which starts it and runs it
+    /// from then on.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone.
+    pub(crate) fn attach_resolver(&self, resolver: AgentResolver) -> io::Result<()> {
+        self.requests
+            .send(Request::AttachResolver(resolver))
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
+    /// Tell the agent to stop, without waiting for it.
+    ///
+    /// Waiting is the driver's: in `SHARED` the agent shares its thread with
+    /// the conductor, so the conductor cannot be the one to join it.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the agent thread is gone already.
+    pub(crate) fn stop(&self) -> io::Result<()> {
+        self.requests
+            .send(Request::Stop)
+            .map_err(|_| io::Error::other("the native resource agent has stopped"))
+    }
+
     /// Ask for a log buffer to be created and mapped, sparse or dense as
     /// `is_sparse` says — the URI's `sparse=` resolved against the driver's
     /// `term.buffer.sparse.file`.
     ///
     /// The answer is a [`Completion`] taken off the agent by the **conductor**
-    /// ([`NativeResourceAgent::poll`]) and routed to the manager that asked.
+    /// (it drains [`AgentQueues`]) and routed to the manager that asked.
     ///
     /// # Errors
     ///

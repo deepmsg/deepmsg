@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
-use crate::idle::Backoff;
+use crate::driver::Role;
 
 use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
@@ -621,11 +621,14 @@ pub struct Receiver {
     thread: Option<JoinHandle<()>>,
 }
 
-impl Receiver {
-    /// What this build calls the receiver's thread — the reference's classic
-    /// `receiver` is shorter, and the two namings are a later commit's.
-    const THREAD_NAME: &'static str = "deepmsg-receiver";
+/// One pass of the receiver, for the runner that drives it.
+impl crate::driver::Agent for ReceiverThread {
+    fn do_work(&mut self) -> Option<usize> {
+        Self::do_work(self)
+    }
+}
 
+impl Receiver {
     /// Start the receiver thread.
     ///
     /// # Errors
@@ -642,7 +645,7 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
-        let ReceiverParts { proxy, mut agent } = Self::split(
+        let ReceiverParts { proxy, agent } = Self::split(
             cnc,
             values_length,
             free_to_reuse_timeout_ms,
@@ -653,18 +656,7 @@ impl Receiver {
             re_resolution_interval_ns,
         )?;
 
-        let thread = std::thread::Builder::new()
-            .name(Self::THREAD_NAME.to_owned())
-            .spawn(move || {
-                // The reference's agent loop (`aeron_agent.c:395-412`): one
-                // pass, then idle with what it did. The loop lives outside the
-                // agent because a `SHARED_NETWORK` or `SHARED` runner drives
-                // the same pass on a thread another agent is on.
-                let mut idle = Backoff::new();
-                while let Some(work) = agent.do_work() {
-                    idle.idle(work);
-                }
-            })?;
+        let thread = crate::driver::run_agent(Role::Receiver.classic_name(), agent)?;
 
         Ok(Self {
             proxy,

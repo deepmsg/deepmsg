@@ -23,6 +23,7 @@ pub mod conductor;
 pub mod config;
 pub mod congestion_control;
 pub mod dir;
+pub(crate) mod driver;
 pub mod flowcontrol;
 pub mod idle;
 pub mod ipc_publication;

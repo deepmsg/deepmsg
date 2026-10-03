@@ -144,6 +144,12 @@ fn main() -> ExitCode {
         }
     };
 
+    // `Conductor::new` has already put the sender, the receiver and the native
+    // resource agent on threads of their own — `DEDICATED`, which is the
+    // reference's default and the one mode this build has so far. A mode that
+    // shares a thread with the conductor is the runner commit's; until then
+    // `aeron.threading.mode` is read and checked but not acted on.
+
     // stdout, not stderr: this line is written on every healthy start, and the
     // reference's own harness asserts stderr is empty (see the module docs).
     println!(
@@ -166,6 +172,11 @@ fn shutdown(conductor: &mut Conductor, prepared: dir::PreparedDir) -> ExitCode {
     if let Err(error) = conductor.close() {
         eprintln!("deepmsg-driver: the shutdown signal could not be published: {error}");
     }
+
+    // After the close, never before: every log buffer it handed back went back
+    // through the agent, and a free sent to an agent that has already stopped
+    // is a file nobody removes.
+    conductor.join_agents();
 
     // After the close, never before: the flush inside it is what the *next*
     // driver reads to decide whether this one is still alive, and removing the

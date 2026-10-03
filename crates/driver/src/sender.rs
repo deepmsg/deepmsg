@@ -47,7 +47,7 @@ use deepmsg_cnc::command::OwnedPublicationError;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
-use crate::idle::Backoff;
+use crate::driver::Role;
 use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
@@ -552,11 +552,14 @@ pub struct Sender {
     thread: Option<JoinHandle<()>>,
 }
 
-impl Sender {
-    /// What this build calls the sender's thread — the reference's classic
-    /// `sender` is shorter, and the two namings are a later commit's.
-    const THREAD_NAME: &'static str = "deepmsg-sender";
+/// One pass of the sender, for the runner that drives it.
+impl crate::driver::Agent for SenderThread {
+    fn do_work(&mut self) -> Option<usize> {
+        Self::do_work(self)
+    }
+}
 
+impl Sender {
     /// Start the sender thread.
     ///
     /// `values_length` is the counters region's length, which is what fixes a
@@ -575,7 +578,7 @@ impl Sender {
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
-        let SenderParts { proxy, mut agent } = Self::split(
+        let SenderParts { proxy, agent } = Self::split(
             cnc,
             values_length,
             free_to_reuse_timeout_ms,
@@ -585,19 +588,7 @@ impl Sender {
             re_resolution_interval_ns,
         )?;
 
-        let thread = std::thread::Builder::new()
-            .name(Self::THREAD_NAME.to_owned())
-            .spawn(move || {
-                // The reference's agent loop (`aeron_agent.c:395-412`): one
-                // pass, then idle with what it did. The loop lives outside the
-                // agent because a `SHARED` runner drives the same pass on a
-                // thread the other agents are on — and because the idle
-                // strategy is the runner's, not the agent's.
-                let mut idle = Backoff::new();
-                while let Some(work) = agent.do_work() {
-                    idle.idle(work);
-                }
-            })?;
+        let thread = crate::driver::run_agent(Role::Sender.classic_name(), agent)?;
 
         Ok(Self {
             proxy,

@@ -559,35 +559,52 @@ fn threads(pid: u32) -> Vec<String> {
     names
 }
 
-/// **One** native resource agent for the whole driver, not one per kind of log
-/// buffer.
+/// The threads a `DEDICATED` driver runs, by the reference's own names.
 ///
-/// A client cannot see which thread mapped its log buffer — they are all
-/// threads that map files — but the *count* is visible from outside, and it is
-/// what `docs/compat.md` used to record as a divergence ("Two native resource
-/// agents, not one") until this landed. The reference has a single agent and
-/// runs it as one of its four runners
-/// (`aeron-driver/src/main/c/aeron_driver.c:1038-1050`, the DEDICATED arm).
+/// Three, and the conductor is not one of them: it runs on the process's main
+/// thread, which is where `main` drives it. The reference spawns it as a fourth
+/// (`aeron-driver/src/main/c/aeron_driver.c:1064-1122`, the `DEDICATED` arm),
+/// and that is the runner commit's.
+///
+/// The names are the classic `aeron.thread.naming` set
+/// (`aeron_driver_context.h:37-42`), which is also the default — `conductor` is
+/// absent with `conductor`'s thread, and the two shared ones belong to modes
+/// this build does not have yet.
+///
+/// One agent, not three: a client cannot see which thread mapped its log
+/// buffer — they are all threads that map files — but the count is visible from
+/// outside, and `docs/compat.md` used to record it as a divergence ("Two native
+/// resource agents, not one") until the three became one.
 #[test]
-fn the_driver_runs_one_native_resource_agent() {
-    let Some(fixture) = Fixture::start("one-native-resource-agent", &[]) else {
+fn a_dedicated_driver_runs_the_references_threads() {
+    let Some(fixture) = Fixture::start("dedicated-threads", &[]) else {
         driver::announce_own_skip();
         return;
     };
 
     let _ = fixture.await_cnc();
 
-    let names = threads(fixture.child.id());
-    let agents: Vec<&String> = names
-        .iter()
-        .filter(|name| name.starts_with("deepmsg-native"))
-        .collect();
+    let mut expected = vec!["aeron-md-nra", "receiver", "sender"];
+    // The main thread's own name is the process's, which the kernel truncates.
+    expected.push("deepmsg-driver");
+    expected.sort_unstable();
+
+    // Waiting, rather than reading once: the threads are started after the CnC
+    // file is published, which is the order the reference has too
+    // (`aeron_driver.c:972` signals the file ready, `:1206` starts the runners).
+    // A client may reach a ready file a moment before the work behind it runs.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let mut names = threads(fixture.child.id());
+
+    while names != expected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        names = threads(fixture.child.id());
+    }
 
     assert_eq!(
-        1,
-        agents.len(),
-        "the driver runs one native resource agent, not one per kind of log \
-         buffer; its threads are {names:?}"
+        expected, names,
+        "the agent, the sender and the receiver, under the reference's classic \
+         names"
     );
 }
 
