@@ -73,38 +73,41 @@ fn a_stream_that_lost_data_is_in_the_loss_report() {
         .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
         .expect("a subscription on it");
 
-    // Publish until messages arrive: the first ones are lost to the handshake
-    // whatever else happens, and what this test is about is the hole the
-    // *sender* made.
+    // Publish until the report has a record for the stream.
+    //
+    // One loop and not two, which is the difference between a test and a coin
+    // toss: the sender drops every fourth datagram, and a hole is only *seen*
+    // once a frame arrives behind it — so a client that stopped offering at
+    // the first message that got through would stop **one frame short of the
+    // first drop**, with nothing to report and nothing being sent that could
+    // change that. The first messages are lost to the handshake whatever else
+    // happens; what this test is about is the hole the *sender* made, and the
+    // offering has to keep going until the image has seen it.
     let deadline = Instant::now() + DEADLINE;
     let payload = [7_u8; 1024];
     let mut received = 0_usize;
     let mut session_id = None;
+    let mut found = None;
 
-    while 0 == received && Instant::now() < deadline {
+    while found.is_none() && Instant::now() < deadline {
         let _ = client.offer(publication, &payload);
         client.poll();
         client.poll_subscription(subscription, 10, |message| {
             received += 1;
             session_id = Some(message.header.session_id);
         });
-        std::thread::sleep(Duration::from_millis(2));
-    }
 
-    assert!(received > 0, "the stream never started");
-
-    // And now the report has a record for it. Read it again rather than
-    // trusting the first mapping: what a reader in another process would see
-    // is the file as it stands.
-    let deadline = Instant::now() + DEADLINE;
-    let mut found = None;
-
-    while found.is_none() && Instant::now() < deadline {
+        // Read the report again rather than trusting the first mapping: what a
+        // reader in another process would see is the file as it stands.
         let report = LossReportFile::open_readonly(&directory).expect("the file is still there");
         found = entries(&report)
             .into_iter()
             .find(|entry| entry.stream_id == STREAM_ID);
+
+        std::thread::sleep(Duration::from_millis(2));
     }
+
+    assert!(received > 0, "the stream never started");
 
     let Some(entry) = found else {
         panic!(

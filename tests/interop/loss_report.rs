@@ -58,25 +58,28 @@ fn the_references_loss_stat_reads_what_this_driver_wrote() {
         .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
         .expect("a subscription on it");
 
+    // Publish until the reference's reader has a record to print, and not
+    // merely until a message gets back. One loop and not two, for the reason
+    // `tests/integration/loss_report.rs` gives: the sender drops every fourth
+    // datagram and a hole is only *seen* once a frame arrives behind it, so a
+    // client that stopped offering at the first message would stop one frame
+    // short of the first drop — and this test would then be waiting out its
+    // whole deadline for a record nothing was going to make.
     let deadline = Instant::now() + DEADLINE;
     let payload = [9_u8; 1024];
     let mut received = 0_usize;
-
-    while 0 == received && Instant::now() < deadline {
-        let _ = client.offer(publication, &payload);
-        client.poll();
-        client.poll_subscription(subscription, 10, |_message| received += 1);
-        std::thread::sleep(Duration::from_millis(2));
-    }
-
-    assert!(received > 0, "the stream never started");
-
-    // The driver appends the record on the receiver's thread, so give it the
-    // same grace the file itself gets.
-    let deadline = Instant::now() + DEADLINE;
     let mut said = String::new();
 
     while Instant::now() < deadline {
+        // A burst, and not one: the client's offer is what a term gets, and the
+        // driver's sender thread is what puts frames on the wire between the
+        // two reads below.
+        for _ in 0..8 {
+            let _ = client.offer(publication, &payload);
+            client.poll();
+            client.poll_subscription(subscription, 10, |_message| received += 1);
+        }
+
         // `LossStat` is not one of the `-p` samples `deepmsg_tests::samples`
         // starts: its base path is `-d` (`loss_stat.c:94-99`), so it is run
         // here the way its own usage says.
@@ -93,13 +96,18 @@ fn the_references_loss_stat_reads_what_this_driver_wrote() {
             "the reference's LossStat failed; it said:\n{said}"
         );
 
-        if said.contains("entries read") && !said.contains("0 entries read") {
+        // Both halves, because the record is written by the image and read by
+        // the client at different moments: the image can see the hole before
+        // the subscription has handed a message up, and stopping there would
+        // leave the sanity check below with nothing to check.
+        if received > 0 && said.contains("entries read") && !said.contains("0 entries read") {
             break;
         }
 
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    assert!(received > 0, "the stream never started");
     assert!(
         said.contains("OBSERVATION_COUNT"),
         "LossStat must print its header; it said:\n{said}"
