@@ -538,6 +538,14 @@ impl SenderProxy {
     }
 }
 
+/// The sender's two halves, before either has a thread.
+pub(crate) struct SenderParts {
+    /// The conductor's end: commands in, events out.
+    pub proxy: SenderProxy,
+    /// The work, which a runner drives one pass at a time.
+    pub agent: SenderThread,
+}
+
 /// The thread itself, with its proxy.
 pub struct Sender {
     proxy: SenderProxy,
@@ -545,6 +553,10 @@ pub struct Sender {
 }
 
 impl Sender {
+    /// What this build calls the sender's thread — the reference's classic
+    /// `sender` is shorter, and the two namings are a later commit's.
+    const THREAD_NAME: &'static str = "deepmsg-sender";
+
     /// Start the sender thread.
     ///
     /// `values_length` is the counters region's length, which is what fixes a
@@ -563,43 +575,77 @@ impl Sender {
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
-        let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
-        let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
+        let SenderParts { proxy, mut agent } = Self::split(
+            cnc,
+            values_length,
+            free_to_reuse_timeout_ms,
+            mtu_length,
+            cycle_threshold_ns,
+            linger_timeout_ns,
+            re_resolution_interval_ns,
+        )?;
 
         let thread = std::thread::Builder::new()
-            .name("deepmsg-sender".to_owned())
+            .name(Self::THREAD_NAME.to_owned())
             .spawn(move || {
-                let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms)
-                else {
-                    return;
-                };
-
-                let mut sender = SenderThread::new(
-                    cnc,
-                    counters,
-                    mtu_length,
-                    cycle_threshold_ns,
-                    linger_timeout_ns,
-                    re_resolution_interval_ns,
-                    deepmsg_core::clock::monotonic_nano_time(),
-                    event_tx,
-                );
                 // The reference's agent loop (`aeron_agent.c:395-412`): one
-                // pass, then idle with what it did. The loop lives here rather
-                // than inside the agent because a `SHARED` runner drives the
-                // same pass on a thread the other agents are on.
+                // pass, then idle with what it did. The loop lives outside the
+                // agent because a `SHARED` runner drives the same pass on a
+                // thread the other agents are on — and because the idle
+                // strategy is the runner's, not the agent's.
                 let mut idle = Backoff::new();
-                while let Some(work) = sender.do_work(&command_rx) {
+                while let Some(work) = agent.do_work() {
                     idle.idle(work);
                 }
             })?;
 
         Ok(Self {
+            proxy,
+            thread: Some(thread),
+        })
+    }
+
+    /// The two halves this is made of, **without** a thread: the end the
+    /// conductor holds and the work a runner drives.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the counters region is too small for a sender's own
+    /// view of it.
+    pub(crate) fn split(
+        cnc: Arc<CncFile>,
+        values_length: usize,
+        free_to_reuse_timeout_ms: i64,
+        mtu_length: usize,
+        cycle_threshold_ns: i64,
+        linger_timeout_ns: i64,
+        re_resolution_interval_ns: i64,
+    ) -> io::Result<SenderParts> {
+        let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
+        let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
+
+        let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms) else {
+            return Err(io::Error::other(
+                "the counters region is too small for the sender's view of it",
+            ));
+        };
+
+        Ok(SenderParts {
             proxy: SenderProxy {
                 commands: command_tx,
                 events: event_rx,
             },
-            thread: Some(thread),
+            agent: SenderThread::new(
+                cnc,
+                counters,
+                mtu_length,
+                cycle_threshold_ns,
+                linger_timeout_ns,
+                re_resolution_interval_ns,
+                deepmsg_core::clock::monotonic_nano_time(),
+                event_tx,
+                command_rx,
+            ),
         })
     }
 
@@ -632,7 +678,7 @@ fn stopped() -> io::Error {
 }
 
 /// What the thread owns.
-struct SenderThread {
+pub(crate) struct SenderThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
     cycle_threshold_ns: i64,
@@ -667,6 +713,8 @@ struct SenderThread {
     /// needs the counter regions.
     pending_subscribers: Vec<SenderCommand>,
     last_cycle_ns: i64,
+    /// The commands the conductor sends, which this drains one pass at a time.
+    commands: Receiver<SenderCommand>,
 }
 
 impl SenderThread {
@@ -680,8 +728,10 @@ impl SenderThread {
         re_resolution_interval_ns: i64,
         now_ns: i64,
         events: Channel<SenderEvent>,
+        commands: Receiver<SenderCommand>,
     ) -> Self {
         Self {
+            commands,
             cnc,
             counters,
             cycle_threshold_ns,
@@ -711,11 +761,11 @@ impl SenderThread {
     /// This is the reference's agent loop body (`aeron_agent.c:395-412`)
     /// separated from the loop, so that a `SHARED` runner can drive it on a
     /// thread the receiver and the agent are on too.
-    pub fn do_work(&mut self, commands: &Receiver<SenderCommand>) -> Option<usize> {
+    pub fn do_work(&mut self) -> Option<usize> {
         {
             let mut stop = false;
 
-            for command in commands.try_iter() {
+            for command in self.commands.try_iter() {
                 match command {
                     SenderCommand::AddEndpoint { id, endpoint } => {
                         self.endpoints.push((id, endpoint));

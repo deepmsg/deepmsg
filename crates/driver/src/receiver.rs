@@ -607,6 +607,14 @@ impl ReceiverProxy {
     }
 }
 
+/// The receiver's two halves, before either has a thread.
+pub(crate) struct ReceiverParts {
+    /// The conductor's end: commands in, events out.
+    pub proxy: ReceiverProxy,
+    /// The work, which a runner drives one pass at a time.
+    pub agent: ReceiverThread,
+}
+
 /// The thread itself, with its proxy.
 pub struct Receiver {
     proxy: ReceiverProxy,
@@ -614,6 +622,10 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// What this build calls the receiver's thread — the reference's classic
+    /// `receiver` is shorter, and the two namings are a later commit's.
+    const THREAD_NAME: &'static str = "deepmsg-receiver";
+
     /// Start the receiver thread.
     ///
     /// # Errors
@@ -630,44 +642,80 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
     ) -> io::Result<Self> {
-        let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
-        let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
+        let ReceiverParts { proxy, mut agent } = Self::split(
+            cnc,
+            values_length,
+            free_to_reuse_timeout_ms,
+            mtu_length,
+            status_message_timeout_ns,
+            initial_window_length,
+            cycle_threshold_ns,
+            re_resolution_interval_ns,
+        )?;
 
         let thread = std::thread::Builder::new()
-            .name("deepmsg-receiver".to_owned())
+            .name(Self::THREAD_NAME.to_owned())
             .spawn(move || {
-                let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms)
-                else {
-                    return;
-                };
-
-                let mut receiver = ReceiverThread::new(
-                    cnc,
-                    counters,
-                    mtu_length,
-                    status_message_timeout_ns,
-                    initial_window_length,
-                    cycle_threshold_ns,
-                    re_resolution_interval_ns,
-                    deepmsg_core::clock::monotonic_nano_time(),
-                    event_tx,
-                );
                 // The reference's agent loop (`aeron_agent.c:395-412`): one
-                // pass, then idle with what it did. The loop lives here rather
-                // than inside the agent because a `SHARED_NETWORK` or `SHARED`
-                // runner drives the same pass on a thread another agent is on.
+                // pass, then idle with what it did. The loop lives outside the
+                // agent because a `SHARED_NETWORK` or `SHARED` runner drives
+                // the same pass on a thread another agent is on.
                 let mut idle = Backoff::new();
-                while let Some(work) = receiver.do_work(&command_rx) {
+                while let Some(work) = agent.do_work() {
                     idle.idle(work);
                 }
             })?;
 
         Ok(Self {
+            proxy,
+            thread: Some(thread),
+        })
+    }
+
+    /// The two halves this is made of, **without** a thread: the end the
+    /// conductor holds and the work a runner drives.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the counters region is too small for a receiver's own
+    /// view of it.
+    #[allow(clippy::too_many_arguments)] // one per setting the agent is built with
+    pub(crate) fn split(
+        cnc: Arc<CncFile>,
+        values_length: usize,
+        free_to_reuse_timeout_ms: i64,
+        mtu_length: usize,
+        status_message_timeout_ns: i64,
+        initial_window_length: i32,
+        cycle_threshold_ns: i64,
+        re_resolution_interval_ns: i64,
+    ) -> io::Result<ReceiverParts> {
+        let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
+        let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
+
+        let Some(counters) = CounterManager::new(values_length, free_to_reuse_timeout_ms) else {
+            return Err(io::Error::other(
+                "the counters region is too small for the receiver's view of it",
+            ));
+        };
+
+        Ok(ReceiverParts {
             proxy: ReceiverProxy {
                 commands: command_tx,
                 events: event_rx,
             },
-            thread: Some(thread),
+            agent: ReceiverThread::new(
+                cnc,
+                counters,
+                mtu_length,
+                status_message_timeout_ns,
+                initial_window_length,
+                cycle_threshold_ns,
+                re_resolution_interval_ns,
+                deepmsg_core::clock::monotonic_nano_time(),
+                event_tx,
+                command_rx,
+            ),
         })
     }
 
@@ -726,7 +774,7 @@ pub(crate) struct PendingSetup {
 }
 
 /// What the thread owns.
-struct ReceiverThread {
+pub(crate) struct ReceiverThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
     #[allow(dead_code)]
@@ -755,6 +803,8 @@ struct ReceiverThread {
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
     last_cycle_ns: i64,
+    /// The commands the conductor sends, which this drains one pass at a time.
+    commands: Inbox<ReceiverCommand>,
 }
 
 impl ReceiverThread {
@@ -769,8 +819,10 @@ impl ReceiverThread {
         re_resolution_interval_ns: i64,
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
+        commands: Inbox<ReceiverCommand>,
     ) -> Self {
         Self {
+            commands,
             cnc,
             counters,
             mtu_length,
@@ -801,11 +853,11 @@ impl ReceiverThread {
     /// This is the reference's agent loop body (`aeron_agent.c:395-412`)
     /// separated from the loop, so that a `SHARED_NETWORK` or `SHARED` runner
     /// can drive it on a thread other agents are on too.
-    pub fn do_work(&mut self, commands: &Inbox<ReceiverCommand>) -> Option<usize> {
+    pub fn do_work(&mut self) -> Option<usize> {
         {
             let mut stop = false;
 
-            for command in commands.try_iter() {
+            for command in self.commands.try_iter() {
                 match command {
                     ReceiverCommand::ResolutionChange {
                         endpoint_id,
