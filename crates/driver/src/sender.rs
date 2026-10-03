@@ -584,7 +584,14 @@ impl Sender {
                     deepmsg_core::clock::monotonic_nano_time(),
                     event_tx,
                 );
-                sender.run(&command_rx);
+                // The reference's agent loop (`aeron_agent.c:395-412`): one
+                // pass, then idle with what it did. The loop lives here rather
+                // than inside the agent because a `SHARED` runner drives the
+                // same pass on a thread the other agents are on.
+                let mut idle = Backoff::new();
+                while let Some(work) = sender.do_work(&command_rx) {
+                    idle.idle(work);
+                }
             })?;
 
         Ok(Self {
@@ -660,7 +667,6 @@ struct SenderThread {
     /// needs the counter regions.
     pending_subscribers: Vec<SenderCommand>,
     last_cycle_ns: i64,
-    idle: Backoff,
 }
 
 impl SenderThread {
@@ -691,13 +697,22 @@ impl SenderThread {
             pending_destinations: Vec::new(),
             pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
-            idle: Backoff::new(),
         }
     }
 
-    /// The loop: commands, then a pass as long as there is work.
-    fn run(&mut self, commands: &Receiver<SenderCommand>) {
-        loop {
+    /// One pass: the commands that arrived, then the send
+    /// (`aeron_driver_sender_do_work`, `aeron_driver_sender.c:133-180`, which
+    /// drains the proxy queue and then calls `_do_send`).
+    ///
+    /// `None` when a `Stop` was among them — the reference's `running` flag,
+    /// cleared and checked after the pass, which is why the pass that stops
+    /// sends nothing. `Some(work)` is what the idle strategy is given.
+    ///
+    /// This is the reference's agent loop body (`aeron_agent.c:395-412`)
+    /// separated from the loop, so that a `SHARED` runner can drive it on a
+    /// thread the receiver and the agent are on too.
+    pub fn do_work(&mut self, commands: &Receiver<SenderCommand>) -> Option<usize> {
+        {
             let mut stop = false;
 
             for command in commands.try_iter() {
@@ -758,16 +773,15 @@ impl SenderThread {
                 }
             }
 
-            let work = if stop { 0 } else { self.do_work() };
-            self.idle.idle(work);
-
             if stop {
-                break;
+                return None;
             }
         }
+
+        Some(self.do_send())
     }
 
-    /// One pass: read the control frames, then send each publication's share
+    /// Read the control frames, then send each publication's share
     /// (`aeron_driver_sender_do_send`,
     /// `aeron-driver/src/main/c/aeron_driver_sender.c:132-260`).
     ///
@@ -775,7 +789,7 @@ impl SenderThread {
     /// that the counter view's borrow and the mutable borrows of the two lists
     /// are visibly disjoint — which is what the borrow checker asks for, and
     /// what makes it obvious that this pass touches nothing else.
-    fn do_work(&mut self) -> usize {
+    fn do_send(&mut self) -> usize {
         // The Arc is cloned rather than borrowed so that the regions' borrow is
         // of this local: a region view holds the mapping, and holding `self`
         // borrowed for its lifetime would forbid every mutation below.

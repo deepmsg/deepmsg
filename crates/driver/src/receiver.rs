@@ -652,7 +652,14 @@ impl Receiver {
                     deepmsg_core::clock::monotonic_nano_time(),
                     event_tx,
                 );
-                receiver.run(&command_rx);
+                // The reference's agent loop (`aeron_agent.c:395-412`): one
+                // pass, then idle with what it did. The loop lives here rather
+                // than inside the agent because a `SHARED_NETWORK` or `SHARED`
+                // runner drives the same pass on a thread another agent is on.
+                let mut idle = Backoff::new();
+                while let Some(work) = receiver.do_work(&command_rx) {
+                    idle.idle(work);
+                }
             })?;
 
         Ok(Self {
@@ -748,7 +755,6 @@ struct ReceiverThread {
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
     last_cycle_ns: i64,
-    idle: Backoff,
 }
 
 impl ReceiverThread {
@@ -781,12 +787,22 @@ impl ReceiverThread {
             buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
             datagrams: Datagrams::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
-            idle: Backoff::new(),
         }
     }
 
-    fn run(&mut self, commands: &Inbox<ReceiverCommand>) {
-        loop {
+    /// One pass: the commands that arrived, then the work
+    /// (`aeron_driver_receiver_do_work`, which drains the proxy queue and then
+    /// polls every transport).
+    ///
+    /// `None` when a `Stop` was among them — the reference's `running` flag,
+    /// cleared and checked after the pass, which is why the pass that stops
+    /// does no work. `Some(work)` is what the idle strategy is given.
+    ///
+    /// This is the reference's agent loop body (`aeron_agent.c:395-412`)
+    /// separated from the loop, so that a `SHARED_NETWORK` or `SHARED` runner
+    /// can drive it on a thread other agents are on too.
+    pub fn do_work(&mut self, commands: &Inbox<ReceiverCommand>) -> Option<usize> {
+        {
             let mut stop = false;
 
             for command in commands.try_iter() {
@@ -1138,18 +1154,17 @@ impl ReceiverThread {
                 }
             }
 
-            let work = if stop { 0 } else { self.do_work() };
-            self.idle.idle(work);
-
             if stop {
-                break;
+                return None;
             }
         }
+
+        Some(self.do_receive())
     }
 
-    /// One pass (`aeron_driver_receiver_do_work`,
+    /// The work of one pass (`aeron_driver_receiver_do_work`'s second half,
     /// `aeron-driver/src/main/c/aeron_driver_receiver.c:130-260`).
-    fn do_work(&mut self) -> usize {
+    fn do_receive(&mut self) -> usize {
         let cnc = Arc::clone(&self.cnc);
         let Some(regions) = cnc.counter_regions() else {
             return 0;

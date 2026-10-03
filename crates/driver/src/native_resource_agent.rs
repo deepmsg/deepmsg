@@ -561,18 +561,60 @@ impl NativeResourceAgent {
         faults: &Sender<AgentFault>,
         checks: &StorageChecks,
     ) {
-        // The resolver arrives with the CnC file, once the driver has published
-        // it, and so does the counters view this thread resolves through: an
-        // allocator view of its own over the conductor's regions, which is how
-        // the sender and the receiver already hold theirs. Safe because **only
-        // the conductor allocates** — this view only has to agree about where
-        // an id's value lives, and it never hands one out.
-        let mut resolver: Option<AgentResolver> = None;
-        let mut counters: Option<CounterManager> = None;
-
+        let mut agent = AgentLoop::new();
         let mut backoff = Backoff::new();
 
-        loop {
+        // The reference's agent loop (`aeron_agent.c:395-412`): one pass, then
+        // idle with what it did. The loop lives here rather than inside the
+        // agent so that a `SHARED` runner can drive the same pass on a thread
+        // the conductor, the sender and the receiver are on too.
+        while let Some(work) = agent.do_work(requests, completions, warnings, faults, checks) {
+            backoff.idle(work);
+        }
+
+        agent.close();
+    }
+}
+
+/// What the agent owns **between passes**: the resolver it was handed and the
+/// allocator view it resolves through.
+///
+/// The reference keeps the same two things in its agent's own state
+/// (`aeron_driver_native_resource_agent_t`), and they are a struct here rather
+/// than the loop's locals so that the loop body can be driven a pass at a time.
+struct AgentLoop {
+    /// The resolver arrives with the CnC file, once the driver has published
+    /// it, and so does the counters view this thread resolves through: an
+    /// allocator view of its own over the conductor's regions, which is how the
+    /// sender and the receiver already hold theirs. Safe because **only the
+    /// conductor allocates** — this view only has to agree about where an id's
+    /// value lives, and it never hands one out.
+    resolver: Option<AgentResolver>,
+    counters: Option<CounterManager>,
+}
+
+impl AgentLoop {
+    const fn new() -> Self {
+        Self {
+            resolver: None,
+            counters: None,
+        }
+    }
+
+    /// One pass: the resolver's duty cycle, then the requests that have arrived.
+    ///
+    /// `None` when a `Stop` came in — or when the handle that sends requests is
+    /// gone — which is the reference's `running` flag cleared. `Some(work)` is
+    /// what the idle strategy is given.
+    fn do_work(
+        &mut self,
+        requests: &Receiver<Request>,
+        completions: &Sender<Completion>,
+        warnings: &Sender<StorageWarning>,
+        faults: &Sender<AgentFault>,
+        checks: &StorageChecks,
+    ) -> Option<usize> {
+        {
             // The resolver's own clock, on this thread's duty cycle
             // (`aeron_driver_native_resource_agent.c:253-270`): a driver nobody
             // is talking to still has to answer when someone does, and its
@@ -580,7 +622,7 @@ impl NativeResourceAgent {
             let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
 
             let mut work = if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
-                (resolver.as_mut(), counters.as_ref())
+                (self.resolver.as_mut(), self.counters.as_ref())
             {
                 match cnc.counter_regions() {
                     Some(regions) => resolver.do_work(now_ms, counters, &regions),
@@ -599,11 +641,11 @@ impl NativeResourceAgent {
                     }
                     Ok(Request::AttachResolver(attached)) => {
                         work += 1;
-                        counters = CounterManager::new(
+                        self.counters = CounterManager::new(
                             attached.cnc.layout().counters_values.len(),
                             attached.free_to_reuse_timeout_ms,
                         );
-                        resolver = Some(attached);
+                        self.resolver = Some(attached);
 
                         // `start` runs **here**, on the agent, and that is the
                         // whole point of the move: it resolves the bootstrap
@@ -616,7 +658,7 @@ impl NativeResourceAgent {
                         // whose resolver is not the one it was configured with
                         // still resolves something.
                         if let (Some(agent), Some(counters)) =
-                            (resolver.as_mut(), counters.as_ref())
+                            (self.resolver.as_mut(), self.counters.as_ref())
                         {
                             if let Some(regions) = agent.cnc.counter_regions() {
                                 if let Err(what) = agent.resolver.start(counters, &regions) {
@@ -632,8 +674,8 @@ impl NativeResourceAgent {
                             completions,
                             warnings,
                             checks,
-                            counters.as_mut(),
-                            resolver.as_mut(),
+                            self.counters.as_mut(),
+                            self.resolver.as_mut(),
                         ) {
                             stopped = true;
                             break;
@@ -652,7 +694,7 @@ impl NativeResourceAgent {
             // `aeron_driver_name_resolver.c:718-723`): the reference's resolver
             // writes into that log directly, and this one hands the entries
             // over because the log is the conductor's.
-            if let Some(AgentResolver { resolver, .. }) = resolver.as_mut() {
+            if let Some(AgentResolver { resolver, .. }) = self.resolver.as_mut() {
                 for fault in resolver.take_faults() {
                     let _ = faults.send(AgentFault {
                         error_code: fault.error_code,
@@ -661,17 +703,19 @@ impl NativeResourceAgent {
                 }
             }
 
-            backoff.idle(work);
-
             if stopped {
-                break;
+                return None;
             }
-        }
 
-        // The resolver goes with the thread that ran it, counters and all
-        // (`aeron_driver_name_resolver_close`, and `on_close` on the agent).
+            Some(work)
+        }
+    }
+
+    /// Let the resolver go, counters and all
+    /// (`aeron_driver_name_resolver_close`, and `on_close` on the agent).
+    fn close(&mut self) {
         if let (Some(AgentResolver { resolver, cnc, .. }), Some(counters)) =
-            (resolver.as_mut(), counters.as_mut())
+            (self.resolver.as_mut(), self.counters.as_mut())
         {
             if let Some(regions) = cnc.counter_regions() {
                 let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
