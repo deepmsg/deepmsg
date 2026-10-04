@@ -34,13 +34,20 @@ use crate::loadtest::transport::util::{
 pub trait Outbound {
     /// Take `length` bytes in the log, hand the frame to `write`, and publish it.
     ///
-    /// Returns what the publication said. Anything but [`Appended::Ok`] means
-    /// nothing was published.
-    fn claim<W: FnMut(&Frame<'_, ReadWrite>)>(&mut self, length: usize, write: W) -> Appended;
+    /// `Err` is why not, in the publication's own terms.
+    fn claim<W: FnMut(&Frame<'_, ReadWrite>)>(&mut self, length: usize, write: W) -> Published;
 
     /// Send `payload` as one message.
-    fn offer(&mut self, payload: &[u8]) -> Appended;
+    fn offer(&mut self, payload: &[u8]) -> Published;
 }
+
+/// Whether a message went in, and if not, why not.
+///
+/// The reference's senders get a `long` back from a publication: anything
+/// negative is why it did not go, and anything else is where it went. A sender
+/// here counts messages rather than bytes, so this is the half of that answer it
+/// uses.
+pub type Published = Result<(), Appended>;
 
 /// Which of the reference's two senders this is
 /// (`MessageSender.create`, `:67-80`).
@@ -209,8 +216,8 @@ impl MessageSender {
                 };
 
                 match outcome {
-                    Appended::Ok { .. } => break,
-                    other => match check_publication_result(other, &mut self.idle) {
+                    Ok(()) => break,
+                    Err(other) => match check_publication_result(other, &mut self.idle) {
                         // An administrative action: the log rotated under us.
                         // Try again, and do not spend an attempt on it.
                         Ok(true) => {}
@@ -239,7 +246,7 @@ impl MessageSender {
         timestamp: i64,
         checksum: i64,
         receiver_index: i32,
-    ) -> Appended {
+    ) -> Published {
         self.scratch.resize(message_length, 0);
 
         assert!(
@@ -259,6 +266,12 @@ mod tests {
     use deepmsg_core::buffer::AtomicBuffer;
     use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
 
+    /// What a publication says when a message goes in.
+    const PUBLISHED: Appended = Appended::Ok {
+        position: deepmsg_core::logbuffer::position::Position::from_term_count(0, 0, 0),
+        term_offset: 0,
+    };
+
     /// A publication that says whatever the test tells it to, and keeps what it
     /// was given.
     #[derive(Debug)]
@@ -275,7 +288,7 @@ mod tests {
         fn new(outcomes: impl IntoIterator<Item = Appended>) -> Self {
             Self {
                 outcomes: outcomes.into_iter().collect(),
-                last: ok(),
+                last: Appended::BackPressured,
                 published: Vec::new(),
                 term: vec![0; 4096],
             }
@@ -283,13 +296,18 @@ mod tests {
 
         /// The next thing the publication says — its last answer once the script
         /// runs out, as a stubbed mock does.
-        fn next_outcome(&mut self) -> Appended {
-            match self.outcomes.pop_front() {
+        fn next_outcome(&mut self) -> Published {
+            let outcome = match self.outcomes.pop_front() {
                 Some(outcome) => {
                     self.last = outcome;
                     outcome
                 }
                 None => self.last,
+            };
+
+            match outcome {
+                Appended::Ok { .. } => Ok(()),
+                other => Err(other),
             }
         }
     }
@@ -299,38 +317,26 @@ mod tests {
             &mut self,
             length: usize,
             mut write: W,
-        ) -> Appended {
-            let outcome = self.next_outcome();
+        ) -> Published {
+            self.next_outcome()?;
 
-            if matches!(outcome, Appended::Ok { .. }) {
-                {
-                    let buffer = AtomicBuffer::from_slice_mut(&mut self.term).expect("a term");
-                    write(&Frame::new(&buffer, 0));
-                }
-
-                self.published
-                    .push(self.term[DATA_HEADER_LENGTH..DATA_HEADER_LENGTH + length].to_vec());
+            {
+                let buffer = AtomicBuffer::from_slice_mut(&mut self.term).expect("a term");
+                write(&Frame::new(&buffer, 0));
             }
 
-            outcome
+            self.published
+                .push(self.term[DATA_HEADER_LENGTH..DATA_HEADER_LENGTH + length].to_vec());
+
+            Ok(())
         }
 
-        fn offer(&mut self, payload: &[u8]) -> Appended {
-            let outcome = self.next_outcome();
+        fn offer(&mut self, payload: &[u8]) -> Published {
+            self.next_outcome()?;
 
-            if matches!(outcome, Appended::Ok { .. }) {
-                self.published.push(payload.to_vec());
-            }
+            self.published.push(payload.to_vec());
 
-            outcome
-        }
-    }
-
-    /// The publication's "yes": a position, which nothing here reads.
-    fn ok() -> Appended {
-        Appended::Ok {
-            position: deepmsg_core::logbuffer::position::Position::from_term_count(0, 0, 0),
-            term_offset: 0,
+            Ok(())
         }
     }
 
@@ -365,10 +371,10 @@ mod tests {
     #[test]
     fn an_offer_sender_gives_up_after_three_back_pressures() {
         let mut outbound = ScriptedOutbound::new([
-            ok(),
-            ok(),
+            PUBLISHED,
+            PUBLISHED,
             Appended::MidRotation,
-            ok(),
+            PUBLISHED,
             Appended::BackPressured,
             Appended::BackPressured,
             Appended::BackPressured,
@@ -397,11 +403,11 @@ mod tests {
     #[test]
     fn a_claim_sender_gives_up_after_three_back_pressures() {
         let mut outbound = ScriptedOutbound::new([
-            ok(),
-            ok(),
-            ok(),
+            PUBLISHED,
+            PUBLISHED,
+            PUBLISHED,
             Appended::MidRotation,
-            ok(),
+            PUBLISHED,
             Appended::BackPressured,
             Appended::BackPressured,
             Appended::BackPressured,

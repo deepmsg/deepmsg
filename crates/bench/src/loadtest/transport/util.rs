@@ -6,6 +6,7 @@
 //! are needed rather than gathered into its `Configuration`.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use deepmsg_core::logbuffer::append::Appended;
@@ -70,6 +71,10 @@ pub mod property {
     pub const FRAGMENT_LIMIT: &str = "io.aeron.benchmarks.aeron.fragment.limit";
     /// `AeronUtil.CONNECTION_TIMEOUT_PROP_NAME`.
     pub const CONNECTION_TIMEOUT: &str = "io.aeron.benchmarks.aeron.connection.timeout";
+    /// The directory the driver is in, which the client is told rather than
+    /// left to guess — the same name the driver reads
+    /// (`CommonContext.AERON_DIR_PROP_NAME`, `aeron.dir`).
+    pub const DIRECTORY: &str = "aeron.dir";
 }
 
 /// The channel and connection settings of one run.
@@ -79,6 +84,10 @@ pub mod property {
 /// them once is the same set of values with somewhere to look them up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSettings {
+    /// Where the driver is. There is no default: the driver insists on being
+    /// told, and a client that guessed a different directory would connect to
+    /// nothing and say so only as a timeout.
+    pub directory: PathBuf,
     /// Where a client publishes.
     pub destination_channel: String,
     /// The stream it publishes on.
@@ -109,6 +118,11 @@ impl ChannelSettings {
     /// written the way Agrona writes one.
     pub fn from_properties(properties: &Properties) -> Result<Self, ConfigError> {
         Ok(Self {
+            directory: PathBuf::from(properties.get(property::DIRECTORY).ok_or(
+                ConfigError::Required {
+                    property: property::DIRECTORY,
+                },
+            )?),
             destination_channel: text(properties, property::DESTINATION_CHANNEL)
                 .unwrap_or_else(|| DEFAULT_DESTINATION_CHANNEL.to_owned()),
             destination_stream: properties
@@ -286,10 +300,25 @@ mod tests {
     use super::*;
     use crate::loadtest::transceiver::SystemClock;
 
+    /// The settings every test here starts from: the directory the driver is in
+    /// is the one thing there is no default for.
+    fn properties() -> Properties {
+        let mut properties = Properties::new();
+        properties.set(property::DIRECTORY, "/dev/shm/deepmsg-bench-test");
+
+        properties
+    }
+
+    #[test]
+    fn the_directory_is_required() {
+        let error = ChannelSettings::from_properties(&Properties::new()).expect_err("refused");
+
+        assert!(error.to_string().contains("aeron.dir"), "{error}");
+    }
+
     #[test]
     fn the_defaults_are_the_reference_s() {
-        let settings =
-            ChannelSettings::from_properties(&Properties::new()).expect("no settings is a run");
+        let settings = ChannelSettings::from_properties(&properties()).expect("valid");
 
         assert_eq!(settings.destination_channel, DEFAULT_DESTINATION_CHANNEL);
         assert_eq!(settings.destination_stream, 77777);
@@ -307,7 +336,7 @@ mod tests {
 
     #[test]
     fn the_settings_are_read_from_the_run_s_properties() {
-        let mut properties = Properties::new();
+        let mut properties = properties();
         properties.set(property::DESTINATION_CHANNEL, "aeron:ipc");
         properties.set(property::DESTINATION_STREAM, "1001");
         properties.set(property::SOURCE_STREAM, "1002");
@@ -340,7 +369,7 @@ mod tests {
             ("1", false),
             ("yes", false),
         ] {
-            let mut properties = Properties::new();
+            let mut properties = properties();
             properties.set(property::USE_TRY_CLAIM, written);
 
             let settings = ChannelSettings::from_properties(&properties).expect("valid");

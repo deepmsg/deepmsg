@@ -7,5 +7,7 @@
 //! they are the interface a run is described through, and both sides of a
 //! comparison are handed the same ones.
 
+pub mod echo;
+pub mod node;
 pub mod sender;
 pub mod util;
