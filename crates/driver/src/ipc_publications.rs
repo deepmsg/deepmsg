@@ -1224,6 +1224,7 @@ impl IpcPublications {
             pub_pos_counter_id,
             pub_lmt_counter_id,
             config.image_liveness_timeout_ns,
+            config.publication_unblock_timeout_ns,
         ) {
             Ok(publication) => publication,
             Err(log) => {

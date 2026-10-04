@@ -888,6 +888,7 @@ impl SenderThread {
             &regions,
         );
         self.check_untethered_subscriptions(&regions, now_ns);
+        self.check_for_blocked_publishers(&regions, now_ns);
 
         let system = System::new(&self.counters, &regions);
 
@@ -1099,6 +1100,32 @@ impl SenderThread {
                     events,
                 });
             }
+        }
+    }
+
+    /// Unblock the log of any publisher whose stream has stopped moving
+    /// (`aeron_network_publication_check_for_blocked_publisher`,
+    /// `aeron_network_publication.c:1011-1031`).
+    ///
+    /// The reference runs this from the **conductor**, on its timer tier —
+    /// `aeron_network_publication_on_time_event` (`:1287`, and only for a
+    /// publication that is not exclusive), reached from
+    /// `aeron_driver_conductor_on_check_managed_resources` (`:1692`, `:1472`).
+    /// It runs here for the reason the pass above does: everything it touches —
+    /// the publication's log, its sender position, its own deadline — is on this
+    /// thread, and the conductor holds only a *record* of a network publication
+    /// (`network_publications.rs`), not the log buffer itself. What the
+    /// difference amounts to is how soon a deadline is noticed, not which
+    /// transitions happen.
+    fn check_for_blocked_publishers(&mut self, regions: &CounterRegions<'_>, now_ns: i64) {
+        let counters = &self.counters;
+
+        for publication in &mut self.publications {
+            let sender_position = counters
+                .value(regions, publication.counters.snd_pos)
+                .unwrap_or(0);
+
+            publication.check_for_blocked_publisher(sender_position, now_ns, counters, regions);
         }
     }
 
@@ -2233,6 +2260,8 @@ mod tests {
                 },
                 0,
                 0,
+                crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
+                crate::config::PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
                 0,
             )
             .expect("a publication");

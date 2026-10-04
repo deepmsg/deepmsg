@@ -1538,7 +1538,9 @@ impl ReceiveChannelEndpoint {
     /// A retired handle is not an error and not a reason to fall back to some
     /// other destination: it is a connection whose socket is no longer there,
     /// and what it gets is nothing.
-    fn destination(&self, id: DestinationId) -> Option<&ReceiveDestination> {
+    /// The destination an id names — what the receiver's packet path needs to
+    /// ask about the channel it arrived on, which the id alone does not carry.
+    pub fn destination(&self, id: DestinationId) -> Option<&ReceiveDestination> {
         self.destinations
             .iter()
             .find(|(candidate, _)| *candidate == id)

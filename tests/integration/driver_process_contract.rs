@@ -161,7 +161,16 @@ const READ: &[(&str, &str)] = &[
     ("AERON_FILE_PAGE_SIZE", "8192"),
     ("AERON_IPC_TERM_BUFFER_LENGTH", "1m"),
     ("AERON_PERFORM_STORAGE_CHECKS", "false"),
+    ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_PUBLICATION_LINGER_TIMEOUT", "1s"),
+    // Twenty seconds rather than the default fifteen, because this list also
+    // sends a fifteen-second liveness window and the first rule of
+    // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1524`)
+    // is `publication_unblock_timeout_ns > client_liveness_timeout_ns`. Equal
+    // values are a combination the reference refuses too — the default fifteen
+    // against this list's liveness is exactly that, which is what made this
+    // entry the one that moved when batch 4-b bound the name.
+    ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "20s"),
     ("AERON_RCV_INITIAL_WINDOW_LENGTH", "64k"),
     ("AERON_RCV_STATUS_MESSAGE_TIMEOUT", "1s"),
     // Two numbers with a **space** between them, which is the shape the
@@ -193,15 +202,21 @@ const READ: &[(&str, &str)] = &[
 /// names, the value below becomes wrong and this test is where it shows up.
 /// That is how the threading set moved to [`READ`]: `G4-1` bound
 /// `AERON_THREADING_MODE` and the six idle strategy names, and the values here
-/// — `SHARED`, `sleeping` — stopped being values the driver ignores.
+/// — `SHARED`, `sleeping` — stopped being values the driver ignores. Batch 4-b
+/// did the same to `AERON_PUBLICATION_UNBLOCK_TIMEOUT`, and that one had to
+/// arrive in [`READ`] with a **new value**, not the same one: the fifteen
+/// seconds it carried here would have been refused against `READ`'s fifteen
+/// second liveness window.
 ///
 /// Three are worth naming, because each is a place a reader might expect a
 /// different answer:
 ///
-/// - `AERON_PUBLICATION_CONNECTION_TIMEOUT` is a **real gap**: the driver has
-///   the setting, with the reference's five-second default, and no name bound
-///   to it — so the harness's value is silently dropped. It is listed here
-///   rather than in [`READ`] because that is the truth today.
+/// - `AERON_PUBLICATION_CONNECTION_TIMEOUT` **was** a real gap: the driver had
+///   the setting, with the reference's five-second default, and nothing bound to
+///   the name, so the harness's value was dropped — and the publication used its
+///   own constant instead. Both halves are closed now (the name is parsed and
+///   the constant is gone), so this entry records the shape a double gap takes
+///   rather than a gap that is still open.
 /// - `AERON_IMAGE_LIVENESS_TIMEOUT` is set by **39 of the system tests**, more
 ///   than any other name here — and it is no longer one this driver ignores:
 ///   it is bound and read (`config.rs`'s `Setting::IMAGE_LIVENESS_TIMEOUT`),
@@ -217,7 +232,6 @@ const IGNORED: &[(&str, &str)] = &[
         "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
         "5s",
     ),
-    ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_ENABLE_EXPERIMENTAL_FEATURES", "true"),
     ("AERON_EVENT_LOG", "admin"),
     ("AERON_EVENT_LOG_DISABLE", ""),
@@ -235,7 +249,6 @@ const IGNORED: &[(&str, &str)] = &[
     ),
     ("AERON_PRINT_CONFIGURATION", "true"),
     ("AERON_PUBLICATION_CONNECTION_TIMEOUT", "5s"),
-    ("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "15s"),
     ("AERON_TRANSPORT_SECURITY_CONF_DIR", "/nonexistent/ats-conf"),
     (
         "AERON_TRANSPORT_SECURITY_CONF_FILE",
@@ -348,7 +361,9 @@ impl Fixture {
 
             assert!(
                 Instant::now() < deadline,
-                "the driver published no usable CnC file within {READY_TIMEOUT:?}: {last}"
+                "the driver published no usable CnC file within {READY_TIMEOUT:?}: {last}\n\
+                 stderr: {}",
+                std::fs::read_to_string(&self.stderr).unwrap_or_default()
             );
 
             std::thread::sleep(Duration::from_millis(5));

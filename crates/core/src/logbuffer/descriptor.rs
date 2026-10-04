@@ -295,6 +295,83 @@ pub fn fill_default_header(
     Some(())
 }
 
+/// Rotate the log to the next term.
+///
+/// Mirrors `aeron_logbuffer_rotate_log`
+/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:194-216`)
+/// and Java's `LogBufferDescriptor.rotateLog`
+/// (`aeron-client/src/main/java/io/aeron/logbuffer/LogBufferDescriptor.java:883-902`).
+///
+/// It is a function of the **metadata block**, not of a producer, because it
+/// has two callers: a producer's own rotation
+/// (`aeron_publication.c:168`, `ConcurrentPublication.java:763`) and the
+/// driver's blocked-publisher unblocker
+/// (`aeron_logbuffer_unblocker.c:46,55`, `LogBufferUnblocker.java:54,70`).
+///
+/// Two steps, in this order and for a reason:
+///
+/// 1. Reset the **next** partition's tail to the new term id at offset
+///    zero — but only if it still holds the term id from three terms ago.
+///    If it does not, another producer has already moved past us and this
+///    rotation is not ours to perform. `next_term_id - PARTITION_COUNT` is
+///    where a three-partition ring keeps that value.
+/// 2. Advance `active_term_count`. **This is the linearization point**: the
+///    tail is written first and the count second, so a producer that sees
+///    the new count is guaranteed to find a zeroed tail.
+///
+/// The return value is the second step's, not the first's. A rotation whose
+/// tail reset succeeded but whose count update did not has not happened.
+pub fn rotate_log(
+    metadata: &crate::buffer::AtomicBuffer<crate::buffer::ReadWrite>,
+    current_term_count: i32,
+    current_term_id: i32,
+) -> bool {
+    let next_term_id = current_term_id.wrapping_add(1);
+    let next_term_count = current_term_count.wrapping_add(1);
+    let next_index = crate::logbuffer::position::index_by_term_count(next_term_count);
+    let expected_term_id = next_term_id.wrapping_sub(PARTITION_COUNT as i32);
+
+    let offset = TERM_TAIL_COUNTERS_OFFSET + next_index * TERM_TAIL_COUNTER_STRIDE;
+
+    // The reset retries while it is still ours to perform. Losing the
+    // compare-exchange to another producer rotating the same term is not a
+    // failure — it means the reset is done — and the reference loops for
+    // exactly that reason (`aeron_logbuffer_descriptor.h:197-211`).
+    loop {
+        let Some(raw) = metadata.load_i64_acquire(offset) else {
+            return false;
+        };
+
+        if expected_term_id != crate::logbuffer::position::RawTail::from_raw(raw).term_id() {
+            break;
+        }
+
+        if metadata
+            .compare_exchange_i64(
+                offset,
+                raw,
+                crate::logbuffer::position::RawTail::new(next_term_id, 0).raw(),
+            )
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
+
+    // The count is the linearization point, and it is **four bytes wide**:
+    // the four bytes after it are structure padding that nothing promises
+    // to keep zero, and an 8-byte compare-exchange would take them into
+    // both the comparison and the write
+    // (`aeron_logbuffer_descriptor.h:186-191`).
+    metadata
+        .compare_exchange_i32(
+            ACTIVE_TERM_COUNT_OFFSET,
+            current_term_count,
+            next_term_count,
+        )
+        .unwrap_or(false)
+}
+
 /// The term space one fragmented message occupies.
 ///
 /// Mirrors `aeron_logbuffer_compute_fragmented_length`

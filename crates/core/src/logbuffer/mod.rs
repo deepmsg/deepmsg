@@ -44,3 +44,4 @@ pub mod logfile;
 pub mod position;
 pub mod repair;
 pub mod scan;
+pub mod unblocker;
