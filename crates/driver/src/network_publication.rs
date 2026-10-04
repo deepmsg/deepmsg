@@ -1971,21 +1971,22 @@ impl NetworkPublication {
             // never falls, so moving `snd-pos` up to it can never move it
             // backwards. Nothing here but the spies — a remote reader's
             // position arrives as a status message and is not in this set.
+            // Both ends in one pass, as the reference takes them
+            // (`aeron_network_publication.c:959-978` folds
+            // `min_consumer_position` and `max_consumer_position` in the same
+            // loop, each seeded with `snd_pos`). This runs on every sender pass
+            // for every network publication.
+            let range = self.subscribers.active_position_range(counters, regions);
+
             if !self.subscribers.is_empty() {
-                let max_consumer = self
-                    .subscribers
-                    .max_active_position(counters, regions)
-                    .unwrap_or(snd_pos);
+                let max_consumer = range.map_or(snd_pos, |(_, max)| max);
 
                 if max_consumer > self.max_spy_position {
                     self.max_spy_position = max_consumer;
                 }
             }
 
-            let min_consumer = self
-                .subscribers
-                .min_active_position(counters, regions)
-                .unwrap_or(snd_pos);
+            let min_consumer = range.map_or(snd_pos, |(min, _)| min);
 
             let new_limit = min_consumer + i64::from(self.term_window_length);
             let current = counters.value(regions, self.counters.pub_lmt).unwrap_or(0);

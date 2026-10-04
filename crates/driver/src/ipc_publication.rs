@@ -1118,22 +1118,23 @@ impl IpcPublication {
         let consumer_position = self.consumer_position;
 
         if self.subscribers.has_working_positions() {
-            let min_sub_pos = self.subscribers.min_active_position(manager, regions);
-
-            // The reference seeds the running maximum with the consumer
-            // position before it takes a single reading
-            // (`aeron_ipc_publication.c:292`): the position is monotonic, and
-            // a reader that comes back below it — a rejoining subscription
-            // still holding its join position — must not drag the limit
-            // arithmetic backwards with it.
-            let max_sub_pos = self
-                .subscribers
-                .max_active_position(manager, regions)
-                .map_or(consumer_position, |max| max.max(consumer_position));
-
-            let Some(min_sub_pos) = min_sub_pos else {
+            // Both ends in one pass, as the reference takes them
+            // (`aeron_ipc_publication.c:288-302` folds `min_sub_pos` and
+            // `max_sub_pos` in the same loop). This runs every cycle for every
+            // IPC publication, so the second walk the two single-ended helpers
+            // would make is paid once per reader per cycle for nothing.
+            let Some((min_sub_pos, max_sub_pos)) =
+                self.subscribers.active_position_range(manager, regions)
+            else {
                 return false;
             };
+
+            // The reference seeds the running maximum with the consumer position
+            // before it takes a single reading (`aeron_ipc_publication.c:292`):
+            // the position is monotonic, and a reader that comes back below it —
+            // a rejoining subscription still holding its join position — must
+            // not drag the limit arithmetic backwards with it.
+            let max_sub_pos = max_sub_pos.max(consumer_position);
 
             let new_limit = min_sub_pos + i64::from(self.term_window_length);
             let mut worked = false;

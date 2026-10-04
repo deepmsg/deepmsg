@@ -1198,17 +1198,12 @@ impl PublicationImage {
     ) -> Option<Gap> {
         let hwm_position = self.hwm_position(counters, regions);
 
-        let Some(min_sub_pos) = self.subscribers.min_active_position(counters, regions) else {
-            // Nobody is reading: there is no position to advance and no window
-            // to offer. Status messages still go out on their timeout, which is
-            // what keeps the sender's view of this endpoint alive.
-            return None;
-        };
-
-        let max_sub_pos = self
-            .subscribers
-            .max_active_position(counters, regions)
-            .unwrap_or(min_sub_pos);
+        // Both ends in one pass, and `None` when nobody is reading: there is
+        // then no position to advance and no window to offer. Status messages
+        // still go out on their timeout, which is what keeps the sender's view
+        // of this endpoint alive.
+        let (min_sub_pos, max_sub_pos) =
+            self.subscribers.active_position_range(counters, regions)?;
 
         let rcv_pos = counters.value(regions, self.counters.rcv_pos).unwrap_or(0);
         let rebuild_position = rcv_pos.max(max_sub_pos);

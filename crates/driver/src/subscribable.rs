@@ -366,6 +366,47 @@ impl Subscribable {
             .filter_map(|position| manager.value(regions, position.counter_id))
             .max()
     }
+
+    /// Both ends of the active readers' positions, in **one** pass over them.
+    ///
+    /// This is how the reference takes them, at both of the places that want
+    /// both: `aeron_ipc_publication.c:288-302` walks the array once and folds
+    /// `min_sub_pos` and `max_sub_pos` together, and
+    /// `aeron_network_publication.c:959-978` does the same for
+    /// `min_consumer_position` and `max_consumer_position`. Asking for them
+    /// separately is two walks, two state filters and two acquire loads of every
+    /// reader's counter — for one answer.
+    ///
+    /// The two single-ended helpers above stay for the callers that want one
+    /// end; this one is for the callers that want both, and they are the ones on
+    /// a per-cycle path.
+    ///
+    /// `None` when no active reader has a readable counter, which is the same
+    /// condition the two above report as `None`.
+    pub fn active_position_range(
+        &self,
+        manager: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> Option<(i64, i64)> {
+        let mut range: Option<(i64, i64)> = None;
+
+        for position in self
+            .positions
+            .iter()
+            .filter(|position| position.state.is_active())
+        {
+            let Some(value) = manager.value(regions, position.counter_id) else {
+                continue;
+            };
+
+            range = Some(match range {
+                Some((min, max)) => (min.min(value), max.max(value)),
+                None => (value, value),
+            });
+        }
+
+        range
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +573,57 @@ mod tests {
             .expect("it was there");
         assert_eq!(None, set.min_active_position(&manager, &regions));
         assert!(!set.has_working_positions());
+    }
+
+    /// The two ends agree with the two single-ended helpers — they are the same
+    /// answer taken in one pass rather than two
+    /// (`aeron_ipc_publication.c:288-302`).
+    #[test]
+    fn both_ends_are_taken_in_one_pass_and_agree_with_the_helpers() {
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+
+        let mut ids = Vec::new();
+        for (label, value) in [
+            (b"middle".as_slice(), 100),
+            (b"lowest", 10),
+            (b"highest", 900),
+        ] {
+            let id = manager.allocate(&regions, 4, &[], label, 0).expect("an id");
+            manager.set_value(&regions, id, value).expect("in range");
+            ids.push((id, value));
+        }
+
+        let mut set = Subscribable::new(99);
+        let mut hooks = Recorder::default();
+        for (id, _) in &ids {
+            set.add_position(position(*id, 7), &mut hooks);
+        }
+
+        assert_eq!(
+            Some((10, 900)),
+            set.active_position_range(&manager, &regions)
+        );
+        assert_eq!(
+            set.min_active_position(&manager, &regions)
+                .zip(set.max_active_position(&manager, &regions)),
+            set.active_position_range(&manager, &regions),
+        );
+
+        // A resting reader is not one either end may be taken over.
+        set.set_state(ids[1].0, TetherState::Resting, 1)
+            .expect("it was there");
+        assert_eq!(
+            Some((100, 900)),
+            set.active_position_range(&manager, &regions)
+        );
+
+        // And with nobody active there is no range at all.
+        for (id, _) in &ids {
+            set.set_state(*id, TetherState::Resting, 2)
+                .expect("it was there");
+        }
+        assert_eq!(None, set.active_position_range(&manager, &regions));
     }
 
     #[test]
