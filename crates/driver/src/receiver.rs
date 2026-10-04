@@ -57,6 +57,17 @@ const RECEIVE_SLOTS: usize = 16;
 /// `aeron-driver/src/main/c/aeron_driver_receiver.c:47` — 100 ms).
 pub const PENDING_SETUP_TIMEOUT_NS: i64 = 1_000_000_000;
 
+/// Whether a `SETUP` on this channel carries a TTL the channel was not
+/// configured for (`aeron_data_packet_dispatcher.c:507-510`).
+///
+/// Only a multicast channel has a TTL to compare, and only a **strictly
+/// larger** received TTL is the asymmetry the reference counts: equal values
+/// are the ordinary case, and a smaller one is a peer sending closer in than we
+/// asked for, which is not the same warning.
+fn ttl_asymmetry(setup_ttl: i32, channel: &UdpChannel) -> bool {
+    channel.is_multicast && i32::from(channel.multicast_ttl) < setup_ttl
+}
+
 /// A destination the receiver has let go, as the conductor needs it: the two
 /// things the conductor allocated for it and only the receiver can say are
 /// gone.
@@ -1670,6 +1681,35 @@ impl ReceiverThread {
                 let setup_flags = header.flags;
                 let control_address = endpoint.control_address(destination, source);
 
+                // A `SETUP` answering a status message this driver sent is when
+                // the reference compares its TTL with ours: a peer whose TTL is
+                // the **larger** of the two is one whose multicast path is not
+                // the one this channel was configured for, and the reference
+                // counts that (`aeron_data_packet_dispatcher.c:501-512`).
+                //
+                // The state is read **before** `on_setup`, which is the
+                // reference's own order: that call moves a waiting session to
+                // "initialising", and the question here is only about sessions
+                // that were still waiting. `ImageState` is spelled out because
+                // `publication_image::ImageState` is a different type with the
+                // same name in this file.
+                let waiting_for_setup = endpoint
+                    .dispatcher()
+                    .state_of(setup.stream_id, setup.session_id)
+                    == crate::media::dispatcher::ImageState::PendingSetup;
+
+                let channel = endpoint.destination(destination).map(|it| &it.channel);
+
+                if waiting_for_setup
+                    && channel.is_some_and(|channel| ttl_asymmetry(setup.ttl, channel))
+                {
+                    system_counters::increment(
+                        counters,
+                        regions,
+                        system_counters::id::POSSIBLE_TTL_ASYMMETRY,
+                    );
+                }
+
                 match endpoint
                     .dispatcher_mut()
                     .on_setup(setup.stream_id, setup.session_id)
@@ -2051,6 +2091,31 @@ impl ReceiverThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn channel(uri: &str) -> UdpChannel {
+        let parsed = crate::channel_uri::ChannelUri::parse(uri.as_bytes()).expect("a URI");
+
+        UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel")
+    }
+
+    /// What the asymmetry counter is asked: multicast only, and the received
+    /// TTL **strictly larger** than the channel's own.
+    #[test]
+    fn only_a_larger_ttl_on_a_multicast_channel_is_an_asymmetry() {
+        let multicast = channel("aeron:udp?endpoint=224.0.1.1:40123|ttl=4");
+        let unicast = channel("aeron:udp?endpoint=127.0.0.1:40123");
+
+        assert!(ttl_asymmetry(5, &multicast), "5 is more than the 4 we sent");
+        assert!(!ttl_asymmetry(4, &multicast), "equal is the ordinary case");
+        assert!(
+            !ttl_asymmetry(3, &multicast),
+            "smaller is a peer sending closer in, which is not this warning"
+        );
+        assert!(
+            !ttl_asymmetry(9, &unicast),
+            "a unicast channel has no TTL to compare against"
+        );
+    }
 
     #[test]
     fn a_thread_that_is_asked_to_stop_stops() {
