@@ -3,7 +3,7 @@
 //!
 //! The rig being copied is `real-logic/benchmarks`' `LoadTestRig` — not a
 //! micro-benchmark but a rate-controlled end-to-end harness: it drives a
-//! a transceiver by a target message rate for a fixed number of one-second
+//! transceiver by a target message rate for a fixed number of one-second
 //! iterations, records the round trip of every reply, and reports what it
 //! managed. `deepmsg-bench`'s own `benches/latency.rs` answers a different
 //! question — one round trip at a time, with no pacing — and the two numbers
@@ -23,4 +23,9 @@
 //! those are not part of the measurement.
 
 pub mod config;
+pub mod format;
+pub mod in_memory;
+pub mod progress;
+pub mod recorder;
 pub mod result;
+pub mod transceiver;

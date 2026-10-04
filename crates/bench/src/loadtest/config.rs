@@ -357,19 +357,26 @@ impl fmt::Display for TimeUnit {
 ///
 /// The reference's `io.aeron.benchmarks.idle.strategy` holds a class name from
 /// `org.agrona.concurrent`; there is no reflection here, so the property holds
-/// one of these names instead. The rig only ever calls `idle` and `reset`, so
-/// the distinction between them is a matter for the transceiver in B3 — what
-/// matters now is that the name in a properties file resolves to something.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// one of these names instead. What each one *does* is in
+/// [`super::transceiver`], next to the `idle` and `reset` the rig calls.
+///
+/// A configuration always holds a fresh one: the backoff's count is the
+/// strategy's own state and not a setting, so a rig copies the value out of the
+/// configuration and mutates the copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IdleStrategy {
     /// The reference's default: `Thread.onSpinWait` in a loop.
+    #[default]
     BusySpin,
     /// Do nothing at all.
     NoOp,
     /// `Thread.yield` in a loop.
     Yielding,
-    /// Sleep with a growing backoff.
-    Backoff,
+    /// Yield, then sleep, as the pauses grow.
+    Backoff {
+        /// How many times `idle` has been called since the last `reset`.
+        idle_count: u32,
+    },
     /// Sleep a fixed short interval.
     Sleeping,
 }
@@ -386,7 +393,7 @@ impl IdleStrategy {
             Self::BusySpin => "busy-spin",
             Self::NoOp => "no-op",
             Self::Yielding => "yielding",
-            Self::Backoff => "backoff",
+            Self::Backoff { .. } => "backoff",
             Self::Sleeping => "sleeping",
         }
     }
@@ -398,7 +405,7 @@ impl IdleStrategy {
             "busy-spin" => Ok(Self::BusySpin),
             "no-op" => Ok(Self::NoOp),
             "yielding" => Ok(Self::Yielding),
-            "backoff" => Ok(Self::Backoff),
+            "backoff" => Ok(Self::Backoff { idle_count: 0 }),
             "sleeping" => Ok(Self::Sleeping),
             other => Err(ConfigError::UnknownIdleStrategy {
                 value: other.to_owned(),
