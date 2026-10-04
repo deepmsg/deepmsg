@@ -134,6 +134,13 @@ path = "integration/image_lifecycle.rs"
 name = "async_add"
 path = "integration/async_add.rs"
 
+# Claiming space in a shared publication and writing into it, which is the
+# zero-copy path a concurrent producer needs. Runs in CI: it needs our own
+# driver, not the reference's.
+[[test]]
+name = "shared_claim"
+path = "integration/shared_claim.rs"
+
 # A `reliable=false` subscription on a lossy stream: it fills its holes instead
 # of asking for them, so the messages lost on the wire are lost. Runs in CI: the
 # loss comes from this driver's own seam, not from the reference's.

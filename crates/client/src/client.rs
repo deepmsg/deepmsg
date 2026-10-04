@@ -77,7 +77,7 @@ use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
 use crate::image_event::ImageEvent;
-use crate::publication::{ExclusivePublication, Publication};
+use crate::publication::{Claim, ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
 use crate::subscription::Subscription;
 
@@ -1872,6 +1872,42 @@ impl Client {
             .unwrap_or(0);
 
         Some(publication.offer(limit, payload))
+    }
+
+    /// Claim `length` bytes of a **shared** publication, to write into.
+    ///
+    /// [`Client::offer`] for a caller that wants to produce the bytes in place
+    /// rather than copy them in: the answer is a window onto the term, written
+    /// to and committed with [`Claim::frame`]`().publish(..)`. Java's
+    /// `ConcurrentPublication.tryClaim`
+    /// (`aeron-client/src/main/java/io/aeron/ConcurrentPublication.java:312`).
+    ///
+    /// The window limit is read from the driver's counter here and per call, for
+    /// the reason [`Client::offer`] gives — it is the only thing between a
+    /// producer and a subscriber that has not read yet, and caching it is how a
+    /// producer outruns its consumer.
+    ///
+    /// `None` when this client holds no such publication; otherwise the claim's
+    /// outcome, where `EndOfLog` and `MidRotation` mean **try again** — another
+    /// producer is rotating, and the claim landed in the term it is leaving.
+    ///
+    /// [`Client::exclusive_publication`] has its own
+    /// [`ExclusivePublication::try_claim`], which takes the offset it has been
+    /// keeping; this one has none to take, and the log decides.
+    pub fn try_claim(
+        &self,
+        registration_id: i64,
+        length: usize,
+    ) -> Option<Result<Claim<'_>, deepmsg_core::logbuffer::append::Appended>> {
+        let publication = self.publication(registration_id)?;
+
+        let limit = self
+            .cnc
+            .counters()
+            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+            .unwrap_or(0);
+
+        Some(publication.try_claim(limit, length))
     }
 
     /// Read up to `fragment_limit` fragments from one image.
