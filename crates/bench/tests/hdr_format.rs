@@ -9,8 +9,8 @@
 //! The golden is `tests/fixtures/reference-interval-log.hdr`, produced by the
 //! reference's own writer: `analysis/bench/hdr-spike/HdrWrite.java`, run against
 //! HdrHistogram 2.2.2, making exactly the call `PersistedHistogram.saveToFile` makes
-//! (`benchmarks-api/.../PersistedHistogram.java:134-152`): one `HistogramLogWriter`,
-//! one `outputIntervalHistogram(startSec, endSec, histogram, 1.0)`, close.
+//! (`benchmarks-api/.../PersistedHistogram.java:134-152`: one `HistogramLogWriter`,
+//! one `outputIntervalHistogram` over the histogram's own timestamps, close).
 //!
 //! # What the comparison can and cannot be
 //!
@@ -18,54 +18,36 @@
 //! is a method of its own and not something `outputIntervalHistogram` does on the way
 //! past — of `start,duration,max,base64 payload`.
 //!
-//! The first three fields are compared **byte for byte** and they are the ones with
-//! content in them: `Interval_Max` is the *highest equivalent* value of the maximum,
-//! not the maximum recorded, so recording 999_999_999 writes 1000341503.000.
+//! The first three fields are compared **byte for byte**, because they can be. The
+//! first two are the same degenerate pair the reference writes (see
+//! [`deepmsg_bench::loadtest::result`] for why they are not times), and
+//! `Interval_Max` is the *highest equivalent* value of the maximum rather than the
+//! maximum recorded: recording 999_999_999 writes 1000341503.000.
 //!
-//! The payload is compared **by what it decodes to**, not byte for byte, and the
-//! reason is worth writing down. Java writes the payload deflated, and a deflate
-//! stream is not a canonical form of its input: Java's `Deflater` runs at level 9
-//! (`78 da`) over zlib, while `V2DeflateSerializer` runs `flate2` at its default
-//! level 6 (`78 9c`) over miniz_oxide. Matching the bytes would mean reimplementing
-//! Java's `Deflater`, and it would buy the rig nothing — the reader is what has to
-//! accept the file, and it does not care which deflate produced a stream it can
-//! inflate. So what is pinned here is the *shape* (the compressed-form cookie, which
-//! is a choice Java made and we follow) and the *contents* (the counts, read back).
+//! The payload is compared **by what it decodes to**, and the reason is worth writing
+//! down. Java writes it deflated, and a deflate stream is not a canonical form of its
+//! input: Java's `Deflater` runs at level 9 over zlib, `V2DeflateSerializer` runs
+//! `flate2` at its default level 6 over miniz_oxide. Matching the bytes would mean
+//! reimplementing Java's `Deflater` to satisfy a reader that cannot tell the
+//! difference. So what is pinned is the *shape* — the compressed-form cookie, which
+//! is a choice Java made and this follows — and the *contents*, read back.
 //!
-//! The end-to-end form of this check — Java reading our file — is
-//! `analysis/bench/hdr-spike/run.sh`, which needs a JDK and the HdrHistogram jar and
-//! so is not a cargo test. Set `DEEPMSG_HDR_SPIKE_DIR` when running this test and it
-//! leaves a copy of what it wrote for that script to pick up.
+//! The end-to-end form of this check is `analysis/bench/hdr-spike/run.sh`, which
+//! needs a JDK and the HdrHistogram jar and so is not a cargo test. Set
+//! `DEEPMSG_HDR_SPIKE_DIR` when running this test and it leaves a copy of what it
+//! wrote for that script to pick up.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
+use deepmsg_bench::loadtest::config::TimeUnit;
+use deepmsg_bench::loadtest::result::{self, Status};
 use hdrhistogram::Histogram;
-use hdrhistogram::serialization::V2DeflateSerializer;
-use hdrhistogram::serialization::interval_log::IntervalLogWriterBuilder;
-
-/// The bounds `PersistedHistogram` gives its histogram: one hour, three significant
-/// digits (`benchmarks-api/.../PersistedHistogram.java:167`).
-///
-/// Not the bounds the rest of this crate uses. The crate's own [`histogram`] helper
-/// starts at the reference *samples*' ten-second ceiling (`cping.c:353`), and with
-/// three significant digits the two ceilings put the same sample in different
-/// buckets. The rig is measured against the benchmark's histogram, so it gets the
-/// benchmark's bounds.
-///
-/// [`histogram`]: deepmsg_bench::histogram
-const HIGHEST_TRACKABLE: u64 = 3_600_000_000_000;
-
-/// `Histogram.getStartTimeStamp()` is milliseconds, and the reference divides it by
-/// 1000.0 to get the log's seconds.
-const START_MS: u64 = 1_759_560_000_123;
-const DURATION_MS: u64 = 10_000;
 
 /// The first four bytes of a payload, in the compressed form Java writes.
 ///
 /// `V2_COMPRESSED_COOKIE` in the crate's own terms; written out here because the
-/// point of the assertion is that we chose the form Java chose, and `HIST` at the
-/// front of the line is the base64 of these.
+/// point of the assertion is that the compressed form is the one being written, and
+/// `HIST` at the front of every interval log is the base64 of these.
 const COMPRESSED_COOKIE: [u8; 4] = [0x1c, 0x84, 0x93, 0x14];
 
 /// The samples, in step with `HdrWrite.java` by hand.
@@ -90,10 +72,32 @@ const SAMPLES: &[(u64, u64)] = &[
     (999_999_999, 4000),
 ];
 
+/// A path under the temporary directory that goes away when the test does.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("deepmsg-bench-hdr-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the temporary directory can be made");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The reference's histogram, with the reference's samples recorded into it.
 fn reference_histogram() -> Histogram<u64> {
-    let mut histogram = Histogram::new_with_bounds(1, HIGHEST_TRACKABLE, 3)
-        .expect("the reference's own bounds are valid");
+    let mut histogram = result::histogram();
 
     for &(value, count) in SAMPLES {
         histogram
@@ -104,30 +108,19 @@ fn reference_histogram() -> Histogram<u64> {
     histogram
 }
 
-/// The file, as bytes.
+/// The line this build writes, without the newline the file ends with.
 ///
-/// Written through a `Vec` rather than a file so what is compared is the bytes and
-/// not two filesystems' idea of them.
-fn interval_log(histogram: &Histogram<u64>) -> Vec<u8> {
-    let mut bytes = Vec::new();
+/// `name` keeps two tests from writing into the same scratch directory at once —
+/// they run in parallel threads of one process.
+fn written_line(name: &str) -> String {
+    let scratch = Scratch::new(name);
+    let path = result::save_to_file(&reference_histogram(), scratch.path(), "test", Status::Ok)
+        .expect("the scratch directory is writable");
 
-    {
-        let mut serializer = V2DeflateSerializer::new();
-        let mut writer = IntervalLogWriterBuilder::new()
-            .begin_log_with(&mut bytes, &mut serializer)
-            .expect("writing to a Vec cannot fail");
-
-        writer
-            .write_histogram(
-                histogram,
-                Duration::from_millis(START_MS),
-                Duration::from_millis(DURATION_MS),
-                None,
-            )
-            .expect("writing to a Vec cannot fail");
-    }
-
-    bytes
+    std::fs::read_to_string(path)
+        .expect("the result is text")
+        .trim_end()
+        .to_owned()
 }
 
 fn golden() -> String {
@@ -136,14 +129,6 @@ fn golden() -> String {
 
     std::fs::read_to_string(path)
         .expect("the golden file is in the tree")
-        .trim_end()
-        .to_owned()
-}
-
-/// The line this build writes, without the newline the writer ends it with.
-fn written_log() -> String {
-    String::from_utf8(interval_log(&reference_histogram()))
-        .expect("the log is text")
         .trim_end()
         .to_owned()
 }
@@ -169,27 +154,14 @@ fn payload(line: &str) -> &str {
     line.rsplit(',').next().expect("the line has four fields")
 }
 
-/// Leaves a copy behind for `analysis/bench/hdr-spike/run.sh`, which needs a JDK and
-/// so cannot be a cargo test.
-fn hand_to_the_java_check(bytes: &[u8]) {
-    let Ok(directory) = std::env::var("DEEPMSG_HDR_SPIKE_DIR") else {
-        return;
-    };
-
-    let directory = PathBuf::from(directory);
-    std::fs::create_dir_all(&directory).expect("the spike directory can be made");
-    std::fs::write(directory.join("rust.hdr"), bytes).expect("the spike directory is writable");
-}
-
-/// The three fields that carry numbers, against the reference's own.
+/// The three fields that carry values, against the reference's own.
 ///
-/// A failure here is not a formatting nit. It is the plan's format claim
-/// (`deepmsg-bench-plan-vs-aeron.md` §2.5) being false, and the rig then owes a
-/// hand-written encoder — or a different way of reporting results at all. So the
-/// assertion prints both lines rather than saying "not equal".
+/// A failure here is not a formatting nit. It is the rig's whole way of reporting
+/// results being a different format from the reference's, so the assertion prints
+/// both lines rather than saying "not equal".
 #[test]
 fn the_interval_log_s_values_are_the_reference_s() {
-    let ours = written_log();
+    let ours = written_line("values");
     let theirs = golden();
 
     assert_eq!(
@@ -199,13 +171,10 @@ fn the_interval_log_s_values_are_the_reference_s() {
     );
 }
 
-/// We write the compressed form, because Java does.
-///
-/// `HIST` at the head of both lines is the base64 of this cookie, so this is also
-/// what makes our file recognisable to the tooling as an interval log at all.
+/// The compressed form, because Java writes the compressed form.
 #[test]
 fn the_payload_is_the_compressed_form_java_writes() {
-    let ours = written_log();
+    let ours = written_line("payload");
     let theirs = golden();
 
     assert_eq!(
@@ -227,12 +196,14 @@ fn the_payload_is_the_compressed_form_java_writes() {
 /// instead of waiting for someone to run a script that needs a JDK.
 #[test]
 fn the_recorded_samples_survive_the_round_trip() {
+    let scratch = Scratch::new("round-trip");
     let histogram = reference_histogram();
-    let bytes = interval_log(&histogram);
+    let path =
+        result::save_to_file(&histogram, scratch.path(), "test", Status::Ok).expect("writable");
+    let line = std::fs::read_to_string(&path).expect("readable");
 
-    hand_to_the_java_check(&bytes);
+    hand_to_the_java_check(&std::fs::read(&path).expect("readable"));
 
-    let line = String::from_utf8(bytes).expect("the log is text");
     let mut deserializer = hdrhistogram::serialization::Deserializer::new();
     let recovered: Histogram<u64> = deserializer
         .deserialize(&mut std::io::Cursor::new(decode_base64(payload(
@@ -252,11 +223,55 @@ fn the_recorded_samples_survive_the_round_trip() {
     }
 }
 
+/// The percentile table is printed in the unit the run reports in.
+#[test]
+fn the_percentile_table_is_scaled_to_the_unit() {
+    let histogram = reference_histogram();
+    let mut nanoseconds = Vec::new();
+
+    result::output_percentile_distribution(
+        &histogram,
+        &mut nanoseconds,
+        TimeUnit::Nanoseconds.scale_ratio(),
+    )
+    .expect("a Vec takes anything");
+
+    let mut microseconds = Vec::new();
+    result::output_percentile_distribution(
+        &histogram,
+        &mut microseconds,
+        TimeUnit::Microseconds.scale_ratio(),
+    )
+    .expect("a Vec takes anything");
+
+    let nanoseconds = String::from_utf8(nanoseconds).expect("the table is text");
+    let microseconds = String::from_utf8(microseconds).expect("the table is text");
+
+    // The table reports the *highest equivalent* of each value, so the largest
+    // sample — 999_999_999 — shows as 1000341503. The same number a thousand
+    // times smaller is what microseconds must show.
+    assert!(nanoseconds.contains("1000341503.000"), "{nanoseconds}");
+    assert!(microseconds.contains("1000341.503"), "{microseconds}");
+}
+
+/// Leaves a copy behind for `analysis/bench/hdr-spike/run.sh`, which needs a JDK and
+/// so cannot be a cargo test.
+fn hand_to_the_java_check(bytes: &[u8]) {
+    let Ok(directory) = std::env::var("DEEPMSG_HDR_SPIKE_DIR") else {
+        return;
+    };
+
+    let directory = PathBuf::from(directory);
+    std::fs::create_dir_all(&directory).expect("the spike directory can be made");
+    // The spike compares two files, so this one is named for which side it is.
+    std::fs::write(directory.join("rust.hdr"), bytes).expect("the spike directory is writable");
+}
+
 /// Standard base64 with padding, as `HistogramLogWriter` emits it.
 ///
-/// The crate's `IntervalLogIterator` hands the payload back as base64 text and
-/// nothing that turns it into bytes, so the four lines that stand between the two are
-/// done here rather than by adding a dependency to the test's build.
+/// The crate's `IntervalLogIterator` hands the payload back as base64 text and nothing
+/// that turns it into bytes, so the four lines that stand between the two are done
+/// here rather than by adding a dependency to the test's build.
 fn decode_base64(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let mut accumulator = 0u32;

@@ -32,6 +32,13 @@ use std::thread;
 
 use hdrhistogram::Histogram;
 
+/// The reference's `LoadTestRig`, rebuilt here.
+///
+/// A second instrument with a different meaning from everything else in this
+/// crate — see the module's own documentation for why the two are never
+/// reported side by side.
+pub mod loadtest;
+
 /// The lowest value the histogram records, in nanoseconds: one.
 ///
 /// The reference's own samples initialise theirs as
