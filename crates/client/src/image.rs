@@ -151,6 +151,22 @@ pub struct Image {
     stream_id: i32,
     /// The counter this image's reader advances.
     subscriber_position_id: i32,
+    /// Where this subscriber started reading — the position the driver wrote
+    /// into the counter when it linked the subscription
+    /// (`aeron_driver_conductor.c:3547-3575`), read back here rather than taken
+    /// from the message that announced the image.
+    ///
+    /// `Image.joinPosition()` (`Image.java:214`);
+    /// `aeron_image_constants_t.join_position` (`aeronc.h:2140`).
+    join_position: i64,
+    /// Where the stream comes from, as the driver described it: `host:port` for
+    /// a network publication and `"aeron:ipc"` for an IPC one
+    /// (`Image.sourceIdentity()`, `Image.java:154`;
+    /// `aeron_image_constants_t.source_identity`, `aeronc.h:2130`).
+    ///
+    /// It arrives in `ON_AVAILABLE_IMAGE`, whose tail carries it after the log
+    /// path (`on_available_image`, `aeron_driver_conductor.c:1327-1336`).
+    source_identity: String,
     log: LogBuffer,
     /// How far this reader has consumed.
     position: Position,
@@ -177,12 +193,15 @@ impl Image {
         stream_id: i32,
         subscriber_position_id: i32,
         join_position: i64,
+        source_identity: String,
     ) -> io::Result<Self> {
         Ok(Self {
             registration_id,
             session_id,
             stream_id,
             subscriber_position_id,
+            join_position,
+            source_identity,
             log: LogBuffer::open(path, false)?,
             position: Position::from_raw(join_position),
         })
@@ -237,6 +256,77 @@ impl Image {
     /// joins a stream that is already running.
     pub const fn set_position(&mut self, position: i64) {
         self.position = Position::from_raw(position);
+    }
+
+    /// Where this subscriber joined the stream
+    /// (`Image.joinPosition()`, `Image.java:214`;
+    /// `aeron_image_constants_t.join_position`, `aeronc.h:2140`).
+    pub const fn join_position(&self) -> i64 {
+        self.join_position
+    }
+
+    /// Where the stream comes from as the driver described it — `host:port` for
+    /// a network publication, `"aeron:ipc"` for an IPC one
+    /// (`Image.sourceIdentity()`, `Image.java:154`).
+    ///
+    /// Two images of the same stream from different sources differ here, which
+    /// is what it is for.
+    pub fn source_identity(&self) -> &str {
+        &self.source_identity
+    }
+
+    /// The MTU the publication was created with (`Image.mtuLength()`,
+    /// `Image.java:164`; `LogBufferDescriptor.mtuLength`,
+    /// `LogBufferDescriptor.java:527`).
+    ///
+    /// `None` only when the metadata block cannot be read, which it always can
+    /// for a log this type opened.
+    pub fn mtu_length(&self) -> Option<i32> {
+        self.metadata()?.load_i32(descriptor::MTU_LENGTH_OFFSET)
+    }
+
+    /// The position the stream reached when the publisher signalled end of
+    /// stream — [`END_OF_STREAM_OPEN`](deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN)
+    /// until then (`Image.endOfStreamPosition()`, `Image.java:265`;
+    /// `aeron_image_end_of_stream_position`, `aeron_image.c:195-208`).
+    pub fn end_of_stream_position(&self) -> Option<i64> {
+        self.metadata()?
+            .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)
+    }
+
+    /// Whether this reader has reached the end of the stream
+    /// (`Image.isEndOfStream()`, `Image.java:249`).
+    ///
+    /// The reference compares the **subscriber position counter** against the
+    /// metadata; this compares the reader's own position against it, which is
+    /// the same number — this client writes that counter after every poll. Both
+    /// are false while the stream is open, because the open marker is
+    /// `INT64_MAX` and no position reaches it.
+    pub fn is_end_of_stream(&self) -> Option<bool> {
+        Some(self.position.raw() >= self.end_of_stream_position()?)
+    }
+
+    /// How many transports the driver has seen active within the image liveness
+    /// timeout; zero for an IPC image, which has no transports
+    /// (`Image.activeTransportCount()`, `Image.java:283`).
+    pub fn active_transport_count(&self) -> Option<i32> {
+        self.metadata()?
+            .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
+    }
+
+    /// Whether the publication behind this image has been revoked
+    /// (`Image.isPublicationRevoked()`, `Image.java:298`;
+    /// `aeron_image_is_publication_revoked`, `aeron_image.c:231-247`).
+    pub fn is_publication_revoked(&self) -> Option<bool> {
+        self.metadata()?
+            .load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET)
+            .map(|value| value != 0)
+    }
+
+    /// The log's metadata block, which is where the four state questions above
+    /// are answered (`crate::log_buffer`).
+    fn metadata(&self) -> Option<AtomicBuffer<'_>> {
+        self.log.metadata()
     }
 
     /// Read up to `fragment_limit` fragments, handing each to `handler`.

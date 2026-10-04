@@ -145,6 +145,43 @@ fn matches_a_ready_response_by_correlation_id() {
     assert_eq!(expected, id, "the id is the correlation id, echoed");
 }
 
+/// The channel-status counter the driver names arrives **after** the
+/// subscription is registered, so it is written onto the subscription rather
+/// than carried back through the caller.
+///
+/// That order is the reference's on both sides: Java puts the subscription into
+/// its map and only then awaits the response (`ClientConductor.java:749-750`),
+/// writing the counter id on it when the response arrives (`:396`), and C
+/// creates the subscription inside the ready handler itself
+/// (`aeron_client_conductor.c:625-652`). It is what closes the gap in which an
+/// image for this subscription could arrive before the subscription existed.
+#[test]
+fn a_subscription_is_registered_before_its_channel_status_counter_is_known() {
+    let cnc = live_cnc();
+    let expected = next_correlation_id(&cnc.cnc_path());
+
+    // A counter id rather than the `-1` an IPC subscription really gets,
+    // because `-1` is the one value the accessor reports as "none" — this has
+    // to be a number the subscription can only have got from the reply.
+    let mut payload = expected.to_le_bytes().to_vec();
+    payload.extend_from_slice(&77i32.to_le_bytes());
+    publish(&cnc.cnc_path(), ON_SUBSCRIPTION_READY_TYPE_ID, &payload);
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let id = client
+        .add_subscription("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the fabricated reply must match");
+
+    assert_eq!(
+        Some(77),
+        client
+            .subscription(id)
+            .expect("the subscription is registered")
+            .channel_status_indicator_id(),
+        "the counter id from the reply lands on the subscription"
+    );
+}
+
 #[test]
 fn a_response_for_someone_else_is_ignored_not_mistaken() {
     // Every client reads the whole broadcast ring, so a reply addressed to a

@@ -576,6 +576,32 @@ all on the client's side. Each names the test that covers it.
   driver's minimum. Covered by
   `crates/cnc/src/command.rs::a_reject_image_is_the_c_clients_bytes_and_not_the_java_ones`
   and `tests/integration/reject_image.rs`.
+- **Image events are queued, and name the image rather than hand it over.**
+  The rule `CounterEvent` is under, applied to `ON_AVAILABLE_IMAGE` and
+  `ON_UNAVAILABLE_IMAGE`. The reference calls a handler registered per
+  subscription and gives it the `Image` itself
+  (`Aeron.addSubscription(…, availableImageHandler, unavailableImageHandler)`,
+  `aeron-client/src/main/java/io/aeron/Aeron.java:417`;
+  `aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:606-611`),
+  from inside its own duty cycle — and forbids calling back into the client
+  there (`AvailableImageHandler.java:21-28`). `Client::image_events` queues
+  `ImageEvent`s instead, carrying the two ids the protocol used rather than the
+  handle, because the image lives inside the client and the poll already holds
+  it mutably. Covered by
+  `tests/integration/image_lifecycle.rs::an_image_event_announces_the_image_and_its_removal`.
+- **A subscription exists before its ready response does.** Both references
+  register one first — Java puts it into its map and only then awaits
+  (`ClientConductor.java:749-750`), and C creates it inside the ready handler
+  (`aeron-client/src/main/c/aeron_client_conductor.c:625-652`) — so an image
+  that arrives alongside the ready response has something to attach to. This
+  build does the same, and writes the channel-status counter id the response
+  carries onto the subscription when it lands rather than carrying it back
+  through the caller. One divergence sits inside that: an `add` whose response
+  never comes removes the subscription again, where Java leaves its map entry
+  behind. Covered by
+  `tests/integration/client_round_trip.rs::a_subscription_is_registered_before_its_channel_status_counter_is_known`
+  and `tests/integration/image_lifecycle.rs::an_image_event_announces_the_image_and_its_removal`.
+
 One thing in this area is **not** a divergence and is written down anyway,
 because the correct value is one edit away: the source address of a publication
 error from an **IPC** rejection is byte-reversed. The reference assigns

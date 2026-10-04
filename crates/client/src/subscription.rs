@@ -56,6 +56,16 @@ impl Subscription {
         }
     }
 
+    /// Record the channel-status counter the driver allocated, which arrives
+    /// with the ready response — **after** this subscription is already
+    /// registered, so the id is written onto it rather than carried back to the
+    /// caller. Java does the same (`ClientConductor.java:396`,
+    /// `subscription.channelStatusId(id)`), which is why its subscriptions are
+    /// registered before the response is awaited.
+    pub(crate) fn set_channel_status_indicator_id(&mut self, id: i32) {
+        self.channel_status_indicator_id = id;
+    }
+
     /// The assembler this subscription's messages are reassembled in, and how
     /// many messages it abandoned on the way.
     pub const fn assembler(&self) -> &FragmentAssembler {
@@ -114,6 +124,43 @@ impl Subscription {
         }
 
         (messages, counter_writes)
+    }
+
+    /// Read up to `fragment_limit` fragments from every image, handing each to
+    /// `handler` as it lies in the term.
+    ///
+    /// The fragment-level counterpart of [`Self::poll_messages`]: nothing is
+    /// reassembled and nothing is copied, so a message that arrived in three
+    /// frames is delivered three times. That is what
+    /// `aeron_subscription_poll` does when it is given a plain fragment handler
+    /// (`aeron_subscription.c:1040-1080`), and what Java's `Subscription.poll`
+    /// always does (`Subscription.java:188`).
+    ///
+    /// Returns how many fragments were delivered, and the counter writes the
+    /// caller has to make afterwards — the same contract as [`Self::poll_messages`].
+    pub(crate) fn poll_fragments<F>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut F,
+    ) -> (usize, Vec<(i32, i64)>)
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        let mut fragments = 0;
+        let mut counter_writes = Vec::new();
+
+        for image in self.images.iter_mut() {
+            let remaining = fragment_limit.saturating_sub(fragments);
+            if 0 == remaining {
+                break;
+            }
+
+            fragments += image.poll(remaining, &mut *handler);
+
+            counter_writes.push((image.subscriber_position_id(), image.position()));
+        }
+
+        (fragments, counter_writes)
     }
 
     /// The subscription's registration id.

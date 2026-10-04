@@ -6690,6 +6690,7 @@ mod tests {
             1001,
             subscriber_position_id,
             join_position,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -8662,6 +8663,7 @@ mod tests {
             1001,
             subscriber_position_id,
             join_position,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -9414,6 +9416,7 @@ mod tests {
             1001,
             subscriber_position_id,
             0,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -9564,6 +9567,7 @@ mod tests {
             1001,
             subscriber_position_id,
             0,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 

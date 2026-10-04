@@ -38,10 +38,10 @@ use std::time::{Duration, Instant};
 use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
     ADD_PUBLICATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
-    ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription, Correlated,
-    DestinationByIdCommand, DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
-    GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
-    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription,
+    CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, Correlated, DestinationByIdCommand, DestinationCommand,
+    GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID,
+    REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
     encode_add_static_counter, encode_reject_image,
 };
@@ -52,6 +52,7 @@ use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver
 use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
+use crate::image_event::ImageEvent;
 use crate::publication::{ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
 use crate::subscription::Subscription;
@@ -259,8 +260,10 @@ pub const DRIVER_TIMEOUT_MS: i64 = 10 * 1000;
 /// What a completed command handed back.
 #[derive(Debug)]
 enum Ready {
-    /// A subscription exists.
-    Subscription { channel_status_indicator_id: i32 },
+    /// A subscription exists. Its channel-status counter id is not carried
+    /// here: it is written onto the subscription, which is already registered by
+    /// the time this arrives.
+    Subscription,
     /// A publication exists, and its log buffer can now be mapped.
     Publication {
         registration_id: i64,
@@ -333,6 +336,14 @@ pub struct Client {
     /// which is why they are kept rather than dropped: a publisher that never
     /// looks loses the only notice it gets.
     publication_errors: Vec<PublicationErrorEvent>,
+    /// Images that appeared under, or left, a subscription, and nobody has
+    /// drained yet.
+    ///
+    /// The reference calls a handler for each of these
+    /// (`AvailableImageHandler`/`UnavailableImageHandler`, registered per
+    /// subscription — `Aeron.java:417`); here they are a queue for the same
+    /// reason [`CounterEvent`] is.
+    image_events: Vec<ImageEvent>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
@@ -407,6 +418,7 @@ impl Client {
             counter_events: Vec::new(),
             static_counters: Vec::new(),
             publication_errors: Vec::new(),
+            image_events: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
@@ -551,6 +563,27 @@ impl Client {
         std::mem::take(&mut self.publication_errors)
     }
 
+    /// Images that appeared under, or left, a subscription since the last
+    /// drain, and take them.
+    ///
+    /// An image is only ever found through a subscription, so this is the only
+    /// way to learn that one arrived without walking every subscription's image
+    /// list every duty cycle. Each event names the image by the ids the
+    /// protocol used; the image itself is
+    /// [`Subscription::image`](crate::subscription::Subscription::image) while
+    /// it is available.
+    ///
+    /// The reference calls a handler per image instead — one pair registered
+    /// per subscription, and a default pair on the context
+    /// (`Aeron.Context.availableImageHandler`, `Aeron.java:1650`) — which a
+    /// poll-driven client has no thread to run. See [`ImageEvent`] for the rest
+    /// of the divergence.
+    ///
+    /// Nothing bounds the queue, as with [`Client::counter_events`].
+    pub fn image_events(&mut self) -> Vec<ImageEvent> {
+        std::mem::take(&mut self.image_events)
+    }
+
     /// Run one duty cycle: refresh the heartbeat, then take at most one
     /// response.
     ///
@@ -617,22 +650,45 @@ impl Client {
 
         self.send(ADD_SUBSCRIPTION_TYPE_ID, &payload, correlation_id, timeout)?;
 
-        let ready = self.wait(correlation_id)?;
-        let Ready::Subscription {
-            channel_status_indicator_id,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
-        };
-
+        // Registered **before** the response is awaited, which is the reference's
+        // order on both sides: Java puts the subscription into its map and only
+        // then awaits (`ClientConductor.java:749-750`), and C creates it inside
+        // the ready handler itself (`aeron_client_conductor.c:625-652`).
+        //
+        // Registering after the wait instead leaves a gap one message wide. A
+        // poll reads a single message, so a ready response followed by an
+        // `ON_AVAILABLE_IMAGE` for the same subscription is two polls — but the
+        // gap is still real for a driver that emits the image first, and an
+        // image that finds no subscription is dropped, not deferred. The
+        // counter id is not known yet; it arrives with the response and is
+        // written onto the subscription there.
         self.subscriptions.push(Subscription::new(
             correlation_id,
             channel.to_owned(),
             stream_id,
-            channel_status_indicator_id,
+            CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
         ));
 
-        Ok(correlation_id)
+        match self.wait(correlation_id) {
+            Ok(Ready::Subscription) => Ok(correlation_id),
+            // Unregistered again, so that a subscription the driver refused —
+            // or never answered for — is not left looking like one that works.
+            // Java leaves its map entry behind here; this does not.
+            Ok(_) => {
+                self.unregister_subscription(correlation_id);
+                Err(CommandError::Encoding)
+            }
+            Err(error) => {
+                self.unregister_subscription(correlation_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Drop a subscription that never became ready, and anything attached to it.
+    fn unregister_subscription(&mut self, registration_id: i64) {
+        self.subscriptions
+            .retain(|subscription| subscription.registration_id() != registration_id);
     }
 
     /// Add a publication and wait for the driver to confirm it.
@@ -1556,6 +1612,54 @@ impl Client {
         messages
     }
 
+    /// Read up to `fragment_limit` fragments from every image of a
+    /// subscription, and deliver them **as they lie in the term**.
+    ///
+    /// [`Client::poll_subscription`] delivers whole messages and reassembles
+    /// fragments to do it, which costs a copy for every message that arrived in
+    /// more than one frame. This delivers the frames themselves, with nothing
+    /// copied and nothing held across calls — Java's `Subscription.poll`
+    /// (`Subscription.java:188`) and `aeron_subscription_poll` with a fragment
+    /// handler. It is the subscription-level twin of [`Client::poll_image`],
+    /// which reads one image; this reads them all, in image order, up to the
+    /// limit.
+    ///
+    /// A message split across frames is delivered once per frame, and a caller
+    /// that wants messages should use [`Client::poll_subscription`] instead —
+    /// the two share the reader position, so mixing them on one subscription
+    /// leaves the assembler missing whatever the raw poll took.
+    ///
+    /// Returns how many fragments were delivered.
+    pub fn poll_subscription_fragments<F>(
+        &mut self,
+        subscription_id: i64,
+        fragment_limit: usize,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        let Some(subscription) = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            return 0;
+        };
+
+        let (fragments, counter_writes) = subscription.poll_fragments(fragment_limit, &mut handler);
+
+        // Published after the poll, never during it — the reason
+        // [`Client::poll_subscription`] gives.
+        if let Some(counters) = self.cnc.counters_writable() {
+            for (counter_id, position) in counter_writes {
+                counters.set_value(counter_id, position);
+            }
+        }
+
+        fragments
+    }
+
     /// Send a command and register it as pending with a deadline.
     fn send(
         &mut self,
@@ -1741,12 +1845,19 @@ impl Client {
                 correlation_id,
                 channel_status_indicator_id,
             } => {
-                self.complete(
-                    correlation_id,
-                    Ok(Ready::Subscription {
-                        channel_status_indicator_id,
-                    }),
-                );
+                // The subscription is registered by now — it goes in before the
+                // ready response is awaited — so the counter id is recorded on
+                // it rather than carried back to the caller. Java does the same
+                // (`ClientConductor.java:396`).
+                if let Some(subscription) = self
+                    .subscriptions
+                    .iter_mut()
+                    .find(|s| s.registration_id() == correlation_id)
+                {
+                    subscription.set_channel_status_indicator_id(channel_status_indicator_id);
+                }
+
+                self.complete(correlation_id, Ok(Ready::Subscription));
             }
             Response::PublicationReady {
                 correlation_id,
@@ -1810,7 +1921,7 @@ impl Client {
                 subscriber_registration_id,
                 subscriber_position_id,
                 log_file,
-                ..
+                source_identity,
             } => {
                 self.attach_image(
                     subscriber_registration_id,
@@ -1819,6 +1930,7 @@ impl Client {
                     stream_id,
                     subscriber_position_id,
                     &path_from_bytes(log_file),
+                    source_identity,
                 );
             }
             Response::UnavailableImage {
@@ -1826,12 +1938,33 @@ impl Client {
                 subscription_registration_id,
                 ..
             } => {
-                if let Some(subscription) = self
+                // The image is read before it is removed, because that is the
+                // only moment it exists — the reference hands its handler the
+                // `Image` for the same reason
+                // (`ClientConductor.onUnavailableImage`, `ClientConductor.java:446-453`).
+                let event = self
                     .subscriptions
                     .iter_mut()
                     .find(|s| s.registration_id() == subscription_registration_id)
-                {
-                    subscription.remove_image(publication_registration_id);
+                    .and_then(|subscription| {
+                        let event = subscription
+                            .image(publication_registration_id)
+                            .map(|image| ImageEvent::Unavailable {
+                                subscription_registration_id,
+                                publication_registration_id,
+                                session_id: image.session_id(),
+                                stream_id: image.stream_id(),
+                                position: image.position(),
+                            });
+
+                        subscription
+                            .remove_image(publication_registration_id)
+                            .then_some(event)
+                            .flatten()
+                    });
+
+                if let Some(event) = event {
+                    self.image_events.push(event);
                 }
             }
             // Not an answer to a command: the driver is telling a client that
@@ -1981,6 +2114,7 @@ impl Client {
     }
 
     /// Map an image's log buffer and attach it to its subscription.
+    #[allow(clippy::too_many_arguments)] // one per field of the message, and two of them are ids
     fn attach_image(
         &mut self,
         subscription_id: i64,
@@ -1989,6 +2123,7 @@ impl Client {
         stream_id: i32,
         subscriber_position_id: i32,
         path: &Path,
+        source_identity: &[u8],
     ) {
         // Where to start reading. The driver writes the join position into the
         // counter as part of linking the subscription
@@ -2008,6 +2143,7 @@ impl Client {
             stream_id,
             subscriber_position_id,
             join_position,
+            String::from_utf8_lossy(source_identity).into_owned(),
         ) {
             Ok(image) => image,
             Err(_) => {
@@ -2026,6 +2162,18 @@ impl Client {
         };
 
         subscription.add_image(image);
+
+        // Announced once the image is in place, so a caller that drains this and
+        // then looks finds it — the order the reference fires its handler in
+        // (`subscription.addImage(image)` then `handler.onAvailableImage(image)`,
+        // `ClientConductor.java:419-427`).
+        self.image_events.push(ImageEvent::Available {
+            subscription_registration_id: subscription_id,
+            publication_registration_id,
+            session_id,
+            stream_id,
+            position: join_position,
+        });
     }
 
     fn complete(&mut self, correlation_id: i64, outcome: Result<Ready, CommandError>) {
