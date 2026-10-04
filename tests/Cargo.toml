@@ -138,6 +138,10 @@ path = "integration/async_add.rs"
 # zero-copy path a concurrent producer needs. Runs in CI: it needs our own
 # driver, not the reference's.
 [[test]]
+name = "claim_rotation"
+path = "integration/claim_rotation.rs"
+
+[[test]]
 name = "shared_claim"
 path = "integration/shared_claim.rs"
 

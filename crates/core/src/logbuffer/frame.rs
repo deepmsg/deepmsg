@@ -270,6 +270,49 @@ impl Frame<'_, ReadWrite> {
             .copy_in(self.offset + DATA_HEADER_LENGTH, payload)
     }
 
+    /// Store an `int64` at `offset` bytes into the payload.
+    ///
+    /// The other half of [`Frame::write_payload`], and the one a **claimed**
+    /// frame wants: a producer that has claimed writes its message where the
+    /// message will lie instead of assembling it elsewhere and copying it in.
+    /// That is what a claim is for — the reference's `BufferClaim` hands over
+    /// the log buffer and an offset into it for exactly this
+    /// (`aeron_exclusive_publication.h:36-41`), and its senders write a
+    /// timestamp, a receiver index and a checksum straight through those and
+    /// leave the rest of the message as whatever the term already held.
+    ///
+    /// Offsets are from the start of the payload, which is where
+    /// `BufferClaim.offset()` points.
+    ///
+    /// Nothing reads a claimed frame before [`Frame::publish`] — its length is
+    /// negative until then — so an offset that is only four-byte aligned is
+    /// written as two halves rather than refused, the way the reference's
+    /// little-endian `putLong` writes wherever it is told to.
+    pub fn store_i64_in_payload(&self, offset: usize, value: i64) -> Option<()> {
+        let at = self.payload_offset(offset)?;
+
+        if self.buffer.store_i64_relaxed(at, value).is_some() {
+            return Some(());
+        }
+
+        self.buffer.store_i64_relaxed_unaligned(at, value)
+    }
+
+    /// Store an `int32` at `offset` bytes into the payload.
+    ///
+    /// See [`Frame::store_i64_in_payload`].
+    pub fn store_i32_in_payload(&self, offset: usize, value: i32) -> Option<()> {
+        self.buffer
+            .store_i32_relaxed(self.payload_offset(offset)?, value)
+    }
+
+    /// Where `offset` bytes into the payload lies in the term.
+    fn payload_offset(&self, offset: usize) -> Option<usize> {
+        self.offset
+            .checked_add(DATA_HEADER_LENGTH)?
+            .checked_add(offset)
+    }
+
     /// Publish the frame: a positive length, release.
     ///
     /// This single 32-bit store is what makes the frame visible, and it is what
@@ -323,5 +366,100 @@ impl Frame<'_, ReadWrite> {
     /// Rewrite the term id recorded in the header.
     pub fn set_term_id(&self, term_id: i32) -> Option<()> {
         self.write_i32(TERM_ID_FIELD_OFFSET, term_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::AtomicBuffer;
+
+    const MESSAGE_LENGTH: usize = 24;
+
+    /// A term with one claimed frame at its start, and the frame's header
+    /// written the way `Appender` writes one.
+    ///
+    /// The buffer cannot be made by a helper and returned: a `Frame` borrows the
+    /// `AtomicBuffer` it reads, and the buffer borrows the term. So each test
+    /// holds all three.
+    macro_rules! claimed {
+        ($term:ident, $buffer:ident, $frame:ident, $length:expr) => {
+            let mut $term = vec![0_u8; 256];
+            let $buffer =
+                AtomicBuffer::from_slice_mut(&mut $term).expect("the term is a valid region");
+            let $frame = Frame::new(&$buffer, 0);
+            let frame_length = i32::try_from($length + DATA_HEADER_LENGTH).expect("small");
+
+            $frame
+                .begin(frame_length, FLAG_UNFRAGMENTED, TYPE_DATA, 0, 1, 2, 3)
+                .expect("the header is inside the term");
+        };
+    }
+
+    fn payload_of(frame: &Frame<'_, ReadWrite>, length: usize) -> Vec<u8> {
+        let mut payload = vec![0_u8; length];
+        assert_eq!(frame.copy_payload(&mut payload), Some(()));
+
+        payload
+    }
+
+    #[test]
+    fn a_claimed_frame_can_be_written_into_where_it_lies() {
+        claimed!(term, buffer, frame, MESSAGE_LENGTH);
+        let frame_length = i32::try_from(MESSAGE_LENGTH + DATA_HEADER_LENGTH).expect("small");
+
+        assert_eq!(
+            frame.store_i64_in_payload(0, 0x0102_0304_0506_0708),
+            Some(())
+        );
+        assert_eq!(frame.store_i32_in_payload(8, 7), Some(()));
+        assert_eq!(
+            frame.store_i64_in_payload(MESSAGE_LENGTH - 8, i64::MIN),
+            Some(())
+        );
+        assert_eq!(frame.publish(frame_length), Some(()));
+
+        let mut expected = vec![0_u8; MESSAGE_LENGTH];
+        expected[0..8].copy_from_slice(&0x0102_0304_0506_0708_i64.to_le_bytes());
+        expected[8..12].copy_from_slice(&7_i32.to_le_bytes());
+        expected[MESSAGE_LENGTH - 8..].copy_from_slice(&i64::MIN.to_le_bytes());
+
+        assert_eq!(payload_of(&frame, MESSAGE_LENGTH), expected);
+    }
+
+    /// The checksum sits `message_length - 8` bytes in, so a message length that
+    /// is not a multiple of eight leaves it only four-byte aligned — where the
+    /// reference writes anyway, and where this writes as two halves.
+    #[test]
+    fn a_checksum_off_an_eight_byte_boundary_is_still_written() {
+        const ODD_LENGTH: usize = 28;
+
+        claimed!(term, buffer, frame, ODD_LENGTH);
+        let frame_length = i32::try_from(ODD_LENGTH + DATA_HEADER_LENGTH).expect("small");
+
+        assert_eq!(
+            frame.store_i64_in_payload(ODD_LENGTH - 8, 0x0A0B_0C0D_0E0F_1011),
+            Some(())
+        );
+        assert_eq!(frame.publish(frame_length), Some(()));
+
+        let payload = payload_of(&frame, ODD_LENGTH);
+
+        assert_eq!(
+            payload[ODD_LENGTH - 8..],
+            0x0A0B_0C0D_0E0F_1011_i64.to_le_bytes()
+        );
+    }
+
+    /// A write that would leave the term is refused rather than wrapping into
+    /// the header before it or past the mapping's end.
+    #[test]
+    fn a_write_past_the_end_of_the_term_is_refused() {
+        claimed!(term, buffer, frame, 16);
+        let past_the_end = 256 - DATA_HEADER_LENGTH;
+
+        assert_eq!(frame.store_i64_in_payload(past_the_end, 1), None);
+        assert_eq!(frame.store_i32_in_payload(past_the_end, 1), None);
+        assert_eq!(frame.store_i64_in_payload(usize::MAX, 1), None);
     }
 }
