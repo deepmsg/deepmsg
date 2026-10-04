@@ -14,14 +14,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use deepmsg_client::client::{Client, CommandError};
+use deepmsg_client::client::{AsyncAddPoll, Client, CommandError};
 use deepmsg_cnc::command::{
     ADD_DESTINATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
     CLIENT_CLOSE_TYPE_ID, CORRELATED_COMMAND_LENGTH, ON_ERROR_TYPE_ID,
     ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
     REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
-    REMOVE_RECEIVE_DESTINATION_TYPE_ID, decode_destination_by_id_command,
-    decode_destination_command,
+    REMOVE_RECEIVE_DESTINATION_TYPE_ID, REMOVE_SUBSCRIPTION_TYPE_ID,
+    decode_destination_by_id_command, decode_destination_command,
 };
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{CncFile, ToDriverRingConsumer};
@@ -242,6 +242,92 @@ fn closing_a_client_tells_the_driver_once() {
         layout::NULL_VALUE,
         i64::from_le_bytes(payload[8..16].try_into().expect("eight")),
         "and a correlation id nothing will answer"
+    );
+}
+
+/// An asynchronous add is written at once and answered later.
+///
+/// The three states the reference's poll can be in
+/// (`aeron_client_conductor_async_resource_poll`,
+/// `aeron_client_conductor.c:3675-3775`): awaiting, registered, and — since
+/// polling consumes the answer — nothing left to say.
+#[test]
+fn an_async_add_is_awaiting_then_ready_then_nothing() {
+    let cnc = live_cnc();
+    let expected = next_correlation_id(&cnc.cnc_path());
+    publish(
+        &cnc.cnc_path(),
+        ON_SUBSCRIPTION_READY_TYPE_ID,
+        &ready_payload(expected),
+    );
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let add = client
+        .async_add_subscription("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the command is written");
+
+    assert_eq!(expected, add.registration_id(), "the id the command drew");
+
+    // Registered on the way in, before any answer was read — which is what
+    // makes it holdable, and what `add_subscription` does too.
+    assert!(client.subscription(expected).is_some());
+
+    // The reply is in the ring and has not been read, so the add is still
+    // waiting on it.
+    assert!(matches!(client.async_add_poll(add), AsyncAddPoll::Awaiting));
+
+    assert!(client.poll(), "the ready response is read");
+    assert!(matches!(client.async_add_poll(add), AsyncAddPoll::Ready));
+
+    assert!(
+        matches!(client.async_add_poll(add), AsyncAddPoll::Unknown),
+        "polling consumed the answer; the reference answers -1 to a second poll"
+    );
+}
+
+/// Giving up on an add is a remove, and it takes the subscription with it.
+///
+/// The command is already in the ring by the time a caller can cancel — the
+/// reference's cancel says so by being a removal
+/// (`aeron_client.c:428-443`) — so the driver is told, and the local list stops
+/// answering immediately rather than waiting for the removal's own
+/// acknowledgement.
+#[test]
+fn cancelling_an_async_add_asks_the_driver_to_remove_it() {
+    let cnc = live_cnc();
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let add = client
+        .async_add_subscription("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the command is written");
+
+    assert!(client.subscription(add.registration_id()).is_some());
+
+    client
+        .async_add_cancel(add)
+        .expect("the removal is written");
+
+    assert!(
+        client.subscription(add.registration_id()).is_none(),
+        "a cancelled add stops being visible at once"
+    );
+    assert!(
+        matches!(client.async_add_poll(add), AsyncAddPoll::Unknown),
+        "and there is nothing left to poll"
+    );
+
+    let commands = commands_written(cnc.path());
+    let removal = commands
+        .iter()
+        .find(|(type_id, _)| *type_id == REMOVE_SUBSCRIPTION_TYPE_ID)
+        .expect("the removal reached the ring");
+
+    // The correlated head names the client, and the field after it is the
+    // *resource* — the id the add drew, which is what the driver keys it by.
+    assert_eq!(
+        add.registration_id(),
+        i64::from_le_bytes(removal.1[16..24].try_into().expect("eight")),
+        "the removal names the subscription the add made"
     );
 }
 

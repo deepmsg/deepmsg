@@ -128,6 +128,12 @@ path = "integration/exclusive_publication.rs"
 name = "image_lifecycle"
 path = "integration/image_lifecycle.rs"
 
+# The asynchronous adds, which write a command and answer later. Runs in CI: it
+# needs our own driver, not the reference's.
+[[test]]
+name = "async_add"
+path = "integration/async_add.rs"
+
 # A `reliable=false` subscription on a lossy stream: it fills its holes instead
 # of asking for them, so the messages lost on the wire are lost. Runs in CI: the
 # loss comes from this driver's own seam, not from the reference's.

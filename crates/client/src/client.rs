@@ -324,6 +324,55 @@ enum Ready {
     OperationSucceeded,
 }
 
+/// A handle on an `ADD_*` that has been sent and not yet answered.
+///
+/// Returned by [`Client::async_add_subscription`] and the two publication
+/// twins, and consumed by [`Client::async_add_poll`] and
+/// [`Client::async_add_cancel`]. What it holds is the registration id the
+/// command drew, which is also the id the resource will have — so a handle is
+/// enough to find the resource once the poll says it is there.
+///
+/// The reference's handle is a pointer to a struct that carries its own
+/// status; this one carries the id and lets the [client](Client) hold the
+/// status, because the client already holds it for every other command. The
+/// difference is visible in one place: polling an id this client is not waiting
+/// on answers [`AsyncAddPoll::Unknown`] rather than reading a stale status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncAdd {
+    registration_id: i64,
+}
+
+impl AsyncAdd {
+    /// The registration id the `ADD_*` drew — and the id the resource has, if
+    /// it arrived.
+    pub const fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+}
+
+/// What [`Client::async_add_poll`] found.
+///
+/// Not `Clone` or `PartialEq`, because [`CommandError`] is neither — it can
+/// carry an [`io::Error`], which is not comparable.
+#[derive(Debug)]
+pub enum AsyncAddPoll {
+    /// The driver has not answered yet. Poll again later.
+    Awaiting,
+    /// It answered, and the resource is in this client's list under
+    /// [`AsyncAdd::registration_id`] — [`Client::subscription`],
+    /// [`Client::publication`] or [`Client::exclusive_publication`] whichever
+    /// kind it was.
+    Ready,
+    /// The driver refused it, or the deadline passed before it answered.
+    ///
+    /// A subscription that failed this way is taken out of the client's list,
+    /// so nothing is left looking like a subscription that works.
+    Failed(CommandError),
+    /// This handle is not one this client is waiting on: it was already
+    /// polled, or cancelled, or never came from this client.
+    Unknown,
+}
+
 /// A pending command, waiting for the response that completes it.
 struct Pending {
     correlation_id: i64,
@@ -550,9 +599,7 @@ impl Client {
         // trying to reach anyway. The reference swallows it too —
         // `DriverProxy.clientClose` does nothing at all when its claim fails
         // (`aeron-client/src/main/java/io/aeron/DriverProxy.java:463-465`).
-        if let Some(ring) = self.cnc.to_driver_ring() {
-            let _ = ring.write(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
-        }
+        let _ = self.write_command(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
     }
 
     /// Whether this client has closed — by an explicit [`Client::close`] or by
@@ -707,6 +754,47 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
+        let correlation_id = self.submit_add_subscription(channel, stream_id, timeout)?;
+
+        match self.wait(correlation_id) {
+            Ok(Ready::Subscription) => Ok(correlation_id),
+            // Unregistered again, so that a subscription the driver refused —
+            // or never answered for — is not left looking like one that works.
+            // Java leaves its map entry behind here; this does not.
+            Ok(_) => {
+                self.forget_subscription(correlation_id);
+                Err(CommandError::Encoding)
+            }
+            Err(error) => {
+                self.forget_subscription(correlation_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Send an `ADD_SUBSCRIPTION` and register the subscription it will make.
+    ///
+    /// Shared by [`Client::add_subscription`] and
+    /// [`Client::async_add_subscription`], which differ only in whether they
+    /// wait for the answer.
+    ///
+    /// The subscription is registered **before** the response is awaited, which
+    /// is the reference's order on both sides: Java puts it into its map and
+    /// only then awaits (`ClientConductor.java:749-750`), and C creates it
+    /// inside the ready handler itself (`aeron_client_conductor.c:625-652`).
+    ///
+    /// Registering after the wait instead would leave a gap one message wide: a
+    /// driver that emits `ON_AVAILABLE_IMAGE` for a subscription before its
+    /// ready response would have the image find nothing to attach to, and an
+    /// image that finds no subscription is dropped rather than deferred. The
+    /// channel-status counter id is not known yet — it arrives with the
+    /// response, and is written onto the subscription there.
+    fn submit_add_subscription(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = AddSubscription {
@@ -727,18 +815,6 @@ impl Client {
 
         self.send(ADD_SUBSCRIPTION_TYPE_ID, &payload, correlation_id, timeout)?;
 
-        // Registered **before** the response is awaited, which is the reference's
-        // order on both sides: Java puts the subscription into its map and only
-        // then awaits (`ClientConductor.java:749-750`), and C creates it inside
-        // the ready handler itself (`aeron_client_conductor.c:625-652`).
-        //
-        // Registering after the wait instead leaves a gap one message wide. A
-        // poll reads a single message, so a ready response followed by an
-        // `ON_AVAILABLE_IMAGE` for the same subscription is two polls — but the
-        // gap is still real for a driver that emits the image first, and an
-        // image that finds no subscription is dropped, not deferred. The
-        // counter id is not known yet; it arrives with the response and is
-        // written onto the subscription there.
         self.subscriptions.push(Subscription::new(
             correlation_id,
             channel.to_owned(),
@@ -746,26 +822,7 @@ impl Client {
             CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
         ));
 
-        match self.wait(correlation_id) {
-            Ok(Ready::Subscription) => Ok(correlation_id),
-            // Unregistered again, so that a subscription the driver refused —
-            // or never answered for — is not left looking like one that works.
-            // Java leaves its map entry behind here; this does not.
-            Ok(_) => {
-                self.unregister_subscription(correlation_id);
-                Err(CommandError::Encoding)
-            }
-            Err(error) => {
-                self.unregister_subscription(correlation_id);
-                Err(error)
-            }
-        }
-    }
-
-    /// Drop a subscription that never became ready, and anything attached to it.
-    fn unregister_subscription(&mut self, registration_id: i64) {
-        self.subscriptions
-            .retain(|subscription| subscription.registration_id() != registration_id);
+        Ok(correlation_id)
     }
 
     /// Add a publication and wait for the driver to confirm it.
@@ -786,49 +843,10 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
-        let correlation_id = self.next_correlation_id()?;
+        let registration_id = self.submit_add_publication(false, channel, stream_id, timeout)?;
+        let ready = self.wait(registration_id)?;
 
-        let command = AddPublication {
-            client_id: self.client_id,
-            correlation_id,
-            stream_id,
-            channel,
-        };
-
-        let mut payload = vec![0u8; command.encoded_length()];
-        if !command.encode_into(&mut payload) {
-            return Err(CommandError::Encoding);
-        }
-
-        self.send(ADD_PUBLICATION_TYPE_ID, &payload, correlation_id, timeout)?;
-
-        let ready = self.wait(correlation_id)?;
-        let Ready::Publication {
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-            log_file,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
-        };
-
-        let publication = Publication::open(
-            &log_file,
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-        )
-        .map_err(|source| CommandError::LogBuffer {
-            path: log_file,
-            source,
-        })?;
-
-        self.publications.push(publication);
+        self.adopt_publication(ready)?;
 
         Ok(registration_id)
     }
@@ -851,6 +869,28 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
+        let registration_id = self.submit_add_publication(true, channel, stream_id, timeout)?;
+        let ready = self.wait(registration_id)?;
+
+        self.adopt_publication(ready)?;
+
+        Ok(registration_id)
+    }
+
+    /// Send an `ADD_PUBLICATION` or its exclusive twin.
+    ///
+    /// Shared by the four publication entry points — the blocking pair and the
+    /// asynchronous pair — which differ in which type id they use and whether
+    /// they wait for the answer. Nothing is registered here: a publication is
+    /// only real once its log buffer has been mapped, and that cannot happen
+    /// before the response names the file.
+    fn submit_add_publication(
+        &mut self,
+        exclusive: bool,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = AddPublication {
@@ -865,42 +905,258 @@ impl Client {
             return Err(CommandError::Encoding);
         }
 
-        self.send(
-            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
-            &payload,
-            correlation_id,
-            timeout,
-        )?;
-
-        let ready = self.wait(correlation_id)?;
-        let Ready::ExclusivePublication {
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-            log_file,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
+        let type_id = if exclusive {
+            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID
+        } else {
+            ADD_PUBLICATION_TYPE_ID
         };
 
-        let publication = ExclusivePublication::open(
-            &log_file,
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-        )
-        .map_err(|source| CommandError::LogBuffer {
-            path: log_file,
-            source,
-        })?;
+        self.send(type_id, &payload, correlation_id, timeout)?;
 
-        self.exclusive_publications.push(publication);
+        Ok(correlation_id)
+    }
 
-        Ok(registration_id)
+    /// Map the log buffer a ready response named, and keep the publication.
+    ///
+    /// The last step of every publication acceptance, blocking or not. The
+    /// driver has created the file by the time it answers, so a failure here is
+    /// the client's rather than the driver's — a path that is not there, or
+    /// holds no usable metadata — which is why it is
+    /// [`CommandError::LogBuffer`] and not a refusal.
+    fn adopt_publication(&mut self, ready: Ready) -> Result<(), CommandError> {
+        match ready {
+            Ready::Publication {
+                registration_id,
+                session_id,
+                stream_id,
+                position_limit_counter_id,
+                channel_status_indicator_id,
+                log_file,
+            } => {
+                let publication = Publication::open(
+                    &log_file,
+                    registration_id,
+                    session_id,
+                    stream_id,
+                    position_limit_counter_id,
+                    channel_status_indicator_id,
+                )
+                .map_err(|source| CommandError::LogBuffer {
+                    path: log_file,
+                    source,
+                })?;
+
+                self.publications.push(publication);
+                Ok(())
+            }
+
+            Ready::ExclusivePublication {
+                registration_id,
+                session_id,
+                stream_id,
+                position_limit_counter_id,
+                channel_status_indicator_id,
+                log_file,
+            } => {
+                let publication = ExclusivePublication::open(
+                    &log_file,
+                    registration_id,
+                    session_id,
+                    stream_id,
+                    position_limit_counter_id,
+                    channel_status_indicator_id,
+                )
+                .map_err(|source| CommandError::LogBuffer {
+                    path: log_file,
+                    source,
+                })?;
+
+                self.exclusive_publications.push(publication);
+                Ok(())
+            }
+
+            _ => Err(CommandError::Encoding),
+        }
+    }
+
+    /// Send an `ADD_SUBSCRIPTION` and return without waiting for the answer.
+    ///
+    /// The subscription is in this client's list as soon as this returns — it
+    /// is registered before the answer is awaited, as
+    /// [`Client::add_subscription`] explains — but whether the driver accepted
+    /// it is not known until [`Client::async_add_poll`] says so.
+    ///
+    /// The reference's asynchronous adds are these three
+    /// (`aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:605`;
+    /// `aeron_async_add_publication`, `:492`;
+    /// `aeron_async_add_exclusive_publication`, `:546`), each with a poll and a
+    /// cancel beside it. Java's return the registration id instead and leave
+    /// the resource to be found by it (`Aeron.asyncAddSubscription`,
+    /// `Aeron.java:451`), which cannot report a *failed* add at all. This is the
+    /// C shape, the authority where both exist.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be built or written. A refusal
+    /// by the driver arrives later, through [`Client::async_add_poll`].
+    pub fn async_add_subscription(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_subscription(channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// Send an `ADD_PUBLICATION` and return without waiting for the answer.
+    ///
+    /// The publication is **not** in this client's list until
+    /// [`Client::async_add_poll`] has mapped its log buffer: a publication
+    /// exists only once its file does, and the response is what names the file.
+    pub fn async_add_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_publication(false, channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// The same, for a publication with one producer
+    /// (`ON_EXCLUSIVE_PUBLICATION_READY`).
+    pub fn async_add_exclusive_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_publication(true, channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// What has become of an [`AsyncAdd`] — and the last step of accepting it.
+    ///
+    /// Polling consumes the answer: a completed add leaves the pending list, so
+    /// a second poll of the same handle answers [`AsyncAddPoll::Unknown`]. The
+    /// reference marks its handle `POLL_COMPLETED` and answers `-1` to a second
+    /// poll (`aeron_client_conductor_async_resource_poll`,
+    /// `aeron_client_conductor.c:3675-3775`); the difference is that it keeps the
+    /// handle and this keeps the state.
+    ///
+    /// A publication is mapped **here** rather than when the response was read,
+    /// because a poll is where the caller is — and because a mapping that fails
+    /// is the caller's to hear about, not something to meet later as a
+    /// missing resource.
+    ///
+    /// [`Client::poll`] has to have run for a driver response to have been read,
+    /// as it does for every other reply.
+    pub fn async_add_poll(&mut self, add: AsyncAdd) -> AsyncAddPoll {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == add.registration_id)
+        else {
+            return AsyncAddPoll::Unknown;
+        };
+
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return AsyncAddPoll::Awaiting;
+        };
+
+        self.pending.swap_remove(index);
+
+        match outcome {
+            Ok(Ready::Subscription) => AsyncAddPoll::Ready,
+
+            Ok(ready @ (Ready::Publication { .. } | Ready::ExclusivePublication { .. })) => {
+                match self.adopt_publication(ready) {
+                    Ok(()) => AsyncAddPoll::Ready,
+                    Err(error) => AsyncAddPoll::Failed(error),
+                }
+            }
+
+            Ok(_) => AsyncAddPoll::Failed(CommandError::Encoding),
+
+            Err(error) => {
+                // A subscription whose add failed comes back out: it was
+                // registered on the way in, and leaving it would report one the
+                // driver never made.
+                self.forget_subscription(add.registration_id);
+                AsyncAddPoll::Failed(error)
+            }
+        }
+    }
+
+    /// Give up on an [`AsyncAdd`].
+    ///
+    /// The reference's cancel is a **remove**:
+    /// `aeron_async_add_subscription_cancel` sends
+    /// `aeron_async_remove_subscription` for the registration the add drew
+    /// (`aeron_client.c:428-443`), because by the time it can be called the
+    /// command is already in the ring and the only way back is another command.
+    /// That is what this does, and it does not wait for the removal's answer —
+    /// the caller asked to give up, not to hear how the driver took it.
+    ///
+    /// Anything the add had already put in this client's list comes back out,
+    /// so a cancelled add stops being visible at the same moment.
+    pub fn async_add_cancel(&mut self, add: AsyncAdd) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        // Which kind it was is not in the handle, and does not need to be: a
+        // subscription add registers its subscription immediately while a
+        // publication add registers nothing, so what this client holds is what
+        // the add was. A publication add whose response never came holds
+        // nothing, and the remove below still names it by the id the driver
+        // knows it by.
+        let subscription = self.forget_subscription(add.registration_id);
+        self.forget_publication(add.registration_id);
+        self.forget_exclusive_publication(add.registration_id);
+
+        let (type_id, payload) = if subscription {
+            let command = deepmsg_cnc::command::RemoveSubscription {
+                correlated: deepmsg_cnc::command::Correlated {
+                    client_id: self.client_id,
+                    correlation_id,
+                },
+                registration_id: add.registration_id,
+            };
+
+            let mut payload = vec![0u8; deepmsg_cnc::command::RemoveSubscription::encoded_length()];
+            if !command.encode_into(&mut payload) {
+                return Err(CommandError::Encoding);
+            }
+
+            (deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID, payload)
+        } else {
+            let command = deepmsg_cnc::command::RemovePublication {
+                correlated: deepmsg_cnc::command::Correlated {
+                    client_id: self.client_id,
+                    correlation_id,
+                },
+                registration_id: add.registration_id,
+                flags: 0,
+            };
+
+            let mut payload = vec![0u8; deepmsg_cnc::command::RemovePublication::encoded_length()];
+            if !command.encode_into(&mut payload) {
+                return Err(CommandError::Encoding);
+            }
+
+            (deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID, payload)
+        };
+
+        // The add is no longer waited for, so its answer — if it comes — is
+        // answered by nobody, which the client already handles as an
+        // unsolicited response.
+        self.pending
+            .retain(|pending| pending.correlation_id != add.registration_id);
+
+        self.write_command(type_id, &payload)
     }
 
     /// Offer to an exclusive publication.
@@ -1295,7 +1551,10 @@ impl Client {
             return Err(CommandError::Encoding);
         };
 
+        // Either list, because the driver keys a publication by registration id
+        // and not by how many producers it has.
         self.forget_publication(registration_id);
+        self.forget_exclusive_publication(registration_id);
 
         Ok(())
     }
@@ -1377,6 +1636,25 @@ impl Client {
         // to call this at all — and the observable that says a publication is
         // closed is that [`Self::publication`] no longer answers with it.
         let _ = self.publications.swap_remove(index);
+
+        true
+    }
+
+    /// The same for a publication with one producer, which is a different list.
+    ///
+    /// A removal names a publication by registration id and the driver does not
+    /// care which kind it was, so the caller of one never has to know either —
+    /// which is why [`Client::remove_publication`] looks in both.
+    fn forget_exclusive_publication(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .exclusive_publications
+            .iter()
+            .position(|publication| publication.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        let _ = self.exclusive_publications.swap_remove(index);
 
         true
     }
@@ -1745,13 +2023,7 @@ impl Client {
         correlation_id: i64,
         timeout: Duration,
     ) -> Result<(), CommandError> {
-        {
-            let ring = self
-                .cnc
-                .to_driver_ring()
-                .ok_or(CommandError::Claim(ClaimError::Invalid))?;
-            ring.write(type_id, payload).map_err(CommandError::Claim)?;
-        }
+        self.write_command(type_id, payload)?;
 
         self.pending.push(Pending {
             correlation_id,
@@ -1760,6 +2032,22 @@ impl Client {
         });
 
         Ok(())
+    }
+
+    /// Write a command and wait for nothing.
+    ///
+    /// Three commands are sent this way: the ones that are answered by nobody
+    /// (`CLIENT_CLOSE`, `TERMINATE_DRIVER`), and a removal sent to give up on an
+    /// add, whose answer the caller did not ask for. An answer to one of these
+    /// arrives with no pending entry to match it, which the client already
+    /// treats as an unsolicited response (`Client::complete`).
+    fn write_command(&self, type_id: i32, payload: &[u8]) -> Result<(), CommandError> {
+        let ring = self
+            .cnc
+            .to_driver_ring()
+            .ok_or(CommandError::Claim(ClaimError::Invalid))?;
+
+        ring.write(type_id, payload).map_err(CommandError::Claim)
     }
 
     /// Drive the loop until `correlation_id` completes or its deadline passes.
