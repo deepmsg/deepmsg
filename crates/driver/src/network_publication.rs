@@ -928,6 +928,21 @@ impl NetworkPublication {
             return false;
         };
 
+        // The end-of-stream byte is **not** decided once, on the way in: the
+        // reference sets it on every tick of the drain, the moment the sender
+        // has caught up with the producer (`:1319-1322`). It is what the flow
+        // control's idle path reads to tell receivers the stream is over
+        // (`:602-606` → `aeron_flow_control_on_idle`), so a publication whose
+        // producer stopped writing before its sender did — which is the whole
+        // point of draining — would otherwise never say so.
+        if !self.is_revoked() && !self.is_end_of_stream {
+            let producer_position = self.producer_position().unwrap_or(0);
+
+            if self.sender_position(counters, regions) >= producer_position {
+                self.is_end_of_stream = true;
+            }
+        }
+
         // A **revoked** publication is done as soon as there is nobody left to
         // tell — that is this build's own shortcut, and `docs/compat.md` says
         // so. One whose clients have all let go waits the window the reference
@@ -2928,6 +2943,47 @@ mod tests {
         let frame = Frame::new(&term, 0);
         assert_eq!(Some(stalled), frame.frame_length());
         assert!(frame.is_padding(), "the sender can move now");
+    }
+
+    /// The end-of-stream byte is decided on every tick of the drain, not once:
+    /// a producer that stopped before its sender did is the ordinary case.
+    #[test]
+    fn a_draining_publication_says_the_stream_ended_when_the_sender_catches_up() {
+        let mut fixture = fixture();
+        let (manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        {
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(1_000, 128).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.ending = true;
+
+        let system = System::new(&manager, &regions);
+        publication.notice_revoke(0, 5_000_000_000, &system, &manager, &regions);
+
+        assert!(
+            !publication.is_end_of_stream,
+            "the sender is still at zero, so the stream has not been sent out yet"
+        );
+
+        // It catches up.
+        manager
+            .set_value(&regions, publication.counters.snd_pos, 128)
+            .expect("the counter");
+
+        publication.notice_revoke(1, 5_000_000_000, &system, &manager, &regions);
+
+        assert!(
+            publication.is_end_of_stream,
+            "now it has, and the flow control's idle path can say so"
+        );
     }
 
     #[test]
