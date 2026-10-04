@@ -29,6 +29,7 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::logfile::LogFile;
 use deepmsg_core::logbuffer::position::{self, Position, RawTail};
+use deepmsg_core::logbuffer::unblocker;
 
 use crate::publication_params::PublicationParams;
 use crate::subscribable::{
@@ -113,10 +114,23 @@ pub struct IpcPublication {
     /// Where the limit may next jump to (`aeron_ipc_publication.h:172`).
     trip_gain: i32,
     trip_limit: i64,
+    /// How long the publisher's position may sit unmoved before its log is
+    /// unblocked for it (`aeron.publication.unblock.timeout`, fifteen seconds).
+    pub unblock_timeout_ns: i64,
     /// The highest subscriber position seen on the last pass.
     pub consumer_position: i64,
     /// How far the terms have been zeroed.
     clean_position: i64,
+    /// The consumer position as of the last time it was seen to move
+    /// (`conductor_fields.last_consumer_position`), and when that was
+    /// (`time_of_last_consumer_position_change_ns`).
+    ///
+    /// The pair is what tells a stalled reader from a slow one, and it is why
+    /// the unblocker needs no clock of its own: the timer is refreshed **only**
+    /// when the position moves, so a publication whose readers keep up never
+    /// reaches its deadline no matter how long it runs.
+    last_consumer_position: i64,
+    time_of_last_consumer_position_change_ns: i64,
     /// How many clients hold a link to this publication.
     refcount: i32,
     /// When the state last changed (`managed_resource.time_of_last_state_change_ns`).
@@ -280,6 +294,7 @@ impl IpcPublication {
         pub_pos_counter_id: i32,
         pub_lmt_counter_id: i32,
         liveness_timeout_ns: i64,
+        unblock_timeout_ns: i64,
     ) -> Result<Self, Box<LogFile>> {
         // The term length is the caller's, not the metadata's: this function is
         // what writes the metadata, so reading it here would read zero.
@@ -405,8 +420,13 @@ impl IpcPublication {
             liveness_timeout_ns,
             trip_gain: params.publication_window_length / 8,
             trip_limit: 0,
+            unblock_timeout_ns,
             consumer_position: start_position,
             clean_position: start_position,
+            // The reference seeds both from the consumer position it starts at
+            // (`aeron_ipc_publication.c:183-184`).
+            last_consumer_position: start_position,
+            time_of_last_consumer_position_change_ns: 0,
             refcount: 0,
             time_of_last_state_change_ns: 0,
             state: State::Active,
@@ -663,13 +683,74 @@ impl IpcPublication {
         self.subscribers.clear();
     }
 
+    /// Whether the readers have fallen behind far enough that the log may be
+    /// blocked (`aeron_ipc_publication_is_possibly_blocked`,
+    /// `aeron_ipc_publication.h:146-159`).
+    ///
+    /// Deliberately not an answer to "is a claim stalled in there": a consumer
+    /// behind the producer, or a consumer whose expected term is not the active
+    /// one, is enough. It gates the expensive question rather than answering
+    /// it — [`unblocker::unblock`] is what walks the term.
+    pub fn is_possibly_blocked(&self, producer_position: i64, consumer_position: i64) -> bool {
+        let Some(term_count) = self
+            .log
+            .metadata()
+            .and_then(|metadata| metadata.load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET))
+        else {
+            return false;
+        };
+
+        #[allow(clippy::cast_possible_truncation)] // the reference truncates here too
+        let expected = (consumer_position >> self.bits_to_shift) as i32;
+
+        term_count != expected || producer_position > consumer_position
+    }
+
+    /// Unblock the log for a publisher that has gone quiet
+    /// (`aeron_ipc_publication_check_for_blocked_publisher`, `:650-672`).
+    ///
+    /// Returns whether the log was unblocked.
+    ///
+    /// The deadline runs from the last time the **consumer position moved**,
+    /// and it is refreshed on every pass where either the position moved or
+    /// the log was not blocked — so a publication whose readers keep up resets
+    /// its own deadline continuously and never reaches one.
+    pub fn check_for_blocked_publisher(
+        &mut self,
+        producer_position: i64,
+        now_ns: i64,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        if self.consumer_position == self.last_consumer_position
+            && self.is_possibly_blocked(producer_position, self.consumer_position)
+        {
+            if now_ns > self.time_of_last_consumer_position_change_ns + self.unblock_timeout_ns
+                && unblocker::unblock(&self.log, self.consumer_position, self.term_length)
+            {
+                crate::system_counters::increment(
+                    counters,
+                    regions,
+                    crate::system_counters::id::UNBLOCKED_PUBLICATIONS,
+                );
+
+                return true;
+            }
+        } else {
+            self.time_of_last_consumer_position_change_ns = now_ns;
+            self.last_consumer_position = self.consumer_position;
+        }
+
+        false
+    }
+
     /// The timeout tier's turn for this publication
     /// (`aeron_ipc_publication_on_time_event`, `:481-585`).
     ///
-    /// Only the two states a publication can be in on its way out are handled
-    /// here; the active state's other duties — the untethered subscription
-    /// sweep, the blocked-publisher unblocker and the cool-down that follows one
-    /// — are not this commit's.
+    /// The active arm's other duties — the untethered subscription sweep, the
+    /// connected byte and the cool-down — run in [`IpcPublications::on_time_event`]
+    /// immediately before this call, on the same tier, because they need the
+    /// subscription links and a publication cannot reach them.
     ///
     /// Returns whether anything happened.
     pub fn on_time_event(
@@ -679,7 +760,18 @@ impl IpcPublication {
         now_ns: i64,
     ) -> bool {
         match self.state {
-            State::Active => false,
+            State::Active => {
+                let producer_position = self.publisher_position().unwrap_or(0);
+
+                // An exclusive publication has one producer, which is
+                // responsible for its own log — the reference skips the check
+                // for it (`:543`).
+                if self.is_exclusive {
+                    return false;
+                }
+
+                self.check_for_blocked_publisher(producer_position, now_ns, counters, regions)
+            }
             State::Draining => {
                 let producer_position = self.publisher_position().unwrap_or(0);
                 counters.set_value(regions, self.pub_pos_counter_id, producer_position);
@@ -1572,6 +1664,7 @@ mod tests {
             0,
             0,
             crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
+            crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
         )
         .expect("a publication");
 
@@ -1833,6 +1926,7 @@ mod tests {
             0,
             0,
             crate::publication_image::IMAGE_LIVENESS_TIMEOUT_NS,
+            crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
         )
         .expect("a publication");
 
@@ -2058,6 +2152,92 @@ mod tests {
         }
 
         assert!(!publication.is_drained(&manager, &region_pair));
+    }
+
+    /// The active arm's blocked-publisher duty: a reader that has not moved for
+    /// longer than the unblock window, with a claim stalled in its way.
+    #[test]
+    fn a_claim_that_has_blocked_a_quiet_publication_is_padded() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+
+        let stalled = 128i32;
+        {
+            // The producer claimed 128 bytes and died: the length is negative,
+            // and no reader can pass it.
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            // And the tail says it got that far — which is what makes the log
+            // *possibly* blocked rather than merely idle.
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(17, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        // The window has run out: the reader has been at zero since the epoch.
+        publication.unblock_timeout_ns = 1_000;
+
+        assert!(
+            publication.on_time_event(&mut manager, &region_pair, 2_000),
+            "the deadline passed and the log was blocked, so it was unblocked"
+        );
+
+        let term = publication.log.term(0).expect("the first term");
+        let frame = frame::Frame::new(&term, 0);
+        assert_eq!(Some(stalled), frame.frame_length());
+        assert!(frame.is_padding(), "the claim is padding now");
+    }
+
+    /// The other half of the same rule: a publication whose reader keeps moving
+    /// refreshes its own deadline on every pass, so it never reaches one.
+    #[test]
+    fn a_publication_whose_reader_keeps_up_is_never_unblocked() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(17, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.unblock_timeout_ns = 1_000;
+        publication.consumer_position = 32;
+        publication.last_consumer_position = 0;
+
+        assert!(
+            !publication.on_time_event(&mut manager, &region_pair, 2_000),
+            "the reader moved, so the timer was refreshed rather than fired"
+        );
+        assert_eq!(
+            2_000, publication.time_of_last_consumer_position_change_ns,
+            "to now"
+        );
+        assert_eq!(32, publication.last_consumer_position);
+
+        let term = publication.log.term(0).expect("the first term");
+        assert_eq!(
+            Some(-stalled),
+            frame::Frame::new(&term, 0).frame_length(),
+            "the claim is still in flight"
+        );
     }
 
     #[test]
