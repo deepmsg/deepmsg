@@ -423,12 +423,16 @@ fn reset_as_padding(
 ) -> Option<()> {
     // How much of the template is valid is a field, not a constant: the C
     // reference copies exactly this many bytes
-    // (`aeron_logbuffer_descriptor.h:323`), while the Java one hardcodes 32.
+    // (`aeron_logbuffer_descriptor.h:323`), while the Java one hardcodes 32. The
+    // clamp is this build's — C would `memcpy` whatever a corrupt field said —
+    // and it is the only guard here: a block whose length reads zero copies
+    // nothing and still gets its padding frame, because the four fields below
+    // are written either way and nothing reads a padding frame's other words.
+    // The reference's own tests call these functions on a zeroed metadata block
+    // and expect exactly that, so refusing it, as this did, was a divergence
+    // with nothing behind it.
     let declared = metadata.load_i32(descriptor::DEFAULT_FRAME_HEADER_LENGTH_OFFSET)?;
     let template_length = declared.clamp(0, descriptor::DEFAULT_FRAME_HEADER_MAX_LENGTH as i32);
-    if template_length < DATA_HEADER_LENGTH as i32 {
-        return None;
-    }
 
     let mut template = vec![0u8; template_length as usize];
     metadata.copy_out(descriptor::DEFAULT_FRAME_HEADER_OFFSET, &mut template)?;
@@ -782,6 +786,32 @@ mod tests {
                 33
             )
         );
+    }
+
+    /// A metadata block whose header template was never written still produces
+    /// a padding frame — the four fields that matter are written regardless.
+    /// This is what the reference's own tests do, with a block filled with
+    /// zeroes, and what this build used to refuse.
+    #[test]
+    fn a_block_with_no_template_still_pads() {
+        let mut bytes = term();
+        let zeroed = Buffer::<{ descriptor::METADATA_STRUCT_LENGTH }>(
+            [0u8; descriptor::METADATA_STRUCT_LENGTH],
+        );
+        let term_buffer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+        let metadata = AtomicBuffer::from_slice(&zeroed.0).expect("aligned");
+
+        set_length(&term_buffer, 0, -128);
+
+        assert_eq!(
+            UnblockStatus::Unblocked,
+            Unblocker::new(&term_buffer, &metadata).unblock(TERM_LENGTH as i32, 0, 128, 33)
+        );
+
+        let frame = Frame::new(&term_buffer, 0);
+        assert_eq!(Some(128), frame.frame_length());
+        assert!(frame.is_padding());
+        assert_eq!(Some(0), frame.term_offset(), "and placed where it was");
     }
 
     #[test]

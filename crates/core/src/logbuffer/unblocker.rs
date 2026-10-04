@@ -165,11 +165,12 @@ mod tests {
 
         // And the default-header template, which is what a padding frame is
         // built from. A real log buffer always has one — the driver writes it at
-        // publication creation (`aeron_ipc_publication.c:107-142`) — but the
+        // publication creation (`aeron_ipc_publication.c:107-142`) — so the
+        // fixture has one too, as every other test in this crate does. (The
         // reference's C test leaves the block zeroed and gets away with it,
-        // because a zero template length is a `memcpy` of zero bytes there.
-        // `reset_as_padding` declines instead, so the fixture fills it, as every
-        // other test in this crate does.
+        // because a zero template length is a `memcpy` of zero bytes there; that
+        // is a case `repair.rs` tests on its own rather than one this fixture
+        // has to stand for.)
         assert!(
             super::super::descriptor::fill_default_header(&metadata(&log), 11, 22, TERM_ID)
                 .is_some(),
