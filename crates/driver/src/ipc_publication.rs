@@ -726,14 +726,8 @@ impl IpcPublication {
             && self.is_possibly_blocked(producer_position, self.consumer_position)
         {
             if now_ns > self.time_of_last_consumer_position_change_ns + self.unblock_timeout_ns
-                && unblocker::unblock(&self.log, self.consumer_position, self.term_length)
+                && self.unblock_at(self.consumer_position, counters, regions)
             {
-                crate::system_counters::increment(
-                    counters,
-                    regions,
-                    crate::system_counters::id::UNBLOCKED_PUBLICATIONS,
-                );
-
                 return true;
             }
         } else {
@@ -742,6 +736,32 @@ impl IpcPublication {
         }
 
         false
+    }
+
+    /// Run the unblocker at `position`, and count it if it did anything
+    /// (`aeron_logbuffer_unblocker.c:19-66` through either of its two callers
+    /// here).
+    ///
+    /// The count goes to the **system** counter 19: the reference takes that one
+    /// address at creation (`aeron_ipc_publication.c:186-188`), so every
+    /// publication in the process increments the same counter.
+    fn unblock_at(
+        &self,
+        position: i64,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        if !unblocker::unblock(&self.log, position, self.term_length) {
+            return false;
+        }
+
+        crate::system_counters::increment(
+            counters,
+            regions,
+            crate::system_counters::id::UNBLOCKED_PUBLICATIONS,
+        );
+
+        true
     }
 
     /// The timeout tier's turn for this publication
@@ -777,7 +797,15 @@ impl IpcPublication {
                 counters.set_value(regions, self.pub_pos_counter_id, producer_position);
 
                 if !self.is_drained(counters, regions) {
-                    return false;
+                    // Not drained, so a reader is stuck — and the publication is
+                    // draining, which means the last client has let go and will
+                    // never commit whatever is in the way. **No timeout gate and
+                    // no `is_exclusive` test** (`aeron_ipc_publication.c:579-585`):
+                    // being here is the evidence. It is also why this arm
+                    // retries on every time event rather than once — an unblock
+                    // advances the log, so the next attempt is at a different
+                    // position.
+                    return self.unblock_at(self.consumer_position, counters, regions);
                 }
 
                 self.state = State::Linger;
@@ -2238,6 +2266,64 @@ mod tests {
             frame::Frame::new(&term, 0).frame_length(),
             "the claim is still in flight"
         );
+    }
+
+    /// The draining arm's duty: a reader stuck behind a dead claim while the
+    /// publication is on its way out. No waiting, and no `is_exclusive` test —
+    /// the publication is draining, so the claim will never be committed.
+    #[test]
+    fn a_draining_publication_unblocks_the_claim_its_reader_is_stuck_behind() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+        subscribe(&mut publication, &mut manager, &region_pair, 100, 0);
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            // The producer got to 128, so a reader at zero has not read the
+            // stream out and the publication is not drained.
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(17, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.state = State::Draining;
+
+        // `now_ns` is the epoch and the window is the fifteen-second default:
+        // a gated arm would not have fired.
+        assert!(
+            publication.on_time_event(&mut manager, &region_pair, 0),
+            "the reader is stuck, so the log is unblocked for it"
+        );
+
+        let term = publication.log.term(0).expect("the first term");
+        let frame = frame::Frame::new(&term, 0);
+        assert_eq!(Some(stalled), frame.frame_length());
+        assert!(frame.is_padding(), "the claim is padding now");
+    }
+
+    /// And a draining publication that is already drained moves on rather than
+    /// trying: the unblock is the `else` of the drained test
+    /// (`aeron_ipc_publication.c:556-585`).
+    #[test]
+    fn a_drained_publication_does_not_look_for_anything_to_unblock() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+
+        publication.state = State::Draining;
+
+        assert!(publication.on_time_event(&mut manager, &region_pair, 0));
+        assert_eq!(State::Linger, publication.state, "nothing to wait for");
     }
 
     #[test]
