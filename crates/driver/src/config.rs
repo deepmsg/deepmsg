@@ -1329,6 +1329,22 @@ impl DriverConfig {
             config.publication_unblock_timeout_ns =
                 parse_duration_ns(&Setting::PUBLICATION_UNBLOCK_TIMEOUT, &value)?;
         }
+        if let Some(value) = get(&Setting::PUBLICATION_CONNECTION_TIMEOUT) {
+            config.publication_connection_timeout_ns =
+                parse_duration_ns(&Setting::PUBLICATION_CONNECTION_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::DRIVER_STREAM_SESSION_LIMIT) {
+            // The reference holds this one as an `int32_t`
+            // (`aeron_config_parse_int32`, `aeron_driver_context.c:1115-1118`),
+            // so a value the type cannot hold — or a negative one, which is not
+            // a count — is refused rather than wrapped.
+            config.stream_session_limit =
+                usize::try_from(parse_count(&Setting::DRIVER_STREAM_SESSION_LIMIT, &value)?)
+                    .map_err(|_| ConfigError::OutOfRange {
+                        name: Setting::DRIVER_STREAM_SESSION_LIMIT.property,
+                        value: value.clone(),
+                    })?;
+        }
         if let Some(value) = get(&Setting::UNTETHERED_WINDOW_LIMIT_TIMEOUT) {
             config.untethered_window_limit_timeout_ns =
                 parse_duration_ns(&Setting::UNTETHERED_WINDOW_LIMIT_TIMEOUT, &value)?;
@@ -1958,6 +1974,16 @@ impl Setting {
     const PUBLICATION_UNBLOCK_TIMEOUT: Self = Self {
         property: "publication.unblock.timeout",
         env: "AERON_PUBLICATION_UNBLOCK_TIMEOUT",
+    };
+    /// `aeron.publication.connection.timeout` (`aeronmd.h:401`).
+    const PUBLICATION_CONNECTION_TIMEOUT: Self = Self {
+        property: "publication.connection.timeout",
+        env: "AERON_PUBLICATION_CONNECTION_TIMEOUT",
+    };
+    /// `aeron.driver.stream.session.limit` (`aeronmd.h:989`).
+    const DRIVER_STREAM_SESSION_LIMIT: Self = Self {
+        property: "driver.stream.session.limit",
+        env: "AERON_DRIVER_STREAM_SESSION_LIMIT",
     };
     /// `aeron.term.buffer.sparse.file` (`aeronmd.h:153`).
     const TERM_BUFFER_SPARSE_FILE: Self = Self {
@@ -3519,6 +3545,71 @@ mod tests {
             ])
             .is_ok(),
             "one millisecond more is enough"
+        );
+    }
+
+    /// `aeron.driver.stream.session.limit` had a value and no name: the
+    /// dispatcher already refuses a stream beyond it
+    /// (`aeron_data_packet_dispatcher.c:489-493`), and nothing could set it.
+    #[test]
+    fn the_stream_session_limit_answers_to_its_two_names() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/deepmsg")],
+            &[("AERON_DRIVER_STREAM_SESSION_LIMIT", "4")],
+        )
+        .expect("four sessions is a limit");
+        assert_eq!(4, config.stream_session_limit);
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.driver.stream.session.limit", "7"),
+        ])
+        .expect("the property is the other name");
+        assert_eq!(7, config.stream_session_limit);
+
+        let config = resolve(&[("deepmsg.dir", "/tmp/deepmsg")]).expect("the defaults");
+        assert_eq!(
+            STREAM_SESSION_LIMIT_DEFAULT, config.stream_session_limit,
+            "the reference's INT32_MAX, which is no limit at all"
+        );
+
+        // The reference holds an `int32_t`, so a count the type cannot hold is
+        // refused rather than wrapped.
+        assert!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                (
+                    "deepmsg.driver.stream.session.limit",
+                    "99999999999999999999"
+                ),
+            ])
+            .is_err()
+        );
+    }
+
+    /// `aeron.publication.connection.timeout` — the double gap: the field was
+    /// here and read by nobody, and the publication that should have read it
+    /// carried its own constant instead.
+    #[test]
+    fn the_connection_timeout_binds_and_reaches_the_publication() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/deepmsg")],
+            &[("AERON_PUBLICATION_CONNECTION_TIMEOUT", "7s")],
+        )
+        .expect("seven seconds is a window");
+        assert_eq!(7_000_000_000, config.publication_connection_timeout_ns);
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.publication.connection.timeout", "3s"),
+        ])
+        .expect("the property is the other name");
+        assert_eq!(3_000_000_000, config.publication_connection_timeout_ns);
+
+        let config = resolve(&[("deepmsg.dir", "/tmp/deepmsg")]).expect("the defaults");
+        assert_eq!(
+            PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT, config.publication_connection_timeout_ns,
+            "the reference's five seconds"
         );
     }
 

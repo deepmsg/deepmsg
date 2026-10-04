@@ -161,6 +161,7 @@ const READ: &[(&str, &str)] = &[
     ("AERON_FILE_PAGE_SIZE", "8192"),
     ("AERON_IPC_TERM_BUFFER_LENGTH", "1m"),
     ("AERON_PERFORM_STORAGE_CHECKS", "false"),
+    ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_PUBLICATION_LINGER_TIMEOUT", "1s"),
     // Twenty seconds rather than the default fifteen, because this list also
     // sends a fifteen-second liveness window and the first rule of
@@ -210,10 +211,12 @@ const READ: &[(&str, &str)] = &[
 /// Three are worth naming, because each is a place a reader might expect a
 /// different answer:
 ///
-/// - `AERON_PUBLICATION_CONNECTION_TIMEOUT` is a **real gap**: the driver has
-///   the setting, with the reference's five-second default, and no name bound
-///   to it — so the harness's value is silently dropped. It is listed here
-///   rather than in [`READ`] because that is the truth today.
+/// - `AERON_PUBLICATION_CONNECTION_TIMEOUT` **was** a real gap: the driver had
+///   the setting, with the reference's five-second default, and nothing bound to
+///   the name, so the harness's value was dropped — and the publication used its
+///   own constant instead. Both halves are closed now (the name is parsed and
+///   the constant is gone), so this entry records the shape a double gap takes
+///   rather than a gap that is still open.
 /// - `AERON_IMAGE_LIVENESS_TIMEOUT` is set by **39 of the system tests**, more
 ///   than any other name here — and it is no longer one this driver ignores:
 ///   it is bound and read (`config.rs`'s `Setting::IMAGE_LIVENESS_TIMEOUT`),
@@ -229,7 +232,6 @@ const IGNORED: &[(&str, &str)] = &[
         "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
         "5s",
     ),
-    ("AERON_DRIVER_STREAM_SESSION_LIMIT", "65536"),
     ("AERON_ENABLE_EXPERIMENTAL_FEATURES", "true"),
     ("AERON_EVENT_LOG", "admin"),
     ("AERON_EVENT_LOG_DISABLE", ""),

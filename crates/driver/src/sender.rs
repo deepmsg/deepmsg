@@ -2261,6 +2261,7 @@ mod tests {
                 0,
                 0,
                 crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
+                crate::config::PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
                 0,
             )
             .expect("a publication");

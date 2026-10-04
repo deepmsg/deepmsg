@@ -786,6 +786,7 @@ impl NetworkPublications {
             pending.channel_sndbuf,
             pending.channel_rcvbuf,
             config.publication_unblock_timeout_ns,
+            config.publication_connection_timeout_ns,
             now.ns,
         );
 

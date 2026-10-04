@@ -70,11 +70,6 @@ pub const SETUP_TIMEOUT_NS: i64 = 100_000_000;
 /// (`AERON_NETWORK_PUBLICATION_HEARTBEAT_TIMEOUT_NS`, `:33`).
 pub const HEARTBEAT_TIMEOUT_NS: i64 = 100_000_000;
 
-/// How long an unanswered publication waits before deciding its receivers are
-/// gone (`AERON_PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:208` — five seconds).
-pub const CONNECTION_TIMEOUT_NS: i64 = 5_000_000_000;
-
 /// What a network publication's own counters are
 /// (`aeron_counter_*_allocate`, `aeron-driver/src/main/c/aeron_driver_conductor.c:4508-4531`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,6 +348,7 @@ impl NetworkPublication {
         channel_sndbuf: usize,
         channel_rcvbuf: usize,
         unblock_timeout_ns: i64,
+        connection_timeout_ns: i64,
         now_ns: i64,
     ) -> Result<Self, PublicationError> {
         let position_bits_to_shift =
@@ -508,8 +504,8 @@ impl NetworkPublication {
             response_correlation_id: params.response_correlation_id,
             is_response: params.is_response,
             endpoint_address: None,
-            status_message_deadline_ns: now_ns + CONNECTION_TIMEOUT_NS,
-            connection_timeout_ns: CONNECTION_TIMEOUT_NS,
+            status_message_deadline_ns: now_ns + connection_timeout_ns,
+            connection_timeout_ns,
             receivers: Vec::new(),
             is_connected: false,
             track_sender_limits: false,
@@ -2343,6 +2339,7 @@ mod tests {
             0,
             0,
             crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
+            crate::config::PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
             0,
         )
         .expect("a publication");
@@ -3014,7 +3011,7 @@ mod tests {
                 &system,
                 &counters,
                 &regions,
-                CONNECTION_TIMEOUT_NS + 2_000,
+                crate::config::PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT + 2_000,
             )
             .expect("a send");
 
@@ -3270,6 +3267,7 @@ mod tests {
                 0,
                 0,
                 crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
+                crate::config::PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
                 0,
             )
             .expect("a publication");
