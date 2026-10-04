@@ -5,7 +5,8 @@
 //!
 //! - a **hole**, where frames were lost and later arrive by retransmission;
 //! - a **stall**, where a producer claimed space and then died, leaving a
-//!   negative length no reader can pass;
+//!   negative length no reader can pass — or a run that reads **zero**, which
+//!   a reader cannot pass either, because zero is not a frame;
 //! - a **gap**, the region beyond the last valid frame that has not been
 //!   written yet and may or may not be on its way.
 //!
@@ -154,15 +155,13 @@ pub fn fill_gap(
 ) -> Option<()> {
     let length = i32::try_from(length).ok()?;
     let offset = i32::try_from(offset).ok()?;
-    let alignment = descriptor::FRAME_ALIGNMENT;
 
-    let mut slot = offset + length - alignment;
-    while slot >= offset {
-        if Frame::new(term, usize::try_from(slot).ok()?).frame_length()? != 0 {
-            return None;
-        }
-
-        slot -= alignment;
+    if !scan_back_to_confirm_zeroed(
+        |slot| Frame::new(term, slot).frame_length(),
+        offset + length,
+        offset,
+    ) {
+        return None;
     }
 
     reset_as_padding(
@@ -174,24 +173,241 @@ pub fn fill_gap(
     )
 }
 
-/// Turn a stalled claim into padding.
+/// Confirm that a run of frame-aligned slots still reads zero, walking
+/// backwards from `from` (exclusive) to `limit` (inclusive).
 ///
-/// A producer that claims space and dies leaves a negative length there, and no
-/// reader can pass it: a scan stops at anything `<= 0` and would wait forever.
-/// The driver calls this once a client has been quiet for its unblock timeout.
+/// The reference names this once — `aeron_term_unblocker_scan_back_to_confirm_zeroed`
+/// (`concurrent/aeron_term_unblocker.c:34-59`) — and then **inlines its own copy**
+/// in the gap filler (`concurrent/aeron_term_gap_filler.c:26-35`, and Java's
+/// `TermGapFiller.java:54`). Sharing one here is a structural choice, not a
+/// behavioural one: the loop is the same loop, and both callers want the same
+/// answer.
 ///
-/// `length` is the length the stalled claim was making — **negative**, since
-/// that is what the frame holds. The reference's caller passes `-frame_length`
-/// for exactly that reason (`concurrent/aeron_term_unblocker.c:73-77`) and the
-/// negation here is what turns "a claim in progress" into "padding".
-pub fn unblock(
-    term: &AtomicBuffer<'_, ReadWrite>,
-    metadata: &AtomicBuffer<'_, ReadOnly>,
-    offset: usize,
-    length: i32,
-    term_id: i32,
-) -> Option<()> {
-    reset_as_padding(term, metadata, offset, -length, term_id)
+/// Zero is the only accepted reading, and a slot that cannot be read at all
+/// counts as non-zero: the point of the walk is to prove the whole run is
+/// still empty, and a run that cannot be proved empty is not one to write over.
+fn scan_back_to_confirm_zeroed(read: impl Fn(usize) -> Option<i32>, from: i32, limit: i32) -> bool {
+    let alignment = descriptor::FRAME_ALIGNMENT;
+    let mut slot = from - alignment;
+
+    while slot >= limit {
+        let Some(offset) = usize::try_from(slot).ok() else {
+            return false;
+        };
+
+        if read(offset) != Some(0) {
+            return false;
+        }
+
+        slot -= alignment;
+    }
+
+    true
+}
+
+/// What an attempt to unblock a term produced.
+///
+/// The reference's three, verbatim: `aeron_term_unblocker_status_t`
+/// (`concurrent/aeron_term_unblocker.h:23-29`) and Java's
+/// `TermUnblocker.Status` (`:38-48`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnblockStatus {
+    /// Nothing at the blocked offset was unblockable.
+    NoAction,
+    /// A run was covered with padding. The log has moved on; there is nothing
+    /// else for the caller to do.
+    Unblocked,
+    /// A run was covered with padding that reaches the **end of the term**, so
+    /// the caller must rotate to the next one
+    /// (`concurrent/aeron_logbuffer_unblocker.c:54-56`,
+    /// `LogBufferUnblocker.java:69-71`).
+    UnblockedToEnd,
+}
+
+/// Turn whatever is stopped at an offset into padding.
+///
+/// A producer that claims space and dies leaves a **negative** length there, and
+/// no reader can pass it: a scan stops at anything `<= 0` and would wait
+/// forever. The other shape is a run that reads **zero** — a claim that was
+/// never committed, or space that was zeroed — which a reader also cannot pass,
+/// because zero is not a frame.
+///
+/// The driver runs this once a client has been quiet past its unblock timeout,
+/// and again while a publication drains, where the client is known to be gone.
+///
+/// This is the reference's `aeron_term_unblocker_unblock`
+/// (`concurrent/aeron_term_unblocker.c:61-116`) and Java's `TermUnblocker.unblock`
+/// (`:77-127`), all three of whose states are reachable:
+///
+/// * negative length → one frame rewritten as padding, [`UnblockStatus::Unblocked`];
+/// * zero → scan forward for the first frame that is *not* zero, confirm by
+///   re-reading backwards that the whole run is still zero, and cover the run;
+///   [`Unblocked`](UnblockStatus::Unblocked), or
+///   [`UnblockedToEnd`](UnblockStatus::UnblockedToEnd) when the run reaches the
+///   end of the term;
+/// * anything else → nothing is wrong, [`NoAction`](UnblockStatus::NoAction).
+pub struct Unblocker<'a> {
+    term: &'a AtomicBuffer<'a, ReadWrite>,
+    metadata: &'a AtomicBuffer<'a, ReadOnly>,
+    /// A test-only seam: the frame-length reads, supplied by the test instead of
+    /// taken from the term.
+    ///
+    /// The backward confirm can only **fail** when a slot that read zero during
+    /// the forward scan reads non-zero at the confirm, and nothing outside the
+    /// scan/confirm pair can be in that window — no thread, no caller. The
+    /// reference's own tests script the term buffer for exactly that reason
+    /// (`TermUnblockerTest.java:143-227` reads a Mockito `UnsafeBuffer` whose
+    /// `thenReturn(0).thenReturn(x)` answers differently on successive reads),
+    /// and a test here sets this and gets the same interleaving deterministically.
+    /// No other build has the field.
+    #[cfg(test)]
+    reads: Option<Box<dyn Fn(usize) -> Option<i32> + 'a>>,
+}
+
+impl<'a> Unblocker<'a> {
+    /// Read and write `term`, taking the padding template from `metadata`.
+    pub fn new(
+        term: &'a AtomicBuffer<'a, ReadWrite>,
+        metadata: &'a AtomicBuffer<'a, ReadOnly>,
+    ) -> Self {
+        Self {
+            term,
+            metadata,
+            #[cfg(test)]
+            reads: None,
+        }
+    }
+
+    /// [`Self::new`], with the frame-length reads supplied by a test.
+    #[cfg(test)]
+    fn with_reads(
+        term: &'a AtomicBuffer<'a, ReadWrite>,
+        metadata: &'a AtomicBuffer<'a, ReadOnly>,
+        reads: Box<dyn Fn(usize) -> Option<i32> + 'a>,
+    ) -> Self {
+        Self {
+            term,
+            metadata,
+            reads: Some(reads),
+        }
+    }
+
+    /// Unblock whatever is at `blocked_offset`.
+    ///
+    /// `tail_offset` is the end of what the producer has written into this term
+    /// — the forward scan stops there, because past it nothing is expected yet.
+    /// `term_id` and `blocked_offset` are what the padding header is stamped
+    /// with, and the reference's caller passes them from the term the blocked
+    /// position falls in, not from the active one
+    /// (`concurrent/aeron_logbuffer_unblocker.c:58-62`).
+    pub fn unblock(
+        &self,
+        term_length: i32,
+        blocked_offset: i32,
+        tail_offset: i32,
+        term_id: i32,
+    ) -> UnblockStatus {
+        let alignment = descriptor::FRAME_ALIGNMENT;
+
+        // The one read that decides which of the three shapes this is. A claim
+        // in progress is negative — the producer stores `-length` before it
+        // knows the frame is complete — so the negation below is what turns "a
+        // claim in progress" into "padding"
+        // (`concurrent/aeron_term_unblocker.c:73-77`).
+        let Some(frame_length) = self.frame_length(blocked_offset) else {
+            return UnblockStatus::NoAction;
+        };
+
+        if frame_length < 0 {
+            return if self
+                .reset_as_padding_at(blocked_offset, -frame_length, term_id)
+                .is_some()
+            {
+                UnblockStatus::Unblocked
+            } else {
+                UnblockStatus::NoAction
+            };
+        }
+
+        if frame_length != 0 {
+            return UnblockStatus::NoAction;
+        }
+
+        let mut status = UnblockStatus::NoAction;
+        let mut current_offset = blocked_offset + alignment;
+
+        while current_offset < tail_offset {
+            let Some(length) = self.frame_length(current_offset) else {
+                break;
+            };
+
+            if length != 0 {
+                // The run ends here. It is only ours to cover if it is still
+                // zero all the way back to where it started: a retransmission
+                // that landed between the scan above and this call would
+                // otherwise be overwritten by padding, and the reader would be
+                // walked past data it never saw.
+                if self.scan_back_to_confirm_zeroed(current_offset, blocked_offset) {
+                    let run = current_offset - blocked_offset;
+                    if self
+                        .reset_as_padding_at(blocked_offset, run, term_id)
+                        .is_some()
+                    {
+                        status = UnblockStatus::Unblocked;
+                    }
+                }
+                break;
+            }
+
+            current_offset += alignment;
+        }
+
+        // Nothing was in the way up to the tail. When the tail is the end of
+        // the term itself, the run is the whole remainder — but the first frame
+        // is read **again** rather than trusted, for the same reason the run
+        // above is confirmed: something may have been written since.
+        if current_offset == term_length && self.frame_length(blocked_offset) == Some(0) {
+            let run = current_offset - blocked_offset;
+            if self
+                .reset_as_padding_at(blocked_offset, run, term_id)
+                .is_some()
+            {
+                status = UnblockStatus::UnblockedToEnd;
+            }
+        }
+
+        status
+    }
+
+    /// The frame length at `offset`, through the scripted reads when a test has
+    /// put them in place. `None` is a slot that cannot be read at all, which
+    /// every caller treats as "not zero".
+    fn frame_length(&self, offset: i32) -> Option<i32> {
+        let offset = usize::try_from(offset).ok()?;
+
+        #[cfg(test)]
+        if let Some(reads) = &self.reads {
+            return reads(offset);
+        }
+
+        Frame::new(self.term, offset).frame_length()
+    }
+
+    /// [`scan_back_to_confirm_zeroed`] over this term's own reads.
+    fn scan_back_to_confirm_zeroed(&self, from: i32, limit: i32) -> bool {
+        scan_back_to_confirm_zeroed(
+            |slot| self.frame_length(i32::try_from(slot).ok()?),
+            from,
+            limit,
+        )
+    }
+
+    /// [`reset_as_padding`] at an offset the caller computed.
+    fn reset_as_padding_at(&self, offset: i32, length: i32, term_id: i32) -> Option<()> {
+        let offset = usize::try_from(offset).ok()?;
+
+        reset_as_padding(self.term, self.metadata, offset, length, term_id)
+    }
 }
 
 /// Overwrite a frame with the default header, mark it padding, and publish it.
@@ -478,32 +694,117 @@ mod tests {
         assert!(!frame.is_padding());
     }
 
+    // The unblocker's twelve cases are the reference's own, ported: the six
+    // static ones are `aeron_logbuffer_unblocker_test.cpp`'s `TermUnblockerTest`
+    // (which are also `TermUnblockerTest.java`'s first six), and the last six
+    // are the Java cases whose term buffers answer differently on successive
+    // reads — the backward confirm's whole reason for existing.
+
+    /// Write a frame length at an offset, leaving the rest of the header zero.
+    fn set_length(term: &AtomicBuffer<'_, ReadWrite>, offset: usize, length: i32) {
+        term.store_i32_release(offset + FRAME_LENGTH_OFFSET, length)
+            .expect("in range");
+    }
+
+    /// Scripted frame-length reads: a listed offset reads `0` the first time and
+    /// the given value every time after; every other offset reads the term.
+    ///
+    /// This is `TermUnblockerTest.java`'s Mockito stub
+    /// (`thenReturn(0).thenReturn(x)`) in Rust — the interleaving a real writer
+    /// would produce, with no thread to schedule.
+    fn scripted<'t>(
+        term: &'t AtomicBuffer<'t, ReadWrite>,
+        script: Vec<(usize, i32)>,
+    ) -> Box<dyn Fn(usize) -> Option<i32> + 't> {
+        let spent = std::cell::RefCell::new(vec![false; script.len()]);
+
+        Box::new(move |offset: usize| {
+            for (index, (at, value)) in script.iter().enumerate() {
+                if *at == offset {
+                    if std::mem::replace(&mut spent.borrow_mut()[index], true) {
+                        return Some(*value);
+                    }
+
+                    return Some(0);
+                }
+            }
+
+            Frame::new(term, offset).frame_length()
+        })
+    }
+
+    /// Build an unblocker over a fresh term and metadata block.
+    fn unblocker<'t>(
+        metadata_bytes: &'t Buffer<{ descriptor::METADATA_STRUCT_LENGTH }>,
+        bytes: &'t mut Buffer<TERM_LENGTH>,
+    ) -> (AtomicBuffer<'t, ReadOnly>, AtomicBuffer<'t, ReadWrite>) {
+        (
+            AtomicBuffer::from_slice(&metadata_bytes.0).expect("aligned"),
+            AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned"),
+        )
+    }
+
     #[test]
-    fn unblocking_turns_a_stalled_claim_into_padding() {
+    fn a_complete_message_is_left_alone() {
+        // `shouldTakeNoActionWhenMessageIsComplete`.
         let metadata_bytes = metadata();
         let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 0, DATA_HEADER_LENGTH as i32);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            Unblocker::new(&term_buffer, &metadata).unblock(
+                TERM_LENGTH as i32,
+                0,
+                TERM_LENGTH as i32,
+                33
+            ),
+            "a frame is already there and readable, so nothing is blocked"
+        );
+    }
+
+    #[test]
+    fn a_term_with_nothing_in_it_is_left_alone() {
+        // `shouldTakeNoActionWhenNoUnblockedMessage`: zero all the way to a tail
+        // that is not the end of the term. Nothing said the tail will not move,
+        // so there is no run to cover.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            Unblocker::new(&term_buffer, &metadata).unblock(
+                TERM_LENGTH as i32,
+                0,
+                (TERM_LENGTH / 2) as i32,
+                33
+            )
+        );
+    }
+
+    #[test]
+    fn a_stalled_claim_becomes_padding() {
+        // `shouldPatchNonCommittedMessage`.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
 
         // A claim in flight: a negative length, as a dead producer leaves it.
-        let stalled_length = 100i32;
-        {
-            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
-            writer
-                .store_i32_release(FRAME_LENGTH_OFFSET, -stalled_length)
-                .expect("in range");
-        }
+        set_length(&term_buffer, 0, -128);
 
-        let metadata = AtomicBuffer::from_slice(&metadata_bytes.0).expect("aligned");
-        let term_buffer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
-
-        // The caller passes the length the claim was making -- negative, as the
-        // frame holds it -- and what lands is positive.
         assert_eq!(
-            Some(()),
-            unblock(&term_buffer, &metadata, 0, -stalled_length, 33)
+            UnblockStatus::Unblocked,
+            Unblocker::new(&term_buffer, &metadata).unblock(TERM_LENGTH as i32, 0, 128, 33)
         );
 
         let frame = Frame::new(&term_buffer, 0);
-        assert_eq!(Some(stalled_length), frame.frame_length());
+        assert_eq!(
+            Some(128),
+            frame.frame_length(),
+            "the negative turns positive"
+        );
         assert!(frame.is_padding());
 
         // And the scan can now pass it, which is the whole point.
@@ -513,6 +814,192 @@ mod tests {
             scanner.advance(),
             super::super::scan::Step::Padding { .. }
         ));
+    }
+
+    #[test]
+    fn a_zeroed_run_to_the_end_of_the_term_is_padded_and_rotates() {
+        // `shouldPatchToEndOfPartition`.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        let offset = TERM_LENGTH - 128;
+
+        assert_eq!(
+            UnblockStatus::UnblockedToEnd,
+            Unblocker::new(&term_buffer, &metadata).unblock(
+                TERM_LENGTH as i32,
+                offset as i32,
+                TERM_LENGTH as i32,
+                33,
+            ),
+            "the run reaches the end of the term, so the caller must rotate"
+        );
+
+        let frame = Frame::new(&term_buffer, offset);
+        assert_eq!(Some(128), frame.frame_length());
+        assert!(frame.is_padding());
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_next_complete_message() {
+        // `shouldScanForwardForNextCompleteMessage`: the run is covered up to
+        // the frame that ends it, and that frame is left alone.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 128, 128);
+
+        assert_eq!(
+            UnblockStatus::Unblocked,
+            Unblocker::new(&term_buffer, &metadata).unblock(TERM_LENGTH as i32, 0, 256, 33)
+        );
+
+        let covered = Frame::new(&term_buffer, 0);
+        assert_eq!(Some(128), covered.frame_length());
+        assert!(covered.is_padding());
+
+        // Only the length is asserted on the frame that ended the run: the
+        // reference's own test stops at the covered frame, and a header whose
+        // type field was never written reads as padding anyway — `PAD` is
+        // `0x00` (`protocol/aeron_udp_protocol.h:172`).
+        let untouched = Frame::new(&term_buffer, 128);
+        assert_eq!(Some(128), untouched.frame_length(), "the run stopped here");
+    }
+
+    #[test]
+    fn the_scan_stops_at_the_next_stalled_claim() {
+        // `shouldScanForwardForNextNonCommittedMessage`: a *negative* length
+        // ends the run just as a positive one does — the run is what gets
+        // covered, not the claim that ends it.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 128, -128);
+
+        assert_eq!(
+            UnblockStatus::Unblocked,
+            Unblocker::new(&term_buffer, &metadata).unblock(TERM_LENGTH as i32, 0, 256, 33)
+        );
+
+        let covered = Frame::new(&term_buffer, 0);
+        assert_eq!(Some(128), covered.frame_length());
+        assert!(covered.is_padding());
+
+        let untouched = Frame::new(&term_buffer, 128);
+        assert_eq!(
+            Some(-128),
+            untouched.frame_length(),
+            "still a claim in flight"
+        );
+    }
+
+    #[test]
+    fn a_message_that_lands_before_the_confirm_is_not_covered() {
+        // `shouldTakeNoActionIfMessageCompleteAfterScan`: the blocked offset
+        // read zero while the scan passed it and reads a frame when the confirm
+        // comes back to it.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 128, 128);
+
+        let reads = scripted(&term_buffer, vec![(0, 128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, 0, 256, 33),
+            "a frame landed in the run between the scan and the confirm"
+        );
+    }
+
+    #[test]
+    fn a_claim_that_lands_before_the_confirm_is_not_covered() {
+        // `shouldTakeNoActionIfMessageNonCommittedAfterScan`: the same race with
+        // a negative length, which is what a *live* producer would be writing.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 128, 128);
+
+        let reads = scripted(&term_buffer, vec![(0, -128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, 0, 256, 33)
+        );
+    }
+
+    #[test]
+    fn a_message_at_the_end_of_the_term_is_not_covered_after_the_scan() {
+        // `shouldTakeNoActionToEndOfPartitionIfMessageCompleteAfterScan`: the
+        // second read of the first frame is the one the end-of-term branch
+        // makes, and it is not skipped in favour of the first.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        let offset = TERM_LENGTH - 128;
+
+        let reads = scripted(&term_buffer, vec![(offset, 128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, offset as i32, TERM_LENGTH as i32, 33),
+            "the run reaches the tail, but its first frame is a frame now"
+        );
+    }
+
+    #[test]
+    fn a_claim_at_the_end_of_the_term_is_not_covered_after_the_scan() {
+        // `shouldTakeNoActionToEndOfPartitionIfMessageNonCommittedAfterScan`.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        let offset = TERM_LENGTH - 128;
+
+        let reads = scripted(&term_buffer, vec![(offset, -128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, offset as i32, TERM_LENGTH as i32, 33)
+        );
+    }
+
+    #[test]
+    fn a_second_message_racing_the_scan_stops_it() {
+        // `shouldNotUnblockGapWithMessageRaceOnSecondMessageIncreasingTailThenInterrupting`.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 256, 128);
+
+        let reads = scripted(&term_buffer, vec![(128, 128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, 0, 384, 33)
+        );
+    }
+
+    #[test]
+    fn a_write_racing_the_scan_forward_stops_it() {
+        // `shouldNotUnblockGapWithMessageRaceWhenScanForwardTakesAnInterrupt`.
+        let metadata_bytes = metadata();
+        let mut bytes = term();
+        let (metadata, term_buffer) = unblocker(&metadata_bytes, &mut bytes);
+        set_length(&term_buffer, 160, 7);
+
+        let reads = scripted(&term_buffer, vec![(128, 128)]);
+        let unblocker = Unblocker::with_reads(&term_buffer, &metadata, reads);
+
+        assert_eq!(
+            UnblockStatus::NoAction,
+            unblocker.unblock(TERM_LENGTH as i32, 0, 384, 33)
+        );
     }
 
     #[test]
