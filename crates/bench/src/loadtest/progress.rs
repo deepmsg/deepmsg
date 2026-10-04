@@ -10,7 +10,7 @@
 //! is also off by default — `io.aeron.benchmarks.report.progress` is false, and
 //! no grid turns it on — so it is not part of anything that gets measured.
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use crate::loadtest::format::grouped;
 
@@ -148,10 +148,60 @@ impl<W: Write> ProgressReporter for DeferredProgressReporter<W> {
     }
 }
 
-/// A reporter that writes to standard output, which is what a run uses.
-#[must_use]
-pub fn to_stdout(iterations: u32) -> DeferredProgressReporter<io::Stdout> {
-    DeferredProgressReporter::new(io::stdout(), iterations)
+/// Which of the reporters a configuration asks for.
+///
+/// `report.progress` is a setting and a setting cannot choose a type, so the
+/// choice is an enum and the rig stays generic over the one it is handed.
+#[derive(Debug)]
+pub enum Reporter<W: Write> {
+    /// Reports nothing, which is the default.
+    Null(NullProgressReporter),
+    /// Collects the lines and writes them when the sending is done.
+    Deferred(DeferredProgressReporter<W>),
+}
+
+impl<W: Write> Reporter<W> {
+    /// The reporter a configuration asks for: quiet unless it says otherwise.
+    ///
+    /// The buffer is reserved for the iterations the run has already declared,
+    /// so even the reporting path does not allocate as it goes.
+    #[must_use]
+    pub fn of(configuration: &crate::loadtest::config::Configuration, out: W) -> Self {
+        if configuration.report_progress() {
+            Self::Deferred(DeferredProgressReporter::new(
+                out,
+                configuration.iterations(),
+            ))
+        } else {
+            Self::Null(NullProgressReporter)
+        }
+    }
+}
+
+impl<W: Write> ProgressReporter for Reporter<W> {
+    fn report_progress(
+        &mut self,
+        start_time_ns: i64,
+        now_ns: i64,
+        sent_messages: i64,
+        iterations: u32,
+    ) {
+        match self {
+            Self::Null(reporter) => {
+                reporter.report_progress(start_time_ns, now_ns, sent_messages, iterations);
+            }
+            Self::Deferred(reporter) => {
+                reporter.report_progress(start_time_ns, now_ns, sent_messages, iterations);
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Null(reporter) => reporter.reset(),
+            Self::Deferred(reporter) => reporter.reset(),
+        }
+    }
 }
 
 #[cfg(test)]

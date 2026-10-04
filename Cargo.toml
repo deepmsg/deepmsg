@@ -28,3 +28,17 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+# The load test rig is built with more than the default release profile, and
+# these are the settings that can be given per package. `lto` and `panic` cannot
+# — cargo refuses to parse them here — so they come from the build invocation
+# instead; see `analysis/bench/build-rig.sh`.
+#
+# The rig is the measuring instrument *and* half of what R3/R4 measure, so its
+# own overhead lands in the numbers: a monomorphised call chain is worth having.
+# The driver and every other crate keep the default profile, so nothing that has
+# already been measured moves.
+[profile.release.package.deepmsg-bench]
+opt-level = 3
+codegen-units = 1
+strip = true
