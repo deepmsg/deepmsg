@@ -430,26 +430,35 @@ impl fmt::Display for IdleStrategy {
 
 /// Which system is under test.
 ///
-/// The reference loads one of these by class name. Only the in-memory one
-/// exists so far; the echo transceivers arrive with the client-side work, and
-/// until they do a name that resolves to nothing is refused rather than
-/// silently running something else.
+/// The reference loads one of these by class name; there is no reflection here,
+/// so a properties file holds one of these names instead.
+///
+/// There is one echo rather than one per transport. The reference has a single
+/// `EchoMessageTransceiver` whose channels come from
+/// `io.aeron.benchmarks.aeron.{source,destination}.channel`, and shared memory is
+/// what it does when those say `aeron:ipc` — so a second name would invent a
+/// distinction the reference does not have, and would let a name and a channel
+/// disagree about which transport a run is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transceiver {
     /// The rig's own ring, which measures the rig and nothing else
     /// (`InMemoryMessageTransceiver`).
     InMemory,
+    /// Publish to a node and read what comes back
+    /// (`EchoMessageTransceiver`), over whatever channel the settings name.
+    Echo,
 }
 
 impl Transceiver {
     /// The names this accepts.
-    pub const NAMES: &'static [&'static str] = &["in-memory"];
+    pub const NAMES: &'static [&'static str] = &["in-memory", "echo"];
 
     /// The name a properties file holds.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::InMemory => "in-memory",
+            Self::Echo => "echo",
         }
     }
 
@@ -457,6 +466,7 @@ impl Transceiver {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         match text {
             "in-memory" => Ok(Self::InMemory),
+            "echo" => Ok(Self::Echo),
             other => Err(ConfigError::UnknownTransceiver {
                 value: other.to_owned(),
             }),
@@ -1565,7 +1575,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "no message transceiver named 'echo-udp'; known: in-memory"
+            "no message transceiver named 'echo-udp'; known: in-memory, echo"
         );
     }
 

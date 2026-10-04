@@ -71,6 +71,10 @@ pub mod property {
     pub const FRAGMENT_LIMIT: &str = "io.aeron.benchmarks.aeron.fragment.limit";
     /// `AeronUtil.CONNECTION_TIMEOUT_PROP_NAME`.
     pub const CONNECTION_TIMEOUT: &str = "io.aeron.benchmarks.aeron.connection.timeout";
+    /// `AeronUtil.IDLE_STRATEGY_PROP_NAME` — the *node's* idle strategy, which
+    /// the reference keeps apart from the client's
+    /// `io.aeron.benchmarks.idle.strategy`.
+    pub const IDLE_STRATEGY: &str = "io.aeron.benchmarks.aeron.idle.strategy";
     /// The directory the driver is in, which the client is told rather than
     /// left to guess — the same name the driver reads
     /// (`CommonContext.AERON_DIR_PROP_NAME`, `aeron.dir`).

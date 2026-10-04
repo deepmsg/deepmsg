@@ -25,7 +25,9 @@ use deepmsg_bench::loadtest::progress::Reporter;
 use deepmsg_bench::loadtest::recorder::{self, Recorder};
 use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
-use deepmsg_bench::loadtest::transceiver::SystemClock;
+use deepmsg_bench::loadtest::transceiver::{MessageTransceiver, SystemClock};
+use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
+use deepmsg_bench::loadtest::transport::util::ChannelSettings;
 
 /// What this program accepts.
 const USAGE: &str = "\
@@ -56,8 +58,11 @@ enum Asked {
     Help,
     /// Print the configuration the settings describe and stop.
     PrintConfig(Configuration),
-    /// Run it.
-    Run(Configuration),
+    /// Run it, with the settings it was built from — a transceiver that talks
+    /// to a driver needs the channel settings too, and those are read on the way
+    /// in rather than eagerly: an in-memory run needs no driver and no
+    /// directory.
+    Run(Configuration, Properties),
 }
 
 /// Everything a command line says.
@@ -97,7 +102,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Asked, String> {
     Ok(if print_config {
         Asked::PrintConfig(configuration)
     } else {
-        Asked::Run(configuration)
+        Asked::Run(configuration, command_line)
     })
 }
 
@@ -111,14 +116,42 @@ fn run() -> Result<(), String> {
             println!("{configuration}");
             return Ok(());
         }
-        Asked::Run(configuration) => configuration,
+        Asked::Run(configuration, settings) => (configuration, settings),
     };
+    let (configuration, settings) = configuration;
 
     // Everything the configuration decides is read off it before it is moved
-    // into the rig.
+    // into the transceiver or the rig.
+    let idle = configuration.idle_strategy();
+    let kind = configuration.transceiver();
+    let logs_directory = configuration.logs_directory().to_path_buf();
+
+    match kind {
+        Transceiver::InMemory => measure(configuration, InMemoryTransceiver::new())?,
+        Transceiver::Echo => {
+            let channels =
+                ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
+            let transceiver = EchoTransceiver::new(channels, idle, logs_directory)
+                .map_err(|error| error.to_string())?;
+
+            measure(configuration, transceiver)?;
+        }
+    }
+
+    std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+/// Run one measurement, whoever is under test.
+///
+/// A function rather than a value so that the two transceivers do not need a
+/// wrapper to share the rig: the rig is generic and this is the one place that
+/// has to name a clock.
+fn measure<T>(configuration: Configuration, transceiver: T) -> Result<(), String>
+where
+    T: MessageTransceiver<SystemClock>,
+{
     let idle = configuration.idle_strategy();
     let progress = Reporter::of(&configuration, std::io::stdout());
-    let transceiver = transceiver_for(configuration.transceiver());
 
     let mut rig = LoadTestRig::new(
         configuration,
@@ -130,19 +163,8 @@ fn run() -> Result<(), String> {
     );
 
     rig.run().map_err(|error| error.to_string())?;
-    std::io::stdout().flush().map_err(|error| error.to_string())
-}
 
-/// The system the configuration names.
-///
-/// The only one so far. The reference's echo transceivers arrive with the
-/// client-side work: until they do, `Transceiver::parse` refuses their names
-/// while the arguments are read, so a run cannot quietly measure the wrong
-/// thing.
-fn transceiver_for(kind: Transceiver) -> InMemoryTransceiver {
-    match kind {
-        Transceiver::InMemory => InMemoryTransceiver::new(),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -164,9 +186,22 @@ mod tests {
 
     fn configuration(arguments: &[&str]) -> Configuration {
         match asked(arguments).expect("the arguments are usable") {
-            Asked::Run(configuration) | Asked::PrintConfig(configuration) => configuration,
+            Asked::Run(configuration, _) | Asked::PrintConfig(configuration) => configuration,
             Asked::Help => panic!("these arguments do not ask for help"),
         }
+    }
+
+    #[test]
+    fn an_echo_transceiver_is_named_and_named_by_one_name() {
+        let mut arguments = settings();
+        arguments[0] = "-Dio.aeron.benchmarks.message.transceiver=echo";
+
+        assert_eq!(configuration(&arguments).transceiver(), Transceiver::Echo);
+        assert_eq!(Transceiver::Echo.name(), "echo");
+        assert!(
+            Transceiver::parse("echo-ipc").is_err(),
+            "the transport is the channel's business"
+        );
     }
 
     #[test]
