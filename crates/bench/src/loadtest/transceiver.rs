@@ -124,26 +124,35 @@ pub trait MessageTransceiver<C: Clock> {
     fn on_benchmark_complete(&mut self, warmup: bool) {
         let _ = warmup;
     }
-
-    /// Discard whatever the transceiver has accumulated, as the reference does
-    /// between warmup and the measurement.
-    fn reset(&mut self) {}
 }
 
-/// The `idle` and `reset` the rig calls, one per name in
-/// [`crate::loadtest::config::IdleStrategy`].
+/// Waiting for something to happen.
 ///
-/// `reset` is not bookkeeping: the rig calls it every time a receive made
-/// progress, which is what makes a backoff start its climb again instead of
-/// staying parked while messages are arriving.
+/// The rig calls `idle` when a look for replies found none, and `reset` as soon
+/// as one does. `reset` is not bookkeeping: it is what makes a backoff start its
+/// climb again rather than staying parked while messages are arriving.
+///
+/// A trait, and not just the enum below, so that a test can count the calls —
+/// the reference's tests assert how many times a run idled, and how many times
+/// it reset, and that is a property of the rig's control flow rather than of the
+/// waiting.
+pub trait Idle {
+    /// Wait for something to happen.
+    fn idle(&mut self);
+
+    /// Something happened, so start again.
+    fn reset(&mut self);
+}
+
+/// The five names `io.aeron.benchmarks.idle.strategy` can hold, as Agrona's
+/// classes behave.
 ///
 /// `BusySpin` is `Thread.onSpinWait`, which is the reference's default and the
 /// only one any grid runs. `Backoff` and `Sleeping` are approximations of
 /// Agrona's: neither is reachable from the reference's own scripts, and their
 /// exact park durations are not part of what a run measures.
-impl IdleStrategy {
-    /// Wait for something to happen.
-    pub fn idle(&mut self) {
+impl Idle for IdleStrategy {
+    fn idle(&mut self) {
         match self {
             Self::BusySpin => std::hint::spin_loop(),
             Self::NoOp => {}
@@ -160,8 +169,7 @@ impl IdleStrategy {
         }
     }
 
-    /// Something happened, so start again.
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         if let Self::Backoff { idle_count } = self {
             *idle_count = 0;
         }

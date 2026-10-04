@@ -28,4 +28,5 @@ pub mod in_memory;
 pub mod progress;
 pub mod recorder;
 pub mod result;
+pub mod rig;
 pub mod transceiver;

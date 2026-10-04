@@ -1015,6 +1015,13 @@ impl Builder {
         self
     }
 
+    /// See [`Configuration::warmup_message_rate`].
+    #[must_use]
+    pub fn warmup_message_rate(mut self, rate: i32) -> Self {
+        self.warmup_message_rate = rate;
+        self
+    }
+
     /// See [`Configuration::batch_size`].
     #[must_use]
     pub fn batch_size(mut self, size: i32) -> Self {
@@ -1069,6 +1076,13 @@ impl Builder {
     #[must_use]
     pub fn track_history(mut self, track: bool) -> Self {
         self.track_history = track;
+        self
+    }
+
+    /// See [`Configuration::transceiver`].
+    #[must_use]
+    pub fn transceiver(mut self, transceiver: Transceiver) -> Self {
+        self.transceiver = transceiver;
         self
     }
 
