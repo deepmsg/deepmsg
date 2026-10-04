@@ -882,6 +882,25 @@ impl NetworkPublication {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> bool {
+        // While a publication whose last client has let go is still draining,
+        // the log is unblocked at the **sender's** position
+        // (`aeron_network_publication.c:1300-1315`). No gate and no
+        // `is_exclusive` test: the client is gone, so whatever is in the way
+        // will never be committed, and being here is the evidence. The reference
+        // skips it for a *revoked* publication, whose stream is being cut off
+        // rather than finished, and so does this.
+        //
+        // The reference runs it on every time event for as long as the state is
+        // DRAINING. Here that window is the one between this call and the linger
+        // decision, and `ending` is the flag that stands for it.
+        if self.ending && !self.is_revoked() {
+            let sender_position = self.sender_position(counters, regions);
+
+            if self.producer_position().unwrap_or(0) > sender_position {
+                self.unblock_at(sender_position, counters, regions);
+            }
+        }
+
         let Some(since) = self.linger_since_ns else {
             // Two ways in, and the reference meets them in one place: a
             // revoked publication says so in its heartbeats
@@ -2875,6 +2894,40 @@ mod tests {
             Frame::new(&term, 0).frame_length(),
             "the claim is still in flight"
         );
+    }
+
+    /// The draining path: the last client has let go, and the sender is stuck
+    /// behind a claim that will never be committed.
+    #[test]
+    fn a_draining_publication_unblocks_the_claim_its_sender_is_stuck_behind() {
+        let mut fixture = fixture();
+        let (manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            // The producer got to 128 and the sender is still at zero.
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(1_000, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.ending = true;
+
+        let system = System::new(&manager, &regions);
+        publication.notice_revoke(0, 5_000_000_000, &system, &manager, &regions);
+
+        let term = publication.log.term(0).expect("the first term");
+        let frame = Frame::new(&term, 0);
+        assert_eq!(Some(stalled), frame.frame_length());
+        assert!(frame.is_padding(), "the sender can move now");
     }
 
     #[test]
