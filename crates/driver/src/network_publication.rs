@@ -155,6 +155,22 @@ pub struct NetworkPublication {
     pub endpoint_id: u64,
     /// Whether the producer asked for a single-producer publication.
     pub is_exclusive: bool,
+    /// How long the sender position may sit unmoved before the log is unblocked
+    /// for the producer (`aeron.publication.unblock.timeout`, fifteen seconds).
+    pub unblock_timeout_ns: i64,
+    /// The sender position as of the last time it was seen to move
+    /// (`conductor_fields.last_snd_pos`), and when that was
+    /// (`time_of_last_activity_ns`).
+    ///
+    /// **Not** the same `time_of_last_activity_ns` the LINGER state uses —
+    /// [`Self::linger_since_ns`] holds that one, and the reference keeps them in
+    /// the same struct under the one name because a publication is never in
+    /// both situations at once. The pair here is the unblock deadline's; the
+    /// timer is refreshed **only** on a pass where the sender position moved or
+    /// the log was not blocked, so a stream that keeps flowing never reaches a
+    /// deadline however long it runs.
+    last_snd_pos: i64,
+    time_of_last_activity_ns: i64,
     /// The log buffer the producer writes and this sends from.
     pub log: Box<LogFile>,
     /// The counters a client reads.
@@ -336,6 +352,7 @@ impl NetworkPublication {
         socket_buffers: crate::sys::SocketBufferLengths,
         channel_sndbuf: usize,
         channel_rcvbuf: usize,
+        unblock_timeout_ns: i64,
         now_ns: i64,
     ) -> Result<Self, PublicationError> {
         let position_bits_to_shift =
@@ -357,6 +374,21 @@ impl NetworkPublication {
             .map(|position| (position.term_id, position.term_offset as i32));
 
         log.initialise_tails(params.initial_term_id, start);
+
+        // Where `snd-pos` begins, which is what `last_snd_pos` is seeded from:
+        // the caller writes this into the counter at creation
+        // (`aeron_network_publication.c:311` reads it back out of the counter,
+        // and the value is not reachable from here, so the same arithmetic the
+        // caller used is repeated).
+        let start_position = params.starting_position.map_or(0, |position| {
+            deepmsg_core::logbuffer::position::Position::new(
+                position.term_id,
+                i32::try_from(position.term_offset).unwrap_or(i32::MAX),
+                position_bits_to_shift,
+                params.initial_term_id,
+            )
+            .raw()
+        });
 
         // And then the metadata block, which is what a *client* reads when it
         // maps the file `ON_PUBLICATION_READY` named
@@ -428,6 +460,14 @@ impl NetworkPublication {
             channel: channel.to_vec(),
             endpoint_id,
             is_exclusive,
+            unblock_timeout_ns,
+            // Seeded from where `snd-pos` starts, which is the position the
+            // caller writes into that counter at creation
+            // (`aeron_network_publication.c:311` reads it back out of the
+            // counter; the value is not available here, so the same arithmetic
+            // the caller used is repeated).
+            last_snd_pos: start_position,
+            time_of_last_activity_ns: 0,
             log,
             counters,
             max_messages_per_send,
@@ -1600,6 +1640,85 @@ impl NetworkPublication {
         self.spies_simulate_connection
     }
 
+    /// Whether the sender has fallen behind far enough that the log may be
+    /// blocked (`aeron_network_publication_is_possibly_blocked`, `.h:209-222`).
+    ///
+    /// The same test as an IPC publication's over the same metadata — the
+    /// reference carries one copy per publication type, word for word — and
+    /// like that one it is a *cheap gate* in front of the expensive question,
+    /// not an answer to it: a sender behind the producer is enough.
+    pub fn is_possibly_blocked(&self, producer_position: i64, sender_position: i64) -> bool {
+        let Some(term_count) = self
+            .log
+            .metadata()
+            .and_then(|metadata| metadata.load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET))
+        else {
+            return false;
+        };
+
+        #[allow(clippy::cast_possible_truncation)] // the reference truncates here too
+        let expected = (sender_position >> self.position_bits_to_shift) as i32;
+
+        term_count != expected || producer_position > sender_position
+    }
+
+    /// Run the unblocker at `position`, and count it if it did anything.
+    ///
+    /// The count goes to the **system** counter 19, whose address the reference
+    /// takes once at creation (`:307-309`) — one counter for every publication
+    /// in the process.
+    fn unblock_at(
+        &self,
+        position: i64,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        if !deepmsg_core::logbuffer::unblocker::unblock(&self.log, position, self.term_length) {
+            return false;
+        }
+
+        system_counters::increment(
+            counters,
+            regions,
+            system_counters::id::UNBLOCKED_PUBLICATIONS,
+        );
+
+        true
+    }
+
+    /// Unblock the log for a producer whose stream has stopped moving
+    /// (`aeron_network_publication_check_for_blocked_publisher`, `:1011-1031`).
+    ///
+    /// Returns whether the log was unblocked. `snd_pos` is passed in rather than
+    /// read here because it is a counter value and the caller holds the regions.
+    ///
+    /// The deadline runs from the last time the **sender position moved**, and
+    /// it is refreshed on every pass where either it moved or the log was not
+    /// blocked — so a stream that keeps flowing resets its own deadline
+    /// continuously and never reaches one.
+    pub fn check_for_blocked_publisher(
+        &mut self,
+        snd_pos: i64,
+        now_ns: i64,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> bool {
+        if snd_pos == self.last_snd_pos
+            && self.is_possibly_blocked(self.producer_position().unwrap_or(0), snd_pos)
+        {
+            if now_ns > self.time_of_last_activity_ns + self.unblock_timeout_ns
+                && self.unblock_at(snd_pos, counters, regions)
+            {
+                return true;
+            }
+        } else {
+            self.time_of_last_activity_ns = now_ns;
+            self.last_snd_pos = snd_pos;
+        }
+
+        false
+    }
+
     /// Whether a reader has stopped reading, and what to do about it
     /// (`aeron_network_publication_check_untethered_subscriptions`,
     /// `aeron_network_publication.c:1120-1236`).
@@ -2189,6 +2308,7 @@ mod tests {
             },
             0,
             0,
+            crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
             0,
         )
         .expect("a publication");
@@ -2684,6 +2804,80 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_that_has_stopped_the_sender_is_padded() {
+        let mut fixture = fixture();
+        let (manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            // The producer got to 128 while the sender stayed at zero, so the
+            // sender is behind it and the log may be blocked.
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(1_000, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.unblock_timeout_ns = 1_000;
+
+        assert!(
+            publication.check_for_blocked_publisher(0, 2_000, &manager, &regions),
+            "the deadline passed and the log was blocked, so it was unblocked"
+        );
+
+        let term = publication.log.term(0).expect("the first term");
+        let frame = Frame::new(&term, 0);
+        assert_eq!(Some(stalled), frame.frame_length());
+        assert!(frame.is_padding(), "the claim is padding now");
+    }
+
+    /// The other half: a sender that keeps moving refreshes its own deadline.
+    #[test]
+    fn a_sender_that_keeps_moving_is_never_unblocked() {
+        let mut fixture = fixture();
+        let (manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(1_000, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.unblock_timeout_ns = 1_000;
+        publication.last_snd_pos = 0;
+
+        assert!(
+            !publication.check_for_blocked_publisher(64, 2_000, &manager, &regions),
+            "the sender moved, so the timer was refreshed rather than fired"
+        );
+        assert_eq!(2_000, publication.time_of_last_activity_ns, "to now");
+        assert_eq!(64, publication.last_snd_pos);
+
+        let term = publication.log.term(0).expect("the first term");
+        assert_eq!(
+            Some(-stalled),
+            Frame::new(&term, 0).frame_length(),
+            "the claim is still in flight"
+        );
+    }
+
+    #[test]
     fn a_quiet_receiver_is_declared_gone_after_the_connection_timeout() {
         let mut fixture = fixture();
         let (counters, regions) = fixture.counters.open();
@@ -2966,6 +3160,7 @@ mod tests {
                 },
                 0,
                 0,
+                crate::config::PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
                 0,
             )
             .expect("a publication");
