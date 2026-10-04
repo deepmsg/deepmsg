@@ -329,6 +329,15 @@ pub const SEND_TO_STATUS_POLL_RATIO_DEFAULT: u8 = 6;
 /// (`aeron_driver_context.c:208`).
 pub const PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT: i64 = 5_000_000_000;
 
+/// `AERON_PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:207`).
+///
+/// How long a publisher may sit with its position unmoved and its log blocked
+/// before the driver decides it is gone and covers the run for it. It must
+/// exceed the client liveness timeout — the check is
+/// `aeron_driver_validate_unblock_timeout` (`:1514-1537`) — because a client
+/// that has not yet been declared dead is one whose claim may still be live.
+pub const PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT: i64 = 15_000_000_000;
+
 /// `AERON_RETRANSMIT_UNICAST_DELAY_NS_DEFAULT` (`aeron_driver_context.c:218`).
 pub const RETRANSMIT_UNICAST_DELAY_NS_DEFAULT: i64 = 0;
 
@@ -672,6 +681,10 @@ pub struct DriverConfig {
     /// receivers are gone (`aeron.publication.connection.timeout`, five
     /// seconds).
     pub publication_connection_timeout_ns: i64,
+    /// How long a publication's position may sit unmoved before the driver
+    /// unblocks its log for it (`aeron.publication.unblock.timeout`, fifteen
+    /// seconds).
+    pub publication_unblock_timeout_ns: i64,
     /// How long a NAK's answer waits before it is sent
     /// (`aeron.retransmit.unicast.delay`; zero answers at once, which is the
     /// default).
@@ -918,6 +931,7 @@ impl Default for DriverConfig {
             send_to_sm_poll_ratio: SEND_TO_STATUS_POLL_RATIO_DEFAULT,
             status_message_timeout_ns: RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             publication_connection_timeout_ns: PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT,
+            publication_unblock_timeout_ns: PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT,
             retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
@@ -1310,6 +1324,10 @@ impl DriverConfig {
         if let Some(value) = get(&Setting::PUBLICATION_LINGER_TIMEOUT) {
             config.publication_linger_timeout_ns =
                 parse_duration_ns(&Setting::PUBLICATION_LINGER_TIMEOUT, &value)?;
+        }
+        if let Some(value) = get(&Setting::PUBLICATION_UNBLOCK_TIMEOUT) {
+            config.publication_unblock_timeout_ns =
+                parse_duration_ns(&Setting::PUBLICATION_UNBLOCK_TIMEOUT, &value)?;
         }
         if let Some(value) = get(&Setting::UNTETHERED_WINDOW_LIMIT_TIMEOUT) {
             config.untethered_window_limit_timeout_ns =
@@ -1801,6 +1819,18 @@ impl DriverConfig {
             });
         }
 
+        // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1537`)
+        // is two rules and this is its first: a publication is only unblocked
+        // for a client the driver has already given up on, so the unblock
+        // window has to be the longer of the two. Its second rule — liveness
+        // above the timer tier — is the check just below.
+        if config.publication_unblock_timeout_ns <= config.client_liveness_timeout_ns {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::PUBLICATION_UNBLOCK_TIMEOUT.property,
+                value: config.publication_unblock_timeout_ns.to_string(),
+            });
+        }
+
         // The liveness window is written into the CnC metadata and every
         // compatible client derives its keepalive contract from it, so a value
         // that is zero, negative, or no longer than the tier that checks it is
@@ -1923,6 +1953,11 @@ impl Setting {
     const PUBLICATION_LINGER_TIMEOUT: Self = Self {
         property: "publication.linger.timeout",
         env: "AERON_PUBLICATION_LINGER_TIMEOUT",
+    };
+    /// `aeron.publication.unblock.timeout` (`aeronmd.h:393`).
+    const PUBLICATION_UNBLOCK_TIMEOUT: Self = Self {
+        property: "publication.unblock.timeout",
+        env: "AERON_PUBLICATION_UNBLOCK_TIMEOUT",
     };
     /// `aeron.term.buffer.sparse.file` (`aeronmd.h:153`).
     const TERM_BUFFER_SPARSE_FILE: Self = Self {
@@ -3442,6 +3477,45 @@ mod tests {
                 ("deepmsg.dir", "/tmp/deepmsg"),
                 ("deepmsg.timer.interval", "1s"),
                 ("deepmsg.client.liveness.timeout", "1001ms"),
+            ])
+            .is_ok(),
+            "one millisecond more is enough"
+        );
+    }
+
+    /// `aeron.publication.unblock.timeout`, and the first of the two rules in
+    /// `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1537`):
+    /// the window has to outlast the liveness window, because a client the
+    /// driver has not yet given up on may still be about to commit its claim.
+    #[test]
+    fn the_unblock_window_binds_and_must_outlast_the_liveness_window() {
+        let config = resolve(&[("deepmsg.dir", "/tmp/deepmsg")]).expect("the defaults");
+
+        assert_eq!(
+            PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT, config.publication_unblock_timeout_ns,
+            "the reference's fifteen seconds"
+        );
+
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/deepmsg")],
+            &[("AERON_PUBLICATION_UNBLOCK_TIMEOUT", "20s")],
+        )
+        .expect("twenty seconds outlasts the liveness window");
+        assert_eq!(20_000_000_000, config.publication_unblock_timeout_ns);
+
+        // The liveness default is ten seconds, so this is a window that would
+        // unblock a client the driver has not given up on.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.publication.unblock.timeout", "10s"),
+            ]),
+            Err(ConfigError::OutOfRange { .. })
+        ));
+        assert!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/deepmsg"),
+                ("deepmsg.publication.unblock.timeout", "10001ms"),
             ])
             .is_ok(),
             "one millisecond more is enough"
