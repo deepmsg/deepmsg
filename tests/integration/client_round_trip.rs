@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, CommandError};
 use deepmsg_cnc::command::{
-    ADD_DESTINATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ON_ERROR_TYPE_ID,
+    ADD_DESTINATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
+    CLIENT_CLOSE_TYPE_ID, CORRELATED_COMMAND_LENGTH, ON_ERROR_TYPE_ID,
     ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
     REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, decode_destination_by_id_command,
@@ -179,6 +180,96 @@ fn a_subscription_is_registered_before_its_channel_status_counter_is_known() {
             .expect("the subscription is registered")
             .channel_status_indicator_id(),
         "the counter id from the reply lands on the subscription"
+    );
+}
+
+/// Closing says so once, and names the client it has been using.
+///
+/// A `CLIENT_CLOSE` is what stops the driver waiting out its liveness timeout
+/// for a client that has gone — ten seconds in which the client's counters,
+/// publications and images are still the driver's to hold. The reference sends
+/// it from `Aeron.close()`/`aeron_close`, and this pins the two things about the
+/// message that are not free: it is the correlated head alone, and its
+/// correlation id is the null one, because nothing answers it.
+#[test]
+fn closing_a_client_tells_the_driver_once() {
+    let cnc = live_cnc();
+    let expected = next_correlation_id(&cnc.cnc_path());
+    publish(
+        &cnc.cnc_path(),
+        ON_SUBSCRIPTION_READY_TYPE_ID,
+        &ready_payload(expected),
+    );
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    client
+        .add_subscription("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the fabricated reply must match");
+
+    assert!(!client.is_closed());
+    client.close();
+    assert!(client.is_closed());
+
+    // A second close is nothing — the reference guards its own with a
+    // compare-and-set (`Aeron.java:278`) for exactly this.
+    client.close();
+
+    let commands = commands_written(cnc.path());
+    let closes: Vec<&(i32, Vec<u8>)> = commands
+        .iter()
+        .filter(|(type_id, _)| *type_id == CLIENT_CLOSE_TYPE_ID)
+        .collect();
+
+    assert_eq!(1, closes.len(), "one goodbye, not two: {commands:?}");
+
+    let subscribed = commands
+        .iter()
+        .find(|(type_id, _)| *type_id == ADD_SUBSCRIPTION_TYPE_ID)
+        .expect("the subscription's command");
+
+    let payload = &closes[0].1;
+    assert_eq!(
+        CORRELATED_COMMAND_LENGTH,
+        payload.len(),
+        "the correlated head and nothing else"
+    );
+    assert_eq!(
+        i64::from_le_bytes(subscribed.1[..8].try_into().expect("eight")),
+        i64::from_le_bytes(payload[..8].try_into().expect("eight")),
+        "the client id it has been using all along"
+    );
+    assert_eq!(
+        layout::NULL_VALUE,
+        i64::from_le_bytes(payload[8..16].try_into().expect("eight")),
+        "and a correlation id nothing will answer"
+    );
+}
+
+/// Going out of scope closes too, which is the half a caller cannot see.
+///
+/// `Client` has no `close` in its public story that a caller has to remember:
+/// the C++ reference closes from `~Aeron` (`cpp_wrapper/Aeron.h:91-96`) and
+/// this closes from `Drop`. A destructor that forgot would leave the driver
+/// holding every resource the client made for its liveness timeout, which is
+/// the failure this pins.
+#[test]
+fn a_client_that_goes_out_of_scope_says_goodbye_too() {
+    let cnc = live_cnc();
+
+    {
+        let client = Client::connect(cnc.path()).expect("connect");
+        assert!(!client.is_closed());
+        drop(client);
+    }
+
+    let commands = commands_written(cnc.path());
+    assert_eq!(
+        1,
+        commands
+            .iter()
+            .filter(|(type_id, _)| *type_id == CLIENT_CLOSE_TYPE_ID)
+            .count(),
+        "the destructor sent it: {commands:?}"
     );
 }
 

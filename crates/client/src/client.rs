@@ -21,13 +21,36 @@
 //! (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`), and that is
 //! what this does.
 //!
-//! # One response per poll, and why that is load-bearing
+//! # One response per poll
 //!
-//! [`Client::poll`] takes at most one message off the broadcast per call. That
-//! is not a simplification: the driver sends `ON_SUBSCRIPTION_READY` and then,
-//! if a matching publication already exists, `ON_AVAILABLE_IMAGE` for it. The
-//! image is matched against a subscription this type only registers *after* the
-//! ready response is seen, so draining both in one call would drop the image.
+//! [`Client::poll`] takes at most one message off the broadcast per call, which
+//! is what the reference's client does — `aeron_client_conductor_do_work` reads
+//! one record with `aeron_broadcast_receiver_receive` and returns
+//! (`aeron-client/src/main/c/aeron_client_conductor.c:2714-2734`) — and it is
+//! what makes the return value a work count an idle strategy can use.
+//!
+//! It used to carry more weight than that. The driver sends
+//! `ON_SUBSCRIPTION_READY` and then, if a matching publication already exists,
+//! `ON_AVAILABLE_IMAGE` for it; an image that arrived before this type had
+//! registered the subscription had nowhere to go, and reading one message per
+//! call was what kept the two apart. That hazard is now closed at the source —
+//! a subscription is registered *before* its ready response is awaited, see
+//! [`Client::add_subscription`] — so the image attaches whichever order they
+//! arrive in.
+//!
+//! # The client-side conductor (M04)
+//!
+//! What the reference divides between `Aeron` and `ClientConductor`
+//! (`aeron-client/src/main/java/io/aeron/ClientConductor.java`, and the C
+//! `aeron_client_conductor.c` it mirrors) is one type here: the duty cycle that
+//! drains driver events and refreshes the liveness heartbeat, the registration
+//! and removal of publications, subscriptions and counters, driver-death
+//! detection and the forced close that follows it, and the close handshake that
+//! sends `CLIENT_CLOSE`.
+//!
+//! The reference's split buys a thin user-facing handle over a thick conductor.
+//! This has no separate handle to keep thin, and a `conductor` module holding
+//! the promise of that split and no code was removed rather than left as one.
 
 use std::ffi::OsStr;
 use std::io;
@@ -39,11 +62,12 @@ use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
     ADD_PUBLICATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
     ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription,
-    CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, Correlated, DestinationByIdCommand, DestinationCommand,
-    GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID, GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID,
-    REMOVE_COUNTER_TYPE_ID, REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, CLIENT_CLOSE_TYPE_ID, Correlated,
+    DestinationByIdCommand, DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
+    GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
+    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
-    encode_add_static_counter, encode_reject_image,
+    encode_add_static_counter, encode_client_close, encode_reject_image,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
@@ -354,6 +378,13 @@ pub struct Client {
     /// cleared: everything it would do afterwards is work for a driver that is
     /// not there.
     terminated: Option<ClientError>,
+    /// Set once by [`Client::close`], and never cleared.
+    ///
+    /// It makes the close idempotent, and keeps [`Drop`] from sending a second
+    /// `CLIENT_CLOSE` for a client that already said goodbye — the reference
+    /// guards its close the same way (`IS_CLOSED_VH.compareAndSet`,
+    /// `Aeron.java:278`).
+    closed: bool,
 }
 
 impl Client {
@@ -423,6 +454,7 @@ impl Client {
             unknown_responses: 0,
             orphan_images: 0,
             terminated: None,
+            closed: false,
         })
     }
 
@@ -482,6 +514,51 @@ impl Client {
     /// Messages discarded because the driver overwrote them mid-read.
     pub const fn discarded(&self) -> u64 {
         self.receiver.discarded()
+    }
+
+    /// Tell the driver this client is going away, and stop using it.
+    ///
+    /// A `CLIENT_CLOSE` is the whole of the message. The driver marks the
+    /// client closed and zeroes its heartbeat counter
+    /// (`aeron_driver_conductor_on_client_close`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6321-6331`), which is
+    /// what stops it being waited on — so a client that says goodbye is
+    /// collected, rather than held for the driver's liveness timeout with its
+    /// counters, publications and images still allocated. For an IPC-only
+    /// client that is ten seconds of the driver's memory and of the log buffers
+    /// it is holding open.
+    ///
+    /// The reference closes the same way: Java from `Aeron.close()`
+    /// (`Aeron.java:276`, guarded by a compare-and-set so a second call does
+    /// nothing, `:278`), and C from `aeron_close` (`aeron_client.c:180`) via
+    /// `aeron_client_conductor_on_cmd_client_close`
+    /// (`aeron_client_conductor.c:1888-1891`).
+    ///
+    /// There is no reply, so nothing here waits for one. Idempotent, and called
+    /// by [`Drop`] — a caller that wants the driver told before the client goes
+    /// out of scope, or wants to be sure the command reached the ring, calls
+    /// this itself; a destructor can report nothing.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        self.closed = true;
+
+        // Best effort, and deliberately: a driver that has already gone is the
+        // ordinary reason this fails, and that is the state the caller was
+        // trying to reach anyway. The reference swallows it too —
+        // `DriverProxy.clientClose` does nothing at all when its claim fails
+        // (`aeron-client/src/main/java/io/aeron/DriverProxy.java:463-465`).
+        if let Some(ring) = self.cnc.to_driver_ring() {
+            let _ = ring.write(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
+        }
+    }
+
+    /// Whether this client has closed — by an explicit [`Client::close`] or by
+    /// going out of scope.
+    pub const fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// The subscriptions this client holds.
@@ -2220,6 +2297,25 @@ impl Client {
             .ok_or(CommandError::Claim(ClaimError::Invalid))?;
         ring.next_correlation_id()
             .ok_or(CommandError::Claim(ClaimError::Invalid))
+    }
+}
+
+impl Drop for Client {
+    /// Say goodbye, then let the rest go.
+    ///
+    /// Both reference clients close from a destructor-shaped path and an
+    /// explicit one: C++'s `~Aeron` calls `aeron_close`
+    /// (`aeron-client/src/main/cpp_wrapper/Aeron.h:91-96`) on top of the C
+    /// `aeron_close` a caller can reach directly, and Java's `Aeron` is
+    /// `AutoCloseable` with a user-callable `close()`. This is the same pair,
+    /// which is why [`Client::close`] is separate and returns nothing to say.
+    ///
+    /// Nothing here may panic and nothing may wait: a destructor also runs
+    /// while a thread is unwinding, and a second panic there aborts the
+    /// process. `close` writes one ring record and reads nothing, which is as
+    /// close to that as this can get.
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
