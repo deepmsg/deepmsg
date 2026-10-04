@@ -42,6 +42,7 @@
 //! The reference's agent also runs the asynchronous error-log and
 //! counter-reclaim duties.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -633,6 +634,30 @@ impl crate::driver::Agent for AgentLoop {
 /// The reference keeps the same two things in its agent's own state
 /// (`aeron_driver_native_resource_agent_t`), and they are a struct here rather
 /// than the loop's locals so that the loop body can be driven a pass at a time.
+/// Give every path in `pending` one attempt at removal, keeping the ones that
+/// fail and reporting each failure.
+///
+/// One pass over the queue, not a loop until it empties: a file that cannot be
+/// removed will not remove itself on the second try within the same pass, and
+/// the reference's own drain makes one attempt each
+/// (`aeron_driver_native_resource_agent.c:205-222`).
+fn retry_frees(pending: &mut VecDeque<PathBuf>, mut on_failure: impl FnMut()) {
+    let mut attempts = pending.len();
+
+    while attempts > 0 {
+        attempts -= 1;
+
+        let Some(path) = pending.pop_front() else {
+            break;
+        };
+
+        if std::fs::remove_file(&path).is_err() {
+            on_failure();
+            pending.push_back(path);
+        }
+    }
+}
+
 pub(crate) struct AgentLoop {
     /// What the storage checks were built from, kept because every create asks
     /// them again.
@@ -651,6 +676,15 @@ pub(crate) struct AgentLoop {
     /// value lives, and it never hands one out.
     resolver: Option<AgentResolver>,
     counters: Option<CounterManager>,
+    /// Log buffers whose file could not be removed, waiting to be tried again
+    /// (`aeron_driver_native_resource_agent.c:213-220`: the reference keeps the
+    /// same queue and re-adds to its tail).
+    ///
+    /// The **path**, not the `LogFile`: [`LogFile::remove`] drops the mapping
+    /// before it removes the file, so a failure leaves nothing to retry but the
+    /// file itself — and the mapping is what the reference's retry keeps, which
+    /// is the one thing about it this build cannot reproduce.
+    pending_frees: VecDeque<std::path::PathBuf>,
 }
 
 impl AgentLoop {
@@ -675,6 +709,7 @@ impl AgentLoop {
             faults,
             resolver: None,
             counters: None,
+            pending_frees: VecDeque::new(),
         }
     }
 
@@ -683,8 +718,41 @@ impl AgentLoop {
     /// `None` when a `Stop` came in — or when the handle that sends requests is
     /// gone — which is the reference's `running` flag cleared. `Some(work)` is
     /// what the idle strategy is given.
+    /// Count a log buffer whose file could not be removed
+    /// (`AERON_SYSTEM_COUNTER_FREE_FAILS`, `aeron_system_counters.c:43`).
+    ///
+    /// The counter regions are reached the way the resolver's own counters are
+    /// (`:871-880`): through the resolver's file, which is where they live. The
+    /// driver attaches a resolver before any log buffer can be freed — the
+    /// resolver is built unconditionally in the conductor's start
+    /// (`conductor.rs:815`) and attached a few lines before the agent is told
+    /// anything else — so this is a reachable path, not a hopeful one.
+    fn count_free_failure(&self) {
+        let (Some(counters), Some(AgentResolver { cnc, .. })) =
+            (self.counters.as_ref(), self.resolver.as_ref())
+        else {
+            return;
+        };
+
+        if let Some(regions) = cnc.counter_regions() {
+            crate::system_counters::increment(
+                counters,
+                &regions,
+                crate::system_counters::id::FREE_FAILS,
+            );
+        }
+    }
+
     fn do_work(&mut self) -> Option<usize> {
         {
+            // Log buffers whose removal failed on an earlier pass get their
+            // next attempt here, before this pass's new work
+            // (`aeron_driver_native_resource_agent.c:213-220`: the reference
+            // drains the same queue at the top of its pass).
+            let mut pending = std::mem::take(&mut self.pending_frees);
+            retry_frees(&mut pending, || self.count_free_failure());
+            self.pending_frees = pending;
+
             // The resolver's own clock, on this thread's duty cycle
             // (`aeron_driver_native_resource_agent.c:253-270`): a driver nobody
             // is talking to still has to answer when someone does, and its
@@ -934,8 +1002,22 @@ impl AgentLoop {
             }
             Request::FreeLogBuffer { log } => {
                 let path = log.path().to_owned();
-                let _ = log.remove();
 
+                // The mapping goes either way — `LogFile::remove` drops it
+                // first — so what a failure leaves behind is the **file**, and
+                // that is what goes on the queue to be tried again
+                // (`aeron_driver_native_resource_agent.c:405-412`).
+                if log.remove().is_err() {
+                    self.count_free_failure();
+                    self.pending_frees.push_back(path.clone());
+                }
+
+                // Reported either way, which the reference does not do: its
+                // failure path calls no callback at all. Nothing here reads the
+                // completion for the file's sake — both consumers ignore it —
+                // and a queue entry is the honest record that the file is still
+                // there, so this stays as it was rather than changing what the
+                // conductor waits for.
                 completions.send(Completion::Freed { path }).is_err()
             }
             // Both are handled by the loop itself: `Stop` is what ends it, and
@@ -1182,6 +1264,66 @@ mod tests {
         }
     }
 
+    /// One pass over the retry queue: what can be removed is, and what cannot
+    /// is counted and kept.
+    #[test]
+    fn a_retry_pass_removes_what_it_can_and_counts_what_it_cannot() {
+        let dir = TempDir::new();
+        let there = dir.0.join("there.logbuffer");
+        let gone = dir.0.join("gone.logbuffer");
+
+        std::fs::write(&there, b"x").expect("a file");
+
+        let mut pending = VecDeque::from(vec![there.clone(), gone.clone()]);
+        let mut failures = 0;
+
+        retry_frees(&mut pending, || failures += 1);
+
+        assert!(!there.exists(), "the one that could be removed was");
+        assert_eq!(1, failures, "and the one that could not was counted");
+        assert_eq!(
+            vec![gone],
+            pending.into_iter().collect::<Vec<_>>(),
+            "which is kept for the next pass, at the back"
+        );
+    }
+
+    /// A removal that fails is not dropped on the floor: the file goes on the
+    /// queue, which is what the reference does with the log buffer
+    /// (`aeron_driver_native_resource_agent.c:405-412`).
+    #[test]
+    fn a_free_that_fails_is_kept_for_another_try() {
+        // `queues` is held, not dropped: it owns the completion receiver, and a
+        // dispatch whose send fails reports that the loop should stop.
+        let AgentParts {
+            mut state, queues, ..
+        } = NativeResourceAgent::split(StorageChecks::new(false, 0, PathBuf::new()))
+            .expect("the agent's parts");
+
+        let dir = TempDir::new();
+        let path = dir.0.join("free.logbuffer");
+        let log = LogFile::create(&path, TERM_LENGTH, 4096, false).expect("a log buffer");
+
+        // Out from under the mapping: `remove` drops the mapping and then finds
+        // no file, which is the failure this is about.
+        std::fs::remove_file(&path).expect("the file goes");
+
+        assert!(
+            !state.dispatch(Request::FreeLogBuffer { log: Box::new(log) }),
+            "a free does not stop the loop"
+        );
+        assert_eq!(1, state.pending_frees.len(), "kept for another try");
+        assert_eq!(Some(&path), state.pending_frees.front());
+
+        drop(queues);
+    }
+
+    // The **counter** is not asserted anywhere, and that is a stated gap: it is
+    // written through the resolver's file (`count_free_failure`), and the
+    // resolver only arrives with `AttachResolver` — which needs a resolver
+    // implementation and a CnC file to build. The driver always attaches one
+    // before anything can be freed, so the path runs in every real driver and in
+    // none of these tests.
     #[test]
     fn a_mapped_log_buffer_comes_back_to_the_caller() {
         let dir = TempDir::new();
