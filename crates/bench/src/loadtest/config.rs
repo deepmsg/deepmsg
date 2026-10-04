@@ -170,6 +170,11 @@ pub enum ConfigError {
         /// What the operating system said.
         message: String,
     },
+    /// A duration was not written the way Agrona writes one.
+    Duration {
+        /// What the property held.
+        value: String,
+    },
     /// A properties file could not be read.
     ///
     /// The reference swallows this — `PropertiesUtil.loadPropertiesFile` wraps
@@ -247,6 +252,9 @@ impl fmt::Display for ConfigError {
             }
             Self::WorkingDirectory { message } => {
                 write!(f, "could not read the working directory: {message}")
+            }
+            Self::Duration { value } => {
+                write!(f, "could not read a duration from '{value}'")
             }
             Self::PropertiesFile { path, message } => {
                 write!(
@@ -570,6 +578,19 @@ impl Properties {
     fn required(&self, name: &'static str) -> Result<&str, ConfigError> {
         self.get(name)
             .ok_or(ConfigError::Required { property: name })
+    }
+
+    /// An `int` when the property is there, and the fallback when it is not.
+    ///
+    /// The reference's `Integer.getInteger(name, default)` — and, as there, a
+    /// property that is set but is not a number is an error rather than the
+    /// default.
+    pub fn integer_or(&self, name: &'static str, fallback: i32) -> Result<i32, ConfigError> {
+        if self.get(name).is_none() {
+            return Ok(fallback);
+        }
+
+        self.integer(name)
     }
 
     /// An `int`, refusing anything else with the reference's complaint
