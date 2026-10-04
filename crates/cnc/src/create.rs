@@ -220,7 +220,7 @@ impl CncLayout {
         // (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:27` via
         // `aeron_rb.h:79-82`; `aeron_broadcast_transmitter.c:29` via
         // `aeron_broadcast_descriptor.h:43`), which is why
-        // `-Daeron.to.conductor.buffer.length=2m` — a round number that leaves
+        // `-Daeron.conductor.buffer.length=2m` — a round number that leaves
         // a capacity 768 bytes short of one — starts a driver that dies in
         // conductor init with "Invalid capacity". Checking it while the length
         // is still the thing being reported says which setting is wrong.
@@ -255,7 +255,7 @@ impl CncLayout {
         let file_length = self.file_length()?;
 
         // The reader's own layout rule, applied to the lengths this build is
-        // about to write. Without it a value like `counters.values.buffer.length
+        // about to write. Without it a value like `counters.buffer.length
         // = 1048579` passes every range check above and then fails *after* the
         // 46 MB file has been written and mapped, as "the CnC file could not be
         // read" about a file this process just wrote. `RegionLayout::compute`
@@ -312,10 +312,10 @@ const fn length_setting_before(region: Region) -> &'static str {
     match region {
         // Bases of 0 and 128 are always aligned; these arms are here because
         // the match has to be total.
-        Region::Metadata | Region::ToDriver => "to.conductor.buffer.length",
-        Region::ToClients => "to.conductor.buffer.length",
-        Region::CountersMetadata => "to.clients.buffer.length",
-        Region::CountersValues | Region::ErrorLog => "counters.values.buffer.length",
+        Region::Metadata | Region::ToDriver => "conductor.buffer.length",
+        Region::ToClients => "conductor.buffer.length",
+        Region::CountersMetadata => "clients.buffer.length",
+        Region::CountersValues | Region::ErrorLog => "counters.buffer.length",
     }
 }
 
@@ -657,7 +657,7 @@ mod tests {
 
         match error {
             CncCreateError::BaseUnaligned { name, region, .. } => {
-                assert_eq!("counters.values.buffer.length", name);
+                assert_eq!("counters.buffer.length", name);
                 assert_eq!(Region::CountersValues, region);
             }
             other => panic!("expected the setting to be named, got {other:?}"),
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn rejects_a_ring_whose_capacity_is_not_a_power_of_two() {
-        // `-Daeron.to.conductor.buffer.length=2m` is the mistake this exists
+        // `-Daeron.conductor.buffer.length=2m` is the mistake this exists
         // for: two mebibytes of region leave a capacity 768 bytes short of a
         // power of two, and the reference dies on it in conductor init with
         // "Invalid capacity".

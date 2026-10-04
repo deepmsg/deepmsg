@@ -609,15 +609,36 @@ name the reference documents, and deepmsg's prefix for the same name — so
 `aeron.dir` and `deepmsg.dir` are the same setting, as a `-D` argument or in
 the environment (`AERON_DIR` / `DEEPMSG_DIR`). Deepmsg's own spelling wins,
 then its environment variable, then the reference's, which is the order a
-one-off override wants. The suffixes are the reference's, including the three
+one-off override wants. The suffixes are the reference's, including the
 environment names that are *not* the property name in capitals:
-`aeron.to.conductor.buffer.length` is `AERON_CONDUCTOR_BUFFER_LENGTH`
-(`aeronmd.h:97`), not `AERON_TO_CONDUCTOR_BUFFER_LENGTH`. A deployment's
-existing configuration therefore works unchanged, which is the point.
+`aeron.conductor.buffer.length` is `AERON_CONDUCTOR_BUFFER_LENGTH`
+(`aeronmd.h:97`), not `AERON_CONDUCTOR_BUFFER_LENGTH` respelled — and the
+property is not that variable's name lowercased either. Six settings had been
+named after the macro instead of after the property and so answered to names
+that appear nowhere in the reference: `to.conductor.buffer.length`,
+`to.clients.buffer.length`, `counters.values.buffer.length`,
+`socket.so.rcvbuf`, `socket.so.sndbuf` and `flow.control.gtag`. They are now
+the reference's names (`aeron-driver/src/main/c/aeron_driver_context.h:208-219`,
+`:253`; `aeron-driver/src/main/java/io/aeron/driver/Configuration.java:182/198/216/322/993`),
+which for `flow.control.group.tag`
+means Java's rather than the one C's context header comments, since C reads no
+property there at all. A deployment's existing configuration therefore works
+unchanged, which is the point; the names are pinned by
+`crates/driver/src/config.rs::tests::the_settings_named_after_an_environment_variable_answer_to_their_property`.
 
 The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
+
+A second divergence is in the idle strategies. The reference's caller gives the
+native resource agent `"1ms"` only while its strategy is **unnamed**
+(`aeron_driver_context.c:1205-1207`), so naming `sleep-ns` and no arguments
+sleeps one nanosecond there (`aeron_agent.c:56-59`); that condition is kept.
+What is not: the reference ignores `AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS`
+whenever the name is unset, and this honours it, because a caller who wrote
+arguments asked for them. Pinned by
+`::arguments_without_a_name_are_honoured_rather_than_overwritten` and
+`::naming_the_native_resource_agents_strategy_drops_the_slots_own_arguments`.
 
 `aeron.send.to.status.poll.ratio` is read **and acted on** (`aeronmd.h:257`,
 the reference's sending-to-polling ratio, `aeron_driver_context.c:199` for its

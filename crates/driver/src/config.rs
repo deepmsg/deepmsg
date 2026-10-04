@@ -29,7 +29,7 @@
 //! (`aeron-client/src/main/c/util/aeron_parse_util.c`), including size
 //! suffixes (`:42-105`: `k`, `m`, `g`, binary multiples) and duration suffixes
 //! (`:170-268`: `s`, `ms`, `us`, `ns`). Those are reproduced, because a
-//! deployment that writes `-Daeron.to.conductor.buffer.length=4m` means 4 MiB
+//! deployment that writes `-Daeron.conductor.buffer.length=4m` means 4 MiB
 //! and would get a driver that refused to start if this parsed plain integers.
 //!
 //! **One deliberate divergence.** The reference *warns and uses the default*
@@ -555,10 +555,10 @@ pub struct DriverConfig {
     /// How far ahead of its slowest reader a network producer may run
     /// (`aeron.publication.term.window.length`; zero means half a term).
     pub publication_window_length: i32,
-    /// `SO_RCVBUF` for a channel that named none (`aeron.socket.so.rcvbuf`,
+    /// `SO_RCVBUF` for a channel that named none (`aeron.socket.so_rcvbuf`,
     /// [`SOCKET_SO_RCVBUF_DEFAULT`]).
     pub socket_so_rcvbuf: i32,
-    /// `SO_SNDBUF`, likewise (`aeron.socket.so.sndbuf`; zero leaves the
+    /// `SO_SNDBUF`, likewise (`aeron.socket.so_sndbuf`; zero leaves the
     /// kernel's default, which is a socket *sending* into a local buffer).
     pub socket_so_sndbuf: i32,
     /// The multicast hop limit a channel that named none gets
@@ -1069,6 +1069,19 @@ impl IdleStrategySetting {
     /// can use.
     pub const NATIVE_RESOURCE_AGENT_DEFAULT_NAME: &'static str = "sleep-ns";
 
+    /// What that strategy sleeps for when nothing named a duration.
+    ///
+    /// This is the one slot whose default **arguments** are not the strategy's
+    /// own. `aeron_idle_strategy_sleeping_init_args` falls back to one
+    /// **nanosecond** when it is handed `NULL` (`aeron_agent.c:56-59`), and
+    /// reading only that function says this slot sleeps a nanosecond — a busy
+    /// spin wearing a sleep's name, burning a core. The reference never lets
+    /// that happen: **its caller** overrides the arguments with `"1ms"`
+    /// whenever the strategy was not named (`aeron_driver_context.c:1205-1207`),
+    /// and Java builds the same one-millisecond strategy outright
+    /// (`Configuration.java:2081-2089`).
+    pub const NATIVE_RESOURCE_AGENT_DEFAULT_ARGS: &'static str = "1ms";
+
     /// The strategy this setting names, or `None` when the name is not one of
     /// the six — which the reference refuses to start over
     /// (`aeron_driver_context.c:1152-1158`).
@@ -1083,7 +1096,7 @@ impl IdleStrategySetting {
     pub fn sleeping_default() -> Self {
         Self {
             name: Self::NATIVE_RESOURCE_AGENT_DEFAULT_NAME.to_owned(),
-            init_args: None,
+            init_args: Some(Self::NATIVE_RESOURCE_AGENT_DEFAULT_ARGS.to_owned()),
         }
     }
 }
@@ -1473,36 +1486,44 @@ impl DriverConfig {
             IdleStrategySetting::BACKOFF_DEFAULT,
             &Setting::CONDUCTOR_IDLE_STRATEGY,
             &Setting::CONDUCTOR_IDLE_STRATEGY_INIT_ARGS,
+            None,
         )?;
         config.sender_idle = idle_strategy(
             &get,
             IdleStrategySetting::BACKOFF_DEFAULT,
             &Setting::SENDER_IDLE_STRATEGY,
             &Setting::SENDER_IDLE_STRATEGY_INIT_ARGS,
+            None,
         )?;
         config.receiver_idle = idle_strategy(
             &get,
             IdleStrategySetting::BACKOFF_DEFAULT,
             &Setting::RECEIVER_IDLE_STRATEGY,
             &Setting::RECEIVER_IDLE_STRATEGY_INIT_ARGS,
+            None,
         )?;
         config.shared_idle = idle_strategy(
             &get,
             IdleStrategySetting::BACKOFF_DEFAULT,
             &Setting::SHARED_IDLE_STRATEGY,
             &Setting::SHARED_IDLE_STRATEGY_INIT_ARGS,
+            None,
         )?;
         config.shared_network_idle = idle_strategy(
             &get,
             IdleStrategySetting::BACKOFF_DEFAULT,
             &Setting::SHARED_NETWORK_IDLE_STRATEGY,
             &Setting::SHARED_NETWORK_IDLE_STRATEGY_INIT_ARGS,
+            None,
         )?;
+        // The native resource agent is the one slot whose default arguments are
+        // not the strategy's own (`aeron_driver_context.c:1205-1207`).
         config.native_resource_agent_idle = idle_strategy(
             &get,
             IdleStrategySetting::NATIVE_RESOURCE_AGENT_DEFAULT_NAME,
             &Setting::NATIVE_RESOURCE_AGENT_IDLE_STRATEGY,
             &Setting::NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS,
+            Some(IdleStrategySetting::NATIVE_RESOURCE_AGENT_DEFAULT_ARGS),
         )?;
         if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_TAG) {
             config.flow_control_group_tag = parse_count(&Setting::FLOW_CONTROL_GROUP_TAG, &value)?;
@@ -1811,10 +1832,11 @@ impl DriverConfig {
 /// One setting, under both of the names it answers to.
 ///
 /// The environment names are the reference's own strings
-/// (`aeron-driver/src/main/c/aeronmd.h`), and three of them are *not* the
-/// property name in capitals: `aeron.to.conductor.buffer.length` is
-/// `AERON_CONDUCTOR_BUFFER_LENGTH` (`:97`), not `AERON_TO_CONDUCTOR_...`. That
-/// is why this is a table rather than a derivation.
+/// (`aeron-driver/src/main/c/aeronmd.h`), and one of them is *not* the property
+/// name in capitals: `aeron.flow.control.group.tag`
+/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:993`) is
+/// `AERON_FLOW_CONTROL_GROUP_TAG` (`:542`), not anything respelled from
+/// `group.tag`. That is why this is a table rather than a derivation.
 struct Setting {
     /// `deepmsg.` plus this, or `aeron.` plus this.
     property: &'static str,
@@ -1843,19 +1865,28 @@ impl Setting {
         property: "dir.delete.on.shutdown",
         env: "AERON_DIR_DELETE_ON_SHUTDOWN",
     };
-    /// `aeron.to.conductor.buffer.length` (`:97`).
+    /// `aeron.conductor.buffer.length` (`aeron_driver_context.h:208`,
+    /// `Configuration.java:182`). Its environment variable is
+    /// `AERON_CONDUCTOR_BUFFER_LENGTH` (`aeronmd.h:97`), and the property is
+    /// **not** that name lowercased: `to.conductor.buffer.length` appears
+    /// nowhere in the reference, and reading it as the property is how this
+    /// setting came to answer to a name nothing ever wrote.
     const TO_CONDUCTOR_BUFFER_LENGTH: Self = Self {
-        property: "to.conductor.buffer.length",
+        property: "conductor.buffer.length",
         env: "AERON_CONDUCTOR_BUFFER_LENGTH",
     };
-    /// `aeron.to.clients.buffer.length` (`:105`).
+    /// `aeron.clients.buffer.length` (`aeron_driver_context.h:209`,
+    /// `Configuration.java:198`) — again not
+    /// `AERON_CLIENTS_BUFFER_LENGTH` lowercased (`:105`).
     const TO_CLIENTS_BUFFER_LENGTH: Self = Self {
-        property: "to.clients.buffer.length",
+        property: "clients.buffer.length",
         env: "AERON_CLIENTS_BUFFER_LENGTH",
     };
-    /// `aeron.counters.values.buffer.length` (`:113`).
+    /// `aeron.counters.buffer.length` (`aeron_driver_context.h:210`,
+    /// `Configuration.java:216`) — the values buffer loses its `values`, which
+    /// is only in the environment variable (`:113`).
     const COUNTERS_VALUES_BUFFER_LENGTH: Self = Self {
-        property: "counters.values.buffer.length",
+        property: "counters.buffer.length",
         env: "AERON_COUNTERS_BUFFER_LENGTH",
     };
     /// `aeron.error.buffer.length` (`:121`).
@@ -1929,15 +1960,19 @@ impl Setting {
         property: "publication.term.window.length",
         env: "AERON_PUBLICATION_TERM_WINDOW_LENGTH",
     };
-    /// `aeron.socket.so.rcvbuf`: the socket buffer a channel that named none
-    /// gets (`aeronmd.h:233`, read at `:754-759`).
+    /// `aeron.socket.so_rcvbuf`: the socket buffer a channel that named none
+    /// gets (`aeron_driver_context.h:218`, `Configuration.java:322`; the
+    /// environment variable is `AERON_SOCKET_SO_RCVBUF`, `aeronmd.h:233`, read
+    /// at `:754-759`). A single underscore, not a second dot.
     const SOCKET_SO_RCVBUF: Self = Self {
-        property: "socket.so.rcvbuf",
+        property: "socket.so_rcvbuf",
         env: "AERON_SOCKET_SO_RCVBUF",
     };
-    /// `aeron.socket.so.sndbuf` (`aeronmd.h:241`, read at `:761-766`).
+    /// `aeron.socket.so_sndbuf` (`aeron_driver_context.h:219`; environment
+    /// variable `AERON_SOCKET_SO_SNDBUF`, `aeronmd.h:241`, read at `:761-766`).
+    /// Underscored like its receive twin above.
     const SOCKET_SO_SNDBUF: Self = Self {
-        property: "socket.so.sndbuf",
+        property: "socket.so_sndbuf",
         env: "AERON_SOCKET_SO_SNDBUF",
     };
     /// `aeron.socket.multicast.ttl` (`aeronmd.h:249`, read at `:768-772`).
@@ -2220,9 +2255,16 @@ impl Setting {
         property: "receiver.group.tag",
         env: "AERON_RECEIVER_GROUP_TAG",
     };
-    /// `aeron.flow.control.gtag` (`aeronmd.h:542`).
+    /// `aeron.flow.control.group.tag` (`Configuration.java:993`; the
+    /// environment variable is `AERON_FLOW_CONTROL_GROUP_TAG`, `aeronmd.h:542`).
+    ///
+    /// The one name where the two references disagree: C's context header
+    /// comments this field `aeron.flow.control.gtag`
+    /// (`aeron_driver_context.h:253`). C reads no property at all here — only
+    /// the environment variable — so its comment describes a name it does not
+    /// consume, and Java's is the one a `-D` deployment would have written.
     const FLOW_CONTROL_GROUP_TAG: Self = Self {
-        property: "flow.control.gtag",
+        property: "flow.control.group.tag",
         env: "AERON_FLOW_CONTROL_GROUP_TAG",
     };
     /// `aeron.flow.control.group.min.size` (`:550`).
@@ -2749,10 +2791,36 @@ fn idle_strategy(
     default_name: &str,
     name_setting: &Setting,
     args_setting: &Setting,
+    default_args: Option<&str>,
 ) -> Result<IdleStrategySetting, ConfigError> {
+    let name = get(name_setting);
+
+    // The arguments the strategy gets, from the first of three places that has
+    // one: what the caller configured, then — only when the strategy was *not*
+    // named — the slot's own default, and otherwise nothing, which leaves the
+    // strategy to its own fallback.
+    //
+    // That middle rung is the reference's and is conditional on the name env
+    // var (`aeron_driver_context.c:1205-1207`). Naming `sleep-ns` while naming
+    // no arguments gives one **nanosecond** there too (`aeron_agent.c:56-59`),
+    // so the condition must not be papered over: a named strategy keeps its own
+    // default, and only the unnamed slot gets the slot's args.
+    //
+    // The first rung is deliberately unconditional, and is the one place this
+    // parts with the reference: the reference ignores `..._INIT_ARGS` whenever
+    // the name is unset, and this honours it. A caller who went to the trouble
+    // of writing arguments gets them. Recorded in `docs/compat.md`.
+    let init_args = get(args_setting).or_else(|| {
+        if name.is_some() {
+            None
+        } else {
+            default_args.map(str::to_owned)
+        }
+    });
+
     let setting = IdleStrategySetting {
-        name: get(name_setting).unwrap_or_else(|| default_name.to_owned()),
-        init_args: get(args_setting),
+        name: name.unwrap_or_else(|| default_name.to_owned()),
+        init_args,
     };
 
     match setting.strategy() {
@@ -3476,13 +3544,11 @@ mod tests {
 
     #[test]
     fn the_reference_environment_names_are_the_ones_it_defines() {
-        // Three of these are not the property name in capitals, which is why
-        // the table exists rather than a name transformation.
-        // The two ring lengths are the reason this is a table and not a name
-        // transformation: `AERON_CONDUCTOR_BUFFER_LENGTH` is what
-        // `aeron.to.conductor.buffer.length` is called in the environment, and
-        // the value is a *region* length — two mebibytes of capacity plus the
-        // trailer, which no size suffix can spell.
+        // One of these is not the property name in capitals, which is why the
+        // table exists rather than a name transformation.
+        // The two ring lengths are the other reason this is a table and not a
+        // name transformation: the value is a *region* length — two mebibytes
+        // of capacity plus the trailer, which no size suffix can spell.
         let config = resolve_with_env(
             &[],
             &[
@@ -3613,7 +3679,7 @@ mod tests {
         // fails at start-up and names the setting.
         let error = resolve(&[
             ("deepmsg.dir", "/tmp/x"),
-            ("deepmsg.to.conductor.buffer.length", "2m"),
+            ("deepmsg.conductor.buffer.length", "2m"),
         ])
         .expect_err("2 MiB of region is not a legal ring");
 
@@ -3667,7 +3733,7 @@ mod tests {
     fn the_flow_control_settings_are_read_under_both_names() {
         let config = resolve(&[
             ("aeron.dir", "/tmp/aeron-test"),
-            ("aeron.flow.control.gtag", "123"),
+            ("aeron.flow.control.group.tag", "123"),
             ("aeron.flow.control.group.min.size", "3"),
             ("aeron.flow.control.receiver.timeout", "1s"),
             ("aeron.receiver.group.tag", "-1"),
@@ -3681,6 +3747,63 @@ mod tests {
             Some(-1),
             config.receiver_group_tag,
             "and `-1` is a tag, unlike naming nothing"
+        );
+    }
+
+    /// Six settings whose property came from an environment variable macro
+    /// rather than from the property it names.
+    ///
+    /// `AERON_TO_CONDUCTOR_BUFFER_LENGTH_ENV_VAR` is
+    /// `"AERON_CONDUCTOR_BUFFER_LENGTH"` (`aeronmd.h:97`), and the property
+    /// beside it is `aeron.conductor.buffer.length`
+    /// (`aeron_driver_context.h:208`, `Configuration.java:182`). Reading the
+    /// macro as the property left these answering to names that appear nowhere
+    /// in the reference, so a deployment writing the real one — as `-Daeron.`
+    /// or as `-Ddeepmsg.` — silently got the default.
+    #[test]
+    fn the_settings_named_after_an_environment_variable_answer_to_their_property() {
+        let env = |_: &str| -> Option<String> { None };
+
+        for (setting, name) in [
+            (
+                &Setting::TO_CONDUCTOR_BUFFER_LENGTH,
+                "conductor.buffer.length",
+            ),
+            (&Setting::TO_CLIENTS_BUFFER_LENGTH, "clients.buffer.length"),
+            (
+                &Setting::COUNTERS_VALUES_BUFFER_LENGTH,
+                "counters.buffer.length",
+            ),
+            (&Setting::SOCKET_SO_RCVBUF, "socket.so_rcvbuf"),
+            (&Setting::SOCKET_SO_SNDBUF, "socket.so_sndbuf"),
+            (&Setting::FLOW_CONTROL_GROUP_TAG, "flow.control.group.tag"),
+        ] {
+            assert_eq!(name, setting.property, "the property the reference has");
+
+            for prefix in ["deepmsg.", "aeron."] {
+                assert_eq!(
+                    Some(name.to_owned()),
+                    lookup(
+                        &[(format!("{prefix}{name}"), name.to_owned())],
+                        &env,
+                        setting
+                    ),
+                    "{prefix}{name} is read"
+                );
+            }
+        }
+
+        // And the macro's name is not one of them.
+        assert_eq!(
+            None,
+            lookup(
+                &[(
+                    "aeron.to.conductor.buffer.length".to_owned(),
+                    "1".to_owned()
+                )],
+                &env,
+                &Setting::TO_CONDUCTOR_BUFFER_LENGTH
+            )
         );
     }
 
@@ -3818,7 +3941,7 @@ mod tests {
         // the one the deployment configured should say so at start-up.
         let error = resolve(&[
             ("deepmsg.dir", "/tmp/x"),
-            ("deepmsg.counters.values.buffer.length", "512k"),
+            ("deepmsg.counters.buffer.length", "512k"),
         ])
         .expect_err("below the reference's floor");
 
@@ -3934,10 +4057,66 @@ mod tests {
         }
 
         assert_eq!("sleep-ns", config.native_resource_agent_idle.name);
+        assert_eq!(
+            Some("1ms".to_owned()),
+            config.native_resource_agent_idle.init_args,
+            "the one slot whose default arguments are not the strategy's own. \
+             Sleeping with none sleeps a nanosecond (`aeron_agent.c:56-59`), \
+             which is a busy spin wearing a sleep's name; the reference's \
+             caller supplies `1ms` instead (`aeron_driver_context.c:1205-1207`)"
+        );
         assert!(matches!(
             config.native_resource_agent_idle.strategy(),
             Some(crate::idle::Strategy::Sleeping(_))
         ));
+    }
+
+    /// Naming the strategy — **even the very strategy the slot defaults to** —
+    /// hands the slot back to that strategy's own default arguments.
+    ///
+    /// The reference's caller injects `"1ms"` only while the name is unset
+    /// (`aeron_driver_context.c:1205-1207`), so a named `sleep-ns` sleeps one
+    /// nanosecond there (`aeron_agent.c:56-59`), and Java reaches the same
+    /// place by another road: its one-millisecond strategy is built outright
+    /// only when the property is empty (`Configuration.java:2081-2089`). The
+    /// condition is the reference's behavior, not an artifact, so it is kept.
+    #[test]
+    fn naming_the_native_resource_agents_strategy_drops_the_slots_own_arguments() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/x")],
+            &[(
+                "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY",
+                "sleep-ns",
+            )],
+        )
+        .expect("resolve");
+
+        assert_eq!("sleep-ns", config.native_resource_agent_idle.name);
+        assert_eq!(None, config.native_resource_agent_idle.init_args);
+    }
+
+    /// Setting arguments without naming a strategy honours them.
+    ///
+    /// This is the one place the slot parts with the reference, which reads
+    /// `AERON_…_INIT_ARGS` only when the name variable is set and otherwise
+    /// overwrites it with `"1ms"` (`aeron_driver_context.c:1205-1207`). A
+    /// caller who wrote arguments gets them. Recorded in `docs/compat.md`.
+    #[test]
+    fn arguments_without_a_name_are_honoured_rather_than_overwritten() {
+        let config = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/x")],
+            &[(
+                "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS",
+                "250us",
+            )],
+        )
+        .expect("resolve");
+
+        assert_eq!("sleep-ns", config.native_resource_agent_idle.name);
+        assert_eq!(
+            Some("250us".to_owned()),
+            config.native_resource_agent_idle.init_args
+        );
     }
 
     /// The names are the reference's environment variables, two of which are

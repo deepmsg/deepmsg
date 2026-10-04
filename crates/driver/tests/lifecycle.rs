@@ -289,7 +289,7 @@ fn a_signal_during_startup_still_takes_the_clean_path() {
             // Milliseconds, and long enough to still be spinning in half a
             // second — the driver's own create window is what it is waiting for.
             "-Ddeepmsg.driver.timeout=3000",
-            "-Ddeepmsg.counters.values.buffer.length=1m",
+            "-Ddeepmsg.counters.buffer.length=1m",
         ],
     );
 
