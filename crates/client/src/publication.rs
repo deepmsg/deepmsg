@@ -131,6 +131,48 @@ impl Publication {
         appender.append(self.session_id, self.stream_id, position_limit, payload)
     }
 
+    /// Claim `length` **payload** bytes and write into them without copying.
+    ///
+    /// The one thing a publication with more than one producer could not do:
+    /// [`Publication::offer`] copies the payload into the term, where a claim
+    /// hands back a window onto it — Java's `ConcurrentPublication.tryClaim`
+    /// (`aeron-client/src/main/java/io/aeron/ConcurrentPublication.java:312`),
+    /// and `aeron_publication_try_claim`
+    /// (`aeron-client/src/main/c/aeron_publication.c:634-685`) behind it.
+    ///
+    /// Where [`ExclusivePublication::try_claim`] takes the offset this
+    /// publication has been keeping, this one has none to keep: whichever
+    /// producer gets there first takes the space, and the claim is what says
+    /// where. The window is written to and committed with
+    /// [`Claim::frame`]`().publish(..)`, exactly as the exclusive one is.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. `MidRotation` and `EndOfLog` both mean "try again":
+    /// another producer is rotating, and the claim landed in the term it is
+    /// leaving.
+    pub fn try_claim(&self, position_limit: i64, length: usize) -> Result<Claim<'_>, Appended> {
+        // Scoped so the appender's borrow of the log ends before the window's
+        // begins — they are the same mapping, taken mutably.
+        let offset = {
+            let Some(appender) = self.appender() else {
+                return Err(Appended::Malformed);
+            };
+
+            appender.try_claim_shared(self.session_id, self.stream_id, position_limit, length)?
+        };
+
+        let Some(partition) = self.log.active_term_partition() else {
+            return Err(Appended::Malformed);
+        };
+
+        let Some(term) = self.log.term_mut(partition) else {
+            return Err(Appended::Malformed);
+        };
+
+        Ok(Claim { term, offset })
+    }
+
     /// The largest payload one frame can carry on this log.
     pub fn max_payload_length(&self) -> Option<usize> {
         self.appender()

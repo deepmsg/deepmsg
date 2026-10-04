@@ -779,6 +779,124 @@ impl<'a> Appender<'a> {
         ))
     }
 
+    /// Claim `length` **payload** bytes at whatever offset the log is at now.
+    ///
+    /// The shared counterpart of [`Appender::try_claim_exclusive`], for a
+    /// publication with more than one producer. Two things differ, and they are
+    /// the whole of what makes it safe for several producers at once:
+    ///
+    /// * the offset is **read** from the active term rather than handed in,
+    ///   because a shared producer has no offset of its own to hand in —
+    ///   whatever it wrote last belongs to whoever got there first
+    ///   (`aeron_publication_try_claim`, `aeron-publication.c:634-685`);
+    /// * it is taken with a **fetch-and-add** on that term's tail counter
+    ///   (`aeron_publication_get_and_add_raw_tail`, `:182-183`), where the
+    ///   exclusive one is a plain store.
+    ///
+    /// Returns the **term offset the claim starts at** — the one number the
+    /// caller could not have known. The frame header is written here, so that
+    /// offset is all that is needed to build a window over the claim.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. [`Appended::MidRotation`] is the one that means "try
+    /// again": another producer rotated between the count and the tail it named.
+    pub fn try_claim_shared(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        length: usize,
+    ) -> Result<usize, Appended> {
+        // The entry, in the reference's order and for its reason: the count
+        // first, then the tail that count names, and only then a position. The
+        // pair is checked against itself because another producer may be
+        // rotating right now — the count advanced while the tail still carries
+        // the old term id — and a position computed from a disagreeing pair is
+        // nonsense.
+        let Some(term_count) = self.active_term_count() else {
+            return Err(Appended::Malformed);
+        };
+        let Some(tail) = self.tail_at(position::index_by_term_count(term_count)) else {
+            return Err(Appended::Malformed);
+        };
+        let term_id = tail.term_id();
+
+        if term_count != position::term_count(term_id, self.initial_term_id) {
+            return Err(Appended::MidRotation);
+        }
+
+        let term_offset = tail.term_offset(self.term_length);
+        let position = Position::new(
+            term_id,
+            term_offset,
+            self.bits_to_shift,
+            self.initial_term_id,
+        );
+
+        if position.raw() >= position_limit {
+            return Err(self.back_pressure(position, length));
+        }
+
+        // A claim is one frame, so the bound is the payload maximum rather than
+        // the message maximum — the reference refuses a longer claim outright
+        // instead of fragmenting it (`aeron_publication.c:645-653`).
+        if length > self.max_payload_length {
+            return Err(Appended::MessageTooLarge);
+        }
+
+        let Some(frame_length) = i32::try_from(length + DATA_HEADER_LENGTH).ok() else {
+            return Err(Appended::Malformed);
+        };
+
+        let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+
+        // The claim is the **only** source of where this lands. Another
+        // producer may have taken the bytes the entry read named, so the tail
+        // it returns decides both the offset and the term — using the entry's
+        // instead is how one producer's frame ends up on top of another's
+        // (`aeron_publication.c:182-186`).
+        let Some(claimed) = self.claim(
+            position::index_by_term_count(term_count),
+            i64::from(aligned_length),
+        ) else {
+            return Err(Appended::Malformed);
+        };
+
+        let claimed_offset = claimed.term_offset(self.term_length);
+        let claimed_term_id = claimed.term_id();
+        let resulting_offset = claimed_offset.saturating_add(aligned_length);
+
+        if resulting_offset > self.term_length {
+            let end_position = Position::new(
+                claimed_term_id,
+                resulting_offset,
+                self.bits_to_shift,
+                self.initial_term_id,
+            );
+
+            return Err(self.handle_end_of_log(claimed_offset, claimed_term_id, end_position));
+        }
+
+        let frame = Frame::new(&self.term, usize::try_from(claimed_offset).unwrap_or(0));
+        if frame
+            .begin(
+                frame_length,
+                FLAG_UNFRAGMENTED,
+                TYPE_DATA,
+                claimed_offset,
+                session_id,
+                stream_id,
+                claimed_term_id,
+            )
+            .is_none()
+        {
+            return Err(Appended::Malformed);
+        }
+
+        usize::try_from(claimed_offset).map_err(|_| Appended::Malformed)
+    }
+
     /// Append a padding frame of `length` **payload** bytes at the caller's
     /// offset (`aeron_append_padding`, `aeron_exclusive_publication.c:356-388`).
     ///
@@ -1454,6 +1572,104 @@ mod tests {
         assert_eq!(frame_length, length);
         assert_eq!(TYPE_DATA, type_id);
         assert_eq!(payload.to_vec(), read_back);
+    }
+
+    /// A shared claim reads the offset it is at, and takes it.
+    ///
+    /// The two things that separate it from the exclusive one: the offset is
+    /// **read** rather than handed in — a shared producer has none of its own —
+    /// and it is taken with a **fetch-and-add**, so a second claim lands after
+    /// the first rather than on top of it.
+    #[test]
+    fn a_shared_claim_reads_its_offset_and_takes_that_space() {
+        let mut log = Log::new();
+        log.set_tail(initial_term_id(), 0, 0);
+
+        let first = b"the first claim";
+        let second = b"and the second";
+
+        let frame_length =
+            |payload: &[u8]| i32::try_from(payload.len() + DATA_HEADER_LENGTH).expect("small");
+        let aligned = |payload: &[u8]| {
+            usize::try_from(position::align_up(
+                frame_length(payload),
+                descriptor::FRAME_ALIGNMENT,
+            ))
+            .expect("positive")
+        };
+
+        let (first_offset, second_offset) = {
+            let appender = log.appender();
+
+            (
+                appender
+                    .try_claim_shared(11, 22, i64::MAX, first.len())
+                    .expect("the first claim"),
+                appender
+                    .try_claim_shared(11, 22, i64::MAX, second.len())
+                    .expect("the second claim"),
+            )
+        };
+
+        assert_eq!(0, first_offset, "an empty log is claimed from its start");
+        assert_eq!(
+            aligned(first),
+            second_offset,
+            "and the second claim is past the first — which is what the \
+             fetch-and-add buys over the exclusive claim's plain store"
+        );
+
+        {
+            let view = AtomicBuffer::from_slice_mut(&mut log.term.0).expect("aligned");
+
+            for (offset, payload) in [(first_offset, &first[..]), (second_offset, &second[..])] {
+                let claim = frame::Frame::new(&view, offset);
+
+                assert_eq!(
+                    Some(-frame_length(payload)),
+                    claim.frame_length(),
+                    "a claim is not readable until its writer publishes it"
+                );
+
+                claim.write_payload(payload).expect("in range");
+                claim.publish(frame_length(payload)).expect("in range");
+            }
+        }
+
+        for (offset, expected) in [(first_offset, &first[..]), (second_offset, &second[..])] {
+            let (length, type_id, payload) = log.read_frame(offset);
+
+            assert_eq!(frame_length(expected), length);
+            assert_eq!(TYPE_DATA, type_id);
+            assert_eq!(expected.to_vec(), payload);
+        }
+    }
+
+    /// A shared claim past the window is classified the way any other append is
+    /// — the caller retries rather than writing into space it may not have.
+    #[test]
+    fn a_shared_claim_past_the_window_is_refused() {
+        let mut log = Log::new();
+        log.set_tail(initial_term_id(), 0, 0);
+        // Somebody is listening, so a full window reads as back-pressure rather
+        // than as nobody being there — the classifier's own distinction.
+        log.set_connected(true);
+
+        let appender = log.appender();
+
+        assert_eq!(
+            Appended::BackPressured,
+            appender
+                .try_claim_shared(11, 22, 0, 16)
+                .expect_err("a window of zero admits nothing")
+        );
+
+        assert_eq!(
+            Appended::MessageTooLarge,
+            appender
+                .try_claim_shared(11, 22, i64::MAX, usize::MAX)
+                .expect_err("a claim is one frame, so it cannot be fragmented")
+        );
     }
 
     #[test]

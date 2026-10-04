@@ -189,13 +189,73 @@ fn reaps_a_client_that_stops_polling() {
         .add_subscription("aeron:ipc", 1003, DEFAULT_TIMEOUT)
         .expect("subscribe");
 
-    // Stop entirely. The subscription, the heartbeat counter and the client
-    // record all go with it.
-    drop(client);
-
+    // Stop polling — and stay **alive**, because those are different things
+    // here. Dropping the client sends `CLIENT_CLOSE`, and a driver announces no
+    // timeout for a client that said goodbye, so dropping it would test the
+    // close rather than the keepalive. The client is held to the end of the
+    // function, silent; the subscription, the heartbeat counter and the client
+    // record go when the driver decides they should.
     assert!(
         wait_for_timeout(&reference, client_id, Duration::from_secs(10)),
         "the driver should reap a client that stopped polling"
+    );
+
+    drop(client);
+}
+
+/// Watch the counters until `client_id`'s heartbeat counter is gone.
+///
+/// The counter is the driver's record of the client: it is allocated when the
+/// client is first seen and freed when the client is reaped, so its absence is
+/// the reap itself rather than a symptom of it.
+fn wait_for_reap(reference: &ReferenceDriver, client_id: i64, within: Duration) -> bool {
+    let start = Instant::now();
+
+    while start.elapsed() < within {
+        if let Ok(cnc) = CncFile::try_open(reference.aeron_dir()) {
+            if let Some(counters) = cnc.counters() {
+                if counters
+                    .find_by_type_and_registration(CLIENT_HEARTBEAT_TYPE_ID, client_id)
+                    .is_none()
+                {
+                    return true;
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    false
+}
+
+/// A client that says goodbye is collected at once, not at the end of the
+/// liveness timeout.
+///
+/// The **default** ten-second liveness is what makes this discriminative: a
+/// client that merely went quiet would still be here when the window closes.
+/// Dropping the client sends `CLIENT_CLOSE`, the driver zeroes the heartbeat
+/// counter with it (`aeron_driver_conductor_on_client_close`), and the counter
+/// reads as long past its deadline on the next tier — so the client and
+/// everything it owned come back in about a second.
+#[test]
+fn a_client_that_closes_is_collected_without_waiting_out_the_timeout() {
+    let Some((reference, _cnc)) = start("client-close", &[]) else {
+        return;
+    };
+
+    let mut client = Client::connect(reference.aeron_dir()).expect("connect");
+    let client_id = client.client_id();
+    let _ = client
+        .add_subscription("aeron:ipc", 1004, DEFAULT_TIMEOUT)
+        .expect("subscribe");
+
+    drop(client);
+
+    assert!(
+        wait_for_reap(&reference, client_id, Duration::from_secs(4)),
+        "the driver should collect a client that closed rather than hold it for \
+         its ten-second liveness timeout"
     );
 }
 

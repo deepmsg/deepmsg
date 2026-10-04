@@ -21,13 +21,36 @@
 //! (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`), and that is
 //! what this does.
 //!
-//! # One response per poll, and why that is load-bearing
+//! # One response per poll
 //!
-//! [`Client::poll`] takes at most one message off the broadcast per call. That
-//! is not a simplification: the driver sends `ON_SUBSCRIPTION_READY` and then,
-//! if a matching publication already exists, `ON_AVAILABLE_IMAGE` for it. The
-//! image is matched against a subscription this type only registers *after* the
-//! ready response is seen, so draining both in one call would drop the image.
+//! [`Client::poll`] takes at most one message off the broadcast per call, which
+//! is what the reference's client does — `aeron_client_conductor_do_work` reads
+//! one record with `aeron_broadcast_receiver_receive` and returns
+//! (`aeron-client/src/main/c/aeron_client_conductor.c:2714-2734`) — and it is
+//! what makes the return value a work count an idle strategy can use.
+//!
+//! It used to carry more weight than that. The driver sends
+//! `ON_SUBSCRIPTION_READY` and then, if a matching publication already exists,
+//! `ON_AVAILABLE_IMAGE` for it; an image that arrived before this type had
+//! registered the subscription had nowhere to go, and reading one message per
+//! call was what kept the two apart. That hazard is now closed at the source —
+//! a subscription is registered *before* its ready response is awaited, see
+//! [`Client::add_subscription`] — so the image attaches whichever order they
+//! arrive in.
+//!
+//! # The client-side conductor (M04)
+//!
+//! What the reference divides between `Aeron` and `ClientConductor`
+//! (`aeron-client/src/main/java/io/aeron/ClientConductor.java`, and the C
+//! `aeron_client_conductor.c` it mirrors) is one type here: the duty cycle that
+//! drains driver events and refreshes the liveness heartbeat, the registration
+//! and removal of publications, subscriptions and counters, driver-death
+//! detection and the forced close that follows it, and the close handshake that
+//! sends `CLIENT_CLOSE`.
+//!
+//! The reference's split buys a thin user-facing handle over a thick conductor.
+//! This has no separate handle to keep thin, and a `conductor` module holding
+//! the promise of that split and no code was removed rather than left as one.
 
 use std::ffi::OsStr;
 use std::io;
@@ -38,12 +61,13 @@ use std::time::{Duration, Instant};
 use deepmsg_cnc::command::{
     ADD_COUNTER_TYPE_ID, ADD_DESTINATION_TYPE_ID, ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
     ADD_PUBLICATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_STATIC_COUNTER_TYPE_ID,
-    ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription, Correlated,
+    ADD_SUBSCRIPTION_TYPE_ID, AddCounter, AddPublication, AddSubscription,
+    CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED, CLIENT_CLOSE_TYPE_ID, Correlated,
     DestinationByIdCommand, DestinationCommand, GET_NEXT_AVAILABLE_SESSION_ID_TYPE_ID,
     GetNextAvailableSessionId, REJECT_IMAGE_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
     REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
-    encode_add_static_counter, encode_reject_image,
+    encode_add_static_counter, encode_client_close, encode_reject_image,
 };
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
@@ -52,7 +76,8 @@ use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver
 use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::Message;
 use crate::image::{Fragment, Image};
-use crate::publication::{ExclusivePublication, Publication};
+use crate::image_event::ImageEvent;
+use crate::publication::{Claim, ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
 use crate::subscription::Subscription;
 
@@ -259,8 +284,10 @@ pub const DRIVER_TIMEOUT_MS: i64 = 10 * 1000;
 /// What a completed command handed back.
 #[derive(Debug)]
 enum Ready {
-    /// A subscription exists.
-    Subscription { channel_status_indicator_id: i32 },
+    /// A subscription exists. Its channel-status counter id is not carried
+    /// here: it is written onto the subscription, which is already registered by
+    /// the time this arrives.
+    Subscription,
     /// A publication exists, and its log buffer can now be mapped.
     Publication {
         registration_id: i64,
@@ -295,6 +322,55 @@ enum Ready {
     /// The command's work is done, and there is nothing to hand back — a
     /// removal's acknowledgement.
     OperationSucceeded,
+}
+
+/// A handle on an `ADD_*` that has been sent and not yet answered.
+///
+/// Returned by [`Client::async_add_subscription`] and the two publication
+/// twins, and consumed by [`Client::async_add_poll`] and
+/// [`Client::async_add_cancel`]. What it holds is the registration id the
+/// command drew, which is also the id the resource will have — so a handle is
+/// enough to find the resource once the poll says it is there.
+///
+/// The reference's handle is a pointer to a struct that carries its own
+/// status; this one carries the id and lets the [client](Client) hold the
+/// status, because the client already holds it for every other command. The
+/// difference is visible in one place: polling an id this client is not waiting
+/// on answers [`AsyncAddPoll::Unknown`] rather than reading a stale status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncAdd {
+    registration_id: i64,
+}
+
+impl AsyncAdd {
+    /// The registration id the `ADD_*` drew — and the id the resource has, if
+    /// it arrived.
+    pub const fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+}
+
+/// What [`Client::async_add_poll`] found.
+///
+/// Not `Clone` or `PartialEq`, because [`CommandError`] is neither — it can
+/// carry an [`io::Error`], which is not comparable.
+#[derive(Debug)]
+pub enum AsyncAddPoll {
+    /// The driver has not answered yet. Poll again later.
+    Awaiting,
+    /// It answered, and the resource is in this client's list under
+    /// [`AsyncAdd::registration_id`] — [`Client::subscription`],
+    /// [`Client::publication`] or [`Client::exclusive_publication`] whichever
+    /// kind it was.
+    Ready,
+    /// The driver refused it, or the deadline passed before it answered.
+    ///
+    /// A subscription that failed this way is taken out of the client's list,
+    /// so nothing is left looking like a subscription that works.
+    Failed(CommandError),
+    /// This handle is not one this client is waiting on: it was already
+    /// polled, or cancelled, or never came from this client.
+    Unknown,
 }
 
 /// A pending command, waiting for the response that completes it.
@@ -333,6 +409,14 @@ pub struct Client {
     /// which is why they are kept rather than dropped: a publisher that never
     /// looks loses the only notice it gets.
     publication_errors: Vec<PublicationErrorEvent>,
+    /// Images that appeared under, or left, a subscription, and nobody has
+    /// drained yet.
+    ///
+    /// The reference calls a handler for each of these
+    /// (`AvailableImageHandler`/`UnavailableImageHandler`, registered per
+    /// subscription — `Aeron.java:417`); here they are a queue for the same
+    /// reason [`CounterEvent`] is.
+    image_events: Vec<ImageEvent>,
     /// Found lazily: the driver allocates it when it first sees `client_id`,
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
@@ -343,6 +427,13 @@ pub struct Client {
     /// cleared: everything it would do afterwards is work for a driver that is
     /// not there.
     terminated: Option<ClientError>,
+    /// Set once by [`Client::close`], and never cleared.
+    ///
+    /// It makes the close idempotent, and keeps [`Drop`] from sending a second
+    /// `CLIENT_CLOSE` for a client that already said goodbye — the reference
+    /// guards its close the same way (`IS_CLOSED_VH.compareAndSet`,
+    /// `Aeron.java:278`).
+    closed: bool,
 }
 
 impl Client {
@@ -407,10 +498,12 @@ impl Client {
             counter_events: Vec::new(),
             static_counters: Vec::new(),
             publication_errors: Vec::new(),
+            image_events: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
             orphan_images: 0,
             terminated: None,
+            closed: false,
         })
     }
 
@@ -470,6 +563,49 @@ impl Client {
     /// Messages discarded because the driver overwrote them mid-read.
     pub const fn discarded(&self) -> u64 {
         self.receiver.discarded()
+    }
+
+    /// Tell the driver this client is going away, and stop using it.
+    ///
+    /// A `CLIENT_CLOSE` is the whole of the message. The driver marks the
+    /// client closed and zeroes its heartbeat counter
+    /// (`aeron_driver_conductor_on_client_close`,
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6321-6331`), which is
+    /// what stops it being waited on — so a client that says goodbye is
+    /// collected, rather than held for the driver's liveness timeout with its
+    /// counters, publications and images still allocated. For an IPC-only
+    /// client that is ten seconds of the driver's memory and of the log buffers
+    /// it is holding open.
+    ///
+    /// The reference closes the same way: Java from `Aeron.close()`
+    /// (`Aeron.java:276`, guarded by a compare-and-set so a second call does
+    /// nothing, `:278`), and C from `aeron_close` (`aeron_client.c:180`) via
+    /// `aeron_client_conductor_on_cmd_client_close`
+    /// (`aeron_client_conductor.c:1888-1891`).
+    ///
+    /// There is no reply, so nothing here waits for one. Idempotent, and called
+    /// by [`Drop`] — a caller that wants the driver told before the client goes
+    /// out of scope, or wants to be sure the command reached the ring, calls
+    /// this itself; a destructor can report nothing.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        self.closed = true;
+
+        // Best effort, and deliberately: a driver that has already gone is the
+        // ordinary reason this fails, and that is the state the caller was
+        // trying to reach anyway. The reference swallows it too —
+        // `DriverProxy.clientClose` does nothing at all when its claim fails
+        // (`aeron-client/src/main/java/io/aeron/DriverProxy.java:463-465`).
+        let _ = self.write_command(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
+    }
+
+    /// Whether this client has closed — by an explicit [`Client::close`] or by
+    /// going out of scope.
+    pub const fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// The subscriptions this client holds.
@@ -551,6 +687,27 @@ impl Client {
         std::mem::take(&mut self.publication_errors)
     }
 
+    /// Images that appeared under, or left, a subscription since the last
+    /// drain, and take them.
+    ///
+    /// An image is only ever found through a subscription, so this is the only
+    /// way to learn that one arrived without walking every subscription's image
+    /// list every duty cycle. Each event names the image by the ids the
+    /// protocol used; the image itself is
+    /// [`Subscription::image`](crate::subscription::Subscription::image) while
+    /// it is available.
+    ///
+    /// The reference calls a handler per image instead — one pair registered
+    /// per subscription, and a default pair on the context
+    /// (`Aeron.Context.availableImageHandler`, `Aeron.java:1650`) — which a
+    /// poll-driven client has no thread to run. See [`ImageEvent`] for the rest
+    /// of the divergence.
+    ///
+    /// Nothing bounds the queue, as with [`Client::counter_events`].
+    pub fn image_events(&mut self) -> Vec<ImageEvent> {
+        std::mem::take(&mut self.image_events)
+    }
+
     /// Run one duty cycle: refresh the heartbeat, then take at most one
     /// response.
     ///
@@ -597,6 +754,47 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
+        let correlation_id = self.submit_add_subscription(channel, stream_id, timeout)?;
+
+        match self.wait(correlation_id) {
+            Ok(Ready::Subscription) => Ok(correlation_id),
+            // Unregistered again, so that a subscription the driver refused —
+            // or never answered for — is not left looking like one that works.
+            // Java leaves its map entry behind here; this does not.
+            Ok(_) => {
+                self.forget_subscription(correlation_id);
+                Err(CommandError::Encoding)
+            }
+            Err(error) => {
+                self.forget_subscription(correlation_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Send an `ADD_SUBSCRIPTION` and register the subscription it will make.
+    ///
+    /// Shared by [`Client::add_subscription`] and
+    /// [`Client::async_add_subscription`], which differ only in whether they
+    /// wait for the answer.
+    ///
+    /// The subscription is registered **before** the response is awaited, which
+    /// is the reference's order on both sides: Java puts it into its map and
+    /// only then awaits (`ClientConductor.java:749-750`), and C creates it
+    /// inside the ready handler itself (`aeron_client_conductor.c:625-652`).
+    ///
+    /// Registering after the wait instead would leave a gap one message wide: a
+    /// driver that emits `ON_AVAILABLE_IMAGE` for a subscription before its
+    /// ready response would have the image find nothing to attach to, and an
+    /// image that finds no subscription is dropped rather than deferred. The
+    /// channel-status counter id is not known yet — it arrives with the
+    /// response, and is written onto the subscription there.
+    fn submit_add_subscription(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = AddSubscription {
@@ -617,19 +815,11 @@ impl Client {
 
         self.send(ADD_SUBSCRIPTION_TYPE_ID, &payload, correlation_id, timeout)?;
 
-        let ready = self.wait(correlation_id)?;
-        let Ready::Subscription {
-            channel_status_indicator_id,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
-        };
-
         self.subscriptions.push(Subscription::new(
             correlation_id,
             channel.to_owned(),
             stream_id,
-            channel_status_indicator_id,
+            CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
         ));
 
         Ok(correlation_id)
@@ -653,49 +843,10 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
-        let correlation_id = self.next_correlation_id()?;
+        let registration_id = self.submit_add_publication(false, channel, stream_id, timeout)?;
+        let ready = self.wait(registration_id)?;
 
-        let command = AddPublication {
-            client_id: self.client_id,
-            correlation_id,
-            stream_id,
-            channel,
-        };
-
-        let mut payload = vec![0u8; command.encoded_length()];
-        if !command.encode_into(&mut payload) {
-            return Err(CommandError::Encoding);
-        }
-
-        self.send(ADD_PUBLICATION_TYPE_ID, &payload, correlation_id, timeout)?;
-
-        let ready = self.wait(correlation_id)?;
-        let Ready::Publication {
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-            log_file,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
-        };
-
-        let publication = Publication::open(
-            &log_file,
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-        )
-        .map_err(|source| CommandError::LogBuffer {
-            path: log_file,
-            source,
-        })?;
-
-        self.publications.push(publication);
+        self.adopt_publication(ready)?;
 
         Ok(registration_id)
     }
@@ -718,6 +869,28 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
+        let registration_id = self.submit_add_publication(true, channel, stream_id, timeout)?;
+        let ready = self.wait(registration_id)?;
+
+        self.adopt_publication(ready)?;
+
+        Ok(registration_id)
+    }
+
+    /// Send an `ADD_PUBLICATION` or its exclusive twin.
+    ///
+    /// Shared by the four publication entry points — the blocking pair and the
+    /// asynchronous pair — which differ in which type id they use and whether
+    /// they wait for the answer. Nothing is registered here: a publication is
+    /// only real once its log buffer has been mapped, and that cannot happen
+    /// before the response names the file.
+    fn submit_add_publication(
+        &mut self,
+        exclusive: bool,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = AddPublication {
@@ -732,42 +905,258 @@ impl Client {
             return Err(CommandError::Encoding);
         }
 
-        self.send(
-            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID,
-            &payload,
-            correlation_id,
-            timeout,
-        )?;
-
-        let ready = self.wait(correlation_id)?;
-        let Ready::ExclusivePublication {
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-            log_file,
-        } = ready
-        else {
-            return Err(CommandError::Encoding);
+        let type_id = if exclusive {
+            ADD_EXCLUSIVE_PUBLICATION_TYPE_ID
+        } else {
+            ADD_PUBLICATION_TYPE_ID
         };
 
-        let publication = ExclusivePublication::open(
-            &log_file,
-            registration_id,
-            session_id,
-            stream_id,
-            position_limit_counter_id,
-            channel_status_indicator_id,
-        )
-        .map_err(|source| CommandError::LogBuffer {
-            path: log_file,
-            source,
-        })?;
+        self.send(type_id, &payload, correlation_id, timeout)?;
 
-        self.exclusive_publications.push(publication);
+        Ok(correlation_id)
+    }
 
-        Ok(registration_id)
+    /// Map the log buffer a ready response named, and keep the publication.
+    ///
+    /// The last step of every publication acceptance, blocking or not. The
+    /// driver has created the file by the time it answers, so a failure here is
+    /// the client's rather than the driver's — a path that is not there, or
+    /// holds no usable metadata — which is why it is
+    /// [`CommandError::LogBuffer`] and not a refusal.
+    fn adopt_publication(&mut self, ready: Ready) -> Result<(), CommandError> {
+        match ready {
+            Ready::Publication {
+                registration_id,
+                session_id,
+                stream_id,
+                position_limit_counter_id,
+                channel_status_indicator_id,
+                log_file,
+            } => {
+                let publication = Publication::open(
+                    &log_file,
+                    registration_id,
+                    session_id,
+                    stream_id,
+                    position_limit_counter_id,
+                    channel_status_indicator_id,
+                )
+                .map_err(|source| CommandError::LogBuffer {
+                    path: log_file,
+                    source,
+                })?;
+
+                self.publications.push(publication);
+                Ok(())
+            }
+
+            Ready::ExclusivePublication {
+                registration_id,
+                session_id,
+                stream_id,
+                position_limit_counter_id,
+                channel_status_indicator_id,
+                log_file,
+            } => {
+                let publication = ExclusivePublication::open(
+                    &log_file,
+                    registration_id,
+                    session_id,
+                    stream_id,
+                    position_limit_counter_id,
+                    channel_status_indicator_id,
+                )
+                .map_err(|source| CommandError::LogBuffer {
+                    path: log_file,
+                    source,
+                })?;
+
+                self.exclusive_publications.push(publication);
+                Ok(())
+            }
+
+            _ => Err(CommandError::Encoding),
+        }
+    }
+
+    /// Send an `ADD_SUBSCRIPTION` and return without waiting for the answer.
+    ///
+    /// The subscription is in this client's list as soon as this returns — it
+    /// is registered before the answer is awaited, as
+    /// [`Client::add_subscription`] explains — but whether the driver accepted
+    /// it is not known until [`Client::async_add_poll`] says so.
+    ///
+    /// The reference's asynchronous adds are these three
+    /// (`aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:605`;
+    /// `aeron_async_add_publication`, `:492`;
+    /// `aeron_async_add_exclusive_publication`, `:546`), each with a poll and a
+    /// cancel beside it. Java's return the registration id instead and leave
+    /// the resource to be found by it (`Aeron.asyncAddSubscription`,
+    /// `Aeron.java:451`), which cannot report a *failed* add at all. This is the
+    /// C shape, the authority where both exist.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be built or written. A refusal
+    /// by the driver arrives later, through [`Client::async_add_poll`].
+    pub fn async_add_subscription(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_subscription(channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// Send an `ADD_PUBLICATION` and return without waiting for the answer.
+    ///
+    /// The publication is **not** in this client's list until
+    /// [`Client::async_add_poll`] has mapped its log buffer: a publication
+    /// exists only once its file does, and the response is what names the file.
+    pub fn async_add_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_publication(false, channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// The same, for a publication with one producer
+    /// (`ON_EXCLUSIVE_PUBLICATION_READY`).
+    pub fn async_add_exclusive_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_publication(true, channel, stream_id, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// What has become of an [`AsyncAdd`] — and the last step of accepting it.
+    ///
+    /// Polling consumes the answer: a completed add leaves the pending list, so
+    /// a second poll of the same handle answers [`AsyncAddPoll::Unknown`]. The
+    /// reference marks its handle `POLL_COMPLETED` and answers `-1` to a second
+    /// poll (`aeron_client_conductor_async_resource_poll`,
+    /// `aeron_client_conductor.c:3675-3775`); the difference is that it keeps the
+    /// handle and this keeps the state.
+    ///
+    /// A publication is mapped **here** rather than when the response was read,
+    /// because a poll is where the caller is — and because a mapping that fails
+    /// is the caller's to hear about, not something to meet later as a
+    /// missing resource.
+    ///
+    /// [`Client::poll`] has to have run for a driver response to have been read,
+    /// as it does for every other reply.
+    pub fn async_add_poll(&mut self, add: AsyncAdd) -> AsyncAddPoll {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == add.registration_id)
+        else {
+            return AsyncAddPoll::Unknown;
+        };
+
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return AsyncAddPoll::Awaiting;
+        };
+
+        self.pending.swap_remove(index);
+
+        match outcome {
+            Ok(Ready::Subscription) => AsyncAddPoll::Ready,
+
+            Ok(ready @ (Ready::Publication { .. } | Ready::ExclusivePublication { .. })) => {
+                match self.adopt_publication(ready) {
+                    Ok(()) => AsyncAddPoll::Ready,
+                    Err(error) => AsyncAddPoll::Failed(error),
+                }
+            }
+
+            Ok(_) => AsyncAddPoll::Failed(CommandError::Encoding),
+
+            Err(error) => {
+                // A subscription whose add failed comes back out: it was
+                // registered on the way in, and leaving it would report one the
+                // driver never made.
+                self.forget_subscription(add.registration_id);
+                AsyncAddPoll::Failed(error)
+            }
+        }
+    }
+
+    /// Give up on an [`AsyncAdd`].
+    ///
+    /// The reference's cancel is a **remove**:
+    /// `aeron_async_add_subscription_cancel` sends
+    /// `aeron_async_remove_subscription` for the registration the add drew
+    /// (`aeron_client.c:428-443`), because by the time it can be called the
+    /// command is already in the ring and the only way back is another command.
+    /// That is what this does, and it does not wait for the removal's answer —
+    /// the caller asked to give up, not to hear how the driver took it.
+    ///
+    /// Anything the add had already put in this client's list comes back out,
+    /// so a cancelled add stops being visible at the same moment.
+    pub fn async_add_cancel(&mut self, add: AsyncAdd) -> Result<(), CommandError> {
+        let correlation_id = self.next_correlation_id()?;
+
+        // Which kind it was is not in the handle, and does not need to be: a
+        // subscription add registers its subscription immediately while a
+        // publication add registers nothing, so what this client holds is what
+        // the add was. A publication add whose response never came holds
+        // nothing, and the remove below still names it by the id the driver
+        // knows it by.
+        let subscription = self.forget_subscription(add.registration_id);
+        self.forget_publication(add.registration_id);
+        self.forget_exclusive_publication(add.registration_id);
+
+        let (type_id, payload) = if subscription {
+            let command = deepmsg_cnc::command::RemoveSubscription {
+                correlated: deepmsg_cnc::command::Correlated {
+                    client_id: self.client_id,
+                    correlation_id,
+                },
+                registration_id: add.registration_id,
+            };
+
+            let mut payload = vec![0u8; deepmsg_cnc::command::RemoveSubscription::encoded_length()];
+            if !command.encode_into(&mut payload) {
+                return Err(CommandError::Encoding);
+            }
+
+            (deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID, payload)
+        } else {
+            let command = deepmsg_cnc::command::RemovePublication {
+                correlated: deepmsg_cnc::command::Correlated {
+                    client_id: self.client_id,
+                    correlation_id,
+                },
+                registration_id: add.registration_id,
+                flags: 0,
+            };
+
+            let mut payload = vec![0u8; deepmsg_cnc::command::RemovePublication::encoded_length()];
+            if !command.encode_into(&mut payload) {
+                return Err(CommandError::Encoding);
+            }
+
+            (deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID, payload)
+        };
+
+        // The add is no longer waited for, so its answer — if it comes — is
+        // answered by nobody, which the client already handles as an
+        // unsolicited response.
+        self.pending
+            .retain(|pending| pending.correlation_id != add.registration_id);
+
+        self.write_command(type_id, &payload)
     }
 
     /// Offer to an exclusive publication.
@@ -1162,7 +1551,10 @@ impl Client {
             return Err(CommandError::Encoding);
         };
 
+        // Either list, because the driver keys a publication by registration id
+        // and not by how many producers it has.
         self.forget_publication(registration_id);
+        self.forget_exclusive_publication(registration_id);
 
         Ok(())
     }
@@ -1244,6 +1636,25 @@ impl Client {
         // to call this at all — and the observable that says a publication is
         // closed is that [`Self::publication`] no longer answers with it.
         let _ = self.publications.swap_remove(index);
+
+        true
+    }
+
+    /// The same for a publication with one producer, which is a different list.
+    ///
+    /// A removal names a publication by registration id and the driver does not
+    /// care which kind it was, so the caller of one never has to know either —
+    /// which is why [`Client::remove_publication`] looks in both.
+    fn forget_exclusive_publication(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .exclusive_publications
+            .iter()
+            .position(|publication| publication.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        let _ = self.exclusive_publications.swap_remove(index);
 
         true
     }
@@ -1463,6 +1874,42 @@ impl Client {
         Some(publication.offer(limit, payload))
     }
 
+    /// Claim `length` bytes of a **shared** publication, to write into.
+    ///
+    /// [`Client::offer`] for a caller that wants to produce the bytes in place
+    /// rather than copy them in: the answer is a window onto the term, written
+    /// to and committed with [`Claim::frame`]`().publish(..)`. Java's
+    /// `ConcurrentPublication.tryClaim`
+    /// (`aeron-client/src/main/java/io/aeron/ConcurrentPublication.java:312`).
+    ///
+    /// The window limit is read from the driver's counter here and per call, for
+    /// the reason [`Client::offer`] gives — it is the only thing between a
+    /// producer and a subscriber that has not read yet, and caching it is how a
+    /// producer outruns its consumer.
+    ///
+    /// `None` when this client holds no such publication; otherwise the claim's
+    /// outcome, where `EndOfLog` and `MidRotation` mean **try again** — another
+    /// producer is rotating, and the claim landed in the term it is leaving.
+    ///
+    /// [`Client::exclusive_publication`] has its own
+    /// [`ExclusivePublication::try_claim`], which takes the offset it has been
+    /// keeping; this one has none to take, and the log decides.
+    pub fn try_claim(
+        &self,
+        registration_id: i64,
+        length: usize,
+    ) -> Option<Result<Claim<'_>, deepmsg_core::logbuffer::append::Appended>> {
+        let publication = self.publication(registration_id)?;
+
+        let limit = self
+            .cnc
+            .counters()
+            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+            .unwrap_or(0);
+
+        Some(publication.try_claim(limit, length))
+    }
+
     /// Read up to `fragment_limit` fragments from one image.
     ///
     /// Returns how many were delivered, or `None` if there is no such
@@ -1556,6 +2003,54 @@ impl Client {
         messages
     }
 
+    /// Read up to `fragment_limit` fragments from every image of a
+    /// subscription, and deliver them **as they lie in the term**.
+    ///
+    /// [`Client::poll_subscription`] delivers whole messages and reassembles
+    /// fragments to do it, which costs a copy for every message that arrived in
+    /// more than one frame. This delivers the frames themselves, with nothing
+    /// copied and nothing held across calls — Java's `Subscription.poll`
+    /// (`Subscription.java:188`) and `aeron_subscription_poll` with a fragment
+    /// handler. It is the subscription-level twin of [`Client::poll_image`],
+    /// which reads one image; this reads them all, in image order, up to the
+    /// limit.
+    ///
+    /// A message split across frames is delivered once per frame, and a caller
+    /// that wants messages should use [`Client::poll_subscription`] instead —
+    /// the two share the reader position, so mixing them on one subscription
+    /// leaves the assembler missing whatever the raw poll took.
+    ///
+    /// Returns how many fragments were delivered.
+    pub fn poll_subscription_fragments<F>(
+        &mut self,
+        subscription_id: i64,
+        fragment_limit: usize,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        let Some(subscription) = self
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            return 0;
+        };
+
+        let (fragments, counter_writes) = subscription.poll_fragments(fragment_limit, &mut handler);
+
+        // Published after the poll, never during it — the reason
+        // [`Client::poll_subscription`] gives.
+        if let Some(counters) = self.cnc.counters_writable() {
+            for (counter_id, position) in counter_writes {
+                counters.set_value(counter_id, position);
+            }
+        }
+
+        fragments
+    }
+
     /// Send a command and register it as pending with a deadline.
     fn send(
         &mut self,
@@ -1564,13 +2059,7 @@ impl Client {
         correlation_id: i64,
         timeout: Duration,
     ) -> Result<(), CommandError> {
-        {
-            let ring = self
-                .cnc
-                .to_driver_ring()
-                .ok_or(CommandError::Claim(ClaimError::Invalid))?;
-            ring.write(type_id, payload).map_err(CommandError::Claim)?;
-        }
+        self.write_command(type_id, payload)?;
 
         self.pending.push(Pending {
             correlation_id,
@@ -1579,6 +2068,22 @@ impl Client {
         });
 
         Ok(())
+    }
+
+    /// Write a command and wait for nothing.
+    ///
+    /// Three commands are sent this way: the ones that are answered by nobody
+    /// (`CLIENT_CLOSE`, `TERMINATE_DRIVER`), and a removal sent to give up on an
+    /// add, whose answer the caller did not ask for. An answer to one of these
+    /// arrives with no pending entry to match it, which the client already
+    /// treats as an unsolicited response (`Client::complete`).
+    fn write_command(&self, type_id: i32, payload: &[u8]) -> Result<(), CommandError> {
+        let ring = self
+            .cnc
+            .to_driver_ring()
+            .ok_or(CommandError::Claim(ClaimError::Invalid))?;
+
+        ring.write(type_id, payload).map_err(CommandError::Claim)
     }
 
     /// Drive the loop until `correlation_id` completes or its deadline passes.
@@ -1741,12 +2246,19 @@ impl Client {
                 correlation_id,
                 channel_status_indicator_id,
             } => {
-                self.complete(
-                    correlation_id,
-                    Ok(Ready::Subscription {
-                        channel_status_indicator_id,
-                    }),
-                );
+                // The subscription is registered by now — it goes in before the
+                // ready response is awaited — so the counter id is recorded on
+                // it rather than carried back to the caller. Java does the same
+                // (`ClientConductor.java:396`).
+                if let Some(subscription) = self
+                    .subscriptions
+                    .iter_mut()
+                    .find(|s| s.registration_id() == correlation_id)
+                {
+                    subscription.set_channel_status_indicator_id(channel_status_indicator_id);
+                }
+
+                self.complete(correlation_id, Ok(Ready::Subscription));
             }
             Response::PublicationReady {
                 correlation_id,
@@ -1810,7 +2322,7 @@ impl Client {
                 subscriber_registration_id,
                 subscriber_position_id,
                 log_file,
-                ..
+                source_identity,
             } => {
                 self.attach_image(
                     subscriber_registration_id,
@@ -1819,6 +2331,7 @@ impl Client {
                     stream_id,
                     subscriber_position_id,
                     &path_from_bytes(log_file),
+                    source_identity,
                 );
             }
             Response::UnavailableImage {
@@ -1826,12 +2339,33 @@ impl Client {
                 subscription_registration_id,
                 ..
             } => {
-                if let Some(subscription) = self
+                // The image is read before it is removed, because that is the
+                // only moment it exists — the reference hands its handler the
+                // `Image` for the same reason
+                // (`ClientConductor.onUnavailableImage`, `ClientConductor.java:446-453`).
+                let event = self
                     .subscriptions
                     .iter_mut()
                     .find(|s| s.registration_id() == subscription_registration_id)
-                {
-                    subscription.remove_image(publication_registration_id);
+                    .and_then(|subscription| {
+                        let event = subscription
+                            .image(publication_registration_id)
+                            .map(|image| ImageEvent::Unavailable {
+                                subscription_registration_id,
+                                publication_registration_id,
+                                session_id: image.session_id(),
+                                stream_id: image.stream_id(),
+                                position: image.position(),
+                            });
+
+                        subscription
+                            .remove_image(publication_registration_id)
+                            .then_some(event)
+                            .flatten()
+                    });
+
+                if let Some(event) = event {
+                    self.image_events.push(event);
                 }
             }
             // Not an answer to a command: the driver is telling a client that
@@ -1981,6 +2515,7 @@ impl Client {
     }
 
     /// Map an image's log buffer and attach it to its subscription.
+    #[allow(clippy::too_many_arguments)] // one per field of the message, and two of them are ids
     fn attach_image(
         &mut self,
         subscription_id: i64,
@@ -1989,6 +2524,7 @@ impl Client {
         stream_id: i32,
         subscriber_position_id: i32,
         path: &Path,
+        source_identity: &[u8],
     ) {
         // Where to start reading. The driver writes the join position into the
         // counter as part of linking the subscription
@@ -2008,6 +2544,7 @@ impl Client {
             stream_id,
             subscriber_position_id,
             join_position,
+            String::from_utf8_lossy(source_identity).into_owned(),
         ) {
             Ok(image) => image,
             Err(_) => {
@@ -2026,6 +2563,18 @@ impl Client {
         };
 
         subscription.add_image(image);
+
+        // Announced once the image is in place, so a caller that drains this and
+        // then looks finds it — the order the reference fires its handler in
+        // (`subscription.addImage(image)` then `handler.onAvailableImage(image)`,
+        // `ClientConductor.java:419-427`).
+        self.image_events.push(ImageEvent::Available {
+            subscription_registration_id: subscription_id,
+            publication_registration_id,
+            session_id,
+            stream_id,
+            position: join_position,
+        });
     }
 
     fn complete(&mut self, correlation_id: i64, outcome: Result<Ready, CommandError>) {
@@ -2072,6 +2621,25 @@ impl Client {
             .ok_or(CommandError::Claim(ClaimError::Invalid))?;
         ring.next_correlation_id()
             .ok_or(CommandError::Claim(ClaimError::Invalid))
+    }
+}
+
+impl Drop for Client {
+    /// Say goodbye, then let the rest go.
+    ///
+    /// Both reference clients close from a destructor-shaped path and an
+    /// explicit one: C++'s `~Aeron` calls `aeron_close`
+    /// (`aeron-client/src/main/cpp_wrapper/Aeron.h:91-96`) on top of the C
+    /// `aeron_close` a caller can reach directly, and Java's `Aeron` is
+    /// `AutoCloseable` with a user-callable `close()`. This is the same pair,
+    /// which is why [`Client::close`] is separate and returns nothing to say.
+    ///
+    /// Nothing here may panic and nothing may wait: a destructor also runs
+    /// while a thread is unwinding, and a second panic there aborts the
+    /// process. `close` writes one ring record and reads nothing, which is as
+    /// close to that as this can get.
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

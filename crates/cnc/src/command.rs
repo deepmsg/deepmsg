@@ -15,6 +15,33 @@ use crate::layout;
 /// `aeron-client/src/main/c/command/aeron_control_protocol.h:64-70`.
 pub const CORRELATED_COMMAND_LENGTH: usize = 16;
 
+/// `AERON_COMMAND_CLIENT_CLOSE`
+/// (`aeron-client/src/main/c/command/aeron_control_protocol.h:37`).
+pub const CLIENT_CLOSE_TYPE_ID: i32 = 0x0B;
+
+/// Encode `CLIENT_CLOSE`, whose payload is the correlated head and nothing
+/// else.
+///
+/// A client sends this when it closes. The driver marks the client closed and
+/// zeroes its heartbeat counter
+/// (`aeron_driver_conductor_on_client_close`,
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:6321-6331`, reached from
+/// the type-id dispatch at `:3135`), which is what stops it being waited on —
+/// so a client that says it is going away is collected rather than timed out.
+/// There is no reply.
+///
+/// The correlation id is [`NULL_VALUE`](crate::layout::NULL_VALUE), not a
+/// drawn one: nothing answers, so nothing needs matching, and the Java client
+/// writes exactly that (`new CorrelatedMessageFlyweight()…
+/// .correlationId(Aeron.NULL_VALUE)`, `DriverProxy.clientClose`,
+/// `aeron-client/src/main/java/io/aeron/DriverProxy.java:461-473`).
+pub fn encode_client_close(client_id: i64) -> [u8; CORRELATED_COMMAND_LENGTH] {
+    let mut out = [0u8; CORRELATED_COMMAND_LENGTH];
+    out[..8].copy_from_slice(&client_id.to_le_bytes());
+    out[8..].copy_from_slice(&layout::NULL_VALUE.to_le_bytes());
+    out
+}
+
 /// `AERON_COMMAND_TERMINATE_DRIVER`
 /// (`aeron-client/src/main/c/command/aeron_control_protocol.h:40`).
 pub const TERMINATE_DRIVER_TYPE_ID: i32 = 0x0E;

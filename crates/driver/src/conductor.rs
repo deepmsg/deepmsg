@@ -4253,6 +4253,7 @@ mod tests {
         PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT, PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT,
     };
     use deepmsg_client::counter::CounterEvent;
+    use deepmsg_cnc::command::CLIENT_CLOSE_TYPE_ID;
     use deepmsg_cnc::layout::NULL_VALUE;
     use deepmsg_cnc::{CncIdentity, CncLayout, TerminateDriver};
     use deepmsg_cnc::{Received, ToClientsReceiver};
@@ -4662,6 +4663,78 @@ mod tests {
             Some(1),
             ring.next_correlation_id(),
             "the driver takes one at startup (`aeron_driver.c:970`)"
+        );
+    }
+
+    /// A client that says goodbye is marked closed — which is what stops the
+    /// driver waiting out its liveness timeout for it.
+    ///
+    /// `CLIENT_CLOSE` carries the correlated head and nothing else: no reply,
+    /// no token, no name. The client writes it when it closes
+    /// (`Client::close`); this is the driver's half of that, and it is here
+    /// rather than only in `clients.rs` because what it pins is the *dispatch*
+    /// — that a sixteen-byte payload with the id first reaches `on_close`
+    /// rather than the malformed arm.
+    #[test]
+    fn a_client_close_marks_the_client_closed() {
+        let (_temp, mut conductor) = running(TerminationPolicy::Deny);
+
+        // A command that names the client registers it: this protocol has no
+        // separate handshake.
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 9, 1001, "aeron:ipc"),
+        );
+        conductor.do_work();
+
+        assert!(
+            conductor.clients().knows(7),
+            "the subscription registered it"
+        );
+        assert!(
+            !conductor
+                .clients()
+                .find(7)
+                .expect("the client")
+                .closed_by_command,
+            "and it is not closed"
+        );
+
+        let mut payload = 7i64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&NULL_VALUE.to_le_bytes());
+        send(&conductor, CLIENT_CLOSE_TYPE_ID, &payload);
+        conductor.do_work();
+
+        assert!(
+            conductor
+                .clients()
+                .find(7)
+                .expect("still listed")
+                .closed_by_command,
+            "the id is read out of the head the client writes"
+        );
+        assert_eq!(
+            0,
+            conductor.unhandled_commands(),
+            "and the type id is known"
+        );
+
+        // Zeroing the heartbeat counter is the whole mechanism, and the reason
+        // this is worth more than a flag: the reaper compares **that counter**
+        // against the liveness timeout (`on_time_event`, `clients.rs`), so a
+        // zeroed one is past its deadline at once — where a client that simply
+        // went quiet is held for the full ten seconds.
+        let regions = counter_regions(&conductor);
+        let counter_id = conductor
+            .clients()
+            .find(7)
+            .expect("still listed")
+            .heartbeat_counter_id;
+        assert_eq!(
+            Some(0),
+            conductor.counters().value(&regions, counter_id),
+            "so the next tier reaps it rather than waiting out the timeout"
         );
     }
 
@@ -6690,6 +6763,7 @@ mod tests {
             1001,
             subscriber_position_id,
             join_position,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -8662,6 +8736,7 @@ mod tests {
             1001,
             subscriber_position_id,
             join_position,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -9414,6 +9489,7 @@ mod tests {
             1001,
             subscriber_position_id,
             0,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 
@@ -9564,6 +9640,7 @@ mod tests {
             1001,
             subscriber_position_id,
             0,
+            "aeron:ipc".to_owned(),
         )
         .expect("the same log, read-only");
 

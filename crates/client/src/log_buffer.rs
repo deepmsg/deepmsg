@@ -151,6 +151,20 @@ impl LogBuffer {
             .map(|value| value != 0)
     }
 
+    /// The partition `active_term_count` names — the term a producer is in.
+    ///
+    /// Read rather than kept, because it moves: a rotation is exactly what
+    /// changes it, and every producer that needs it needs the value as of now.
+    /// The count is read **before** anything derived from it, which is the
+    /// reference's order for its own reason — after a rotation the count and a
+    /// tail disagree for a moment, and the count is the one that is right
+    /// (`aeron_logbuffer_descriptor.h:94-102`).
+    pub fn active_term_partition(&self) -> Option<usize> {
+        self.metadata()?
+            .load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET)
+            .map(position::index_by_term_count)
+    }
+
     /// One of the three terms.
     pub fn term(&self, partition: usize) -> Option<deepmsg_core::buffer::AtomicBuffer<'_>> {
         if partition >= descriptor::PARTITION_COUNT {
