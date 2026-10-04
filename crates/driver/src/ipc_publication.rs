@@ -2223,6 +2223,66 @@ mod tests {
         assert!(frame.is_padding(), "the claim is padding now");
     }
 
+    /// The same unblock with the **system** counter in place, because that is
+    /// the observable: counter 19 is one per process, not one per publication
+    /// (`aeron_ipc_publication.c:186-188`), so nothing about the publication
+    /// shows it was counted.
+    #[test]
+    fn unblocking_moves_the_system_counter() {
+        let dir = TempDir::new();
+        let mut regions = Regions::new();
+        let (mut manager, region_pair) = regions.open();
+
+        // The system counters take ids 0..N, so they go in first — the
+        // publication's own counters follow them, as they do in the driver.
+        crate::system_counters::allocate_all(
+            &mut manager,
+            &region_pair,
+            0,
+            0,
+            &crate::system_counters::LabelSuffixes {
+                resolver_name: "",
+                threading_mode: "SHARED",
+                conductor_cycle_threshold_ns: 0,
+                sender_cycle_threshold_ns: 0,
+                receiver_cycle_threshold_ns: 0,
+                name_resolver_threshold_ns: 0,
+            },
+        )
+        .expect("the system counters");
+
+        let mut publication = publication(&dir, &mut manager, &region_pair);
+        let unblocked = crate::system_counters::id::UNBLOCKED_PUBLICATIONS;
+        assert_eq!(
+            Some(0),
+            manager.value(&region_pair, unblocked),
+            "nothing has been unblocked yet"
+        );
+
+        let stalled = 128i32;
+        {
+            let term = publication.log.term(0).expect("the first term");
+            term.store_i32_release(0, -stalled).expect("in range");
+
+            let metadata = publication.log.metadata().expect("the block");
+            metadata
+                .store_i64_release(
+                    descriptor::TERM_TAIL_COUNTERS_OFFSET,
+                    RawTail::new(17, stalled).raw(),
+                )
+                .expect("in range");
+        }
+
+        publication.unblock_timeout_ns = 1_000;
+
+        assert!(publication.on_time_event(&mut manager, &region_pair, 2_000));
+        assert_eq!(
+            Some(1),
+            manager.value(&region_pair, unblocked),
+            "and the one that happened is counted"
+        );
+    }
+
     /// The other half of the same rule: a publication whose reader keeps moving
     /// refreshes its own deadline on every pass, so it never reaches one.
     #[test]
