@@ -200,6 +200,14 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
         let fragment_limit = self.settings.fragment_limit;
         let subscription = self.subscription;
 
+        // The client's own duty cycle, and not optional: it is what refreshes the
+        // heartbeat the driver reaps an idle client by, and what takes the
+        // driver's answers off the queue — the counter events, the image
+        // lifecycle. Polling only the subscription reads messages while telling
+        // the driver nothing, and a driver that is watching says so by dropping
+        // the client, which takes the far end's image with it.
+        self.client.poll();
+
         self.client
             .poll_subscription(subscription, fragment_limit, |message| {
                 let payload = message.payload;
