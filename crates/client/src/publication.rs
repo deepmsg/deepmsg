@@ -357,7 +357,10 @@ impl ExclusivePublication {
         );
 
         match outcome {
-            Appended::EndOfLog => self.seed_from_log(),
+            // As in `try_claim`: both "try again" answers say this publication's
+            // cached term is not the log's current one, and re-seeding is how the
+            // cache hears the log's answer.
+            Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
             Appended::Ok { position, .. } => self.advance_to(position),
             _ => {}
         }
@@ -394,7 +397,18 @@ impl ExclusivePublication {
             ) {
                 Ok(position) => self.advance_to(position),
                 Err(error) => {
-                    if error == Appended::EndOfLog {
+                    // Both of the "try again" answers mean this publication's
+                    // cached term is not the log's current one, and the cache is
+                    // what the next call is judged against: a term count that has
+                    // moved on is `EndOfLog`, a cached term id that names a term
+                    // the log has left behind is `MidRotation`. Re-seeding reads
+                    // the log's own answer, which is what the reference does on
+                    // *every* call (`aeron_publication.c:483-493` reads the
+                    // active term count, that partition's tail and the term id
+                    // from the metadata each time) — and without it a
+                    // `MidRotation` is returned for ever, because nothing else
+                    // moves the cache.
+                    if matches!(error, Appended::EndOfLog | Appended::MidRotation) {
                         self.seed_from_log();
                     }
 
@@ -450,7 +464,10 @@ impl ExclusivePublication {
         );
 
         match outcome {
-            Appended::EndOfLog => self.seed_from_log(),
+            // As in `try_claim`: both "try again" answers say this publication's
+            // cached term is not the log's current one, and re-seeding is how the
+            // cache hears the log's answer.
+            Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
             Appended::Ok { position, .. } => self.advance_to(position),
             _ => {}
         }
@@ -480,7 +497,10 @@ impl ExclusivePublication {
         );
 
         match outcome {
-            Appended::EndOfLog => self.seed_from_log(),
+            // As in `try_claim`: both "try again" answers say this publication's
+            // cached term is not the log's current one, and re-seeding is how the
+            // cache hears the log's answer.
+            Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
             Appended::Ok { position, .. } => self.advance_to(position),
             _ => {}
         }
