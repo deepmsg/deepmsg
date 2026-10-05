@@ -582,8 +582,10 @@ pub struct Conductor {
     commands: ToDriverRingConsumer,
     transmitter: ToClientsTransmitter,
     counters: CounterManager,
-    /// What this driver allocated for itself, so its shutdown gives back
-    /// exactly that (`aeron_system_counters_close`, `:3487`).
+    /// What this driver allocated for itself, in allocation order. It is held
+    /// and not given back — `close` carries that decision — and what it is
+    /// still read for is the one thing it establishes: that the ids are the
+    /// ones the table names.
     system_counters: SystemCounters,
     /// The client command that is waiting on the agent, if there is one — the
     /// reference's `conductor->client_command`
@@ -2209,13 +2211,43 @@ impl Conductor {
         // join.
         let _ = self.agent_handle.stop();
 
-        let released = self
-            .system_counters
-            .release_all(&mut self.counters, &regions, self.now_ms);
+        // The system counters are **not** given back, and this is where that is
+        // decided rather than forgotten. Freeing one stamps its record
+        // `RECLAIMED`, and the reader the benchmark's own dump goes through
+        // prints only `ALLOCATED` and skips the rest — `CountersReader.forEach`,
+        // the iterator behind `AeronUtil.dumpAeronStats`
+        // (`benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/AeronUtil.java:445-450`).
+        // So a driver that releases on the way out publishes a file in which
+        // counters 0 to 45 — `Bytes sent`, `Bytes received`, `Errors`, `NAKs`,
+        // and the three cycle-time counters — cannot be read at all, while a
+        // reader that arrived a moment earlier saw every one of them. That is
+        // not hypothetical: it is why every node dump of this driver in the
+        // first matrix named no system counter, and it was nothing but the dump
+        // racing this line.
+        //
+        // The reference disagrees with itself, and both halves were read. The C
+        // driver frees them at the end of its shutdown
+        // (`aeron-driver/src/main/c/aeron_system_counters.c:119-125`, called
+        // from `aeron_driver_conductor.c:3487`). The Java driver refuses to:
+        // `MediaDriver.Context.close` disconnects the counter from its manager
+        // before closing it, which is exactly what makes that close not a
+        // release (`aeron-driver/src/main/java/io/aeron/driver/MediaDriver.java:757-762`).
+        // This driver follows Java, and the tie is broken on what each answer
+        // costs: returning the slots buys nothing — the process is ending, and
+        // the allocator's state is this process's memory rather than the file's
+        // (`crates/cnc/src/counter_manager.rs`, "the allocator's whole state is
+        // in this process's heap, not in the file") — while keeping them is what
+        // lets the file be read afterwards, which is the rule the comment below
+        // already states for the error log.
+        //
+        // The C driver survives the same race on luck rather than on design: its
+        // shutdown reaches its free later because it deletes a log file per
+        // image on the way (`aeron_driver_conductor_delete_log_buffer`,
+        // `aeron_driver_conductor.c:3483`).
         debug_assert_eq!(
             system_counters::COUNT,
-            released,
-            "the driver releases exactly the counters it allocated"
+            self.system_counters.len(),
+            "the driver holds exactly the counters its table names"
         );
 
         // The distinct error log's *process* half needs no line here: the
@@ -5001,16 +5033,32 @@ mod tests {
     }
 
     #[test]
-    fn closing_reclaims_the_counters_the_driver_owns() {
+    fn closing_leaves_the_counters_the_driver_owns_readable() {
         let (temp, mut conductor) = running_with(10_000_000_000, 1_000_000_000);
 
         conductor.close().expect("close");
 
+        // A reader arriving *after* the shutdown is the case this covers: the
+        // benchmark's own dump is written by the node on its way out and races
+        // this close, and a freed counter is one `CountersReader.forEach` —
+        // what that dump goes through — skips. A driver that reclaims on the
+        // way out is a driver whose `Bytes sent`, `Errors` and cycle-time
+        // counters cannot be read afterwards.
         let reader = CncFile::try_open(&temp.0).expect("the file is published");
         let counters = reader.counters().expect("the counter regions");
-        let scan = counters.for_each(|_| {});
-        assert_eq!(0, scan.allocated, "a stopped driver publishes none");
-        assert_eq!(46, scan.reclaimed, "and leaves forty-six reclaimed slots");
+        let mut labels = Vec::new();
+        let scan = counters.for_each(|descriptor| labels.push(descriptor.label.clone()));
+
+        assert_eq!(
+            46, scan.allocated,
+            "a stopped driver still publishes the counters it owns"
+        );
+        assert_eq!(0, scan.reclaimed, "and reclaims none of them");
+        assert_eq!(
+            Some("Bytes sent"),
+            labels.first().map(String::as_str),
+            "and a reader still finds them by name"
+        );
         assert!(
             !conductor.is_running(),
             "and a closed conductor is not a running one"
