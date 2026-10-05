@@ -207,6 +207,13 @@ impl UdpTransport {
         self.recv_socket.as_ref().unwrap_or(&self.socket)
     }
 
+    /// The same socket, mutably: a receive writes into the socket's own
+    /// argument scratch (`DatagramSocket::receive_batch`), which the immutable
+    /// accessor above cannot hand out.
+    fn receiving_mut(&mut self) -> &mut DatagramSocket {
+        self.recv_socket.as_mut().unwrap_or(&mut self.socket)
+    }
+
     /// Whether an error is the kernel saying "not now" rather than "no".
     ///
     /// `ECONNREFUSED` counts as "not now" for the reason the reference gives:
@@ -260,7 +267,7 @@ impl Transport for UdpTransport {
         // worth naming: it does *not* count a failed receive as an error when
         // the failure is one of the "not now" errnos — it answers zero, and the
         // receiver's pass ends with nothing done.
-        match self.receiving().receive_batch(buffers, datagrams) {
+        match self.receiving_mut().receive_batch(buffers, datagrams) {
             Ok(received) => Ok(received),
             Err(error) if Self::is_back_pressure(&error) => Ok(0),
             Err(error) => Err(error),

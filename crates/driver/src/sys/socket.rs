@@ -97,6 +97,117 @@ impl Default for Datagrams {
     }
 }
 
+/// The arguments one receive hands the kernel, built once and pointed at
+/// itself.
+///
+/// Self-referential by construction: every `msg_hdr.msg_name` and `msg_iov`
+/// points at the `names` and `io_vectors` below. Building that once rather than
+/// per call is the whole point — `receive_batch` used to zero sixteen `msghdr`s
+/// and fill in their pointers on every turn of the loop, and the loop turns
+/// over about a million times a second, most of those turns finding nothing at
+/// all (measured: 19.66% of the receive thread's user-space instructions at
+/// 25K msg/s, where 98% of the turns are empty).
+///
+/// It is held through a [`Box`] by [`DatagramSocket`] because the pointers are
+/// into the allocation, so the allocation must not move. A box's pointee does
+/// not, even when the value holding the box does — which matters here: a
+/// transport is built as a local and boxed into its endpoint, and the tests
+/// move sockets by value too.
+///
+/// Three invariants keep those pointers true, and they are load-bearing:
+///
+/// - the field is private to [`DatagramSocket`], so no code outside can replace
+///   the pointee — `mem::replace` would leave the headers pointing at the
+///   value that was moved out;
+/// - [`DatagramSocket`] is not `Clone`: a bitwise copy would carry the pointers
+///   into a second allocation;
+/// - the pointee is never copied out of its box.
+#[derive(Debug)]
+struct RecvMessages {
+    messages: [libc::mmsghdr; MAX_BATCH],
+    names: [libc::sockaddr_storage; MAX_BATCH],
+    io_vectors: [libc::iovec; MAX_BATCH],
+    /// How many leading entries the kernel filled on the last call, and so
+    /// wrote its answers into — the entries whose input fields it has
+    /// overwritten. Zero after a turn that found nothing, which is why
+    /// [`RecvMessages::reset`] costs nothing where it matters most.
+    dirty: usize,
+}
+
+impl RecvMessages {
+    /// Allocate the scratch and point its headers at itself.
+    ///
+    /// The pointers are taken after `Box::new`, and this is the only place they
+    /// are taken: the value handed to `Box::new` is moved into the allocation,
+    /// so headers pointed at it before that would be pointed at the stack.
+    fn new() -> Box<Self> {
+        let mut receive = Box::new(
+            // SAFETY: all three arrays are plain data with no invalid bit
+            // patterns and no destructor — a zeroed `sockaddr_storage` is
+            // `AF_UNSPEC`, a zeroed `iovec` a null buffer of no length, and a
+            // zeroed `msghdr` the "no name, no control" spelling. Every field
+            // the kernel reads is written below, before anything is handed
+            // over.
+            unsafe {
+                Self {
+                    messages: std::mem::zeroed(),
+                    names: std::mem::zeroed(),
+                    io_vectors: std::mem::zeroed(),
+                    dirty: 0,
+                }
+            },
+        );
+
+        for index in 0..MAX_BATCH {
+            let header = &mut receive.messages[index].msg_hdr;
+            header.msg_name = std::ptr::from_mut(&mut receive.names[index]).cast();
+            header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            header.msg_iov = std::ptr::from_mut(&mut receive.io_vectors[index]);
+            header.msg_iovlen = 1;
+        }
+
+        receive
+    }
+
+    /// Put back the input fields the kernel overwrote.
+    ///
+    /// `recvmsg(2)` reads `msg_namelen` as the capacity of the address buffer
+    /// and writes back what it actually wrote there, so a call that did not
+    /// reset it would hand the kernel the previous call's answer as this call's
+    /// limit — an address longer than that one would be truncated. Nothing else
+    /// in the header is read back in: `msg_len` and `msg_flags` are outputs
+    /// that the next call overwrites before we read them anew, and the control
+    /// fields are zero and unused here.
+    fn reset(&mut self) {
+        let namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+        for message in self.messages[..self.dirty].iter_mut() {
+            message.msg_hdr.msg_namelen = namelen;
+        }
+
+        self.dirty = 0;
+    }
+}
+
+// SAFETY: `RecvMessages` fails to be `Send` and `Sync` for one reason only —
+// the kernel's own message headers carry raw pointers, and raw pointers have
+// neither auto trait. Every one of those pointers points into the box this
+// value is the pointee of, so moving the owner moves the box pointer and
+// leaves what it points at where it is; a shared reference cannot observe a
+// mutation, because the only method that writes through them
+// (`DatagramSocket::receive_batch`) takes `&mut self`, so no receive can be in
+// flight while another thread holds one. The three invariants named on
+// `RecvMessages` are what keep the pointers true, and none of them is about
+// which thread the owner is on.
+unsafe impl Send for RecvMessages {}
+// SAFETY: the same argument as `Send` above, in its `Sync` form — what makes
+// this type fail `Sync` is the pointers, and what makes sharing it sound is
+// that a shared reference cannot reach a write: every method that writes
+// through those pointers takes `&mut self`, so no receive can be in flight
+// while another thread holds one. `&self` methods of the socket never touch
+// the scratch.
+unsafe impl Sync for RecvMessages {}
+
 /// `IPV6_JOIN_GROUP` — one option number with `IPV6_ADD_MEMBERSHIP` on Linux,
 /// which is the name `libc` carries
 /// (`unix/linux_like/mod.rs:898`).
@@ -138,10 +249,16 @@ impl std::fmt::Display for BindFailure {
 impl std::error::Error for BindFailure {}
 
 /// A UDP socket, owned for as long as this value lives.
+///
+/// Not `Clone`: see [`RecvMessages`].
 #[derive(Debug)]
 pub struct DatagramSocket {
     fd: libc::c_int,
     family: AddressFamily,
+    /// The kernel's arguments for one `recvmmsg`, held across calls. See
+    /// [`RecvMessages`] for why it is a box and what keeps it pointed at
+    /// itself.
+    receive: Box<RecvMessages>,
 }
 
 impl DatagramSocket {
@@ -166,7 +283,11 @@ impl DatagramSocket {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { fd, family })
+        Ok(Self {
+            fd,
+            family,
+            receive: RecvMessages::new(),
+        })
     }
 
     /// Bind the socket to a local address
@@ -574,7 +695,7 @@ impl DatagramSocket {
     /// The error from `recvmmsg(2)`, with `WouldBlock` left for the caller to
     /// read as "nothing arrived this time" (`:584-587`).
     pub fn receive_batch(
-        &self,
+        &mut self,
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
     ) -> io::Result<usize> {
@@ -583,32 +704,28 @@ impl DatagramSocket {
             return Ok(0);
         }
 
-        let mut messages = [MaybeUninit::<libc::mmsghdr>::uninit(); MAX_BATCH];
-        let mut names = [MaybeUninit::<libc::sockaddr_storage>::uninit(); MAX_BATCH];
-        let mut io_vectors = [libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        }; MAX_BATCH];
+        let receive = &mut *self.receive;
 
+        // The input fields the kernel answered in, and only on the entries it
+        // filled — so the turn that found nothing, which is most of them, does
+        // no work here at all.
+        receive.reset();
+
+        // The one thing the caller may change between calls: where each message
+        // is to be written. The headers that carry the pointers to these
+        // iovecs were built once, in `RecvMessages::new`, and are not touched.
         for (index, buffer) in buffers.iter_mut().take(count).enumerate() {
-            io_vectors[index] = libc::iovec {
-                iov_base: buffer.as_mut_ptr().cast(),
-                iov_len: buffer.len(),
-            };
-
-            // SAFETY: `msghdr` is plain data with no invalid bit patterns; the
-            // fields that matter are written below, and the ones that do not
-            // (control, flags) are documented as ignored when zero.
-            let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-            header.msg_name = names[index].as_mut_ptr().cast();
-            header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            header.msg_iov = std::ptr::from_mut(&mut io_vectors[index]);
-            header.msg_iovlen = 1;
-
-            messages[index].write(libc::mmsghdr {
-                msg_hdr: header,
-                msg_len: 0,
-            });
+            // SAFETY: `RecvMessages::new` set this entry's `msg_iov` to the
+            // `io_vectors` entry of the same index, in the same allocation, and
+            // nothing has written it since — so the pointer is live, and this
+            // writes through it to that `iovec`, which the kernel reads and
+            // never writes.
+            unsafe {
+                receive.messages[index].msg_hdr.msg_iov.write(libc::iovec {
+                    iov_base: buffer.as_mut_ptr().cast(),
+                    iov_len: buffer.len(),
+                });
+            }
         }
 
         // No timeout: the socket is non-blocking, so this returns everything
@@ -617,13 +734,14 @@ impl DatagramSocket {
         // "return after the first datagram" — the same datagrams, one syscall
         // per burst instead of one per datagram.
         //
-        // SAFETY: the first `count` messages were initialized above, each
-        // pointing at one of this function's `names` entries and at a buffer
-        // the caller lent for the duration of the call.
+        // SAFETY: every one of the first `count` messages was built by
+        // `RecvMessages::new`; each points at that allocation's own `names`
+        // entry, which is a whole `sockaddr_storage`, and at a buffer the
+        // caller lent for the duration of the call.
         let received = unsafe {
             libc::recvmmsg(
                 self.fd,
-                messages.as_mut_ptr().cast::<libc::mmsghdr>(),
+                receive.messages.as_mut_ptr(),
                 count as libc::c_uint,
                 0,
                 std::ptr::null_mut(),
@@ -639,9 +757,9 @@ impl DatagramSocket {
         datagrams.count = received;
 
         for index in 0..received {
-            // SAFETY: the kernel filled the first `received` messages, so each
+            // SAFETY: the kernel filled the first `received` messages, so this
             // one's `msg_len` and `msg_hdr.msg_namelen` are written.
-            let message = unsafe { messages[index].assume_init_ref() };
+            let message = &receive.messages[index];
 
             datagrams.datagrams[index] = Datagram {
                 length: message.msg_len as usize,
@@ -649,12 +767,20 @@ impl DatagramSocket {
                     None
                 } else {
                     // SAFETY: the kernel wrote an address of `msg_namelen`
-                    // bytes into this entry, and `msg_namelen` says how much
-                    // of it is meaningful.
-                    unsafe { from_sockaddr(names[index].as_ptr(), message.msg_hdr.msg_namelen) }
+                    // bytes into this entry's own `names` slot, and
+                    // `msg_namelen` says how much of it is meaningful.
+                    unsafe {
+                        from_sockaddr(
+                            std::ptr::from_ref(&receive.names[index]),
+                            message.msg_hdr.msg_namelen,
+                        )
+                    }
                 },
             };
         }
+
+        // What the next call has to put back.
+        receive.dirty = received;
 
         Ok(received)
     }
@@ -883,7 +1009,7 @@ mod tests {
 
     #[test]
     fn a_datagram_goes_from_one_socket_to_another() {
-        let receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         receiver
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -921,7 +1047,7 @@ mod tests {
 
     #[test]
     fn a_connected_socket_sends_and_receives_without_an_address() {
-        let receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         receiver
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -948,6 +1074,87 @@ mod tests {
                 .map(|source| SocketAddr::new(source.ip(), local.port())),
             "the sender's source port is the one the kernel gave it"
         );
+    }
+
+    /// A receive after a turn that found nothing must not be held to the answer
+    /// of the last turn that found something.
+    ///
+    /// `recvmsg(2)` reads `msg_namelen` as the capacity of the address buffer
+    /// and writes back the length it filled, so a second call that did not put
+    /// that field back would hand the kernel the first call's answer as its
+    /// limit — and the address it then reports is truncated to it. This is the
+    /// field the scratch a socket keeps across calls has to reset, and it is
+    /// reset on exactly the entries the kernel filled last time: a turn that
+    /// found nothing wrote nothing, so it must leave them alone and the turn
+    /// after it must still be right.
+    ///
+    /// The three receives below are that sequence — filled, empty, filled — and
+    /// the fourth hands the socket a *different* set of buffers, because the
+    /// headers are kept while what they describe is the caller's to change.
+    #[test]
+    fn a_receive_after_an_empty_one_is_not_bounded_by_the_one_before_it() {
+        let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        receiver
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        receiver.set_nonblocking().expect("non-blocking");
+
+        let local = receiver.local_address().expect("a bound address");
+        let sender = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        sender.connect(local).expect("a connect");
+        sender.set_nonblocking().expect("non-blocking");
+
+        let mut buffers: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; 64]).collect();
+        let mut datagrams = Datagrams::new();
+
+        assert_eq!(3, sender.send(b"one").expect("a send"));
+        assert_eq!(
+            1,
+            receiver
+                .receive_batch(&mut buffers, &mut datagrams)
+                .expect("a receive")
+        );
+        let first_source = datagrams.as_slice()[0].source.expect("a source");
+        assert_eq!(b"one", &buffers[0][..3]);
+
+        // Nothing was sent: at this layer a poll that finds nothing is the
+        // error the caller above reads as "nothing arrived this time"
+        // (`UdpTransport::receive`), and it is the turn that writes nothing.
+        let empty = receiver.receive_batch(&mut buffers, &mut datagrams);
+        assert_eq!(
+            Some(io::ErrorKind::WouldBlock),
+            empty.err().map(|error| error.kind())
+        );
+
+        assert_eq!(3, sender.send(b"two").expect("a send"));
+        assert_eq!(
+            1,
+            receiver
+                .receive_batch(&mut buffers, &mut datagrams)
+                .expect("a receive")
+        );
+        assert_eq!(
+            3,
+            datagrams.as_slice()[0].length,
+            "the second batch's own length"
+        );
+        assert_eq!(b"two", &buffers[0][..3]);
+        assert_eq!(
+            first_source,
+            datagrams.as_slice()[0].source.expect("a source"),
+            "and its own source address, not one truncated to the first's"
+        );
+
+        // The scratch's headers outlive the call; the buffers do not have to.
+        let mut other: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; 64]).collect();
+        assert_eq!(5, sender.send(b"three").expect("a send"));
+        assert_eq!(
+            1,
+            receiver
+                .receive_batch(&mut other, &mut datagrams)
+                .expect("a receive")
+        );
+        assert_eq!(b"three", &other[0][..5]);
     }
 
     #[test]
@@ -978,7 +1185,7 @@ mod tests {
 
     #[test]
     fn a_six_socket_binds_and_sends_to_itself() {
-        let socket = DatagramSocket::open(AddressFamily::Inet6).expect("a socket");
+        let mut socket = DatagramSocket::open(AddressFamily::Inet6).expect("a socket");
         socket
             .bind("[::1]:0".parse().expect("an address"))
             .expect("a bind");
