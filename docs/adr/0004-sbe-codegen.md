@@ -123,4 +123,6 @@ classpath, and `sbe.target.language=Rust`.
   land; the tests are what turn them into contracts. That is also why `just
   gen` is checked in CI rather than run by hand — a schema that drifted
   without its codecs following would otherwise keep the table looking
-  verified.
+  verified. The check is the `codecs` job in `.github/workflows/ci.yml`:
+  it fetches the pinned generator, regenerates, and requires the tree not to
+  move.
