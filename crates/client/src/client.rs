@@ -377,7 +377,11 @@ pub enum AsyncAddPoll {
 ///
 /// Carries both ids for the same reason [`AsyncAdd`] carries one: the
 /// correlation id is what the driver answers under, and the registration id is
-/// what has to leave this client's list when it does.
+/// what has to leave this client's list when it does. `Copy` for the same
+/// reason too — a handle is two ids and nothing else, and polling is what
+/// consumes the answer, so a caller is free to ask again and be told
+/// [`RemovePoll::Unknown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AsyncRemove {
     correlation_id: i64,
     registration_id: i64,
