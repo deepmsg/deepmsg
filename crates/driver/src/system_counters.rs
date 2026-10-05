@@ -233,11 +233,18 @@ pub struct LabelSuffixes<'a> {
 
 /// The counters a driver allocated for itself, in the order it allocated them.
 ///
-/// A value rather than a range constant: the release path gives back *what was
-/// allocated* rather than what this build happens to allocate, so a count that
-/// changes between the two — a slice that adds one, an init that stops halfway
-/// — cannot make the shutdown free the wrong slots. It also gives the release
-/// something to check: every id it holds was handed out by this process.
+/// A value rather than a range constant, so that what the driver holds is the
+/// record of what it actually got rather than what this build happens to
+/// allocate: a table that gains a line, or an init that stops halfway, cannot
+/// make a reader of this value name the wrong slot.
+///
+/// Nothing gives them back, and that is a decision rather than an omission —
+/// `Conductor::close` carries the reason. The C driver does give its own back,
+/// at the end of its shutdown
+/// (`aeron-driver/src/main/c/aeron_system_counters.c:119-125`, called from
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:3487`), so this is a
+/// deliberate departure from the authority, taken because what it costs is the
+/// file's readability and what it buys is nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemCounters {
     ids: Vec<i32>,
@@ -257,23 +264,6 @@ impl SystemCounters {
     /// Whether the driver owns none — only true before init.
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
-    }
-
-    /// Return every one of them to the pool, and say how many went back.
-    ///
-    /// A count rather than nothing, because the caller is a shutdown: a counter
-    /// that would not release is an inconsistency worth surfacing, and a `bool`
-    /// per counter is what [`CounterManager::free`] already reports.
-    pub fn release_all(
-        &self,
-        manager: &mut CounterManager,
-        regions: &CounterRegions<'_>,
-        now_ms: i64,
-    ) -> usize {
-        self.ids
-            .iter()
-            .filter(|counter_id| manager.free(regions, **counter_id, now_ms))
-            .count()
     }
 }
 
