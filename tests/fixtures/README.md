@@ -68,3 +68,11 @@ Same as `cnc-header.bin`, with one extra step before the kill:
 
 If a future reference build changes a label, the diff will be in this file —
 which is the point of committing it whole rather than as a list of strings.
+
+## `sbe/`
+
+Sixty-two SBE messages encoded by the reference's own `sbe-tool` output, with
+the reference's own decoder's reading of each one recorded in `sbe/golden.tsv`.
+They are the golden for `deepmsg-codec`, and they are a directory of their own
+because they are a set rather than a capture: `sbe/README.md` says how the set
+is built, what the value rule is, and what it deliberately leaves uncovered.
