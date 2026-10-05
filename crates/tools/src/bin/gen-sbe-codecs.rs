@@ -38,7 +38,7 @@ const AGRONA_VERSION: &str = "2.6.1";
 
 /// Each schema; the package name `sbe-tool` derives from its `package`
 /// attribute (dots to underscores), which is where it stages the crate; and the
-/// directory under `crates/` this repository files it in.
+/// directory this repository files it in, relative to [`DEST`].
 ///
 /// The two names differ on purpose. The generated one is the schema's own
 /// namespace and nothing here should carry it: the word `aeron` is kept out of
@@ -51,29 +51,35 @@ const SCHEMAS: &[(&str, &str, &str)] = &[
     (
         "aeron-archive-codecs.xml",
         "io_aeron_archive_codecs",
-        "codec-archive",
+        "archive",
     ),
     (
         "aeron-archive-mark-codecs.xml",
         "io_aeron_archive_codecs_mark",
-        "codec-archive-mark",
+        "archive-mark",
     ),
     (
         "aeron-cluster-codecs.xml",
         "io_aeron_cluster_codecs",
-        "codec-cluster",
+        "cluster",
     ),
     (
         "aeron-cluster-mark-codecs.xml",
         "io_aeron_cluster_codecs_mark",
-        "codec-cluster-mark",
+        "cluster-mark",
     ),
     (
         "aeron-cluster-node-state-codecs.xml",
         "io_aeron_cluster_codecs_node",
-        "codec-cluster-node-state",
+        "cluster-node-state",
     ),
 ];
+
+/// Where the generated crates live, relative to the repository root: under the
+/// façade crate rather than beside it, because they have no life of their own —
+/// nothing depends on one of them directly, and a reader looking for "the
+/// codecs" finds one directory instead of six.
+const DEST: &str = "crates/codec";
 
 /// The XSD the schemas are validated against, relative to the repository root.
 const VALIDATION_XSD: &str = "schemas/fpl/sbe.xsd";
@@ -83,7 +89,7 @@ usage: gen-sbe-codecs [OPTIONS]
 
 Regenerate the SBE codecs from schemas/ and place them in their crates.
 
-  --dest DIR       where the crates live (default: crates)
+  --dest DIR       where the crates live (default: crates/codec)
   -h, --help       show this message
 
 The generator (`sbe-tool` 1.40.2) and its runtime (`agrona` 2.6.1) are found
@@ -273,11 +279,30 @@ fn generated_packages(stage: &Path) -> Result<Vec<String>, String> {
 /// The crate this repository files a generated package under. The generator's
 /// own name is a staging directory and never reaches the workspace.
 fn directory_for(generated: &str) -> Result<&'static str, String> {
-    SCHEMAS
+    let directory = SCHEMAS
         .iter()
         .find(|(_, package, _)| *package == generated)
         .map(|(_, _, directory)| *directory)
-        .ok_or_else(|| format!("{generated} is not a package any schema in schemas/ names"))
+        .ok_or_else(|| format!("{generated} is not a package any schema in schemas/ names"))?;
+
+    // The destination is the façade crate's own directory, so a name that
+    // resolves to the destination itself would put generated code where the
+    // façade's `src/` is — and the destination check in `run` would wave it
+    // through, because `crates/codec/Cargo.toml` does exist. One plain segment
+    // is the only thing that cannot do that.
+    if !is_one_directory_name(directory) {
+        return Err(format!(
+            "{generated} would be filed at {directory:?}, which is not one directory name inside \
+             {DEST}"
+        ));
+    }
+    Ok(directory)
+}
+
+/// One plain segment, so that joining it onto [`DEST`] cannot land back on
+/// `DEST` itself.
+fn is_one_directory_name(directory: &str) -> bool {
+    !directory.is_empty() && !directory.starts_with('.') && !directory.contains('/')
 }
 
 /// Replace the generator's manifest with a throwaway one, for formatting only.
@@ -392,7 +417,7 @@ struct Options {
 impl Options {
     /// `Ok(None)` is a request for the usage message, not a failure.
     fn parse(args: &[String]) -> Result<Option<Self>, String> {
-        let mut dest = PathBuf::from("crates");
+        let mut dest = PathBuf::from(DEST);
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
             match arg.as_str() {
@@ -445,6 +470,7 @@ mod tests {
                 !directory.contains("aeron"),
                 "{directory} would put the word into this repository's identifiers"
             );
+
             assert!(
                 generated.contains("aeron"),
                 "{schema}: the generated package is expected to, and the point is that it \
@@ -453,6 +479,27 @@ mod tests {
             assert_eq!(directory_for(generated).unwrap(), *directory);
         }
         assert!(directory_for("io_aeron_something_else").is_err());
+    }
+
+    #[test]
+    fn a_directory_that_would_land_on_the_facade_is_refused() {
+        // The destination is the façade's own crate directory, so these all
+        // resolve to it and would put generated code where its `src/` is. A
+        // lookup cannot be asked to reject them — it is not a name any schema
+        // holds — which is why the predicate is what is tested.
+        for directory in ["", ".", "..", "./archive", "../codec", "a/b"] {
+            assert!(
+                !is_one_directory_name(directory),
+                "{directory:?} was accepted"
+            );
+        }
+
+        for (schema, _, directory) in SCHEMAS {
+            assert!(
+                is_one_directory_name(directory),
+                "{schema}: {directory:?} is not one name"
+            );
+        }
     }
 
     #[test]
@@ -483,9 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn dest_defaults_to_crates_and_is_overridable() {
+    fn dest_defaults_to_the_facade_and_is_overridable() {
         let options = Options::parse(&[]).unwrap().unwrap();
-        assert_eq!(options.dest, PathBuf::from("crates"));
+        assert_eq!(options.dest, PathBuf::from(DEST));
 
         let args = vec!["--dest".to_string(), "/tmp/elsewhere".to_string()];
         let options = Options::parse(&args).unwrap().unwrap();

@@ -7,10 +7,12 @@
 //!
 //! This crate is a façade and nothing more: it puts the five generated crates
 //! under one roof so a caller need not know which schema a message came from.
-//! The codecs live in `crates/codec-*`, are generated from `schemas/` by
-//! `just gen`, and are checked in (ADR-0004). Regeneration replaces their
-//! `src/` wholesale, which is why nothing hand-written may go there; each
-//! crate's `Cargo.toml` is ours and the generator never touches it.
+//! The codecs live in the directories beside this one — `archive/`,
+//! `archive-mark/`, `cluster/`, `cluster-mark/`, `cluster-node-state/` — and
+//! are generated from `schemas/` by `just gen`, then checked in (ADR-0004).
+//! Regeneration replaces their `src/` wholesale, which is why nothing
+//! hand-written may go there; each crate's `Cargo.toml` is ours and the
+//! generator never touches it.
 
 #![forbid(unsafe_code)]
 

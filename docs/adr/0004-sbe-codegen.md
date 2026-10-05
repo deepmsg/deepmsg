@@ -60,7 +60,12 @@ classpath, and `sbe.target.language=Rust`.
 - **One crate per schema**, filed under names of ours:
   `deepmsg-codec-archive`, `deepmsg-codec-archive-mark`,
   `deepmsg-codec-cluster`, `deepmsg-codec-cluster-mark` and
-  `deepmsg-codec-cluster-node-state`, in `crates/codec-*`.
+  `deepmsg-codec-cluster-node-state`, each in its own directory inside
+  `crates/codec/` — `archive/`, `archive-mark/`, `cluster/`,
+  `cluster-mark/`, `cluster-node-state/`. They sit under the façade rather
+  than beside it because nothing depends on one of them directly: they have
+  no dependencies at all, the façade is what names them, and a reader looking
+  for the codecs finds one directory instead of six entries in `crates/`.
   The generator names its output after the schema's `package` —
   `io_aeron_archive_codecs` and so on — and those names stop at the staging
   directory. The word `aeron` is kept out of this repository's identifiers as

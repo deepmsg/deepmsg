@@ -7,11 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-deepmsg-codec-archive = { path = "../codec-archive" }
-deepmsg-codec-archive-mark = { path = "../codec-archive-mark" }
-deepmsg-codec-cluster = { path = "../codec-cluster" }
-deepmsg-codec-cluster-mark = { path = "../codec-cluster-mark" }
-deepmsg-codec-cluster-node-state = { path = "../codec-cluster-node-state" }
+deepmsg-codec-archive = { path = "archive" }
+deepmsg-codec-archive-mark = { path = "archive-mark" }
+deepmsg-codec-cluster = { path = "cluster" }
+deepmsg-codec-cluster-mark = { path = "cluster-mark" }
+deepmsg-codec-cluster-node-state = { path = "cluster-node-state" }
 
 [lints]
 workspace = true
