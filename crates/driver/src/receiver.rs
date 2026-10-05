@@ -842,6 +842,12 @@ pub(crate) struct ReceiverThread {
     /// The (endpoint, destination) each index refers to, rebuilt each pass
     /// because the lists change as channels come and go.
     transports: Vec<(usize, usize)>,
+    /// The descriptors those destinations listen on, in the same order — held
+    /// rather than built fresh each pass, because a pass is the unit the
+    /// receive latency is made of. A `Vec::new()` here is a `malloc` and a
+    /// `free` in every one of them, hundreds of thousands of times a second,
+    /// on the path whose whole measured cost is under a microsecond.
+    descriptors: Vec<crate::sys::socket::Descriptor>,
     last_cycle_ns: i64,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Inbox<ReceiverCommand>,
@@ -884,6 +890,7 @@ impl ReceiverThread {
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
             transports: Vec::new(),
+            descriptors: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
         }
     }
@@ -1294,6 +1301,7 @@ impl ReceiverThread {
             &mut self.poller,
             &mut self.readable,
             &mut self.transports,
+            &mut self.descriptors,
             &mut self.pending_setups,
             &system,
             &self.counters,
@@ -1435,6 +1443,7 @@ impl ReceiverThread {
         poller: &mut crate::media::poller::TransportPoller,
         readable: &mut Vec<usize>,
         transports: &mut Vec<(usize, usize)>,
+        descriptors: &mut Vec<crate::sys::socket::Descriptor>,
         pending_setups: &mut Vec<PendingSetup>,
         system: &System<'_>,
         counters: &CounterManager,
@@ -1455,7 +1464,7 @@ impl ReceiverThread {
         // — makes the pass read everything, because a poller that cannot see a
         // socket must not be the reason it is skipped.
         transports.clear();
-        let mut descriptors: Vec<crate::sys::socket::Descriptor> = Vec::new();
+        descriptors.clear();
         let mut every_transport_has_one = true;
 
         for (endpoint_index, (_, endpoint)) in endpoints.iter().enumerate() {
@@ -1470,7 +1479,7 @@ impl ReceiverThread {
         }
 
         if every_transport_has_one {
-            if poller.ready(&descriptors, readable).is_err() {
+            if poller.ready(descriptors, readable).is_err() {
                 // A poller that cannot answer is not a reason to read nothing:
                 // the pass reads everything, which is the branch below the
                 // threshold and always correct.
