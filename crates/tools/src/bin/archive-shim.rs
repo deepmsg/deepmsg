@@ -56,11 +56,85 @@
 //! wired **refuses**; it never falls back to forwarding, because a fallback is
 //! the silent green this program exists to prevent.
 
+#![deny(unsafe_code)]
+
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode};
+use std::time::Duration;
+
+/// The signal seam — ADR-0002's fifth zone, and the only `unsafe` in this
+/// repository outside `deepmsg-core` and `deepmsg-driver`.
+///
+/// It is here because `hybrid` has to run two processes where the reference ran
+/// one, and the reference's teardown signals **one pid** and waits for it
+/// (`TestArchive.h:164-171`). So whoever owns that pid has to survive the
+/// signal, pass it on, and only then exit — and catching a signal in Rust means
+/// `libc::signal`, which takes a C function pointer.
+///
+/// Not folded into zone 4, which is the same kernel boundary: a zone is a
+/// *named module* whose contents a reviewer reads, and zone 4 is the driver's
+/// own syscalls. Putting a test instrument's supervision there would enlarge
+/// what a driver reviewer must check with code no driver ever runs.
+mod supervise {
+    use std::io;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// Zero until a signal arrives, then the number of the signal that did.
+    static STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    /// Ask to be told about the two signals the reference's teardown sends.
+    #[allow(unsafe_code)]
+    pub fn install_stop_handler() -> io::Result<()> {
+        // The same cast `deepmsg-driver::sys` makes, and for the same reason:
+        // `sighandler_t` wants a C function pointer and a Rust `extern "C" fn`
+        // item is not one until it is cast to it.
+        let handler = handle_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: `handle_stop` is `extern "C"`, takes one `c_int` and
+            // returns nothing, which is the signature `sighandler_t` requires.
+            // It stores to a static atomic and does nothing else, so it may run
+            // at any instruction without allocating, locking or blocking —
+            // which is the whole discipline an async-signal-safe handler owes.
+            // The signal numbers come from `libc`, so they are the kernel's.
+            if libc::SIG_ERR == unsafe { libc::signal(signal, handler) } {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// The signal that has asked this process to stop, if one has.
+    pub fn stop_signal() -> Option<i32> {
+        match STOP_SIGNAL.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// Ask a child to stop the way its own teardown would have.
+    ///
+    /// `SIGTERM` rather than `Child::kill`'s `SIGKILL`: the driver deletes its
+    /// directory and the archive flushes on an orderly shutdown, and a test
+    /// that reads either afterwards is reading what this leaves behind.
+    #[allow(unsafe_code)]
+    pub fn terminate(pid: u32) -> io::Result<()> {
+        // SAFETY: `kill` reads no memory of ours — it takes a pid and a signal
+        // number. The pid is a live child's, and both numbers come from `libc`.
+        if 0 != unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    extern "C" fn handle_stop(signal: libc::c_int) {
+        STOP_SIGNAL.store(signal, Ordering::SeqCst);
+    }
+}
 
 /// Asking the shim what it knows. Not a java option, and it cannot be mistaken
 /// for one: it is answered before parsing, so it never reaches `java`.
@@ -160,18 +234,8 @@ fn run(args: &[OsString], config: &Config) -> Result<(), Failure> {
 
     match decision? {
         Decision::Forward => config.exec_java(args),
-        // Wired in the commit that adds the modes. Refusing rather than
-        // forwarding is the whole point: a `hybrid` run that quietly spawned
-        // the real java archive would report on a system nobody configured.
-        Decision::Replace(_) | Decision::Supervise => Err(Failure::refused(
-            main,
-            format!(
-                "mode {} is configured but not wired yet, and forwarding would test the real \
-                 java archive by accident; invoke `{}` deliberately instead",
-                config.mode.name(),
-                main
-            ),
-        )),
+        Decision::Replace(replacement) => config.exec_ours(main, replacement, args),
+        Decision::Supervise => config.supervise(main, &invocation, args),
     }
 }
 
@@ -312,6 +376,10 @@ struct Invocation {
     /// java's own options — `-version` above all, which the suite's CMake
     /// configuration runs before it will accept the shim as a JVM.
     main_class: Option<String>,
+    /// Where it was, because `hybrid` runs the same property list twice with
+    /// the class swapped: the reference's one process becomes the archive half
+    /// of two.
+    main_index: Option<usize>,
 }
 
 impl Invocation {
@@ -332,21 +400,51 @@ impl Invocation {
     /// main class — and would be wrong the first time a test passed a program
     /// argument.
     fn parse(args: &[OsString]) -> Self {
-        let mut rest = args.iter();
-        while let Some(arg) = rest.next() {
-            let text = arg.to_string_lossy();
+        let mut index = 0;
+        while index < args.len() {
+            let text = args[index].to_string_lossy();
             if text.starts_with('-') {
                 if VALUE_OPTIONS.contains(&text.as_ref()) {
                     // Its value is an argument, not the class.
-                    rest.next();
+                    index += 1;
                 }
+                index += 1;
                 continue;
             }
             return Self {
                 main_class: Some(text.into_owned()),
+                main_index: Some(index),
             };
         }
-        Self { main_class: None }
+        Self {
+            main_class: None,
+            main_index: None,
+        }
+    }
+
+    /// The same invocation, running a different class.
+    fn with_main_class(&self, args: &[OsString], main_class: &str) -> Vec<OsString> {
+        let mut out = args.to_vec();
+        if let Some(index) = self.main_index {
+            out[index] = OsString::from(main_class);
+        }
+        out
+    }
+
+    /// The `-D` arguments, and only those.
+    ///
+    /// They are the properties, and both halves of a `hybrid` pair read the
+    /// same ones: our driver answers to the reference's own spelling
+    /// (`-Daeron.dir=…` is its documented dialect) and ignores properties it
+    /// has no use for rather than rejecting them, while the java archive takes
+    /// them as system properties. So nothing is translated and nothing is
+    /// sorted into two lists — which is also why a property added to the
+    /// reference's harness tomorrow arrives without an edit here.
+    fn properties(args: &[OsString]) -> Vec<OsString> {
+        args.iter()
+            .filter(|arg| arg.to_string_lossy().starts_with("-D"))
+            .cloned()
+            .collect()
     }
 }
 
@@ -407,6 +505,11 @@ const CONFIG_FILE: &str = "archive-shim.conf";
 #[derive(Debug)]
 struct Config {
     mode: Mode,
+    /// Where the three binaries a mode may want live. Optional, and a mode that
+    /// needs one that was not configured refuses by name: the alternative is a
+    /// `deepmsg` run that quietly spawned the real java archive because nobody
+    /// said where ours was.
+    binaries: BTreeMap<&'static str, PathBuf>,
     /// The java it replaced. `Java_JAVA_EXECUTABLE` now holds the shim's own
     /// path, so after that nobody else remembers where java is.
     java: PathBuf,
@@ -438,6 +541,7 @@ impl Config {
         let mut mode = None;
         let mut java = None;
         let mut log = None;
+        let mut binaries = BTreeMap::new();
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -450,9 +554,20 @@ impl Config {
                 "mode" => mode = Some(Mode::parse(value.trim())?),
                 "java" => java = Some(value.trim().to_string()),
                 "log" => log = Some(PathBuf::from(value.trim())),
+                "driver" | "archive" | "archiving-media-driver" => {
+                    // Leaked rather than borrowed: the key has to outlive this
+                    // function to be a map key, and it is one of three literals.
+                    let key: &'static str = match key.trim() {
+                        "driver" => "driver",
+                        "archive" => "archive",
+                        _ => "archiving-media-driver",
+                    };
+                    binaries.insert(key, PathBuf::from(value.trim()));
+                }
                 other => {
                     return Err(format!(
-                        "{}:{}: {other:?} is not a setting this shim has; it knows mode, java, log",
+                        "{}:{}: {other:?} is not a setting this shim has; it knows mode, java, \
+                         log, driver, archive, archiving-media-driver",
                         path.display(),
                         number + 1
                     ));
@@ -474,9 +589,133 @@ impl Config {
             // `transparent` when unstated: the mode that proves the shim
             // invisible is the only one that is safe to reach by accident.
             mode: mode.unwrap_or(Mode::Transparent),
+            binaries,
             java,
             log: log.unwrap_or_else(|| std::env::temp_dir().join("deepmsg-archive-shim.log")),
         })
+    }
+
+    /// Run one of ours where the java process would have been.
+    ///
+    /// `exec`, for the same reason as `exec_java`: the reference signals the
+    /// pid it spawned, so the replacement has to *be* that pid.
+    fn exec_ours(
+        &self,
+        main: &str,
+        replacement: Replacement,
+        args: &[OsString],
+    ) -> Result<(), Failure> {
+        use std::os::unix::process::CommandExt;
+
+        let binary = self.binary(main, replacement)?;
+        let error = Command::new(&binary)
+            .args(Invocation::properties(args))
+            .exec();
+        Err(Failure::plain(format!(
+            "could not exec {}: {error}",
+            binary.display()
+        )))
+    }
+
+    /// The two halves of one process, run as two and torn down as one.
+    ///
+    /// The reference's `ArchivingMediaDriver` launches a driver and an archive
+    /// in a single process, and its teardown signals the one pid it spawned
+    /// (`TestArchive.h:164-171`). So this process is that pid, and its job is
+    /// to pass the signal on and not exit until both halves have.
+    fn supervise(
+        &self,
+        main: &str,
+        invocation: &Invocation,
+        args: &[OsString],
+    ) -> Result<(), Failure> {
+        let driver = self.binary(main, Replacement::Driver)?;
+        supervise::install_stop_handler().map_err(|e| {
+            Failure::plain(format!(
+                "cannot catch the signal this process is torn down with, so a supervised pair \
+                 could not be stopped: {e}"
+            ))
+        })?;
+
+        let properties = Invocation::properties(args);
+        let mut driver_half = spawn(&driver, &properties, main)?;
+        let mut archive_half = spawn(
+            &self.java,
+            &invocation.with_main_class(args, ARCHIVE_STANDALONE),
+            main,
+        )?;
+
+        loop {
+            if let Some(signal) = supervise::stop_signal() {
+                // The reference signals the pid it spawned, which is this
+                // process; passing it on is what keeps an orderly shutdown
+                // orderly. `SIGTERM` rather than `Child::kill`'s `SIGKILL`,
+                // because the driver deletes its directory and the archive
+                // flushes on the way out, and the test reads what is left.
+                for half in [&mut driver_half, &mut archive_half] {
+                    if let Err(e) = supervise::terminate(half.id()) {
+                        eprintln!("archive-shim: could not stop pid {}: {e}", half.id());
+                    }
+                }
+                let _ = driver_half.wait();
+                let _ = archive_half.wait();
+                self.log(main, &format!("supervised:stopped-by-signal-{signal}"))
+                    .map_err(Failure::plain)?;
+                return Ok(());
+            }
+
+            // One half gone is the pair gone: the survivor is not a system any
+            // more, and leaving it would hold the ports the next case wants.
+            if let Some(status) = driver_half.try_wait().map_err(plain)? {
+                return Err(take_down(
+                    &mut archive_half,
+                    "archive",
+                    "driver",
+                    status,
+                    main,
+                ));
+            }
+            if let Some(status) = archive_half.try_wait().map_err(plain)? {
+                return Err(take_down(
+                    &mut driver_half,
+                    "driver",
+                    "archive",
+                    status,
+                    main,
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The binary a mode asked for, or a refusal naming what is missing.
+    fn binary(&self, main: &str, replacement: Replacement) -> Result<PathBuf, Failure> {
+        let key = match replacement {
+            Replacement::Driver => "driver",
+            Replacement::Archive => "archive",
+            Replacement::ArchivingMediaDriver => "archiving-media-driver",
+        };
+        let path = self.binaries.get(key).ok_or_else(|| {
+            Failure::refused(
+                main,
+                format!(
+                    "this mode replaces {main} with our {key}, and the configuration does not say \
+                     where that binary is; add `{key}=` to {}",
+                    CONFIG_FILE
+                ),
+            )
+        })?;
+        if !is_executable(path) {
+            return Err(Failure::refused(
+                main,
+                format!(
+                    "{key} is {}, which is not an executable file",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(path.clone())
     }
 
     /// `exec`, not spawn-and-wait: the reference signals the pid it spawned and
@@ -522,6 +761,42 @@ impl Config {
         file.write_all(line.as_bytes())
             .map_err(|e| format!("{}: {e}", self.log.display()))
     }
+}
+
+/// The standalone archive entry point (`archive/Archive.java:184`), which is
+/// what the archive half of a `hybrid` pair runs: the reference's combined
+/// process is split into ours and theirs, and theirs is this.
+const ARCHIVE_STANDALONE: &str = "io.aeron.archive.Archive";
+
+/// Stop the half that outlived its partner, and say which one went.
+fn take_down(
+    survivor: &mut Child,
+    survivor_name: &str,
+    gone: &str,
+    status: std::process::ExitStatus,
+    main: &str,
+) -> Failure {
+    if let Err(e) = supervise::terminate(survivor.id()) {
+        eprintln!("archive-shim: could not stop pid {}: {e}", survivor.id());
+    }
+    let _ = survivor.wait();
+    Failure::plain(format!(
+        "the {gone} half of {main} exited {status} on its own; the {survivor_name} half was \
+         stopped with it"
+    ))
+}
+
+fn plain(e: std::io::Error) -> Failure {
+    Failure::plain(e.to_string())
+}
+
+fn spawn(program: &Path, args: &[OsString], main: &str) -> Result<Child, Failure> {
+    Command::new(program).args(args).spawn().map_err(|e| {
+        Failure::plain(format!(
+            "could not start {} for {main}: {e}",
+            program.display()
+        ))
+    })
 }
 
 fn describe(decision: Decision) -> String {
@@ -720,6 +995,82 @@ mod tests {
                 row.main_class
             );
         }
+    }
+
+    /// Only the properties, and all of them: the driver half of a `hybrid`
+    /// pair reads the reference's own spelling, so the same list goes to both
+    /// halves and nothing has to be sorted into two.
+    #[test]
+    fn the_properties_are_the_dash_d_arguments_and_nothing_else() {
+        let properties = Invocation::properties(&captured_argv());
+        let text: Vec<String> = properties
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            vec![
+                "-Daeron.archive.id=42",
+                "-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:8010",
+                "-Daeron.dir=/dev/shm/aeron-gavin"
+            ],
+            text
+        );
+        assert!(
+            !text.iter().any(|a| a.contains("add-opens")),
+            "java's own options are not ours"
+        );
+        assert!(
+            !text.iter().any(|a| a.ends_with(".jar")),
+            "the classpath is java's"
+        );
+    }
+
+    /// The split that makes one reference process into two: same properties,
+    /// same classpath, the archive's own entry point instead of the combined
+    /// one (`archive/Archive.java:184`).
+    #[test]
+    fn the_class_can_be_swapped_for_the_standalone_archive() {
+        let invocation = Invocation::parse(&captured_argv());
+        let swapped = invocation.with_main_class(&captured_argv(), ARCHIVE_STANDALONE);
+
+        assert_eq!(
+            Some(ARCHIVE_STANDALONE.to_string()),
+            Invocation::parse(&swapped).main_class
+        );
+        assert_eq!(captured_argv().len(), swapped.len(), "only the class moves");
+        assert_eq!(
+            Invocation::properties(&captured_argv()),
+            Invocation::properties(&swapped),
+            "the halves are configured identically"
+        );
+    }
+
+    /// The refusal that keeps a `deepmsg` run from quietly spawning the real
+    /// archive because nobody said where ours was.
+    #[test]
+    fn a_replacement_binary_that_was_not_configured_is_refused_by_name() {
+        let config = config("java = /bin/sh\nmode = deepmsg\n").unwrap();
+        for replacement in [
+            Replacement::Driver,
+            Replacement::Archive,
+            Replacement::ArchivingMediaDriver,
+        ] {
+            let failure = config
+                .binary("io.aeron.archive.ArchivingMediaDriver", replacement)
+                .expect_err("must refuse");
+            assert!(failure.refused.is_some(), "a refusal owes the marker line");
+        }
+    }
+
+    #[test]
+    fn a_replacement_binary_that_is_not_executable_is_refused_too() {
+        let config =
+            config("java = /bin/sh\nmode = deepmsg\ndriver = /definitely/not/here\n").unwrap();
+        let failure = config
+            .binary("io.aeron.driver.MediaDriver", Replacement::Driver)
+            .unwrap_err();
+        assert!(failure.refused.unwrap().contains("not an executable"));
     }
 
     /// The flag the runner uses, and that it is exactly one main class per
