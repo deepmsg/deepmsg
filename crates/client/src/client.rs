@@ -373,6 +373,42 @@ pub enum AsyncAddPoll {
     Unknown,
 }
 
+/// A removal that has been sent and not yet answered.
+///
+/// Carries both ids for the same reason [`AsyncAdd`] carries one: the
+/// correlation id is what the driver answers under, and the registration id is
+/// what has to leave this client's list when it does.
+pub struct AsyncRemove {
+    correlation_id: i64,
+    registration_id: i64,
+}
+
+impl AsyncRemove {
+    /// The id the driver's answer will carry.
+    pub const fn correlation_id(&self) -> i64 {
+        self.correlation_id
+    }
+
+    /// The publication that leaves this client's list when it arrives.
+    pub const fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+}
+
+/// What [`Client::remove_publication_poll`] found.
+#[derive(Debug)]
+pub enum RemovePoll {
+    /// The driver has not answered yet. Poll again later.
+    Awaiting,
+    /// It answered, and the publication is out of this client's list.
+    Ready,
+    /// The driver refused it, or the deadline passed before it answered.
+    Failed(CommandError),
+    /// No removal is outstanding under that correlation id — one already
+    /// answered, or one this client never sent.
+    Unknown,
+}
+
 /// A pending command, waiting for the response that completes it.
 struct Pending {
     correlation_id: i64,
@@ -1524,6 +1560,31 @@ impl Client {
         flags: i64,
         timeout: Duration,
     ) -> Result<(), CommandError> {
+        let correlation_id = self.send_remove_publication(registration_id, flags, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        // Either list, because the driver keys a publication by registration id
+        // and not by how many producers it has.
+        self.forget_publication(registration_id);
+        self.forget_exclusive_publication(registration_id);
+
+        Ok(())
+    }
+
+    /// The command both removals send, and the pending entry that answers it.
+    ///
+    /// Shared so that the synchronous and the asynchronous removal cannot
+    /// disagree about what a removal *is* — the flags, the encoding, the type
+    /// id, and the deadline the answer has to arrive by.
+    fn send_remove_publication(
+        &mut self,
+        registration_id: i64,
+        flags: i64,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = deepmsg_cnc::command::RemovePublication {
@@ -1547,16 +1608,72 @@ impl Client {
             timeout,
         )?;
 
-        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
-            return Err(CommandError::Encoding);
+        Ok(correlation_id)
+    }
+
+    /// Send a publication back without waiting for the driver's answer.
+    ///
+    /// `Aeron.asyncRemovePublication` (`Aeron.java:350-353`) returns nothing,
+    /// and the reference's archive calls it six times — every one of them in a
+    /// teardown path, where waiting would put a timeout on each step of closing
+    /// down. What it buys over [`Client::remove_publication`] is exactly that:
+    /// the command goes out, and the caller finds out later.
+    ///
+    /// The timeout is where this differs from the reference, and it is not
+    /// decoration. The reference's conductor has its own thread and always
+    /// makes progress, so a removal it has sent will be answered or the process
+    /// will die trying. A poll-driven client makes progress only when it is
+    /// polled, so the deadline is what keeps a caller that stops polling from
+    /// leaving an entry in this client's list for ever. Poll it with
+    /// [`Client::remove_publication_poll`].
+    pub fn async_remove_publication(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<AsyncRemove, CommandError> {
+        let correlation_id = self.send_remove_publication(registration_id, 0, timeout)?;
+
+        Ok(AsyncRemove {
+            correlation_id,
+            registration_id,
+        })
+    }
+
+    /// What [`Client::async_remove_publication`] has heard back.
+    ///
+    /// The counterpart of [`Client::async_add_poll`], and the same shape: the
+    /// client cannot know a publication is gone until the driver says so, and a
+    /// caller that stopped polling would never hear it. `Ready` is the moment
+    /// the publication leaves this client's list — not when the command was
+    /// sent, because until the answer arrives the driver still holds it.
+    pub fn remove_publication_poll(&mut self, remove: AsyncRemove) -> RemovePoll {
+        let correlation_id = remove.correlation_id;
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == correlation_id)
+        else {
+            return RemovePoll::Unknown;
         };
 
-        // Either list, because the driver keys a publication by registration id
-        // and not by how many producers it has.
-        self.forget_publication(registration_id);
-        self.forget_exclusive_publication(registration_id);
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return RemovePoll::Awaiting;
+        };
 
-        Ok(())
+        self.pending.swap_remove(index);
+
+        match outcome {
+            Ok(Ready::OperationSucceeded) => {
+                // Either list, as the synchronous removal does it: the driver
+                // keys a publication by registration id and not by how many
+                // producers it has.
+                self.forget_publication(remove.registration_id);
+                self.forget_exclusive_publication(remove.registration_id);
+                RemovePoll::Ready
+            }
+            Ok(_) => RemovePoll::Failed(CommandError::Encoding),
+            Err(error) => RemovePoll::Failed(error),
+        }
     }
 
     /// Give a subscription back to the driver
