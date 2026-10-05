@@ -50,7 +50,14 @@ pub struct Datagram {
 ///
 /// A fixed-size array rather than a `Vec`: this is on the receive hot path,
 /// where ADR-0003 keeps allocation out.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy`, and for the same reason. Sixteen `Datagram`s is about nine
+/// hundred bytes, and a caller that wants one badly enough to copy it is a
+/// caller that copies it on every destination of every pass — which is what
+/// happened, and is most of the `memmove` the receive path used to do. Taking
+/// one by reference is what the pass does now; a copy needs a `.clone()` and a
+/// reason.
+#[derive(Clone, Debug)]
 pub struct Datagrams {
     datagrams: [Datagram; MAX_BATCH],
     count: usize,

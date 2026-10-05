@@ -1306,10 +1306,12 @@ impl SenderThread {
                 continue;
             }
 
-            let batch = *datagrams;
+            // Borrowed, not copied — the same nine-hundred-byte copy the
+            // receiver had, on the sender's side of the same loop: once per
+            // destination, per pass, for a batch the loop only reads.
             let mut bytes_received = 0i64;
 
-            for (slot, datagram) in batch.as_slice().iter().enumerate() {
+            for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
                 bytes_received += i64::try_from(datagram.length).unwrap_or(0);
                 work += 1;
 

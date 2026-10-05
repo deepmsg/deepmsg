@@ -1526,10 +1526,17 @@ impl ReceiverThread {
                     continue;
                 }
 
-                let batch = *datagrams;
+                // Borrowed, not copied. This used to be `let batch = *datagrams;`
+                // — a `Datagrams` is sixteen `Datagram`s and about nine hundred
+                // bytes, and the copy was the largest single `memmove` on the
+                // receive path, once per destination per pass, taken to end a
+                // borrow that the loop below no longer needs ended. It reads the
+                // batch and nothing else in the pass writes to it
+                // (`docs/adr/0003` keeps this path allocation-free; it was not
+                // copy-free either).
                 let mut bytes_received = 0i64;
 
-                for (slot, datagram) in batch.as_slice().iter().enumerate() {
+                for (slot, datagram) in datagrams.as_slice().iter().enumerate() {
                     bytes_received += i64::try_from(datagram.length).unwrap_or(0);
                     work += 1;
 
