@@ -691,3 +691,292 @@ mod ledger_tests {
         assert_eq!(None, ledger.settled());
     }
 }
+
+/// A log buffer file, and the image over it.
+///
+/// `Image` has no in-memory constructor and should not get one — a client never
+/// creates a log buffer, the driver's native resource agent does, and a type
+/// that could be built out of nothing would be a type that pretends otherwise.
+/// So the tests build the file the driver would have built: three terms and the
+/// metadata page after them (`crate::log_buffer` has the layout), with the
+/// geometry written **before** the file is opened, because opening validates
+/// it.
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+
+    use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
+    use deepmsg_core::logbuffer::append::{Appended, Appender};
+    use deepmsg_core::logbuffer::{descriptor, frame, position};
+
+    use super::{Action, ControlledFragments, Fragment, Image};
+    use crate::log_buffer::LogBuffer;
+
+    /// The smallest legal term length, so the fixture stays small.
+    const TERM_LENGTH: i32 = 64 * 1024;
+    const INITIAL_TERM_ID: i32 = 17;
+    const PAGE: i32 = 4096;
+
+    struct TempLog {
+        path: PathBuf,
+    }
+
+    impl TempLog {
+        /// The file as the driver leaves it: geometry in the last page, and
+        /// nothing else.
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("deepmsg-image-{name}-{}.log", std::process::id()));
+
+            let terms = 3 * TERM_LENGTH;
+            let length = position::align_up(terms + PAGE, PAGE);
+
+            let mut file = std::fs::File::create(&path).expect("a temp file");
+            file.set_len(u64::try_from(length).expect("positive"))
+                .expect("sized");
+
+            let mut page = [0u8; PAGE as usize];
+            {
+                let view = AtomicBuffer::from_slice_mut(&mut page).expect("aligned");
+                view.store_i32_relaxed(descriptor::TERM_LENGTH_OFFSET, TERM_LENGTH)
+                    .expect("in range");
+                view.store_i32_relaxed(descriptor::INITIAL_TERM_ID_OFFSET, INITIAL_TERM_ID)
+                    .expect("in range");
+                view.store_i32_relaxed(
+                    descriptor::MTU_LENGTH_OFFSET,
+                    descriptor::MTU_LENGTH_DEFAULT,
+                )
+                .expect("in range");
+                view.store_i32_relaxed(descriptor::IS_CONNECTED_OFFSET, 1)
+                    .expect("in range");
+            }
+
+            file.seek(SeekFrom::Start(u64::try_from(terms).expect("positive")))
+                .expect("seek");
+            file.write_all(&page).expect("the metadata page");
+
+            Self { path }
+        }
+
+        /// What a publisher does to the log before a subscriber maps it: write
+        /// the tails, then the messages.
+        fn write(&self, f: impl FnOnce(&mut Appender<'_>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let metadata = log
+                .file()
+                .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+                .expect("the metadata page");
+            let term = log.term_mut(0).expect("term 0");
+
+            let mut appender = Appender::new(metadata, term).expect("a usable log");
+            assert!(appender.initialise_tails(INITIAL_TERM_ID));
+            f(&mut appender);
+        }
+
+        /// Re-open the file and write raw bytes into term 0.
+        ///
+        /// A second phase because an `Appender` borrows the term it writes
+        /// into, so a frame cannot be hand-written beside one — and some frames
+        /// only a hand can write: the appender pads at a term's end, while a
+        /// **repaired hole** is padding in the middle of one.
+        fn patch(&self, offset: usize, f: impl Fn(usize, &AtomicBuffer<'_, ReadWrite>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let term = log.term_mut(0).expect("term 0");
+            f(offset, &term);
+        }
+
+        fn image(&self) -> Image {
+            Image::open(&self.path, 1, 7, 1, 3, 0, "aeron:ipc".to_string()).expect("an image")
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// What a handler collects, and what it answers.
+    ///
+    /// `answer` is given to the first fragment only and `Continue` to the rest,
+    /// which is what makes a single test able to say where a scan stopped.
+    struct Answering {
+        seen: Vec<Vec<u8>>,
+        answer: Action,
+        first: bool,
+    }
+
+    impl Answering {
+        fn new(answer: Action) -> Self {
+            Self {
+                seen: Vec::new(),
+                answer,
+                first: true,
+            }
+        }
+    }
+
+    impl ControlledFragments for Answering {
+        fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+            let mut payload = vec![0u8; fragment.payload_length()];
+            fragment.copy_payload(&mut payload);
+            self.seen.push(payload);
+
+            if self.first {
+                self.first = false;
+                return self.answer;
+            }
+            Action::Continue
+        }
+    }
+
+    fn write_message(appender: &mut Appender<'_>, payload: &[u8]) {
+        assert!(matches!(
+            appender.append(7, 1, i64::MAX, payload),
+            Appended::Ok { .. }
+        ));
+    }
+
+    /// How far a frame carrying this payload reaches, aligned.
+    ///
+    /// Arithmetic rather than the appender's own tail: `RawTail` packs a term
+    /// id beside the offset, and reading one back correctly depends on knowing
+    /// which term it belongs to — which is a thing this test does not need to
+    /// know to place a frame after a message it just wrote.
+    fn frame_reach(payload: &[u8]) -> usize {
+        let raw = i32::try_from(frame::DATA_HEADER_LENGTH + payload.len()).expect("small");
+        usize::try_from(position::align_up(raw, descriptor::FRAME_ALIGNMENT)).expect("positive")
+    }
+
+    #[test]
+    fn the_fixture_is_an_image_over_a_log_buffer_file() {
+        let log = TempLog::new("smoke");
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let image = log.image();
+        assert_eq!(7, image.session_id());
+        assert_eq!(0, image.join_position());
+    }
+
+    #[test]
+    fn a_scan_reads_the_message_that_was_written() {
+        let log = TempLog::new("read");
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let mut handler = Answering::new(Action::Continue);
+        let mut published = Vec::new();
+        let mut image = log.image();
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments);
+        assert_eq!(vec![b"hello".to_vec()], handler.seen);
+        assert_eq!(
+            vec![image.position()],
+            published,
+            "published once, at the end"
+        );
+    }
+
+    /// `Break` consumes the fragment it stopped on, and the reader comes back
+    /// after it rather than at it.
+    ///
+    /// This is what tells `Break` from `Abort` at the scan's level, and it is
+    /// the property a poller relies on when it stops reading a batch of control
+    /// responses part-way through: the ones it took stay taken.
+    #[test]
+    fn a_break_stops_with_the_fragment_it_stopped_on_consumed() {
+        let log = TempLog::new("break");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut handler = Answering::new(Action::Break);
+        let mut published = Vec::new();
+        let mut image = log.image();
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments, "the second message was not read");
+        assert_eq!(vec![b"first".to_vec()], handler.seen);
+        assert_eq!(
+            1,
+            published.len(),
+            "and the position moved past what was taken"
+        );
+        assert!(image.position() > 0, "the break's fragment is consumed");
+    }
+
+    /// Padding moves the position without being a fragment, so it never spends
+    /// the budget.
+    ///
+    /// This is the shape a **repaired hole** leaves: an image that filled a gap
+    /// because its channel said `reliable=false` writes padding in the middle
+    /// of a term, with frames the reader has not seen on the other side of it.
+    /// Counting it would cost a reader a message; jumping to the term's end
+    /// would throw the rest of the term away. The scan steps over it and adds
+    /// nothing to the count — and the test is here rather than left to the
+    /// scan's shape because that shape has changed once already (see the
+    /// `Step::Padding` arm, which used to jump).
+    #[test]
+    fn a_padding_frame_moves_the_position_without_being_a_fragment() {
+        let log = TempLog::new("padding");
+        let message = b"first";
+        log.write(|appender| write_message(appender, message));
+        let tail = frame_reach(message);
+
+        // At the tail, which is where the appender would have written next.
+        log.patch(tail, |offset, term| {
+            const PAD: i32 = 64;
+            term.store_i32_relaxed(offset + frame::FRAME_LENGTH_OFFSET, PAD)
+                .expect("in range");
+            term.store_u8_relaxed(offset + frame::TYPE_OFFSET, frame::TYPE_PAD as u8)
+                .expect("in range");
+        });
+
+        let mut handler = Answering::new(Action::Continue);
+        let mut published = Vec::new();
+        let mut image = log.image();
+        let mut publish = |p: i64| published.push(p);
+
+        // One fragment, so the poll stops on the message and the padding is
+        // still ahead of the reader.
+        assert_eq!(
+            1,
+            image.controlled_poll(1, &mut handler, &mut publish),
+            "the message"
+        );
+        let after_message = image.position();
+
+        assert_eq!(
+            0,
+            image.controlled_poll(1, &mut handler, &mut publish),
+            "the padding"
+        );
+        assert!(
+            image.position() > after_message,
+            "but the position went past it"
+        );
+        assert_eq!(1, handler.seen.len(), "and no second message was invented");
+    }
+
+    /// `Abort` is the other half: the fragment it refused is given back, so the
+    /// reader comes back *at* it and the same message arrives again.
+    #[test]
+    fn an_abort_gives_the_fragment_back() {
+        let log = TempLog::new("abort");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut handler = Answering::new(Action::Abort);
+        let mut published = Vec::new();
+        let mut image = log.image();
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(0, fragments, "a refused fragment is not counted");
+        assert!(published.is_empty(), "and nothing was published");
+        assert_eq!(0, image.position(), "the reader did not move over it");
+    }
+}
