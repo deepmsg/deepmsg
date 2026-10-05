@@ -62,6 +62,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+/// Asking the shim what it knows. Not a java option, and it cannot be mistaken
+/// for one: it is answered before parsing, so it never reaches `java`.
+const TABLE_QUERY: &str = "--deepmsg-shim-table";
+
 /// Written to the log when an invocation is refused, on its own line so the
 /// runner can find it with a plain `grep` rather than by parsing the table.
 const REFUSAL_MARKER: &str = "DEEPMSG-SHIM-REFUSED";
@@ -74,7 +78,18 @@ const WATCHED_NAMESPACES: &[&str] = &["io.aeron.archive.", "io.aeron.driver."];
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
 
-    let config = match Config::from_env() {
+    // Answered before anything else, and before java's grammar gets a look at
+    // it: the runner's completeness check — the classes the shim saw are a
+    // subset of the classes it knows — needs this list, and a copy of it kept
+    // in the runner would be a copy that drifts.
+    if args.len() == 1 && args[0] == TABLE_QUERY {
+        for row in TABLE {
+            println!("{}", row.main_class);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let config = match Config::load() {
         Ok(config) => config,
         Err(message) => {
             eprintln!("archive-shim: {message}");
@@ -370,31 +385,98 @@ fn looks_like_a_class_name(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
 }
 
-/// Everything the shim is told, all of it through the environment: the shim is
-/// baked into the reference's build as a compile-time constant, so it cannot
-/// read anything out of this repository.
+/// Where the shim is told what to do.
+///
+/// **Not the environment**, and that is a measurement rather than a taste.
+/// `TestArchive.h:122` spawns with `posix_spawn(..., envp = NULL)`, and this
+/// glibc hands the child an **empty** environment for that: a three-line
+/// program that spawned a shell the same way saw `MARKER=` and one variable,
+/// against fifty-eight when it passed `environ`. `$PATH` goes with the rest,
+/// so the shim cannot find `java` by name even if it wanted to.
+///
+/// The rehearsal never caught this because its shim was a shell script with the
+/// java path written into it — it needed nothing from the environment, so
+/// nothing was asked of it.
+///
+/// So the configuration is a file beside the binary. The runner writes it
+/// before a run, it travels with the binary it configures, and a missing or
+/// unreadable one is refused by name rather than defaulted into something that
+/// quietly tests the wrong system.
+const CONFIG_FILE: &str = "archive-shim.conf";
+
+#[derive(Debug)]
 struct Config {
     mode: Mode,
-    /// The java it replaced. `Java_JAVA_EXECUTABLE` is overwritten with the
-    /// shim's own path, so after that nobody else remembers where java is.
+    /// The java it replaced. `Java_JAVA_EXECUTABLE` now holds the shim's own
+    /// path, so after that nobody else remembers where java is.
     java: PathBuf,
     log: PathBuf,
 }
 
 impl Config {
-    fn from_env() -> Result<Self, String> {
-        let mode = match std::env::var("DEEPMSG_SHIM_MODE") {
-            Ok(text) => Mode::parse(&text)?,
-            Err(_) => Mode::Transparent,
-        };
+    fn load() -> Result<Self, String> {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot find my own path, so not my configuration either: {e}"))?;
+        let path = exe
+            .parent()
+            .ok_or_else(|| format!("{} has no directory", exe.display()))?
+            .join(CONFIG_FILE);
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "{}: {e}; the runner writes this file next to the shim before a run",
+                path.display()
+            )
+        })?;
 
-        let java = required_path("DEEPMSG_SHIM_JAVA")?;
-        let log = match std::env::var_os("DEEPMSG_SHIM_LOG") {
-            Some(path) => PathBuf::from(path),
-            None => std::env::temp_dir().join("deepmsg-archive-shim.log"),
-        };
+        Self::parse(&text, &path)
+    }
 
-        Ok(Self { mode, java, log })
+    /// Kept apart from finding the file so that what the file may say is
+    /// testable: everything below this line is a decision, and decisions are
+    /// what have to be right.
+    fn parse(text: &str, path: &Path) -> Result<Self, String> {
+        let mut mode = None;
+        let mut java = None;
+        let mut log = None;
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("{}:{}: not key=value", path.display(), number + 1))?;
+            match key.trim() {
+                "mode" => mode = Some(Mode::parse(value.trim())?),
+                "java" => java = Some(value.trim().to_string()),
+                "log" => log = Some(PathBuf::from(value.trim())),
+                other => {
+                    return Err(format!(
+                        "{}:{}: {other:?} is not a setting this shim has; it knows mode, java, log",
+                        path.display(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+
+        let java = java.ok_or_else(|| format!("{}: no `java=` line", path.display()))?;
+        let java = PathBuf::from(java);
+        if !is_executable(&java) {
+            return Err(format!(
+                "{}: java is {}, which is not an executable file",
+                path.display(),
+                java.display()
+            ));
+        }
+
+        Ok(Self {
+            // `transparent` when unstated: the mode that proves the shim
+            // invisible is the only one that is safe to reach by accident.
+            mode: mode.unwrap_or(Mode::Transparent),
+            java,
+            log: log.unwrap_or_else(|| std::env::temp_dir().join("deepmsg-archive-shim.log")),
+        })
     }
 
     /// `exec`, not spawn-and-wait: the reference signals the pid it spawned and
@@ -452,19 +534,6 @@ fn describe(decision: Decision) -> String {
             "replace:archiving-media-driver".to_string()
         }
     }
-}
-
-fn required_path(variable: &str) -> Result<PathBuf, String> {
-    let value = std::env::var_os(variable)
-        .ok_or_else(|| format!("${variable} is not set; the shim cannot run java without it"))?;
-    let path = PathBuf::from(value);
-    if !is_executable(&path) {
-        return Err(format!(
-            "${variable} is {}, which is not an executable file",
-            path.display()
-        ));
-    }
-    Ok(path)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -651,6 +720,64 @@ mod tests {
                 row.main_class
             );
         }
+    }
+
+    /// The flag the runner uses, and that it is exactly one main class per
+    /// line so that a shell can compare sets without parsing.
+    #[test]
+    fn the_table_query_answers_with_the_classes_the_table_holds() {
+        let listed: Vec<&str> = TABLE.iter().map(|row| row.main_class).collect();
+        assert_eq!(3, listed.len(), "the runner compares against this list");
+        assert!(listed.contains(&"io.aeron.archive.Archive"));
+        assert!(listed.contains(&"io.aeron.archive.ArchivingMediaDriver"));
+        assert!(listed.contains(&"io.aeron.driver.MediaDriver"));
+    }
+
+    fn config(text: &str) -> Result<Config, String> {
+        Config::parse(text, Path::new("archive-shim.conf"))
+    }
+
+    #[test]
+    fn a_configuration_names_java_and_the_mode() {
+        let parsed = config(
+            "# written by the runner\n\
+             java = /bin/sh\n\
+             mode = hybrid\n\
+             log = /tmp/x.log\n",
+        )
+        .unwrap();
+        assert_eq!(Mode::Hybrid, parsed.mode);
+        assert_eq!(PathBuf::from("/bin/sh"), parsed.java);
+        assert_eq!(PathBuf::from("/tmp/x.log"), parsed.log);
+    }
+
+    /// The safe default is the mode that proves the shim invisible. A mode
+    /// reached by accident must never be one that swaps a component out.
+    #[test]
+    fn a_configuration_that_does_not_say_the_mode_is_transparent() {
+        assert_eq!(Mode::Transparent, config("java = /bin/sh\n").unwrap().mode);
+    }
+
+    /// A setting the shim does not have is a runner that has fallen out of step
+    /// with it, which is worth stopping for rather than ignoring.
+    #[test]
+    fn a_setting_that_is_not_one_is_refused_by_name() {
+        let message = config("java=/bin/sh\ndedicated=true\n").unwrap_err();
+        assert!(message.contains("dedicated"), "{message}");
+    }
+
+    #[test]
+    fn a_configuration_without_java_is_refused() {
+        assert!(
+            config("mode = transparent\n")
+                .unwrap_err()
+                .contains("java=")
+        );
+        assert!(
+            config("java = /definitely/not/here\n")
+                .unwrap_err()
+                .contains("not an executable")
+        );
     }
 
     #[test]
