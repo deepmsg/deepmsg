@@ -727,6 +727,11 @@ pub struct DriverConfig {
     /// is not. Zero, the default, delays nothing. `docs/compat.md` records the
     /// difference, as it does for `data_loss_drop_every`.
     pub debug_resolver_delay_ms: u64,
+    /// Whether to time a data packet from the kernel's own arrival stamp to the
+    /// write into the image log, and publish it to `<aeron.dir>/stage-timing.txt`
+    /// (`debug.stage.timing`). Off unless a run asks for it. See
+    /// [`Setting::DEBUG_STAGE_TIMING`].
+    pub debug_stage_timing: bool,
     /// Which resolver this driver builds and keeps
     /// (`aeron.name.resolver.supplier`, `AERON_NAME_RESOLVER_SUPPLIER`,
     /// `aeronmd.h:808-809`, whose default is `default`) — `default`,
@@ -937,6 +942,7 @@ impl Default for DriverConfig {
             max_resend: MAX_RESEND_DEFAULT,
             data_loss_drop_every: None,
             debug_resolver_delay_ms: 0,
+            debug_stage_timing: false,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
             name_resolver_supplier: NAME_RESOLVER_SUPPLIER_DEFAULT,
             name_resolver_init_args: None,
@@ -1647,6 +1653,10 @@ impl DriverConfig {
                     });
                 }
             }
+        }
+
+        if let Some(value) = get(&Setting::DEBUG_STAGE_TIMING) {
+            config.debug_stage_timing = parse_bool(&Setting::DEBUG_STAGE_TIMING, &value)?;
         }
 
         if let Some(value) = get(&Setting::DATA_LOSS_DROP_EVERY) {
@@ -2450,6 +2460,27 @@ impl Setting {
     const DEBUG_RESOLVER_DELAY_MILLIS: Self = Self {
         property: "debug.resolver.delay.millis",
         env: "DEEPMSG_DEBUG_RESOLVER_DELAY_MILLIS",
+    };
+    /// `deepmsg.debug.stage.timing`: time a data packet from the kernel to the
+    /// log, and write the running distribution to `<aeron.dir>/stage-timing.txt`
+    /// once a second.
+    ///
+    /// The third setting here with no reference variable to borrow, and this one
+    /// reproduces no reference behaviour at all: it is this driver's own
+    /// instrument. What it measures is the one stage of a round trip that
+    /// belongs to the driver alone and that no counter of the reference's
+    /// describes — how long a datagram sits between arriving at the socket and
+    /// being written into the image log. It exists because the same grid run
+    /// against the reference driver is measurably quicker in a way none of that
+    /// driver's counters account for, and because the reference cannot be
+    /// instrumented the same way (its binary is not ours to change).
+    ///
+    /// **Off by default, and it must stay off for any run whose numbers are
+    /// reported**: reading a timestamp out of a control message costs a little
+    /// per datagram, and that is exactly the budget under study.
+    const DEBUG_STAGE_TIMING: Self = Self {
+        property: "debug.stage.timing",
+        env: "DEEPMSG_DEBUG_STAGE_TIMING",
     };
 }
 

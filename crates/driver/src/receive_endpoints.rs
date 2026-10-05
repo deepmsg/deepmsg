@@ -559,6 +559,12 @@ impl ReceiveChannelEndpoints {
             } else {
                 config.socket_multicast_ttl
             },
+            // The one knob here the reference has no counterpart for: it is
+            // this driver's own instrument, and it is off unless a run asked
+            // for it. Set on the descriptor that receives, which for a
+            // multicast transport is the second one — `UdpTransport::open`
+            // reads this where it reads the receive buffer.
+            receive_timestamps: config.debug_stage_timing,
         }
     }
 

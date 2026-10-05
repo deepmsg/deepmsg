@@ -44,6 +44,15 @@ pub struct Datagram {
     /// The source address; `None` when the socket is connected and the kernel
     /// reported none.
     pub source: Option<SocketAddr>,
+    /// When the kernel says the datagram arrived, in nanoseconds since the
+    /// epoch — `None` unless the socket was asked for receive timestamps
+    /// ([`DatagramSocket::set_receive_timestamps`]).
+    ///
+    /// This is the only reading of "when did it arrive" that is not the
+    /// driver's own clock, and it is why the option exists: the distance from
+    /// here to the write into the log is the driver's receive latency, with the
+    /// caller's own polling on it.
+    pub kernel_ns: Option<i64>,
 }
 
 /// The datagrams one [`DatagramSocket::receive_batch`] filled, in order.
@@ -63,6 +72,7 @@ impl Datagrams {
             datagrams: [Datagram {
                 length: 0,
                 source: None,
+                kernel_ns: None,
             }; MAX_BATCH],
             count: 0,
         }
@@ -87,6 +97,47 @@ impl Datagrams {
 impl Default for Datagrams {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Room for one control message carrying a `timespec`, rounded up to the
+/// alignment `cmsghdr` needs — which is what `CMSG_SPACE` is for, and why the
+/// buffer below is `u64`s rather than bytes.
+const CONTROL_BYTES: usize =
+    // SAFETY: `CMSG_SPACE` is arithmetic on constants — no pointer, no state.
+    unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::timespec>() as libc::c_uint) as usize };
+
+/// The same, in `u64`s, so the buffer's alignment is `cmsghdr`'s.
+const CONTROL_WORDS: usize = CONTROL_BYTES.div_ceil(std::mem::size_of::<u64>());
+
+/// The kernel's arrival stamp from a message's control block, if it put one
+/// there (`SCM_TIMESTAMPNS`).
+///
+/// # Safety
+///
+/// `header` must be a message the kernel just filled, with `msg_control`
+/// pointing at a buffer at least `msg_controllen` bytes long and aligned for
+/// `cmsghdr`.
+unsafe fn kernel_timestamp(header: &libc::msghdr) -> Option<i64> {
+    // SAFETY: the caller guarantees `msg_control` bounds and alignment, which
+    // is exactly what the `cmsg` macros walk; every read below is inside that
+    // buffer.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(header);
+
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS
+            {
+                let stamp =
+                    std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
+
+                return Some(stamp.tv_sec * 1_000_000_000 + stamp.tv_nsec);
+            }
+
+            cmsg = libc::CMSG_NXTHDR(header, cmsg);
+        }
+
+        None
     }
 }
 
@@ -135,6 +186,9 @@ impl std::error::Error for BindFailure {}
 pub struct DatagramSocket {
     fd: libc::c_int,
     family: AddressFamily,
+    /// Whether the kernel is asked to stamp arriving datagrams
+    /// (`set_receive_timestamps`). Read once per batch, so a plain relaxed load.
+    receive_timestamps: std::sync::atomic::AtomicBool,
 }
 
 impl DatagramSocket {
@@ -159,7 +213,11 @@ impl DatagramSocket {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { fd, family })
+        Ok(Self {
+            fd,
+            family,
+            receive_timestamps: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Bind the socket to a local address
@@ -424,6 +482,27 @@ impl DatagramSocket {
         }
     }
 
+    /// Ask the kernel to stamp arriving datagrams with the time it took them
+    /// off the queue (`SO_TIMESTAMPNS`), so that a datagram's own arrival can
+    /// be told apart from the moment this process got round to reading it.
+    ///
+    /// Not the reference's option — it has none — and not free: the kernel
+    /// builds a control message for every datagram, which is work on the very
+    /// path being timed. It is here for `debug.stage.timing`, and a run whose
+    /// numbers are reported leaves it off.
+    ///
+    /// # Errors
+    ///
+    /// The error from `setsockopt(2)`.
+    pub fn set_receive_timestamps(&self, enabled: bool) -> io::Result<()> {
+        let enabled: libc::c_int = i32::from(enabled);
+        self.set_option(libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, &enabled)?;
+        self.receive_timestamps
+            .store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
     /// Put the socket in non-blocking mode, which is how the data plane polls
     /// (`aeron_udp_channel_transport.c:356-366`).
     ///
@@ -583,6 +662,14 @@ impl DatagramSocket {
             iov_len: 0,
         }; MAX_BATCH];
 
+        // Only when the socket was asked for them: an unused control buffer is
+        // a `msg_controllen` of zero, and the kernel then writes no control
+        // message at all.
+        let stamping = self
+            .receive_timestamps
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut control = [[MaybeUninit::<u64>::uninit(); CONTROL_WORDS]; MAX_BATCH];
+
         for (index, buffer) in buffers.iter_mut().take(count).enumerate() {
             io_vectors[index] = libc::iovec {
                 iov_base: buffer.as_mut_ptr().cast(),
@@ -597,6 +684,11 @@ impl DatagramSocket {
             header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             header.msg_iov = std::ptr::from_mut(&mut io_vectors[index]);
             header.msg_iovlen = 1;
+
+            if stamping {
+                header.msg_control = control[index].as_mut_ptr().cast();
+                header.msg_controllen = CONTROL_BYTES as libc::size_t;
+            }
 
             messages[index].write(libc::mmsghdr {
                 msg_hdr: header,
@@ -645,6 +737,14 @@ impl DatagramSocket {
                     // bytes into this entry, and `msg_namelen` says how much
                     // of it is meaningful.
                     unsafe { from_sockaddr(names[index].as_ptr(), message.msg_hdr.msg_namelen) }
+                },
+                kernel_ns: if stamping {
+                    // SAFETY: `stamping` was set with the same control buffer
+                    // this message was given, so the kernel wrote its headers
+                    // into `control[index]` and `msg_controllen` bounds them.
+                    unsafe { kernel_timestamp(&message.msg_hdr) }
+                } else {
+                    None
                 },
             };
         }

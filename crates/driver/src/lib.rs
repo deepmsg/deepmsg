@@ -52,6 +52,7 @@ pub mod receiver;
 pub mod retransmit_handler;
 pub mod send_endpoints;
 pub mod sender;
+pub mod stage_timing;
 pub mod subscribable;
 /// The kernel seam: the one `unsafe` in this crate, and the only place the
 /// allow appears. ADR-0002 zone 4.

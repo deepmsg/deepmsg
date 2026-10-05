@@ -657,6 +657,7 @@ impl Receiver {
         initial_window_length: i32,
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
+        debug_stage_timing: bool,
     ) -> io::Result<Self> {
         // A test-only constructor: it puts the loss report beside the CnC file
         // it was handed, which is where a driver puts it too.
@@ -678,6 +679,7 @@ impl Receiver {
             initial_window_length,
             cycle_threshold_ns,
             re_resolution_interval_ns,
+            debug_stage_timing,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -711,6 +713,7 @@ impl Receiver {
         initial_window_length: i32,
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
+        debug_stage_timing: bool,
     ) -> io::Result<ReceiverParts> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
         let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
@@ -738,6 +741,7 @@ impl Receiver {
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
+                debug_stage_timing,
             ),
         })
     }
@@ -843,6 +847,10 @@ pub(crate) struct ReceiverThread {
     /// because the lists change as channels come and go.
     transports: Vec<(usize, usize)>,
     last_cycle_ns: i64,
+    /// This driver's own instrument (`debug.stage.timing`), or `None` — which
+    /// is every run whose numbers are reported, and is why the receive path
+    /// reads no clock when it is off. See [`crate::stage_timing`].
+    stage_timing: Option<crate::stage_timing::StageTiming>,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Inbox<ReceiverCommand>,
 }
@@ -861,7 +869,16 @@ impl ReceiverThread {
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
         commands: Inbox<ReceiverCommand>,
+        debug_stage_timing: bool,
     ) -> Self {
+        // Beside the CnC file, which is where the driver's other diagnostic —
+        // the loss report — goes, and built before the `cnc` below is moved.
+        let stage_timing = debug_stage_timing.then(|| {
+            crate::stage_timing::StageTiming::new(
+                cnc.path().parent().unwrap_or_else(|| Path::new(".")),
+            )
+        });
+
         Self {
             commands,
             cnc,
@@ -885,6 +902,7 @@ impl ReceiverThread {
             readable: Vec::new(),
             transports: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
+            stage_timing,
         }
     }
 
@@ -1300,6 +1318,7 @@ impl ReceiverThread {
             &regions,
             &self.events,
             &cnc,
+            &mut self.stage_timing,
             now_ns,
         );
 
@@ -1335,6 +1354,13 @@ impl ReceiverThread {
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
         );
+
+        // The instrument publishes on this thread's own pass — no new pipe, and
+        // no second thread writing the same file. It compares against the
+        // pass's own clock, which is the one `now_ns` already is.
+        if let Some(timing) = self.stage_timing.as_mut() {
+            timing.flush_if_due(now_ns);
+        }
 
         work + re_resolved
     }
@@ -1425,7 +1451,6 @@ impl ReceiverThread {
 
     /// Read every endpoint's socket and give each datagram to the thing that
     /// wants it (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)] // one per thing the pass carries
     fn receive_datagrams(
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
@@ -1441,6 +1466,7 @@ impl ReceiverThread {
         regions: &CounterRegions<'_>,
         events: &Outbox<ReceiverEvent>,
         cnc: &Arc<CncFile>,
+        stage_timing: &mut Option<crate::stage_timing::StageTiming>,
         now_ns: i64,
     ) -> usize {
         let _ = cnc;
@@ -1533,6 +1559,31 @@ impl ReceiverThread {
                     bytes_received += i64::try_from(datagram.length).unwrap_or(0);
                     work += 1;
 
+                    // The instrument's first mark, and the reason it is taken
+                    // here rather than anywhere later: this line is the moment
+                    // the driver *noticed* the datagram, so what it measures is
+                    // the waiting and none of the work. Every datagram the
+                    // kernel stamped gets one, including the ones the
+                    // interceptors below throw away.
+                    let samples = match (stage_timing.as_mut(), datagram.kernel_ns) {
+                        (Some(timing), Some(kernel_ns)) => {
+                            timing.record_walked();
+                            timing.record_pickup(crate::stage_timing::since_kernel_ns(kernel_ns));
+
+                            Some((timing, kernel_ns))
+                        }
+                        (Some(timing), None) => {
+                            // Walked and not stamped: the mark cannot be taken,
+                            // and a distribution that quietly left these out
+                            // would be a distribution over a subset.
+                            timing.record_walked();
+                            timing.record_unstamped();
+
+                            None
+                        }
+                        (None, _) => None,
+                    };
+
                     let Some(source) = datagram.source else {
                         continue;
                     };
@@ -1560,6 +1611,7 @@ impl ReceiverThread {
                         regions,
                         events,
                         now_ns,
+                        samples,
                     );
                 }
 
@@ -1572,7 +1624,6 @@ impl ReceiverThread {
 
     /// One datagram, to the dispatcher
     /// (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)] // the frame, and where it arrived
     fn dispatch(
         endpoint_id: u64,
@@ -1587,6 +1638,7 @@ impl ReceiverThread {
         regions: &CounterRegions<'_>,
         events: &Outbox<ReceiverEvent>,
         now_ns: i64,
+        samples: Option<(&mut crate::stage_timing::StageTiming, i64)>,
     ) {
         let Some(header) = FrameHeader::read(packet) else {
             return;
@@ -1617,7 +1669,14 @@ impl ReceiverThread {
                             .iter_mut()
                             .find(|image| image.registration_id == registration_id)
                         {
-                            image.insert_packet(
+                            // The instrument's second mark, and the reason it is
+                            // taken here rather than after `dispatch` returns:
+                            // this is where the reference's receive stage ends
+                            // — the packet is in the term. `insert_packet`
+                            // answers with the packet's length for a packet it
+                            // wrote and with zero for every packet it refuses,
+                            // so a zero is not a sample.
+                            let written = image.insert_packet(
                                 frame.term_id,
                                 frame.term_offset,
                                 packet,
@@ -1628,6 +1687,14 @@ impl ReceiverThread {
                                 regions,
                                 now_ns,
                             );
+
+                            if written != 0 {
+                                if let Some((timing, kernel_ns)) = samples {
+                                    timing.record_logged(crate::stage_timing::since_kernel_ns(
+                                        kernel_ns,
+                                    ));
+                                }
+                            }
                         }
                     }
                     Interest::ElicitSetup => {
@@ -2145,6 +2212,7 @@ mod tests {
             128 * 1024,
             100_000_000,
             0,
+            false,
         )
         .expect("a receiver");
 

@@ -1408,6 +1408,11 @@ pub fn transport_params(config: &DriverConfig, channel: &UdpChannel) -> Transpor
         } else {
             config.socket_multicast_ttl
         },
+        // A sender's socket does receive — status messages — but
+        // `debug.stage.timing` times the data path, which arrives on a
+        // receive endpoint's socket, and that is the only params builder that
+        // sets this.
+        receive_timestamps: false,
     }
 }
 

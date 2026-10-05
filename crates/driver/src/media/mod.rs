@@ -60,6 +60,11 @@ pub struct TransportParams {
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, in bytes; zero leaves the kernel's default.
     pub socket_sndbuf: usize,
+    /// Whether the kernel is asked to stamp arriving datagrams with the time it
+    /// took them off the queue (`SO_TIMESTAMPNS`), which is what
+    /// `debug.stage.timing` measures from. Never set for a run whose numbers
+    /// are reported: it is work on the very path the instrument is looking at.
+    pub receive_timestamps: bool,
     /// The channel's interface index, which the IPv6 multicast options take in
     /// place of an address (`aeron_udp_channel_transport.c:213-227`, `:230-235`).
     pub multicast_if_index: u32,

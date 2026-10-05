@@ -167,6 +167,16 @@ impl UdpTransport {
             receive.set_receive_buffer(params.socket_rcvbuf)?;
         }
 
+        if params.receive_timestamps {
+            // On the descriptor that receives, for the same reason the buffer
+            // is: a multicast transport looks at its second one. This is the
+            // step `debug.stage.timing` cannot be wired without — the socket is
+            // opened here, on the conductor, and handed to the receiver with
+            // the endpoint, so the option has to be set before the handover
+            // rather than by the thread that reads it.
+            receive.set_receive_timestamps(true)?;
+        }
+
         if params.socket_sndbuf > 0 {
             // `:336-344`: on the one that sends.
             socket.set_send_buffer(params.socket_sndbuf)?;
@@ -445,6 +455,7 @@ mod tests {
                 socket_sndbuf: 1 << 20,
                 multicast_if_index: 0,
                 ttl: 4,
+                ..TransportParams::default()
             },
         )
         .expect("a socket");
@@ -453,6 +464,108 @@ mod tests {
         // book minimum, so the assertion is that the option took effect at
         // all rather than that it round-trips.
         assert!(transport.receive_buffer_size().expect("an answer") > 0);
+    }
+
+    /// The instrument's own option, and the one thing about it that has to hold
+    /// for its numbers to mean anything: asked for, the datagram arrives
+    /// carrying the kernel's stamp; not asked for, it does not.
+    ///
+    /// An option that silently did nothing would not produce a wrong number —
+    /// it would produce an empty file, and an empty file read as "the stage is
+    /// zero" is the wrong conclusion. This is the test that tells the two
+    /// apart.
+    #[test]
+    fn a_datagram_carries_the_kernel_s_stamp_only_when_the_socket_asked_for_it() {
+        for asked in [false, true] {
+            let mut receiver = UdpTransport::open(
+                loopback(0),
+                None,
+                None,
+                &TransportParams {
+                    receive_timestamps: asked,
+                    ..TransportParams::default()
+                },
+            )
+            .expect("a socket");
+            let bound = receiver.local_address().expect("a bound address");
+
+            let mut sender =
+                UdpTransport::open(loopback(0), None, None, &TransportParams::default())
+                    .expect("a socket");
+            assert_eq!(1, sender.send(Some(bound), &[b"hello"]).expect("a send"));
+
+            let mut buffers = vec![vec![0u8; 1408]];
+            let mut datagrams = Datagrams::new();
+            assert_eq!(
+                1,
+                receiver
+                    .receive(&mut buffers, &mut datagrams)
+                    .expect("a receive"),
+                "asked: {asked}"
+            );
+
+            let stamp = datagrams.as_slice()[0].kernel_ns;
+            assert_eq!(asked, stamp.is_some(), "asked: {asked}");
+
+            if let Some(stamp) = stamp {
+                // A reading of `CLOCK_REALTIME`: past the epoch, and not ahead
+                // of this thread's own reading of that same clock. The mark the
+                // instrument takes is this number subtracted from that clock,
+                // and if the two were not the same one this assertion is what
+                // would have caught it.
+                assert!(
+                    stamp > 0 && stamp <= deepmsg_core::clock::epoch_nano_time(),
+                    "{stamp}"
+                );
+            }
+        }
+    }
+
+    /// A batch is not one sample. The receiver reads up to sixteen datagrams in
+    /// one `recvmmsg`, and the instrument takes a mark per datagram — so if the
+    /// kernel stamped only the first of them, the instrument would count one
+    /// sample per *pass* and quietly report a distribution over a fraction of
+    /// the traffic.
+    #[test]
+    fn every_datagram_in_one_batch_carries_its_own_stamp() {
+        const BATCH: usize = 8;
+
+        let mut receiver = UdpTransport::open(
+            loopback(0),
+            None,
+            None,
+            &TransportParams {
+                receive_timestamps: true,
+                ..TransportParams::default()
+            },
+        )
+        .expect("a socket");
+        let bound = receiver.local_address().expect("a bound address");
+
+        let mut sender = UdpTransport::open(loopback(0), None, None, &TransportParams::default())
+            .expect("a socket");
+
+        // Queued before anything reads, so the one `recvmmsg` below sees all of
+        // them — which is the batch this is about.
+        for _ in 0..BATCH {
+            sender.send(Some(bound), &[b"hello"]).expect("a send");
+        }
+
+        let mut buffers: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0u8; 1408]).collect();
+        let mut datagrams = Datagrams::new();
+        assert_eq!(
+            BATCH,
+            receiver
+                .receive(&mut buffers, &mut datagrams)
+                .expect("a receive")
+        );
+
+        for (index, datagram) in datagrams.as_slice().iter().enumerate() {
+            assert!(
+                datagram.kernel_ns.is_some(),
+                "datagram {index} of the batch"
+            );
+        }
     }
 
     /// The interface this host joins a group on — what a channel with no
