@@ -1865,6 +1865,21 @@ impl Conductor {
             let _ = self
                 .counters
                 .free(&region, image.counters.rcv_pos, self.now_ms);
+            // The third of the image's own three, and the one this used to
+            // leave behind. `aeron_publication_image_close` gives back the high
+            // water mark, the position **and** the NAK count, in that order and
+            // in one function
+            // (`aeron-driver/src/main/c/aeron_publication_image.c:410-412`);
+            // ours freed the first two and dropped this one.
+            //
+            // A slot nobody gives back is a slot the pool does not have for the
+            // next channel, and it is visible from outside: the node's dump,
+            // taken after the client that owned the image had gone, showed this
+            // counter still allocated while the rest of its block was
+            // reclaimed.
+            let _ = self
+                .counters
+                .free(&region, image.counters.rcv_naks_sent, self.now_ms);
 
             for counter_id in &image.congestion_control_counters {
                 let _ = self.counters.free(&region, *counter_id, self.now_ms);
@@ -6225,6 +6240,30 @@ mod tests {
             conductor.publication_images().is_empty(),
             "and the image is gone from the driver"
         );
+
+        // All three of the image's own counters go back to the pool. The third
+        // is the one that did not: a released image left its `rcv-naks-sent`
+        // allocated for the life of the driver, and the reference frees all
+        // three in one function (`aeron_publication_image.c:410-412`).
+        let regions = counter_regions(&conductor);
+        let counters = regions.reader();
+
+        for (type_id, name) in [
+            (
+                crate::position::type_id::RECEIVER_HWM,
+                "the high water mark",
+            ),
+            (crate::position::type_id::RECEIVER_POSITION, "the position"),
+            (
+                crate::position::type_id::RECEIVER_NAKS_SENT,
+                "and the NAK count",
+            ),
+        ] {
+            assert!(
+                counters.find_by_type_id(type_id).is_none(),
+                "{name} is reclaimed"
+            );
+        }
     }
 
     /// A12: the session id a network publication runs under.
