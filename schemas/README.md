@@ -1,9 +1,10 @@
 # SBE schemas
 
-Single source of truth for the SBE-encoded contracts. The wire protocol,
-archive/cluster control protocols, mark files and the node-state file all
-share SBE encoding; the only deliberately non-SBE on-disk format in the
-system is the archive `recording.log` (hand-rolled inside `deepmsg-archive`).
+Single source of truth for the SBE-encoded contracts: the archive and cluster
+control protocols, the mark files and the node-state file. The UDP wire
+protocol is not one of them — its frames are hand-written structs, not
+generated (`docs/protocol/wire-frames.md`) — and neither is the archive
+`recording.log`, which is hand-rolled inside `deepmsg-archive`.
 
 Forked verbatim from the [aeron-io/aeron](https://github.com/aeron-io/aeron)
 **1.53.2** tree (commit `664f58e705`) on 2026-09-25. Upstream filenames are
