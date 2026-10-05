@@ -254,10 +254,14 @@ public final class Generate {
                     throw new IllegalStateException(name + "." + field.getAttribute("name")
                         + " names the type " + typeName + ", which this program does not know");
                 }
+                // A field is optional if the schema says so on the field or on
+                // the type alias it names — the mark schema declares its three
+                // optional fields the second way, and only the second way.
                 fields.add(new Field(
                     field.getAttribute("name"),
                     type,
-                    intOrZero(field.getAttribute("sinceVersion"))));
+                    intOrZero(field.getAttribute("sinceVersion")),
+                    "optional".equals(field.getAttribute("presence")) || type.optional()));
             }
         }
 
@@ -305,15 +309,20 @@ public final class Generate {
      * this program invents is inside the range the schema allows and not merely
      * inside the width of the integer.
      */
-    record TypeSpec(Kind kind, String primitive, Long min, Long max, String enumClass, List<String> enumNames) {
+    record TypeSpec(Kind kind, String primitive, Long min, Long max, Long nullValue,
+                    String enumClass, List<String> enumNames, boolean optional) {
         static TypeSpec primitive(String primitive) {
-            return new TypeSpec(Kind.INTEGER, primitive, null, null, null, null);
+            return new TypeSpec(Kind.INTEGER, primitive, null, null, defaultNull(primitive), null, null, false);
         }
 
         static TypeSpec integer(Element type) {
-            return new TypeSpec(Kind.INTEGER, type.getAttribute("primitiveType"),
+            String primitive = type.getAttribute("primitiveType");
+            Long declared = numberOrNull(type.getAttribute("nullValue"));
+            return new TypeSpec(Kind.INTEGER, primitive,
                 numberOrNull(type.getAttribute("minValue")),
-                numberOrNull(type.getAttribute("maxValue")), null, null);
+                numberOrNull(type.getAttribute("maxValue")),
+                declared != null ? declared : defaultNull(primitive), null, null,
+                "optional".equals(type.getAttribute("presence")));
         }
 
         static TypeSpec enumeration(String className, Element type) {
@@ -321,16 +330,25 @@ public final class Generate {
             for (Element value : children(type, "validValue")) {
                 names.add(value.getAttribute("name"));
             }
-            return new TypeSpec(Kind.ENUM, "int32", null, null, className, List.copyOf(names));
+            return new TypeSpec(Kind.ENUM, "int32", null, null, null, className, List.copyOf(names), false);
         }
 
         static TypeSpec variable(Kind kind) {
-            return new TypeSpec(kind, null, null, null, null, null);
+            return new TypeSpec(kind, null, null, null, null, null, null, false);
         }
 
-        /** The `sbe-tool` name for this type, as `golden.tsv` writes it. */
+        /**
+         * The `sbe-tool` name for this type, as `golden.tsv` writes it.
+         *
+         * A field the schema marks `presence="optional"` carries its null value
+         * with it, because that value is not recoverable from the reading: an
+         * optional field's null and a field that is really zero read the same
+         * in the table, and only the schema knows which it was. The decoders
+         * `sbe-tool` generates answer `None` for exactly that value, so the
+         * Rust side cannot check one without knowing the other.
+         */
         String typeName(Field field) {
-            return switch (kind) {
+            String name = switch (kind) {
                 case INTEGER -> switch (primitive) {
                     case "int8" -> "i8";
                     case "int16" -> "i16";
@@ -342,10 +360,29 @@ public final class Generate {
                 case VAR_ASCII -> "ascii";
                 case VAR_DATA -> "data";
             };
+            if (!field.optional()) {
+                return name;
+            }
+            if (kind != Kind.INTEGER) {
+                throw new IllegalStateException(
+                    field.name() + " is optional and " + kind + ", which this program cannot name");
+            }
+            return name + ":null=" + nullValue;
         }
     }
 
-    record Field(String name, TypeSpec type, int sinceVersion) {
+    /** SBE's null for a primitive, where the schema does not state one. */
+    private static long defaultNull(String primitive) {
+        return switch (primitive) {
+            case "int8" -> Byte.MIN_VALUE;
+            case "int16" -> Short.MIN_VALUE;
+            case "int32" -> Integer.MIN_VALUE;
+            case "int64" -> Long.MIN_VALUE;
+            default -> throw new IllegalStateException("no null value for " + primitive);
+        };
+    }
+
+    record Field(String name, TypeSpec type, int sinceVersion, boolean optional) {
         Kind kind() {
             return type.kind();
         }

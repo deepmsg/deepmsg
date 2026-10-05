@@ -37,6 +37,15 @@ difference between a golden and a hope.
 `enum:<Name>` — whose value is `<NAME>:<raw>`, so the name and the wire integer
 are both pinned.
 
+A field the schema marks optional carries its null value in the type —
+`i32:null=0`, `i64:null=-1`. It has to be written down somewhere: the decoder
+`sbe-tool` generates answers `None` for exactly that value, and the reading
+alone cannot say whether a field was absent or really zero. The null comes from
+the schema's `nullValue` where it states one and from SBE's rule for the
+primitive where it does not — and "the schema marks optional" includes both
+places the two schemas say it, the field and the type alias it names (the mark
+header's three optional fields are declared the second way).
+
 ## The second version of a few fixtures
 
 A handful of messages have fields added after the message was introduced
@@ -57,6 +66,12 @@ whatever the header says, which a probe against the jar confirmed — so the onl
 old version the reference can be asked about is the one it reads. The generator
 lowers the header's `version` byte in a copy and asks the reference decoder for
 its answer; the committed `.bin` keeps the version the encoder wrote.
+
+Read back by `tests/integration/sbe_golden.rs`, one test per message with three
+assertions on it: our decoder against these readings, our encoder's bytes
+against the fixture, and the two lengths against each other. That test needs
+nothing but this directory, so it runs in CI — which the interop suite, needing
+the reference checkout, cannot.
 
 ## Regenerating
 

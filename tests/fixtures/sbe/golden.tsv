@@ -81,7 +81,7 @@ field	control-response-error	14	controlSessionId	i64	56
 field	control-response-error	14	correlationId	i64	59
 field	control-response-error	14	relevantId	i64	62
 field	control-response-error	14	code	enum:ControlResponseCode	ERROR:1
-field	control-response-error	14	version	i32	85
+field	control-response-error	14	version	i32:null=0	85
 field	control-response-error	14	errorMessage	ascii	errorMessage
 header	control-response-error	3	blockLength	u16	32
 header	control-response-error	3	templateId	u16	1
@@ -91,7 +91,7 @@ field	control-response-error	3	controlSessionId	i64	56
 field	control-response-error	3	correlationId	i64	59
 field	control-response-error	3	relevantId	i64	62
 field	control-response-error	3	code	enum:ControlResponseCode	ERROR:1
-field	control-response-error	3	version	i32	0
+field	control-response-error	3	version	i32:null=0	0
 field	control-response-error	3	errorMessage	ascii	errorMessage
 header	control-response-ok	14	blockLength	u16	32
 header	control-response-ok	14	templateId	u16	1
@@ -101,7 +101,7 @@ field	control-response-ok	14	controlSessionId	i64	56
 field	control-response-ok	14	correlationId	i64	59
 field	control-response-ok	14	relevantId	i64	62
 field	control-response-ok	14	code	enum:ControlResponseCode	OK:0
-field	control-response-ok	14	version	i32	0
+field	control-response-ok	14	version	i32:null=0	0
 field	control-response-ok	14	errorMessage	ascii	
 header	control-response-ok	3	blockLength	u16	32
 header	control-response-ok	3	templateId	u16	1
@@ -111,7 +111,7 @@ field	control-response-ok	3	controlSessionId	i64	56
 field	control-response-ok	3	correlationId	i64	59
 field	control-response-ok	3	relevantId	i64	62
 field	control-response-ok	3	code	enum:ControlResponseCode	OK:0
-field	control-response-ok	3	version	i32	0
+field	control-response-ok	3	version	i32:null=0	0
 field	control-response-ok	3	errorMessage	ascii	
 header	control-response-recording-unknown	14	blockLength	u16	32
 header	control-response-recording-unknown	14	templateId	u16	1
@@ -121,7 +121,7 @@ field	control-response-recording-unknown	14	controlSessionId	i64	56
 field	control-response-recording-unknown	14	correlationId	i64	59
 field	control-response-recording-unknown	14	relevantId	i64	62
 field	control-response-recording-unknown	14	code	enum:ControlResponseCode	RECORDING_UNKNOWN:2
-field	control-response-recording-unknown	14	version	i32	85
+field	control-response-recording-unknown	14	version	i32:null=0	85
 field	control-response-recording-unknown	14	errorMessage	ascii	errorMessage
 header	control-response-recording-unknown	3	blockLength	u16	32
 header	control-response-recording-unknown	3	templateId	u16	1
@@ -131,7 +131,7 @@ field	control-response-recording-unknown	3	controlSessionId	i64	56
 field	control-response-recording-unknown	3	correlationId	i64	59
 field	control-response-recording-unknown	3	relevantId	i64	62
 field	control-response-recording-unknown	3	code	enum:ControlResponseCode	RECORDING_UNKNOWN:2
-field	control-response-recording-unknown	3	version	i32	0
+field	control-response-recording-unknown	3	version	i32:null=0	0
 field	control-response-recording-unknown	3	errorMessage	ascii	errorMessage
 header	control-response-subscription-unknown	14	blockLength	u16	32
 header	control-response-subscription-unknown	14	templateId	u16	1
@@ -141,7 +141,7 @@ field	control-response-subscription-unknown	14	controlSessionId	i64	56
 field	control-response-subscription-unknown	14	correlationId	i64	59
 field	control-response-subscription-unknown	14	relevantId	i64	62
 field	control-response-subscription-unknown	14	code	enum:ControlResponseCode	SUBSCRIPTION_UNKNOWN:3
-field	control-response-subscription-unknown	14	version	i32	85
+field	control-response-subscription-unknown	14	version	i32:null=0	85
 field	control-response-subscription-unknown	14	errorMessage	ascii	errorMessage
 header	control-response-subscription-unknown	3	blockLength	u16	32
 header	control-response-subscription-unknown	3	templateId	u16	1
@@ -151,7 +151,7 @@ field	control-response-subscription-unknown	3	controlSessionId	i64	56
 field	control-response-subscription-unknown	3	correlationId	i64	59
 field	control-response-subscription-unknown	3	relevantId	i64	62
 field	control-response-subscription-unknown	3	code	enum:ControlResponseCode	SUBSCRIPTION_UNKNOWN:3
-field	control-response-subscription-unknown	3	version	i32	0
+field	control-response-subscription-unknown	3	version	i32:null=0	0
 field	control-response-subscription-unknown	3	errorMessage	ascii	errorMessage
 header	close-session-request	14	blockLength	u16	8
 header	close-session-request	14	templateId	u16	3
@@ -539,7 +539,7 @@ header	auth-connect-request	14	schemaId	u16	101
 header	auth-connect-request	14	version	u16	14
 field	auth-connect-request	14	correlationId	i64	59
 field	auth-connect-request	14	responseStreamId	i32	20
-field	auth-connect-request	14	version	i32	85
+field	auth-connect-request	14	version	i32:null=0	85
 field	auth-connect-request	14	responseChannel	ascii	responseChannel
 field	auth-connect-request	14	encodedCredentials	data	656e636f64656443726564656e7469616c73
 field	auth-connect-request	14	clientInfo	ascii	clientInfo
@@ -549,7 +549,7 @@ header	auth-connect-request	11	schemaId	u16	101
 header	auth-connect-request	11	version	u16	11
 field	auth-connect-request	11	correlationId	i64	59
 field	auth-connect-request	11	responseStreamId	i32	20
-field	auth-connect-request	11	version	i32	85
+field	auth-connect-request	11	version	i32:null=0	85
 field	auth-connect-request	11	responseChannel	ascii	responseChannel
 field	auth-connect-request	11	encodedCredentials	data	656e636f64656443726564656e7469616c73
 field	auth-connect-request	11	clientInfo	ascii	
@@ -559,7 +559,7 @@ header	challenge	14	schemaId	u16	101
 header	challenge	14	version	u16	14
 field	challenge	14	controlSessionId	i64	56
 field	challenge	14	correlationId	i64	59
-field	challenge	14	version	i32	85
+field	challenge	14	version	i32:null=0	85
 field	challenge	14	encodedChallenge	data	656e636f6465644368616c6c656e6765
 header	challenge-response	14	blockLength	u16	16
 header	challenge-response	14	templateId	u16	60
@@ -728,9 +728,9 @@ field	mark-file-header	2	pid	i64	87
 field	mark-file-header	2	controlStreamId	i32	48
 field	mark-file-header	2	localControlStreamId	i32	65
 field	mark-file-header	2	eventsStreamId	i32	94
-field	mark-file-header	2	headerLength	i32	69
-field	mark-file-header	2	errorBufferLength	i32	68
-field	mark-file-header	2	archiveId	i64	97
+field	mark-file-header	2	headerLength	i32:null=0	69
+field	mark-file-header	2	errorBufferLength	i32:null=0	68
+field	mark-file-header	2	archiveId	i64:null=-1	97
 field	mark-file-header	2	controlChannel	ascii	controlChannel
 field	mark-file-header	2	localControlChannel	ascii	localControlChannel
 field	mark-file-header	2	eventsChannel	ascii	eventsChannel
@@ -746,9 +746,9 @@ field	mark-file-header	0	pid	i64	87
 field	mark-file-header	0	controlStreamId	i32	48
 field	mark-file-header	0	localControlStreamId	i32	65
 field	mark-file-header	0	eventsStreamId	i32	94
-field	mark-file-header	0	headerLength	i32	0
-field	mark-file-header	0	errorBufferLength	i32	0
-field	mark-file-header	0	archiveId	i64	-1
+field	mark-file-header	0	headerLength	i32:null=0	0
+field	mark-file-header	0	errorBufferLength	i32:null=0	0
+field	mark-file-header	0	archiveId	i64:null=-1	-1
 field	mark-file-header	0	controlChannel	ascii	controlChannel
 field	mark-file-header	0	localControlChannel	ascii	localControlChannel
 field	mark-file-header	0	eventsChannel	ascii	eventsChannel

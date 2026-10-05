@@ -316,6 +316,7 @@ version = "0.1.0"
 dependencies = [
  "deepmsg-client",
  "deepmsg-cnc",
+ "deepmsg-codec",
  "deepmsg-core",
  "deepmsg-driver",
 ]
