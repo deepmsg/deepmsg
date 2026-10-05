@@ -74,7 +74,7 @@ use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
 
 use crate::counter::{Counter, CounterEvent, StaticCounter};
-use crate::fragment_assembler::Message;
+use crate::fragment_assembler::{ControlledHandler, Message};
 use crate::image::{Fragment, Image};
 use crate::image_event::ImageEvent;
 use crate::publication::{Claim, ExclusivePublication, Publication};
@@ -2021,6 +2021,54 @@ impl Client {
     /// leaves the assembler missing whatever the raw poll took.
     ///
     /// Returns how many fragments were delivered.
+    /// Read whole messages from a subscription, letting each one decide what
+    /// happens to it.
+    ///
+    /// The controlled face, and the reason the archive's client needs it: a
+    /// poller looks at a control response and says whether to take it. The four
+    /// answers move the reader's position, and they are the whole of the
+    /// difference from [`Client::poll_subscription`] — which is otherwise the
+    /// same read, the same reassembly, and the same messages.
+    ///
+    /// The position is published as the poll runs rather than after it, because
+    /// that is what `Action::Commit` asks for: a point flow control may rely on
+    /// however the rest of the poll goes.
+    pub fn poll_subscription_controlled<H>(
+        &mut self,
+        subscription_id: i64,
+        fragment_limit: usize,
+        handler: &mut H,
+    ) -> usize
+    where
+        H: ControlledHandler,
+    {
+        // The subscription and the counters are borrowed apart: the poll
+        // publishes into the counters *while* it reads, which is the point.
+        let Self {
+            subscriptions, cnc, ..
+        } = self;
+
+        let Some(subscription) = subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            return 0;
+        };
+
+        let Some(counters) = cnc.counters_writable() else {
+            // No counters to publish through. The read still happens — a poll
+            // is not a counter write — and the caller sees what it read.
+            let mut discard = |_: i32, _: i64| {};
+            return subscription.controlled_poll(fragment_limit, handler, &mut discard);
+        };
+
+        let mut publish = |counter_id: i32, position: i64| {
+            counters.set_value(counter_id, position);
+        };
+
+        subscription.controlled_poll(fragment_limit, handler, &mut publish)
+    }
+
     pub fn poll_subscription_fragments<F>(
         &mut self,
         subscription_id: i64,

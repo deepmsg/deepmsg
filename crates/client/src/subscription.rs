@@ -11,11 +11,30 @@
 
 use deepmsg_cnc::command::CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED;
 
-use crate::fragment_assembler::FragmentAssembler;
-use crate::image::Fragment;
-use crate::image::Image;
+use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
+use crate::image::{ControlledFragments, Fragment, Image};
 
 /// A subscription and the images attached to it.
+/// One object a controlled scan can call: the assembler, and the handler it
+/// answers to.
+///
+/// The scan reads **fragments**; this build's controlled trait speaks in
+/// **messages**. The reassembly therefore sits between them, and the scan needs
+/// a single thing to call — which is all this is. It is private on purpose: a
+/// caller supplies a message handler and never meets the seam, and the
+/// alternative (handing the scan an assembler and a handler side by side) would
+/// put that seam in the scan's signature instead.
+struct AssemblingSink<'a, H> {
+    assembler: &'a mut FragmentAssembler,
+    handler: &'a mut H,
+}
+
+impl<H: ControlledHandler> ControlledFragments for AssemblingSink<'_, H> {
+    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+        self.assembler.push_controlled(fragment, self.handler)
+    }
+}
+
 pub struct Subscription {
     /// The id the driver keys this subscription by — the correlation id the
     /// `ADD_SUBSCRIPTION` used.
@@ -124,6 +143,52 @@ impl Subscription {
         }
 
         (messages, counter_writes)
+    }
+
+    /// Read up to `fragment_limit` fragments from every image, reassembling
+    /// them, and hand each whole message to `handler` — which answers.
+    ///
+    /// The answers are what the reader's position does, and they are why this
+    /// exists at all: `Abort` leaves a message unconsumed so it arrives again,
+    /// `Commit` publishes the position at that message so a later refusal
+    /// cannot take it back, `Break` stops with the message consumed. The
+    /// arithmetic lives in [`crate::image`]'s controlled scan; this is where it
+    /// is given something to publish through.
+    ///
+    /// `publish` is handed the counter and the position, because a subscription
+    /// has one counter per image and a commit belongs to the image it happened
+    /// on.
+    pub(crate) fn controlled_poll<H>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut H,
+        publish: &mut dyn FnMut(i32, i64),
+    ) -> usize
+    where
+        H: ControlledHandler,
+    {
+        // Borrowed apart for the same reason `poll_messages` does it: the
+        // images are what is read, the assembler is where their fragments go.
+        let Self {
+            images, assembler, ..
+        } = self;
+
+        let mut fragments = 0;
+
+        for image in images.iter_mut() {
+            let remaining = fragment_limit.saturating_sub(fragments);
+            if 0 == remaining {
+                break;
+            }
+
+            let counter_id = image.subscriber_position_id();
+            let mut sink = AssemblingSink { assembler, handler };
+            let mut relay = |position: i64| publish(counter_id, position);
+
+            fragments += image.controlled_poll(remaining, &mut sink, &mut relay);
+        }
+
+        fragments
     }
 
     /// Read up to `fragment_limit` fragments from every image, handing each to
