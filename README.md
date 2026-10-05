@@ -94,7 +94,9 @@ Principles:
       archive/   recording, replay, catalog (P2)
       cluster/   placeholder for the future cluster track (not a workspace
                  member yet)
-      tools/     cnc-dump, errlog-dump, reclog-dump, deepmsg-stat
+      tools/     cnc-dump, errlog-dump, reclog-dump, deepmsg-stat, and the
+                 archive shim the reference's archive suite is pointed at
+                 (docs/reference.md)
       bench/     micro-benchmarks + latency harness
     examples/    ping/pong, pub/sub, record/replay
     tests/       integration tests + interop suite (feature "interop")

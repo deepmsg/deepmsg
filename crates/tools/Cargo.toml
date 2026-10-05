@@ -1,6 +1,6 @@
 [package]
 name = "deepmsg-tools"
-description = "Operational tooling: CnC/error-log/recording-log inspection and live stats"
+description = "Operational tooling and harness instruments: CnC/error-log/recording-log inspection, live stats, and the archive shim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
