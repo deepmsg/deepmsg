@@ -1673,9 +1673,26 @@ impl PublicationImage {
         let window_length = i64::from(self.next_sm_receiver_window_length);
         let untethered_window_limit = (max_sub_pos - window_length) + (window_length / 4);
 
-        let positions = self.subscribers.positions().to_vec();
+        // Walked by index, taking one entry out by value, rather than collected
+        // into a `Vec` first. The loop changes the state of the entries it
+        // walks, so the borrow that reads an entry has to end before the one
+        // that writes it — and a `to_vec()` ended it by asking the allocator
+        // for a fresh copy of the whole list, on every image, every pass, on
+        // the path `docs/adr/0003` keeps allocation-free. `TetherablePosition`
+        // is `Copy`, so taking one out by value ends the same borrow and
+        // allocates nothing, which is also how the reference walks the array
+        // (`aeron-driver/src/main/c/aeron_publication_image.c:494`).
+        //
+        // The length is read once, as the reference reads it once: the loop
+        // leaves every entry in place — a closed reader keeps its position with
+        // an id that is no longer a counter — and an entry that did leave would
+        // end the walk rather than run past the end of it.
+        let length = self.subscribers.positions().len();
 
-        for position in positions {
+        for index in 0..length {
+            let Some(position) = self.subscribers.positions().get(index).copied() else {
+                break;
+            };
             if position.is_tether {
                 // A tethered reader keeps its claim on the stream whatever it
                 // does; only its timestamp moves.
