@@ -57,13 +57,17 @@ rather than that two generators disagree.
 Use the reference's own `sbe-tool` 1.40.2, with `agrona` 2.6.1 on the
 classpath, and `sbe.target.language=Rust`.
 
-- **One crate per schema**, named as the generator names them:
-  `io_aeron_archive_codecs`, `io_aeron_archive_codecs_mark`,
-  `io_aeron_cluster_codecs`, `io_aeron_cluster_codecs_mark`,
-  `io_aeron_cluster_codecs_node`. The names are kept because a name that
-  says `io_aeron_...` is the clearest available marker that the code is
-  generated, and it is what the Java side does too (it uses the schema's
-  `package` name directly).
+- **One crate per schema**, filed under names of ours:
+  `deepmsg-codec-archive`, `deepmsg-codec-archive-mark`,
+  `deepmsg-codec-cluster`, `deepmsg-codec-cluster-mark` and
+  `deepmsg-codec-cluster-node-state`, in `crates/codec-*`.
+  The generator names its output after the schema's `package` —
+  `io_aeron_archive_codecs` and so on — and those names stop at the staging
+  directory. The word `aeron` is kept out of this repository's identifiers as
+  a standing rule, and the rename costs nothing: the generated sources never
+  name their own crate, reaching for it with `crate::`, so only the staging
+  directory and the manifest the generator writes are ever affected — and the
+  manifest is ours anyway.
 - **`Cargo.toml` is ours; `src/` is the generator's.** Each crate directory
   holds a hand-written manifest following the workspace conventions
   (`edition.workspace`, `license.workspace`, `[lints] workspace = true`) and

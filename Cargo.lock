@@ -258,6 +258,33 @@ dependencies = [
 [[package]]
 name = "deepmsg-codec"
 version = "0.1.0"
+dependencies = [
+ "deepmsg-codec-archive",
+ "deepmsg-codec-archive-mark",
+ "deepmsg-codec-cluster",
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-codec-cluster-node-state",
+]
+
+[[package]]
+name = "deepmsg-codec-archive"
+version = "0.1.0"
+
+[[package]]
+name = "deepmsg-codec-archive-mark"
+version = "0.1.0"
+
+[[package]]
+name = "deepmsg-codec-cluster"
+version = "0.1.0"
+
+[[package]]
+name = "deepmsg-codec-cluster-mark"
+version = "0.1.0"
+
+[[package]]
+name = "deepmsg-codec-cluster-node-state"
+version = "0.1.0"
 
 [[package]]
 name = "deepmsg-core"

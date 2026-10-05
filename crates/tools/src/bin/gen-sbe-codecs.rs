@@ -36,23 +36,42 @@ use std::process::{Command, ExitCode};
 const SBE_TOOL_VERSION: &str = "1.40.2";
 const AGRONA_VERSION: &str = "2.6.1";
 
-/// Each schema, and the crate the generator derives from its `package`
-/// attribute — dots to underscores, which is what `sbe-tool` does on its way
-/// to a directory name.
-const SCHEMAS: &[(&str, &str)] = &[
-    ("aeron-archive-codecs.xml", "io_aeron_archive_codecs"),
+/// Each schema; the package name `sbe-tool` derives from its `package`
+/// attribute (dots to underscores), which is where it stages the crate; and the
+/// directory under `crates/` this repository files it in.
+///
+/// The two names differ on purpose. The generated one is the schema's own
+/// namespace and nothing here should carry it: the word `aeron` is kept out of
+/// this repository's identifiers, which is a standing rule for legal rather
+/// than stylistic reasons, and the generated sources never mention the crate by
+/// name — they reach for their own root with `crate::` — so the rename costs
+/// nothing but this column. The directory follows the layout the rest of
+/// `crates/` uses, which drops the `deepmsg-` the crate's own name carries.
+const SCHEMAS: &[(&str, &str, &str)] = &[
+    (
+        "aeron-archive-codecs.xml",
+        "io_aeron_archive_codecs",
+        "codec-archive",
+    ),
     (
         "aeron-archive-mark-codecs.xml",
         "io_aeron_archive_codecs_mark",
+        "codec-archive-mark",
     ),
-    ("aeron-cluster-codecs.xml", "io_aeron_cluster_codecs"),
+    (
+        "aeron-cluster-codecs.xml",
+        "io_aeron_cluster_codecs",
+        "codec-cluster",
+    ),
     (
         "aeron-cluster-mark-codecs.xml",
         "io_aeron_cluster_codecs_mark",
+        "codec-cluster-mark",
     ),
     (
         "aeron-cluster-node-state-codecs.xml",
         "io_aeron_cluster_codecs_node",
+        "codec-cluster-node-state",
     ),
 ];
 
@@ -125,7 +144,7 @@ fn run(options: &Options) -> Result<(), String> {
     fs::create_dir_all(&stage).map_err(|e| format!("{}: {e}", stage.display()))?;
 
     let mut sources = Vec::new();
-    for (schema, _) in SCHEMAS {
+    for (schema, _, _) in SCHEMAS {
         let path = schemas_dir.join(schema);
         if !path.is_file() {
             return Err(format!("{} is missing", path.display()));
@@ -164,7 +183,7 @@ fn run(options: &Options) -> Result<(), String> {
     }
 
     let produced = generated_packages(&stage)?;
-    let expected: Vec<String> = SCHEMAS.iter().map(|(_, p)| (*p).to_string()).collect();
+    let expected: Vec<String> = SCHEMAS.iter().map(|(_, p, _)| (*p).to_string()).collect();
     if produced != expected {
         return Err(format!(
             "expected the generator to produce {expected:?}, it produced {produced:?}"
@@ -181,7 +200,10 @@ fn run(options: &Options) -> Result<(), String> {
     // third crate with the first two already replaced is a half-applied
     // regeneration, and the diff it leaves is harder to read than a refusal.
     for package in &produced {
-        let manifest = options.dest.join(package).join("Cargo.toml");
+        let manifest = options
+            .dest
+            .join(directory_for(package)?)
+            .join("Cargo.toml");
         if !manifest.is_file() {
             return Err(format!(
                 "{} does not exist — a crate is only ever given a generated `src/`, its \
@@ -192,7 +214,7 @@ fn run(options: &Options) -> Result<(), String> {
     }
 
     for package in &produced {
-        let src = options.dest.join(package).join("src");
+        let src = options.dest.join(directory_for(package)?).join("src");
         if src.exists() {
             fs::remove_dir_all(&src).map_err(|e| format!("{}: {e}", src.display()))?;
         }
@@ -219,7 +241,7 @@ fn transcript_is_clean(transcript: &str) -> bool {
 /// this list against [`SCHEMAS`] to find the ones that went missing — which is
 /// how a stale crate fails loudly instead of being left in the tree.
 fn generated_packages(stage: &Path) -> Result<Vec<String>, String> {
-    let known: Vec<&str> = SCHEMAS.iter().map(|(_, package)| *package).collect();
+    let known: Vec<&str> = SCHEMAS.iter().map(|(_, package, _)| *package).collect();
     let mut produced = Vec::new();
     let mut unexpected = Vec::new();
 
@@ -246,6 +268,16 @@ fn generated_packages(stage: &Path) -> Result<Vec<String>, String> {
 
     produced.sort();
     Ok(produced)
+}
+
+/// The crate this repository files a generated package under. The generator's
+/// own name is a staging directory and never reaches the workspace.
+fn directory_for(generated: &str) -> Result<&'static str, String> {
+    SCHEMAS
+        .iter()
+        .find(|(_, package, _)| *package == generated)
+        .map(|(_, _, directory)| *directory)
+        .ok_or_else(|| format!("{generated} is not a package any schema in schemas/ names"))
 }
 
 /// Replace the generator's manifest with a throwaway one, for formatting only.
@@ -397,13 +429,30 @@ mod tests {
 
     #[test]
     fn the_schema_set_is_five_distinct_packages() {
-        let packages: Vec<&str> = SCHEMAS.iter().map(|(_, package)| *package).collect();
+        let packages: Vec<&str> = SCHEMAS.iter().map(|(_, package, _)| *package).collect();
         assert_eq!(packages.len(), 5);
 
         let mut sorted = packages.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), packages.len(), "a package is named twice");
+    }
+
+    #[test]
+    fn no_directory_carries_the_word_aeron() {
+        for (schema, generated, directory) in SCHEMAS {
+            assert!(
+                !directory.contains("aeron"),
+                "{directory} would put the word into this repository's identifiers"
+            );
+            assert!(
+                generated.contains("aeron"),
+                "{schema}: the generated package is expected to, and the point is that it \
+                 does not have to reach the workspace"
+            );
+            assert_eq!(directory_for(generated).unwrap(), *directory);
+        }
+        assert!(directory_for("io_aeron_something_else").is_err());
     }
 
     #[test]

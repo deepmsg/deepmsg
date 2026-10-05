@@ -1,10 +1,17 @@
 [package]
 name = "deepmsg-codec"
-description = "SBE codecs generated from the schemas/ directory"
+description = "The SBE codecs, one generated crate per schema"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+deepmsg-codec-archive = { path = "../codec-archive" }
+deepmsg-codec-archive-mark = { path = "../codec-archive-mark" }
+deepmsg-codec-cluster = { path = "../codec-cluster" }
+deepmsg-codec-cluster-mark = { path = "../codec-cluster-mark" }
+deepmsg-codec-cluster-node-state = { path = "../codec-cluster-node-state" }
 
 [lints]
 workspace = true
