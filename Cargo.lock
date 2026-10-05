@@ -328,6 +328,7 @@ dependencies = [
  "deepmsg-archive",
  "deepmsg-cnc",
  "deepmsg-core",
+ "libc",
 ]
 
 [[package]]

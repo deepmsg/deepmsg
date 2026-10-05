@@ -1,12 +1,16 @@
 [package]
 name = "deepmsg-tools"
-description = "Operational tooling: CnC/error-log/recording-log inspection and live stats"
+description = "Operational tooling and harness instruments: CnC/error-log/recording-log inspection, live stats, and the archive shim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# ADR-0002 zone 5: the archive shim supervises two processes where the
+# reference ran one, and catching the signal it is torn down with takes
+# `libc::signal`.
+libc = "0.2"
 deepmsg-core = { path = "../core" }
 deepmsg-cnc = { path = "../cnc" }
 deepmsg-archive = { path = "../archive" }

@@ -436,14 +436,31 @@ pub enum TerminationPolicy {
 }
 
 impl TerminationPolicy {
-    /// Parse the validator name, exactly as the reference's symbol table does:
-    /// two names, anything else is a start-up failure
-    /// (`aeron_termination_validator.c:55-62` returns null, and
-    /// `aeron_driver_context.c:1247-1251` fails initialisation on null).
+    /// Parse the validator name.
+    ///
+    /// The **C** reference's symbol table has exactly two names and fails
+    /// start-up on anything else (`aeron_termination_validator.c:55-62`
+    /// returns null, and `aeron_driver_context.c:1247-1251` fails
+    /// initialisation on null). The **Java** driver takes a class name instead
+    /// and its two defaults mean exactly these two policies —
+    /// `DefaultAllowTerminationValidator.allowTermination` returns `true`
+    /// (`DefaultAllowTerminationValidator.java:41`) and its deny counterpart
+    /// returns `false`.
+    ///
+    /// Both spellings are accepted, because the reference's own C test harness
+    /// writes the Java one everywhere it sets this property
+    /// (`TestArchive.h:49`, `TestMediaDriver.h:52`,
+    /// `aeron-archive/src/test/cpp_wrapper/TestArchive.h:75`) — the value was
+    /// written for a Java process, and a driver standing in for that process
+    /// meets those names on every run of that suite.
+    ///
+    /// Recognising two names is not loading code. A validator interface that
+    /// some other class implements is still refused, and this build still
+    /// cannot `dlopen` one ([`ConfigError::DynamicLoadingNotSupported`]).
     fn parse(name: &str) -> Result<Self, ConfigError> {
         match name {
-            "allow" => Ok(Self::Allow),
-            "deny" => Ok(Self::Deny),
+            "allow" | "io.aeron.driver.DefaultAllowTerminationValidator" => Ok(Self::Allow),
+            "deny" | "io.aeron.driver.DefaultDenyTerminationValidator" => Ok(Self::Deny),
             other => Err(ConfigError::UnknownValidator {
                 value: other.to_owned(),
             }),
@@ -3417,6 +3434,49 @@ mod tests {
                 "{value:?} must not install a generator"
             );
         }
+    }
+
+    /// The reference's own C harness writes this property the Java way, in all
+    /// three places it sets it, because the value was written for a Java
+    /// process. A driver standing in for that process meets those names on
+    /// every run of that suite, and meeting them with a start-up failure is a
+    /// suite that cannot begin.
+    #[test]
+    fn the_java_spelling_of_the_two_validators_is_the_two_validators() {
+        for (spelling, policy) in [
+            ("allow", TerminationPolicy::Allow),
+            (
+                "io.aeron.driver.DefaultAllowTerminationValidator",
+                TerminationPolicy::Allow,
+            ),
+            ("deny", TerminationPolicy::Deny),
+            (
+                "io.aeron.driver.DefaultDenyTerminationValidator",
+                TerminationPolicy::Deny,
+            ),
+        ] {
+            let config = resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("aeron.driver.termination.validator", spelling),
+            ])
+            .expect(spelling);
+            assert_eq!(policy, config.termination, "{spelling}");
+        }
+
+        // Two names recognised is not code loading: a validator of somebody
+        // else's is still refused, and still by name.
+        let error = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            (
+                "aeron.driver.termination.validator",
+                "com.example.MyValidator",
+            ),
+        ])
+        .expect_err("a class this build cannot load must stop it");
+        assert!(
+            matches!(error, ConfigError::UnknownValidator { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
