@@ -405,6 +405,87 @@ fn complete(
     header
 }
 
+/// What a controlled handler tells the poll to do with the message it just saw.
+///
+/// The reference has four of these and names them the same way
+/// (`ControlledFragmentHandler.java:30-53`; C spells them
+/// `AERON_ACTION_ABORT`…`AERON_ACTION_CONTINUE`, `aeronc.h:1719-1737`).
+///
+/// **The numbers are not part of the contract.** The two reference
+/// implementations agree on the order and disagree on where it starts — Java
+/// numbers them 0…3, C 1…4 — so a Rust enum that carried a discriminant would
+/// be picking a side that does not exist. What is a contract is the *meaning*
+/// of each, which the three predicates below state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Do not consume this message, and stop. The reader's position stays
+    /// where it was, so the same message arrives again on the next poll.
+    Abort,
+    /// Consume this message, then stop. The position moves past it.
+    Break,
+    /// Consume this message, publish the position **here** rather than at the
+    /// end, and carry on. Publishing mid-poll is the whole of what `Commit`
+    /// means: flow control sees the reader has got this far.
+    Commit,
+    /// Consume this message and carry on; the position is published once, when
+    /// the poll ends.
+    Continue,
+}
+
+impl Action {
+    /// Whether the message is consumed.
+    ///
+    /// The C loop is where this is visible: `ABORT` walks the offset back by
+    /// the frame it had already stepped over and gives the fragment count back
+    /// (`aeron_image.c`, the `AERON_ACTION_ABORT` arm). Nothing else does.
+    pub const fn consumes(self) -> bool {
+        !matches!(self, Self::Abort)
+    }
+
+    /// Whether the poll stops after this message.
+    pub const fn stops(self) -> bool {
+        matches!(self, Self::Abort | Self::Break)
+    }
+
+    /// Whether the position is published at this message instead of at the end.
+    ///
+    /// Exactly one action asks for it, and that is what makes it worth a
+    /// predicate: `ABORT` and `BREAK` also end the poll early, and a reader that
+    /// conflated "stopped" with "published here" would move the position over
+    /// an aborted message.
+    pub const fn publishes_now(self) -> bool {
+        matches!(self, Self::Commit)
+    }
+}
+
+/// What a controlled poll calls: look at a message, say what to do with it.
+///
+/// `on_message` rather than the reference's `onFragment`, and the name is the
+/// difference: this build's controlled face delivers **whole messages** and not
+/// the fragments that carried them. The reason is in `docs/compat.md` — a
+/// handler here is handed a slice that belongs to this process, so the
+/// reference's zero-copy forwarding of term memory is not something this build
+/// can offer. What it offers instead is the *decision*, which is what every
+/// consumer of this face actually uses: the archive's eight pollers all decode
+/// the message in place and none of them forwards it.
+pub trait ControlledHandler {
+    /// Say what the poll should do with this message.
+    fn on_message(&mut self, message: Message<'_>) -> Action;
+}
+
+/// A closure is a handler, so the common case needs no type of its own.
+///
+/// The reference gets this from an interface a lambda satisfies; here it is a
+/// blanket implementation, which is the same thing said in Rust.
+impl<F> ControlledHandler for F
+where
+    F: FnMut(Message<'_>) -> Action,
+{
+    fn on_message(&mut self, message: Message<'_>) -> Action {
+        self(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +496,90 @@ mod tests {
     use deepmsg_core::logbuffer::position;
 
     use crate::image::Fragment;
+
+    /// The plan's table, as the three predicates. Four actions and four
+    /// readings — an enum with two rows alike would be an enum with a spare
+    /// variant, and the predicates exist to be the thing a poll switches on.
+    #[test]
+    fn the_four_actions_are_four_readings_of_one_poll() {
+        use Action::{Abort, Break, Commit, Continue};
+
+        let table = [
+            // action, consumes, stops, publishes_now
+            (Abort, false, true, false),
+            (Break, true, true, false),
+            (Commit, true, false, true),
+            (Continue, true, false, false),
+        ];
+
+        let mut readings = Vec::new();
+        for (action, consumes, stops, publishes_now) in table {
+            assert_eq!(consumes, action.consumes(), "{action:?} consumes");
+            assert_eq!(stops, action.stops(), "{action:?} stops");
+            assert_eq!(
+                publishes_now,
+                action.publishes_now(),
+                "{action:?} publishes now"
+            );
+            readings.push((consumes, stops, publishes_now));
+        }
+
+        let mut unique = readings.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            readings.len(),
+            unique.len(),
+            "two actions read the same: {readings:?}"
+        );
+    }
+
+    /// `Commit` is the only one that asks for the position early, and it does
+    /// not stop. Keeping those two apart is the whole point of three
+    /// predicates rather than one: `Abort` and `Break` also end the poll, and a
+    /// reader that took "stopped" for "published here" would move the position
+    /// over a message it refused.
+    #[test]
+    fn committing_early_is_not_the_same_as_stopping_early() {
+        assert!(Action::Commit.publishes_now());
+        assert!(!Action::Commit.stops());
+
+        assert!(Action::Abort.stops());
+        assert!(!Action::Abort.publishes_now());
+        assert!(Action::Break.stops());
+        assert!(!Action::Break.publishes_now());
+    }
+
+    /// The blanket implementation, which is what lets a caller hand a closure
+    /// where the reference hands a lambda.
+    #[test]
+    fn a_closure_is_a_controlled_handler() {
+        fn deliver<H: ControlledHandler>(handler: &mut H, message: Message<'_>) -> Action {
+            handler.on_message(message)
+        }
+
+        let seen = std::cell::Cell::new(0);
+        let mut closure = |message: Message<'_>| {
+            seen.set(seen.get() + message.payload.len());
+            Action::Break
+        };
+
+        let message = Message {
+            header: MessageHeader {
+                session_id: 7,
+                stream_id: 1,
+                term_offset: 0,
+                flags: 0,
+                position: 0,
+                frame_length: 0,
+                fragmented_frame_length: 0,
+            },
+            payload: b"hello",
+        };
+
+        assert_eq!(Action::Break, deliver(&mut closure, message));
+        assert_eq!(5, seen.get());
+    }
 
     /// The smallest legal term length, so the fixture stays small.
     const TERM_LENGTH: i32 = 64 * 1024;
