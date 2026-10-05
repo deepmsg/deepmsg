@@ -702,7 +702,7 @@ mod ledger_tests {
 /// geometry written **before** the file is opened, because opening validates
 /// it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
 
@@ -718,16 +718,25 @@ mod tests {
     const INITIAL_TERM_ID: i32 = 17;
     const PAGE: i32 = 4096;
 
-    struct TempLog {
+    pub(crate) struct TempLog {
         path: PathBuf,
     }
 
     impl TempLog {
         /// The file as the driver leaves it: geometry in the last page, and
         /// nothing else.
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("deepmsg-image-{name}-{}.log", std::process::id()));
+        pub(crate) fn new(name: &str) -> Self {
+            // A serial number as well as the pid: the test harness runs tests
+            // on several threads, and two of them naming a fixture the same
+            // would have one truncate the file the other has mapped — which is
+            // a `SIGBUS` in the middle of a read, not a failed assertion.
+            static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let path = std::env::temp_dir().join(format!(
+                "deepmsg-image-{name}-{}-{serial}.log",
+                std::process::id()
+            ));
 
             let terms = 3 * TERM_LENGTH;
             let length = position::align_up(terms + PAGE, PAGE);
@@ -761,7 +770,7 @@ mod tests {
 
         /// What a publisher does to the log before a subscriber maps it: write
         /// the tails, then the messages.
-        fn write(&self, f: impl FnOnce(&mut Appender<'_>)) {
+        pub(crate) fn write(&self, f: impl FnOnce(&mut Appender<'_>)) {
             let log = LogBuffer::open(&self.path, true).expect("mappable");
             let metadata = log
                 .file()
@@ -786,8 +795,20 @@ mod tests {
             f(offset, &term);
         }
 
-        fn image(&self) -> Image {
-            Image::open(&self.path, 1, 7, 1, 3, 0, "aeron:ipc".to_string()).expect("an image")
+        /// The image a subscriber would have. The registration id is the
+        /// **publication's**, and a subscription keys its images by it, so two
+        /// images of one subscription need two ids.
+        pub(crate) fn image(&self, registration_id: i64) -> Image {
+            Image::open(
+                &self.path,
+                registration_id,
+                7,
+                1,
+                3,
+                0,
+                "aeron:ipc".to_string(),
+            )
+            .expect("an image")
         }
     }
 
@@ -831,7 +852,7 @@ mod tests {
         }
     }
 
-    fn write_message(appender: &mut Appender<'_>, payload: &[u8]) {
+    pub(crate) fn write_message(appender: &mut Appender<'_>, payload: &[u8]) {
         assert!(matches!(
             appender.append(7, 1, i64::MAX, payload),
             Appended::Ok { .. }
@@ -854,7 +875,7 @@ mod tests {
         let log = TempLog::new("smoke");
         log.write(|appender| write_message(appender, b"hello"));
 
-        let image = log.image();
+        let image = log.image(1);
         assert_eq!(7, image.session_id());
         assert_eq!(0, image.join_position());
     }
@@ -866,7 +887,7 @@ mod tests {
 
         let mut handler = Answering::new(Action::Continue);
         let mut published = Vec::new();
-        let mut image = log.image();
+        let mut image = log.image(1);
         let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
 
         assert_eq!(1, fragments);
@@ -894,7 +915,7 @@ mod tests {
 
         let mut handler = Answering::new(Action::Break);
         let mut published = Vec::new();
-        let mut image = log.image();
+        let mut image = log.image(1);
         let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
 
         assert_eq!(1, fragments, "the second message was not read");
@@ -936,7 +957,7 @@ mod tests {
 
         let mut handler = Answering::new(Action::Continue);
         let mut published = Vec::new();
-        let mut image = log.image();
+        let mut image = log.image(1);
         let mut publish = |p: i64| published.push(p);
 
         // One fragment, so the poll stops on the message and the padding is
@@ -972,7 +993,7 @@ mod tests {
 
         let mut handler = Answering::new(Action::Abort);
         let mut published = Vec::new();
-        let mut image = log.image();
+        let mut image = log.image(1);
         let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
 
         assert_eq!(0, fragments, "a refused fragment is not counted");
