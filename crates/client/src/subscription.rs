@@ -11,11 +11,30 @@
 
 use deepmsg_cnc::command::CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED;
 
-use crate::fragment_assembler::FragmentAssembler;
-use crate::image::Fragment;
-use crate::image::Image;
+use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
+use crate::image::{ControlledFragments, Fragment, Image};
 
 /// A subscription and the images attached to it.
+/// One object a controlled scan can call: the assembler, and the handler it
+/// answers to.
+///
+/// The scan reads **fragments**; this build's controlled trait speaks in
+/// **messages**. The reassembly therefore sits between them, and the scan needs
+/// a single thing to call — which is all this is. It is private on purpose: a
+/// caller supplies a message handler and never meets the seam, and the
+/// alternative (handing the scan an assembler and a handler side by side) would
+/// put that seam in the scan's signature instead.
+struct AssemblingSink<'a, H> {
+    assembler: &'a mut FragmentAssembler,
+    handler: &'a mut H,
+}
+
+impl<H: ControlledHandler> ControlledFragments for AssemblingSink<'_, H> {
+    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+        self.assembler.push_controlled(fragment, self.handler)
+    }
+}
+
 pub struct Subscription {
     /// The id the driver keys this subscription by — the correlation id the
     /// `ADD_SUBSCRIPTION` used.
@@ -27,6 +46,15 @@ pub struct Subscription {
     channel: String,
     stream_id: i32,
     images: Vec<Image>,
+    /// Which image the next poll starts from.
+    ///
+    /// The reference's `roundRobinIndex` (`Subscription.java`, in both `poll`
+    /// and `controlledPoll`): a subscription whose fragment budget runs out
+    /// before it reaches its last image would otherwise read the first one
+    /// forever — and a subscription with a replay image and a live image is
+    /// exactly where that shows, which is the arrangement the archive's
+    /// persistent subscriptions use.
+    round_robin: usize,
     /// What the fragments of this subscription's images are reassembled into
     /// when it is polled for whole messages.
     ///
@@ -52,6 +80,7 @@ impl Subscription {
             channel,
             stream_id,
             images: Vec::new(),
+            round_robin: 0,
             assembler: FragmentAssembler::new(),
         }
     }
@@ -80,6 +109,27 @@ impl Subscription {
     /// need the file borrowed while the subscription is borrowed mutably, which
     /// is exactly the aliasing the borrow checker exists to refuse. The caller
     /// — [`crate::Client::poll_subscription`] — writes them after the poll.
+    /// Where the next poll begins, and how many images there are to cover.
+    ///
+    /// One image later each call, wrapping. The reference advances a counter and
+    /// resets it to one when it runs past the end (`Subscription.java`); taking
+    /// the remainder does the same thing without the special case, because the
+    /// only thing anyone does with it is index.
+    fn rotation(&self) -> (usize, usize) {
+        let length = self.images.len();
+        if 0 == length {
+            return (0, 0);
+        }
+        (self.round_robin % length, length)
+    }
+
+    /// The next poll's index, after this one has taken it.
+    fn take_rotation(&mut self) -> (usize, usize) {
+        let (start, length) = self.rotation();
+        self.round_robin = if 0 == length { 0 } else { (start + 1) % length };
+        (start, length)
+    }
+
     pub(crate) fn poll_messages<F>(
         &mut self,
         fragment_limit: usize,
@@ -95,11 +145,14 @@ impl Subscription {
         // The images and the assembler are borrowed apart here because both are
         // needed at once: the images are what is read, the assembler is where
         // their fragments go.
+        let (start, length) = self.take_rotation();
+
         let Self {
             images, assembler, ..
         } = self;
 
-        for image in images.iter_mut() {
+        for offset in 0..length {
+            let image = &mut images[(start + offset) % length];
             let remaining = fragment_limit.saturating_sub(fragments);
             if 0 == remaining {
                 break;
@@ -126,6 +179,55 @@ impl Subscription {
         (messages, counter_writes)
     }
 
+    /// Read up to `fragment_limit` fragments from every image, reassembling
+    /// them, and hand each whole message to `handler` — which answers.
+    ///
+    /// The answers are what the reader's position does, and they are why this
+    /// exists at all: `Abort` leaves a message unconsumed so it arrives again,
+    /// `Commit` publishes the position at that message so a later refusal
+    /// cannot take it back, `Break` stops with the message consumed. The
+    /// arithmetic lives in [`crate::image`]'s controlled scan; this is where it
+    /// is given something to publish through.
+    ///
+    /// `publish` is handed the counter and the position, because a subscription
+    /// has one counter per image and a commit belongs to the image it happened
+    /// on.
+    pub(crate) fn controlled_poll<H>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut H,
+        publish: &mut dyn FnMut(i32, i64),
+    ) -> usize
+    where
+        H: ControlledHandler,
+    {
+        // Borrowed apart for the same reason `poll_messages` does it: the
+        // images are what is read, the assembler is where their fragments go.
+        let (start, length) = self.take_rotation();
+
+        let Self {
+            images, assembler, ..
+        } = self;
+
+        let mut fragments = 0;
+
+        for offset in 0..length {
+            let image = &mut images[(start + offset) % length];
+            let remaining = fragment_limit.saturating_sub(fragments);
+            if 0 == remaining {
+                break;
+            }
+
+            let counter_id = image.subscriber_position_id();
+            let mut sink = AssemblingSink { assembler, handler };
+            let mut relay = |position: i64| publish(counter_id, position);
+
+            fragments += image.controlled_poll(remaining, &mut sink, &mut relay);
+        }
+
+        fragments
+    }
+
     /// Read up to `fragment_limit` fragments from every image, handing each to
     /// `handler` as it lies in the term.
     ///
@@ -146,10 +248,12 @@ impl Subscription {
     where
         F: FnMut(&Fragment<'_>),
     {
+        let (start, length) = self.take_rotation();
         let mut fragments = 0;
         let mut counter_writes = Vec::new();
 
-        for image in self.images.iter_mut() {
+        for offset in 0..length {
+            let image = &mut self.images[(start + offset) % length];
             let remaining = fragment_limit.saturating_sub(fragments);
             if 0 == remaining {
                 break;
@@ -244,5 +348,111 @@ impl std::fmt::Debug for Subscription {
             .field("stream_id", &self.stream_id)
             .field("images", &self.images.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Subscription;
+    use crate::fragment_assembler::{Action, Message};
+    use crate::image::tests::{TempLog, write_message};
+
+    /// A subscription over two images, the first of them holding two messages.
+    ///
+    /// The imbalance is the point: a poll with a budget of one can never reach
+    /// the second image if it always begins at the first, and that is what the
+    /// reference's round-robin exists to prevent.
+    fn a_subscription_over_two_images() -> (Subscription, TempLog, TempLog) {
+        let first = TempLog::new("robin-a");
+        let second = TempLog::new("robin-b");
+
+        first.write(|appender| {
+            write_message(appender, b"a1");
+            write_message(appender, b"a2");
+        });
+        second.write(|appender| write_message(appender, b"b1"));
+
+        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
+        subscription.add_image(first.image(1));
+        subscription.add_image(second.image(2));
+
+        // The files have to outlive the images, which map them — so they go
+        // back to the caller rather than being leaked, and the `Drop` that
+        // removes them runs when the test ends.
+        (subscription, first, second)
+    }
+
+    /// Each poll begins one image later, so a budget of one still reaches all
+    /// of them.
+    ///
+    /// Without the rotation the third poll is where the second image is finally
+    /// reached — the first image's two messages spend the first two polls — and
+    /// with more messages in front it would never be reached at all. That is
+    /// the starvation the reference names in `Subscription.java`, and a
+    /// subscription carrying a replay image beside a live one is where it
+    /// matters.
+    #[test]
+    fn a_budget_of_one_still_reaches_every_image() {
+        let (mut subscription, _first, _second) = a_subscription_over_two_images();
+        let mut publish = |_: i32, _: i64| {};
+        let mut order = Vec::new();
+
+        for poll in 0..3 {
+            let mut handler = |message: Message<'_>| {
+                order.push(message.payload.to_vec());
+                Action::Continue
+            };
+            let read = subscription.controlled_poll(1, &mut handler, &mut publish);
+            assert_eq!(1, read, "poll {poll} read one fragment");
+        }
+
+        // The order is the whole assertion. Counting fragments would pass
+        // without the rotation too — the third poll reaches the second image
+        // once the first has run dry — and it is reaching it *first* that the
+        // reference's round-robin buys.
+        assert_eq!(
+            vec![b"a1".to_vec(), b"b1".to_vec(), b"a2".to_vec()],
+            order,
+            "each poll begins one image later"
+        );
+    }
+
+    /// The same for the plain fragment path, which had the same loop.
+    #[test]
+    fn the_fragment_path_rotates_too() {
+        let (mut subscription, _first, _second) = a_subscription_over_two_images();
+        let mut seen = Vec::new();
+
+        for _ in 0..3 {
+            let mut handler = |fragment: &crate::image::Fragment<'_>| {
+                seen.push((fragment.session_id(), fragment.position()));
+            };
+            assert_eq!(1, subscription.poll_fragments(1, &mut handler).0);
+        }
+
+        // Two images, both written by session 7, so the positions are what
+        // tells them apart: the second image's first message begins at 0 of its
+        // own term, and the first image's second message does not.
+        assert_eq!(
+            3,
+            seen.len(),
+            "one fragment a poll, and all three were read"
+        );
+        assert_eq!(
+            seen[0].1, seen[1].1,
+            "the third poll went back to the first image"
+        );
+    }
+
+    /// A rotation that ran off the end comes back to the start rather than
+    /// leaving the remainder behind — the reference resets its index to one.
+    #[test]
+    fn the_rotation_wraps() {
+        let (mut subscription, _first, _second) = a_subscription_over_two_images();
+        assert_eq!((0, 2), subscription.rotation());
+
+        assert_eq!((0, 2), subscription.take_rotation());
+        assert_eq!((1, 2), subscription.take_rotation());
+        assert_eq!((0, 2), subscription.take_rotation());
     }
 }

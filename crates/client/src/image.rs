@@ -38,6 +38,7 @@ use deepmsg_core::logbuffer::position::{self, Position};
 use deepmsg_core::logbuffer::scan::{Scanner, Step};
 use deepmsg_core::logbuffer::{descriptor, frame};
 
+use crate::fragment_assembler::Action;
 use crate::log_buffer::LogBuffer;
 
 /// One fragment, as it lies in the term buffer.
@@ -427,6 +428,107 @@ impl Image {
         fragments
     }
 
+    /// The same scan, with the caller answering for each fragment.
+    ///
+    /// The answer decides where the reader's position ends up, which is the
+    /// whole of what the controlled face adds to [`Image::poll`]:
+    ///
+    /// * **`Abort`** — the fragment is not consumed, so the position does not
+    ///   reach it and the same fragment arrives again next time. The reference
+    ///   walks its offset back by the frame it had already stepped over
+    ///   (`aeron_image.c`, the `AERON_ACTION_ABORT` arm); this walks `next`
+    ///   back, which is the same statement about a position.
+    /// * **`Break`** — consumed, and the scan stops here.
+    /// * **`Commit`** — consumed, and the position is **published now**, so a
+    ///   later refusal cannot take it back. The reference publishes inside the
+    ///   loop for the same reason, and that is what makes `Commit` different
+    ///   from `Continue` rather than merely more eager: what it buys is a
+    ///   watermark that survives a mistake further on.
+    /// * **`Continue`** — consumed; the position is published once, at the end.
+    ///
+    /// `publish` is called at each commit and once at the end when the scan
+    /// moved. It is a `dyn` call, and that is deliberate: commits are rare — a
+    /// poller that reads a control response refuses far more than it takes —
+    /// and the alternative is threading a counter handle through this type,
+    /// which is the arrangement [`crate::Client`] already owns.
+    pub(crate) fn controlled_poll<H>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut H,
+        publish: &mut dyn FnMut(i64),
+    ) -> usize
+    where
+        H: ControlledFragments,
+    {
+        let geometry = self.log.geometry();
+        let term_length = geometry.term_length as usize;
+
+        let term_begin = self.position.term_begin(geometry.bits_to_shift);
+        let term_end = Position::from_raw(term_begin.raw() + geometry.term_length as i64);
+
+        let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
+            return 0;
+        };
+        let offset = (self.position.raw() - term_begin.raw()) as usize;
+
+        let mut scanner = Scanner::at(&term, term_length, offset);
+        let mut ledger = PositionLedger::new(self.position);
+        let mut fragments = 0;
+
+        loop {
+            match scanner.advance() {
+                Step::Data {
+                    offset,
+                    frame_length,
+                } => {
+                    let action = handler.on_fragment(&Fragment {
+                        frame: Frame::new(&term, offset),
+                        position: ledger.next.raw(),
+                    });
+
+                    if !action.consumes() {
+                        ledger.refuse();
+                        break;
+                    }
+
+                    let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+                    ledger.consume(i64::from(aligned));
+                    fragments += 1;
+
+                    if action.publishes_now() {
+                        publish(ledger.commit());
+                    }
+
+                    if action.stops() || fragments >= fragment_limit {
+                        break;
+                    }
+                }
+                Step::Padding { frame_length, .. } => {
+                    // A padding frame moves the position without being a
+                    // fragment, so it never spends the budget — which is what
+                    // keeps a repaired hole from costing a reader a message.
+                    let aligned = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
+                    ledger.consume(i64::from(aligned));
+                }
+                Step::End => {
+                    ledger.next = term_end;
+                    break;
+                }
+                Step::NotReady { .. } | Step::Malformed { .. } => break,
+            }
+        }
+
+        if let Some(position) = ledger.settled() {
+            publish(position);
+        }
+
+        if ledger.committed.raw() > self.position.raw() {
+            self.position = ledger.committed;
+        }
+
+        fragments
+    }
+
     /// The term buffer regions, for a test or a tool that wants to look at the
     /// raw bytes rather than scan them.
     pub fn term(&self, partition: usize) -> Option<AtomicBuffer<'_>> {
@@ -446,6 +548,456 @@ impl std::fmt::Debug for Image {
     }
 }
 
+/// Where a controlled scan's position stands, as the caller's answers move it.
+///
+/// Split out from the scan because this is the part with rules in it — the
+/// reference's four actions and what each does to a reader's position
+/// (`aeron_image.c`, the action arms of `aeron_image_controlled_poll`) — and
+/// the part that can be checked without a term buffer to read. The scan owns
+/// the frames; this owns the arithmetic.
+#[derive(Clone, Copy, Debug)]
+struct PositionLedger {
+    /// Where the scan has read up to.
+    next: Position,
+    /// The last point that was published, and the point a refusal falls back
+    /// to. It starts where the reader started: a refusal with nothing committed
+    /// before it leaves the reader where it was.
+    committed: Position,
+}
+
+impl PositionLedger {
+    const fn new(start: Position) -> Self {
+        Self {
+            next: start,
+            committed: start,
+        }
+    }
+
+    /// A consumed fragment moves the scan on by its aligned length.
+    fn consume(&mut self, aligned: i64) {
+        self.next = Position::from_raw(self.next.raw() + aligned);
+    }
+
+    /// `Commit`: this point is published now and a later refusal cannot pass it.
+    fn commit(&mut self) -> i64 {
+        self.committed = self.next;
+        self.next.raw()
+    }
+
+    /// `Abort`: the fragment is not consumed, and the position falls back to
+    /// the last committed point rather than to where the scan began.
+    fn refuse(&mut self) {
+        self.next = self.committed;
+    }
+
+    /// Where the scan ended up, if it moved past the last thing published.
+    fn settled(&mut self) -> Option<i64> {
+        if self.next.raw() > self.committed.raw() {
+            self.committed = self.next;
+            return Some(self.next.raw());
+        }
+        None
+    }
+}
+
+/// What a controlled scan calls for each fragment, and what it answers.
+///
+/// Fragment-shaped rather than message-shaped, because that is the level this
+/// scan reads at: the reassembly from fragments to messages happens one layer
+/// up, and [`crate::Client`]'s controlled poll puts it there.
+pub trait ControlledFragments {
+    /// Say what the scan should do with this fragment.
+    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action;
+}
+
 /// The frame bits a caller is most likely to test, re-exported so a handler
 /// does not have to reach into `deepmsg_core`.
 pub use frame::{FLAG_BEGIN, FLAG_END, FLAG_UNFRAGMENTED};
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::{Position, PositionLedger};
+
+    fn at(raw: i64) -> PositionLedger {
+        PositionLedger::new(Position::from_raw(raw))
+    }
+
+    /// The four answers, as positions. This is the table the plan calls the
+    /// acceptance for this slice, and it is here rather than in a scan because
+    /// a scan needs a term buffer and this needs only the arithmetic.
+    #[test]
+    fn the_four_actions_move_the_position_where_the_reference_moves_it() {
+        // `Continue`: consumed, and published once at the end.
+        let mut ledger = at(100);
+        ledger.consume(64);
+        ledger.consume(64);
+        assert_eq!(
+            Some(228),
+            ledger.settled(),
+            "the end publishes what was read"
+        );
+        assert_eq!(None, ledger.settled(), "and only once");
+
+        // `Break`: the same, because a break consumes what it stopped on.
+        let mut ledger = at(100);
+        ledger.consume(64);
+        assert_eq!(Some(164), ledger.settled());
+
+        // `Commit`: published there and then, so the end has nothing left.
+        let mut ledger = at(100);
+        ledger.consume(64);
+        assert_eq!(164, ledger.commit());
+        assert_eq!(None, ledger.settled(), "the end adds nothing to a commit");
+    }
+
+    /// What `Commit` buys over `Continue`: a point a later refusal cannot take
+    /// back. Without this the two actions would be the same action.
+    ///
+    /// The difference is in what was **published**, not in what is left to
+    /// publish — after the refusal neither ledger has anything more to say, and
+    /// only one of them has already said 164.
+    #[test]
+    fn a_committed_point_survives_a_refusal_after_it() {
+        let mut published = Vec::new();
+
+        let mut committed = at(100);
+        committed.consume(64);
+        published.push(committed.commit());
+        committed.consume(128);
+        committed.refuse();
+        if let Some(position) = committed.settled() {
+            published.push(position);
+        }
+        assert_eq!(vec![164], published, "the refused fragment is given back");
+
+        // The same reads with no commit among them publish nothing at all.
+        let mut uncommitted = at(100);
+        uncommitted.consume(64);
+        uncommitted.consume(128);
+        uncommitted.refuse();
+        assert_eq!(
+            None,
+            uncommitted.settled(),
+            "nothing was committed, nothing moved"
+        );
+    }
+
+    /// A refusal as the first answer leaves the reader exactly where it was —
+    /// a poll that reads a message it will not take has not read anything.
+    #[test]
+    fn a_refusal_with_nothing_committed_moves_nothing() {
+        let mut ledger = at(100);
+        ledger.refuse();
+        assert_eq!(None, ledger.settled());
+    }
+}
+
+/// A log buffer file, and the image over it.
+///
+/// `Image` has no in-memory constructor and should not get one — a client never
+/// creates a log buffer, the driver's native resource agent does, and a type
+/// that could be built out of nothing would be a type that pretends otherwise.
+/// So the tests build the file the driver would have built: three terms and the
+/// metadata page after them (`crate::log_buffer` has the layout), with the
+/// geometry written **before** the file is opened, because opening validates
+/// it.
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+
+    use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
+    use deepmsg_core::logbuffer::append::{Appended, Appender};
+    use deepmsg_core::logbuffer::{descriptor, frame, position};
+
+    use super::{Action, ControlledFragments, Fragment, Image};
+    use crate::log_buffer::LogBuffer;
+
+    /// The smallest legal term length, so the fixture stays small.
+    const TERM_LENGTH: i32 = 64 * 1024;
+    const INITIAL_TERM_ID: i32 = 17;
+    const PAGE: i32 = 4096;
+
+    pub(crate) struct TempLog {
+        path: PathBuf,
+    }
+
+    impl TempLog {
+        /// The file as the driver leaves it: geometry in the last page, and
+        /// nothing else.
+        pub(crate) fn new(name: &str) -> Self {
+            // A serial number as well as the pid: the test harness runs tests
+            // on several threads, and two of them naming a fixture the same
+            // would have one truncate the file the other has mapped — which is
+            // a `SIGBUS` in the middle of a read, not a failed assertion.
+            static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let path = std::env::temp_dir().join(format!(
+                "deepmsg-image-{name}-{}-{serial}.log",
+                std::process::id()
+            ));
+
+            let terms = 3 * TERM_LENGTH;
+            let length = position::align_up(terms + PAGE, PAGE);
+
+            let mut file = std::fs::File::create(&path).expect("a temp file");
+            file.set_len(u64::try_from(length).expect("positive"))
+                .expect("sized");
+
+            let mut page = [0u8; PAGE as usize];
+            {
+                let view = AtomicBuffer::from_slice_mut(&mut page).expect("aligned");
+                view.store_i32_relaxed(descriptor::TERM_LENGTH_OFFSET, TERM_LENGTH)
+                    .expect("in range");
+                view.store_i32_relaxed(descriptor::INITIAL_TERM_ID_OFFSET, INITIAL_TERM_ID)
+                    .expect("in range");
+                view.store_i32_relaxed(
+                    descriptor::MTU_LENGTH_OFFSET,
+                    descriptor::MTU_LENGTH_DEFAULT,
+                )
+                .expect("in range");
+                view.store_i32_relaxed(descriptor::IS_CONNECTED_OFFSET, 1)
+                    .expect("in range");
+            }
+
+            file.seek(SeekFrom::Start(u64::try_from(terms).expect("positive")))
+                .expect("seek");
+            file.write_all(&page).expect("the metadata page");
+
+            Self { path }
+        }
+
+        /// What a publisher does to the log before a subscriber maps it: write
+        /// the tails, then the messages.
+        pub(crate) fn write(&self, f: impl FnOnce(&mut Appender<'_>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let metadata = log
+                .file()
+                .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+                .expect("the metadata page");
+            let term = log.term_mut(0).expect("term 0");
+
+            let mut appender = Appender::new(metadata, term).expect("a usable log");
+            assert!(appender.initialise_tails(INITIAL_TERM_ID));
+            f(&mut appender);
+        }
+
+        /// Re-open the file and write raw bytes into term 0.
+        ///
+        /// A second phase because an `Appender` borrows the term it writes
+        /// into, so a frame cannot be hand-written beside one — and some frames
+        /// only a hand can write: the appender pads at a term's end, while a
+        /// **repaired hole** is padding in the middle of one.
+        fn patch(&self, offset: usize, f: impl Fn(usize, &AtomicBuffer<'_, ReadWrite>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let term = log.term_mut(0).expect("term 0");
+            f(offset, &term);
+        }
+
+        /// The image a subscriber would have. The registration id is the
+        /// **publication's**, and a subscription keys its images by it, so two
+        /// images of one subscription need two ids.
+        pub(crate) fn image(&self, registration_id: i64) -> Image {
+            Image::open(
+                &self.path,
+                registration_id,
+                7,
+                1,
+                3,
+                0,
+                "aeron:ipc".to_string(),
+            )
+            .expect("an image")
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// What a handler collects, and what it answers.
+    ///
+    /// `answer` is given to the first fragment only and `Continue` to the rest,
+    /// which is what makes a single test able to say where a scan stopped.
+    struct Answering {
+        seen: Vec<Vec<u8>>,
+        answer: Action,
+        first: bool,
+    }
+
+    impl Answering {
+        fn new(answer: Action) -> Self {
+            Self {
+                seen: Vec::new(),
+                answer,
+                first: true,
+            }
+        }
+    }
+
+    impl ControlledFragments for Answering {
+        fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+            let mut payload = vec![0u8; fragment.payload_length()];
+            fragment.copy_payload(&mut payload);
+            self.seen.push(payload);
+
+            if self.first {
+                self.first = false;
+                return self.answer;
+            }
+            Action::Continue
+        }
+    }
+
+    pub(crate) fn write_message(appender: &mut Appender<'_>, payload: &[u8]) {
+        assert!(matches!(
+            appender.append(7, 1, i64::MAX, payload),
+            Appended::Ok { .. }
+        ));
+    }
+
+    /// How far a frame carrying this payload reaches, aligned.
+    ///
+    /// Arithmetic rather than the appender's own tail: `RawTail` packs a term
+    /// id beside the offset, and reading one back correctly depends on knowing
+    /// which term it belongs to — which is a thing this test does not need to
+    /// know to place a frame after a message it just wrote.
+    fn frame_reach(payload: &[u8]) -> usize {
+        let raw = i32::try_from(frame::DATA_HEADER_LENGTH + payload.len()).expect("small");
+        usize::try_from(position::align_up(raw, descriptor::FRAME_ALIGNMENT)).expect("positive")
+    }
+
+    #[test]
+    fn the_fixture_is_an_image_over_a_log_buffer_file() {
+        let log = TempLog::new("smoke");
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let image = log.image(1);
+        assert_eq!(7, image.session_id());
+        assert_eq!(0, image.join_position());
+    }
+
+    #[test]
+    fn a_scan_reads_the_message_that_was_written() {
+        let log = TempLog::new("read");
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let mut handler = Answering::new(Action::Continue);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments);
+        assert_eq!(vec![b"hello".to_vec()], handler.seen);
+        assert_eq!(
+            vec![image.position()],
+            published,
+            "published once, at the end"
+        );
+    }
+
+    /// `Break` consumes the fragment it stopped on, and the reader comes back
+    /// after it rather than at it.
+    ///
+    /// This is what tells `Break` from `Abort` at the scan's level, and it is
+    /// the property a poller relies on when it stops reading a batch of control
+    /// responses part-way through: the ones it took stay taken.
+    #[test]
+    fn a_break_stops_with_the_fragment_it_stopped_on_consumed() {
+        let log = TempLog::new("break");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut handler = Answering::new(Action::Break);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments, "the second message was not read");
+        assert_eq!(vec![b"first".to_vec()], handler.seen);
+        assert_eq!(
+            1,
+            published.len(),
+            "and the position moved past what was taken"
+        );
+        assert!(image.position() > 0, "the break's fragment is consumed");
+    }
+
+    /// Padding moves the position without being a fragment, so it never spends
+    /// the budget.
+    ///
+    /// This is the shape a **repaired hole** leaves: an image that filled a gap
+    /// because its channel said `reliable=false` writes padding in the middle
+    /// of a term, with frames the reader has not seen on the other side of it.
+    /// Counting it would cost a reader a message; jumping to the term's end
+    /// would throw the rest of the term away. The scan steps over it and adds
+    /// nothing to the count — and the test is here rather than left to the
+    /// scan's shape because that shape has changed once already (see the
+    /// `Step::Padding` arm, which used to jump).
+    #[test]
+    fn a_padding_frame_moves_the_position_without_being_a_fragment() {
+        let log = TempLog::new("padding");
+        let message = b"first";
+        log.write(|appender| write_message(appender, message));
+        let tail = frame_reach(message);
+
+        // At the tail, which is where the appender would have written next.
+        log.patch(tail, |offset, term| {
+            const PAD: i32 = 64;
+            term.store_i32_relaxed(offset + frame::FRAME_LENGTH_OFFSET, PAD)
+                .expect("in range");
+            term.store_u8_relaxed(offset + frame::TYPE_OFFSET, frame::TYPE_PAD as u8)
+                .expect("in range");
+        });
+
+        let mut handler = Answering::new(Action::Continue);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let mut publish = |p: i64| published.push(p);
+
+        // One fragment, so the poll stops on the message and the padding is
+        // still ahead of the reader.
+        assert_eq!(
+            1,
+            image.controlled_poll(1, &mut handler, &mut publish),
+            "the message"
+        );
+        let after_message = image.position();
+
+        assert_eq!(
+            0,
+            image.controlled_poll(1, &mut handler, &mut publish),
+            "the padding"
+        );
+        assert!(
+            image.position() > after_message,
+            "but the position went past it"
+        );
+        assert_eq!(1, handler.seen.len(), "and no second message was invented");
+    }
+
+    /// `Abort` is the other half: the fragment it refused is given back, so the
+    /// reader comes back *at* it and the same message arrives again.
+    #[test]
+    fn an_abort_gives_the_fragment_back() {
+        let log = TempLog::new("abort");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut handler = Answering::new(Action::Abort);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(0, fragments, "a refused fragment is not counted");
+        assert!(published.is_empty(), "and nothing was published");
+        assert_eq!(0, image.position(), "the reader did not move over it");
+    }
+}
