@@ -284,10 +284,28 @@ pub struct CpuAssignment {
 /// What `aeron_driver_apply_cpuset_affinity` decides
 /// (`aeron-driver/src/main/c/aeron_driver.c:1138-1209`).
 ///
-/// With `aeron.driver.cpuset.affinity` off — which is the default — this reads
-/// nothing and assigns nothing: the whole path is an operator's choice, and a
-/// driver that never asked for it does not look at the machine's topology at
-/// all.
+/// The per-agent affinities and the cpuset are two things, and reading them as
+/// one setting with two positions pins nothing at all. The reference applies
+/// `*_cpu_affinity_no` to each agent **unconditionally**: `aeronmd` installs
+/// `aeron_set_thread_affinity_on_start` as the agents' `on_start`
+/// (`aeronmd.c:139`), and that hook pins whichever agent is starting from
+/// `conductor`, `receiver`, `sender` or `native_resource_agent_cpu_affinity_no`
+/// with no cpuset condition anywhere in it
+/// (`aeron_driver_context.c:3406-3428`; the test it makes is `0 <= affinity`,
+/// `:3410`).
+///
+/// The cpuset path is a **translation** of those numbers rather than an
+/// alternative to them. With `aeron.driver.cpuset.affinity` on it reads the
+/// cgroup's cpuset and rewrites each number in place — a position in the cpuset
+/// becomes the CPU id at that position
+/// (`aeron_driver_context.c:3560-3588`) — after which the same `on_start` hook
+/// applies them. With it off the function returns immediately
+/// (`aeron_driver.c:1138-1143`) and the numbers stand as they were written.
+///
+/// So `aeron.sender.cpu.affinity=2` pins the sender to CPU 2 whether or not the
+/// cpuset was asked for, and a value below zero leaves that agent wherever the
+/// scheduler puts it. What an operator turns on with `cpuset.affinity` is
+/// reading the machine's topology — not being pinned.
 ///
 /// With it on, in the reference's order: read the cpuset, run the three topology
 /// checks (their warnings go to **stderr**, which is where the reference's
@@ -301,7 +319,12 @@ pub struct CpuAssignment {
 /// cpuset does not have, and the warnings-as-errors refusal.
 pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, CpusetError> {
     if !config.cpuset_affinity {
-        return Ok(CpuAssignment::default());
+        return Ok(CpuAssignment {
+            conductor: at(config.conductor_cpu_affinity),
+            receiver: at(config.receiver_cpu_affinity),
+            sender: at(config.sender_cpu_affinity),
+            native_resource_agent: at(config.native_resource_agent_cpu_affinity),
+        });
     }
 
     let cpus = cgroup_read_v2(Path::new(PROC_SELF_CGROUP), Path::new(CGROUP_MOUNT_V2))?;
@@ -343,12 +366,21 @@ pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, Cpus
     })
 }
 
+/// One slot's CPU where there is no cpuset to translate it through: the number
+/// **is** the id, and a value below zero leaves the agent wherever the scheduler
+/// puts it — the test the reference's `on_start` hook makes before it pins
+/// anything (`0 <= affinity`, `aeron_driver_context.c:3410`).
+fn at(affinity: i32) -> Option<i32> {
+    (affinity >= 0).then_some(affinity)
+}
+
 /// One slot's position in the cpuset as a CPU id, or `None` for `-1` — the
-/// reference's own `-1 < affinity` test (`aeron_driver_context.c:3553`).
+/// reference's own test and translation (`-1 < affinity`, then
+/// `cpus[(int)affinity]`, `aeron_driver_context.c:3551-3556`).
 fn slot(role: &'static str, affinity: i32, cpus: &[i32]) -> Result<Option<i32>, CpusetError> {
-    if affinity < 0 {
+    let Some(affinity) = at(affinity) else {
         return Ok(None);
-    }
+    };
 
     let index = usize::try_from(affinity).unwrap_or(usize::MAX);
     let Some(cpu) = cpus.get(index) else {
@@ -527,8 +559,9 @@ mod tests {
     }
 
     /// With `aeron.driver.cpuset.affinity` off — which is the default — the
-    /// whole path is skipped: no cgroup is read, no topology is looked at, and
-    /// no agent is pinned (`aeron_driver.c:1140-1143`).
+    /// cpuset is not read and the topology is not looked at
+    /// (`aeron_driver.c:1140-1143`), and a configuration that named no affinity
+    /// pins nothing, because `-1` is the number that says so.
     #[test]
     fn a_driver_that_did_not_ask_for_affinity_reads_nothing() {
         let config = crate::config::DriverConfig::default();
@@ -538,6 +571,34 @@ mod tests {
             Ok(CpuAssignment::default()),
             apply(&config),
             "and nothing is assigned"
+        );
+    }
+
+    /// Off is not the same as unasked-for. The reference pins each agent from
+    /// `*_cpu_affinity_no` whatever the cpuset says
+    /// (`aeron_driver_context.c:3406-3428`), and the cpuset on top of that only
+    /// rewrites the numbers. Reading them only when the cpuset was on left
+    /// every agent to the scheduler under a configuration that had named a CPU
+    /// for each — which is the configuration the benchmark runs on.
+    #[test]
+    fn a_driver_that_did_not_ask_for_a_cpuset_is_still_pinned() {
+        let config = crate::config::DriverConfig {
+            conductor_cpu_affinity: 1,
+            sender_cpu_affinity: 2,
+            receiver_cpu_affinity: 3,
+            native_resource_agent_cpu_affinity: -1,
+            ..crate::config::DriverConfig::default()
+        };
+
+        assert_eq!(
+            Ok(CpuAssignment {
+                conductor: Some(1),
+                receiver: Some(3),
+                sender: Some(2),
+                native_resource_agent: None,
+            }),
+            apply(&config),
+            "the numbers stand as written, and -1 pins nothing"
         );
     }
 

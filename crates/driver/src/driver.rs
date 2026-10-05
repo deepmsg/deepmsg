@@ -386,14 +386,23 @@ impl Driver {
             let _ = sys::set_current_thread_name(self.runner_zero_role().name(self.naming));
         }
 
+        self.start_runners()?;
+
         // Slot 0 runs on **this** thread, so its affinity is set here rather
         // than by a runner (`aeronmd.c:137-141` pins every agent from its own
         // `on_start`, and this one's is the process's).
+        //
+        // After the runners, not before, and the order is the whole point: a
+        // thread inherits the mask of the thread that made it, and an agent
+        // whose own affinity is `-1` is pinned by nothing. The reference starts
+        // its agents from a thread that has not been pinned yet, and its native
+        // resource agent — which is `-1` in the benchmark's configuration — is
+        // measured on 0-7 while its conductor is on 1. Pinning this thread
+        // first handed that agent this one CPU instead, and left it sharing a
+        // core with the conductor.
         if let Some(cpu) = self.affinity.conductor {
             let _ = sys::set_current_thread_affinity(cpu);
         }
-
-        self.start_runners()?;
 
         let mut idle = strategy(self.idle.runner_zero(self.mode))?;
 
