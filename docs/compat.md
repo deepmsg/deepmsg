@@ -404,6 +404,46 @@ pins both halves: the driver serves with all four names set, stops cleanly,
 keeps stderr empty, and — the half a test can forget — does **not** create the
 file the filename name points at.
 
+## Reading a subscription, and what a controlled handler is handed
+
+The reference's controlled face — `ControlledFragmentHandler`,
+`Subscription.controlledPoll` — exists so a reader can look at a fragment and
+say whether to take it, and the one thing it hands the handler is a pointer
+into the term buffer. **This build hands it a whole message instead**: the same
+`Message` the rest of the client sees, whose payload is a slice of the
+assembler's own buffer, and the handler's side of the bargain is a returned
+action rather than a pointer.
+
+That is a deliberate divergence and the reason is a rule this repository already
+keeps. `deepmsg_core::pal` mints no `&[u8]` over a mapping — "a `&[u8]` would
+promise that the bytes do not change, and the driver writes to them for as long
+as it runs" (`crates/core/src/pal/linux.rs:349-355`) — so a handler cannot be
+given a slice of the term, which is exactly what the reference's contract is
+built on. Scoping the borrow to a closure does not settle it: the promise is
+false for as long as the closure runs, not merely afterwards.
+
+What the divergence costs is one copy, and the consumers this face exists for do
+not spend it on anything the reference saves. All eight of the archive client's
+pollers **decode in place** — `messageHeaderDecoder.wrap(buffer, offset)` and no
+retention, no forwarding — so they need to read the bytes during the callback
+and nothing more. The reference's own reassembling path hands its delegate
+`builder.buffer()`, the assembler's buffer rather than the term
+(`ControlledFragmentAssembler.java:113-167`), which is the same arrangement this
+build uses everywhere; and seven of those eight pollers reassemble. Zero-copy
+forwarding is a real thing the reference can do and this build cannot, and it is
+left to whoever needs it rather than opened here for a face whose callers do not.
+
+The four actions are the reference's, and the numbers are not a contract: Java
+numbers `ABORT, BREAK, COMMIT, CONTINUE` from zero
+(`logbuffer/ControlledFragmentHandler.java:30-53`) and C numbers the same order
+from one (`aeron-client/src/main/c/aeronc.h:1719-1737`). What each does to a
+reader's position is the contract, and it is pinned by
+`crates/client/src/image.rs::the_four_actions_move_the_position_where_the_reference_moves_it`,
+with a refused message coming back assembled by the same last fragment
+(`fragment_assembler.rs::a_refused_message_is_assembled_again_by_the_same_last_fragment`)
+and a paid-for position surviving a later refusal
+(`a_committed_point_survives_a_refusal_after_it`).
+
 ## The channel URIs this driver refuses
 
 Three shapes the reference *serves*, this driver refuses, because in each one
