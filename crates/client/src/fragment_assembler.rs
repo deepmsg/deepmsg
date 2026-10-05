@@ -160,6 +160,37 @@ impl FragmentAssembler {
     where
         F: FnMut(Message<'_>),
     {
+        // The plain path has no decisions in it: every message is consumed and
+        // the poll runs to its limit, which is `Continue` — the action that
+        // asks for nothing. Wrapping is what keeps **one** implementation of
+        // the assembly rules rather than two that have to be kept agreeing; a
+        // `FnMut(Message)` is monomorphised either way, so the reader of a
+        // subscription pays nothing for the shared code.
+        self.push_controlled(fragment, &mut |message: Message<'_>| {
+            handler(message);
+            Action::Continue
+        });
+    }
+
+    /// Feed one fragment; call `handler` for every whole message it completes,
+    /// and carry its answer back.
+    ///
+    /// The answer is what the caller's poll does next with the reader's
+    /// position: [`Action::Abort`] leaves the message unconsumed — the builder
+    /// is rewound to where it stood before this last fragment, and the reader's
+    /// position never reaches the frame — so the same message arrives again
+    /// ([`Action::Abort`]). The reference restores the builder's limit for the
+    /// same reason (`ControlledFragmentAssembler.java:146-153`); rewinding a
+    /// length is the same thing said about a `Vec`.
+    ///
+    /// A message that is refused therefore stays assembled **up to the fragment
+    /// before the last**, and the last fragment arrives again to complete it —
+    /// which works because `next_term_offset` is only advanced by a fragment
+    /// that is not the message's end.
+    pub fn push_controlled<H>(&mut self, fragment: &Fragment<'_>, handler: &mut H) -> Action
+    where
+        H: ControlledHandler,
+    {
         let (Some(session_id), Some(stream_id), Some(term_offset)) = (
             fragment.session_id(),
             fragment.stream_id(),
@@ -169,22 +200,28 @@ impl FragmentAssembler {
             // build can assemble; it is counted and dropped rather than
             // guessed at.
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         };
 
         let Some(flags) = fragment.flags() else {
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         };
 
         if flags & FLAG_UNFRAGMENTED == FLAG_UNFRAGMENTED {
-            self.deliver_unfragmented(fragment, session_id, stream_id, term_offset, flags, handler);
-            return;
+            return self.deliver_unfragmented(
+                fragment,
+                session_id,
+                stream_id,
+                term_offset,
+                flags,
+                handler,
+            );
         }
 
         let Some(next_term_offset) = fragment.next_term_offset() else {
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         };
 
         if flags & FLAG_BEGIN == FLAG_BEGIN {
@@ -196,7 +233,7 @@ impl FragmentAssembler {
                 next_term_offset,
                 flags,
             );
-            return;
+            return Action::Continue;
         }
 
         // A middle or last fragment: it continues a message only if it begins
@@ -205,7 +242,7 @@ impl FragmentAssembler {
             // Nothing was being assembled for this session: this is the tail of
             // a message whose beginning was never seen.
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         };
 
         if builder.next_term_offset != Some(term_offset) {
@@ -214,45 +251,61 @@ impl FragmentAssembler {
             // delivered short.
             builder.reset();
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         }
 
         let Some(header) = builder.header.as_mut() else {
             builder.reset();
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         };
 
         header.flags |= flags;
 
+        // Where the buffer stood before this fragment, for a handler that
+        // refuses the message it completes — see `push_controlled`.
+        let mark = builder.buffer.len();
+
         if !append(fragment, &mut builder.buffer) {
             builder.reset();
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         }
 
-        if flags & FLAG_END == FLAG_END {
-            let Some(header) = builder.header.take() else {
-                builder.reset();
-                self.abandoned += 1;
-                return;
-            };
+        if flags & FLAG_END != FLAG_END {
+            builder.next_term_offset = fragment.next_term_offset();
+            return Action::Continue;
+        }
 
-            let header = complete(header, builder.buffer.len(), fragment);
+        let Some(header) = builder.header.take() else {
+            builder.reset();
+            self.abandoned += 1;
+            return Action::Continue;
+        };
 
-            // The borrow of the builder's buffer ends with this call, which is
-            // what lets the reset below happen — and the handler is what the
-            // borrow is for, so nothing else may touch the buffer while it
-            // holds it.
-            handler(Message {
-                header,
-                payload: &builder.buffer,
-            });
+        let header = complete(header, builder.buffer.len(), fragment);
 
+        // The borrow of the builder's buffer ends with this call, which is what
+        // lets the rewind below happen — and the handler is what the borrow is
+        // for, so nothing else may touch the buffer while it holds it.
+        let action = handler.on_message(Message {
+            header,
+            payload: &builder.buffer,
+        });
+
+        if action.consumes() {
             builder.reset();
         } else {
-            builder.next_term_offset = fragment.next_term_offset();
+            // Refused: the message stays assembled up to the fragment before
+            // this one, and the header goes back so that the same last fragment
+            // completes it again. Completing twice is harmless — the flags are
+            // OR-ed and the two lengths are computed from the buffer, so the
+            // second pass writes what the first did.
+            builder.buffer.truncate(mark);
+            builder.header = Some(header);
         }
+
+        action
     }
 
     /// A message that arrived in one frame.
@@ -262,21 +315,22 @@ impl FragmentAssembler {
     /// **not** touched: a fragmented message may be in flight for the same
     /// session, and the reference passes the whole one through without
     /// disturbing it (`aeron_fragment_assembler.c:158-161`).
-    fn deliver_unfragmented<F>(
+    fn deliver_unfragmented<H>(
         &mut self,
         fragment: &Fragment<'_>,
         session_id: i32,
         stream_id: i32,
         term_offset: i32,
         flags: u8,
-        handler: &mut F,
-    ) where
-        F: FnMut(Message<'_>),
+        handler: &mut H,
+    ) -> Action
+    where
+        H: ControlledHandler,
     {
         self.passthrough.clear();
         if !append(fragment, &mut self.passthrough) {
             self.abandoned += 1;
-            return;
+            return Action::Continue;
         }
 
         let header = MessageHeader {
@@ -293,10 +347,10 @@ impl FragmentAssembler {
         };
 
         self.delivered += 1;
-        handler(Message {
+        handler.on_message(Message {
             header,
             payload: &self.passthrough,
-        });
+        })
     }
 
     /// Start a message.
@@ -678,6 +732,25 @@ mod tests {
             }
         }
 
+        /// The same, for a handler that answers back.
+        fn push_controlled_into<H>(
+            &self,
+            index: usize,
+            assembler: &mut FragmentAssembler,
+            handler: &mut H,
+        ) -> Action
+        where
+            H: ControlledHandler,
+        {
+            let view = AtomicBuffer::from_slice(&self.term.0).expect("aligned");
+            let fragment = Fragment::new(
+                frame::Frame::new(&view, self.frames[index]),
+                i64::from(i32::try_from(self.frames[index]).expect("a term fits an i32")),
+            );
+
+            assembler.push_controlled(&fragment, handler)
+        }
+
         /// Feed the frame at `index` to an assembler, as a subscriber would.
         ///
         /// The buffer view is built inside this call because a `Fragment`
@@ -724,6 +797,150 @@ mod tests {
         log.push_into(0, &mut assembler, &mut handler);
 
         assert_eq!(vec![(7, b"hello".to_vec())], seen);
+        assert_eq!(0, assembler.abandoned());
+    }
+
+    /// Two frames of one message, for the tests that need a message assembled
+    /// rather than passed through.
+    ///
+    /// 1376 bytes is what one frame holds, so this is one frame's worth and a
+    /// remainder — the appender's own fragmentation, not a test's.
+    fn a_two_frame_message() -> (Log, Vec<u8>) {
+        let mut log = Log::new();
+        let payload = vec![b'a'; 1376 + 64];
+        log.write(7, 1, &payload);
+        assert_eq!(2, log.frames.len(), "the appender made two frames");
+        (log, payload)
+    }
+
+    /// The controlled entry point delivers what the plain one does.
+    ///
+    /// They share an implementation, so this is not what makes them agree —
+    /// it is what says the shared implementation is the one being exercised,
+    /// and it is the assertion the slice's acceptance asks for: a caller that
+    /// wants decisions gets the same messages as one that does not.
+    #[test]
+    fn the_controlled_path_delivers_what_the_plain_one_delivers() {
+        let (log, payload) = a_two_frame_message();
+
+        let mut plain = FragmentAssembler::new();
+        let mut by_plain = Vec::new();
+        {
+            let mut handler = |message: Message<'_>| by_plain.push(message.payload.to_vec());
+            log.push_into(0, &mut plain, &mut handler);
+            log.push_into(1, &mut plain, &mut handler);
+        }
+
+        let mut controlled = FragmentAssembler::new();
+        let mut by_controlled = Vec::new();
+        {
+            let mut handler = |message: Message<'_>| {
+                by_controlled.push(message.payload.to_vec());
+                Action::Continue
+            };
+            assert_eq!(
+                Action::Continue,
+                log.push_controlled_into(0, &mut controlled, &mut handler)
+            );
+            assert_eq!(
+                Action::Continue,
+                log.push_controlled_into(1, &mut controlled, &mut handler)
+            );
+        }
+
+        assert_eq!(vec![payload], by_plain);
+        assert_eq!(by_plain, by_controlled);
+    }
+
+    /// A refused message is not consumed, and comes back.
+    ///
+    /// The reference restores the builder's limit so the message stays
+    /// assembled up to the fragment before the last
+    /// (`ControlledFragmentAssembler.java:146-153`); this rewinds a `Vec` to
+    /// the length it had, and puts the header back so the same last fragment
+    /// completes it again. Nothing is lost and nothing is delivered short.
+    #[test]
+    fn a_refused_message_is_assembled_again_by_the_same_last_fragment() {
+        let (log, payload) = a_two_frame_message();
+        let mut assembler = FragmentAssembler::new();
+        let mut seen = Vec::new();
+
+        {
+            let mut handler = |_: Message<'_>| Action::Continue;
+            log.push_controlled_into(0, &mut assembler, &mut handler);
+        }
+
+        {
+            let mut handler = |message: Message<'_>| {
+                seen.push(message.payload.to_vec());
+                Action::Abort
+            };
+            assert_eq!(
+                Action::Abort,
+                log.push_controlled_into(1, &mut assembler, &mut handler)
+            );
+        }
+        assert_eq!(vec![payload.clone()], seen, "the handler saw it once");
+
+        // The same frame again, because an aborted message is not consumed —
+        // which is what a poll that did not advance the reader's position does.
+        {
+            let mut handler = |message: Message<'_>| {
+                seen.push(message.payload.to_vec());
+                Action::Continue
+            };
+            assert_eq!(
+                Action::Continue,
+                log.push_controlled_into(1, &mut assembler, &mut handler)
+            );
+        }
+
+        assert_eq!(
+            vec![payload.clone(), payload],
+            seen,
+            "and the same whole message again"
+        );
+        assert_eq!(
+            0,
+            assembler.abandoned(),
+            "a refusal is not an abandoned message"
+        );
+    }
+
+    /// The key is still the session, on this path too.
+    ///
+    /// Two publications on one stream interleaving their fragments must not
+    /// assemble into one message — the same rule the plain path keeps, and the
+    /// reason the two share a module rather than a file each.
+    #[test]
+    fn the_controlled_path_keeps_two_sessions_apart() {
+        let mut log = Log::new();
+        // One frame holds 1376, so `+ 64` is the appender's own fragmentation
+        // rather than a test's — 1376 exactly would be a single frame each.
+        let first = vec![b'a'; 1376 + 64];
+        let second = vec![b'b'; 1376 + 64];
+        log.write(7, 1, &first);
+        log.write(9, 1, &second);
+        let (head_a, tail_a, head_b, tail_b) = (0, 1, 2, 3);
+        assert_eq!(4, log.frames.len(), "two two-frame messages");
+
+        let mut assembler = FragmentAssembler::new();
+        let mut seen = Vec::new();
+        {
+            // The closure holds the borrow of `seen` while it lives, so it sits
+            // in a block of its own — as the plain path's tests do.
+            let mut handler = |message: Message<'_>| {
+                seen.push((message.header.session_id, message.payload[0]));
+                Action::Continue
+            };
+
+            // Interleaved, so a single builder would splice one onto the other.
+            for index in [head_a, head_b, tail_a, tail_b] {
+                log.push_controlled_into(index, &mut assembler, &mut handler);
+            }
+        }
+
+        assert_eq!(vec![(7, b'a'), (9, b'b')], seen);
         assert_eq!(0, assembler.abandoned());
     }
 
