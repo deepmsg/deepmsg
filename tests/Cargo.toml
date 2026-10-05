@@ -17,6 +17,7 @@ deepmsg-core = { path = "../crates/core" }
 deepmsg-client = { path = "../crates/client" }
 deepmsg-driver = { path = "../crates/driver" }
 deepmsg-cnc = { path = "../crates/cnc" }
+deepmsg-codec = { path = "../crates/codec" }
 
 [[test]]
 name = "basic_roundtrip"
@@ -40,6 +41,13 @@ required-features = ["interop"]
 [[test]]
 name = "cnc_fixture"
 path = "integration/cnc_fixture.rs"
+
+# The SBE goldens: the reference's own encoded bytes, read back by our decoders
+# and re-encoded by our encoders. Needs `tests/fixtures/sbe/` and no checkout,
+# so it runs in CI.
+[[test]]
+name = "sbe_golden"
+path = "integration/sbe_golden.rs"
 
 # The writer's side of the same contract `cnc_fixture` reads: a file this
 # build creates, compared byte for byte with a real driver's.

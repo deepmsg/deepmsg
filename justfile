@@ -40,9 +40,10 @@ bench:
 bench-latency *args:
     cargo bench -p deepmsg-bench --bench latency -- {{args}}
 
-# Regenerate SBE codecs from schemas/ (once ADR-0004 lands a generator).
-gen:
-    @echo "SBE code generation is not wired up yet (see docs/adr/0004-sbe-codegen.md)"
+# Regenerate the SBE codecs from schemas/ (ADR-0004). Needs a JDK and the
+# pinned sbe-tool/agrona jars; see `gen-sbe-codecs --help`.
+gen *args:
+    cargo run --quiet -p deepmsg-tools --bin gen-sbe-codecs -- {{args}}
 
 # License and dependency audit.
 deny:

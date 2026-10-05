@@ -1,0 +1,12 @@
+# `src/` is generated from `schemas/aeron-cluster-node-state-codecs.xml` by `just gen` (ADR-0004), and is
+# replaced wholesale when it runs. This file is hand-written and is not.
+[package]
+name = "deepmsg-codec-cluster-node-state"
+description = "Generated SBE codecs for the cluster node-state file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

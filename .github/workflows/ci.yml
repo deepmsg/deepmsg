@@ -36,3 +36,76 @@ jobs:
         run: cargo test -p deepmsg-tests --features interop --no-run
       - name: Lint the interop targets
         run: cargo clippy -p deepmsg-tests --all-targets --features interop -- -D warnings
+
+  # The generated codecs are checked in (ADR-0004), so nothing but this job
+  # stands between a schema edit and a crate that no longer matches it. The
+  # check is the one the tool's own documentation promises: regenerate, and the
+  # tree must not move.
+  #
+  # A **separate job**, and the reason is `check`'s: this one needs a JDK, and
+  # putting one in `check` would make every Rust build wait on a JVM. It is not
+  # in `interop.yml` either, which is where the plan first put it — that
+  # workflow is manual-only and is *expected to be red* (its header says so: it
+  # is a list of known gaps, not a build gate), so a drift reported there would
+  # be a failure among a hundred and sixty-five others, in a run nobody
+  # triggers. That is the one shape a gate must not have.
+  #
+  # The generator is fetched rather than built, and from Maven Central rather
+  # than from the reference checkout's Gradle cache, because this gate needs
+  # the *tool*, not the tree: `gen-sbe-codecs` reads `schemas/` and the XSD
+  # beside it and nothing else. That also makes the pin stronger than a cache
+  # path — the two jars are held to a sha256, and the artifacts Central serves
+  # were confirmed byte-identical to the ones a Gradle build of the reference
+  # puts in `~/.gradle/caches` (both sha256s below are the same either way).
+  codecs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # `rustfmt` and not just the channel: `gen-sbe-codecs` formats what it
+        # generates, because the target's output is not `rustfmt`-clean and
+        # `cargo fmt --check` is the first gate `check` runs.
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --component rustfmt --no-self-update
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The versions here are the ones `gen-sbe-codecs` searches its Gradle
+      # cache for, so the two ways of finding the generator cannot disagree
+      # about which generator it is. `-f` so a 404 is an error rather than a
+      # 200-byte file that fails the checksum with a puzzling message.
+      - name: Fetch the pinned generator
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eu
+          curl -fsSLO https://repo1.maven.org/maven2/uk/co/real-logic/sbe-tool/1.40.2/sbe-tool-1.40.2.jar
+          curl -fsSLO https://repo1.maven.org/maven2/org/agrona/agrona/2.6.1/agrona-2.6.1.jar
+          echo "df2556a61a199383952030a6cd7fd2e3a82c3eb835bf4d5bc6fe3ca11295d058  sbe-tool-1.40.2.jar" | sha256sum -c -
+          echo "84c07eb02695c06bfda3d6c3a20c1984e3ff1bbd617b2f8e678140baf973fa28  agrona-2.6.1.jar" | sha256sum -c -
+
+      - name: Regenerate the SBE codecs
+        env:
+          SBE_TOOL_JAR: ${{ runner.temp }}/sbe-tool-1.40.2.jar
+          AGRONA_JAR: ${{ runner.temp }}/agrona-2.6.1.jar
+        run: cargo run --quiet -p deepmsg-tools --bin gen-sbe-codecs
+
+      # `--porcelain` rather than a bare `git diff --exit-code`. The two agree
+      # on everything the generator does today — a schema that gains a message
+      # also rewrites the generated `lib.rs` that lists it, so the new file is
+      # never the only thing that moves, which was checked rather than assumed.
+      # But `git diff` cannot see an *untracked* file at all, and the one thing
+      # this step must not do is pass because it was not looking.
+      - name: The tree is what schemas/ makes of it
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::regenerating the codecs changed the tree; commit the result of \`just gen\`"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          echo "regeneration is a no-op"

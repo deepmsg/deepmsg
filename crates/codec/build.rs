@@ -1,7 +1,11 @@
-//! Build script: validate that the SBE schemas are present and wire rebuild
-//! triggers. Actual code generation is deferred until ADR-0004 picks a
-//! generator; generated sources will be checked in under `src/generated/`
-//! and regenerated via `just gen`.
+//! Build script: check that the five SBE schemas are where `just gen` expects
+//! them.
+//!
+//! It is a leftover of the placeholder era and it is thin on purpose: the
+//! generator ran once, its crates are checked in beside this one (ADR-0004),
+//! and nothing in this build reads `schemas/`. The check duplicates what
+//! `just gen` already does — it refuses to run against a missing schema — so
+//! its only live effect is to fail `cargo build` early and by name.
 
 use std::{env, fs, path::Path};
 

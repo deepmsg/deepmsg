@@ -85,7 +85,9 @@ Principles:
       core/      protocol-agnostic foundation: buffers, lock-free structures,
                  log-buffer framing, counters, URI, versioning
       cnc/       the CnC file contract (client <-> driver shared memory)
-      codec/     SBE codecs generated from schemas/ (ADR-0004)
+      codec/     the SBE codecs (ADR-0004): this crate is the façade over five
+                 generated crates in the directories inside it — archive/,
+                 archive-mark/, cluster/, cluster-mark/, cluster-node-state/
       client/    publications, subscriptions, images, client conductor
       driver/    media driver: conductor, sender, receiver, media, loss,
                  flow control
