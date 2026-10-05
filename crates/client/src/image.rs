@@ -208,6 +208,28 @@ impl Image {
         })
     }
 
+    /// The term this stream began at.
+    ///
+    /// `Image.initialTermId()` (`Image.java:120`); the reference's archive
+    /// reads it eighteen times, because a recording's descriptor is built from
+    /// what its images say about themselves.
+    ///
+    /// Not [`Image::term_buffer_length`]: this is *which* term the stream
+    /// started in, and that one is how many bytes a term is.
+    pub fn initial_term_id(&self) -> i32 {
+        self.log.geometry().initial_term_id
+    }
+
+    /// How many bytes one term of this image's log buffer is.
+    ///
+    /// `Image.termBufferLength()` (`Image.java:138`); the reference's archive
+    /// reads it twenty-six times — more than anything else an image answers —
+    /// because it goes into every recording descriptor and every replay's
+    /// bounds.
+    pub fn term_buffer_length(&self) -> i32 {
+        self.log.geometry().term_length
+    }
+
     /// The **publication's** registration id — not this subscriber's
     /// (`aeron_image_t.correlation_id`, `aeron_image.h:28`; `Image.correlationId()`,
     /// `Image.java:184`).
@@ -878,6 +900,23 @@ pub(crate) mod tests {
         let image = log.image(1);
         assert_eq!(7, image.session_id());
         assert_eq!(0, image.join_position());
+    }
+
+    /// What an image says about the log it is reading.
+    ///
+    /// Both come from the mapped metadata, which is why the fixture writes the
+    /// geometry into the file before anything opens it — and they are two
+    /// different things (`Image.java:120` against `:138`), which is worth a test
+    /// because the reference's archive reads them eighteen and twenty-six times
+    /// respectively and would notice.
+    #[test]
+    fn an_image_answers_with_the_geometry_of_its_log() {
+        let log = TempLog::new("geometry");
+        log.write(|appender| write_message(appender, b"hello"));
+        let image = log.image(1);
+
+        assert_eq!(INITIAL_TERM_ID, image.initial_term_id());
+        assert_eq!(TERM_LENGTH, image.term_buffer_length());
     }
 
     #[test]

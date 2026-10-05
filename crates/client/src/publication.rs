@@ -174,6 +174,32 @@ impl Publication {
     }
 
     /// The largest payload one frame can carry on this log.
+    /// The term this stream began at.
+    ///
+    /// `Publication.initialTermId()` (`Publication.java:378`) — the id the
+    /// driver picked when the publication was created, which a caller needs to
+    /// place a position in a term rather than merely to count bytes.
+    pub fn initial_term_id(&self) -> i32 {
+        self.log.geometry().initial_term_id
+    }
+
+    /// How many bytes one term of this publication's log buffer is.
+    ///
+    /// `Publication.termBufferLength()` (`Publication.java:383`).
+    pub fn term_buffer_length(&self) -> i32 {
+        self.log.geometry().term_length
+    }
+
+    /// `log2(term length)`, for a caller doing its own position arithmetic.
+    ///
+    /// `Publication.positionBitsToShift()` (`Publication.java:390`); the
+    /// reference's archive reads it six times, alongside
+    /// [`Publication::initial_term_id`] and
+    /// [`Publication::term_buffer_length`], to size the frames it writes.
+    pub fn position_bits_to_shift(&self) -> u32 {
+        self.log.geometry().bits_to_shift
+    }
+
     pub fn max_payload_length(&self) -> Option<usize> {
         self.appender()
             .map(|appender| appender.max_payload_length())
@@ -330,6 +356,32 @@ impl ExclusivePublication {
     }
 
     /// The largest payload one frame can carry on this log.
+    /// The term this stream began at.
+    ///
+    /// `Publication.initialTermId()` (`Publication.java:378`) — the id the
+    /// driver picked when the publication was created, which a caller needs to
+    /// place a position in a term rather than merely to count bytes.
+    pub fn initial_term_id(&self) -> i32 {
+        self.log.geometry().initial_term_id
+    }
+
+    /// How many bytes one term of this publication's log buffer is.
+    ///
+    /// `Publication.termBufferLength()` (`Publication.java:383`).
+    pub fn term_buffer_length(&self) -> i32 {
+        self.log.geometry().term_length
+    }
+
+    /// `log2(term length)`, for a caller doing its own position arithmetic.
+    ///
+    /// `Publication.positionBitsToShift()` (`Publication.java:390`); the
+    /// reference's archive reads it six times, alongside
+    /// [`Publication::initial_term_id`] and
+    /// [`Publication::term_buffer_length`], to size the frames it writes.
+    pub fn position_bits_to_shift(&self) -> u32 {
+        self.log.geometry().bits_to_shift
+    }
+
     pub fn max_payload_length(&self) -> Option<usize> {
         self.appender()
             .map(|appender| appender.max_payload_length())

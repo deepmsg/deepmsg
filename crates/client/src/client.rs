@@ -2662,7 +2662,15 @@ impl Client {
         }
     }
 
-    fn next_correlation_id(&mut self) -> Result<i64, CommandError> {
+    /// A correlation id no command in flight is using.
+    ///
+    /// `Aeron.nextCorrelationId()` (`Aeron.java:768`), which the reference's
+    /// archive calls sixty-one times — it is how every request is matched to
+    /// its response. The reference's cannot fail and this one can, because the
+    /// id comes out of the to-driver ring rather than the client's own
+    /// counter: a ring with no room is a caller that must try again rather
+    /// than an id that may be guessed.
+    pub fn next_correlation_id(&mut self) -> Result<i64, CommandError> {
         let ring = self
             .cnc
             .to_driver_ring()
