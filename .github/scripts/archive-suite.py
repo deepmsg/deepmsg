@@ -11,7 +11,8 @@ client's, everything, for a result about none of them.
 So this runs the nine archive binaries itself and lets gtest write its own XML.
 Nothing in the reference tree is modified.
 
-    .github/scripts/archive-suite.py <build-dir> <out.tsv> [--log <shim-log>]
+    .github/scripts/archive-suite.py <build-dir> <out.tsv> \
+        [--mode transparent|hybrid|deepmsg] [--driver <binary>] [--log <shim-log>]
 
 The build directory must be one configured with `-DJava_JAVA_EXECUTABLE` set to
 `archive-shim` or to the real `java` — both are useful, and the two runs are the
@@ -131,20 +132,28 @@ def run_binary(build: Path, binary: str, reports: Path) -> dict[str, str]:
     return outcomes
 
 
-def write_shim_config(shim: Path, *, mode: str, java: str, log: Path) -> None:
+def write_shim_config(shim: Path, *, mode: str, java: str, log: Path, driver: str | None) -> None:
     """Beside the binary, which is the only place it looks.
 
     Paths are absolute because the shim's working directory is whatever the C
     test's was, and one of the nine runs from a different subdirectory than the
     others.
+
+    `driver=` is written only when one was named. It is what a mode that
+    replaces the reference's driver points the shim at, and without it `hybrid`
+    has nothing to start — but writing a path nobody gave would be this script
+    guessing, which is the failure it exists to avoid.
     """
     config = shim.parent / "archive-shim.conf"
-    config.write_text(
-        "# Written by p2-0b-run.py. Read by the shim, which has no environment.\n"
-        f"java={Path(java).resolve()}\n"
-        f"mode={mode}\n"
-        f"log={log.resolve()}\n"
-    )
+    lines = [
+        "# Written by archive-suite.py. Read by the shim, which has no environment.",
+        f"java={Path(java).resolve()}",
+        f"mode={mode}",
+        f"log={log.resolve()}",
+    ]
+    if driver is not None:
+        lines.append(f"driver={Path(driver).resolve()}")
+    config.write_text("\n".join(lines) + "\n")
 
 
 def ledger_cases() -> dict[str, str]:
@@ -179,14 +188,36 @@ def main() -> int:
         default=Path("/tmp/deepmsg-archive-shim.log"),
         help="the shim's log, checked for classes it did not recognise",
     )
+    parser.add_argument(
+        "--driver",
+        help="the binary a mode replaces the reference's driver with; required by "
+        "every mode but `transparent`, because the shim will not guess",
+    )
     args = parser.parse_args()
+
+    # Absolute before anything uses it. A binary is spawned with `cwd=` set to
+    # its own directory (`working_directory`), and a relative executable path is
+    # resolved by the child *after* that chdir — so `../aeron/cppbuild/…` stops
+    # pointing at the build and the failure is a bare FileNotFoundError naming a
+    # path that plainly exists.
+    args.build = args.build.resolve()
 
     shim = shim_build(args.build)
     if shim is not None:
         if not os.access(args.java, os.X_OK):
             sys.exit(f"--java {args.java} is not an executable file")
-        write_shim_config(shim, mode=args.mode, java=args.java, log=args.log)
+        if args.mode != "transparent" and args.driver is None:
+            # Refused here rather than left to the shim, which would refuse too
+            # but only once a spawned process is already waiting on a driver
+            # that is never going to appear — and the suite's readiness wait has
+            # no timeout, so that reads as a hang.
+            sys.exit(f"--mode {args.mode} needs --driver: it replaces the reference's driver with ours")
+        if args.driver is not None and not os.access(args.driver, os.X_OK):
+            sys.exit(f"--driver {args.driver} is not an executable file")
+        write_shim_config(shim, mode=args.mode, java=args.java, log=args.log, driver=args.driver)
         print(f"shim       {shim} (mode {args.mode})")
+        if args.driver is not None:
+            print(f"driver     {args.driver}")
     else:
         print("shim       none (the real java)")
 

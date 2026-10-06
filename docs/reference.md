@@ -91,8 +91,16 @@ the runner checks a run against.
 
 ### Running it
 
-    DEEPMSG_SHIM_MODE=transparent .github/scripts/archive-suite.py \
-      ../aeron/cppbuild/deepmsg-archive-shim  out.tsv
+    .github/scripts/archive-suite.py ../aeron/cppbuild/deepmsg-archive-shim  out.tsv
+    .github/scripts/archive-suite.py ../aeron/cppbuild/deepmsg-archive-shim  out.tsv \
+      --mode hybrid --driver target/debug/deepmsg-driver
+
+The mode is a **flag**, not an environment variable: the shim is spawned with an
+empty environment (see above), so everything it is told arrives through the file
+beside it, which this script rewrites each run. A mode that replaces the
+reference's driver is refused without `--driver` rather than left to guess —
+a hybrid run that quietly ran `transparent` instead would report the suite
+green while exercising none of our code.
 
 It runs the nine binaries itself rather than through `ctest`, because the
 reference registers **one test per binary** (`aeron-archive/src/test/c/CMakeLists.txt:40`)

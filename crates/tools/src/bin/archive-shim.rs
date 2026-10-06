@@ -276,7 +276,7 @@ impl Mode {
             "hybrid" => Ok(Self::Hybrid),
             "deepmsg" => Ok(Self::Deepmsg),
             other => Err(format!(
-                "DEEPMSG_SHIM_MODE is {other:?}; it is one of transparent, hybrid, deepmsg"
+                "mode is {other:?}; it is one of transparent, hybrid, deepmsg"
             )),
         }
     }
