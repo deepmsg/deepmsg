@@ -369,7 +369,7 @@ fn need(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -378,10 +378,10 @@ mod tests {
     /// Hand-rolled, like the ones in `deepmsg_cnc::create` and
     /// `deepmsg_core::pal`: the workspace has no test dependencies and this is
     /// all one would be used for.
-    struct TempDir(PathBuf);
+    pub(crate) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path =
@@ -391,8 +391,12 @@ mod tests {
             Self(path)
         }
 
-        fn file(&self, name: &str) -> PathBuf {
+        pub(crate) fn file(&self, name: &str) -> PathBuf {
             self.0.join(name)
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
         }
     }
 

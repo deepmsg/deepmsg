@@ -10,5 +10,6 @@
 pub mod catalog;
 pub mod client;
 pub mod mark;
+pub mod mark_file;
 pub mod recording_log;
 pub mod server;
