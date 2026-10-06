@@ -466,7 +466,14 @@ impl NetworkPublication {
             time_of_last_activity_ns: 0,
             log,
             counters,
-            max_messages_per_send,
+            // Clamped where the reference clamps it — its context setter
+            // refuses anything above `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND`
+            // (`aeron_driver_context.c:3378-3384`), which is the sixteen
+            // `send_data`'s batch arrays are sized to. The setting is not read
+            // here yet, so this is the default four and the clamp cannot bite
+            // today; it is here so that adding the setting cannot turn a batch
+            // into an out-of-bounds write.
+            max_messages_per_send: max_messages_per_send.min(crate::sys::socket::MAX_BATCH),
             term_length: params.term_length,
             position_bits_to_shift,
             mtu_length: params.mtu_length,
@@ -1015,10 +1022,19 @@ impl NetworkPublication {
 
         let mut scratch = std::mem::take(&mut self.scratch);
         let mut filled = 0usize;
-        let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(self.max_messages_per_send);
+        // A fixed array, not a `Vec`: the reference's batch is
+        // `struct iovec iov[AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND]`
+        // on the stack (`aeron_network_publication.c:515`), that macro is 16
+        // (`aeron_driver_context.h:57`), and the context setter clamps the
+        // setting to the same sixteen this build's socket shim batches with
+        // (`crate::sys::socket::MAX_BATCH`). Two `Vec`s here were a `malloc`
+        // and a `free` in every send — the allocator is ~14% of this thread
+        // and the chain that reaches it is this one.
+        let mut bounds = [(0usize, 0usize); crate::sys::socket::MAX_BATCH];
+        let mut frames = 0usize;
         let mut blocked = false;
 
-        while bounds.len() < self.max_messages_per_send && available_window > 0 {
+        while frames < self.max_messages_per_send && available_window > 0 {
             let scan_limit =
                 i32::try_from(available_window.min(i64::from(self.mtu_length))).unwrap_or(0);
             let term_length_left = i32::try_from(term_length - term_offset).unwrap_or(0);
@@ -1054,7 +1070,8 @@ impl NetworkPublication {
                     break;
                 }
 
-                bounds.push((filled, available));
+                bounds[frames] = (filled, available);
+                frames += 1;
                 filled += available;
             }
 
@@ -1076,15 +1093,14 @@ impl NetworkPublication {
             }
         }
 
-        let frames = bounds.len();
-
-        let slices: Vec<&[u8]> = bounds
-            .iter()
-            .map(|(offset, length)| &scratch[*offset..*offset + *length])
-            .collect();
+        let mut slices: [&[u8]; crate::sys::socket::MAX_BATCH] =
+            [&[]; crate::sys::socket::MAX_BATCH];
+        for (index, (offset, length)) in bounds[..frames].iter().enumerate() {
+            slices[index] = &scratch[*offset..*offset + *length];
+        }
 
         let sent = if frames > 0 {
-            self.do_send(endpoint, &slices, counters, regions, now_ns)?
+            self.do_send(endpoint, &slices[..frames], counters, regions, now_ns)?
         } else {
             0
         };
@@ -1094,7 +1110,11 @@ impl NetworkPublication {
         // its `do_send` accumulated (`aeron_network_publication.c:576`,
         // `aeron_driver_sender.c:457`). A partial send is the first `sent`
         // datagrams — `send` reports how many of the batch it took, in order.
-        let bytes_sent: usize = slices.iter().take(sent).map(|slice| slice.len()).sum();
+        let bytes_sent: usize = slices[..frames]
+            .iter()
+            .take(sent)
+            .map(|slice| slice.len())
+            .sum();
 
         self.scratch = scratch;
 
