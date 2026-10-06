@@ -35,7 +35,7 @@ use std::thread::JoinHandle;
 use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
-use crate::driver::Role;
+use crate::driver::{Role, Timer};
 
 use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
@@ -801,52 +801,6 @@ pub(crate) struct PendingSetup {
 }
 
 /// What the thread owns.
-/// A deadline that comes due once per interval.
-///
-/// The image's own maintenance — the untethered state machine and the image
-/// state machine — runs on the conductor's timer in the reference, not once per
-/// pass: `aeron_driver_conductor_on_check_managed_resources` is gated at
-/// `aeron_driver_conductor.c:3377-3384` and carries the image list at
-/// `:1705-1706`, where `aeron_publication_image_on_time_event` (`:1294`) runs
-/// and calls `check_untethered_subscriptions` (`:1311`) from its `ACTIVE` arm.
-/// The receiver's own loop does neither (`aeron_driver_receiver.c:170-209`).
-/// An image here belongs to this thread, so the thread carries the conductor's
-/// deadline rather than running the pair on every pass.
-///
-/// What the gate changes is *when* a transition is noticed, and by a bounded
-/// amount: both machines decide by `now_ns > stamp + timeout_ns`, so a
-/// transition that would have been seen within one pass is seen within one
-/// interval instead — which is the latency the reference has.
-#[derive(Debug)]
-struct Timer {
-    interval_ns: i64,
-    deadline_ns: i64,
-}
-
-impl Timer {
-    /// Seeded to `now_ns`, so the first pass runs it: that pass reads a later
-    /// clock than this constructor did, and the comparison is strict. The
-    /// conductor seeds its own deadline to `now_ns` for the same reason and
-    /// says so (`conductor.rs`'s `timeout_check_deadline_ns`).
-    const fn new(interval_ns: i64, now_ns: i64) -> Self {
-        Self {
-            interval_ns,
-            deadline_ns: now_ns,
-        }
-    }
-
-    const fn is_due(&self, now_ns: i64) -> bool {
-        now_ns > self.deadline_ns
-    }
-
-    /// The run happened: the next one is one interval out. Saturating, because
-    /// the clock is a raw nanosecond count and a deadline past its end would
-    /// otherwise wrap to the distant past and fire every pass.
-    fn ran(&mut self, now_ns: i64) {
-        self.deadline_ns = now_ns.saturating_add(self.interval_ns);
-    }
-}
-
 pub(crate) struct ReceiverThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
@@ -2190,54 +2144,6 @@ mod tests {
         assert!(
             !ttl_asymmetry(9, &unicast),
             "a unicast channel has no TTL to compare against"
-        );
-    }
-
-    /// The image's own maintenance is due on the tick and not before, which is
-    /// what keeps the pair off the per-pass path.
-    #[test]
-    fn the_image_maintenance_timer_is_due_once_an_interval() {
-        const INTERVAL: i64 = 1_000_000_000;
-
-        let mut timer = Timer::new(INTERVAL, 5_000);
-
-        // Seeded to the constructing instant, and strictly compared: the first
-        // pass reads a later clock than the constructor did, and that is what
-        // makes it the pass that runs.
-        assert!(!timer.is_due(5_000), "not due at the instant it was seeded");
-        assert!(timer.is_due(5_001), "due as soon as the clock moves");
-
-        timer.ran(5_001);
-        assert_eq!(
-            1_000_005_001, timer.deadline_ns,
-            "one interval out from now"
-        );
-
-        // The boundary is exclusive, matching `now_ns > deadline` in the
-        // conductor's own gate (`conductor.rs`'s `timeout_check_deadline_ns`).
-        assert!(
-            !timer.is_due(1_000_005_001),
-            "not due at the deadline itself"
-        );
-        assert!(timer.is_due(1_000_005_002), "due one nanosecond past it");
-        assert!(
-            !timer.is_due(999_999_999),
-            "and not again inside the interval"
-        );
-    }
-
-    /// A deadline past the end of the clock saturates rather than wrapping —
-    /// a wrap would put the deadline in the distant past and fire every pass,
-    /// which is the cost this gate exists to remove.
-    #[test]
-    fn the_image_maintenance_timer_does_not_wrap() {
-        let mut timer = Timer::new(i64::MAX, 0);
-        timer.ran(i64::MAX);
-
-        assert_eq!(i64::MAX, timer.deadline_ns);
-        assert!(
-            !timer.is_due(i64::MAX),
-            "a saturated deadline is never due again"
         );
     }
 

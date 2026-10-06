@@ -178,6 +178,112 @@ pub(crate) fn default_strategy() -> Strategy {
     Strategy::Backoff(crate::idle::Backoff::new())
 }
 
+/// A deadline that comes due once per interval.
+///
+/// Some of what the data-plane threads do, the reference does on the conductor
+/// and **once per `timer_interval_ns`** rather than once per pass — its
+/// `aeron_driver_conductor_on_check_managed_resources` is gated that way
+/// (`aeron_driver_conductor.c:3377-3384`), and two lists hang off it:
+///
+/// - the images (`:1705-1706`), where `aeron_publication_image_on_time_event`
+///   (`:1294`) runs and calls `check_untethered_subscriptions` (`:1311`) from
+///   its `ACTIVE` arm — neither of which the receiver's own loop does
+///   (`aeron_driver_receiver.c:170-209`);
+/// - the network publications (`aeron_driver_conductor.c:766`), where
+///   `aeron_network_publication_check_managed_resources` (`:1287`) reaches
+///   `check_for_blocked_publisher` — which the sender's own loop runs every
+///   pass (`sender.rs`).
+///
+/// Those records belong to the thread that owns them here, so the thread
+/// carries the conductor's deadline instead of the work moving.
+///
+/// What the gate changes is *when* a transition is noticed, and by a bounded
+/// amount: these machines decide by `now_ns > stamp + timeout_ns`, so a
+/// transition that would have been seen within one pass is seen within one
+/// interval instead — which is the latency the reference has.
+#[derive(Debug)]
+pub(crate) struct Timer {
+    interval_ns: i64,
+    deadline_ns: i64,
+}
+
+impl Timer {
+    /// Seeded to `now_ns`, so the first pass runs it: that pass reads a later
+    /// clock than this constructor did, and the comparison is strict. The
+    /// conductor seeds its own deadline to `now_ns` for the same reason and
+    /// says so (`conductor.rs`'s `timeout_check_deadline_ns`).
+    pub(crate) const fn new(interval_ns: i64, now_ns: i64) -> Self {
+        Self {
+            interval_ns,
+            deadline_ns: now_ns,
+        }
+    }
+
+    pub(crate) const fn is_due(&self, now_ns: i64) -> bool {
+        now_ns > self.deadline_ns
+    }
+
+    /// The run happened: the next one is one interval out. Saturating, because
+    /// the clock is a raw nanosecond count and a deadline past its end would
+    /// otherwise wrap to the distant past and fire every pass.
+    pub(crate) fn ran(&mut self, now_ns: i64) {
+        self.deadline_ns = now_ns.saturating_add(self.interval_ns);
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::Timer;
+
+    /// The maintenance these gate is due on the tick and not before, which is
+    /// what keeps it off the per-pass path.
+    #[test]
+    fn the_timer_is_due_once_an_interval() {
+        const INTERVAL: i64 = 1_000_000_000;
+
+        let mut timer = Timer::new(INTERVAL, 5_000);
+
+        // Seeded to the constructing instant, and strictly compared: the first
+        // pass reads a later clock than the constructor did, and that is what
+        // makes it the pass that runs.
+        assert!(!timer.is_due(5_000), "not due at the instant it was seeded");
+        assert!(timer.is_due(5_001), "due as soon as the clock moves");
+
+        timer.ran(5_001);
+        assert_eq!(
+            1_000_005_001, timer.deadline_ns,
+            "one interval out from now"
+        );
+
+        // The boundary is exclusive, matching `now_ns > deadline` in the
+        // conductor's own gate (`conductor.rs`'s `timeout_check_deadline_ns`).
+        assert!(
+            !timer.is_due(1_000_005_001),
+            "not due at the deadline itself"
+        );
+        assert!(timer.is_due(1_000_005_002), "due one nanosecond past it");
+        assert!(
+            !timer.is_due(999_999_999),
+            "and not again inside the interval"
+        );
+    }
+
+    /// A deadline past the end of the clock saturates rather than wrapping —
+    /// a wrap would put the deadline in the distant past and fire every pass,
+    /// which is the cost this gate exists to remove.
+    #[test]
+    fn the_timer_does_not_wrap() {
+        let mut timer = Timer::new(i64::MAX, 0);
+        timer.ran(i64::MAX);
+
+        assert_eq!(i64::MAX, timer.deadline_ns);
+        assert!(
+            !timer.is_due(i64::MAX),
+            "a saturated deadline is never due again"
+        );
+    }
+}
+
 /// The three agents the conductor does not run itself, before a runner takes
 /// them.
 ///
