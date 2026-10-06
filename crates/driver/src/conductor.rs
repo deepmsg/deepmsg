@@ -6008,7 +6008,7 @@ mod tests {
         let mut frame = [0u8; SetupFrame::LENGTH];
         assert!(setup.write_with_flags(&mut frame, 0).is_some());
 
-        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         publisher
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -8355,7 +8355,7 @@ mod tests {
     /// first is whatever it said before it was rejected; the frame is picked
     /// out by type rather than by being the next datagram.
     fn await_error_frame(
-        socket: &crate::sys::socket::DatagramSocket,
+        socket: &mut crate::sys::socket::DatagramSocket,
         within: std::time::Duration,
     ) -> Option<Vec<u8>> {
         use crate::protocol::{FrameHeader, frame_type};
@@ -8409,7 +8409,7 @@ mod tests {
         let (cnc, mut receiver) = events_reader(&temp.0);
         let mut pending = Vec::new();
 
-        let socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut socket = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         socket
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -8435,7 +8435,7 @@ mod tests {
 
         while std::time::Instant::now() < deadline && driver_address.is_none() {
             conductor.do_work();
-            driver_address = next_datagram(&socket).map(|(_, source)| source);
+            driver_address = next_datagram(&mut socket).map(|(_, source)| source);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
@@ -8454,7 +8454,7 @@ mod tests {
 
     /// Read this test's own socket once, with where the datagram came from.
     fn next_datagram(
-        socket: &crate::sys::socket::DatagramSocket,
+        socket: &mut crate::sys::socket::DatagramSocket,
     ) -> Option<(Vec<u8>, std::net::SocketAddr)> {
         use crate::sys::socket::Datagrams;
 
@@ -8644,7 +8644,7 @@ mod tests {
         let mut frame = [0u8; SetupFrame::LENGTH];
         assert!(setup.write_with_flags(&mut frame, 0).is_some());
 
-        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         publisher
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -8705,7 +8705,7 @@ mod tests {
 
         // And the publisher is told — on the wire, by the receiver, which is the
         // only half of this that a client on the other end can see.
-        let frame = await_error_frame(&publisher, std::time::Duration::from_secs(5))
+        let frame = await_error_frame(&mut publisher, std::time::Duration::from_secs(5))
             .expect("an ERR frame reaches the publisher");
         let error = crate::protocol::ErrorFrame::read(&frame).expect("an ERR frame");
 

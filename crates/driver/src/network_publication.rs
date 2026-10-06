@@ -2401,7 +2401,7 @@ mod tests {
             .load_i32_acquire(descriptor::IS_CONNECTED_OFFSET)
     }
 
-    fn receive(listener: &DatagramSocket, buffers: &mut [Vec<u8>]) -> Vec<Vec<u8>> {
+    fn receive(listener: &mut DatagramSocket, buffers: &mut [Vec<u8>]) -> Vec<Vec<u8>> {
         let mut datagrams = Datagrams::new();
         let received = match listener.receive_batch(buffers, &mut datagrams) {
             Ok(received) => received,
@@ -2563,7 +2563,7 @@ mod tests {
             .expect("a send");
 
         let mut buffers = vec![vec![0u8; 2048]];
-        let first = receive(&fixture.listener, &mut buffers);
+        let first = receive(&mut fixture.listener, &mut buffers);
         assert_eq!(1, first.len());
         assert_eq!(first[0].len(), sent, "the bytes that went out");
 
@@ -2588,7 +2588,7 @@ mod tests {
 
         // And the frame is on the wire again, byte for byte.
         let mut buffers = vec![vec![0u8; 2048]];
-        let resent = receive(&fixture.listener, &mut buffers);
+        let resent = receive(&mut fixture.listener, &mut buffers);
         assert_eq!(1, resent.len(), "the retransmission arrived");
         assert_eq!(first[0], resent[0], "the same bytes, not new ones");
 
@@ -2649,7 +2649,7 @@ mod tests {
 
         let mut buffers = vec![vec![0u8; 2048]];
         assert!(
-            receive(&fixture.listener, &mut buffers).is_empty(),
+            receive(&mut fixture.listener, &mut buffers).is_empty(),
             "nothing is sent for a frame the term has moved past"
         );
     }
@@ -2710,7 +2710,7 @@ mod tests {
             .expect("a send");
 
         let mut buffers = vec![vec![0u8; MTU as usize + 64]];
-        let datagrams = receive(&fixture.listener, &mut buffers);
+        let datagrams = receive(&mut fixture.listener, &mut buffers);
         assert_eq!(1, datagrams.len(), "one datagram");
         assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 
@@ -2778,7 +2778,7 @@ mod tests {
         );
 
         let mut buffers = vec![vec![0u8; MTU as usize]];
-        assert!(receive(&fixture.listener, &mut buffers).is_empty());
+        assert!(receive(&mut fixture.listener, &mut buffers).is_empty());
     }
 
     #[test]
@@ -3077,7 +3077,7 @@ mod tests {
             .expect("a send");
 
         let mut buffers = vec![vec![0u8; MTU as usize]];
-        let datagrams = receive(&fixture.listener, &mut buffers);
+        let datagrams = receive(&mut fixture.listener, &mut buffers);
         assert_eq!(1, datagrams.len(), "one datagram");
         assert_eq!(datagrams[0].len(), sent, "and the bytes it measured");
 

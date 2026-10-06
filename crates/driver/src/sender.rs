@@ -2135,7 +2135,7 @@ mod tests {
 
         let cnc = Arc::new(cnc);
 
-        let listener = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        let mut listener = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
         listener
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");

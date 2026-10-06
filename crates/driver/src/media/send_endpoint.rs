@@ -1219,8 +1219,9 @@ mod tests {
         // The endpoint is bound to the channel's local control address — the
         // wildcard, so the kernel picks — and sends to the endpoint
         // parameter. A plain socket bound to that address is the other end.
-        let listener = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
-            .expect("a socket");
+        let mut listener =
+            crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+                .expect("a socket");
         listener
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
@@ -1268,7 +1269,7 @@ mod tests {
     #[test]
     fn an_endpoint_that_is_not_connected_can_send_somewhere_else() {
         let named = bound_listener().local_address().expect("a bound address");
-        let elsewhere = bound_listener();
+        let mut elsewhere = bound_listener();
         let elsewhere_address = elsewhere.local_address().expect("a bound address");
 
         let mut fixture = Fixture::new();
@@ -1316,9 +1317,9 @@ mod tests {
     /// the packets can go.
     #[test]
     fn a_connected_endpoint_sends_only_where_its_channel_points() {
-        let named = bound_listener();
+        let mut named = bound_listener();
         let named_address = named.local_address().expect("a bound address");
-        let elsewhere = bound_listener();
+        let mut elsewhere = bound_listener();
         let elsewhere_address = elsewhere.local_address().expect("a bound address");
 
         let mut fixture = Fixture::new();
@@ -1377,8 +1378,9 @@ mod tests {
         // advances `snd-pos` past it and never sends it again — and the
         // datagram that is missing on the far side is what a NAK comes back
         // for.
-        let listener = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
-            .expect("a socket");
+        let mut listener =
+            crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
+                .expect("a socket");
         listener
             .bind("127.0.0.1:0".parse().expect("an address"))
             .expect("a bind");
