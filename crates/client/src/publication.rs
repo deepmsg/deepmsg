@@ -28,6 +28,7 @@ use std::path::Path;
 use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
 use deepmsg_core::logbuffer::append::{Appended, Appender};
 use deepmsg_core::logbuffer::frame::Frame;
+use deepmsg_core::logbuffer::position::Position;
 use deepmsg_core::logbuffer::{descriptor, position};
 
 use crate::log_buffer::LogBuffer;
@@ -40,6 +41,15 @@ pub struct Publication {
     position_limit_counter_id: i32,
     channel_status_indicator_id: i32,
     log: LogBuffer,
+    /// Set by [`Publication::revoke_on_close`], read by the removal that gives
+    /// this publication back.
+    ///
+    /// It is the whole difference between the two endings the reference offers:
+    /// a quiet close, and one that tells every reader the stream is over
+    /// (`ExclusivePublication.revokeOnClose`,
+    /// `ExclusivePublication.java:155-158`, and the flag its conductor reads on
+    /// the way out at `ClientConductor.java:700-713`).
+    revoke_on_close: bool,
 }
 
 impl Publication {
@@ -65,6 +75,7 @@ impl Publication {
             position_limit_counter_id,
             channel_status_indicator_id,
             log: LogBuffer::open(path, true)?,
+            revoke_on_close: false,
         })
     }
 
@@ -205,6 +216,69 @@ impl Publication {
             .map(|appender| appender.max_payload_length())
     }
 
+    /// Where this producer has got to in the stream
+    /// (`Publication.position`, `Publication.java:367-378`).
+    ///
+    /// Read from the **active term's raw tail** every time rather than kept,
+    /// which is what the reference does and the reason it matters here: a
+    /// publication with more than one producer can be moved by another of them
+    /// between two calls, so a position this one remembered would be a number
+    /// it could not sign for. `None` for a log whose metadata cannot be read.
+    ///
+    /// [`Publication::offer`] hands back the same number after writing a frame,
+    /// which is cheaper for a caller that has just written one; this is for a
+    /// caller that has not.
+    pub fn position(&self) -> Option<i64> {
+        let tail = self.appender()?.current_tail()?;
+        let geometry = self.log.geometry();
+
+        Some(
+            Position::new(
+                tail.term_id(),
+                tail.term_offset(geometry.term_length),
+                geometry.bits_to_shift,
+                geometry.initial_term_id,
+            )
+            .raw(),
+        )
+    }
+
+    /// How much room is left before this publication is back-pressured
+    /// (`Publication.availableWindow`, `Publication.java:409-413`;
+    /// `ConcurrentPublication.java:73-80`).
+    ///
+    /// The limit is passed in for the reason [`Publication::offer`] gives: the
+    /// counter lives in the CnC file, which this type does not own. What comes
+    /// back is `limit - position` — positive while there is room — and the
+    /// reference's `CLOSED` (-1) for a closed publication is [`None`] here,
+    /// because a publication this client has given back is one
+    /// [`crate::Client::available_window`] cannot find.
+    ///
+    /// A positive answer is a **guide**, as the reference calls it: the limit
+    /// moves under the caller, so an offer made on the strength of it can still
+    /// come back `BackPressured`.
+    pub fn available_window(&self, position_limit: i64) -> Option<i64> {
+        Some(position_limit - self.position()?)
+    }
+
+    /// Mark this publication to be revoked when it is given back
+    /// (`ExclusivePublication.revokeOnClose`, `ExclusivePublication.java:155-158`).
+    ///
+    /// Giving it back is [`crate::Client::remove_publication`] here, which is
+    /// this crate's close: the reference's `close()` and this build's removal
+    /// are the same event, and neither sends the revoke until it happens. So a
+    /// caller that knows it wants a loud ending can say so now and close later,
+    /// which is what the archive does (`ControlSession.java:168-169` marks it
+    /// and closes on the next line).
+    pub const fn revoke_on_close(&mut self) {
+        self.revoke_on_close = true;
+    }
+
+    /// Whether it has been marked.
+    pub const fn is_revoke_on_close(&self) -> bool {
+        self.revoke_on_close
+    }
+
     /// A fresh appender over the current term.
     ///
     /// Built per offer rather than held: an `Appender` borrows the mapping, so
@@ -235,6 +309,7 @@ impl std::fmt::Debug for Publication {
             .field("session_id", &self.session_id)
             .field("stream_id", &self.stream_id)
             .field("position_limit_counter_id", &self.position_limit_counter_id)
+            .field("revoke_on_close", &self.revoke_on_close)
             .field("log", &self.log)
             .finish()
     }
@@ -273,6 +348,10 @@ pub struct ExclusivePublication {
     /// concession to sharing.
     term_id: std::cell::Cell<i32>,
     term_offset: std::cell::Cell<i32>,
+    /// As [`Publication::revoke_on_close`], which is the whole of what the two
+    /// kinds share about endings: the flag is not a property of having one
+    /// producer.
+    revoke_on_close: bool,
 }
 
 impl ExclusivePublication {
@@ -300,6 +379,7 @@ impl ExclusivePublication {
             log: LogBuffer::open(path, true)?,
             term_id: std::cell::Cell::new(0),
             term_offset: std::cell::Cell::new(0),
+            revoke_on_close: false,
         };
 
         publication.seed_from_log();
@@ -385,6 +465,49 @@ impl ExclusivePublication {
     pub fn max_payload_length(&self) -> Option<usize> {
         self.appender()
             .map(|appender| appender.max_payload_length())
+    }
+
+    /// Where this producer has got to in the stream
+    /// (`ExclusivePublication.position`, `ExclusivePublication.java:437-445`).
+    ///
+    /// The pair this publication keeps, rather than the log's tail — which is
+    /// the one place the two kinds of publication answer this question
+    /// differently, and for the reason they are different types: an exclusive
+    /// publication is the only writer of its log, so what it remembers cannot
+    /// have been moved by anybody else. `Some` always, then; the [`Option`] is
+    /// the shape every publication shares.
+    pub fn position(&self) -> Option<i64> {
+        let geometry = self.log.geometry();
+
+        Some(
+            Position::new(
+                self.term_id.get(),
+                self.term_offset.get(),
+                geometry.bits_to_shift,
+                geometry.initial_term_id,
+            )
+            .raw(),
+        )
+    }
+
+    /// How much room is left before this publication is back-pressured
+    /// (`ExclusivePublication.availableWindow`, `ExclusivePublication.java:195-203`).
+    ///
+    /// As [`Publication::available_window`]: the limit comes in from the CnC
+    /// file and the answer is `limit - position`.
+    pub fn available_window(&self, position_limit: i64) -> Option<i64> {
+        Some(position_limit - self.position()?)
+    }
+
+    /// Mark this publication to be revoked when it is given back. See
+    /// [`Publication::revoke_on_close`], which is the same flag.
+    pub const fn revoke_on_close(&mut self) {
+        self.revoke_on_close = true;
+    }
+
+    /// Whether it has been marked.
+    pub const fn is_revoke_on_close(&self) -> bool {
+        self.revoke_on_close
     }
 
     /// Append `payload` as one frame, if `position_limit` allows it.

@@ -1284,12 +1284,7 @@ impl Client {
         payload: &[u8],
     ) -> Option<deepmsg_core::logbuffer::append::Appended> {
         let publication = self.exclusive_publication(registration_id)?;
-
-        let limit = self
-            .cnc
-            .counters()
-            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
-            .unwrap_or(0);
+        let limit = self.position_limit(publication.position_limit_counter_id());
 
         Some(publication.offer(limit, payload))
     }
@@ -1711,12 +1706,26 @@ impl Client {
     /// Shared so that the synchronous and the asynchronous removal cannot
     /// disagree about what a removal *is* — the flags, the encoding, the type
     /// id, and the deadline the answer has to arrive by.
+    ///
+    /// The revoke flag a publication was **marked** with is added here rather
+    /// than by each caller, which is what makes every way of giving one back
+    /// honour it: the synchronous removal, the asynchronous one, and the
+    /// revoke-that-is-also-a-removal that arrives with the flag already set.
+    /// The reference reads the same flag in the same place
+    /// (`ClientConductor.java:700-713`, on its one removal path).
     fn send_remove_publication(
         &mut self,
         registration_id: i64,
         flags: i64,
         timeout: Duration,
     ) -> Result<i64, CommandError> {
+        let flags = flags
+            | if self.is_marked_for_revocation(registration_id) {
+                deepmsg_cnc::command::REMOVE_PUBLICATION_FLAG_REVOKE
+            } else {
+                0
+            };
+
         let correlation_id = self.next_correlation_id()?;
 
         let command = deepmsg_cnc::command::RemovePublication {
@@ -1741,6 +1750,62 @@ impl Client {
         )?;
 
         Ok(correlation_id)
+    }
+
+    /// Mark a publication to be revoked when it is given back, whichever way it
+    /// is given back (`ExclusivePublication.revokeOnClose`,
+    /// `ExclusivePublication.java:155-158`).
+    ///
+    /// The entry point is here rather than on the publication because the flag
+    /// is read by a removal, and removals are commands — this client's, not a
+    /// handle's. Returns whether there was such a publication to mark, which is
+    /// what the reference's own caller would have found out by dereferencing a
+    /// null.
+    ///
+    /// A publication marked this way and then removed is exactly
+    /// [`Client::revoke_publication`]: the readers' images are revoked rather
+    /// than drained. What it buys over calling that is the **timing** — the
+    /// reference marks a publication on the way into a close it has not decided
+    /// about yet (`ControlSession.java:168-169`), and the mark is what makes the
+    /// close loud when it comes.
+    pub fn revoke_publication_on_close(&mut self, registration_id: i64) -> bool {
+        if let Some(publication) = self
+            .publications
+            .iter_mut()
+            .find(|publication| publication.registration_id() == registration_id)
+        {
+            publication.revoke_on_close();
+
+            return true;
+        }
+
+        let Some(publication) = self
+            .exclusive_publications
+            .iter_mut()
+            .find(|publication| publication.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        publication.revoke_on_close();
+
+        true
+    }
+
+    /// Whether the publication under this registration id is marked for
+    /// revocation. Either list, as a removal searches them.
+    fn is_marked_for_revocation(&self, registration_id: i64) -> bool {
+        self.publications
+            .iter()
+            .find(|publication| publication.registration_id() == registration_id)
+            .map(Publication::is_revoke_on_close)
+            .or_else(|| {
+                self.exclusive_publications
+                    .iter()
+                    .find(|publication| publication.registration_id() == registration_id)
+                    .map(ExclusivePublication::is_revoke_on_close)
+            })
+            .unwrap_or(false)
     }
 
     /// Send a publication back without waiting for the driver's answer.
@@ -2131,16 +2196,51 @@ impl Client {
         payload: &[u8],
     ) -> Option<deepmsg_core::logbuffer::append::Appended> {
         let publication = self.publication(registration_id)?;
-
-        // The limit counter is in the CnC file; the log buffer is the
-        // publication's own mapping. Disjoint, so both borrows are shared.
-        let limit = self
-            .cnc
-            .counters()
-            .and_then(|counters| counters.value(publication.position_limit_counter_id()))
-            .unwrap_or(0);
+        let limit = self.position_limit(publication.position_limit_counter_id());
 
         Some(publication.offer(limit, payload))
+    }
+
+    /// How much room is left before this publication is back-pressured
+    /// (`Publication.availableWindow`, `Publication.java:409-413`).
+    ///
+    /// Either list, because the driver keys a publication by registration id
+    /// and the reference's `availableWindow` is on the type both kinds have in
+    /// common. `None` when this client holds no such publication, which is
+    /// where the reference's `CLOSED` (-1) lands.
+    ///
+    /// The limit is read from the driver's counter here, as [`Client::offer`]
+    /// reads it — the same warning applies: the answer is a **guide**, because
+    /// the limit moves and the offer comes later.
+    pub fn available_window(&self, registration_id: i64) -> Option<i64> {
+        if let Some(publication) = self.publication(registration_id) {
+            let limit = self.position_limit(publication.position_limit_counter_id());
+
+            return publication.available_window(limit);
+        }
+
+        let publication = self.exclusive_publication(registration_id)?;
+        let limit = self.position_limit(publication.position_limit_counter_id());
+
+        publication.available_window(limit)
+    }
+
+    /// The window limit the driver maintains for a publication, from its
+    /// counter.
+    ///
+    /// Read per call rather than cached, for the reason [`Client::offer`]
+    /// gives: that counter is the only thing standing between a producer and
+    /// overwriting data a subscriber has not read, and caching it is how a
+    /// producer silently outruns its consumer. A missing region or counter
+    /// answers zero, which is "no room" — the answer that stops a producer
+    /// rather than one that lets it run.
+    fn position_limit(&self, counter_id: i32) -> i64 {
+        // The limit counter is in the CnC file; the log buffer is the
+        // publication's own mapping. Disjoint, so both borrows are shared.
+        self.cnc
+            .counters()
+            .and_then(|counters| counters.value(counter_id))
+            .unwrap_or(0)
     }
 
     /// Claim `length` bytes of a **shared** publication, to write into.
