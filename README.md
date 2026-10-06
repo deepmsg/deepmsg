@@ -76,8 +76,9 @@ Principles:
    throughout. Each use is an exception that names what it buys — never the
    default, and never a substitute for a Rust implementation that would do.
 3. **Unsafe has an address.** Raw memory and syscall access lives only in
-   `deepmsg-core::pal`, `deepmsg-core::buffer`, `deepmsg-cnc`, and the
-   driver's syscall shim (ADR-0002); every other crate forbids it outright.
+   ADR-0002's five named zones — `deepmsg-core::pal`, `deepmsg-core::buffer`,
+   `deepmsg-cnc`, the driver's syscall shim, and the archive shim — and each
+   zone is a module a reviewer reads; every other crate forbids it outright.
 
 ## Layout
 
