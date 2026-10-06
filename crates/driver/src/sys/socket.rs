@@ -714,7 +714,16 @@ impl DatagramSocket {
         // The one thing the caller may change between calls: where each message
         // is to be written. The headers that carry the pointers to these
         // iovecs were built once, in `RecvMessages::new`, and are not touched.
-        for (index, buffer) in buffers.iter_mut().take(count).enumerate() {
+        //
+        // Nothing to do for the single-message path: `recvfrom` takes the
+        // buffer itself, and the whole point of it is that there is no `iovec`
+        // to build. See the branch below.
+        for (index, buffer) in buffers
+            .iter_mut()
+            .take(count)
+            .enumerate()
+            .skip(usize::from(count == 1))
+        {
             // SAFETY: `RecvMessages::new` set this entry's `msg_iov` to the
             // `io_vectors` entry of the same index, in the same allocation, and
             // nothing has written it since — so the pointer is live, and this
@@ -738,25 +747,53 @@ impl DatagramSocket {
         // `RecvMessages::new`; each points at that allocation's own `names`
         // entry, which is a whole `sockaddr_storage`, and at a buffer the
         // caller lent for the duration of the call.
-        // Which of the two syscalls this is, is what `vlen` decides — the
-        // reference's own branch (`media/aeron_udp_channel_transport.c:551-554`:
-        // `if (vlen > 1)` is what selects `recvmmsg`, and one message falls
-        // through to `aeron_udp_channel_transport_recvmsg`). The two differ in
-        // how the length comes back: `recvmmsg` writes it into the messages it
-        // was given, `recvmsg` returns it, so the one result is put where the
-        // loop below reads it.
+        // One message is `recvfrom`; more than one is `recvmmsg`.
+        //
+        // `recvfrom` is what the **Java** driver's data path lands on — its
+        // `DataTransportPoller` reads one datagram per transport per poll into
+        // a preallocated buffer (`media/DataTransportPoller.java:222-225`,
+        // `media/UdpChannelTransport.java:450-471`), and the JDK maps
+        // `DatagramChannel.receive` to it — and it is the cheapest of the
+        // three by a wide margin on an empty queue, which is what 98.5% of
+        // this driver's polls are: measured on one socket, 889 instructions per
+        // empty call against 1,366 for `recvmsg` and 1,463 for a sixteen-wide
+        // `recvmmsg` (`b1-out/pollcost/`, and
+        // `doc/deepmsg-driver-perf-map.md` §5.4). The reason is that it takes
+        // the buffer and the address directly and there is no `msghdr` — with
+        // its `msg_iov` array and its `msg_control` region — to marshal in and
+        // out of the kernel.
+        //
+        // The two differ in how the length comes back: `recvmmsg` writes it
+        // into the messages it was given, `recvfrom` returns it, so the one
+        // result is put where the loop below reads it — and its address length
+        // likewise, because that loop reads `msg_namelen` for the source.
+        //
+        // SAFETY: `recvfrom` writes at most `length` bytes into the caller's
+        // buffer, which it was handed with that length and which lives as long
+        // as this call; the address goes into this socket's own `names[0]`, a
+        // whole `sockaddr_storage`, with `namelen` saying how much of it is
+        // meaningful. Every one of the first `count` messages on the other
+        // branch was built by `RecvMessages::new`, points at that allocation's
+        // own `names` entry, and at a buffer the caller lent for the duration.
         let received = unsafe {
             if count == 1 {
-                let length = libc::recvmsg(
+                let buffer = &mut buffers[0];
+                let mut namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+                let length = libc::recvfrom(
                     self.fd,
-                    std::ptr::from_mut(&mut receive.messages[0].msg_hdr),
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
                     0,
+                    std::ptr::from_mut(&mut receive.names[0]).cast::<libc::sockaddr>(),
+                    &mut namelen,
                 );
 
                 if length < 0 {
                     -1
                 } else {
                     receive.messages[0].msg_len = u32::try_from(length).unwrap_or(u32::MAX);
+                    receive.messages[0].msg_hdr.msg_namelen = namelen;
                     1
                 }
             } else {
@@ -1216,6 +1253,16 @@ mod tests {
                 expected,
                 &buffers[0][..datagrams.as_slice()[0].length],
                 "and they come out in the order they went in"
+            );
+            // The source is what `recvfrom` writes its address length back
+            // for, and the only thing this path does not share with the
+            // `recvmmsg` branch — so it is the thing worth pinning.
+            assert_eq!(
+                Some(local),
+                datagrams.as_slice()[0]
+                    .source
+                    .map(|source| SocketAddr::new(source.ip(), local.port())),
+                "and the address is the one they came from"
             );
         }
 

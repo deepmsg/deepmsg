@@ -48,14 +48,21 @@ use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
 
 /// How many datagrams a receiver with no `aeron.receiver.io.vector.capacity`
-/// of its own keeps and reads per poll.
+/// of its own keeps.
 ///
-/// The configured value is this by default and is what the poll passes as the
-/// `vlen` of its `recvmmsg` (`aeron_driver_receiver.c:127` reads
+/// The configured value is this by default. In the **C** driver that value is
+/// also the `vlen` its poll reads with (`aeron_driver_receiver.c:127` reads
 /// `recv_buffers.vector_capacity`, set from `receiver_io_vector_capacity` at
-/// `:47`). The reference's ceiling for it is
-/// `AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX` (`aeron_driver_context.h:59`).
+/// `:47`); in the **Java** driver it is read nowhere at all and the poll takes
+/// one datagram per transport (`media/DataTransportPoller.java:222-225`). This
+/// build keeps the pool the size the setting asks for and reads one, which is
+/// Java's cadence over C's allocation.
 pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT;
+
+/// How many datagrams one receive poll takes from one destination, which is
+/// one — the Java driver's shape. See the call site for why a burst is not
+/// paced by it.
+const DATAGRAMS_PER_POLL: usize = 1;
 
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
@@ -1320,7 +1327,19 @@ impl ReceiverThread {
         let mut work = Self::receive_datagrams(
             &mut self.endpoints,
             &mut self.images,
-            &mut self.buffers,
+            // One datagram per destination per pass, which is the reference's
+            // **Java** shape: its poller reads each transport once into a
+            // preallocated buffer (`media/DataTransportPoller.java:222-225`),
+            // where the C driver reads `recv_buffers.vector_capacity` at a
+            // time (`aeron_driver_receiver.c:127`). The pool below is still
+            // sized by `aeron.receiver.io.vector.capacity`, as both references
+            // size theirs; only the first entry is ever filled.
+            //
+            // What keeps a burst from being paced by this is that a pass reads
+            // *every* ready destination, so the drain rate is the pass rate
+            // times the destination count — 676,000 a second at 501K against
+            // the 500,000 arriving.
+            &mut self.buffers[..DATAGRAMS_PER_POLL],
             &mut self.datagrams,
             &mut self.poller,
             &mut self.readable,
