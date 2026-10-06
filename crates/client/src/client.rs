@@ -435,6 +435,17 @@ pub enum RemovePoll {
     Unknown,
 }
 
+/// One thing to run when a client closes, and the id it was registered under.
+///
+/// The reference's are a `Runnable` in a map keyed by registration id (Java) or
+/// an `{handler, clientd}` pair in an array (C,
+/// `aeron_on_close_client_pair_t`); this is the pair, and the id is what the
+/// caller is given back to remove it by.
+struct CloseHandler {
+    registration_id: i64,
+    handler: Box<dyn FnMut() + Send>,
+}
+
 /// A pending command, waiting for the response that completes it.
 struct Pending {
     correlation_id: i64,
@@ -483,6 +494,30 @@ pub struct Client {
     /// which is during the first command, so it may not exist yet.
     heartbeat_counter: Option<i32>,
     unknown_responses: u64,
+    /// What to run when this client closes, in the order they were added.
+    ///
+    /// Not a queue a poll drains, which is how this crate carries the other two
+    /// callback families ([`CounterEvent`] and
+    /// [`ImageEvent`](crate::image_event::ImageEvent)) — and the difference is
+    /// the whole reason this one is here rather than there. Those carry news
+    /// **from the driver**, and a poll-driven client has no thread to hand it
+    /// to, so the news waits for a poll. A close handler is the client's own
+    /// lifecycle and the driver has no part in it: Java's `addCloseHandler`
+    /// takes a `Runnable` and its conductor runs it from its own close path
+    /// (`ClientConductor.java:184` → `:2063-2077`), and C's runs them from
+    /// `aeron_client_conductor_on_close` (`aeron_client_conductor.c:2749-2751`).
+    /// A queue would be exactly wrong here, because when a client closes there
+    /// is nobody left to poll it.
+    ///
+    /// `Send` on the boxed closure so that a `Client`, which is `Send`, stays
+    /// that way: the reference draws no such distinction, and this is Rust's.
+    close_handlers: Vec<CloseHandler>,
+    /// How many close handlers have panicked.
+    ///
+    /// ADR-0003's rule, which is what this crate does with an input it cannot
+    /// act on: count it rather than swallow it. There is nowhere else to report
+    /// a panic from a destructor.
+    close_handler_panics: u64,
     /// Images that arrived for a subscription this client did not have yet.
     orphan_images: u64,
     /// Set once when this client discovers the driver is gone, and never
@@ -563,6 +598,8 @@ impl Client {
             image_events: Vec::new(),
             heartbeat_counter: None,
             unknown_responses: 0,
+            close_handlers: Vec::new(),
+            close_handler_panics: 0,
             orphan_images: 0,
             terminated: None,
             closed: false,
@@ -649,6 +686,15 @@ impl Client {
     /// by [`Drop`] — a caller that wants the driver told before the client goes
     /// out of scope, or wants to be sure the command reached the ring, calls
     /// this itself; a destructor can report nothing.
+    ///
+    /// The close handlers run first, before the driver is told. Both references
+    /// order it that way and for the same reason — a handler is a caller's last
+    /// chance to do something that wants the client still there, and what it
+    /// cannot have is a client the driver has already forgotten: Java runs
+    /// `notifyCloseHandlers()` and sends `clientClose` afterwards
+    /// (`ClientConductor.java:184` against `:203`), and C notifies at the top
+    /// of `aeron_client_conductor_on_close` and claims the command at the
+    /// bottom of it (`aeron_client_conductor.c:2749-2751` against `:2779`).
     pub fn close(&mut self) {
         if self.closed {
             return;
@@ -656,12 +702,79 @@ impl Client {
 
         self.closed = true;
 
+        self.notify_close_handlers();
+
         // Best effort, and deliberately: a driver that has already gone is the
         // ordinary reason this fails, and that is the state the caller was
         // trying to reach anyway. The reference swallows it too —
         // `DriverProxy.clientClose` does nothing at all when its claim fails
         // (`aeron-client/src/main/java/io/aeron/DriverProxy.java:463-465`).
         let _ = self.write_command(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
+    }
+
+    /// Register something to run when this client closes
+    /// (`Aeron.addCloseHandler`, `Aeron.java:661-664`).
+    ///
+    /// Returns the registration id [`Client::remove_close_handler`] takes back.
+    /// It is drawn from the same counter a command's correlation id comes from,
+    /// which is what the reference does (`ClientConductor.java:1551`,
+    /// `aeron.nextCorrelationId()`) — so an id that names a close handler can
+    /// never be one that names a command, and a caller holding both cannot
+    /// confuse them.
+    ///
+    /// A handler added to a client that has **already** closed is never run:
+    /// there is no close left for it to hear about. The reference throws there
+    /// (`ensureActive`, `:1548`); this one can only say so, because the id it
+    /// would have to fail to produce is drawn from a file that is closed for a
+    /// different reason.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] when the CnC file's counter cannot be read at all —
+    /// the same failure [`Client::next_correlation_id`] has, and the only one
+    /// here.
+    pub fn add_close_handler(
+        &mut self,
+        handler: impl FnMut() + Send + 'static,
+    ) -> Result<i64, CommandError> {
+        let registration_id = self.next_correlation_id()?;
+
+        self.close_handlers.push(CloseHandler {
+            registration_id,
+            handler: Box::new(handler),
+        });
+
+        Ok(registration_id)
+    }
+
+    /// Stop a close handler running, by the id
+    /// [`Client::add_close_handler`] returned.
+    ///
+    /// Returns whether there was one to remove, which is the question the
+    /// reference's `removeCloseHandler` answers
+    /// (`ClientConductor.java:1561-1575`).
+    pub fn remove_close_handler(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .close_handlers
+            .iter()
+            .position(|handler| handler.registration_id == registration_id)
+        else {
+            return false;
+        };
+
+        let _ = self.close_handlers.swap_remove(index);
+
+        true
+    }
+
+    /// How many close handlers have panicked.
+    ///
+    /// A handler that panics is caught and the rest still run, which is what
+    /// the reference does with a throwing one (`ClientConductor.java:2068-2075`
+    /// catches and reports it through the error handler). The count is this
+    /// build's report: a destructor has no other.
+    pub const fn close_handler_panics(&self) -> u64 {
+        self.close_handler_panics
     }
 
     /// Whether this client has closed — by an explicit [`Client::close`] or by
@@ -768,6 +881,37 @@ impl Client {
     /// Nothing bounds the queue, as with [`Client::counter_events`].
     pub fn image_events(&mut self) -> Vec<ImageEvent> {
         std::mem::take(&mut self.image_events)
+    }
+
+    /// Run every close handler, once, in the order they were added.
+    ///
+    /// A panic from one is caught rather than allowed through, and the rest run
+    /// regardless. That is not politeness: this is reached from [`Client::close`],
+    /// which [`Drop`] calls, and a destructor that panics while a thread is
+    /// already unwinding aborts the process — so a caller's closure would be
+    /// able to turn a dropped client into a crash. The reference guards the
+    /// same seam with a `try`/`catch` around `closeHandler.run()`
+    /// (`ClientConductor.java:2068-2075`) and reports what it caught; this
+    /// counts it ([`Client::close_handler_panics`]).
+    ///
+    /// Re-entrancy needs no flag here, though the reference keeps one
+    /// (`isInCallback`): a handler is handed no client and the client is
+    /// borrowed mutably for the length of this call, so there is nothing for a
+    /// handler to call back into.
+    fn notify_close_handlers(&mut self) {
+        for handler in &mut self.close_handlers {
+            // `AssertUnwindSafe` because a `FnMut` is not `UnwindSafe` by
+            // construction and there is nothing here for a panic to leave
+            // half-done: the closure is the caller's, and a handler that
+            // panicked is not one this client will call again.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (handler.handler)();
+            }));
+
+            if ran.is_err() {
+                self.close_handler_panics += 1;
+            }
+        }
     }
 
     /// Run one duty cycle: refresh the heartbeat, then take at most one
