@@ -35,7 +35,9 @@ use crate::pal::MappedFile;
 use super::descriptor;
 use super::position::{self, RawTail};
 
-/// A log buffer file this process created.
+/// A log buffer file, mapped: either one this process created
+/// ([`LogFile::create`]) or a second view of one that already exists
+/// ([`LogFile::open`]).
 pub struct LogFile {
     file: MappedFile,
     /// Where it is, for the removal and for reports. `MappedFile` does not
@@ -82,6 +84,54 @@ impl LogFile {
         } else {
             MappedFile::create(path, length)?
         };
+
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            term_length,
+            metadata_offset: length - descriptor::METADATA_LENGTH,
+        })
+    }
+
+    /// Map a log buffer that already exists, as a second view of it.
+    ///
+    /// The same file, mapped again. Two mappings of one file are two addresses
+    /// over the **same pages** — the page cache is what they share — so this
+    /// does not copy anything and does not put the threads that use the two
+    /// views on different cache lines. What it buys is that the two threads
+    /// doing different jobs over one log buffer can each hold a mapping of
+    /// their own, which is the shape the reference has: its conductor cleans a
+    /// publication's terms and its sender reads them to build datagrams
+    /// (`aeron_network_publication.c:947-1010` against `:515-560`), over one
+    /// `aeron_log_buffer_t` they both reach through the same publication.
+    ///
+    /// Read-write rather than read-only, because cleaning is a write: a caller
+    /// that only wants the metadata could pass nothing else, but there is no
+    /// such caller yet and a read-only map would fail at the first `zero`.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the file cannot be opened or mapped, or is shorter than
+    /// the layout `term_length` and `page_size` describe. The length is checked
+    /// rather than assumed because a second view can be opened over a file this
+    /// process did not create — a shorter one would map, and then every offset
+    /// past its end would silently read as absent (`MappedFile::region` bounds
+    /// its windows).
+    pub fn open(path: &Path, term_length: i32, page_size: usize) -> io::Result<Self> {
+        let Some(length) = Self::log_length(term_length, page_size) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the term length or page size is not one a log buffer may have",
+            ));
+        };
+
+        let file = MappedFile::open_readwrite(path)?;
+        if file.len() < length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the log buffer is shorter than its term length and page size describe",
+            ));
+        }
 
         Ok(Self {
             file,
@@ -298,6 +348,43 @@ mod tests {
         .expect("a log buffer");
 
         (dir, log)
+    }
+
+    #[test]
+    fn a_second_view_of_a_log_buffer_reaches_the_same_pages() {
+        // What `open` is for: two mappings over one file. A write through the
+        // first has to be visible through the second, or two threads holding
+        // one each would be working on different memory and the cleaning one of
+        // them does would not reach the one that sends.
+        let (dir, first) = created();
+        let path = dir.path().join("test.logbuffer");
+
+        first
+            .term(0)
+            .expect("term 0")
+            .store_i32_release(0, 0x2A)
+            .expect("in range");
+
+        let second = LogFile::open(&path, TERM_LENGTH, PAGE_SIZE).expect("a second view");
+
+        assert_eq!(
+            Some(0x2A),
+            second.term(0).expect("term 0").load_i32_acquire(0),
+            "the second view reads what the first wrote"
+        );
+    }
+
+    #[test]
+    fn a_file_shorter_than_the_layout_describes_is_refused() {
+        // A second view can be opened over a file this process did not create,
+        // and a short one would map happily — every offset past its end would
+        // then read as absent rather than as an error, which is the kind of
+        // failure that shows up as a driver that silently sends nothing.
+        let dir = TempDir::new();
+        let short = dir.path().join("short.logbuffer");
+        std::fs::write(&short, b"not a log buffer").expect("a small file");
+
+        assert!(LogFile::open(&short, TERM_LENGTH, PAGE_SIZE).is_err());
     }
 
     #[test]
