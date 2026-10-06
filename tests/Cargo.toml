@@ -378,6 +378,14 @@ name = "ipc_response_channel_probe"
 path = "interop/ipc_response_channel_probe.rs"
 required-features = ["interop"]
 
+# P2-1c, one level up: a real archive in the probe's own process, a real client,
+# and one connect over IPC. The driver on its own was measured and is not where
+# the archive's red is; this is the case with the archive put back.
+[[test]]
+name = "archive_connect_over_ipc"
+path = "interop/archive_connect_over_ipc.rs"
+required-features = ["interop"]
+
 # The conductor's own clock while the agent is busy: the property
 # `AsyncResourceTest.shouldDetectUnknownHost` is about, pinned without asking a
 # nameserver anything.

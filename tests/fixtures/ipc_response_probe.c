@@ -194,6 +194,45 @@ static const probe_case_t CASES[] = {
         1
     },
     {"sub-response", "aeron:ipc", "aeron:ipc?control-mode=response", 0},
+    /* The four that came out of `archive_connect_over_ipc.rs`, where the
+     * request publication never linked to the archive's plain control
+     * subscription. It carries `term-length=64k|sparse=true|mtu=1408|
+     * response-correlation-id=<id>`; the subscription carries none of them.
+     * `correlation` above says the id alone is not the difference, so these
+     * take the other three one at a time and then together. */
+    {"sparse", "aeron:ipc?sparse=true", "aeron:ipc", 0},
+    {"mtu", "aeron:ipc?mtu=1408", "aeron:ipc", 0},
+    {"term-length", "aeron:ipc?term-length=64k", "aeron:ipc", 0},
+    {
+        "request-shape",
+        "aeron:ipc?term-length=64k|sparse=true|response-correlation-id=%lld|mtu=1408",
+        "aeron:ipc",
+        1
+    },
+    /* The pair as it actually stands in `archive_connect_over_ipc.rs`: the
+     * subscription is the archive's **local control** one, which is not the
+     * bare channel but `aeron:ipc?term-length=64k`
+     * (`ARCHIVE localControlChannel=…` in that test's reading). Every case
+     * above subscribes on the bare channel, so this is the one difference left
+     * between the shapes that all agree and the pair that does not connect. */
+    {
+        "archive-pair",
+        "aeron:ipc?term-length=64k|sparse=true|response-correlation-id=%lld|mtu=1408",
+        "aeron:ipc?term-length=64k",
+        1
+    },
+    /* And the subscription carrying the parameters the client library adds to
+     * every channel it builds — the reading in `archive_connect_over_ipc.rs`
+     * shows the client's *response* subscription as
+     * `aeron:ipc?term-length=65536|sparse=true|mtu=1408|control-mode=response`,
+     * so the archive's control subscription is unlikely to be the bare
+     * `term-length` either. */
+    {
+        "archive-pair-full",
+        "aeron:ipc?term-length=64k|sparse=true|response-correlation-id=%lld|mtu=1408",
+        "aeron:ipc?term-length=64k|sparse=true|mtu=1408",
+        1
+    },
 };
 
 static const size_t CASE_COUNT = sizeof(CASES) / sizeof(CASES[0]);
