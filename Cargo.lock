@@ -315,6 +315,7 @@ dependencies = [
 name = "deepmsg-tests"
 version = "0.1.0"
 dependencies = [
+ "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-cnc",
  "deepmsg-codec",

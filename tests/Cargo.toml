@@ -18,6 +18,7 @@ deepmsg-client = { path = "../crates/client" }
 deepmsg-driver = { path = "../crates/driver" }
 deepmsg-cnc = { path = "../crates/cnc" }
 deepmsg-codec = { path = "../crates/codec" }
+deepmsg-archive = { path = "../crates/archive" }
 
 [[test]]
 name = "basic_roundtrip"
@@ -237,6 +238,14 @@ required-features = ["interop"]
 # The other direction: the reference's own counter viewer reading a file
 # *this* build wrote. Needs the reference build for `AeronStat`, not for a
 # driver.
+# The mark file, both ways round: the reference's own `ArchiveTool` reading a
+# mark file this build wrote, and both readers on the same golden. Needs the
+# reference's `aeron-all` jar, not a driver.
+[[test]]
+name = "mark_file_reference"
+path = "interop/mark_file_reference.rs"
+required-features = ["interop"]
+
 [[test]]
 name = "aeron_stat_counters"
 path = "interop/aeron_stat_counters.rs"
