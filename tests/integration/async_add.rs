@@ -1,12 +1,13 @@
 //! The asynchronous adds, against a real driver.
 //!
-//! `async_add_subscription`, `async_add_publication` and
-//! `async_add_exclusive_publication` write the command and return a handle;
-//! `async_add_poll` says what became of it. What needs a driver to say anything
-//! is the far end of that: that the handle the add drew is the registration id
-//! the resource really has, and — for the two publication kinds — that the log
-//! buffer is mapped before the poll says `Ready`, so a caller that sees `Ready`
-//! gets a publication it can offer into.
+//! `async_add_subscription`, `async_add_publication`,
+//! `async_add_exclusive_publication` and `async_add_counter` write the command
+//! and return a handle; `async_add_poll` says what became of it. What needs a
+//! driver to say anything is the far end of that: that the handle the add drew
+//! is the registration id the resource really has, and — for the three kinds
+//! that have something to map or allocate — that the log buffer is mapped, or
+//! the counter's slot chosen, before the poll says `Ready`, so a caller that
+//! sees `Ready` gets something it can use.
 //!
 //! Everything here is our own client against our own driver over `aeron:ipc`,
 //! so it needs no reference checkout and runs in CI.
@@ -98,6 +99,55 @@ fn an_async_exclusive_publication_arrives_the_same_way() {
             .expect("the publication the handle drew")
             .registration_id(),
         "the handle's id is the resource's id"
+    );
+}
+
+/// A counter is the fourth thing an asynchronous add can ask for, and it is the
+/// one where `Ready` cannot be a local matter: the slot in the values region is
+/// the driver's to allocate, so there is nothing to hold until the response
+/// names it.
+#[test]
+fn an_async_counter_is_allocated_by_the_time_the_poll_says_ready() {
+    let Some((_own, mut client)) = own_driver_and_client("async-add-counter") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    const TYPE_ID: i32 = 1001;
+
+    let add = client
+        .async_add_counter(TYPE_ID, b"a-key", "an async counter", DEFAULT_TIMEOUT)
+        .expect("the command is written");
+
+    assert!(
+        client.counter(add.registration_id()).is_none(),
+        "nothing is registered until the driver says which slot it is"
+    );
+
+    assert!(matches!(until_ready(&mut client, add), AsyncAddPoll::Ready));
+
+    let counter = client
+        .counter(add.registration_id())
+        .expect("a caller that sees Ready can use it");
+
+    assert_eq!(
+        add.registration_id(),
+        counter.registration_id(),
+        "the handle's id is the resource's id"
+    );
+
+    // The driver's own metadata region agreeing is the part this client cannot
+    // fake: the counter is in the file, under the type id the add asked for and
+    // the registration id the request used.
+    let reader = client.counters_reader().expect("the counter regions");
+
+    assert_eq!(
+        Some(counter.counter_id()),
+        reader.find_by_type_and_registration(TYPE_ID, counter.registration_id())
+    );
+    assert_eq!(
+        "an async counter",
+        counter.descriptor(&reader).expect("allocated").label
     );
 }
 

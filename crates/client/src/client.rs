@@ -326,9 +326,9 @@ enum Ready {
 
 /// A handle on an `ADD_*` that has been sent and not yet answered.
 ///
-/// Returned by [`Client::async_add_subscription`] and the two publication
-/// twins, and consumed by [`Client::async_add_poll`] and
-/// [`Client::async_add_cancel`]. What it holds is the registration id the
+/// Returned by [`Client::async_add_subscription`], the two publication twins
+/// and [`Client::async_add_counter`], and consumed by [`Client::async_add_poll`]
+/// and [`Client::async_add_cancel`]. What it holds is the registration id the
 /// command drew, which is also the id the resource will have — so a handle is
 /// enough to find the resource once the poll says it is there.
 ///
@@ -360,8 +360,8 @@ pub enum AsyncAddPoll {
     Awaiting,
     /// It answered, and the resource is in this client's list under
     /// [`AsyncAdd::registration_id`] — [`Client::subscription`],
-    /// [`Client::publication`] or [`Client::exclusive_publication`] whichever
-    /// kind it was.
+    /// [`Client::publication`], [`Client::exclusive_publication`] or
+    /// [`Client::counter`], whichever kind it was.
     Ready,
     /// The driver refused it, or the deadline passed before it answered.
     ///
@@ -1120,6 +1120,12 @@ impl Client {
                 }
             }
 
+            Ok(Ready::Counter { counter_id }) => {
+                self.adopt_counter(add.registration_id, counter_id);
+
+                AsyncAddPoll::Ready
+            }
+
             Ok(_) => AsyncAddPoll::Failed(CommandError::Encoding),
 
             Err(error) => {
@@ -1252,6 +1258,54 @@ impl Client {
         label: &str,
         timeout: Duration,
     ) -> Result<Counter, CommandError> {
+        let correlation_id = self.submit_add_counter(type_id, key, label, timeout)?;
+
+        let Ready::Counter { counter_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(self.adopt_counter(correlation_id, counter_id))
+    }
+
+    /// Send an `ADD_COUNTER` and return without waiting for the answer.
+    ///
+    /// The counter is **not** in this client's list until
+    /// [`Client::async_add_poll`] has read the response: the slot in the values
+    /// region is the driver's to allocate, and its id is what the response
+    /// carries. So `Ready` is the moment [`Client::counter`] starts answering,
+    /// under the registration id the handle drew.
+    ///
+    /// The reference has the same split twice over. C's `aeron_async_add_counter`
+    /// (`aeronc.h:679-687`) takes a handle to poll (`:695`), and Java's
+    /// `Aeron.asyncAddCounter` (`Aeron.java:678-693`) returns the registration id
+    /// and leaves the counter itself to `getCounter` — which is this shape, and
+    /// the reason the handle is the one [`AsyncAdd`] the other adds return.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be built or written. A refusal
+    /// by the driver arrives later, through [`Client::async_add_poll`].
+    pub fn async_add_counter(
+        &mut self,
+        type_id: i32,
+        key: &[u8],
+        label: &str,
+        timeout: Duration,
+    ) -> Result<AsyncAdd, CommandError> {
+        let registration_id = self.submit_add_counter(type_id, key, label, timeout)?;
+
+        Ok(AsyncAdd { registration_id })
+    }
+
+    /// The command both counter adds send, and the pending entry that answers
+    /// it.
+    fn submit_add_counter(
+        &mut self,
+        type_id: i32,
+        key: &[u8],
+        label: &str,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = AddCounter {
@@ -1271,17 +1325,21 @@ impl Client {
 
         self.send(ADD_COUNTER_TYPE_ID, &payload, correlation_id, timeout)?;
 
-        let Ready::Counter { counter_id } = self.wait(correlation_id)? else {
-            return Err(CommandError::Encoding);
-        };
+        Ok(correlation_id)
+    }
 
-        // One command, one registration: the id the driver allocated under is
-        // the correlation id this request used, which is what `ON_COUNTER_READY`
-        // echoed (`aeron_client_conductor.c:850-895`).
+    /// Register a counter the driver has allocated, and hand it back.
+    ///
+    /// Both counter adds come through here, so they cannot disagree about the
+    /// handle or about which list holds it. One command, one registration: the
+    /// id the driver allocated under is the correlation id the request used,
+    /// which is what `ON_COUNTER_READY` echoed
+    /// (`aeron_client_conductor.c:850-895`).
+    fn adopt_counter(&mut self, correlation_id: i64, counter_id: i32) -> Counter {
         let counter = Counter::new(correlation_id, correlation_id, counter_id);
         self.counters.push(counter);
 
-        Ok(counter)
+        counter
     }
 
     /// Remove a counter and wait for the driver to acknowledge.
