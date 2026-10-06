@@ -30,6 +30,10 @@
  *     CASE response      pub=aeron:ipc?control-mode=response|response-…   -> sub=aeron:ipc
  *     CASE sub-response  pub=aeron:ipc                                    -> sub=aeron:ipc?control-mode=response
  *
+ * and then the chain those four only narrow down: a response subscription, the
+ * request publication that names it, and the response publication that names
+ * the request — which is what the archive actually builds. See `run_chain_case`.
+ *
  * Each case gets a stream of its own, so a case cannot be read as another's
  * result. It exits 0 whenever it produced readings at all: a delivery is not a
  * verdict, the comparison is.
@@ -151,6 +155,21 @@ static int64_t registration_id_of(aeron_subscription_t *subscription)
     return constants.registration_id;
 }
 
+static int64_t publication_registration_id(aeron_publication_t *publication)
+{
+    aeron_publication_constants_t constants;
+
+    memset(&constants, 0, sizeof(constants));
+
+    if (aeron_publication_constants(publication, &constants) < 0)
+    {
+        fprintf(stderr, "aeron_publication_constants: %s\n", aeron_errmsg());
+        return 0;
+    }
+
+    return constants.registration_id;
+}
+
 typedef struct
 {
     const char *name;
@@ -265,6 +284,207 @@ static void run_case(aeron_t *aeron, const probe_case_t *probe, int32_t stream_i
     aeron_subscription_close(subscription, NULL, NULL);
 }
 
+/* The chain the archive actually builds — and the reading this probe exists
+ * for. The four simple cases above say a response *subscription* is not fed by
+ * a plain publication, in either driver; this says what does feed it.
+ *
+ *     S  response subscription   aeron:ipc?control-mode=response                   (stream R)
+ *     P  request publication     aeron:ipc?response-correlation-id=<S's id>        (stream C)
+ *     Q  response publication    aeron:ipc?control-mode=response|response-correlation-id=<P's id>  (stream R)
+ *
+ * P is what the client makes (`AeronArchive.java:4043-4048` puts S's
+ * registration id onto the request channel) and Q is what the archive makes
+ * when a ConnectRequest arrives, naming the request publication it came from.
+ * The driver is supposed to pair the three by those ids
+ * (`aeron_driver_conductor.c:1714-1729`), and then a fragment offered on Q
+ * reaches S — which is the whole of the archive client's connect path, minus
+ * the archive.
+ *
+ * Built in that order because each id is needed to write the next channel. */
+static void run_chain_case(
+    aeron_t *aeron,
+    const char *name,
+    int32_t response_stream_id,
+    int32_t request_stream_id,
+    const char *response_extra)
+{
+    const char *sub_channel = "aeron:ipc?control-mode=response";
+    char request_channel[256];
+    char response_channel[256];
+    uint8_t payload[PAYLOAD_LENGTH];
+    aeron_subscription_t *subscription;
+    aeron_publication_t *request;
+    aeron_publication_t *response;
+    int64_t sub_id;
+    int64_t request_id;
+    int offered = 0;
+
+    memset(payload, 0xA5, sizeof(payload));
+
+    subscription = add_subscription(aeron, sub_channel, response_stream_id);
+
+    if (NULL == subscription)
+    {
+        printf("CASE %s sub=%s failed:never-appeared delivered=0\n", name, sub_channel);
+        fflush(stdout);
+        return;
+    }
+
+    sub_id = registration_id_of(subscription);
+    snprintf(request_channel, sizeof(request_channel), "aeron:ipc?response-correlation-id=%lld", (long long)sub_id);
+
+    request = add_publication(aeron, request_channel, request_stream_id);
+
+    if (NULL == request)
+    {
+        printf("CASE %s sub=%s req=%s failed:never-appeared delivered=0\n", name, sub_channel, request_channel);
+        fflush(stdout);
+        aeron_subscription_close(subscription, NULL, NULL);
+        return;
+    }
+
+    request_id = publication_registration_id(request);
+    snprintf(
+        response_channel,
+        sizeof(response_channel),
+        "aeron:ipc?control-mode=response%s|response-correlation-id=%lld",
+        response_extra,
+        (long long)request_id);
+
+    response = add_publication(aeron, response_channel, response_stream_id);
+
+    if (NULL == response)
+    {
+        printf(
+            "CASE %s sub=%s req=%s resp=%s failed:never-appeared delivered=0\n",
+            name,
+            sub_channel,
+            request_channel,
+            response_channel);
+        fflush(stdout);
+        aeron_publication_close(request, NULL, NULL);
+        aeron_subscription_close(subscription, NULL, NULL);
+        return;
+    }
+
+    delivered = 0;
+
+    for (int i = 0; i < POLLS_PER_CASE && running && 0 == delivered; i++)
+    {
+        if (0 == offered &&
+            aeron_publication_offer(response, payload, PAYLOAD_LENGTH, NULL, NULL) > 0)
+        {
+            offered = 1;
+        }
+
+        aeron_subscription_poll(subscription, on_fragment, NULL, 10);
+        aeron_main_do_work(aeron);
+
+        if (0 == delivered)
+        {
+            usleep(POLL_SLEEP_US);
+        }
+    }
+
+    printf(
+        "CASE %s sub=%s req=%s resp=%s delivered=%" PRId64 "\n",
+        name,
+        sub_channel,
+        request_channel,
+        response_channel,
+        delivered);
+    fflush(stdout);
+
+    aeron_publication_close(response, NULL, NULL);
+    aeron_publication_close(request, NULL, NULL);
+    aeron_subscription_close(subscription, NULL, NULL);
+}
+
+/* The value the archive actually pairs on, read from the driver rather than
+ * computed here.
+ *
+ * `ArchiveConductor.java:478` writes `image.correlationId()` onto the response
+ * publication, not the request publication's registration id — and an image's
+ * correlation id is the figure this driver gave it when it linked the two. The
+ * chain cases above cannot see a difference in that number, because they put
+ * the publication's own registration id on both sides and are self-consistent
+ * whatever the driver reports. This reads it: the image's correlation id has to
+ * be the publication's registration id, or the archive will name a publication
+ * that does not exist and the client's response subscription will wait for a
+ * fragment that is addressed to nobody. */
+static void run_image_correlation_case(aeron_t *aeron, int32_t stream_id)
+{
+    const char *channel = "aeron:ipc";
+    aeron_subscription_t *subscription;
+    aeron_publication_t *publication;
+    aeron_image_t *image;
+    aeron_image_constants_t constants;
+    int64_t publication_id;
+    int waited = 0;
+
+    subscription = add_subscription(aeron, channel, stream_id);
+
+    if (NULL == subscription)
+    {
+        printf("CASE image-correlation sub failed:never-appeared\n");
+        fflush(stdout);
+        return;
+    }
+
+    publication = add_publication(aeron, channel, stream_id);
+
+    if (NULL == publication)
+    {
+        printf("CASE image-correlation pub failed:never-appeared\n");
+        fflush(stdout);
+        aeron_subscription_close(subscription, NULL, NULL);
+        return;
+    }
+
+    publication_id = publication_registration_id(publication);
+
+    for (waited = 0; waited < POLLS_PER_CASE && running; waited++)
+    {
+        if (aeron_subscription_image_count(subscription) > 0)
+        {
+            break;
+        }
+
+        aeron_main_do_work(aeron);
+        usleep(POLL_SLEEP_US);
+    }
+
+    image = aeron_subscription_image_at_index(subscription, 0);
+
+    if (NULL == image)
+    {
+        printf(
+            "CASE image-correlation pub_registration=%lld image=never-appeared\n",
+            (long long)publication_id);
+        fflush(stdout);
+        aeron_publication_close(publication, NULL, NULL);
+        aeron_subscription_close(subscription, NULL, NULL);
+        return;
+    }
+
+    memset(&constants, 0, sizeof(constants));
+
+    if (aeron_image_constants(image, &constants) < 0)
+    {
+        fprintf(stderr, "aeron_image_constants: %s\n", aeron_errmsg());
+    }
+
+    printf(
+        "CASE image-correlation pub_registration=%lld image_correlation=%lld match=%d\n",
+        (long long)publication_id,
+        (long long)constants.correlation_id,
+        constants.correlation_id == publication_id);
+    fflush(stdout);
+
+    aeron_publication_close(publication, NULL, NULL);
+    aeron_subscription_close(subscription, NULL, NULL);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = NULL;
@@ -326,6 +546,29 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < CASE_COUNT && running; i++)
     {
         run_case(aeron, &CASES[i], first_stream_id + (int32_t)i);
+    }
+
+    if (running)
+    {
+        /* The same chain with the parameters the archive actually puts on its
+         * response publication: `strippedChannelBuilder` keeps `control-mode`
+         * and the archive adds the term length, sparseness and MTU it resolved
+         * (`ArchiveConductor.java:471-481`), where the plain `chain` above has
+         * none of them. If the two readings differ, the parameters are the
+         * difference. */
+        run_chain_case(
+            aeron,
+            "chain",
+            first_stream_id + (int32_t)CASE_COUNT,
+            first_stream_id + (int32_t)CASE_COUNT + 1,
+            "");
+        run_chain_case(
+            aeron,
+            "chain-full",
+            first_stream_id + (int32_t)CASE_COUNT + 2,
+            first_stream_id + (int32_t)CASE_COUNT + 3,
+            "|term-length=64k|sparse=true|mtu=1408");
+        run_image_correlation_case(aeron, first_stream_id + (int32_t)CASE_COUNT + 4);
     }
 
     printf("DONE\n");
