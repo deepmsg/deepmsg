@@ -1093,28 +1093,37 @@ impl NetworkPublication {
             }
         }
 
-        let mut slices: [&[u8]; crate::sys::socket::MAX_BATCH] =
-            [&[]; crate::sys::socket::MAX_BATCH];
-        for (index, (offset, length)) in bounds[..frames].iter().enumerate() {
-            slices[index] = &scratch[*offset..*offset + *length];
+        // Built only when there is something to send. Every one of these
+        // arrays is sixteen entries wide whatever the batch is, and this
+        // function runs about 1.3M times a second with nothing to send — an
+        // initialised `slices` on that path is 256 bytes written to be read by
+        // nobody.
+        let mut bytes_sent = 0usize;
+        // How many of the batch the socket took, which the check below reads
+        // even on a pass that sent nothing.
+        let mut sent = 0usize;
+
+        if frames > 0 {
+            let mut slices: [&[u8]; crate::sys::socket::MAX_BATCH] =
+                [&[]; crate::sys::socket::MAX_BATCH];
+            for (index, (offset, length)) in bounds[..frames].iter().enumerate() {
+                slices[index] = &scratch[*offset..*offset + *length];
+            }
+
+            // What `do_send` returns is **bytes**, not datagrams: the sender
+            // adds it to `bytes-sent`, and the reference's `send_data` returns
+            // the byte count its `do_send` accumulated
+            // (`aeron_network_publication.c:576`, `aeron_driver_sender.c:457`).
+            // A partial send is the first `sent` datagrams — `send` reports how
+            // many of the batch it took, in order.
+            sent = self.do_send(endpoint, &slices[..frames], counters, regions, now_ns)?;
+
+            bytes_sent = slices[..frames]
+                .iter()
+                .take(sent)
+                .map(|slice| slice.len())
+                .sum();
         }
-
-        let sent = if frames > 0 {
-            self.do_send(endpoint, &slices[..frames], counters, regions, now_ns)?
-        } else {
-            0
-        };
-
-        // What this returns is **bytes**, not datagrams: the sender adds it to
-        // `bytes-sent`, and the reference's `send_data` returns the byte count
-        // its `do_send` accumulated (`aeron_network_publication.c:576`,
-        // `aeron_driver_sender.c:457`). A partial send is the first `sent`
-        // datagrams — `send` reports how many of the batch it took, in order.
-        let bytes_sent: usize = slices[..frames]
-            .iter()
-            .take(sent)
-            .map(|slice| slice.len())
-            .sum();
 
         self.scratch = scratch;
 
