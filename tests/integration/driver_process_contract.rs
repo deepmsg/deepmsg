@@ -387,7 +387,17 @@ impl Fixture {
     /// actually sends, so it is the one worth pinning.
     fn terminate(&mut self) -> Duration {
         let written = Instant::now();
+        self.write_terminate();
 
+        self.wait(written)
+    }
+
+    /// The write alone, for a test about a driver that is **not** expected to go.
+    ///
+    /// A refused termination is a write that changes nothing, so a caller that
+    /// waited for an exit would be waiting out the timeout to be told what the
+    /// driver's continued life already says.
+    fn write_terminate(&self) {
         let cnc = CncFile::try_open_writable(self.aeron_dir()).expect("reopen the CnC file");
         let ring = cnc.to_driver_ring().expect("the to-driver ring");
 
@@ -403,8 +413,6 @@ impl Fixture {
         assert!(command.encode_into(&mut payload), "the command encodes");
         ring.write(TERMINATE_DRIVER_TYPE_ID, &payload)
             .expect("the command is written");
-
-        self.wait(written)
     }
 
     /// Ask the driver to stop on `SIGTERM` and wait for it.
@@ -750,6 +758,89 @@ fn the_harness_shaped_terminate_command_stops_the_driver() {
         "the driver ran its own shutdown path rather than being killed"
     );
     assert_eq!(0, fixture.stderr_len());
+}
+
+/// The validator's two **Java** spellings, which are the one place a name this
+/// driver does not define is recognised rather than refused.
+///
+/// `aeron.driver.termination.validator` names code in the C reference — its
+/// symbol table is `allow`/`deny` and nothing else
+/// (`aeron-driver/src/main/c/aeron_termination_validator.c:55-62`, which fails
+/// context init on anything else) — while the Java driver takes a **class
+/// name**. The reference's own C harnesses write the Java spelling every time
+/// they start a driver: `TestArchive.h:49` as a property,
+/// `aeron-test-support/src/main/c/TestMediaDriver.h:52` and
+/// `aeron-archive/src/test/cpp_wrapper/TestArchive.h:75` as `-D` arguments. So
+/// a driver standing in for the Java one meets those names on every run of
+/// those suites, and the first hybrid run of the archive suite refused to
+/// start — which the archive's readiness wait has no timeout for, so it hung
+/// rather than failed.
+///
+/// The two class names mean exactly the two policies, and nothing else: their
+/// `allowTermination` returns `true` and `false`
+/// (`DefaultAllowTerminationValidator.java:41`). Recognising two names is not
+/// loading code, and a validator of somebody else's is still refused by name —
+/// `crates/driver/src/config.rs::the_java_spelling_of_the_two_validators_is_the_two_validators`
+/// pins all four spellings and the refusal beside them.
+///
+/// Not in [`READ`]: that list is every name the **Java** harness can send
+/// (clause 1), and `CTestMediaDriver` sends no validator at all. These come
+/// from the C harnesses, and they arrive the way any other setting does.
+#[test]
+fn the_java_spellings_of_the_validators_are_the_two_validators() {
+    // Allowed, and observable: the driver runs its own shutdown path.
+    let Some(mut fixture) = Fixture::start(
+        "validator-java-allow",
+        &[(
+            "AERON_DRIVER_TERMINATION_VALIDATOR",
+            "io.aeron.driver.DefaultAllowTerminationValidator",
+        )],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _ = fixture.await_cnc();
+    fixture.terminate();
+
+    assert_eq!(
+        Some(0),
+        fixture.exit().code(),
+        "a name the reference's own harness sends must be one this driver can act on"
+    );
+    assert_eq!(0, fixture.stderr_len());
+
+    // Denied, and the pair is what says the name was *read* rather than
+    // ignored: a driver that dropped the setting would take the default, which
+    // is deny, and pass this half alone.
+    let Some(mut fixture) = Fixture::start(
+        "validator-java-deny",
+        &[(
+            "AERON_DRIVER_TERMINATION_VALIDATOR",
+            "io.aeron.driver.DefaultDenyTerminationValidator",
+        )],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _ = fixture.await_cnc();
+    fixture.write_terminate();
+
+    // A short wait first, so a driver that *did* stop has time to say so rather
+    // than being caught mid-flight — the same window the reference's own
+    // refusal test gives it (`tests/interop/c_driver_terminate.rs`).
+    std::thread::sleep(Duration::from_millis(250));
+
+    assert!(
+        fixture.child.try_wait().expect("poll the child").is_none(),
+        "the deny spelling is a refusal, not another name for allow"
+    );
+    // A refusal is silent in the reference too (`M15` §4.5: the driver keeps
+    // running and writes nothing), so this is the contract's clause 3 as well.
+    assert_eq!(0, fixture.stderr_len());
+
+    fixture.stop_on_signal();
 }
 
 /// Every thread the process is running, by the name the kernel holds for it.

@@ -375,6 +375,35 @@ send endpoint whose channel names an explicit endpoint connects its socket to it
 `::an_endpoint_that_is_not_connected_can_send_somewhere_else` and
 `::a_connected_endpoint_sends_only_where_its_channel_points`.
 
+**`aeron.driver.termination.validator` is a third, and it is the one name this
+driver recognises without defining.** The C reference's symbol table holds
+`allow` and `deny` and nothing else
+(`aeron-driver/src/main/c/aeron_termination_validator.c:28-40`), and a name that
+resolves to nothing stops context init
+(`:55-62` → `aeron_driver_context.c:1247-1251`), while the Java driver takes a
+**class** name. The reference's own C harnesses
+write the Java spelling every time they start a driver —
+`aeron-archive/src/test/c/TestArchive.h:49`,
+`aeron-test-support/src/main/c/TestMediaDriver.h:52`,
+`aeron-archive/src/test/cpp_wrapper/TestArchive.h:75` — so a driver standing in
+for the Java one meets
+`io.aeron.driver.DefaultAllowTerminationValidator` on every run of the archive
+suite. The first hybrid run refused to start on it, and the archive's readiness
+wait has no timeout, so it hung rather than failed.
+
+Both class names are recognised, and only those two: they are the two policies
+written out, since their `allowTermination` returns `true` and `false`
+(`aeron-driver/src/main/java/io/aeron/driver/DefaultAllowTerminationValidator.java:41`,
+`DefaultDenyTerminationValidator.java:41`). Recognising a name is not loading
+code — a validator of somebody else's is still refused, and the driver still
+cannot `dlopen` one (ADR-0002). The four spellings and the refusal are pinned by
+`crates/driver/src/config.rs::the_java_spelling_of_the_two_validators_is_the_two_validators`;
+that the names are **acted on**, and that the deny one is a refusal rather than
+another name for allow, by
+`tests/integration/driver_process_contract.rs::the_java_spellings_of_the_validators_are_the_two_validators`,
+which starts this driver with each spelling and sends it the harness's own
+`TERMINATE_DRIVER`.
+
 ## The event log
 
 `AERON_EVENT_LOG` and the three names beside it are **accepted and ignored**:
