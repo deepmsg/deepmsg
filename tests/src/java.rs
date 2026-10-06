@@ -54,6 +54,57 @@ pub fn run(jar: &Path, class: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Compile one of the reference's **probe** classes, and answer with the
+/// directory to run it from.
+///
+/// The fixtures' generators are compiled by hand when a fixture is made — their
+/// READMEs say how — because a fixture is committed and a test that needed a
+/// compiler would need a JDK everywhere CI runs. A **probe** is the other
+/// position: its answer is about a file the test just wrote, so it cannot be
+/// recorded, and it has to be compiled as part of the run.
+///
+/// `None` when there is no `javac`, which is how a machine with a JRE and no JDK
+/// skips rather than failing: the caller announces the skip.
+///
+/// # Panics
+///
+/// When `javac` is there and **fails**, which is a broken probe rather than a
+/// missing one, and a test that carried on would be reading whatever class was
+/// left from before.
+#[must_use]
+pub fn compile_probe(source: &Path, into: &Path) -> Option<()> {
+    let output = Command::new("javac")
+        .arg("-proc:none")
+        .arg("-cp")
+        .arg(crate::driver::locate_aeron_all()?)
+        .arg("-d")
+        .arg(into)
+        .arg(source)
+        .output()
+        .ok()?;
+
+    assert!(
+        output.status.success(),
+        "javac failed for {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Some(())
+}
+
+/// Run a probe compiled into `classpath` by [`compile_probe`].
+///
+/// # Panics
+///
+/// As [`run`].
+#[must_use]
+pub fn run_probe(jar: &Path, classpath: &Path, class: &str, args: &[&str]) -> String {
+    let joined = std::env::join_paths([jar, classpath]).expect("two paths join");
+
+    run(Path::new(&joined), class, args)
+}
+
 /// `ArchiveTool <directory> <command…>`.
 ///
 /// The directory comes first, which is the opposite of what the command name

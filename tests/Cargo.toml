@@ -244,6 +244,14 @@ required-features = ["interop"]
 # The catalog, read by the reference's own `ArchiveTool`: `count-entries`,
 # `capacity` and `describe-all` on an archive directory this build wrote, and
 # both readers on the golden. Needs the reference's `aeron-all` jar.
+# Segments and recovery against the reference's own tools: `ArchiveTool checksum`
+# on what this build wrote, and `RecoverCatalog` — a probe, because the reference
+# repairs inside its catalog constructor — on the same directory.
+[[test]]
+name = "segment_reference"
+path = "interop/segment_reference.rs"
+required-features = ["interop"]
+
 [[test]]
 name = "catalog_reference"
 path = "interop/catalog_reference.rs"
