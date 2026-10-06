@@ -24,7 +24,9 @@
 
 use std::path::PathBuf;
 
-use deepmsg_archive::catalog::{Catalog, DEFAULT_CAPACITY, FILENAME as CATALOG_FILENAME};
+use deepmsg_archive::catalog::{
+    Catalog, DEFAULT_CAPACITY, FILENAME as CATALOG_FILENAME, MIN_CAPACITY, Recording,
+};
 use deepmsg_archive::mark_file::{
     ArchiveMarkFile, ERROR_BUFFER_LENGTH_DEFAULT, FILENAME as MARK_FILENAME, Header,
 };
@@ -38,6 +40,28 @@ const RECORDINGS: i64 = 3;
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/catalog")
+}
+
+/// One recording, distinguishable from the one beside it by every field a
+/// reader can see — the channels included, so a walk that lost its place among
+/// them is a mismatch rather than a coincidence.
+fn recording(index: i64) -> Recording {
+    Recording {
+        recording_id: 0,
+        start_timestamp: NOW + index,
+        stop_timestamp: NOW + index + 1000,
+        start_position: index * 4096,
+        stop_position: (index + 1) * 4096,
+        initial_term_id: 7,
+        segment_file_length: 64 * 1024 * 1024,
+        term_buffer_length: 64 * 1024,
+        mtu_length: 1408,
+        session_id: 42,
+        stream_id: 1001 + i32::try_from(index).expect("small"),
+        stripped_channel: format!("aeron:udp?endpoint=localhost:{}", 9100 + index),
+        original_channel: format!("aeron:udp?endpoint=localhost:{}|sparse=true", 9100 + index),
+        source_identity: format!("aeron:udp?endpoint=localhost:{}", 8100 + index),
+    }
 }
 
 /// The mark header an archive directory needs beside its catalog.
@@ -72,29 +96,7 @@ fn our_archive_directory(dir: &TempDir) -> (Catalog, Vec<i64>) {
     let mut ids = Vec::new();
 
     for index in 0..RECORDINGS {
-        let id = catalog
-            .add_recording(&deepmsg_archive::catalog::Recording {
-                recording_id: 0,
-                start_timestamp: NOW + index,
-                stop_timestamp: NOW + index + 1000,
-                start_position: index * 4096,
-                stop_position: (index + 1) * 4096,
-                initial_term_id: 7,
-                segment_file_length: 64 * 1024 * 1024,
-                term_buffer_length: 64 * 1024,
-                mtu_length: 1408,
-                session_id: 42,
-                stream_id: 1001 + i32::try_from(index).expect("small"),
-                stripped_channel: format!("aeron:udp?endpoint=localhost:{}", 9100 + index),
-                original_channel: format!(
-                    "aeron:udp?endpoint=localhost:{}|sparse=true",
-                    9100 + index
-                ),
-                source_identity: format!("aeron:udp?endpoint=localhost:{}", 8100 + index),
-            })
-            .expect("added");
-
-        ids.push(id);
+        ids.push(catalog.add_recording(&recording(index)).expect("added"));
     }
 
     (catalog, ids)
@@ -157,6 +159,72 @@ fn the_reference_reads_the_catalog_this_build_writes() {
             "nor its source identity {source}:\n{described}"
         );
     }
+}
+
+/// A catalog that **grew** under the writer, read back by the reference.
+///
+/// The file this build hands over is not the one it started: `Catalog::create`
+/// at the minimum capacity, then enough recordings that the mapping is extended
+/// several times. So the reference's reader is walking a file whose size changed
+/// while it was being written — which is the arrangement the growth path exists
+/// for and the one an in-memory test cannot ask about, because only another
+/// process's mapping can disagree with ours about what the file is.
+#[test]
+fn the_reference_reads_a_catalog_that_grew() {
+    let Some(jar) = driver::locate_aeron_all() else {
+        driver::announce_tool_skip("ArchiveTool");
+        return;
+    };
+
+    let dir = TempDir::new("catalog-grown-interop");
+    let mark = ArchiveMarkFile::create(
+        dir.path(),
+        &mark_header(dir.path().to_str().expect("a path")),
+        ERROR_BUFFER_LENGTH_DEFAULT,
+        PAGE_SIZE,
+        i64::from(std::process::id()),
+    )
+    .expect("a mark file");
+    mark.signal_ready(NOW).expect("signalled");
+
+    let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, 0).expect("a catalog");
+    let mut ids = Vec::new();
+
+    // Eight recordings into a catalog that is 32 bytes to begin with: the file
+    // is extended, by half again each time, before most of these are written.
+    for index in 0..8 {
+        ids.push(
+            catalog
+                .add_recording(&recording(index))
+                .expect("the catalog grows for it"),
+        );
+    }
+
+    let capacity = catalog.capacity();
+
+    assert!(
+        capacity > MIN_CAPACITY,
+        "the fixture is only interesting if the file grew: {capacity}"
+    );
+
+    let described = archive_tool(&jar, dir.path(), &["describe-all"]);
+
+    assert!(
+        described.contains(&format!("Catalog capacity in bytes: {capacity}")),
+        "the reference read the capacity the file ended at:\n{described}"
+    );
+
+    for id in &ids {
+        assert!(
+            described.contains(&format!("recordingId={id}")),
+            "the reference did not walk to recording {id} through the grown file:\n{described}"
+        );
+    }
+
+    assert_eq!(
+        ids.len().to_string(),
+        archive_tool(&jar, dir.path(), &["count-entries"]).trim()
+    );
 }
 
 /// Both readers, one file: the golden the previous commit brought in, counted by

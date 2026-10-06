@@ -440,13 +440,9 @@ impl Catalog {
         written.recording_id = recording_id;
 
         let frame = encode_record(&written, self.alignment)?;
-        let end = self.next_offset + frame.len();
 
-        if end > self.capacity() {
-            return Err(CatalogError::Full {
-                needed: frame.len(),
-                remaining: self.capacity().saturating_sub(self.next_offset),
-            });
+        if self.next_offset + frame.len() > self.capacity() {
+            self.grow(frame.len())?;
         }
 
         {
@@ -460,7 +456,7 @@ impl Catalog {
         }
 
         self.index.add(recording_id, self.next_offset);
-        self.next_offset = end;
+        self.next_offset += frame.len();
         self.next_recording_id = recording_id + 1;
         self.write_header()?;
 
@@ -507,6 +503,44 @@ impl Catalog {
             })?;
 
         Ok(true)
+    }
+
+    /// Make room for `needed` more bytes, the way the reference does it.
+    ///
+    /// `newCapacity` grows by **half again** — `newCapacity + (newCapacity >> 1)`
+    /// — until the target fits, capped at `MAX_CATALOG_LENGTH`
+    /// (`Catalog.growCatalog`, `:866-880`). Not to the exact size that was
+    /// asked for: a catalog that grew by one record each time would remap for
+    /// every record once it filled up.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Full`] when even the maximum capacity cannot hold the
+    /// record — the reference has two messages for that, one for a catalog
+    /// already at its maximum and one for a record too big for what is left
+    /// (`:858-865`), and they are the same refusal to a caller.
+    fn grow(&mut self, needed: usize) -> Result<(), CatalogError> {
+        let target = self.next_offset + needed;
+
+        if target > MAX_CAPACITY {
+            return Err(CatalogError::Full {
+                needed,
+                remaining: MAX_CAPACITY.saturating_sub(self.next_offset),
+            });
+        }
+
+        let mut new_capacity = self.capacity();
+
+        while new_capacity < target {
+            // Half again, and never past the maximum. A capacity of zero would
+            // make this loop turn forever, which is why the minimum is a
+            // construction-time check rather than an assumption.
+            new_capacity = (new_capacity + (new_capacity >> 1)).min(MAX_CAPACITY);
+        }
+
+        self.file.grow(new_capacity)?;
+
+        Ok(())
     }
 
     /// Read a recording back by id.
@@ -1097,16 +1131,99 @@ mod tests {
         );
     }
 
-    /// A record that does not fit is refused rather than written past the end.
+    /// A catalog that runs out of room **grows** — by half again, and without
+    /// losing a byte of what is already in it.
+    ///
+    /// The three assertions are one claim: the records written before the growth
+    /// are still readable after it, the capacity is larger than the sum of the
+    /// frames (so it grew by more than the one record that did not fit), and a
+    /// reopened catalog finds everything — which is the walk over a file that
+    /// changed size under it.
     #[test]
-    fn a_record_that_does_not_fit_is_refused() {
+    fn a_catalog_that_runs_out_of_room_grows() {
         let dir = TempDir::new();
         let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID).expect("create");
+        let first = catalog
+            .add_recording(&recording(0))
+            .expect("the first fits");
 
-        let error = catalog.add_recording(&recording(0)).expect_err("no room");
+        // A `MIN_CAPACITY` catalog is its own header and nothing else — 32 bytes
+        // — so the very first record grows it. That is the path, not an edge of
+        // it: an archive that starts at the minimum size is one that grows on
+        // its first recording.
+        assert!(
+            catalog.capacity() > MIN_CAPACITY,
+            "the first record cannot fit 32 bytes, so the file grew: {}",
+            catalog.capacity()
+        );
+
+        let mut ids = vec![first];
+
+        for index in 1..8 {
+            ids.push(catalog.add_recording(&recording(index)).expect("grown"));
+        }
+
+        let capacity = catalog.capacity();
+
+        assert!(
+            capacity > MIN_CAPACITY,
+            "the file grew: {capacity} against {MIN_CAPACITY}"
+        );
+        assert_eq!(ids.len(), catalog.count_entries());
+
+        // The first record was written before any of that happened.
+        let mut expected = recording(0);
+        expected.recording_id = first;
+        assert_eq!(
+            expected,
+            catalog
+                .recording(first)
+                .expect("the first recording survived")
+        );
+
+        assert_eq!(
+            u64::try_from(capacity).expect("fits"),
+            std::fs::metadata(dir.file(FILENAME))
+                .expect("the file")
+                .len(),
+            "and the file on disk is the mapping's length"
+        );
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+
+        assert_eq!(capacity, reopened.capacity());
+        assert_eq!(
+            ids.len(),
+            reopened.count_entries(),
+            "every record is still there"
+        );
+        assert_eq!(NEXT_ID + 8, reopened.next_recording_id());
+
+        for (index, id) in ids.iter().enumerate() {
+            let mut expected = recording(index as i64);
+            expected.recording_id = *id;
+            assert_eq!(expected, reopened.recording(*id).expect("read back"));
+        }
+    }
+
+    /// Growing is refused when even the maximum capacity cannot hold what was
+    /// asked for, and the refusal leaves the catalog as it was.
+    ///
+    /// Asked of `grow` directly rather than through a record: the alternative is
+    /// a record of two gigabytes, and the arithmetic is the whole of the check.
+    #[test]
+    fn growth_past_the_maximum_is_refused() {
+        let dir = TempDir::new();
+        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID).expect("create");
+        let id = catalog.add_recording(&recording(0)).expect("added");
+
+        let before = catalog.capacity();
+        let error = catalog.grow(MAX_CAPACITY).expect_err("no such file");
+
         assert!(matches!(error, CatalogError::Full { .. }), "{error:?}");
-
-        assert_eq!(0, catalog.count_entries());
-        assert_eq!(NEXT_ID, catalog.next_recording_id(), "and nothing moved");
+        assert_eq!(before, catalog.capacity(), "and nothing changed");
+        assert_eq!(Some(id), catalog.recording_ids().next());
     }
 }
