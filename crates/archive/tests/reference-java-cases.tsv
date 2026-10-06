@@ -1,0 +1,351 @@
+# The reference's *Java* archive suite, one row per case — the denominator for
+# the P2-0c entry exam and, later, for LA-1.
+#
+# The sibling of `reference-cases.tsv`, which does this job for the reference's
+# *C* suite. The two instruments are not redundant: the C suite drives through
+# the C client from a separate process, this one through the Java client with
+# the archive in-process. The C ledger tracks what this crate owes; this one is
+# only ever a name set — the exam asks whether the driver can carry the
+# reference's archive, not whether our archive has caught up.
+#
+# Keys are the reference's own: `name` is JUnit's display name and `class` is
+# its `classname`. A `@ParameterizedTest`'s display name carries the arguments
+# and not the method name, so (class, name) must be unique within a class —
+# names are rendered with a method prefix by
+# `junit-parameterized-displayname.init.gradle`, and this refuses to write the
+# file if two cases in one class still collide.
+#
+# Growth rule: regenerating from a different reference commit is a deliberate
+# edit that shows up as a diff of names. Nothing is deleted quietly.
+#
+# case<TAB>class
+test(String, String) [1] requestChannel = "aeron:ipc", responseChannel = "aeron:ipc"	io.aeron.archive.ArchiveAbandonedClientTest
+test(String, String) [2] requestChannel = "aeron:udp?endpoint=localhost:10001", responseChannel = "aeron:udp?endpoint=localhost:10002"	io.aeron.archive.ArchiveAbandonedClientTest
+test(String, String) [3] requestChannel = "aeron:udp?endpoint=localhost:10001", responseChannel = "aeron:udp?control=localhost:10002|control-mode=response"	io.aeron.archive.ArchiveAbandonedClientTest
+shouldBeAbleToRecordWithAuthenticateOnChallengeResponse()	io.aeron.archive.ArchiveAuthenticationTest
+shouldBeAbleToRecordWithAuthenticateOnConnectRequestWithCredentials()	io.aeron.archive.ArchiveAuthenticationTest
+shouldBeAbleToRecordWithDefaultCredentialsAndAuthenticator()	io.aeron.archive.ArchiveAuthenticationTest
+shouldNotBeAbleToConnectWithRejectOnChallengeResponse()	io.aeron.archive.ArchiveAuthenticationTest
+shouldNotBeAbleToConnectWithRejectOnConnectRequest()	io.aeron.archive.ArchiveAuthenticationTest
+recordAndReplayExclusivePublication()	io.aeron.archive.ArchiveDeleteAndRestartTest
+shouldFailToUpdateChannelForARecordingThatDoesntExist()	io.aeron.archive.ArchiveListRecordingsTest
+shouldFilterByChannelUri()	io.aeron.archive.ArchiveListRecordingsTest
+shouldUpdateChannelForARecording()	io.aeron.archive.ArchiveListRecordingsTest
+archiveOperationsWithOversizedVarLengthValuesShouldNotBreakArchiveAndLogging(Path)	io.aeron.archive.ArchiveLoggingSystemTest
+shouldExitOnEmptyLiveRecording()	io.aeron.archive.ArchiveReplayTest
+shouldExitOnEmptyRecording()	io.aeron.archive.ArchiveReplayTest
+shouldExitOnNonEmptyLiveRecording()	io.aeron.archive.ArchiveReplayTest
+shouldNotErrorOnReplayThatHasAlreadyStopped()	io.aeron.archive.ArchiveReplayTest
+shouldNotExitWhenFollowingAnEmptyLiveRecording()	io.aeron.archive.ArchiveReplayTest
+shouldRemoveTokenOnAeronArchiveClose()	io.aeron.archive.ArchiveResponseClientFailuresTest
+shouldTimeoutReplyTokenChannel()	io.aeron.archive.ArchiveResponseClientFailuresTest
+shouldAsyncConnectUsingResponseChannel(String) [1] responseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldAsyncConnectUsingResponseChannel(String) [2] responseChannel = "aeron:udp?endpoint=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldBoundedReplayUsingResponseChannel()	io.aeron.archive.ArchiveResponseClientTest
+shouldConnectUsingLocalIpcResponseChannels()	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingIpcReplayChannel(String) [1] replayChannel = "aeron:ipc"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingIpcReplayChannel(String) [2] replayChannel = "aeron:ipc?session-id=1"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingIpcReplayChannel(String) [3] replayChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingIpcReplayChannel(String) [4] replayChannel = "aeron:ipc?control-mode=response|session-id=42"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingUdpReplayChannel(String) [1] replayChannel = "aeron:udp?endpoint=localhost:4042"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingUdpReplayChannel(String) [2] replayChannel = "aeron:udp?endpoint=localhost:4042|session=119"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingUdpReplayChannel(String) [3] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingUdpReplayChannel(String) [4] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
+shouldReplayUsingUdpReplayChannel(String) [5] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002|session-id=42"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartBoundedReplayUsingResponseChannel(String) [1] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartBoundedReplayUsingResponseChannel(String) [2] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartReplayUsingResponseChannel(String) [1] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartReplayUsingResponseChannel(String) [2] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
+recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [1] threadingMode = SHARED, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [2] threadingMode = SHARED_NETWORK, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [3] threadingMode = DEDICATED, archiveThreadingMode = DEDICATED	io.aeron.archive.ArchiveSystemTest
+recordAndReplayExclusivePublication(ThreadingMode, ArchiveThreadingMode) [1] threadingMode = SHARED, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+recordAndReplayExclusivePublication(ThreadingMode, ArchiveThreadingMode) [2] threadingMode = SHARED_NETWORK, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+recordAndReplayExclusivePublication(ThreadingMode, ArchiveThreadingMode) [3] threadingMode = DEDICATED, archiveThreadingMode = DEDICATED	io.aeron.archive.ArchiveSystemTest
+replayExclusivePublicationWhileRecording(ThreadingMode, ArchiveThreadingMode) [1] threadingMode = SHARED, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+replayExclusivePublicationWhileRecording(ThreadingMode, ArchiveThreadingMode) [2] threadingMode = SHARED_NETWORK, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
+replayExclusivePublicationWhileRecording(ThreadingMode, ArchiveThreadingMode) [3] threadingMode = DEDICATED, archiveThreadingMode = DEDICATED	io.aeron.archive.ArchiveSystemTest
+shouldHaveCorrectArchiveThreadNames(ArchiveThreadingMode, String, String[]) [1] threadingMode = DEDICATED, threadNaming = "classic", expectedThreadNames = [archive-recorder, archive-replayer, archive-conductor]	io.aeron.archive.ArchiveThreadNamingTest
+shouldHaveCorrectArchiveThreadNames(ArchiveThreadingMode, String, String[]) [2] threadingMode = DEDICATED, threadNaming = "new", expectedThreadNames = [aeron-ar-rec, aeron-ar-rep, aeron-ar-cnd]	io.aeron.archive.ArchiveThreadNamingTest
+shouldHaveCorrectArchiveThreadNames(ArchiveThreadingMode, String, String[]) [3] threadingMode = SHARED, threadNaming = "classic", expectedThreadNames = [archive-conductor]	io.aeron.archive.ArchiveThreadNamingTest
+shouldHaveCorrectArchiveThreadNames(ArchiveThreadingMode, String, String[]) [4] threadingMode = SHARED, threadNaming = "new", expectedThreadNames = [aeron-ar-shd]	io.aeron.archive.ArchiveThreadNamingTest
+shouldTruncateRecordingWithConcurrentReplay()	io.aeron.archive.ArchiveTruncateRecordingTest
+truncateRecordingShouldDeleteAllFilesWhenTruncatingToTheStartOfTheRecording()	io.aeron.archive.ArchiveTruncateRecordingTest
+truncateRecordingShouldDeleteAllFilesWhenTruncatingToZero()	io.aeron.archive.ArchiveTruncateRecordingTest
+truncateRecordingShouldDeleteSegmentFilesPastPositionAndEraseAlreadyWrittenData()	io.aeron.archive.ArchiveTruncateRecordingTest
+jumboRecordingDescriptorEndToEndTest()	io.aeron.archive.BasicArchiveTest
+purgeRecording()	io.aeron.archive.BasicArchiveTest
+purgeRecordingFailsIfRecordingIsActive()	io.aeron.archive.BasicArchiveTest
+purgeRecordingFailsIfThereAreActiveReplays()	io.aeron.archive.BasicArchiveTest
+shakeListingAndPurgingRecordings()	io.aeron.archive.BasicArchiveTest
+shouldErrorReplayFileIoMaxLengthLessThanMtu()	io.aeron.archive.BasicArchiveTest
+shouldFindLastMatchingRecordingIdWithFullUri()	io.aeron.archive.BasicArchiveTest
+shouldNotListRecordingThatWasPurged()	io.aeron.archive.BasicArchiveTest
+shouldRecordReplayAndCancelReplayEarly()	io.aeron.archive.BasicArchiveTest
+shouldRecordThenReplayThenTruncate()	io.aeron.archive.BasicArchiveTest
+shouldReplayRecordingFromLateJoinPosition()	io.aeron.archive.BasicArchiveTest
+shouldReturnNullValueWithFindLastMatchingRecordingIdDoesNotFindTheRecording()	io.aeron.archive.BasicArchiveTest
+shouldStopAllReplaysWithoutConsumingAnEntireRecording()	io.aeron.archive.BasicArchiveTest
+shouldStopReplayWithoutConsumingAnEntireRecording()	io.aeron.archive.BasicArchiveTest
+listRecording()	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [1] fromRecordingId = 9223372036854775807, recordCount = 5, expectedRecordCount = 0	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [2] fromRecordingId = -1, recordCount = 10, expectedRecordCount = 10	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [3] fromRecordingId = 2, recordCount = 10, expectedRecordCount = 10	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [4] fromRecordingId = 5, recordCount = 64, expectedRecordCount = 64	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [5] fromRecordingId = 25, recordCount = 100, expectedRecordCount = 100	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [6] fromRecordingId = 10, recordCount = 128, expectedRecordCount = 128	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordings(long, int, int) [7] fromRecordingId = 182, recordCount = 64, expectedRecordCount = 5	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [1] fromRecordingId = 9223372036854775807, recordCount = 5, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 0	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [2] fromRecordingId = -1, recordCount = 10, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 10	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [3] fromRecordingId = 2, recordCount = 10, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 10	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [4] fromRecordingId = -1, recordCount = 10, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 0, expectedRecordCount = 0	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [5] fromRecordingId = -1, recordCount = 10, channelFragment = "ch2?tag=OKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK…", streamId = 2, expectedRecordCount = 0	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [6] fromRecordingId = 5, recordCount = 64, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 53	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [7] fromRecordingId = 10, recordCount = 128, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 51	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+listRecordingsForUri(long, int, String, int, int) [8] fromRecordingId = 182, recordCount = 64, channelFragment = "ch3?tag=OK|endpoint=localhost:8089", streamId = 2, expectedRecordCount = 2	io.aeron.archive.CatalogWithJumboRecordingsAndGapsTest
+shouldMergeTwoIndependentStreams(boolean) [1] concurrent = true	io.aeron.archive.DualReplayMergeTest
+shouldMergeTwoIndependentStreams(boolean) [2] concurrent = false	io.aeron.archive.DualReplayMergeTest
+shouldDisallowConcurrentExtendRecordingOperations()	io.aeron.archive.ExtendRecordingTest
+shouldExtendRecordingAndReplay(boolean) [1] exclusive = true	io.aeron.archive.ExtendRecordingTest
+shouldExtendRecordingAndReplay(boolean) [2] exclusive = false	io.aeron.archive.ExtendRecordingTest
+shouldRejectExtendRecordingAttemptIfRecordingSessionIsPresent()	io.aeron.archive.ExtendRecordingTest
+shouldTruncateAndExtendFromTheMiddleOfTheTerm()	io.aeron.archive.ExtendRecordingTest
+deleteDetachedSegmentsIsANoOpIfNoFilesWereDetached(long) [1] startPosition = 0	io.aeron.archive.ManageRecordingHistoryTest
+deleteDetachedSegmentsIsANoOpIfNoFilesWereDetached(long) [2] startPosition = 131136	io.aeron.archive.ManageRecordingHistoryTest
+shouldAttachSegmentsWhenFirstSegmentGapExceedsFileIoMaxLength()	io.aeron.archive.ManageRecordingHistoryTest
+shouldDeleteDetachedFullSegments()	io.aeron.archive.ManageRecordingHistoryTest
+shouldDeleteDetachedSegmentsWhenStartNotSegmentAligned()	io.aeron.archive.ManageRecordingHistoryTest
+shouldDetachThenAttachFullSegments()	io.aeron.archive.ManageRecordingHistoryTest
+shouldDetachThenAttachWhenStartNotSegmentAligned()	io.aeron.archive.ManageRecordingHistoryTest
+shouldPurgeForLateJoinedStream()	io.aeron.archive.ManageRecordingHistoryTest
+shouldPurgeForStreamJoinedAtTheBeginning()	io.aeron.archive.ManageRecordingHistoryTest
+shouldPurgeRecording()	io.aeron.archive.ManageRecordingHistoryTest
+migrateSegmentsShouldThrow(FailureCaseParams) [10] testCase = {source={startPosition=0, recordedPosition=1024, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=1024, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [11] testCase = {source={startPosition=262144, recordedPosition=393216, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=131072, followingSegment=TRUNCATE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [12] testCase = {source={startPosition=262144, recordedPosition=393216, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [13] testCase = {source={startPosition=262144, recordedPosition=393216, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=LIVE}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [14] testCase = {source={startPosition=262144, recordedPosition=655360, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}, archiveDirPerturbation=DeleteSrcSegment(393216)}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [15] testCase = {source={startPosition=262144, recordedPosition=655360, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}, archiveDirPerturbation=AddDstSegment(393216)}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [1] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [2] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [3] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [4] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [5] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=LIVE}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [6] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, destination={startPosition=393216, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [7] testCase = {source={startPosition=0, recordedPosition=393216, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=393216, recordedPosition=655360, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=DeleteSrcSegment(131072)}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [8] testCase = {source={startPosition=0, recordedPosition=393216, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=393216, recordedPosition=655360, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=AddDstSegment(131072)}	io.aeron.archive.MigrateSegmentsTest
+migrateSegmentsShouldThrow(FailureCaseParams) [9] testCase = {source={startPosition=0, recordedPosition=65536, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=65536, recordedPosition=262144, followingSegment=LEAVE_ALONE, state=STOPPED}, archiveDirPerturbation=None}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [1] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=ASSERT_EXISTS, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [2] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=ASSERT_EXISTS, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=ASSERT_EXISTS, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [3] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=RENAME_FOR_DELETION, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=ASSERT_EXISTS, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [4] testCase = {source={startPosition=131328, recordedPosition=262144, followingSegment=ASSERT_EXISTS, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=ASSERT_EXISTS, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [5] testCase = {source={startPosition=0, recordedPosition=262144, followingSegment=ASSERT_EXISTS, state=STOPPED}, destination={startPosition=262144, recordedPosition=524288, followingSegment=LEAVE_ALONE, state=LIVE}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [6] testCase = {source={startPosition=262144, recordedPosition=524288, followingSegment=TRUNCATE, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [7] testCase = {source={startPosition=262144, recordedPosition=524288, followingSegment=ASSERT_EXISTS, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMigrateSegments(TestCaseParams) [8] testCase = {source={startPosition=262144, recordedPosition=524288, followingSegment=RENAME_FOR_DELETION, state=STOPPED}, destination={startPosition=0, recordedPosition=262144, followingSegment=TRUNCATE, state=STOPPED}}	io.aeron.archive.MigrateSegmentsTest
+shouldMergeFromReplayToLive()	io.aeron.archive.ReplayMergeTest
+shouldErrorReplicateIfFileIoMaxLengthIsLessThanMtu()	io.aeron.archive.ReplicateRecordingTest
+shouldFailReplicationWithUsefulErrorWithChallengeResponseAuthentication()	io.aeron.archive.ReplicateRecordingTest
+shouldHandleMultipleConcurrentReplicationsToSeveralArchives(boolean, Path) [1] useResponseChannels = true	io.aeron.archive.ReplicateRecordingTest
+shouldHandleMultipleConcurrentReplicationsToSeveralArchives(boolean, Path) [2] useResponseChannels = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMerge(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMerge(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeBeforeDataFlows(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeBeforeDataFlows(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeIntoADestinationIpcOnlyArchive(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeIntoADestinationIpcOnlyArchive(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeWhileFollowingWithTaggedSubscription(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndMergeWhileFollowingWithTaggedSubscription(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndStopAtSpecifiedPosition(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveRecordingAndStopAtSpecifiedPosition(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveWithoutMergingRecording(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateLiveWithoutMergingRecording(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateMoreThanOnce()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateRecordingWithCustomSessionId()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecording(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecording(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingOverAnExistingTruncatedRecordingReplacingAllParameters(String, String, int, int) [1] srcChannel = "aeron:ipc?alias=src-recording|mtu=1344|init-term-id=777|term-id=1111112|term-offset=4096|term-length=512K", dstChannel = "aeron:udp?alias=OTHER|endpoint=localhost:8108|term-length=1G", srcMessageCount = "5", dstMessageCount = "1"	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingOverAnExistingTruncatedRecordingReplacingAllParameters(String, String, int, int) [2] srcChannel = "aeron:udp?alias=OTHER|endpoint=localhost:8108|term-length=1G", dstChannel = "aeron:ipc?alias=dst-recording|mtu=1344|init-term-id=1111111|term-id=1111112|term-offset=4096|term-length=512K", srcMessageCount = "3", dstMessageCount = "10"	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingOverAnExistingTruncatedRecordingReplacingAllParameters(String, String, int, int) [3] srcChannel = "aeron:udp?endpoint=localhost:8108|mtu=1344|init-term-id=11|term-id=15|term-offset=1024|term-length=512K", dstChannel = "aeron:udp?endpoint=localhost:8109|mtu=1376|init-term-id=222|term-id=333|term-offset=96|term-length=256M", srcMessageCount = "7", dstMessageCount = "4"	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingOverAnExistingTruncatedRecordingReplacingAllParameters(String, String, int, int) [4] srcChannel = "aeron:ipc?alias=src", dstChannel = "aeron:udp?alias=dst|endpoint=localhost:8080", srcMessageCount = "21", dstMessageCount = "21"	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingOverAnExistingTruncatedRecordingReplacingAllParameters(String, String, int, int) [5] srcChannel = "aeron:udp?alias=src|endpoint=localhost:8080|init-term-id=3|term-id=5|term-length=64K|term-offset=64", dstChannel = "aeron:ipc?alias=dst|init-term-id=11|term-id=13|term-length=64K|term-offset=2752", srcMessageCount = "42", dstMessageCount = "19"	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingWithFileIoMaxLength()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingWithResponseChannel()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateStoppedRecordingsConcurrently()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateSyncedRecording(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateSyncedRecording(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateWithAuthentication()	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateWithOlderVersion(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldReplicateWithOlderVersion(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionLiveDestinationUsedWithResponseChannels()	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionTagsUsedWithResponseChannels()	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionWhenDstRecordingIdUnknown(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionWhenDstRecordingIdUnknown(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionWhenSrcRecordingIdUnknown(boolean) [1] useParams = true	io.aeron.archive.ReplicateRecordingTest
+shouldThrowExceptionWhenSrcRecordingIdUnknown(boolean) [2] useParams = false	io.aeron.archive.ReplicateRecordingTest
+shouldRejectDeleteAttemptIfAnotherOneInProgress()	io.aeron.archive.ValidationTests
+shouldRejectExtendRecordingRequestIfTruncationIsInProgress()	io.aeron.archive.ValidationTests
+shouldRejectExtendRecordingSessionIfTruncateIsInProgress()	io.aeron.archive.ValidationTests
+shouldAllowToStopReplay()	io.aeron.archive.client.AsyncAeronArchiveTest
+shouldCloseItselfIfErrorIsTerminal()	io.aeron.archive.client.AsyncAeronArchiveTest
+test()	io.aeron.archive.client.AsyncAeronArchiveTest
+anUntetheredPersistentSubscriptionCanFallBehindATetheredSubscription(String) [1] channel = "aeron:udp?endpoint=localhost:2000"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+anUntetheredPersistentSubscriptionCanFallBehindATetheredSubscription(String) [2] channel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canFallbackToReplayAfterStartingFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canFallbackToReplayInTheMiddleOfAFragmentedMessage()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canJoinALiveStreamAtTheBeginning()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canJoinLiveInTheMiddleOfAFragmentedMessage()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canJoinLiveWhenLiveAndReplayAreAdvancing()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canStartAtRecordingStopPositionWhenLiveHasNotAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canStartFromLiveWhenRecordingHasStopped()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+canSwitchFromReplayToLiveWhenLivePositionIsAheadOfReplayPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+cannotFallbackToReplayWhenRecordingHasBeenRemoved()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+cannotFallbackToReplayWhenRecordingHasStoppedAtAnEarlierPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+fallbackFromLiveFailsWhenRecordingStoppedBeforeLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldAssembleMessages()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldCatchUpWhenStartingAtStopPositionAndRecordingResumes()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldCatchUpWhenStartingAtStopPositionOfExtendedRecording()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldCloseArchiveConnectionOnFailureInCaseApplicationKeepsPolling()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [1] fragmentLimit = 1, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [2] fragmentLimit = 1, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [3] fragmentLimit = 1, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [4] fragmentLimit = 10, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [5] fragmentLimit = 10, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [6] fragmentLimit = 10, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [7] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [8] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [9] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldContinueConsumingFromLiveWhileArchiveIsUnavailable()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldCreateOwnAeronInstanceWhenNotSupplied()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldDropFromLiveBackToReplayThenJoinLiveAgain()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorIfRecordingDoesNotExist()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorIfRecordingStreamDoesNotMatchLiveStream()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsAfterRecordingLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsAfterStopPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsBeforeRecordingStartPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldErrorWhenStartPositionDoesNotAlignWithFrame()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldFailIfLiveStreamPositionGoesBackwards()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldHandOffToLiveWhenReplayCatchesUpAtPublisherJoinPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldHandleReplayBeingAheadOfLive()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldJoinLiveUponReachingEndOfRecordingWhenLiveBecomesAvailable()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldNotCloseSuppliedAeronInstance()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldNotReplayOldMessagesWhenStartingFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldNotRequireEventListener()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithHeavyReplayLoss()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithLossOnLiveChannel()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithModerateReplayLoss()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReconnectToTheArchiveAfterArchiveRestart(Path)	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRecoverFromArchiveRestartDuringReplay(Path)	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRecoverFromReplayChannelNetworkProblems()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRecoverWhenThePersistentPublicationIsRestartedDuringReplay()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRecoverWhenThePersistentPublicationIsRestartedWhileOnLive()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRefreshAndReplayWhenLiveAheadOfStopPositionAfterResume()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRejoinLiveEvenIfNoFragmentsHaveBeenConsumedAfterJoiningFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayAndCatchUpWhenExtendedRecordingIsAheadOfLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayExistingRecordingThenJoinLive(int) [1] fragmentLimit = 1	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayExistingRecordingThenJoinLive(int) [2] fragmentLimit = 10	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayFromRecordingStartPositionWhenStartingFromStart(long) [1] recordingStartPosition = 0	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayFromRecordingStartPositionWhenStartingFromStart(long) [2] recordingStartPosition = 1024	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayFromSpecificMidRecordingPosition()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [10] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|endpoint=localhost:0", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [11] replayChannel = "aeron:ipc?control-mode=response", replayStreamId = -11, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [12] replayChannel = "aeron:ipc?control-mode=response|session-id=42", replayStreamId = -11, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [13] replayChannel = "aeron:ipc?control-mode=response|session-id=555", replayStreamId = -555, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [1] replayChannel = "aeron:udp?endpoint=localhost:0", replayStreamId = -10, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [2] replayChannel = "aeron:udp?endpoint=localhost:10001", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [3] replayChannel = "aeron:udp?endpoint=localhost:0|session-id=6", replayStreamId = -10, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [4] replayChannel = "aeron:udp?endpoint=localhost:10001|session-id=901", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [5] replayChannel = "aeron:ipc", replayStreamId = -12, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [6] replayChannel = "aeron:ipc?session-id=8", replayStreamId = -12, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [7] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [8] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|session-id=555", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [9] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|endpoint=localhost:5006", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenArchiveIsNotAvailableDuringStartUp(long, Path) [1] startPosition = -1	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenArchiveIsNotAvailableDuringStartUp(long, Path) [2] startPosition = -2	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenLiveIsNotAvailableDuringStartUp()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldStartFromLiveWhenThereIsNoDataToReplay()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldStartFromStoppedRecordingAndErrorWhenLiveHasAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldStartFromStoppedRecordingAndJoinLiveWhenLiveHasNotAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldStayOnReplayWhenLiveCannotConnect()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+shouldTransitionToLiveThroughLossyReplayWhilePublishing()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+untetheredSpyCanFallbackToReplay()	io.aeron.archive.client.PersistentSubscriptionTest$ControlledPollingPersistentSubscriptionTest
+anUntetheredPersistentSubscriptionCanFallBehindATetheredSubscription(String) [1] channel = "aeron:udp?endpoint=localhost:2000"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+anUntetheredPersistentSubscriptionCanFallBehindATetheredSubscription(String) [2] channel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canFallbackToReplayAfterStartingFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canFallbackToReplayInTheMiddleOfAFragmentedMessage()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canJoinALiveStreamAtTheBeginning()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canJoinLiveInTheMiddleOfAFragmentedMessage()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canJoinLiveWhenLiveAndReplayAreAdvancing()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canStartAtRecordingStopPositionWhenLiveHasNotAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canStartFromLiveWhenRecordingHasStopped()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+canSwitchFromReplayToLiveWhenLivePositionIsAheadOfReplayPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+cannotFallbackToReplayWhenRecordingHasBeenRemoved()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+cannotFallbackToReplayWhenRecordingHasStoppedAtAnEarlierPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+fallbackFromLiveFailsWhenRecordingStoppedBeforeLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldAssembleMessages()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldCatchUpWhenStartingAtStopPositionAndRecordingResumes()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldCatchUpWhenStartingAtStopPositionOfExtendedRecording()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldCloseArchiveConnectionOnFailureInCaseApplicationKeepsPolling()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [1] fragmentLimit = 1, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [2] fragmentLimit = 1, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [3] fragmentLimit = 1, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [4] fragmentLimit = 10, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [5] fragmentLimit = 10, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [6] fragmentLimit = 10, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [7] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron:ipc", publicationChannel = "aeron:ipc"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [8] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost", publicationChannel = "aeron:udp?endpoint=224.20.30.39:14456|interface=localhost"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldConsumeLiveOverConfiguredChannel(int, String, String) [9] fragmentLimit = 2147483647, persistentSubscriptionChannel = "aeron-spy:aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max", publicationChannel = "aeron:udp?control=localhost:2000|control-mode=dynamic|fc=max"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldContinueConsumingFromLiveWhileArchiveIsUnavailable()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldCreateOwnAeronInstanceWhenNotSupplied()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldDropFromLiveBackToReplayThenJoinLiveAgain()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorIfRecordingDoesNotExist()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorIfRecordingStreamDoesNotMatchLiveStream()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsAfterRecordingLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsAfterStopPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorIfStartPositionIsBeforeRecordingStartPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldErrorWhenStartPositionDoesNotAlignWithFrame()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldFailIfLiveStreamPositionGoesBackwards()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldHandOffToLiveWhenReplayCatchesUpAtPublisherJoinPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldHandleReplayBeingAheadOfLive()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldJoinLiveUponReachingEndOfRecordingWhenLiveBecomesAvailable()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldNotCloseSuppliedAeronInstance()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldNotReplayOldMessagesWhenStartingFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldNotRequireEventListener()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithHeavyReplayLoss()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithLossOnLiveChannel()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReceiveAllMessagesWithModerateReplayLoss()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReconnectToTheArchiveAfterArchiveRestart(Path)	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRecoverFromArchiveRestartDuringReplay(Path)	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRecoverFromReplayChannelNetworkProblems()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRecoverWhenThePersistentPublicationIsRestartedDuringReplay()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRecoverWhenThePersistentPublicationIsRestartedWhileOnLive()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRefreshAndReplayWhenLiveAheadOfStopPositionAfterResume()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRejoinLiveEvenIfNoFragmentsHaveBeenConsumedAfterJoiningFromLive()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayAndCatchUpWhenExtendedRecordingIsAheadOfLivePosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayExistingRecordingThenJoinLive(int) [1] fragmentLimit = 1	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayExistingRecordingThenJoinLive(int) [2] fragmentLimit = 10	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayFromRecordingStartPositionWhenStartingFromStart(long) [1] recordingStartPosition = 0	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayFromRecordingStartPositionWhenStartingFromStart(long) [2] recordingStartPosition = 1024	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayFromSpecificMidRecordingPosition()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [10] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|endpoint=localhost:0", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [11] replayChannel = "aeron:ipc?control-mode=response", replayStreamId = -11, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [12] replayChannel = "aeron:ipc?control-mode=response|session-id=42", replayStreamId = -11, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [13] replayChannel = "aeron:ipc?control-mode=response|session-id=555", replayStreamId = -555, archiveControlRequestChannel = "aeron:ipc", archiveControlResponseChannel = "aeron:ipc?control-mode=response"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [1] replayChannel = "aeron:udp?endpoint=localhost:0", replayStreamId = -10, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [2] replayChannel = "aeron:udp?endpoint=localhost:10001", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [3] replayChannel = "aeron:udp?endpoint=localhost:0|session-id=6", replayStreamId = -10, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [4] replayChannel = "aeron:udp?endpoint=localhost:10001|session-id=901", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [5] replayChannel = "aeron:ipc", replayStreamId = -12, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [6] replayChannel = "aeron:ipc?session-id=8", replayStreamId = -12, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?endpoint=localhost:0"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [7] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [8] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|session-id=555", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldReplayOverConfiguredChannel(String, int, String, String) [9] replayChannel = "aeron:udp?control=localhost:10001|control-mode=response|endpoint=localhost:5006", replayStreamId = -11, archiveControlRequestChannel = "aeron:udp?endpoint=localhost:8010", archiveControlResponseChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenArchiveIsNotAvailableDuringStartUp(long, Path) [1] startPosition = -1	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenArchiveIsNotAvailableDuringStartUp(long, Path) [2] startPosition = -2	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldRetryAndRecoverWhenLiveIsNotAvailableDuringStartUp()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldStartFromLiveWhenThereIsNoDataToReplay()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldStartFromStoppedRecordingAndErrorWhenLiveHasAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldStartFromStoppedRecordingAndJoinLiveWhenLiveHasNotAdvanced()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldStayOnReplayWhenLiveCannotConnect()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+shouldTransitionToLiveThroughLossyReplayWhilePublishing()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest
+untetheredSpyCanFallbackToReplay()	io.aeron.archive.client.PersistentSubscriptionTest$UncontrolledPollingPersistentSubscriptionTest

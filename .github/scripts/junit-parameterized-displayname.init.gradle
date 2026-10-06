@@ -1,0 +1,25 @@
+// P2-0c: give a @ParameterizedTest's JUnit display name a method prefix.
+//
+// Gradle's XML carries only `classname` and `name`, and for a parameterized
+// test `name` is the *display* name — the argument rendering, with no method
+// name in it. So two parameterized methods in one class that are fed the same
+// arguments produce byte-identical `<testcase>` elements. Measured, not
+// supposed: `ArchiveSystemTest` is three methods over three threading-mode
+// pairs, and each display name occurs **three** times. A ledger keyed on
+// (classname, name) would hold 3 rows for 9 cases and lose 6 silently — in the
+// one artifact whose whole job is to be the denominator.
+//
+// JUnit 5.8+ reads the default display-name pattern from the configuration
+// parameter `junit.jupiter.params.displayname.default`, and `{displayName}` is
+// the method's own display name. Prefixing with it makes the key unique.
+//
+// An init script rather than an edit, because the reference checkout is pinned
+// at 664f58e705 and is not ours to touch; `--init-script` is the Gradle-shaped
+// equivalent of the `-D` switches everything else in this harness uses.
+
+allprojects {
+    tasks.withType(Test).configureEach {
+        systemProperty 'junit.jupiter.params.displayname.default',
+            '{displayName} [{index}] {argumentsWithNames}'
+    }
+}
