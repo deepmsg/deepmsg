@@ -75,7 +75,7 @@ use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver
 
 use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::{ControlledHandler, Message};
-use crate::image::{Fragment, Image};
+use crate::image::{Block, Fragment, Image};
 use crate::image_event::ImageEvent;
 use crate::publication::{Claim, ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
@@ -2210,6 +2210,49 @@ impl Client {
                 .find(|i| i.registration_id() == image_registration_id)?;
 
             let read = image.poll(fragment_limit, handler);
+
+            (image.subscriber_position_id(), image.position(), read)
+        };
+
+        if let Some(counters) = self.cnc.counters_writable() {
+            counters.set_value(counter_id, position);
+        }
+
+        Some(read)
+    }
+
+    /// Read one run of frames from one image, up to `block_length_limit` bytes,
+    /// and hand the whole run to `handler`.
+    ///
+    /// [`Client::poll_image`]'s counterpart for the block face: the same image,
+    /// the same publishing of the reader's position afterwards, and a count in
+    /// **bytes** rather than fragments. It is here for the reason every poll on
+    /// an image is: this client hands images out borrowed, so a caller outside
+    /// it cannot reach [`Image::block_poll`] itself — and the position it moves
+    /// is the client's to publish.
+    ///
+    /// `None` when this client holds no image with those ids.
+    pub fn block_poll_image<F>(
+        &mut self,
+        subscription_id: i64,
+        image_registration_id: i64,
+        block_length_limit: usize,
+        handler: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(&Block<'_>),
+    {
+        let (counter_id, position, read) = {
+            let subscription = self
+                .subscriptions
+                .iter_mut()
+                .find(|s| s.registration_id() == subscription_id)?;
+            let image = subscription
+                .images_mut()
+                .iter_mut()
+                .find(|i| i.registration_id() == image_registration_id)?;
+
+            let read = image.block_poll(block_length_limit, handler);
 
             (image.subscriber_position_id(), image.position(), read)
         };

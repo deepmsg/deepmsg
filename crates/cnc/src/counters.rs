@@ -313,6 +313,67 @@ impl<'a, Access> CountersReader<'a, Access> {
 /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1038-1055`).
 pub const CLIENT_HEARTBEAT_TYPE_ID: i32 = 11;
 
+/// `AERON_COUNTER_LOCAL_SOCKADDR_TYPE_ID`
+/// (`aeron-client/src/main/c/aeron_counters.h:109`).
+///
+/// One per endpoint or destination, and the address it actually bound to is in
+/// its **key** rather than its value — which is the only place the port a
+/// kernel chose for `:0` can be read from, and therefore what
+/// `ReplayMerge` reads when it has to build a replay channel.
+pub const LOCAL_SOCKADDR_TYPE_ID: i32 = 14;
+
+/// `AERON_COUNTER_CHANNEL_ENDPOINT_STATUS_ACTIVE`
+/// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:32`).
+///
+/// What a channel-status counter holds once its socket is bound and usable, and
+/// the value a reader has to see before either the channel's status or an
+/// address beside it means anything. The values on either side —
+/// `INITIALIZING` (0) before the socket exists, `CLOSING` (2) and `ERRORED`
+/// (-1) after it — are the driver's to write and this side's to read past.
+pub const CHANNEL_ENDPOINT_STATUS_ACTIVE: i64 = 1;
+
+/// The address an endpoint or destination bound to, read out of the key of a
+/// [`LOCAL_SOCKADDR_TYPE_ID`] counter.
+///
+/// The layout is `aeron_local_sockaddr_key_layout_t`
+/// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:62-68`): the
+/// channel-status counter the address belongs to, the length of the address,
+/// and the address as text. A reader finds the address by the id and reads the
+/// text beside it, which is what `aeron_local_sockaddr_find_addrs` does from
+/// the C client (`aeron-client/src/main/c/status/aeron_local_sockaddr.c:95-131`)
+/// and `LocalSocketAddressStatus.findAddress` from Java.
+///
+/// Decoding is checked rather than trusting: the address field's length is the
+/// writer's, and a key is 112 bytes whatever the address needs.
+pub struct LocalSocketAddress<'a> {
+    /// The `snd-channel` or `rcv-channel` counter of the endpoint this address
+    /// belongs to.
+    pub channel_status_id: i32,
+    /// The bound address as text, e.g. `127.0.0.1:40456`.
+    pub address: &'a str,
+}
+
+impl<'a> LocalSocketAddress<'a> {
+    /// Where the address starts, after the two `int32`s.
+    const ADDRESS_OFFSET: usize = 8;
+
+    /// Read the address out of a counter's key.
+    ///
+    /// `None` when the key is too short to hold the two `int32`s, when the
+    /// address its length claims reaches past the key, or when those bytes are
+    /// not UTF-8.
+    pub fn decode(key: &'a [u8]) -> Option<Self> {
+        let channel_status_id = i32::from_le_bytes(key.get(..4)?.try_into().ok()?);
+        let length = usize::try_from(i32::from_le_bytes(key.get(4..8)?.try_into().ok()?)).ok()?;
+        let address = key.get(Self::ADDRESS_OFFSET..Self::ADDRESS_OFFSET.checked_add(length)?)?;
+
+        Some(Self {
+            channel_status_id,
+            address: std::str::from_utf8(address).ok()?,
+        })
+    }
+}
+
 /// The write half, available only on counters built from writable memory.
 impl<'a> CountersReader<'a, ReadWrite> {
     /// Write a counter's value.
@@ -665,5 +726,53 @@ mod tests {
 
         assert!(reader.get(2).is_none(), "the scan stops at the gap");
         assert!(reader.is_active(2, CLIENT_HEARTBEAT_TYPE_ID, 7));
+    }
+
+    /// The address a local-address counter carries, laid out as the reference
+    /// lays it out: the channel status, the length, then the text.
+    #[test]
+    fn a_local_address_is_read_out_of_its_key() {
+        let mut key = [0u8; layout::COUNTER_KEY_LENGTH];
+        key[..4].copy_from_slice(&312_i32.to_le_bytes());
+        key[4..8].copy_from_slice(&15_i32.to_le_bytes());
+        key[8..23].copy_from_slice(b"127.0.0.1:40456");
+
+        let address = LocalSocketAddress::decode(&key).expect("a well-formed key");
+
+        assert_eq!(312, address.channel_status_id);
+        assert_eq!("127.0.0.1:40456", address.address);
+
+        // The length is the writer's, so it is checked rather than trusted —
+        // and the three ways it can be wrong are all `None` rather than a
+        // short read or a panic.
+        let mut too_long = key;
+        too_long[4..8].copy_from_slice(&9000_i32.to_le_bytes());
+        assert!(
+            LocalSocketAddress::decode(&too_long).is_none(),
+            "past the key"
+        );
+
+        let mut negative = key;
+        negative[4..8].copy_from_slice(&(-1_i32).to_le_bytes());
+        assert!(LocalSocketAddress::decode(&negative).is_none(), "negative");
+
+        let mut not_text = key;
+        not_text[8] = 0xFF;
+        not_text[9] = 0xFE;
+        assert!(LocalSocketAddress::decode(&not_text).is_none(), "not UTF-8");
+
+        assert!(
+            LocalSocketAddress::decode(&key[..7]).is_none(),
+            "shorter than the layout"
+        );
+
+        // Zero length is a key a writer made but has not filled in yet: an
+        // address of no bytes, which is not an address.
+        let mut empty = key;
+        empty[4..8].copy_from_slice(&0_i32.to_le_bytes());
+        assert_eq!(
+            "",
+            LocalSocketAddress::decode(&empty).expect("empty").address
+        );
     }
 }

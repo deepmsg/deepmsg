@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_client::image_event::ImageEvent;
 use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN;
+use deepmsg_core::logbuffer::descriptor::{END_OF_STREAM_OPEN, FRAME_ALIGNMENT};
+use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
+use deepmsg_core::logbuffer::position::align_up;
 use deepmsg_tests::driver::{self, OwnDriver};
 
 /// The stream every test here uses.
@@ -288,4 +290,191 @@ fn an_images_state_is_readable_from_the_client() {
 
     // And the publication is still there, so nothing above was the last gasp.
     assert!(client.publication(publication).is_some());
+}
+
+/// Publish one message, waiting out back pressure.
+///
+/// The log buffer is finite and the subscriber in these tests has not read
+/// anything yet, so an offer can come back `BackPressured` before it is taken.
+fn offer(client: &mut Client, publication: i64, payload: &[u8]) {
+    let deadline = Instant::now() + DEADLINE;
+
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the publication never took the message"
+        );
+        client.poll();
+
+        match client.offer(publication, payload) {
+            Some(Appended::Ok { .. }) => return,
+            Some(Appended::BackPressured) => {}
+            other => panic!("offer came back {other:?}"),
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The other name an image has: the **session** its stream is in.
+///
+/// The registration id an image carries is this client's own bookkeeping — a
+/// publication on another client never had one here — so a caller handed "the
+/// image on session 7" has nothing else to look it up by. The session is the
+/// id the driver gave the publication, and every frame of the stream carries
+/// it, which is what makes it the name the archive's replay-merge can use.
+#[test]
+fn an_image_is_found_by_the_session_its_stream_is_in() {
+    let Some((_own, mut client)) = own_driver_and_client("image-by-session") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    let image_registration_id = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("the image")
+        .registration_id();
+    let session_id = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("the image")
+        .session_id();
+
+    let found = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .image_by_session_id(session_id)
+        .expect("the image, by the session it is in");
+
+    assert_eq!(image_registration_id, found.registration_id());
+
+    assert!(
+        client
+            .subscription(subscription)
+            .expect("the subscription")
+            .image_by_session_id(session_id.wrapping_add(1))
+            .is_none(),
+        "a session this subscription is not reading answers nothing"
+    );
+
+    assert!(client.publication(publication).is_some());
+}
+
+/// The block face, reached the way a caller reaches it: through the client.
+///
+/// `Image::block_poll` cannot be called from outside — this client lends
+/// images out borrowed, and it is the client that publishes the reader's
+/// position afterwards — so `block_poll_image` is the door, and this is what
+/// it is for: a recorder copying runs of frames out rather than being called
+/// once per frame (`RecordingSession.java:237`).
+#[test]
+fn a_run_of_frames_can_be_read_in_one_call() {
+    let Some((_own, mut client)) = own_driver_and_client("image-block-poll") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    const MESSAGES: usize = 4;
+    const PAYLOAD: &[u8] = b"four";
+
+    for _ in 0..MESSAGES {
+        offer(&mut client, publication, PAYLOAD);
+    }
+
+    let image = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("the image");
+
+    let image_registration_id = image.registration_id();
+    let session_id = image.session_id();
+    let position_before = image.position();
+    let subscriber_position_id = image.subscriber_position_id();
+
+    let mut blocks = Vec::new();
+    let read = client
+        .block_poll_image(subscription, image_registration_id, 4096, |block| {
+            let mut bytes = vec![0u8; block.length()];
+            assert!(block.copy_out(&mut bytes).is_some(), "the block fits");
+
+            blocks.push((block.length(), block.session_id(), bytes));
+        })
+        .expect("the image this client holds");
+
+    // One call, one run: four frames that were written one after another.
+    let reach = usize::try_from(align_up(
+        i32::try_from(DATA_HEADER_LENGTH + PAYLOAD.len()).expect("small"),
+        FRAME_ALIGNMENT,
+    ))
+    .expect("positive");
+
+    assert_eq!(1, blocks.len(), "one run, one call");
+    assert_eq!(reach * MESSAGES, read, "and the count is in bytes");
+    assert_eq!(&read, &blocks[0].0);
+    assert_eq!(&session_id, &blocks[0].1, "the stream the frames came from");
+
+    for index in 0..MESSAGES {
+        let start = index * reach + DATA_HEADER_LENGTH;
+        assert_eq!(
+            PAYLOAD,
+            &blocks[0].2[start..start + PAYLOAD.len()],
+            "frame {index} of the run"
+        );
+    }
+
+    // The position moved over the run, and it is the counter's now — which the
+    // next call sees as "nothing left" rather than as the same run again.
+    assert_eq!(
+        position_before + read as i64,
+        client
+            .subscription(subscription)
+            .expect("the subscription")
+            .images()
+            .first()
+            .expect("the image")
+            .position()
+    );
+
+    // And it reached the **counter**, not just this client's field, which is
+    // the half of a poll only the client can do: the position is what says the
+    // run was consumed, to the driver and to any other reader of the same log.
+    assert_eq!(
+        Some(position_before + read as i64),
+        client
+            .counters_reader()
+            .and_then(|reader| reader.value(subscriber_position_id)),
+        "the reader's position was published"
+    );
+    assert_eq!(
+        Some(0),
+        client.block_poll_image(subscription, image_registration_id, 4096, |_| panic!(
+            "nothing is left to hand over"
+        )),
+        "the run was consumed, not re-delivered"
+    );
 }
