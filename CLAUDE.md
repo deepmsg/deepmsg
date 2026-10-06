@@ -39,7 +39,7 @@ Each rule has one authority. Read that file, not this table.
 
 | Rule | Authority |
 |---|---|
-| `unsafe` only in `core::buffer`, `cnc`, and the driver syscall shim | `docs/adr/0002` |
+| `unsafe` only in ADR-0002's five named zones: `core::pal`, `core::buffer`, `cnc`, the driver `sys` shim, the `tools` archive shim | `docs/adr/0002` |
 | No async runtime, no FFI, no allocation on hot paths | `docs/adr/0003` |
 | Aeron's concept nouns are kept; no C-era abbreviations in code | `docs/adr/0005` |
 | Every byte-level claim cites an upstream `file:line` | `docs/roadmap.md` |
