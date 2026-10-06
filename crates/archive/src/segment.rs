@@ -40,17 +40,41 @@
 //! * **the offset advances by the frame's length, not by what was written**,
 //!   which is the padding rule again from the other side: 32 bytes written,
 //!   a whole frame consumed.
+//!
+//! # What a reader has to know that a writer does not
+//!
+//! A reader starts **wherever the caller asks**, which is usually in the middle
+//! of a term and often in the middle of a segment, so it has to place a stream
+//! position in a file. Three numbers do it (`RecordingReader.java:83-96`):
+//!
+//! ```text
+//! segmentOffset        = (fromPosition - startTermBase) & (segmentLength - 1)
+//! termOffset           =  fromPosition & (termLength - 1)
+//! termBaseSegmentOffset = segmentOffset - termOffset
+//! ```
+//!
+//! and the last is where the term containing that position begins *in the
+//! segment*, which is what makes a term a window of the file rather than
+//! something the reader has to assemble. A position it cannot verify is refused:
+//! the frame at the position has to carry the term offset, the term id and the
+//! stream id the caller's recording implies (`:100-107`), because a position
+//! that is a few bytes off is a position that reads somebody's payload as a
+//! header.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
 use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use deepmsg_core::logbuffer::frame::{
-    DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, SESSION_ID_FIELD_OFFSET, TYPE_OFFSET, TYPE_PAD,
+    DATA_HEADER_LENGTH, FLAGS_OFFSET, FRAME_LENGTH_OFFSET, RESERVED_VALUE_OFFSET,
+    SESSION_ID_FIELD_OFFSET, STREAM_ID_FIELD_OFFSET, TERM_ID_FIELD_OFFSET,
+    TERM_OFFSET_FIELD_OFFSET, TYPE_OFFSET, TYPE_PAD,
 };
-use deepmsg_core::logbuffer::position::align_up;
+use deepmsg_core::logbuffer::position::{align_up, bits_to_shift};
+use deepmsg_core::pal::MappedFile;
 
 use crate::checksum::Checksum;
 
@@ -109,6 +133,12 @@ pub enum SegmentError {
         /// The file that was there.
         path: PathBuf,
     },
+    /// A segment file the reader was asked for is not there
+    /// (`RecordingReader.openRecordingSegment`, `:207-210`).
+    Missing {
+        /// The file that was not.
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for SegmentError {
@@ -125,6 +155,11 @@ impl std::fmt::Display for SegmentError {
             Self::Exists { path } => {
                 write!(f, "segment file already exists: {}", path.display())
             }
+            Self::Missing { path } => write!(
+                f,
+                "failed to open recording segment file {}",
+                path.display()
+            ),
         }
     }
 }
@@ -790,6 +825,263 @@ mod tests {
         );
     }
 
+    /// A summary of a recording written into `dir`, for the reader's tests.
+    fn summary(
+        recording_id: i64,
+        start_position: i64,
+        stop_position: Option<i64>,
+    ) -> SegmentSummary {
+        SegmentSummary {
+            recording_id,
+            start_position,
+            stop_position,
+            initial_term_id: 7,
+            term_buffer_length: TERM_LENGTH,
+            segment_file_length: SEGMENT_LENGTH as i32,
+            stream_id: 1001,
+        }
+    }
+
+    /// Write `blocks` into a recording's first segment, and answer with what a
+    /// reader would need.
+    fn recorded(dir: &TempDir, blocks: &[Vec<u8>]) -> (SegmentSummary, i64) {
+        let mut writer = writer(dir, 0, 0);
+
+        for block in blocks {
+            writer.write_block(block).expect("written");
+        }
+
+        let stop = writer.offset() as i64;
+
+        (summary(7, 0, Some(stop)), stop)
+    }
+
+    fn payloads(reader: &mut SegmentReader) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+
+        reader
+            .poll(usize::MAX, |fragment| {
+                let mut payload = vec![0_u8; fragment.payload_length()];
+                fragment.copy_payload(&mut payload).expect("fits");
+
+                seen.push(payload);
+            })
+            .expect("poll");
+
+        seen
+    }
+
+    /// What a writer put in, a reader gets back — in order, one fragment per
+    /// frame, with the payloads intact.
+    #[test]
+    fn a_recording_reads_back_frame_for_frame() {
+        let dir = TempDir::new();
+        let blocks = vec![
+            frame(0, 7, b"the first message"),
+            frame(64, 7, b"the second, longer message"),
+            frame(128, 7, b"third"),
+        ];
+        let (summary, _stop) = recorded(&dir, &blocks);
+
+        let mut reader = SegmentReader::open(dir.path(), summary, None, None).expect("a reader");
+
+        assert_eq!(0, reader.replay_position());
+        assert!(!reader.is_done());
+
+        let read = payloads(&mut reader);
+
+        assert_eq!(
+            vec![
+                b"the first message".to_vec(),
+                b"the second, longer message".to_vec(),
+                b"third".to_vec()
+            ],
+            read
+        );
+        assert!(
+            reader.is_done(),
+            "and the read ended at the hole behind them"
+        );
+    }
+
+    /// A reader that starts in the middle of the recording has to be given a
+    /// position that is a **frame boundary**, and the only way to know is to ask
+    /// the frame there: its term offset, its term id and its stream id all have
+    /// to be the ones the position implies.
+    ///
+    /// A position a few bytes off is the case this exists for: the bytes there
+    /// would be read as a header, and a header read from a payload is a length
+    /// that walks somewhere else entirely.
+    #[test]
+    fn a_position_that_is_not_a_frame_boundary_is_refused() {
+        let dir = TempDir::new();
+        let blocks = vec![frame(0, 7, b"the first message"), frame(64, 7, b"second")];
+        let (summary, _stop) = recorded(&dir, &blocks);
+
+        // The second frame's own start: a boundary.
+        let second = blocks[0].len() as i64;
+        let mut reader =
+            SegmentReader::open(dir.path(), summary, Some(second), None).expect("a reader");
+        assert_eq!(
+            vec![b"second".to_vec()],
+            payloads(&mut reader),
+            "a frame boundary reads from there"
+        );
+
+        // Eight bytes into the first frame: inside its header, where a term
+        // offset is not the one the position implies.
+        let error =
+            SegmentReader::open(dir.path(), summary, Some(8), None).expect_err("not a boundary");
+        assert!(matches!(error, SegmentError::Malformed { .. }), "{error:?}");
+    }
+
+    /// The read ends where the writing did: a segment is preallocated, so what
+    /// follows the last frame is zeroes, and a frame length of zero is the end.
+    #[test]
+    fn the_read_ends_at_the_hole_behind_the_recording() {
+        let dir = TempDir::new();
+        let blocks = vec![frame(0, 7, b"one"), frame(64, 7, b"two")];
+        let (summary, _stop) = recorded(&dir, &blocks);
+
+        let mut reader = SegmentReader::open(dir.path(), summary, None, None).expect("a reader");
+
+        assert_eq!(2, payloads(&mut reader).len());
+        assert!(reader.is_done());
+
+        // And a second poll finds nothing rather than reading the zeroes as
+        // frames.
+        assert_eq!(0, reader.poll(10, |_| {}).expect("poll"));
+    }
+
+    /// A read is bounded by the recording's own stop position, not only by what
+    /// the caller asked for: asking for more than there is reads what there is.
+    ///
+    /// The recording here **stops with a frame still in the file**, which is the
+    /// only arrangement in which the clamp is visible: a recording whose stop is
+    /// where the writing stopped would be bounded by the hole behind it whether
+    /// the clamp was there or not, and the test would pass for a reader that
+    /// ignored the stop position entirely.
+    #[test]
+    fn a_bounded_read_stops_at_the_recordings_stop() {
+        let dir = TempDir::new();
+        let blocks = vec![
+            frame(0, 7, b"one"),
+            frame(64, 7, b"two"),
+            frame(128, 7, b"three, after the stop"),
+        ];
+        let (mut summary, stop) = recorded(&dir, &blocks);
+
+        // Where the recording stopped: after two frames, with the third still
+        // in the segment.
+        let stopped_at = (blocks[0].len() + blocks[1].len()) as i64;
+        assert!(stopped_at < stop, "the third frame is past the stop");
+
+        summary.stop_position = Some(stopped_at);
+
+        let mut reader =
+            SegmentReader::open(dir.path(), summary, None, Some(stop * 10)).expect("a reader");
+        assert_eq!(
+            vec![b"one".to_vec(), b"two".to_vec()],
+            payloads(&mut reader),
+            "the recording's stop bounded it, not the hole"
+        );
+
+        // And the caller's own limit, when it is the smaller of the two.
+        let mut reader =
+            SegmentReader::open(dir.path(), summary, None, Some(blocks[0].len() as i64))
+                .expect("a reader");
+        assert_eq!(vec![b"one".to_vec()], payloads(&mut reader));
+        assert!(reader.is_done(), "the limit ended it");
+
+        // A recording that has not stopped is read to its hole instead.
+        summary.stop_position = None;
+        let mut reader = SegmentReader::open(dir.path(), summary, None, None).expect("a reader");
+        assert_eq!(3, payloads(&mut reader).len());
+    }
+
+    /// A read that crosses a term boundary and a **segment** boundary hands
+    /// back every frame, in order.
+    ///
+    /// Frames in a recording are contiguous — a live term's frames happen to
+    /// reach a term's end, and the next term's follow in the same file — so the
+    /// boundaries are where a reader that lost its place would be visibly wrong
+    /// rather than merely slow. The count is one frame more than a segment
+    /// holds, so both crossings happen: `next_term` moves the window within the
+    /// file, and the last one opens the next file.
+    #[test]
+    fn a_read_crosses_term_and_segment_boundaries() {
+        /// Frames as large as a term allows, so that few of them cross a term
+        /// and the test does not pay for the crossings four times over. The term
+        /// cannot be shrunk instead: 64 KiB is the log buffer's minimum, and
+        /// `bits_to_shift` refuses anything smaller.
+        const FRAME_LENGTH_BYTES: usize = 4 * 1024;
+        const PAYLOAD: usize = FRAME_LENGTH_BYTES - DATA_HEADER_LENGTH;
+
+        const TERM: i32 = TERM_LENGTH;
+        const SEGMENT: usize = 2 * TERM as usize;
+
+        let dir = TempDir::new();
+        let per_term = TERM as usize / FRAME_LENGTH_BYTES;
+        let frames = SEGMENT / FRAME_LENGTH_BYTES + 1;
+
+        let mut writer = SegmentWriter::create(
+            dir.path(),
+            SegmentSpec {
+                recording_id: 7,
+                start_position: 0,
+                join_position: 0,
+                term_buffer_length: TERM,
+                segment_length: SEGMENT,
+            },
+            1,
+            None,
+        )
+        .expect("a writer");
+
+        for index in 0..frames {
+            let offset = (index % per_term) * FRAME_LENGTH_BYTES;
+            let term_id = 7 + i32::try_from(index / per_term).expect("small");
+            let mut payload = vec![b' '; PAYLOAD];
+            let text = format!("message {index}");
+            payload[..text.len()].copy_from_slice(text.as_bytes());
+
+            writer
+                .write_block(&frame(offset as i32, term_id, &payload))
+                .expect("written");
+        }
+
+        assert!(
+            writer.offset() < SEGMENT,
+            "the last frame opened a second segment: {} of {SEGMENT}",
+            writer.offset()
+        );
+
+        let summary = SegmentSummary {
+            term_buffer_length: TERM,
+            segment_file_length: SEGMENT as i32,
+            ..summary(7, 0, None)
+        };
+        let mut reader = SegmentReader::open(dir.path(), summary, None, None).expect("a reader");
+        let mut index = 0;
+
+        reader
+            .poll(usize::MAX, |fragment| {
+                let mut payload = vec![0_u8; fragment.payload_length()];
+                fragment.copy_payload(&mut payload).expect("fits");
+
+                let expected = format!("message {index}");
+                assert_eq!(
+                    expected.as_bytes(),
+                    &payload[..expected.len()],
+                    "frame {index} is not where the read got to"
+                );
+                index += 1;
+            })
+            .expect("poll");
+
+        assert_eq!(frames, index, "every frame, across both boundaries");
+    }
+
     /// A block that is not a walkable run of frames is refused rather than
     /// written, and nothing is left half-written.
     #[test]
@@ -810,4 +1102,392 @@ mod tests {
         assert_eq!(0, writer.offset(), "and the offset did not move");
         assert_eq!(0, writer.bytes_written());
     }
+}
+
+/// What a reader needs to know about the recording it is reading.
+///
+/// A subset of the catalog's descriptor, and named for it: the reference reads
+/// a `RecordingSummary` (`RecordingReader.java:46-68`) rather than the whole
+/// thing, because a reader places positions in files and has no use for a
+/// channel or a timestamp.
+///
+/// [`From<&Recording>`] is how a caller gets one from the catalog, which keeps
+/// the coupling one-way: this module does not know what a catalog is, and the
+/// catalog does not know what a segment is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentSummary {
+    /// The recording's id, which names its files.
+    pub recording_id: i64,
+    /// Where the recording began.
+    pub start_position: i64,
+    /// Where it stopped, or `None` while it has not.
+    pub stop_position: Option<i64>,
+    /// The term the stream started in.
+    pub initial_term_id: i32,
+    /// One term of the stream.
+    pub term_buffer_length: i32,
+    /// How long one segment file is.
+    pub segment_file_length: i32,
+    /// The stream's id, which every frame in it carries.
+    pub stream_id: i32,
+}
+
+impl From<&crate::catalog::Recording> for SegmentSummary {
+    fn from(recording: &crate::catalog::Recording) -> Self {
+        Self {
+            recording_id: recording.recording_id,
+            start_position: recording.start_position,
+            // The catalog writes a null stop position for a recording that has
+            // not finished, which is `Aeron.NULL_VALUE` — every negative value
+            // is "no stop" to this reader, as it is to the reference's.
+            stop_position: (recording.stop_position >= 0).then_some(recording.stop_position),
+            initial_term_id: recording.initial_term_id,
+            term_buffer_length: recording.term_buffer_length,
+            segment_file_length: recording.segment_file_length,
+            stream_id: recording.stream_id,
+        }
+    }
+}
+
+/// One frame of a recording, handed to a poll's handler.
+///
+/// A **window**, not a copy — the segment is mapped and a fragment is a place in
+/// it — and the payload is copied out with [`SegmentFragment::copy_payload`] for
+/// the reason [`deepmsg_client::image::Fragment`] gives: this build's buffers do
+/// not hand out slices of a mapping, so a caller that wants bytes asks for them.
+pub struct SegmentFragment<'a> {
+    segment: &'a AtomicBuffer<'a, ReadOnly>,
+    offset: usize,
+    length: usize,
+    flags: u8,
+    header_type: i16,
+    reserved_value: i64,
+    position: i64,
+}
+
+impl SegmentFragment<'_> {
+    /// Where the frame is in the stream.
+    #[must_use]
+    pub const fn position(&self) -> i64 {
+        self.position
+    }
+
+    /// How many payload bytes it carries: the frame less its header.
+    #[must_use]
+    pub const fn payload_length(&self) -> usize {
+        self.length
+    }
+
+    /// A frame's header type (`DATA` is 1, and 0 is padding).
+    #[must_use]
+    pub const fn header_type(&self) -> i16 {
+        self.header_type
+    }
+
+    /// The `BEGIN`/`END`/`EOS`/`REVOKED` bits.
+    #[must_use]
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// The frame's reserved value, which the publisher sets.
+    #[must_use]
+    pub const fn reserved_value(&self) -> i64 {
+        self.reserved_value
+    }
+
+    /// Copy the payload out.
+    ///
+    /// `None` when `dst` is shorter than [`SegmentFragment::payload_length`],
+    /// or when the window does not lie within the mapping — which it does, since
+    /// the poll proved it before handing this over.
+    pub fn copy_payload(&self, dst: &mut [u8]) -> Option<()> {
+        self.segment
+            .copy_out(self.offset, dst.get_mut(..self.length)?)
+    }
+}
+
+/// Reads one recording's frames out of its segment files.
+///
+/// Mirrors `io.aeron.archive.RecordingReader`: the same three numbers place a
+/// stream position in a file, the same check refuses a position that is not a
+/// frame boundary, and the same rule ends the read — **a frame length of zero or
+/// less is the end**, because that is what the preallocated tail of a segment
+/// reads as once the recording has been read to its end.
+pub struct SegmentReader {
+    directory: PathBuf,
+    summary: SegmentSummary,
+    replay_position: i64,
+    replay_limit: i64,
+    segment_file_position: i64,
+    term_offset: usize,
+    term_base_segment_offset: usize,
+    mapping: MappedFile,
+    done: bool,
+}
+
+impl SegmentReader {
+    /// Open the reader for `from_position`, at most `length` bytes of it.
+    ///
+    /// `None` for `from_position` means the recording's start, and `None` for
+    /// `length` means "to the end" — which is the recording's stop position when
+    /// it has one, and unbounded when it has not, so a bounded request is
+    /// clamped to the recording rather than reading past it
+    /// (`RecordingReader.java:70-77`).
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::Malformed`] when the position is not a frame boundary —
+    /// the frame there has to carry the term offset, term id and stream id this
+    /// recording implies — and [`SegmentError::Io`] when the segment file is not
+    /// there or cannot be mapped.
+    pub fn open(
+        directory: &Path,
+        summary: SegmentSummary,
+        from_position: Option<i64>,
+        length: Option<i64>,
+    ) -> Result<Self, SegmentError> {
+        let bits_to_shift =
+            bits_to_shift(summary.term_buffer_length).ok_or(SegmentError::Malformed {
+                offset: 0,
+                frame_length: summary.term_buffer_length,
+            })?;
+
+        let from = from_position.unwrap_or(summary.start_position);
+        let max_length = match summary.stop_position {
+            Some(stop) => stop - from,
+            None => i64::MAX - from,
+        };
+        let replay_length = length.map_or(max_length, |asked| asked.min(max_length));
+
+        if replay_length < 0 {
+            return Err(SegmentError::Malformed {
+                offset: 0,
+                frame_length: i32::try_from(replay_length).unwrap_or(i32::MIN),
+            });
+        }
+
+        let term_length = summary.term_buffer_length;
+        let segment_file_length = summary.segment_file_length;
+        let start_term_base =
+            summary.start_position - (summary.start_position & i64::from(term_length - 1));
+        let segment_offset =
+            usize::try_from((from - start_term_base) & i64::from(segment_file_length - 1))
+                .unwrap_or(0);
+        let term_offset = usize::try_from(from & i64::from(term_length - 1)).unwrap_or(0);
+        let term_id = i32::try_from(from >> bits_to_shift)
+            .unwrap_or(0)
+            .wrapping_add(summary.initial_term_id);
+
+        let segment_file_position = segment_file_base_position(
+            summary.start_position,
+            from,
+            term_length,
+            segment_file_length,
+        );
+        let mapping = map_segment(directory, summary.recording_id, segment_file_position)?;
+
+        let reader = Self {
+            directory: directory.to_path_buf(),
+            summary,
+            replay_position: from,
+            replay_limit: from + replay_length,
+            segment_file_position,
+            term_offset,
+            term_base_segment_offset: segment_offset - term_offset,
+            mapping,
+            done: false,
+        };
+
+        // A position that is not the recording's start has to be a frame
+        // boundary, and the only way to know is to ask the frame there
+        // (`:100-107`).
+        if from > summary.start_position {
+            reader.check_aligned_to_fragment(term_id)?;
+        }
+
+        Ok(reader)
+    }
+
+    /// Where the read has got to.
+    #[must_use]
+    pub const fn replay_position(&self) -> i64 {
+        self.replay_position
+    }
+
+    /// Whether there is nothing left to read.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Read up to `fragment_limit` frames, handing each to `handler`.
+    ///
+    /// The read ends at the earlier of the limit the caller asked for and the
+    /// recording's own stop, and before either of those it ends at the first
+    /// frame that cannot be read — a length of zero or less, which is what the
+    /// preallocated tail of a segment reads as past the end of what was written.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError`] when the next segment file is missing, or when a frame
+    /// is not walkable.
+    pub fn poll<H>(&mut self, fragment_limit: usize, mut handler: H) -> Result<usize, SegmentError>
+    where
+        H: FnMut(&SegmentFragment<'_>),
+    {
+        let mut fragments = 0;
+
+        while self.replay_position < self.replay_limit && fragments < fragment_limit {
+            if self.term_offset == self.summary.term_buffer_length as usize {
+                self.next_term()?;
+            }
+
+            let frame_offset = self.term_offset;
+            let term = self.term();
+
+            let Some(frame_length) = read_i32_in(&term, frame_offset + FRAME_LENGTH_OFFSET) else {
+                self.done = true;
+                break;
+            };
+
+            if frame_length <= 0 {
+                // The end: a segment is preallocated, so what follows what was
+                // written is zeroes, and a zero length is where the writing
+                // stopped.
+                self.done = true;
+                break;
+            }
+
+            let aligned = usize::try_from(align_up(frame_length, FRAME_ALIGNMENT)).unwrap_or(0);
+            let payload_length = usize::try_from(frame_length).unwrap_or(0) - DATA_HEADER_LENGTH;
+
+            let fragment = SegmentFragment {
+                segment: &term,
+                offset: frame_offset + DATA_HEADER_LENGTH,
+                length: payload_length,
+                flags: read_u8_in(&term, frame_offset + FLAGS_OFFSET).unwrap_or(0),
+                header_type: read_i16_in(&term, frame_offset + TYPE_OFFSET).unwrap_or(0),
+                reserved_value: read_i64_in(&term, frame_offset + RESERVED_VALUE_OFFSET)
+                    .unwrap_or(0),
+                position: self.replay_position,
+            };
+
+            handler(&fragment);
+
+            self.replay_position += i64::try_from(aligned).unwrap_or(0);
+            self.term_offset += aligned;
+            fragments += 1;
+
+            if self.replay_position >= self.replay_limit {
+                self.done = true;
+                break;
+            }
+        }
+
+        Ok(fragments)
+    }
+
+    /// Move to the next term, which is a window of the segment until the segment
+    /// itself runs out (`RecordingReader.nextTerm`, `:178-193`).
+    fn next_term(&mut self) -> Result<(), SegmentError> {
+        self.term_offset = 0;
+        self.term_base_segment_offset += self.summary.term_buffer_length as usize;
+
+        if self.term_base_segment_offset == self.summary.segment_file_length as usize {
+            self.segment_file_position += i64::from(self.summary.segment_file_length);
+            self.mapping = map_segment(
+                &self.directory,
+                self.summary.recording_id,
+                self.segment_file_position,
+            )?;
+            self.term_base_segment_offset = 0;
+        }
+
+        Ok(())
+    }
+
+    /// The term the reader is in, as a window of the segment.
+    ///
+    /// A term is a window of the file rather than something the reader
+    /// assembles: `term_base_segment_offset` is where it begins in the segment,
+    /// and a segment is a whole number of terms, so the window always fits.
+    fn term(&self) -> AtomicBuffer<'_, ReadOnly> {
+        self.mapping
+            .region(
+                self.term_base_segment_offset,
+                self.summary.term_buffer_length as usize,
+            )
+            .unwrap_or_else(|| {
+                // The window was proven to fit when the segment was mapped: it
+                // is a term inside a segment, and a segment is a whole number of
+                // terms. `region` cannot fail here.
+                unreachable!("the term window lies inside the segment")
+            })
+    }
+
+    /// Whether the frame at the current position is the one this position
+    /// implies.
+    fn check_aligned_to_fragment(&self, term_id: i32) -> Result<(), SegmentError> {
+        let term = self.term();
+        let offset = self.term_offset;
+
+        let frame_term_offset = read_i32_in(&term, offset + TERM_OFFSET_FIELD_OFFSET).unwrap_or(-1);
+        let frame_term_id = read_i32_in(&term, offset + TERM_ID_FIELD_OFFSET).unwrap_or(-1);
+        let frame_stream_id = read_i32_in(&term, offset + STREAM_ID_FIELD_OFFSET).unwrap_or(-1);
+
+        if frame_term_offset != i32::try_from(offset).unwrap_or(-1)
+            || frame_term_id != term_id
+            || frame_stream_id != self.summary.stream_id
+        {
+            return Err(SegmentError::Malformed {
+                offset: self.term_base_segment_offset + offset,
+                frame_length: read_i32_in(&term, offset + FRAME_LENGTH_OFFSET).unwrap_or(0),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SegmentReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentReader")
+            .field("segment_file_position", &self.segment_file_position)
+            .field("replay_position", &self.replay_position)
+            .field("replay_limit", &self.replay_limit)
+            .field("term_offset", &self.term_offset)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+/// Map one segment file, read-only.
+fn map_segment(
+    directory: &Path,
+    recording_id: i64,
+    segment_file_position: i64,
+) -> Result<MappedFile, SegmentError> {
+    let path = directory.join(segment_file_name(recording_id, segment_file_position));
+
+    MappedFile::open_readonly(&path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => SegmentError::Missing { path },
+        _ => SegmentError::Io(error),
+    })
+}
+
+fn read_u8_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<u8> {
+    buffer.load_u8(offset)
+}
+
+fn read_i16_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<i16> {
+    buffer.load_i16(offset)
+}
+
+fn read_i32_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<i32> {
+    buffer.load_i32(offset)
+}
+
+fn read_i64_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<i64> {
+    buffer.load_i64(offset)
 }
