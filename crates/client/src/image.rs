@@ -50,6 +50,46 @@ pub struct Fragment<'a> {
     position: i64,
 }
 
+/// One run of frames, handed to a [`Image::block_poll`] handler.
+///
+/// A window onto the term, not a copy — the reference hands its block handler
+/// the term buffer, an offset and a length
+/// (`aeron_image_block_poll`, `aeron_image.c:709-716`), and a copy here would
+/// be an allocation on the read path.
+pub struct Block<'a> {
+    term: &'a AtomicBuffer<'a, ReadOnly>,
+    offset: usize,
+    length: usize,
+    session_id: i32,
+    term_id: i32,
+}
+
+impl Block<'_> {
+    /// How many bytes the run covers, padding frames included.
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The session whose publication wrote the frames.
+    pub const fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
+    /// The term the frames are in, read from the frames themselves rather than
+    /// computed from the reader's position.
+    pub const fn term_id(&self) -> i32 {
+        self.term_id
+    }
+
+    /// Copy the run out.
+    ///
+    /// `None` when `dst` is shorter than [`Self::length`] — the only way this
+    /// can fail, and the reason it takes a slice rather than growing one.
+    pub fn copy_out(&self, dst: &mut [u8]) -> Option<()> {
+        self.term.copy_out(self.offset, dst.get_mut(..self.length)?)
+    }
+}
+
 impl<'a> Fragment<'a> {
     /// A fragment over one frame.
     ///
@@ -206,6 +246,28 @@ impl Image {
             log: LogBuffer::open(path, false)?,
             position: Position::from_raw(join_position),
         })
+    }
+
+    /// The term this stream began at.
+    ///
+    /// `Image.initialTermId()` (`Image.java:120`); the reference's archive
+    /// reads it eighteen times, because a recording's descriptor is built from
+    /// what its images say about themselves.
+    ///
+    /// Not [`Image::term_buffer_length`]: this is *which* term the stream
+    /// started in, and that one is how many bytes a term is.
+    pub fn initial_term_id(&self) -> i32 {
+        self.log.geometry().initial_term_id
+    }
+
+    /// How many bytes one term of this image's log buffer is.
+    ///
+    /// `Image.termBufferLength()` (`Image.java:138`); the reference's archive
+    /// reads it twenty-six times — more than anything else an image answers —
+    /// because it goes into every recording descriptor and every replay's
+    /// bounds.
+    pub fn term_buffer_length(&self) -> i32 {
+        self.log.geometry().term_length
     }
 
     /// The **publication's** registration id — not this subscriber's
@@ -426,6 +488,113 @@ impl Image {
         self.position = next;
 
         fragments
+    }
+
+    /// Read one run of contiguous frames, up to `block_length_limit` bytes, and
+    /// hand the whole run to `handler` as a single block.
+    ///
+    /// Returns how many **bytes** were consumed — which is the first thing that
+    /// separates this from [`Image::poll`], whose count is fragments — and the
+    /// name is about the block of frames, not about waiting: nothing here
+    /// blocks, and a run of length zero is an ordinary answer.
+    ///
+    /// What it buys is the shape a writer of the bytes wants: a recording that
+    /// has to write what it read can copy one run out instead of being called
+    /// once per fragment (`RecordingSession.java:237` is the archive's use).
+    /// The run is bounded by the same three things the reference's is
+    /// (`aeron_image_block_poll`, `aeron_image.c:647-722`): the caller's limit,
+    /// the term's end, and the first frame that does not fit — a block never
+    /// straddles a term, because a producer that could not fit one padded
+    /// instead.
+    ///
+    /// A padding frame ends the run, and is **part of it only when it is the
+    /// run's first frame** (`aeron_image.c:670-677`): a producer's tail padding
+    /// is the last thing in a term and belongs to the block that reached it,
+    /// while a repaired hole means the frames after it are real data the reader
+    /// has not been given yet. The reference's `poll` has the same rule, and
+    /// the same reason.
+    ///
+    /// The position advances past exactly the bytes delivered; publishing it to
+    /// the counter is the caller's, for the reason [`Image::poll`] gives.
+    pub fn block_poll<F>(&mut self, block_length_limit: usize, mut handler: F) -> usize
+    where
+        F: FnMut(&Block<'_>),
+    {
+        let geometry = self.log.geometry();
+        let term_begin = self.position.term_begin(geometry.bits_to_shift);
+        let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
+            return 0;
+        };
+
+        let offset = (self.position.raw() - term_begin.raw()) as usize;
+        let limit = offset
+            .saturating_add(block_length_limit)
+            .min(geometry.term_length as usize);
+
+        let mut scanner = Scanner::at(&term, geometry.term_length as usize, offset);
+        scanner.set_limit(limit);
+
+        // Where the run ends. The scanner's own cursor runs ahead of this by
+        // one frame, because it has to look at a frame to know whether it
+        // belongs.
+        let mut scanned = offset;
+
+        loop {
+            let before = scanner.offset();
+
+            match scanner.advance() {
+                Step::Data { frame_length, .. } => {
+                    // The reference stops **before** a frame that would cross
+                    // the limit rather than delivering it whole
+                    // (`aeron_image.c:683-686`): the limit is a limit on the
+                    // block, and the next call starts at this frame.
+                    let Ok(aligned) = usize::try_from(position::align_up(
+                        frame_length,
+                        descriptor::FRAME_ALIGNMENT,
+                    )) else {
+                        break;
+                    };
+
+                    if before + aligned > limit {
+                        break;
+                    }
+
+                    scanned = scanner.offset();
+                }
+                Step::Padding { .. } => {
+                    if before == offset {
+                        scanned = scanner.offset();
+                    }
+
+                    break;
+                }
+                // Nothing to read: the term is empty here, a frame is still
+                // being written, or the header is one no writer could have
+                // produced. All three end the run where it is.
+                Step::End | Step::NotReady { .. } | Step::Malformed { .. } => break,
+            }
+        }
+
+        let length = scanned - offset;
+        if length > 0 {
+            // The term id is read from the frames rather than derived from the
+            // position, which is what the reference does
+            // (`aeron_image.c:709-715`) — and is the only answer that is right
+            // for a run that begins mid-term.
+            if let Some(term_id) = Frame::new(&term, offset).term_id() {
+                handler(&Block {
+                    term: &term,
+                    offset,
+                    length,
+                    session_id: self.session_id,
+                    term_id,
+                });
+            }
+        }
+
+        self.position = Position::from_raw(self.position.raw() + length as i64);
+
+        length
     }
 
     /// The same scan, with the caller answering for each fragment.
@@ -710,7 +879,7 @@ pub(crate) mod tests {
     use deepmsg_core::logbuffer::append::{Appended, Appender};
     use deepmsg_core::logbuffer::{descriptor, frame, position};
 
-    use super::{Action, ControlledFragments, Fragment, Image};
+    use super::{Action, Block, ControlledFragments, Fragment, Image};
     use crate::log_buffer::LogBuffer;
 
     /// The smallest legal term length, so the fixture stays small.
@@ -880,6 +1049,23 @@ pub(crate) mod tests {
         assert_eq!(0, image.join_position());
     }
 
+    /// What an image says about the log it is reading.
+    ///
+    /// Both come from the mapped metadata, which is why the fixture writes the
+    /// geometry into the file before anything opens it — and they are two
+    /// different things (`Image.java:120` against `:138`), which is worth a test
+    /// because the reference's archive reads them eighteen and twenty-six times
+    /// respectively and would notice.
+    #[test]
+    fn an_image_answers_with_the_geometry_of_its_log() {
+        let log = TempLog::new("geometry");
+        log.write(|appender| write_message(appender, b"hello"));
+        let image = log.image(1);
+
+        assert_eq!(INITIAL_TERM_ID, image.initial_term_id());
+        assert_eq!(TERM_LENGTH, image.term_buffer_length());
+    }
+
     #[test]
     fn a_scan_reads_the_message_that_was_written() {
         let log = TempLog::new("read");
@@ -979,6 +1165,181 @@ pub(crate) mod tests {
             "but the position went past it"
         );
         assert_eq!(1, handler.seen.len(), "and no second message was invented");
+    }
+
+    /// What a block handler sees, copied out.
+    ///
+    /// A tuple rather than a struct because the assertions below are about
+    /// individual facts — the length, the term, the bytes — and naming them
+    /// keeps a failure legible.
+    fn copied(block: &Block<'_>) -> (usize, i32, i32, Vec<u8>) {
+        let mut bytes = vec![0u8; block.length()];
+        assert!(block.copy_out(&mut bytes).is_some(), "the block fits");
+
+        (block.length(), block.session_id(), block.term_id(), bytes)
+    }
+
+    /// The block face: several frames handed over in **one** call, counted in
+    /// bytes.
+    #[test]
+    fn a_block_poll_hands_over_a_run_of_frames() {
+        let log = TempLog::new("block-run");
+        let payloads: [&[u8]; 3] = [b"one-one-", b"two-two-", b"three-3-"];
+        log.write(|appender| {
+            for payload in payloads {
+                write_message(appender, payload);
+            }
+        });
+
+        let reach = frame_reach(payloads[0]);
+        let mut image = log.image(1);
+        let mut blocks = Vec::new();
+
+        let read = image.block_poll(reach * payloads.len(), |block| blocks.push(copied(block)));
+
+        assert_eq!(reach * payloads.len(), read, "the count is in bytes");
+        assert_eq!(1, blocks.len(), "one run, one call");
+
+        let (length, session_id, term_id, bytes) = &blocks[0];
+        assert_eq!(&(reach * payloads.len()), length, "and it covers the run");
+        assert_eq!(&7, session_id);
+        assert_eq!(
+            &INITIAL_TERM_ID, term_id,
+            "the term id is read from the frames, not computed from the position"
+        );
+
+        // Every frame is where the run says it is, in order: which is what
+        // makes this one run rather than three windows that happen to be
+        // adjacent.
+        for (index, payload) in payloads.iter().enumerate() {
+            let start = index * reach + frame::DATA_HEADER_LENGTH;
+            assert_eq!(
+                *payload,
+                &bytes[start..start + payload.len()],
+                "frame {index} is at {}",
+                index * reach
+            );
+        }
+
+        assert_eq!(
+            reach as i64 * payloads.len() as i64,
+            image.position(),
+            "and the reader moved over exactly what it was handed"
+        );
+    }
+
+    /// A block boundary is a frame boundary: the frame that does not fit is
+    /// left for the next call rather than delivered in pieces.
+    #[test]
+    fn a_block_never_stops_in_the_middle_of_a_frame() {
+        let log = TempLog::new("block-limit");
+        log.write(|appender| {
+            for _ in 0..3 {
+                write_message(appender, b"eight---");
+            }
+        });
+
+        let reach = frame_reach(b"eight---");
+        let mut image = log.image(1);
+        let mut blocks = Vec::new();
+
+        // One byte more than two frames: the third would cross the limit.
+        assert_eq!(
+            reach * 2,
+            image.block_poll(reach * 2 + 1, |block| blocks.push(copied(block))),
+            "the third frame was not squeezed in"
+        );
+        assert_eq!(
+            reach,
+            image.block_poll(usize::MAX, |block| blocks.push(copied(block)))
+        );
+
+        assert_eq!(2, blocks.len(), "two calls, two runs");
+        assert_eq!(
+            reach as i64 * 3,
+            image.position(),
+            "and nothing was skipped between them"
+        );
+    }
+
+    /// A padding frame ends a run, and is part of one **only when it is the
+    /// run's first frame** — the rule the reference states in one line
+    /// (`aeron_image.c:670-677`) and the one a repaired hole makes matter.
+    #[test]
+    fn a_block_ends_at_a_padding_frame_and_begins_with_one() {
+        let log = TempLog::new("block-padding");
+        log.write(|appender| {
+            for _ in 0..3 {
+                write_message(appender, b"eight---");
+            }
+        });
+
+        // The middle frame becomes a padding frame of the same length, which is
+        // the shape an unreliable stream leaves when it fills a hole: data, a
+        // gap nobody will send again, and data after it.
+        let reach = frame_reach(b"eight---");
+        log.patch(reach, |offset, term| {
+            term.store_i32_relaxed(offset + frame::FRAME_LENGTH_OFFSET, reach as i32)
+                .expect("in range");
+            term.store_u8_relaxed(offset + frame::TYPE_OFFSET, frame::TYPE_PAD as u8)
+                .expect("in range");
+        });
+
+        let mut image = log.image(1);
+        let mut blocks = Vec::new();
+
+        // The run stops **before** the padding, so the frames past it are not
+        // handed over as if they had come first.
+        assert_eq!(
+            reach,
+            image.block_poll(usize::MAX, |block| blocks.push(copied(block))),
+            "a run ends where the padding begins"
+        );
+
+        // The next run starts **at** it, and the padding is a run of its own —
+        // the reference's `offset == scan_offset` case, which is the only one
+        // that ever delivers a padding frame.
+        assert_eq!(
+            reach,
+            image.block_poll(usize::MAX, |block| blocks.push(copied(block))),
+            "and the next one is the padding itself"
+        );
+        assert_eq!(
+            reach,
+            image.block_poll(usize::MAX, |block| blocks.push(copied(block))),
+            "and then the frame after the hole"
+        );
+        assert_eq!(
+            &[reach, reach, reach],
+            &blocks
+                .iter()
+                .map(|(length, ..)| *length)
+                .collect::<Vec<_>>()[..],
+            "three runs of one frame each"
+        );
+        assert_eq!(
+            reach as i64 * 3,
+            image.position(),
+            "nothing was left behind"
+        );
+    }
+
+    /// An empty term is not an error and not a block: the run is of length
+    /// zero, and the handler is not called.
+    #[test]
+    fn an_empty_term_is_a_run_of_no_bytes() {
+        let log = TempLog::new("block-empty");
+
+        let mut image = log.image(1);
+        let mut called = false;
+
+        assert_eq!(
+            0,
+            image.block_poll(usize::MAX, |_| called = true),
+            "nothing to hand over"
+        );
+        assert!(!called, "so nobody was called");
+        assert_eq!(0, image.position(), "and the reader did not move");
     }
 
     /// `Abort` is the other half: the fragment it refused is given back, so the

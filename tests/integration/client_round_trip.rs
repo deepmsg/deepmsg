@@ -12,14 +12,16 @@
 //! for, and what happens when none arrives.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{AsyncAddPoll, Client, CommandError};
 use deepmsg_cnc::command::{
     ADD_DESTINATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
     CLIENT_CLOSE_TYPE_ID, CORRELATED_COMMAND_LENGTH, ON_ERROR_TYPE_ID,
-    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
-    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
+    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID, REMOVE_PUBLICATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, REMOVE_SUBSCRIPTION_TYPE_ID,
     decode_destination_by_id_command, decode_destination_command,
 };
@@ -331,6 +333,47 @@ fn cancelling_an_async_add_asks_the_driver_to_remove_it() {
     );
 }
 
+/// The removal a cancelled add sends is the one for *its* kind of resource.
+///
+/// Which kind that is comes from the handle, not from what the client happens
+/// to be holding — a publication add registers nothing until its answer is
+/// polled, and a counter registers nothing either, so state cannot tell the two
+/// apart and the wrong command would be a wrong removal rather than a missing
+/// one. The publication here is never adopted, which is the case that has no
+/// local evidence at all.
+#[test]
+fn a_cancelled_add_sends_the_removal_for_its_own_kind() {
+    let cnc = live_cnc();
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let publication = client
+        .async_add_publication("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the command is written");
+    let counter = client
+        .async_add_counter(1001, b"a-key", "a counter", Duration::from_secs(1))
+        .expect("the command is written");
+
+    for (add, type_id) in [
+        (publication, REMOVE_PUBLICATION_TYPE_ID),
+        (counter, REMOVE_COUNTER_TYPE_ID),
+    ] {
+        client
+            .async_add_cancel(add)
+            .expect("the removal is written");
+
+        let removal = commands_written(cnc.path())
+            .into_iter()
+            .find(|(written, _)| *written == type_id)
+            .unwrap_or_else(|| panic!("no removal of type {type_id} reached the ring"));
+
+        assert_eq!(
+            add.registration_id(),
+            i64::from_le_bytes(removal.1[16..24].try_into().expect("eight")),
+            "the removal names the resource the add drew"
+        );
+    }
+}
+
 /// Going out of scope closes too, which is the half a caller cannot see.
 ///
 /// `Client` has no `close` in its public story that a caller has to remember:
@@ -357,6 +400,202 @@ fn a_client_that_goes_out_of_scope_says_goodbye_too() {
             .count(),
         "the destructor sent it: {commands:?}"
     );
+}
+
+/// A close handler is the client's own lifecycle, and it runs **before** the
+/// client tells the driver it is going.
+///
+/// That ordering is the reference's, in both implementations: Java notifies
+/// before `driverProxy.clientClose` (`ClientConductor.java:184` against `:203`),
+/// and C notifies at the top of `aeron_client_conductor_on_close` and claims the
+/// command at the bottom (`aeron_client_conductor.c:2749-2751` against `:2779`).
+/// It is worth a test rather than a doc comment because it is the one thing a
+/// handler can be used for that a queue could not do — and because getting it
+/// backwards would be invisible until something needed it.
+#[test]
+fn a_close_handler_runs_before_the_driver_is_told() {
+    let cnc = live_cnc();
+    let mut client = Client::connect(cnc.path()).expect("connect");
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&seen);
+    let dir = cnc.path().to_path_buf();
+
+    client
+        .add_close_handler(move || {
+            let goodbyes = commands_written(&dir)
+                .iter()
+                .filter(|(type_id, _)| *type_id == CLIENT_CLOSE_TYPE_ID)
+                .count();
+
+            counting.store(goodbyes, Ordering::SeqCst);
+        })
+        .expect("a registration id");
+
+    client.close();
+
+    assert_eq!(
+        0,
+        seen.load(Ordering::SeqCst),
+        "the handler ran while the goodbye was still unwritten"
+    );
+    assert_eq!(
+        1,
+        commands_written(cnc.path())
+            .iter()
+            .filter(|(type_id, _)| *type_id == CLIENT_CLOSE_TYPE_ID)
+            .count(),
+        "and it is written afterwards"
+    );
+}
+
+/// Every handler runs, in the order it was added, and a second close is not a
+/// second chance to run them: `close` is idempotent, and the reference's is too
+/// (`Aeron.java:276-278`).
+#[test]
+fn close_handlers_run_in_order_and_only_once() {
+    let cnc = live_cnc();
+    let mut client = Client::connect(cnc.path()).expect("connect");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    for marker in [1, 2, 3] {
+        let recording = Arc::clone(&seen);
+        client
+            .add_close_handler(move || {
+                recording.lock().expect("not poisoned").push(marker);
+            })
+            .expect("a registration id");
+    }
+
+    client.close();
+    client.close();
+
+    assert_eq!(
+        vec![1, 2, 3],
+        *seen.lock().expect("not poisoned"),
+        "each one ran once, in the order they were added"
+    );
+}
+
+/// The destructor is the reference's own path — C++'s `~Aeron` calls
+/// `aeron_close` (`cpp_wrapper/Aeron.h:91-96`) — so it is a close like any
+/// other, and handlers hear about it.
+#[test]
+fn close_handlers_run_when_the_client_goes_out_of_scope() {
+    let cnc = live_cnc();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    {
+        let mut client = Client::connect(cnc.path()).expect("connect");
+
+        let counting = Arc::clone(&seen);
+        client
+            .add_close_handler(move || {
+                counting.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("a registration id");
+
+        assert_eq!(0, seen.load(Ordering::SeqCst), "not before it closes");
+    }
+
+    assert_eq!(1, seen.load(Ordering::SeqCst), "and once when it does");
+}
+
+/// A handler that is removed does not run, and asking twice is not a removal —
+/// the question the reference's `removeCloseHandler` answers with a boolean
+/// (`ClientConductor.java:1561-1575`).
+#[test]
+fn a_removed_close_handler_does_not_run() {
+    let cnc = live_cnc();
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    let counting = Arc::clone(&seen);
+    let id = client
+        .add_close_handler(move || {
+            counting.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("a registration id");
+
+    assert!(client.remove_close_handler(id), "there was one");
+    assert!(
+        !client.remove_close_handler(id),
+        "and there is nothing under that id now"
+    );
+    assert!(!client.remove_close_handler(i64::MAX));
+
+    drop(client);
+
+    assert_eq!(0, seen.load(Ordering::SeqCst), "so it never ran");
+}
+
+/// One handler's panic is nobody else's — not the next handler's, and not the
+/// process's: this runs from a destructor, where a second panic is an abort
+/// rather than a failed assertion.
+///
+/// The reference catches a throwing handler for the same reason and reports it
+/// through its error handler (`ClientConductor.java:2068-2075`); this counts it,
+/// which is where this build puts the things it survives.
+#[test]
+fn a_panicking_close_handler_does_not_take_the_rest_with_it() {
+    let cnc = live_cnc();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    {
+        let mut client = Client::connect(cnc.path()).expect("connect");
+
+        client
+            .add_close_handler(|| panic!("a close handler that is a bug"))
+            .expect("a registration id");
+
+        let counting = Arc::clone(&seen);
+        client
+            .add_close_handler(move || {
+                counting.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("a registration id");
+
+        client.close();
+
+        assert_eq!(
+            1,
+            seen.load(Ordering::SeqCst),
+            "the handler after the panicking one still ran"
+        );
+        assert_eq!(
+            1,
+            client.close_handler_panics(),
+            "and the panic was counted rather than lost"
+        );
+    }
+}
+
+/// The same panic inside a **destructor**, which is the path that must not
+/// abort: reaching the end of this test is the assertion.
+#[test]
+fn a_panicking_close_handler_does_not_abort_a_destructor() {
+    let cnc = live_cnc();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    {
+        let mut client = Client::connect(cnc.path()).expect("connect");
+
+        client
+            .add_close_handler(|| panic!("a close handler that is a bug"))
+            .expect("a registration id");
+
+        let counting = Arc::clone(&seen);
+        client
+            .add_close_handler(move || {
+                counting.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("a registration id");
+
+        // Dropped here, with nobody to catch anything but `close` itself.
+    }
+
+    assert_eq!(1, seen.load(Ordering::SeqCst));
 }
 
 #[test]

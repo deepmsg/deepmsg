@@ -10,6 +10,9 @@
 //! Mirrors `aeron-client/src/main/c/aeron_client_conductor.c:1040-1080`.
 
 use deepmsg_cnc::command::CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED;
+use deepmsg_cnc::counters::{
+    CHANNEL_ENDPOINT_STATUS_ACTIVE, CountersReader, LOCAL_SOCKADDR_TYPE_ID, LocalSocketAddress,
+};
 
 use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
 use crate::image::{ControlledFragments, Fragment, Image};
@@ -312,6 +315,86 @@ impl Subscription {
             .find(|image| image.registration_id() == publication_registration_id)
     }
 
+    /// An image by the **session** its stream is in
+    /// (`Subscription.imageBySessionId`, `Subscription.java:339-352`;
+    /// `aeron_subscription_image_by_session_id`,
+    /// `aeron-client/src/main/c/aeron_subscription.c:291-318`).
+    ///
+    /// The session is the id a publication's stream carries across every one of
+    /// its term rotations, so it is what a caller names an image by when the
+    /// publication's registration id is not a thing it ever had. The archive's
+    /// replay-merge is that caller: it is handed a replay session's images and
+    /// has to pick the one whose session the request named.
+    pub fn image_by_session_id(&self, session_id: i32) -> Option<&Image> {
+        self.images
+            .iter()
+            .find(|image| image.session_id() == session_id)
+    }
+
+    /// Where this subscription is actually bound, or `None` while it is not
+    /// (`Subscription.resolvedEndpoint`, `Subscription.java:579-586`, over
+    /// `LocalSocketAddressStatus.findAddress`).
+    ///
+    /// The address is not something the subscription was told: a channel may
+    /// name port `0` — a multi-destination one does — and the kernel's choice
+    /// comes back only through the driver, in the **key** of a
+    /// [`LOCAL_SOCKADDR_TYPE_ID`] counter
+    /// ([`deepmsg_cnc::counters::LocalSocketAddress`], which reads it). So this
+    /// is a read of the CnC file, and the reader is passed in for the reason
+    /// [`Client::poll`] returns positions rather than writing them: the file is
+    /// the client's, and this type does not own it.
+    ///
+    /// Both gates the reference has are here. The channel-status counter has to
+    /// hold `ACTIVE` — before the socket is bound there is no address to report
+    /// — and so does each address counter itself, which is how an endpoint
+    /// still being set up is told apart from one that is up.
+    ///
+    /// `None` also for `aeron:ipc`, where there is no endpoint and no status
+    /// counter to read ([`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`]).
+    ///
+    /// [`Client::poll`]: crate::Client::poll
+    pub fn resolved_endpoint(&self, counters: &CountersReader<'_>) -> Option<String> {
+        let channel_status_id = self.channel_status_indicator_id()?;
+
+        if counters.value(channel_status_id) != Some(CHANNEL_ENDPOINT_STATUS_ACTIVE) {
+            return None;
+        }
+
+        // The first address that names this channel, which is what the
+        // reference returns: an endpoint may have more than one bound address
+        // (the reference's own `findAddresses` returns a list), and the single
+        // answer is the first.
+        let mut endpoint = None;
+
+        counters.for_each(|counter| {
+            if endpoint.is_some() || counter.type_id != LOCAL_SOCKADDR_TYPE_ID {
+                return;
+            }
+
+            let Some(key) = counters.key(counter.counter_id) else {
+                return;
+            };
+            let Some(address) = LocalSocketAddress::decode(&key) else {
+                return;
+            };
+
+            // All three of the reference's conditions (`findAddress` checks
+            // the id, the counter's own status, and a length above zero): a
+            // counter that names this channel, is up itself, and has been
+            // filled in. The length is Java's `length > 0` — an allocated
+            // counter whose address has not been written yet is not an address,
+            // and answering with the empty string would be answering.
+            if address.channel_status_id == channel_status_id
+                && counter.value == CHANNEL_ENDPOINT_STATUS_ACTIVE
+                && !address.address.is_empty()
+            {
+                endpoint = Some(address.address.to_owned());
+            }
+        });
+
+        endpoint
+    }
+
     /// Attach a newly available image.
     ///
     /// Replacing an image that is already there, because the driver can send
@@ -353,7 +436,11 @@ impl std::fmt::Debug for Subscription {
 
 #[cfg(test)]
 mod tests {
-    use super::Subscription;
+    use deepmsg_cnc::counters::LOCAL_SOCKADDR_TYPE_ID;
+    use deepmsg_cnc::layout;
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    use super::{CHANNEL_ENDPOINT_STATUS_ACTIVE, CountersReader, Subscription};
     use crate::fragment_assembler::{Action, Message};
     use crate::image::tests::{TempLog, write_message};
 
@@ -441,6 +528,151 @@ mod tests {
         assert_eq!(
             seen[0].1, seen[1].1,
             "the third poll went back to the first image"
+        );
+    }
+
+    /// A counters region the tests can lay out by hand.
+    ///
+    /// The reader takes two aligned buffers, so the storage has to be declared
+    /// aligned — a `Vec<u8>` cannot be read as an `AtomicBuffer` for that
+    /// reason and that reason only.
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
+
+    impl Region {
+        fn zeroed(length: usize) -> Self {
+            Self(vec![0u8; length])
+        }
+
+        fn put_i32(&mut self, offset: usize, value: i32) {
+            self.0[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_i64(&mut self, offset: usize, value: i64) {
+            self.0[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// A file with the two counters `resolved_endpoint` reads: the channel's
+    /// own status at id 0, and one local address beside it at id 1.
+    ///
+    /// Both are written with the states a caller asks for, because the ones
+    /// that matter here are states this driver never leaves behind — it binds
+    /// the socket and fills the address in the same breath, so a real file only
+    /// ever holds the first combination below.
+    fn counters_with(
+        status: i64,
+        channel_status_id: i32,
+        address: &str,
+        up: bool,
+    ) -> (Region, Region) {
+        let mut metadata = Region::zeroed(2 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(2 * layout::COUNTER_VALUE_LENGTH);
+
+        // Counter 0: the channel's status, which is what the reader gates on
+        // before it looks at anything else. Type 6 and 7 are `snd-channel` and
+        // `rcv-channel`; which of the two it is does not matter here, because
+        // the reader finds it by the id the ready response named.
+        metadata.put_i32(layout::COUNTER_TYPE_ID_OFFSET, 6);
+        metadata.put_i32(
+            layout::COUNTER_STATE_OFFSET,
+            layout::COUNTER_STATE_ALLOCATED,
+        );
+        values.put_i64(layout::COUNTER_VALUE_OFFSET, status);
+
+        // Counter 1: the address, keyed by the channel status it belongs to.
+        let base = layout::COUNTER_METADATA_LENGTH;
+        let key = base + layout::COUNTER_KEY_OFFSET;
+        let length = i32::try_from(address.len()).expect("short");
+
+        metadata.put_i32(
+            base + layout::COUNTER_TYPE_ID_OFFSET,
+            LOCAL_SOCKADDR_TYPE_ID,
+        );
+        metadata.put_i32(
+            base + layout::COUNTER_STATE_OFFSET,
+            layout::COUNTER_STATE_ALLOCATED,
+        );
+        metadata.put_i32(key, channel_status_id);
+        metadata.put_i32(key + 4, length);
+        metadata.0[key + 8..key + 8 + address.len()].copy_from_slice(address.as_bytes());
+
+        values.put_i64(
+            layout::COUNTER_VALUE_LENGTH + layout::COUNTER_VALUE_OFFSET,
+            if up {
+                CHANNEL_ENDPOINT_STATUS_ACTIVE
+            } else {
+                0
+            },
+        );
+
+        (metadata, values)
+    }
+
+    fn reader<'a>(metadata: &'a Region, values: &'a Region) -> CountersReader<'a> {
+        CountersReader::new(
+            AtomicBuffer::from_slice(&metadata.0).expect("aligned"),
+            AtomicBuffer::from_slice(&values.0).expect("aligned"),
+        )
+    }
+
+    /// The four ways the scan can decline to answer, each of them a condition
+    /// the reference states in one expression (`findAddress` checks the id, the
+    /// counter's own status, and a length above zero).
+    ///
+    /// Laid out by hand rather than taken from a live driver because three of
+    /// the four are states it never leaves behind. A reader that dropped one
+    /// would answer with an address of no bytes, or with another channel's
+    /// — and the caller that reads this is building a replay channel out of it.
+    #[test]
+    fn an_endpoint_comes_only_from_this_channels_address_and_only_when_it_is_up() {
+        let subscription = Subscription::new(1, "aeron:udp?endpoint=127.0.0.1:0".to_string(), 1, 0);
+
+        let (metadata, values) =
+            counters_with(CHANNEL_ENDPOINT_STATUS_ACTIVE, 0, "127.0.0.1:40456", true);
+        assert_eq!(
+            Some("127.0.0.1:40456".to_string()),
+            subscription.resolved_endpoint(&reader(&metadata, &values)),
+            "the address of this channel, which is up"
+        );
+
+        // The channel itself is not up yet: there is nothing to report, and a
+        // counter left over from a previous endpoint is not an answer.
+        let (metadata, values) = counters_with(0, 0, "127.0.0.1:40456", true);
+        assert_eq!(
+            None,
+            subscription.resolved_endpoint(&reader(&metadata, &values)),
+            "a channel that is not up has no address"
+        );
+
+        // An address counter that belongs to another channel — which a
+        // subscription has no business reading, and would otherwise answer
+        // with.
+        let (metadata, values) =
+            counters_with(CHANNEL_ENDPOINT_STATUS_ACTIVE, 9, "127.0.0.1:40457", true);
+        assert_eq!(
+            None,
+            subscription.resolved_endpoint(&reader(&metadata, &values)),
+            "another channel's address is not this one's"
+        );
+
+        // Allocated, keyed, and not yet filled in: the reference's
+        // `length > 0`, which the empty string does not satisfy.
+        let (metadata, values) = counters_with(CHANNEL_ENDPOINT_STATUS_ACTIVE, 0, "", true);
+        assert_eq!(
+            None,
+            subscription.resolved_endpoint(&reader(&metadata, &values)),
+            "a key with no address in it is not an address"
+        );
+
+        // And an address counter that is itself not up, which is the second
+        // `ACTIVE` the reference checks.
+        let (metadata, values) =
+            counters_with(CHANNEL_ENDPOINT_STATUS_ACTIVE, 0, "127.0.0.1:40456", false);
+        assert_eq!(
+            None,
+            subscription.resolved_endpoint(&reader(&metadata, &values)),
+            "an address counter that is not up is not an address"
         );
     }
 

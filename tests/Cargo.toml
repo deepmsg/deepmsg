@@ -149,6 +149,13 @@ path = "integration/async_add.rs"
 name = "claim_rotation"
 path = "integration/claim_rotation.rs"
 
+# The window a publication reports, in both directions: a reader that stops
+# closes it until an offer is refused, and a reader that catches up opens it.
+# Runs in CI: it needs our own driver, not the reference's.
+[[test]]
+name = "available_window"
+path = "integration/available_window.rs"
+
 [[test]]
 name = "shared_claim"
 path = "integration/shared_claim.rs"

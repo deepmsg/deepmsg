@@ -371,7 +371,13 @@ pub const SEND_LOCAL_SOCKADDR_NAME: &str = "snd-local-sockaddr";
 pub const RECEIVE_LOCAL_SOCKADDR_NAME: &str = "rcv-local-sockaddr";
 
 /// `AERON_COUNTER_LOCAL_SOCKADDR_TYPE_ID` (`aeron_counters.h:109`).
-pub const LOCAL_SOCKADDR_TYPE_ID: i32 = 14;
+///
+/// Re-exported rather than restated: a client reads these counters out of the
+/// CnC file by their type id, so the number the writer allocates under and the
+/// number the reader looks for are one fact and belong in the one crate both
+/// can see ([`deepmsg_cnc::counters`], where the client's own vocabulary of the
+/// file already lives).
+pub use deepmsg_cnc::counters::LOCAL_SOCKADDR_TYPE_ID;
 
 /// The key a local-address counter carries
 /// (`aeron_local_sockaddr_key_layout_t`,
@@ -560,6 +566,16 @@ mod tests {
             key[23..].iter().all(|byte| 0 == *byte),
             "everything past the address is zero"
         );
+
+        // And the reader on the other side of the file agrees with the writer
+        // here. The two are separate statements of one layout — this crate
+        // writes the key, `deepmsg-cnc` reads it, and neither depends on the
+        // other — so the round trip is the only thing that keeps them one
+        // layout rather than two that happen to match today.
+        let read = deepmsg_cnc::counters::LocalSocketAddress::decode(&key).expect("a key we wrote");
+
+        assert_eq!(42, read.channel_status_id);
+        assert_eq!("127.0.0.1:40456", read.address);
     }
 
     /// The counter itself: type 14, the address in its label beside the channel
