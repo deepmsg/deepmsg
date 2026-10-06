@@ -943,6 +943,7 @@ impl SenderThread {
             &regions,
             self.linger_timeout_ns,
             &self.events,
+            now_ns,
         );
 
         let short_sends_after = system.value(system_counters::id::SHORT_SENDS);
@@ -978,6 +979,7 @@ impl SenderThread {
             &regions,
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
+            now_ns,
         );
 
         work + resolved
@@ -1676,8 +1678,8 @@ impl SenderThread {
         regions: &CounterRegions<'_>,
         linger_timeout_ns: i64,
         events: &Channel<SenderEvent>,
+        now_ns: i64,
     ) -> usize {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         // Bytes, not publications: the reference's `do_send` returns
         // `bytes_sent` and its duty cycle keys on that (`:150`, `:455`), so a
         // pass that walked ten publications and sent nothing is a pass that
@@ -1735,8 +1737,8 @@ impl SenderThread {
         regions: &CounterRegions<'_>,
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
+        now_ns: i64,
     ) {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 
