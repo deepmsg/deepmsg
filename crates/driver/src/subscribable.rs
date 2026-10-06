@@ -335,6 +335,32 @@ impl Subscribable {
         })
     }
 
+    /// The smallest and the largest position among the **active** readers, in
+    /// one pass, or `None` when there is none.
+    ///
+    /// The reference takes both readings in a single loop over the set
+    /// (`aeron_network_publication.c:966-977` seeds a running minimum and
+    /// maximum and updates each inside the one `for`), and every caller here
+    /// that wants one of them wants the other in the same pass: the publisher
+    /// limit needs the minimum, the spy position needs the maximum, and both
+    /// are computed from the same set at the same moment. Reading them
+    /// separately walks the set — and re-resolves every counter id into an
+    /// offset — twice for one answer.
+    pub fn active_position_bounds(
+        &self,
+        manager: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> Option<(i64, i64)> {
+        self.positions
+            .iter()
+            .filter(|position| position.state.is_active())
+            .filter_map(|position| manager.value(regions, position.counter_id))
+            .fold(None, |bounds, position| match bounds {
+                None => Some((position, position)),
+                Some((min, max)) => Some((min.min(position), max.max(position))),
+            })
+    }
+
     /// The smallest position among the **active** readers, or `None` when there
     /// is none.
     ///
@@ -346,11 +372,8 @@ impl Subscribable {
         manager: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> Option<i64> {
-        self.positions
-            .iter()
-            .filter(|position| position.state.is_active())
-            .filter_map(|position| manager.value(regions, position.counter_id))
-            .min()
+        self.active_position_bounds(manager, regions)
+            .map(|(min, _)| min)
     }
 
     /// The largest position among the **active** readers, or `None` when there
@@ -360,11 +383,8 @@ impl Subscribable {
         manager: &CounterManager,
         regions: &CounterRegions<'_>,
     ) -> Option<i64> {
-        self.positions
-            .iter()
-            .filter(|position| position.state.is_active())
-            .filter_map(|position| manager.value(regions, position.counter_id))
-            .max()
+        self.active_position_bounds(manager, regions)
+            .map(|(_, max)| max)
     }
 }
 
@@ -532,6 +552,49 @@ mod tests {
             .expect("it was there");
         assert_eq!(None, set.min_active_position(&manager, &regions));
         assert!(!set.has_working_positions());
+    }
+
+    #[test]
+    fn both_bounds_come_out_of_one_walk_of_the_active_readers() {
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+
+        let slow = manager
+            .allocate(&regions, 4, &[], b"slow", 0)
+            .expect("an id");
+        let fast = manager
+            .allocate(&regions, 4, &[], b"fast", 0)
+            .expect("an id");
+        manager.set_value(&regions, slow, 10).expect("in range");
+        manager.set_value(&regions, fast, 500).expect("in range");
+
+        let mut set = Subscribable::new(99);
+        let mut hooks = Recorder::default();
+        set.add_position(position(slow, 7), &mut hooks);
+        set.add_position(position(fast, 9), &mut hooks);
+
+        assert_eq!(
+            Some((10, 500)),
+            set.active_position_bounds(&manager, &regions)
+        );
+
+        // The single-ended readings are the same walk, so they cannot disagree
+        // with it about which readers counted.
+        assert_eq!(Some(10), set.min_active_position(&manager, &regions));
+        assert_eq!(Some(500), set.max_active_position(&manager, &regions));
+
+        // A resting reader is at neither end.
+        set.set_state(fast, TetherState::Resting, 1)
+            .expect("it was there");
+        assert_eq!(
+            Some((10, 10)),
+            set.active_position_bounds(&manager, &regions)
+        );
+
+        // With nobody active there is no pair at all.
+        set.set_state(slow, TetherState::Resting, 2)
+            .expect("it was there");
+        assert_eq!(None, set.active_position_bounds(&manager, &regions));
     }
 
     #[test]

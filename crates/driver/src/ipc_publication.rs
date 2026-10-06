@@ -1118,7 +1118,11 @@ impl IpcPublication {
         let consumer_position = self.consumer_position;
 
         if self.subscribers.has_working_positions() {
-            let min_sub_pos = self.subscribers.min_active_position(manager, regions);
+            let Some((min_sub_pos, max_sub_pos)) =
+                self.subscribers.active_position_bounds(manager, regions)
+            else {
+                return false;
+            };
 
             // The reference seeds the running maximum with the consumer
             // position before it takes a single reading
@@ -1126,14 +1130,7 @@ impl IpcPublication {
             // a reader that comes back below it — a rejoining subscription
             // still holding its join position — must not drag the limit
             // arithmetic backwards with it.
-            let max_sub_pos = self
-                .subscribers
-                .max_active_position(manager, regions)
-                .map_or(consumer_position, |max| max.max(consumer_position));
-
-            let Some(min_sub_pos) = min_sub_pos else {
-                return false;
-            };
+            let max_sub_pos = max_sub_pos.max(consumer_position);
 
             let new_limit = min_sub_pos + i64::from(self.term_window_length);
             let mut worked = false;
