@@ -10,6 +10,7 @@ covers it.
 | CnC semantic version | `AERON_CNC_VERSION` | **0.2.0** | `aeron-client/src/main/c/aeron_cnc_file_descriptor.h:26` |
 | Archive protocol SBE | schema id / version | 101 / 14 (semanticVersion 5.2) | `schemas/aeron-archive-codecs.xml` |
 | Archive mark SBE | schema id / version | 100 / 2 (semanticVersion 5.2) | `schemas/aeron-archive-mark-codecs.xml` |
+| Archive mark **file** | `ArchiveMarkFile.SEMANTIC_VERSION` | **3.1.0**; only the **major** is compared, so a minor ahead is read | `aeron-archive/src/main/java/io/aeron/archive/ArchiveMarkFile.java:55-72` |
 | Cluster protocol SBE | schema id / version | 111 / 17 (semanticVersion 5.4) | `schemas/aeron-cluster-codecs.xml` |
 | Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
 | Cluster node-state SBE | schema id / version | 112 / 10 | `schemas/aeron-cluster-node-state-codecs.xml` |
@@ -34,6 +35,18 @@ Rules:
   tracks cross-component versions only.
 - Changing anything in this table without extending the interop suite first
   is a review-blocking offence.
+
+The archive mark **file**'s row is the one whose two halves are pinned
+separately, because they fail differently. The version it holds is read out of a
+file the **reference** wrote, in CI, by
+`crates/archive/tests/mark_file.rs::the_golden_is_alive_for_its_own_timeout`;
+that only the major is compared — a minor ahead is still read — is
+`crates/archive/src/mark_file.rs::another_major_is_refused_and_a_minor_is_not`,
+and its both-ways reading by the reference's own `ArchiveTool` is
+`tests/interop/mark_file_reference.rs`. The golden itself is
+`tests/fixtures/mark-file/`, written by the reference's `ArchiveMarkFile`; its
+README is where the file's layout facts and the one field that cannot be fixed
+across runs (the pid) are recorded.
 
 ## Counters
 
