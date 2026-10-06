@@ -914,7 +914,13 @@ impl SenderThread {
         // whole of what the divergence costs: "how soon a deadline is noticed,
         // not which transitions happen". Noticing it every pass instead of
         // every interval therefore buys nothing.
-        if self.maintenance.is_due(now_ns) {
+        // One decision for the pass: the send loop notices a revoke under the
+        // same gate the two checks below run under, and all three are the
+        // reference's `aeron_network_publication_check_managed_resources`
+        // (`aeron_network_publication.c:1240-1290`) on the conductor's tier.
+        let maintenance_due = self.maintenance.is_due(now_ns);
+
+        if maintenance_due {
             self.check_untethered_subscriptions(&regions, now_ns);
             self.check_for_blocked_publishers(&regions, now_ns);
             self.maintenance.ran(now_ns);
@@ -950,6 +956,7 @@ impl SenderThread {
             self.linger_timeout_ns,
             &self.events,
             now_ns,
+            maintenance_due,
         );
 
         let short_sends_after = system.value(system_counters::id::SHORT_SENDS);
@@ -1693,6 +1700,7 @@ impl SenderThread {
         linger_timeout_ns: i64,
         events: &Channel<SenderEvent>,
         now_ns: i64,
+        maintenance_due: bool,
     ) -> usize {
         // Bytes, not publications: the reference's `do_send` returns
         // `bytes_sent` and its duty cycle keys on that (`:150`, `:455`), so a
@@ -1711,10 +1719,16 @@ impl SenderThread {
             let registration_id = publication.registration_id;
 
             // A revoked publication has one last thing to do — say so — and
-            // this is where it is noticed, on the thread that owns it
-            // (`aeron_network_publication_check_managed_resources`'s ACTIVE and
-            // LINGER arms, `:1240-1340`).
-            if publication.notice_revoke(now_ns, linger_timeout_ns, system, counters, regions) {
+            // the reference notices it on the managed-resource tier, in the
+            // same function as the two checks above
+            // (`aeron_network_publication_check_managed_resources`'s ACTIVE
+            // arm, `aeron_network_publication.c:1246-1250`). It runs there
+            // here too: what that tier decides is how soon a revoked
+            // publication is told, and the reference's answer is an interval,
+            // not a pass.
+            if maintenance_due
+                && publication.notice_revoke(now_ns, linger_timeout_ns, system, counters, regions)
+            {
                 let _ = events.send(SenderEvent::PublicationDrained { registration_id });
             }
 
