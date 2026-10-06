@@ -945,6 +945,7 @@ impl Conductor {
             config.re_resolution_check_interval_ns,
             config.status_message_timeout_ns,
             config.send_to_sm_poll_ratio,
+            config.timer_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 

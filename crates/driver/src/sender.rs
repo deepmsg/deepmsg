@@ -47,7 +47,7 @@ use deepmsg_cnc::command::OwnedPublicationError;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
-use crate::driver::Role;
+use crate::driver::{Role, Timer};
 use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
@@ -580,6 +580,7 @@ impl Sender {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
     ) -> io::Result<Self> {
         let SenderParts { proxy, agent } = Self::split(
             cnc,
@@ -591,6 +592,7 @@ impl Sender {
             re_resolution_interval_ns,
             status_message_timeout_ns,
             send_to_sm_poll_ratio,
+            timer_interval_ns,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -624,6 +626,7 @@ impl Sender {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -648,6 +651,7 @@ impl Sender {
                 re_resolution_interval_ns,
                 status_message_timeout_ns,
                 send_to_sm_poll_ratio,
+                timer_interval_ns,
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -702,6 +706,9 @@ pub(crate) struct SenderThread {
     /// at all.
     re_resolution_interval_ns: i64,
     re_resolution_deadline_ns: i64,
+    /// When the maintenance the reference runs on its timer tier next runs.
+    /// See [`Timer`].
+    maintenance: Timer,
     publications: Vec<NetworkPublication>,
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
@@ -741,6 +748,7 @@ impl SenderThread {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
         now_ns: i64,
         events: Channel<SenderEvent>,
         commands: Receiver<SenderCommand>,
@@ -753,6 +761,7 @@ impl SenderThread {
             linger_timeout_ns,
             re_resolution_interval_ns,
             re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
+            maintenance: Timer::new(timer_interval_ns, now_ns),
             duty_cycle: DutyCycle::new(send_to_sm_poll_ratio, status_message_timeout_ns),
             events,
             endpoints: Vec::new(),
@@ -887,8 +896,23 @@ impl SenderThread {
             &self.counters,
             &regions,
         );
-        self.check_untethered_subscriptions(&regions, now_ns);
-        self.check_for_blocked_publishers(&regions, now_ns);
+        // The reference runs both of these from the conductor, on its timer
+        // tier — `aeron_network_publication_check_managed_resources`
+        // (`aeron_network_publication.c:1270-1290`), reached from
+        // `aeron_driver_conductor_on_check_managed_resources` (`:1692`), whose
+        // `on_time_event` the publication list is wired to at `:766`. They run
+        // here because the publications are this thread's; the deadline is the
+        // same one. See [`Timer`].
+        //
+        // The comment on `check_for_blocked_publishers` below already says the
+        // whole of what the divergence costs: "how soon a deadline is noticed,
+        // not which transitions happen". Noticing it every pass instead of
+        // every interval therefore buys nothing.
+        if self.maintenance.is_due(now_ns) {
+            self.check_untethered_subscriptions(&regions, now_ns);
+            self.check_for_blocked_publishers(&regions, now_ns);
+            self.maintenance.ran(now_ns);
+        }
 
         let system = System::new(&self.counters, &regions);
 
@@ -2281,6 +2305,7 @@ mod tests {
             0,
             crate::config::RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             crate::config::SEND_TO_STATUS_POLL_RATIO_DEFAULT,
+            crate::config::TIMER_INTERVAL_NS_DEFAULT,
         )
         .expect("a sender");
 
