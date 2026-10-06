@@ -47,10 +47,15 @@ use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
 
-/// How many datagrams one poll may read
-/// (`AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX`,
-/// `aeron-driver/src/main/c/aeron_driver_context.h:59`).
-const RECEIVE_SLOTS: usize = 16;
+/// How many datagrams a receiver with no `aeron.receiver.io.vector.capacity`
+/// of its own keeps and reads per poll.
+///
+/// The configured value is this by default and is what the poll passes as the
+/// `vlen` of its `recvmmsg` (`aeron_driver_receiver.c:127` reads
+/// `recv_buffers.vector_capacity`, set from `receiver_io_vector_capacity` at
+/// `:47`). The reference's ceiling for it is
+/// `AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX` (`aeron_driver_context.h:59`).
+pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT;
 
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
@@ -653,6 +658,7 @@ impl Receiver {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -675,6 +681,7 @@ impl Receiver {
             values_length,
             free_to_reuse_timeout_ms,
             mtu_length,
+            io_vector_capacity,
             status_message_timeout_ns,
             initial_window_length,
             cycle_threshold_ns,
@@ -709,6 +716,7 @@ impl Receiver {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -734,6 +742,7 @@ impl Receiver {
                 loss_report,
                 counters,
                 mtu_length,
+                io_vector_capacity,
                 status_message_timeout_ns,
                 initial_window_length,
                 cycle_threshold_ns,
@@ -866,6 +875,7 @@ impl ReceiverThread {
         loss_report: Arc<LossReportFile>,
         counters: CounterManager,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -893,7 +903,13 @@ impl ReceiverThread {
             images: Vec::new(),
             pending_setups: Vec::new(),
             pending_resolutions: Vec::new(),
-            buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
+            // `receiver->recv_buffers.vector_capacity`
+            // (`aeron_driver_receiver.c:47`), which is also the `vlen` its poll
+            // reads with (`:127`) — so this is the one setting that decides how
+            // much of a burst one turn takes.
+            buffers: (0..io_vector_capacity.max(RECEIVE_SLOTS_DEFAULT))
+                .map(|_| vec![0u8; mtu_length])
+                .collect(),
             datagrams: Datagrams::new(),
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
@@ -2171,6 +2187,7 @@ mod tests {
             deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN,
             1_000,
             1408,
+            crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT,
             crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
             128 * 1024,
             100_000_000,

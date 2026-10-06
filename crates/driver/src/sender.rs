@@ -61,10 +61,16 @@ use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
 use deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH;
 
-/// How many datagrams one poll may read
-/// (`AERON_DRIVER_SENDER_IO_VECTOR_LENGTH_MAX`,
-/// `aeron-driver/src/main/c/aeron_driver_context.h:55`).
-const RECEIVE_SLOTS: usize = 16;
+/// How many datagrams the sender reads per poll, which is **one**.
+///
+/// Not a capacity and not configurable: `aeron_driver_sender.c:154` builds a
+/// `struct mmsghdr mmsghdr[1]` and `:170` hands the poller `vlen = 1`, so the
+/// reference's sender is on `aeron_udp_channel_transport_recvmsg` rather than
+/// `..._recvmmsg` (`media/aeron_udp_channel_transport.c:551-554`) however many
+/// buffers `aeron.sender.io.vector.capacity` sized for it. A datagram that
+/// arrives while another is being dispatched waits for the next poll, and the
+/// next poll is one pass away.
+const DATAGRAMS_PER_CONTROL_POLL: usize = 1;
 
 /// What the conductor asks the sender to do.
 pub enum SenderCommand {
@@ -575,6 +581,7 @@ impl Sender {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
@@ -587,6 +594,7 @@ impl Sender {
             values_length,
             free_to_reuse_timeout_ms,
             mtu_length,
+            io_vector_capacity,
             cycle_threshold_ns,
             linger_timeout_ns,
             re_resolution_interval_ns,
@@ -621,6 +629,7 @@ impl Sender {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
@@ -646,6 +655,7 @@ impl Sender {
                 cnc,
                 counters,
                 mtu_length,
+                io_vector_capacity,
                 cycle_threshold_ns,
                 linger_timeout_ns,
                 re_resolution_interval_ns,
@@ -748,6 +758,7 @@ impl SenderThread {
         cnc: Arc<CncFile>,
         counters: CounterManager,
         mtu_length: usize,
+        io_vector_capacity: usize,
         cycle_threshold_ns: i64,
         linger_timeout_ns: i64,
         re_resolution_interval_ns: i64,
@@ -772,7 +783,13 @@ impl SenderThread {
             endpoints: Vec::new(),
             pending_resolutions: Vec::new(),
             publications: Vec::new(),
-            buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
+            // `sender->recv_buffers.vector_capacity`
+            // (`aeron_driver_sender.c:49`) — a pool sized by the setting whose
+            // first entry is the only one a poll fills, which is the reference's
+            // own arrangement.
+            buffers: (0..io_vector_capacity.max(DATAGRAMS_PER_CONTROL_POLL))
+                .map(|_| vec![0u8; mtu_length])
+                .collect(),
             datagrams: Datagrams::new(),
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
@@ -974,7 +991,10 @@ impl SenderThread {
             work += Self::receive_control_frames(
                 &mut self.endpoints,
                 &mut self.publications,
-                &mut self.buffers,
+                // One datagram per poll, as the reference's sender reads
+                // (`aeron_driver_sender.c:154`, `:170`): the capacity sizes the
+                // pool, it does not decide how much of it a poll fills.
+                &mut self.buffers[..DATAGRAMS_PER_CONTROL_POLL],
                 &mut self.datagrams,
                 &system,
                 &self.counters,
@@ -2330,6 +2350,7 @@ mod tests {
             COUNTERS_VALUES_BUFFER_LENGTH_MIN,
             1_000,
             1408,
+            crate::config::SENDER_IO_VECTOR_CAPACITY_DEFAULT,
             100_000_000,
             crate::config::PUBLICATION_LINGER_TIMEOUT_NS_DEFAULT,
             0,

@@ -738,14 +738,36 @@ impl DatagramSocket {
         // `RecvMessages::new`; each points at that allocation's own `names`
         // entry, which is a whole `sockaddr_storage`, and at a buffer the
         // caller lent for the duration of the call.
+        // Which of the two syscalls this is, is what `vlen` decides — the
+        // reference's own branch (`media/aeron_udp_channel_transport.c:551-554`:
+        // `if (vlen > 1)` is what selects `recvmmsg`, and one message falls
+        // through to `aeron_udp_channel_transport_recvmsg`). The two differ in
+        // how the length comes back: `recvmmsg` writes it into the messages it
+        // was given, `recvmsg` returns it, so the one result is put where the
+        // loop below reads it.
         let received = unsafe {
-            libc::recvmmsg(
-                self.fd,
-                receive.messages.as_mut_ptr(),
-                count as libc::c_uint,
-                0,
-                std::ptr::null_mut(),
-            )
+            if count == 1 {
+                let length = libc::recvmsg(
+                    self.fd,
+                    std::ptr::from_mut(&mut receive.messages[0].msg_hdr),
+                    0,
+                );
+
+                if length < 0 {
+                    -1
+                } else {
+                    receive.messages[0].msg_len = u32::try_from(length).unwrap_or(u32::MAX);
+                    1
+                }
+            } else {
+                libc::recvmmsg(
+                    self.fd,
+                    receive.messages.as_mut_ptr(),
+                    count as libc::c_uint,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
         };
 
         if received < 0 {
@@ -1155,6 +1177,57 @@ mod tests {
                 .expect("a receive")
         );
         assert_eq!(b"three", &other[0][..5]);
+    }
+
+    #[test]
+    fn a_batch_of_one_takes_one_datagram_however_many_are_queued() {
+        // The length of the slice is the `vlen`, and the sender's control read
+        // is a slice of one: `aeron_driver_sender.c:154` builds a
+        // `struct mmsghdr mmsghdr[1]` and `:170` passes `vlen = 1`, so a burst
+        // of control frames takes as many polls as it has frames. This is what
+        // makes that true on this side.
+        let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        receiver
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        receiver.set_nonblocking().expect("non-blocking");
+
+        let local = receiver.local_address().expect("a bound address");
+        let sender = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        assert_eq!(
+            3,
+            sender
+                .send_batch(Some(local), &[b"one", b"two", b"three"])
+                .expect("a send")
+        );
+
+        let mut buffers = vec![vec![0u8; 64]];
+        let mut datagrams = Datagrams::new();
+
+        for expected in [b"one".as_slice(), b"two", b"three"] {
+            assert_eq!(
+                1,
+                receiver
+                    .receive_batch(&mut buffers, &mut datagrams)
+                    .expect("a receive"),
+                "one buffer in, one datagram out"
+            );
+            assert_eq!(
+                expected,
+                &buffers[0][..datagrams.as_slice()[0].length],
+                "and they come out in the order they went in"
+            );
+        }
+
+        // And the queue is what says when to stop, not the slice. The socket
+        // reports an empty queue the way the kernel does — `EAGAIN` — and it is
+        // the transport above it that turns that into the zero a pass reads
+        // (`media::udp_transport`'s `is_back_pressure`).
+        match receiver.receive_batch(&mut buffers, &mut datagrams) {
+            Ok(0) => {}
+            Err(error) => assert_eq!(io::ErrorKind::WouldBlock, error.kind()),
+            Ok(other) => panic!("a fourth datagram appeared: {other}"),
+        }
     }
 
     #[test]

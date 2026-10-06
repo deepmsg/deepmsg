@@ -316,6 +316,27 @@ pub const RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT: i64 = 200 * 1000 * 1000;
 /// false, so a stream with only spies looks unconnected until someone asks.
 pub const SPIES_SIMULATE_CONNECTION_DEFAULT: bool = false;
 
+/// `AERON_RECEIVER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:240`):
+/// how many datagrams one receive poll may read, and how many buffers the
+/// receiver keeps for it.
+pub const RECEIVER_IO_VECTOR_CAPACITY_DEFAULT: usize = 4;
+
+/// `AERON_SENDER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:241`):
+/// how many buffers the **sender** keeps for the control frames it reads.
+///
+/// It does not decide how many of them a poll fills: the sender reads exactly
+/// one datagram per poll (`aeron_driver_sender.c:154` builds `mmsghdr[1]` and
+/// `:170` passes `vlen = 1`), so the capacity sizes a pool whose first entry is
+/// the only one ever used.
+pub const SENDER_IO_VECTOR_CAPACITY_DEFAULT: usize = 4;
+
+/// `AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX` and
+/// `AERON_DRIVER_SENDER_IO_VECTOR_LENGTH_MAX` (`aeron_driver_context.h:55`,
+/// `:59`): the ceiling both of this build's readers are bounded by, which is
+/// what the reference's two setters clamp to
+/// (`aeron_driver_context.c:3348-3371`).
+pub const IO_VECTOR_CAPACITY_MAX: usize = 16;
+
 /// `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT`
 /// (`aeron_driver_context.c:242`), which is clamped to
 /// [`crate::media::udp_transport`]'s sixteen by the context setter
@@ -587,6 +608,15 @@ pub struct DriverConfig {
     /// `SO_SNDBUF`, likewise (`aeron.socket.so_sndbuf`; zero leaves the
     /// kernel's default, which is a socket *sending* into a local buffer).
     pub socket_so_sndbuf: i32,
+    /// How many datagrams one receive poll may read
+    /// (`aeron.receiver.io.vector.capacity`; the reference's receiver passes
+    /// it as the `vlen` of its `recvmmsg`, `aeron_driver_receiver.c:127`).
+    pub receiver_io_vector_capacity: usize,
+    /// How many buffers the **sender** keeps for the control frames it reads
+    /// (`aeron.sender.io.vector.capacity`). See
+    /// [`SENDER_IO_VECTOR_CAPACITY_DEFAULT`] for the one thing it does not
+    /// decide.
+    pub sender_io_vector_capacity: usize,
     /// The multicast hop limit a channel that named none gets
     /// (`aeron.socket.multicast.ttl = 0`, `AERON_SOCKET_MULTICAST_TTL`).
     ///
@@ -927,6 +957,8 @@ impl Default for DriverConfig {
             publication_window_length: PUBLICATION_WINDOW_LENGTH_DEFAULT,
             socket_so_rcvbuf: SOCKET_SO_RCVBUF_DEFAULT,
             socket_so_sndbuf: SOCKET_SO_SNDBUF_DEFAULT,
+            receiver_io_vector_capacity: RECEIVER_IO_VECTOR_CAPACITY_DEFAULT,
+            sender_io_vector_capacity: SENDER_IO_VECTOR_CAPACITY_DEFAULT,
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
@@ -1451,6 +1483,22 @@ impl DriverConfig {
                 &value,
                 0,
                 u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::RECEIVER_IO_VECTOR_CAPACITY) {
+            config.receiver_io_vector_capacity = parse_bounded_usize(
+                &Setting::RECEIVER_IO_VECTOR_CAPACITY,
+                &value,
+                1,
+                u64::try_from(IO_VECTOR_CAPACITY_MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::SENDER_IO_VECTOR_CAPACITY) {
+            config.sender_io_vector_capacity = parse_bounded_usize(
+                &Setting::SENDER_IO_VECTOR_CAPACITY,
+                &value,
+                1,
+                u64::try_from(IO_VECTOR_CAPACITY_MAX).unwrap_or(u64::MAX),
             )?;
         }
         if let Some(value) = get(&Setting::SOCKET_MULTICAST_TTL) {
@@ -2052,6 +2100,20 @@ impl Setting {
     const SOCKET_SO_SNDBUF: Self = Self {
         property: "socket.so_sndbuf",
         env: "AERON_SOCKET_SO_SNDBUF",
+    };
+    /// `aeron.receiver.io.vector.capacity` (`aeron_driver_context.h:228`,
+    /// environment variable `AERON_RECEIVER_IO_VECTOR_CAPACITY`,
+    /// `aeronmd.h:937`, read at `aeron_driver_context.c:1084-1089`).
+    const RECEIVER_IO_VECTOR_CAPACITY: Self = Self {
+        property: "receiver.io.vector.capacity",
+        env: "AERON_RECEIVER_IO_VECTOR_CAPACITY",
+    };
+    /// `aeron.sender.io.vector.capacity` (`aeron_driver_context.h:229`,
+    /// environment variable `AERON_SENDER_IO_VECTOR_CAPACITY`,
+    /// `aeronmd.h:941`, read at `aeron_driver_context.c:1091-1097`).
+    const SENDER_IO_VECTOR_CAPACITY: Self = Self {
+        property: "sender.io.vector.capacity",
+        env: "AERON_SENDER_IO_VECTOR_CAPACITY",
     };
     /// `aeron.socket.multicast.ttl` (`aeronmd.h:249`, read at `:768-772`).
     const SOCKET_MULTICAST_TTL: Self = Self {
@@ -2783,6 +2845,36 @@ fn parse_size64(setting: &Setting, value: &str) -> Result<usize, ConfigError> {
 /// (`aeron_config_parse_size64`'s `min` and `max` arguments,
 /// `aeron-client/src/main/c/util/aeron_parse_util.c:170-268`), as the `i32` the
 /// driver holds it in.
+/// Parse a count and refuse it outside `min..=max`.
+///
+/// The reference *clamps* — its setters run the value through
+/// `aeron_driver_context_clamp_value` (`aeron_driver_context.c:3339-3346`) —
+/// and this refuses instead, which is the divergence `docs/compat.md` records
+/// for every other bounded setting here: a value that means something other
+/// than what it spells is a typo rather than a configuration.
+///
+/// # Errors
+///
+/// [`ConfigError::OutOfRange`] outside the bounds, and whatever
+/// [`parse_size64`] gives for a value that is not a number.
+fn parse_bounded_usize(
+    setting: &Setting,
+    value: &str,
+    min: u64,
+    max: u64,
+) -> Result<usize, ConfigError> {
+    let parsed = u64::try_from(parse_size64(setting, value)?).unwrap_or(u64::MAX);
+
+    if parsed < min || parsed > max {
+        return Err(ConfigError::OutOfRange {
+            name: setting.property,
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(usize::try_from(parsed).unwrap_or(usize::MAX))
+}
+
 fn parse_bounded_size32(
     setting: &Setting,
     value: &str,
@@ -3733,6 +3825,56 @@ mod tests {
     }
 
     #[test]
+    fn the_two_io_vector_capacities_answer_to_the_references_names() {
+        // The reference's own defaults, which are four each
+        // (`aeron_driver_context.c:240-241`, `:523-524`). This build answered
+        // sixteen to both before it read the setting at all.
+        let defaults = DriverConfig::default();
+        assert_eq!(4, defaults.receiver_io_vector_capacity);
+        assert_eq!(4, defaults.sender_io_vector_capacity);
+
+        // By property, and by the environment variable each becomes: `aeronmd`
+        // turns `aeron.foo.bar` into `AERON_FOO_BAR`
+        // (`aeron-client/src/main/c/util/aeron_properties_util.c:151-172`), and
+        // the context reads the variable (`aeron_driver_context.c:1084-1097`).
+        let by_property = resolve(&[
+            ("deepmsg.dir", "/tmp/deepmsg"),
+            ("aeron.receiver.io.vector.capacity", "16"),
+            ("aeron.sender.io.vector.capacity", "2"),
+        ])
+        .expect("resolve");
+        assert_eq!(16, by_property.receiver_io_vector_capacity);
+        assert_eq!(2, by_property.sender_io_vector_capacity);
+
+        let by_env = resolve_with_env(
+            &[("deepmsg.dir", "/tmp/deepmsg")],
+            &[
+                ("AERON_RECEIVER_IO_VECTOR_CAPACITY", "8"),
+                ("AERON_SENDER_IO_VECTOR_CAPACITY", "1"),
+            ],
+        )
+        .expect("resolve");
+        assert_eq!(8, by_env.receiver_io_vector_capacity);
+        assert_eq!(1, by_env.sender_io_vector_capacity);
+
+        // The reference clamps to `1..=AERON_DRIVER_*_IO_VECTOR_LENGTH_MAX`
+        // (`aeron_driver_context.c:3348-3371`); this refuses, which is the
+        // divergence `docs/compat.md` records for every bounded setting here.
+        for value in ["0", "17"] {
+            for capacity in [
+                "aeron.receiver.io.vector.capacity",
+                "aeron.sender.io.vector.capacity",
+            ] {
+                let refused = resolve(&[("deepmsg.dir", "/tmp/deepmsg"), (capacity, value)]);
+                assert!(
+                    matches!(refused, Err(ConfigError::OutOfRange { .. })),
+                    "{capacity}={value} is refused rather than clamped"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_property_sets_a_value_and_the_alias_does_too() {
         let ours = resolve(&[("deepmsg.dir", "/tmp/deepmsg")]).expect("resolve");
         assert_eq!(PathBuf::from("/tmp/deepmsg"), ours.aeron_dir);
@@ -4002,6 +4144,14 @@ mod tests {
             (&Setting::SOCKET_SO_RCVBUF, "socket.so_rcvbuf"),
             (&Setting::SOCKET_SO_SNDBUF, "socket.so_sndbuf"),
             (&Setting::FLOW_CONTROL_GROUP_TAG, "flow.control.group.tag"),
+            (
+                &Setting::RECEIVER_IO_VECTOR_CAPACITY,
+                "receiver.io.vector.capacity",
+            ),
+            (
+                &Setting::SENDER_IO_VECTOR_CAPACITY,
+                "sender.io.vector.capacity",
+            ),
         ] {
             assert_eq!(name, setting.property, "the property the reference has");
 
