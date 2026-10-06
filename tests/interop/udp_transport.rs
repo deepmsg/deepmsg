@@ -725,7 +725,7 @@ fn a_full_window_stops_the_producer_and_a_larger_one_starts_it_again() {
         .await_cnc(READY_TIMEOUT)
         .expect("this driver must publish a readable CnC file");
 
-    let subscriber = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+    let mut subscriber = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
     subscriber
         .bind("127.0.0.1:0".parse().expect("an address"))
         .expect("a bind");

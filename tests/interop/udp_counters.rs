@@ -42,7 +42,7 @@ fn aeron_stat_reads_the_network_counters_a_udp_session_moves() {
         .expect("this driver must publish a readable CnC file");
 
     // The subscriber: a socket the driver will send to, and which answers once.
-    let subscriber = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+    let mut subscriber = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
     subscriber
         .bind("127.0.0.1:0".parse().expect("an address"))
         .expect("a bind");
