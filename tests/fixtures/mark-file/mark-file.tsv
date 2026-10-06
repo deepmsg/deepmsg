@@ -1,0 +1,22 @@
+# the reference's own reading of archive-mark.dat
+# written by GenerateMarkFile, from the classpath's aeron-archive
+
+pid	13001
+version	196864
+activityTimestamp	1700000001000
+startTimestamp	1700000000000
+controlStreamId	1001
+localControlStreamId	1002
+eventsStreamId	1003
+headerLength	8192
+errorBufferLength	1048576
+archiveId	1234605616436508552
+semanticVersion	196864
+majorVersion	3
+fileName	archive-mark.dat
+linkFileName	archive-mark.lnk
+fileLength	1056768
+controlChannel	aeron:udp?endpoint=localhost:8010
+localControlChannel	aeron:ipc
+eventsChannel	aeron:udp?endpoint=localhost:8011
+aeronDirectory	/dev/shm/aeron-mark-golden

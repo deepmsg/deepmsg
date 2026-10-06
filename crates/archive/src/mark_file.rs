@@ -339,6 +339,27 @@ impl ArchiveMarkFile {
         self.field(|header| header.activity_timestamp())
     }
 
+    /// The header's own length, which is where the error buffer begins — the
+    /// first of the two numbers a reader needs and cannot compute.
+    pub fn header_length(&self) -> Option<i32> {
+        self.field(|header| header.header_length()).flatten()
+    }
+
+    /// The control stream id.
+    pub fn control_stream_id(&self) -> Option<i32> {
+        self.field(|header| header.control_stream_id())
+    }
+
+    /// The local control stream id.
+    pub fn local_control_stream_id(&self) -> Option<i32> {
+        self.field(|header| header.local_control_stream_id())
+    }
+
+    /// The recording-events stream id.
+    pub fn events_stream_id(&self) -> Option<i32> {
+        self.field(|header| header.events_stream_id())
+    }
+
     /// The four strings in the header, in the order the format puts them.
     pub fn channels(&self) -> Option<Channels> {
         let bytes = header_bytes(&self.mark).ok()?;
