@@ -16,7 +16,6 @@
 //! `aeronmd` — only the checkout P2-0a already needs for its goldens.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use deepmsg_archive::mark::NULL_VALUE;
 use deepmsg_archive::mark_file::{
@@ -25,7 +24,8 @@ use deepmsg_archive::mark_file::{
 use deepmsg_cnc::create::{COUNTERS_VALUES_BUFFER_LENGTH_MIN, CncLayout};
 use deepmsg_cnc::error_log::{DistinctErrorLog, ErrorLogRegion};
 use deepmsg_cnc::{CncFile, CncIdentity};
-use deepmsg_tests::driver::{self, AGRONA_JVM_ARGS};
+use deepmsg_tests::driver;
+use deepmsg_tests::java::archive_tool;
 use deepmsg_tests::temp::TempDir;
 
 /// An epoch clock's reading, as the liveness rule is arithmetic on one.
@@ -81,27 +81,6 @@ fn cnc_in(directory: &Path) -> PathBuf {
     aeron_dir
 }
 
-/// Run `ArchiveTool <dir> <command>` from the reference's own jar.
-fn archive_tool(jar: &Path, directory: &Path, command: &str) -> String {
-    let output = Command::new("java")
-        .args(AGRONA_JVM_ARGS)
-        .arg("-cp")
-        .arg(jar)
-        .arg("io.aeron.archive.ArchiveTool")
-        .arg(directory)
-        .arg(command)
-        .output()
-        .expect("java runs");
-
-    assert!(
-        output.status.success(),
-        "ArchiveTool {command} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/mark-file")
 }
@@ -149,7 +128,7 @@ fn the_reference_reads_the_mark_file_this_build_writes() {
     mark.signal_ready(NOW).expect("signalled");
 
     // The pid, as the reference's own tool reads it.
-    let said = archive_tool(&jar, dir.path(), "pid");
+    let said = archive_tool(&jar, dir.path(), &["pid"]);
     assert_eq!(
         pid.to_string(),
         said.trim(),
@@ -158,7 +137,7 @@ fn the_reference_reads_the_mark_file_this_build_writes() {
 
     // And the errors, which are at an offset this build computed and in a
     // format it wrote itself.
-    let errors = archive_tool(&jar, dir.path(), "errors");
+    let errors = archive_tool(&jar, dir.path(), &["errors"]);
     assert!(
         errors.contains("the first error a mark file wrote"),
         "the reference's ErrorStat-equivalent did not find the first error:\n{errors}"
@@ -186,7 +165,7 @@ fn both_readers_agree_about_the_golden() {
     let golden = fixtures();
     let mark = ArchiveMarkFile::open(&golden).expect("the golden opens");
 
-    let said = archive_tool(&jar, &golden, "pid");
+    let said = archive_tool(&jar, &golden, &["pid"]);
     assert_eq!(
         mark.pid().expect("a pid").to_string(),
         said.trim(),

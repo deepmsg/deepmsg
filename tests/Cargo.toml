@@ -241,6 +241,14 @@ required-features = ["interop"]
 # The mark file, both ways round: the reference's own `ArchiveTool` reading a
 # mark file this build wrote, and both readers on the same golden. Needs the
 # reference's `aeron-all` jar, not a driver.
+# The catalog, read by the reference's own `ArchiveTool`: `count-entries`,
+# `capacity` and `describe-all` on an archive directory this build wrote, and
+# both readers on the golden. Needs the reference's `aeron-all` jar.
+[[test]]
+name = "catalog_reference"
+path = "interop/catalog_reference.rs"
+required-features = ["interop"]
+
 [[test]]
 name = "mark_file_reference"
 path = "interop/mark_file_reference.rs"
