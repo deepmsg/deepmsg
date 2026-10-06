@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod driver;
+pub mod java;
 pub mod samples;
 pub mod synthetic;
 pub mod temp;

@@ -10,6 +10,7 @@ rust-version.workspace = true
 deepmsg-core = { path = "../core" }
 deepmsg-client = { path = "../client" }
 deepmsg-codec = { path = "../codec" }
+deepmsg-cnc = { path = "../cnc" }
 
 [lints]
 workspace = true

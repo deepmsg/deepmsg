@@ -225,6 +225,7 @@ name = "deepmsg-archive"
 version = "0.1.0"
 dependencies = [
  "deepmsg-client",
+ "deepmsg-cnc",
  "deepmsg-codec",
  "deepmsg-core",
 ]
@@ -314,6 +315,7 @@ dependencies = [
 name = "deepmsg-tests"
 version = "0.1.0"
 dependencies = [
+ "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-cnc",
  "deepmsg-codec",

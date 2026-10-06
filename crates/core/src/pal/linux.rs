@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::buffer::{AtomicBuffer, ReadWrite};
 
@@ -102,6 +102,11 @@ fn allocate(fd: i32, length: usize) -> io::Result<()> {
 pub struct MappedFile {
     addr: *const u8,
     len: usize,
+    /// The file this is a mapping of, kept because a mapping cannot be resized:
+    /// growing one means reopening the file, extending it and mapping it again
+    /// ([`MappedFile::grow`]). The `File` itself is not kept — a mapping outlives
+    /// the descriptor it came from, which is the whole point of `mmap`.
+    path: PathBuf,
     /// Whether this mapping was taken with write access. Tracked as a value
     /// rather than encoded in the type because the one caller that needs both
     /// modes — the CnC reader, which validates a file and then, for the command
@@ -309,6 +314,7 @@ impl MappedFile {
         Ok(Self {
             addr,
             len: length,
+            path: path.to_path_buf(),
             writable: true,
         })
     }
@@ -342,8 +348,72 @@ impl MappedFile {
         Ok(Self {
             addr,
             len,
+            path: path.to_path_buf(),
             writable,
         })
+    }
+
+    /// Extend the file and its mapping to `new_length`, keeping every byte that
+    /// is in it.
+    ///
+    /// A mapping cannot be resized, so this is what the reference does in two
+    /// steps — close and unmap, then map the new capacity
+    /// (`Catalog.growCatalog`'s `unmapAndCloseChannel` and the `map` after it,
+    /// `:866-880`) — with one difference in the order: the new mapping is taken
+    /// **before** the old one is unmapped. That way a failure at either step
+    /// leaves this value exactly as it was rather than half-grown, which is a
+    /// state a caller would have to remember not to use.
+    ///
+    /// What must not happen is a truncating create: the bytes already in the
+    /// file are the caller's data, and a mapping taken over a file that was
+    /// shortened is a fault waiting for the next reader.
+    ///
+    /// A `new_length` no larger than the current one is not an error and does
+    /// nothing — a caller that grows to a size it already has has asked for
+    /// nothing to change.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the file cannot be reopened or extended, or the new
+    /// mapping cannot be taken; the mapping is unchanged in every one of those
+    /// cases. A **read-only** mapping cannot grow at all, and says so with
+    /// [`io::ErrorKind::PermissionDenied`].
+    pub fn grow(&mut self, new_length: usize) -> io::Result<()> {
+        if new_length <= self.len {
+            return Ok(());
+        }
+
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a read-only mapping cannot grow",
+            ));
+        }
+
+        let file = File::options().read(true).write(true).open(&self.path)?;
+
+        // The file first: a mapping may not reach past the end of its file, so
+        // the length has to be there before the mapping that covers it.
+        file.set_len(new_length as u64)?;
+
+        // SAFETY: `file` is open for the duration of the call and was just
+        // extended to `new_length`, which is what makes the mapping's extent
+        // both non-zero and within the file — the preconditions `mmap_impl`
+        // documents. The old mapping is still valid and still owned by this
+        // value; it is unmapped below, after the new one exists.
+        let addr = unsafe { mmap_impl(file.as_raw_fd(), new_length, true)? };
+
+        let old = std::mem::replace(&mut self.addr, addr);
+        let old_len = std::mem::replace(&mut self.len, new_length);
+
+        // SAFETY: `old` and `old_len` are exactly the pair the successful `mmap`
+        // in this value's constructor returned, and this is the only other place
+        // that unmaps — so that mapping is unmapped exactly once. `Drop` unmaps
+        // what `self` holds now, which is the new one.
+        let rc = unsafe { libc::munmap(old.cast_mut().cast::<c_void>(), old_len) };
+        debug_assert_eq!(0, rc, "munmap failed for a mapping this type owns");
+
+        Ok(())
     }
 
     /// A checked window into the mapping, for reading through atomics.
@@ -504,6 +574,74 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Growing is what a caller that ran out of room does, and the thing it must
+    /// not cost is the bytes that were already there — a truncating create would
+    /// take them. Three things are asserted together because any one alone has
+    /// another explanation: the length is the new one, the old bytes are still
+    /// where they were, and the new region is writable.
+    #[test]
+    fn growing_a_mapping_keeps_what_was_in_it() {
+        let temp = TempFile::vacant();
+        let short = 4096;
+        let long = 16 * 1024;
+        let marker = b"the bytes that were already there";
+
+        let mut mapped = MappedFile::create(&temp.0, short).expect("create");
+        assert_eq!(short, mapped.len());
+
+        {
+            let region = mapped.region_mut(0, short).expect("writable");
+            region.copy_in(0, marker).expect("written");
+        }
+
+        mapped.grow(long).expect("grown");
+
+        assert_eq!(long, mapped.len(), "the mapping is the new length");
+        assert_eq!(
+            u64::try_from(long).expect("fits"),
+            std::fs::metadata(&temp.0).expect("the file").len(),
+            "and so is the file"
+        );
+
+        let mut read = vec![0_u8; marker.len()];
+        mapped
+            .region(0, marker.len())
+            .expect("readable")
+            .copy_out(0, &mut read)
+            .expect("read");
+        assert_eq!(marker, &read[..], "the old bytes are untouched");
+
+        // And the region that did not exist before is usable: a file extended
+        // without being mapped further would read as zeroes and be unwritable.
+        let tail = long - 64;
+        mapped
+            .region_mut(tail, 64)
+            .expect("the new region is writable")
+            .store_i64_release(0, 0x5A5A_5A5A)
+            .expect("stored");
+        assert_eq!(
+            Some(0x5A5A_5A5A),
+            mapped
+                .region(tail, 64)
+                .expect("readable")
+                .load_i64_acquire(0)
+        );
+
+        // Growing to a length it already has asks for nothing; growing a
+        // read-only mapping is refused rather than silently ignored.
+        mapped.grow(long).expect("no-op");
+        assert_eq!(long, mapped.len());
+
+        drop(mapped);
+
+        let readonly = MappedFile::open_readonly(&temp.0).expect("map");
+        let mut readonly = readonly;
+        let error = readonly.grow(long * 2).expect_err("read-only cannot grow");
+
+        assert_eq!(io::ErrorKind::PermissionDenied, error.kind(), "{error:?}");
+        assert_eq!(long, readonly.len(), "and it is unchanged");
     }
 
     #[test]

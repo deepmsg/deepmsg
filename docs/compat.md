@@ -10,6 +10,7 @@ covers it.
 | CnC semantic version | `AERON_CNC_VERSION` | **0.2.0** | `aeron-client/src/main/c/aeron_cnc_file_descriptor.h:26` |
 | Archive protocol SBE | schema id / version | 101 / 14 (semanticVersion 5.2) | `schemas/aeron-archive-codecs.xml` |
 | Archive mark SBE | schema id / version | 100 / 2 (semanticVersion 5.2) | `schemas/aeron-archive-mark-codecs.xml` |
+| Archive mark **file** | `ArchiveMarkFile.SEMANTIC_VERSION` | **3.1.0**; only the **major** is compared, so a minor ahead is read | `aeron-archive/src/main/java/io/aeron/archive/ArchiveMarkFile.java:55-72` |
 | Cluster protocol SBE | schema id / version | 111 / 17 (semanticVersion 5.4) | `schemas/aeron-cluster-codecs.xml` |
 | Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
 | Cluster node-state SBE | schema id / version | 112 / 10 | `schemas/aeron-cluster-node-state-codecs.xml` |
@@ -34,6 +35,18 @@ Rules:
   tracks cross-component versions only.
 - Changing anything in this table without extending the interop suite first
   is a review-blocking offence.
+
+The archive mark **file**'s row is the one whose two halves are pinned
+separately, because they fail differently. The version it holds is read out of a
+file the **reference** wrote, in CI, by
+`crates/archive/tests/mark_file.rs::the_golden_is_alive_for_its_own_timeout`;
+that only the major is compared — a minor ahead is still read — is
+`crates/archive/src/mark_file.rs::another_major_is_refused_and_a_minor_is_not`,
+and its both-ways reading by the reference's own `ArchiveTool` is
+`tests/interop/mark_file_reference.rs`. The golden itself is
+`tests/fixtures/mark-file/`, written by the reference's `ArchiveMarkFile`; its
+README is where the file's layout facts and the one field that cannot be fixed
+across runs (the pid) are recorded.
 
 ## Counters
 
@@ -374,6 +387,35 @@ send endpoint whose channel names an explicit endpoint connects its socket to it
 `crates/driver/src/media/send_endpoint.rs`, with the two outcomes pinned by
 `::an_endpoint_that_is_not_connected_can_send_somewhere_else` and
 `::a_connected_endpoint_sends_only_where_its_channel_points`.
+
+**`aeron.driver.termination.validator` is a third, and it is the one name this
+driver recognises without defining.** The C reference's symbol table holds
+`allow` and `deny` and nothing else
+(`aeron-driver/src/main/c/aeron_termination_validator.c:28-40`), and a name that
+resolves to nothing stops context init
+(`:55-62` → `aeron_driver_context.c:1247-1251`), while the Java driver takes a
+**class** name. The reference's own C harnesses
+write the Java spelling every time they start a driver —
+`aeron-archive/src/test/c/TestArchive.h:49`,
+`aeron-test-support/src/main/c/TestMediaDriver.h:52`,
+`aeron-archive/src/test/cpp_wrapper/TestArchive.h:75` — so a driver standing in
+for the Java one meets
+`io.aeron.driver.DefaultAllowTerminationValidator` on every run of the archive
+suite. The first hybrid run refused to start on it, and the archive's readiness
+wait has no timeout, so it hung rather than failed.
+
+Both class names are recognised, and only those two: they are the two policies
+written out, since their `allowTermination` returns `true` and `false`
+(`aeron-driver/src/main/java/io/aeron/driver/DefaultAllowTerminationValidator.java:41`,
+`DefaultDenyTerminationValidator.java:41`). Recognising a name is not loading
+code — a validator of somebody else's is still refused, and the driver still
+cannot `dlopen` one (ADR-0002). The four spellings and the refusal are pinned by
+`crates/driver/src/config.rs::the_java_spelling_of_the_two_validators_is_the_two_validators`;
+that the names are **acted on**, and that the deny one is a refusal rather than
+another name for allow, by
+`tests/integration/driver_process_contract.rs::the_java_spellings_of_the_validators_are_the_two_validators`,
+which starts this driver with each spelling and sends it the harness's own
+`TERMINATE_DRIVER`.
 
 ## The event log
 

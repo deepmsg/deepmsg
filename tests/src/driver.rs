@@ -213,6 +213,41 @@ pub fn locate_error_stat() -> Option<PathBuf> {
     locate_tool(ERRORSTAT_ENV, DEFAULT_ERRORSTAT)
 }
 
+/// Environment variable naming the reference's `aeron-all` jar.
+pub const AERON_ALL_ENV: &str = "DEEPMSG_REF_AERON_ALL_JAR";
+
+/// Where the jar is expected to be when the variable is unset: the reference's
+/// own Gradle output, which is what `aeron-archive`'s tools are run from.
+pub const DEFAULT_AERON_ALL: &str = "../../aeron/aeron-all/build/libs/aeron-all-1.53.2.jar";
+
+/// Find the reference's `aeron-all` jar, or `None` when there is no reference
+/// build.
+///
+/// The archive server is Java-only, so its tools — `ArchiveTool` is the one P2
+/// leans on — are a class in this jar rather than a binary beside `aeronmd`.
+/// The jar carries Agrona too, which is why one classpath entry is enough.
+pub fn locate_aeron_all() -> Option<PathBuf> {
+    locate_tool(AERON_ALL_ENV, DEFAULT_AERON_ALL)
+}
+
+/// The JVM flags Agrona needs on a JDK that keeps `Unsafe` to itself.
+///
+/// The reference's own Gradle and CMake builds pass the same two, and without
+/// them every Agrona class fails at class-initialisation with
+/// `IllegalAccessError: ... cannot access class jdk.internal.misc.Unsafe`.
+pub const AGRONA_JVM_ARGS: &[&str] = &[
+    "--add-exports",
+    "java.base/jdk.internal.misc=ALL-UNNAMED",
+    "--add-opens",
+    "java.base/sun.nio.ch=ALL-UNNAMED",
+    // The third is for the archive rather than for Agrona itself: its `Crc32`
+    // reaches `java.util.zip.CRC32.updateByteBuffer0` by reflection, and
+    // without this the class fails to initialise — which `ArchiveTool checksum`
+    // and any recording made with `aeron.archive.record.checksum` need.
+    "--add-opens",
+    "java.base/java.util.zip=ALL-UNNAMED",
+];
+
 /// Announce that a tool-based test could not run, and why.
 pub fn announce_tool_skip(tool: &str) {
     eprintln!(

@@ -728,6 +728,105 @@ mod tests {
         assert!(reader.is_active(2, CLIENT_HEARTBEAT_TYPE_ID, 7));
     }
 
+    /// `ControlSessionCounter.findByControlSessionId`
+    /// (`aeron-archive/src/main/java/io/aeron/archive/ControlSessionCounter.java:92-118`),
+    /// written against this reader's public API — no metadata window, just
+    /// `for_each` and `key`.
+    ///
+    /// Kept here as the executable half of a decision: this is the shape that
+    /// put `metaDataBuffer` on the P2-1b list, and it is expressible without
+    /// it.
+    fn find_control_session(
+        reader: &CountersReader<'_>,
+        archive_id: i64,
+        control_session_id: i64,
+    ) -> Option<i32> {
+        const TYPE_ID: i32 = 103;
+
+        let mut found = None;
+
+        reader.for_each(|counter| {
+            if found.is_some() || counter.type_id != TYPE_ID {
+                return;
+            }
+
+            let Some(key) = reader.key(counter.counter_id) else {
+                return;
+            };
+
+            let archive = i64::from_le_bytes(key[0..8].try_into().expect("eight"));
+            let session = i64::from_le_bytes(key[8..16].try_into().expect("eight"));
+
+            if archive == archive_id && session == control_session_id {
+                found = Some(counter.counter_id);
+            }
+        });
+
+        found
+    }
+
+    /// The shape the reference's archive searches its own counters by — the
+    /// reason `metaDataBuffer` was on the list — needs no metadata window.
+    ///
+    /// Both of the archive's finders (`ArchiveCounters.find` and
+    /// `ControlSessionCounter.findByControlSessionId`, and `RecordingPos`'s
+    /// five) walk counter ids to the watermark, keep the `ALLOCATED` ones,
+    /// compare the **type id**, and read fields out of the **key** at fixed
+    /// offsets. That is `for_each` plus `key` here, and both are already
+    /// public — so the question the window would answer is answered, and what
+    /// handing the window out would add is the ability to read a record that is
+    /// being allocated, which is the race this reader takes its state
+    /// **before** believing a record in order to avoid.
+    ///
+    /// The enumeration is the reference's own in both directions: a slot that
+    /// is not `ALLOCATED` is stepped over, and the first `UNUSED` one ends the
+    /// scan (`for_each`, against `ControlSessionCounter`'s
+    /// `else if (RECORD_UNUSED == counterState) break`).
+    #[test]
+    fn the_archives_finder_shape_needs_no_metadata_window() {
+        const CONTROL_SESSION_TYPE_ID: i32 = 103;
+        const OTHER_TYPE_ID: i32 = 101;
+
+        let mut metadata = Region::zeroed(4 * layout::COUNTER_METADATA_LENGTH);
+        let values = Region::zeroed(4 * layout::COUNTER_VALUE_LENGTH);
+
+        // The decoy comes first and carries the **right key**: a finder that
+        // skipped the type id would return it and never look further.
+        for (id, type_id, archive_id, control_session_id) in [
+            (0, OTHER_TYPE_ID, 7_i64, 12_i64),
+            (1, CONTROL_SESSION_TYPE_ID, 7, 11),
+            (2, CONTROL_SESSION_TYPE_ID, 7, 12),
+        ] {
+            allocate(&mut metadata, id, type_id, "control-session");
+
+            // Keyed the way the archive keys its own: the archive id first,
+            // then the control session (`ARCHIVE_ID_KEY_OFFSET`,
+            // `CONTROL_SESSION_ID_KEY_OFFSET`).
+            let key = id as usize * layout::COUNTER_METADATA_LENGTH + layout::COUNTER_KEY_OFFSET;
+            metadata.put_i64(key, archive_id);
+            metadata.put_i64(key + 8, control_session_id);
+        }
+
+        let reader = reader_pair(&metadata, &values);
+
+        assert_eq!(
+            Some(2),
+            find_control_session(&reader, 7, 12),
+            "the counter with this key *and* this type, not the decoy above it"
+        );
+        assert_eq!(Some(1), find_control_session(&reader, 7, 11));
+        assert_eq!(
+            None,
+            find_control_session(&reader, 7, 99),
+            "no such session"
+        );
+        assert_eq!(
+            None,
+            find_control_session(&reader, 8, 12),
+            "nor such an archive"
+        );
+    }
+
     /// The address a local-address counter carries, laid out as the reference
     /// lays it out: the channel status, the length, then the text.
     #[test]
