@@ -23,6 +23,14 @@
 //! (`shouldThrowIf…` argument validation, an async-op leak), which the client
 //! track answers to and this crate does not.
 //!
+//! `reference-java-cases.tsv` is the same idea for a second instrument. The
+//! reference also has a *Java* archive suite, and whether a driver can carry
+//! the reference's archive at all is a question only that suite answers. Its
+//! 330 case names are pinned here for the same reason as the other ledger's:
+//! a suite whose cases are counted rather than named loses rows quietly. This
+//! one carries no ownership column — nothing in it is ours to port; it is the
+//! denominator for an instrument, not a todo list.
+//!
 //! What CI can check is that the ledger is well formed and that nobody has
 //! quietly dropped a row. What CI *cannot* check is whether the ledger still
 //! matches the reference — that takes the acceptance run, which lists the cases
