@@ -240,6 +240,12 @@ pub const AGRONA_JVM_ARGS: &[&str] = &[
     "java.base/jdk.internal.misc=ALL-UNNAMED",
     "--add-opens",
     "java.base/sun.nio.ch=ALL-UNNAMED",
+    // The third is for the archive rather than for Agrona itself: its `Crc32`
+    // reaches `java.util.zip.CRC32.updateByteBuffer0` by reflection, and
+    // without this the class fails to initialise — which `ArchiveTool checksum`
+    // and any recording made with `aeron.archive.record.checksum` need.
+    "--add-opens",
+    "java.base/java.util.zip=ALL-UNNAMED",
 ];
 
 /// Announce that a tool-based test could not run, and why.
