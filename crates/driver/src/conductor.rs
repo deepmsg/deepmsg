@@ -1087,6 +1087,7 @@ impl Conductor {
             work_count += 1;
             work_count += self.check_clients();
             work_count += self.check_publications(now_ns);
+            work_count += self.check_untethered_publications(now_ns);
             work_count += usize::from(self.check_for_blocked_commands(now_ns));
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
@@ -1099,6 +1100,7 @@ impl Conductor {
             + self.process_commands(now_ns)
             + self.poll_publications()
             + self.update_publication_limits()
+            + self.network_publication_limits()
             + self.poll_receiver(now_ns);
         // What the pass noticed and could not record while it held the file:
         // the errors behind the `ON_ERROR`s it sent, the command adapter's own
@@ -1187,6 +1189,72 @@ impl Conductor {
 
         self.publications
             .update_limits(&mut self.counters, &counter_regions)
+    }
+
+    /// Run every network publication's tether cycle
+    /// (`aeron_network_publication_check_untethered_subscriptions`,
+    /// `aeron_network_publication.c:1120-1236`), on the tier the reference runs
+    /// it on: `aeron_network_publication_on_time_event` (`:1277`), reached from
+    /// `aeron_driver_conductor_on_check_managed_resources`, which the
+    /// publication list is wired to at `:766`.
+    ///
+    /// It ran on the sender until the readers moved here, and the move is what
+    /// it was waiting for: what it moves *is* the publication's set of readers,
+    /// and a set on another thread can only be moved by asking that thread.
+    /// What the two places differ in is how soon a deadline is noticed — at the
+    /// next timer tick rather than at the first pass after it — and not which
+    /// transitions happen; the timeouts it decides on are seconds.
+    fn check_untethered_publications(&mut self, now_ns: i64) -> usize {
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut work = 0;
+
+        for publication in self.network_publications.publications_mut() {
+            let events = publication.maintenance.check_untethered_subscriptions(
+                &mut self.counters,
+                &counter_regions,
+                now_ns,
+            );
+
+            if !events.is_empty() {
+                self.pending_untethered
+                    .push((publication.registration_id, events));
+                work += 1;
+            }
+        }
+
+        work
+    }
+
+    /// Write `pub-pos` and recompute `pub-lmt` for every network publication
+    /// (`aeron_network_publication_update_pub_pos_and_lmt`,
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:947-1010`), and
+    /// return how many of them did work.
+    ///
+    /// The reference runs this from its own `do_work`, over its network
+    /// publications and then over its IPC ones
+    /// (`aeron_driver_conductor.c:3395-3404`) — which is this position, after
+    /// the driver commands and immediately before the IPC half that
+    /// [`Self::update_publication_limits`] already is.
+    fn network_publication_limits(&mut self) -> usize {
+        let Some(counter_regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let mut worked = 0;
+
+        for publication in self.network_publications.publications_mut() {
+            if publication
+                .maintenance
+                .update_pub_pos_and_lmt(&self.counters, &counter_regions)
+            {
+                worked += 1;
+            }
+        }
+
+        worked
     }
 
     /// Take the native resource agent's completions — **all** of them, once —
@@ -1996,12 +2064,6 @@ impl Conductor {
             work += 1;
 
             match event {
-                crate::sender::SenderEvent::Untethered {
-                    registration_id,
-                    events,
-                } => {
-                    self.pending_untethered.push((registration_id, events));
-                }
                 crate::sender::SenderEvent::PublicationDrained { registration_id } => {
                     // The publication has said `REVOKED` and is done with; the
                     // release the client asked for can finish now.
@@ -2863,9 +2925,9 @@ impl Conductor {
                                 counters,
                                 &counter_regions,
                                 publications,
+                                network_publications,
                                 receive_endpoints,
                                 Some(receiver),
-                                sender,
                                 now_ms,
                             );
 
@@ -2914,7 +2976,6 @@ impl Conductor {
                                 &counter_regions,
                                 clients,
                                 network_publications,
-                                sender,
                                 now,
                                 &mut transmit,
                             )
@@ -3465,6 +3526,7 @@ impl Conductor {
                         counters,
                         &counter_regions,
                         publications,
+                        network_publications,
                         now_ms,
                         &mut transmit,
                     ) {
@@ -3505,7 +3567,6 @@ impl Conductor {
                             &counter_regions,
                             receive_endpoints,
                             network_publications,
-                            sender,
                             now,
                             &mut transmit,
                         );
@@ -3523,7 +3584,7 @@ impl Conductor {
                         request.channel,
                         counters,
                         &counter_regions,
-                        sender,
+                        network_publications,
                         now_ms,
                         &mut transmit,
                     ) {
@@ -3893,10 +3954,10 @@ impl Conductor {
             &counter_regions,
             &mut transmit,
             &mut self.publications,
+            &mut self.network_publications,
             &mut self.subscriptions,
             &mut self.receive_endpoints,
             Some(&self.receiver),
-            &self.sender,
         );
 
         self.release_orphaned_network_publications() + reaped

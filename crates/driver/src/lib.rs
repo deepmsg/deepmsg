@@ -46,6 +46,7 @@ pub mod position;
 pub mod protocol;
 pub mod publication_image;
 pub mod publication_images;
+pub mod publication_maintenance;
 pub mod publication_params;
 pub mod receive_endpoints;
 pub mod receiver;

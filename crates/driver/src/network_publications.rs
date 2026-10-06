@@ -32,12 +32,14 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ipc_subscriptions::IpcSubscriptions;
 use deepmsg_cnc::command::{AddPublicationCommand, PublicationBuffersReady};
 use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
 use deepmsg_core::logbuffer::descriptor;
+use deepmsg_core::logbuffer::logfile::LogFile;
 
 use crate::channel_uri::{ChannelUri, Transport};
 use crate::clients::{ClientEvents, Clients, PublicationLink};
@@ -48,6 +50,7 @@ use crate::media::TransportParams;
 use crate::native_resource_agent::{AgentHandle, Completion};
 use crate::network_publication::{NetworkPublication, PublicationCounters};
 use crate::publication_images::PublicationImages;
+use crate::publication_maintenance::{PublicationMaintenance, PublicationSightlines};
 use crate::publication_params::{
     PROTOTYPE_CORRELATION_ID, PublicationParams, PublicationParamsError, TaggedPublication,
 };
@@ -118,7 +121,7 @@ struct PendingNetworkPublication {
 /// agree with. That split is this build's answer to the reference's shared
 /// pointer, and it is why `pub-lmt` moves on the sender's pass
 /// ([`NetworkPublication::send`]).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NetworkPublicationRecord {
     /// The publication's own registration id — the client's correlation id for
     /// the `ADD_PUBLICATION` that made it.
@@ -159,6 +162,10 @@ pub struct NetworkPublicationRecord {
     pub channel_status_counter_id: i32,
     /// How many clients hold a link to it (`publication_links`).
     pub refcount: i32,
+    /// The conductor's half of the publication: its log buffer mapped a second
+    /// time, its readers, the position it has cleaned up to, and the counters
+    /// its limit is written into. The sender holds the other half.
+    pub maintenance: PublicationMaintenance,
 }
 
 impl NetworkPublicationRecord {
@@ -237,6 +244,24 @@ impl NetworkPublications {
         self.publications
             .iter()
             .find(|publication| publication.registration_id == registration_id)
+    }
+
+    /// The same, mutably, for the readers: linking a spy and unlinking one are
+    /// writes to the publication's own set of them now that the set is the
+    /// conductor's.
+    pub fn find_mut(&mut self, registration_id: i64) -> Option<&mut NetworkPublicationRecord> {
+        self.publications
+            .iter_mut()
+            .find(|publication| publication.registration_id == registration_id)
+    }
+
+    /// The publications, mutably, for a caller that has already decided which.
+    ///
+    /// Indexed rather than iterated because the spy match reads fields the same
+    /// loop has to write: a walk that decided *which* publications to link
+    /// holds them shared, and the linking needs one of them mutably.
+    pub fn publications_mut(&mut self) -> &mut [NetworkPublicationRecord] {
+        &mut self.publications
     }
 
     /// The publication an entity tag names, as the `session-id=tag:N` reader
@@ -767,6 +792,29 @@ impl NetworkPublications {
             }
         }
 
+        // The conductor's own view of the buffer, opened **before** the log is
+        // moved into the publication: after `NetworkPublication::create` takes
+        // it, the only way to reach the terms from this thread is a second
+        // mapping, and this is the one place both the path and the geometry are
+        // in hand. See [`PublicationMaintenance`].
+        let view = match LogFile::open(
+            &pending.path,
+            pending.params.term_length,
+            config.layout.page_size,
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                events.error(
+                    pending.registration_id,
+                    deepmsg_cnc::command::ERROR_CODE_STORAGE_SPACE,
+                    format!("could not map the log buffer a second time: {error}").as_bytes(),
+                );
+                return;
+            }
+        };
+
+        let sightlines = Arc::new(PublicationSightlines::new());
+
         let publication = NetworkPublication::create(
             pending.registration_id,
             pending.client_id,
@@ -788,6 +836,7 @@ impl NetworkPublications {
             config.publication_unblock_timeout_ns,
             config.publication_connection_timeout_ns,
             now.ns,
+            Arc::clone(&sightlines),
         );
 
         let publication = match publication {
@@ -834,6 +883,13 @@ impl NetworkPublications {
             counters: pending.counters,
             channel_status_counter_id: pending.channel_status_counter_id,
             refcount: 1,
+            maintenance: PublicationMaintenance::new(
+                view,
+                pending.registration_id,
+                &pending.params,
+                pending.counters,
+                sightlines,
+            ),
         });
 
         // The client's link, and the reply that names both ids.
@@ -871,10 +927,9 @@ impl NetworkPublications {
         // of `:3305-3318`). It is a reader the client will never hear about,
         // and the alternative — silence — is a spy that waits for ever.
         let failed = subscriptions.link_spy_subscriptions(
-            self.publications.last().expect("just pushed"),
+            self.publications.last_mut().expect("just pushed"),
             counters,
             regions,
-            sender,
             now,
             events,
         );

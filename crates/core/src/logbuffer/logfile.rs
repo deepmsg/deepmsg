@@ -203,6 +203,50 @@ impl LogFile {
             .region_mut(self.metadata_offset, descriptor::METADATA_LENGTH)
     }
 
+    /// The highest position the three term tails describe: what the producer has
+    /// published (`aeron_network_publication_producer_position`,
+    /// `aeron-driver/src/main/c/aeron_network_publication.c:400-430`, and the
+    /// same walk as `aeron_ipc_publication_publisher_position`).
+    ///
+    /// A tail's raw value is **term-id-major** and a position is
+    /// **term-count-major**, so the two are never numerically comparable: the
+    /// comparison has to be made between the positions the tails imply
+    /// (`:406-419` does the same). `initial_term_id` is what turns a term id
+    /// into a term count, and it is the *caller's* because it is the stream's,
+    /// not the file's.
+    ///
+    /// `None` when the mapping has no metadata block or the term length is not
+    /// one a log buffer may have.
+    pub fn producer_position(&self, initial_term_id: i32) -> Option<i64> {
+        let metadata = self.metadata()?;
+        let shift = position::bits_to_shift(self.term_length)?;
+
+        let mut highest: Option<RawTail> = None;
+
+        for index in 0..descriptor::PARTITION_COUNT {
+            let offset = descriptor::TERM_TAIL_COUNTERS_OFFSET
+                + index * descriptor::TERM_TAIL_COUNTER_STRIDE;
+            let Some(raw) = metadata.load_i64_acquire(offset) else {
+                continue;
+            };
+            let tail = RawTail::from_raw(raw);
+
+            let position = position::Position::new(
+                tail.term_id(),
+                tail.term_offset(self.term_length),
+                shift,
+                initial_term_id,
+            );
+
+            highest = Some(match highest {
+                Some(current) if position::Position::from_raw(current.raw()) > position => current,
+                _ => RawTail::from_raw(position.raw()),
+            });
+        }
+
+        highest.map(|tail| tail.raw())
+    }
+
     /// Write the three term tails and the active term count.
     ///
     /// With `start` at `None` the log begins at the first term of

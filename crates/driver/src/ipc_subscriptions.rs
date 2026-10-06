@@ -53,7 +53,6 @@ use crate::publication_images::PublicationImages;
 use crate::publication_params::{PublicationParamsError, SubscriptionParams};
 use crate::receive_endpoints::{ReceiveChannelEndpoints, ReceiveEndpointErrorKind};
 use crate::receiver::ReceiverProxy;
-use crate::sender::SenderProxy;
 use crate::subscribable::TetherState;
 use crate::subscribable::TetherablePosition;
 use crate::udp_channel::{ControlMode, INVALID_TAG, UdpChannel};
@@ -645,8 +644,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         clients: &mut Clients,
-        publications: &NetworkPublications,
-        sender: &SenderProxy,
+        publications: &mut NetworkPublications,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
@@ -714,16 +712,18 @@ impl IpcSubscriptions {
         // question has no third answer to give.
         let link = self.links.last_mut().expect("just pushed");
 
-        for publication in publications.publications() {
-            if !link.spy_matches(
-                &publication.endpoint_channel,
-                publication.stream_id,
-                publication.session_id,
-            ) {
-                continue;
-            }
+        // Matched first and linked second, because linking a reader is a write
+        // to the publication now that the readers are the conductor's: the walk
+        // that decides *which* publications holds them shared and the linking
+        // needs them mutably.
+        let matched = spy_matched_indices(publications, link);
 
-            link_spy_publication(link, publication, counters, regions, sender, now, events)
+        for index in matched {
+            let Some(publication) = publications.publications_mut().get_mut(index) else {
+                continue;
+            };
+
+            link_spy_publication(link, publication, counters, regions, now, events)
                 .map_err(|()| AddSubscriptionError::Link)?;
         }
 
@@ -746,10 +746,9 @@ impl IpcSubscriptions {
     #[allow(clippy::too_many_arguments)] // one per collaborator
     pub fn link_spy_subscriptions(
         &mut self,
-        publication: &NetworkPublicationRecord,
+        publication: &mut NetworkPublicationRecord,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
-        sender: &SenderProxy,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> usize {
@@ -767,9 +766,7 @@ impl IpcSubscriptions {
                 continue;
             }
 
-            if link_spy_publication(link, publication, counters, regions, sender, now, events)
-                .is_err()
-            {
+            if link_spy_publication(link, publication, counters, regions, now, events).is_err() {
                 failures += 1;
             }
         }
@@ -809,8 +806,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         endpoints: &ReceiveChannelEndpoints,
-        publications: &NetworkPublications,
-        sender: &SenderProxy,
+        publications: &mut NetworkPublications,
         now: crate::ipc_publications::Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
@@ -871,16 +867,18 @@ impl IpcSubscriptions {
 
         let link = self.links.last_mut().expect("just pushed");
 
-        for publication in publications.publications() {
-            if !link.spy_matches(
-                &publication.endpoint_channel,
-                publication.stream_id,
-                publication.session_id,
-            ) {
-                continue;
-            }
+        // Matched first and linked second, because linking a reader is a write
+        // to the publication now that the readers are the conductor's: the walk
+        // that decides *which* publications holds them shared and the linking
+        // needs them mutably.
+        let matched = spy_matched_indices(publications, link);
 
-            link_spy_publication(link, publication, counters, regions, sender, now, events)
+        for index in matched {
+            let Some(publication) = publications.publications_mut().get_mut(index) else {
+                continue;
+            };
+
+            link_spy_publication(link, publication, counters, regions, now, events)
                 .map_err(|()| AddSubscriptionError::Link)?;
         }
 
@@ -1017,6 +1015,7 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        network_publications: &mut NetworkPublications,
         now_ms: i64,
         events: &mut impl ClientEvents,
     ) -> bool {
@@ -1041,7 +1040,15 @@ impl IpcSubscriptions {
         // publication's own, and `unlink_all` finds it by the registration id
         // in the target (`aeron_driver_conductor_unlink_all_subscribable`,
         // `:3620-3691`).
-        unlink_all(link, counters, regions, publications, None, None, now_ms);
+        unlink_all(
+            link,
+            counters,
+            regions,
+            publications,
+            network_publications,
+            None,
+            now_ms,
+        );
 
         true
     }
@@ -1070,7 +1077,7 @@ impl IpcSubscriptions {
         channel: &[u8],
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
-        sender: &SenderProxy,
+        publications: &mut NetworkPublications,
         now_ms: i64,
         events: &mut impl ClientEvents,
     ) -> bool {
@@ -1088,8 +1095,12 @@ impl IpcSubscriptions {
             // The publication is told before the counter goes back, for the
             // same reason the message is sent before it: a set holding a freed
             // counter id reads whatever takes its place.
-            if let SubscriptionTarget::NetworkPublication(publication) = entry.target {
-                let _ = sender.remove_subscriber(publication, entry.counter_id);
+            if let SubscriptionTarget::NetworkPublication(registration_id) = entry.target {
+                if let Some(publication) = publications.find_mut(registration_id) {
+                    if publication.maintenance.remove_spy(entry.counter_id) {
+                        publication.maintenance.refresh_connected_status();
+                    }
+                }
             }
 
             events.unavailable_image(
@@ -1394,9 +1405,9 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        network_publications: &mut NetworkPublications,
         endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
-        sender: &SenderProxy,
         now_ms: i64,
     ) -> bool {
         let mut found = false;
@@ -1416,8 +1427,8 @@ impl IpcSubscriptions {
                 counters,
                 regions,
                 publications,
+                network_publications,
                 receiver,
-                Some(sender),
                 now_ms,
             );
             found = true;
@@ -1436,9 +1447,9 @@ impl IpcSubscriptions {
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
         publications: &mut IpcPublications,
+        network_publications: &mut NetworkPublications,
         endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
-        sender: &SenderProxy,
         now_ms: i64,
     ) -> usize {
         let mut removed = 0;
@@ -1460,8 +1471,8 @@ impl IpcSubscriptions {
                 counters,
                 regions,
                 publications,
+                network_publications,
                 receiver,
-                Some(sender),
                 now_ms,
             );
             removed += 1;
@@ -2095,13 +2106,14 @@ pub(crate) fn try_remove_endpoint(
 /// The position leaves the publication's set first — which is what the removal
 /// hook counts, and what closes the log's `is_connected` byte when it was the
 /// last reader — and the counter goes back after.
+#[allow(clippy::too_many_arguments)] // the three collections a removal reaches
 fn unlink_all(
     link: SubscriptionLink,
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
     publications: &mut IpcPublications,
+    network_publications: &mut NetworkPublications,
     receiver: Option<&ReceiverProxy>,
-    sender: Option<&SenderProxy>,
     now_ms: i64,
 ) {
     for entry in &link.subscribables {
@@ -2115,12 +2127,14 @@ fn unlink_all(
                     let _ = receiver.remove_subscriber(registration_id, entry.counter_id);
                 }
             }
-            // A network publication's readers are the sender's, so the
-            // position comes out of its set before the counter goes back — a
-            // set that still held the id would read whatever took its place.
+            // A network publication's readers are the conductor's own now, so
+            // the position comes out of its set before the counter goes back —
+            // a set that still held the id would read whatever took its place.
             SubscriptionTarget::NetworkPublication(registration_id) => {
-                if let Some(sender) = sender {
-                    let _ = sender.remove_subscriber(registration_id, entry.counter_id);
+                if let Some(publication) = network_publications.find_mut(registration_id) {
+                    if publication.maintenance.remove_spy(entry.counter_id) {
+                        publication.maintenance.refresh_connected_status();
+                    }
                 }
             }
             SubscriptionTarget::IpcPublication(registration_id) => {
@@ -2236,10 +2250,9 @@ fn link_subscribable(
 /// is how the reference says so.
 fn link_spy_publication(
     link: &mut SubscriptionLink,
-    publication: &NetworkPublicationRecord,
+    publication: &mut NetworkPublicationRecord,
     counters: &mut CounterManager,
     regions: &CounterRegions<'_>,
-    sender: &SenderProxy,
     now: crate::ipc_publications::Now,
     events: &mut impl ClientEvents,
 ) -> Result<(), ()> {
@@ -2273,26 +2286,56 @@ fn link_spy_publication(
         events,
     )?;
 
-    // And only now does the **publication** hear about it, which is the
-    // reader count this whole path exists for: from here the publication
-    // counts the spy, its limits are computed with it, and `ssc` can make it
-    // look connected. The counter is already seeded (in `publish_reader`),
-    // because the sender reads it the moment the position is in the set — the
-    // reference has the two in the other order only because one thread does
-    // both.
-    let _ = sender.add_subscriber(
-        publication.registration_id,
-        TetherablePosition {
-            counter_id,
-            subscription_registration_id: link.registration_id,
-            time_of_last_update_ns: now.ns,
-            state: TetherState::Active,
-            is_tether: link.is_tether,
-            is_rejoin: link.is_rejoin,
-        },
-    );
+    // And only now does the **publication** hear about it, which is the reader
+    // count this whole path exists for: from here the publication counts the
+    // spy, its limits are computed with it, and `ssc` can make it look
+    // connected. The counter is already seeded (in `publish_reader`), because
+    // the limit is computed the moment the position is in the set — the reader
+    // would otherwise hold the producer back to a place it never was.
+    //
+    // This is a direct call and not a command to the sender any more: the
+    // readers are the conductor's (`PublicationMaintenance`), which is where
+    // the reference keeps them too, so the two halves of the reference's own
+    // ordering — counter, then set — happen on one thread.
+    let rewrite_status = publication.maintenance.add_spy(TetherablePosition {
+        counter_id,
+        subscription_registration_id: link.registration_id,
+        time_of_last_update_ns: now.ns,
+        state: TetherState::Active,
+        is_tether: link.is_tether,
+        is_rejoin: link.is_rejoin,
+    });
+
+    if rewrite_status {
+        publication.maintenance.refresh_connected_status();
+    }
 
     Ok(())
+}
+
+/// The publications a spy link matches, by index
+/// (`aeron_driver_conductor_spy_subscription_link_matches`,
+/// `aeron_driver_conductor.c:92-108`).
+///
+/// Collected before anything is linked because the match reads the publication
+/// and the link writes it: the readers are the conductor's now, so a link is a
+/// `&mut` on the record.
+fn spy_matched_indices(publications: &NetworkPublications, link: &SubscriptionLink) -> Vec<usize> {
+    publications
+        .publications()
+        .iter()
+        .enumerate()
+        .filter(|(_, publication)| {
+            link.spy_channel.is_some()
+                && link.spy_matches(
+                    &publication.endpoint_channel,
+                    publication.stream_id,
+                    publication.session_id,
+                )
+                && !link.reads(publication.registration_id)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// The first two steps of a link: the reader's counter, with the join position
