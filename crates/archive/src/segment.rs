@@ -133,6 +133,16 @@ pub enum SegmentError {
         /// The file that was there.
         path: PathBuf,
     },
+    /// The last fragment of a segment crosses a page boundary and was not
+    /// written whole, which is what a write interrupted by a crash leaves
+    /// (`Catalog.recoverStopOffset`). The reference refuses it in the recovery
+    /// path too, and truncates it only when `ArchiveTool verify` is told to.
+    StraddlesPage {
+        /// Where the fragment is.
+        offset: usize,
+        /// How long it claims to be.
+        length: usize,
+    },
     /// A segment file the reader was asked for is not there
     /// (`RecordingReader.openRecordingSegment`, `:207-210`).
     Missing {
@@ -159,6 +169,11 @@ impl std::fmt::Display for SegmentError {
                 f,
                 "failed to open recording segment file {}",
                 path.display()
+            ),
+            Self::StraddlesPage { offset, length } => write!(
+                f,
+                "Found potentially incomplete last fragment straddling page boundary at \
+                 offset {offset} of length {length}"
             ),
         }
     }
@@ -1491,3 +1506,232 @@ fn read_i32_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<i32
 fn read_i64_in(buffer: &AtomicBuffer<'_, ReadOnly>, offset: usize) -> Option<i64> {
     buffer.load_i64(offset)
 }
+
+/// The base position encoded in a segment file's name
+/// (`Catalog.parseSegmentFilePosition`).
+///
+/// `None` for a name that is not one: no dash, nothing between the dash and the
+/// suffix, or digits that are not a number.
+#[must_use]
+pub fn parse_segment_file_position(file_name: &str) -> Option<i64> {
+    let (_, rest) = file_name.split_once('-')?;
+    let digits = rest.strip_suffix(SUFFIX)?;
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    digits.parse().ok()
+}
+
+/// The segment files of one recording, by base position, highest last.
+///
+/// The reference indexes every file in the directory and keeps the lists by
+/// recording id (`Catalog.indexSegmentFiles`), then asks for the highest of one
+/// recording's list (`findSegmentFileWithHighestPosition`, which *selects* by
+/// parsing every name). Same answer, and this does the selecting while listing.
+#[must_use]
+pub fn segment_files(directory: &Path, recording_id: i64) -> Vec<(i64, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<(i64, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let position = parse_segment_file_position(&name)?;
+
+            // The id is the part before the dash, and it has to be *this*
+            // recording's: two recordings in one directory share it.
+            let id: i64 = name.split_once('-')?.0.parse().ok()?;
+
+            (id == recording_id).then_some((position, entry.path()))
+        })
+        .collect();
+
+    files.sort_by_key(|(position, _)| *position);
+
+    files
+}
+
+/// How far into a segment its frames reach, from `offset`: one past the last
+/// frame that is there (`Catalog.recoverStopOffset`).
+///
+/// The read stops at the first frame whose length is zero or less, which is what
+/// the preallocated tail of a segment reads as — and the fragment before that is
+/// the last one.
+///
+/// # Errors
+///
+/// [`SegmentError::StraddlesPage`] when that last fragment **crosses a page
+/// boundary and was not fully written**, which is the shape a crash in the
+/// middle of a write leaves: the reference refuses it here too, in the recovery
+/// path, and offers to truncate it only from `ArchiveTool verify`
+/// (`Catalog.recoverStopOffset`, and the `onStraddleError` it is given at
+/// `:1092-1096`).
+pub fn recover_stop_offset(
+    directory: &Path,
+    file_name: &str,
+    offset: usize,
+    checksum: Option<Checksum>,
+) -> Result<usize, SegmentError> {
+    let path = directory.join(file_name);
+    let mapping = MappedFile::open_readonly(&path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => SegmentError::Missing { path },
+        _ => SegmentError::Io(error),
+    })?;
+
+    let limit = mapping.len();
+    let segment = mapping.region(0, limit).ok_or(SegmentError::Malformed {
+        offset: 0,
+        frame_length: i32::try_from(limit).unwrap_or(i32::MAX),
+    })?;
+
+    let mut next_offset = offset;
+    let mut last_length = 0_usize;
+
+    while next_offset < limit {
+        let Some(frame_length) = read_i32_in(&segment, next_offset + FRAME_LENGTH_OFFSET) else {
+            break;
+        };
+
+        if frame_length <= 0 {
+            break;
+        }
+
+        let aligned = usize::try_from(align_up(frame_length, FRAME_ALIGNMENT)).unwrap_or(0);
+        if 0 == aligned || next_offset + aligned > limit {
+            break;
+        }
+
+        last_length = aligned;
+        next_offset += aligned;
+    }
+
+    let last_offset = next_offset - last_length;
+
+    if last_length > 0
+        && straddles_page_boundary(last_offset, last_length)
+        && !is_write_complete(&segment, last_offset, last_length, checksum)
+    {
+        return Err(SegmentError::StraddlesPage {
+            offset: last_offset,
+            length: last_length,
+        });
+    }
+
+    Ok(next_offset)
+}
+
+/// The stop position a recording's segments imply
+/// (`Catalog.computeStopPosition`).
+///
+/// `max_segment_file` is the highest-numbered segment the recording has, or
+/// `None` when it has none — and then the answer is where the recording started,
+/// because nothing was written.
+///
+/// The scan begins at the start term's offset when the highest segment is the
+/// one the recording started in, and at zero otherwise, which is what makes this
+/// correct for a recording whose first segment is not a whole one. Both branches
+/// begin at or after the recording's start, so the answer cannot be before it.
+///
+/// The reference clamps the answer to the start position anyway
+/// (`max(segmentFileBasePosition + segmentStopOffset, startPosition)`) and this
+/// keeps that, with the honest note that **no test can falsify it**: the two
+/// branches above make the clamp unreachable. It is cheap, it is what the
+/// reference does, and the day it stops being unreachable is a day nobody will
+/// be looking here.
+pub fn compute_stop_position(
+    directory: &Path,
+    summary: &SegmentSummary,
+    max_segment_file: Option<&str>,
+    checksum: Option<Checksum>,
+) -> Result<i64, SegmentError> {
+    let Some(max_segment_file) = max_segment_file else {
+        return Ok(summary.start_position);
+    };
+
+    let term_length = summary.term_buffer_length;
+    let start_term_offset = summary.start_position & i64::from(term_length - 1);
+    let start_term_base = summary.start_position - start_term_offset;
+    let segment_base =
+        parse_segment_file_position(max_segment_file).ok_or(SegmentError::Malformed {
+            offset: 0,
+            frame_length: 0,
+        })?;
+
+    let offset = if segment_base == start_term_base {
+        usize::try_from(start_term_offset).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let segment_stop_offset = recover_stop_offset(directory, max_segment_file, offset, checksum)?;
+
+    Ok(
+        (segment_base + i64::try_from(segment_stop_offset).unwrap_or(0))
+            .max(summary.start_position),
+    )
+}
+
+/// Whether a fragment reaches past the end of the page it starts in
+/// (`Catalog.fragmentStraddlesPageBoundary`).
+fn straddles_page_boundary(offset: usize, length: usize) -> bool {
+    const PAGE_SIZE: usize = 4096;
+
+    0 != length && (offset / PAGE_SIZE) != ((offset + (length - 1)) / PAGE_SIZE)
+}
+
+/// Whether a fragment that straddles a page was **written whole**
+/// (`Catalog.isValidFragment`).
+///
+/// Two ways to be sure, and the reference asks both: the checksum matches, or
+/// every page the fragment reaches into holds something. The second is what a
+/// recording with no checksum falls back on, and it is the reason the question
+/// is asked of whole pages rather than of the fragment's bytes — a fragment
+/// whose straddled part was never written leaves those pages **zero**, which is
+/// what a truncated write looks like.
+fn is_write_complete(
+    segment: &AtomicBuffer<'_, ReadOnly>,
+    offset: usize,
+    length: usize,
+    checksum: Option<Checksum>,
+) -> bool {
+    if let Some(checksum) = checksum {
+        let mut payload = vec![0_u8; length - DATA_HEADER_LENGTH];
+        if segment
+            .copy_out(offset + DATA_HEADER_LENGTH, &mut payload)
+            .is_none()
+        {
+            return false;
+        }
+
+        let recorded = read_i32_in(segment, offset + SESSION_ID_FIELD_OFFSET).unwrap_or(0);
+
+        if recorded == checksum.compute(&payload) {
+            return true;
+        }
+    }
+
+    let end = offset + length;
+    let mut page = (offset / PAGE_SIZE) * PAGE_SIZE + PAGE_SIZE;
+
+    while page < end {
+        let Some(byte) = segment.load_u8(page) else {
+            return false;
+        };
+
+        if 0 == byte {
+            return false;
+        }
+
+        page += PAGE_SIZE;
+    }
+
+    true
+}
+
+/// The page size the straddle rule is measured in
+/// (`Catalog.PAGE_SIZE`, `:110`).
+const PAGE_SIZE: usize = 4096;

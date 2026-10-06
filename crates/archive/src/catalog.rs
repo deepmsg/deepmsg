@@ -46,6 +46,7 @@ use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 
+use crate::checksum::Checksum;
 use crate::mark_file::{MAJOR_VERSION, SEMANTIC_VERSION};
 
 /// `Archive.FILENAME_CATALOG` (`Archive.java:284`).
@@ -127,6 +128,13 @@ pub enum CatalogError {
         /// The id that was asked for.
         recording_id: i64,
     },
+    /// A recording could not be repaired: its segments could not be walked.
+    Repair {
+        /// The recording being repaired.
+        recording_id: i64,
+        /// Why, in the segment's own words.
+        reason: String,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -157,6 +165,13 @@ impl fmt::Display for CatalogError {
             Self::UnknownRecording { recording_id } => {
                 write!(f, "unknown recording id: {recording_id}")
             }
+            Self::Repair {
+                recording_id,
+                reason,
+            } => write!(
+                f,
+                "recording {recording_id} could not be repaired: {reason}"
+            ),
         }
     }
 }
@@ -461,6 +476,119 @@ impl Catalog {
         self.write_header()?;
 
         Ok(recording_id)
+    }
+
+    /// Repair the recordings whose stop position was never written
+    /// (`Catalog.refreshAndFixDescriptor`, `:1066-1097`).
+    ///
+    /// A recording that was being written when its archive died has a `VALID`
+    /// record with a **null** stop position — the position was to be written
+    /// when the recording stopped, and it never did. What it would have been is
+    /// still in the segment files, so the repair reads them: the highest-numbered
+    /// segment of that recording, walked to its last frame, and the position one
+    /// past it ([`crate::segment::compute_stop_position`]).
+    ///
+    /// The stop **timestamp** is `now_ms`, which is the reference's choice too:
+    /// it writes `epochClock.time()` when it repairs (`Catalog.java:1093-1095`),
+    /// because the time the recording actually stopped is not knowable from the
+    /// files. A caller that wants a different answer has a different question.
+    ///
+    /// This is a **method** rather than something [`Catalog::open`] does, which
+    /// is the one place this diverges from the reference: its constructor
+    /// repairs as it opens (`:228-231`). A constructor that writes is a
+    /// constructor whose caller cannot choose, and a reader — `ArchiveTool
+    /// describe` is one — has no business repairing somebody's catalog because it
+    /// looked at it.
+    ///
+    /// Returns how many records were repaired.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Malformed`] when a segment file cannot be walked — a
+    /// fragment straddling a page boundary that was never written whole is the
+    /// case the reference refuses here too. Nothing has been written when that
+    /// happens: the repair reads every recording it is going to repair before it
+    /// writes any of them.
+    pub fn refresh_and_fix(
+        &mut self,
+        checksum: Option<Checksum>,
+        now_ms: i64,
+    ) -> Result<usize, CatalogError> {
+        let Some(directory) = self.path.parent().map(Path::to_path_buf) else {
+            return Ok(0);
+        };
+
+        let mut repairs = Vec::new();
+
+        for recording_id in self.index.recording_ids().collect::<Vec<_>>() {
+            let recording = self.recording(recording_id)?;
+
+            if recording.stop_position >= 0 {
+                continue;
+            }
+
+            let files = crate::segment::segment_files(&directory, recording_id);
+            let highest = files.last().map(|(_, path)| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            let summary = crate::segment::SegmentSummary::from(&recording);
+            let stop_position = crate::segment::compute_stop_position(
+                &directory,
+                &summary,
+                highest.as_deref(),
+                checksum,
+            )
+            .map_err(|error| CatalogError::Repair {
+                recording_id,
+                reason: error.to_string(),
+            })?;
+
+            repairs.push((recording_id, stop_position));
+        }
+
+        for (recording_id, stop_position) in &repairs {
+            let offset =
+                self.recording_offset(*recording_id)
+                    .ok_or(CatalogError::UnknownRecording {
+                        recording_id: *recording_id,
+                    })?;
+
+            self.write_stop(offset, *stop_position, now_ms)?;
+        }
+
+        Ok(repairs.len())
+    }
+
+    /// Write a record's stop position and stop timestamp, in place
+    /// (`Catalog.refreshAndFixDescriptor`'s two encoder calls).
+    ///
+    /// The window is the record's **descriptor**, which starts on the 8-byte
+    /// grid because the record does — and the two fields are at the block
+    /// offsets the generated codec gives them (`recording_descriptor_codec`:
+    /// `stopTimestamp` at 32, `stopPosition` at 48).
+    fn write_stop(
+        &mut self,
+        offset: usize,
+        stop_position: i64,
+        now_ms: i64,
+    ) -> Result<(), CatalogError> {
+        const STOP_TIMESTAMP_OFFSET: usize = 32;
+        const STOP_POSITION_OFFSET: usize = 48;
+
+        let region =
+            self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, STOP_POSITION_OFFSET + 8)?;
+
+        region
+            .store_i64_release(STOP_TIMESTAMP_OFFSET, now_ms)
+            .and_then(|()| region.store_i64_release(STOP_POSITION_OFFSET, stop_position))
+            .ok_or(CatalogError::Malformed {
+                offset,
+                length: i32::try_from(STOP_POSITION_OFFSET + 8).unwrap_or(i32::MAX),
+            })
     }
 
     /// Retire a record, or bring it back: the record's `state` changes and the
@@ -883,6 +1011,10 @@ mod tests {
     const CAPACITY: usize = 16 * 1024;
     const NEXT_ID: i64 = 100;
 
+    /// An epoch clock's reading, as the crate's other tests use: the stop
+    /// timestamp a repair writes is a wall-clock time.
+    const NOW: i64 = 1_700_000_000_000;
+
     fn recording(index: i64) -> Recording {
         Recording {
             recording_id: 0,
@@ -1092,6 +1224,263 @@ mod tests {
         assert_eq!(
             RecordingState::INVALID,
             reopened.state_at(offset).expect("the state")
+        );
+    }
+
+    /// A recording that was being written when its archive died has a `VALID`
+    /// record with no stop position. What it would have been is in the segment
+    /// files, one past their last frame.
+    #[test]
+    fn a_recording_that_never_stopped_is_repaired_from_its_segments() {
+        use crate::segment::{SegmentSpec, SegmentWriter};
+        use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
+        use deepmsg_core::logbuffer::frame::{
+            DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, TYPE_OFFSET,
+        };
+        use deepmsg_core::logbuffer::position::align_up;
+
+        const TERM: i32 = 64 * 1024;
+        const SEGMENT: usize = 4 * TERM as usize;
+
+        let dir = TempDir::new();
+
+        // Three frames, written the way a recording writes them.
+        let mut writer = SegmentWriter::create(
+            dir.path(),
+            SegmentSpec {
+                recording_id: NEXT_ID,
+                start_position: 0,
+                join_position: 0,
+                term_buffer_length: TERM,
+                segment_length: SEGMENT,
+            },
+            1,
+            None,
+        )
+        .expect("a writer");
+
+        for (offset, text) in [(0_i32, "one"), (64, "two"), (128, "three")] {
+            let mut frame = vec![0_u8; 64];
+            let length = i32::try_from(DATA_HEADER_LENGTH + text.len()).expect("small");
+            frame[FRAME_LENGTH_OFFSET..FRAME_LENGTH_OFFSET + 4]
+                .copy_from_slice(&length.to_le_bytes());
+            frame[TYPE_OFFSET..TYPE_OFFSET + 2].copy_from_slice(&1_i16.to_le_bytes());
+            frame[8..12].copy_from_slice(&offset.to_le_bytes());
+            frame[20..24].copy_from_slice(&7_i32.to_le_bytes());
+            frame[16..20].copy_from_slice(&1001_i32.to_le_bytes());
+            frame[DATA_HEADER_LENGTH..DATA_HEADER_LENGTH + text.len()]
+                .copy_from_slice(text.as_bytes());
+            let _ = align_up(length, FRAME_ALIGNMENT);
+
+            writer.write_block(&frame).expect("written");
+        }
+
+        let written = writer.offset() as i64;
+        assert!(written > 0);
+
+        // A catalog whose record for it never got a stop position — which is
+        // what `add_recording` writes when the caller passes one that is not
+        // there.
+        let mut catalog = created(&dir);
+        let mut unfinished = recording(0);
+        unfinished.stop_position = -1;
+        unfinished.stop_timestamp = -1;
+
+        let id = catalog.add_recording(&unfinished).expect("added");
+        assert_eq!(-1, catalog.recording(id).expect("read back").stop_position);
+
+        let repaired = catalog.refresh_and_fix(None, NOW).expect("repair");
+
+        assert_eq!(1, repaired, "one recording was unfinished");
+
+        let fixed = catalog.recording(id).expect("read back");
+
+        assert_eq!(
+            written, fixed.stop_position,
+            "one past the last frame written"
+        );
+        assert_eq!(NOW, fixed.stop_timestamp, "and the time of the repair");
+
+        // And it stays repaired: a second pass has nothing to do.
+        assert_eq!(0, catalog.refresh_and_fix(None, NOW).expect("repair"));
+    }
+
+    /// A recording with no segments at all stopped where it started: there is
+    /// nothing to read a stop position out of (`computeStopPosition`'s null
+    /// branch), and the answer cannot be before the start.
+    #[test]
+    fn a_recording_with_no_segments_stopped_where_it_started() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let mut unfinished = recording(0);
+        unfinished.start_position = 8192;
+        unfinished.stop_position = -1;
+        unfinished.stop_timestamp = -1;
+
+        let id = catalog.add_recording(&unfinished).expect("added");
+
+        assert_eq!(1, catalog.refresh_and_fix(None, NOW).expect("repair"));
+        assert_eq!(
+            8192,
+            catalog.recording(id).expect("read back").stop_position
+        );
+    }
+
+    /// A recording that **joined mid-term** starts partway into its first
+    /// segment, and the scan has to start there too: from zero it would meet the
+    /// preallocated zeroes before the join and answer with the start position,
+    /// which is what the recording began at rather than where it got to.
+    #[test]
+    fn a_recording_that_joined_mid_term_is_scanned_from_there() {
+        use crate::segment::{SegmentSpec, SegmentWriter};
+        use deepmsg_core::logbuffer::frame::{
+            DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, TYPE_OFFSET,
+        };
+
+        const TERM: i32 = 64 * 1024;
+        const SEGMENT: usize = 4 * TERM as usize;
+        const JOIN: i64 = 4096;
+
+        let dir = TempDir::new();
+
+        let mut writer = SegmentWriter::create(
+            dir.path(),
+            SegmentSpec {
+                recording_id: NEXT_ID,
+                start_position: JOIN,
+                join_position: JOIN,
+                term_buffer_length: TERM,
+                segment_length: SEGMENT,
+            },
+            1,
+            None,
+        )
+        .expect("a writer");
+
+        for (index, offset) in [4096_i32, 4160].into_iter().enumerate() {
+            let mut frame = vec![0_u8; 64];
+            let payload = format!("m{index}xx");
+            let length = i32::try_from(DATA_HEADER_LENGTH + payload.len()).expect("small");
+            frame[FRAME_LENGTH_OFFSET..FRAME_LENGTH_OFFSET + 4]
+                .copy_from_slice(&length.to_le_bytes());
+            frame[TYPE_OFFSET..TYPE_OFFSET + 2].copy_from_slice(&1_i16.to_le_bytes());
+            frame[8..12].copy_from_slice(&offset.to_le_bytes());
+            frame[16..20].copy_from_slice(&1001_i32.to_le_bytes());
+            frame[20..24].copy_from_slice(&7_i32.to_le_bytes());
+            frame[DATA_HEADER_LENGTH..DATA_HEADER_LENGTH + payload.len()]
+                .copy_from_slice(payload.as_bytes());
+
+            writer.write_block(&frame).expect("written");
+        }
+
+        // The stream position of the end, which is the segment's base plus the
+        // file offset — not the join plus the offset, which is what this test
+        // first said: the base is where the *term* the recording started in
+        // begins, and the file offset counts from there.
+        let base = crate::segment::segment_file_base_position(JOIN, JOIN, TERM, SEGMENT as i32);
+        let written = base + writer.offset() as i64;
+        let mut catalog = created(&dir);
+        let mut unfinished = recording(0);
+        unfinished.start_position = JOIN;
+        unfinished.stop_position = -1;
+        unfinished.stop_timestamp = -1;
+
+        let id = catalog.add_recording(&unfinished).expect("added");
+
+        assert_eq!(1, catalog.refresh_and_fix(None, NOW).expect("repair"));
+        assert_eq!(
+            written,
+            catalog.recording(id).expect("read back").stop_position,
+            "the frames after the join, not the join"
+        );
+    }
+
+    /// The last fragment of a segment that crosses a page boundary and was never
+    /// written whole is **refused**, and the refusal happens before anything is
+    /// written.
+    #[test]
+    fn a_fragment_that_straddles_a_page_is_refused() {
+        use crate::segment::{SegmentSpec, SegmentWriter};
+        use deepmsg_core::logbuffer::frame::{
+            DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, TYPE_OFFSET,
+        };
+
+        const TERM: i32 = 64 * 1024;
+        const SEGMENT: usize = 4 * TERM as usize;
+
+        let dir = TempDir::new();
+        let mut writer = SegmentWriter::create(
+            dir.path(),
+            SegmentSpec {
+                recording_id: NEXT_ID,
+                start_position: 0,
+                join_position: 0,
+                term_buffer_length: TERM,
+                segment_length: SEGMENT,
+            },
+            1,
+            None,
+        )
+        .expect("a writer");
+
+        // Frames that reach the page boundary and stop there, so that the
+        // **last** fragment is the one that straddles it: a scan that met a hole
+        // before it would never get to the fragment this is about.
+        let mut payload = vec![0_u8; 32];
+        payload[..4].copy_from_slice(b"fill");
+        for _ in 0..63 {
+            let mut complete = vec![0_u8; 64];
+            let length = i32::try_from(DATA_HEADER_LENGTH + payload.len()).expect("small");
+            complete[FRAME_LENGTH_OFFSET..FRAME_LENGTH_OFFSET + 4]
+                .copy_from_slice(&length.to_le_bytes());
+            complete[TYPE_OFFSET..TYPE_OFFSET + 2].copy_from_slice(&1_i16.to_le_bytes());
+            complete[8..12].copy_from_slice(&((writer.offset()) as i32).to_le_bytes());
+            complete[16..20].copy_from_slice(&1001_i32.to_le_bytes());
+            complete[20..24].copy_from_slice(&7_i32.to_le_bytes());
+            complete[DATA_HEADER_LENGTH..DATA_HEADER_LENGTH + payload.len()]
+                .copy_from_slice(&payload);
+
+            writer.write_block(&complete).expect("written");
+        }
+
+        assert_eq!(4096 - 64, writer.offset(), "the frames reach the boundary");
+
+        // The fragment that starts just before the page boundary and reaches
+        // past it, with its header written and its body never filled in — which
+        // is what a write interrupted by a crash leaves.
+        let mut frame = vec![0_u8; 4096];
+        frame[FRAME_LENGTH_OFFSET..FRAME_LENGTH_OFFSET + 4]
+            .copy_from_slice(&4096_i32.to_le_bytes());
+        frame[TYPE_OFFSET..TYPE_OFFSET + 2].copy_from_slice(&1_i16.to_le_bytes());
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.file(&crate::segment::segment_file_name(NEXT_ID, 0)))
+            .expect("the segment");
+        {
+            use std::os::unix::fs::FileExt;
+
+            file.write_all_at(&frame, 4032_u64).expect("written");
+        }
+
+        let mut catalog = created(&dir);
+        let mut unfinished = recording(0);
+        unfinished.stop_position = -1;
+        unfinished.stop_timestamp = -1;
+
+        let id = catalog.add_recording(&unfinished).expect("added");
+        let error = catalog.refresh_and_fix(None, NOW).expect_err("refused");
+
+        assert!(matches!(error, CatalogError::Repair { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("straddling page boundary"),
+            "the reference's own words: {error}"
+        );
+        assert_eq!(
+            -1,
+            catalog.recording(id).expect("read back").stop_position,
+            "and nothing was written"
         );
     }
 
