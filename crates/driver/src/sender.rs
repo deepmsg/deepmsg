@@ -718,6 +718,11 @@ pub(crate) struct SenderThread {
     /// (`aeron_driver_sender.c:150-180` polls through `sender->poller`).
     poller: crate::media::poller::TransportPoller,
     readable: Vec<usize>,
+    /// The descriptors those endpoints listen on, in the same order — held
+    /// rather than built fresh each pass, as the receiver holds its own
+    /// (`receiver.rs`): a `Vec` here is a `malloc` and a `free` in every one of
+    /// the million-odd passes a second this thread makes.
+    descriptors: Vec<crate::sys::socket::Descriptor>,
     /// Destination changes waiting for a pass that has the counters.
     ///
     /// The command loop has none — they arrive with [`SenderThread::do_work`] —
@@ -771,6 +776,7 @@ impl SenderThread {
             datagrams: Datagrams::new(),
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
+            descriptors: Vec::new(),
             pending_destinations: Vec::new(),
             pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
@@ -969,6 +975,7 @@ impl SenderThread {
                 &self.events,
                 &mut self.poller,
                 &mut self.readable,
+                &mut self.descriptors,
             );
 
             self.duty_cycle.polled(now_ns);
@@ -1280,6 +1287,7 @@ impl SenderThread {
         events: &Channel<SenderEvent>,
         poller: &mut crate::media::poller::TransportPoller,
         readable: &mut Vec<usize>,
+        descriptors: &mut Vec<crate::sys::socket::Descriptor>,
     ) -> usize {
         let mut work = 0;
 
@@ -1290,16 +1298,22 @@ impl SenderThread {
         // transport has no descriptor — a test's — makes the pass read every
         // one, because a poller that cannot see a socket must not be the reason
         // it is skipped.
-        let descriptors: Vec<Option<crate::sys::socket::Descriptor>> = endpoints
-            .iter()
-            .map(|(_, endpoint)| endpoint.descriptor())
-            .collect();
+        // One held vector and a flag, which is the shape the receiver's twin
+        // of this already has (`receiver.rs`): the pair of `Vec`s that stood
+        // here — one of `Option`s, then a `flatten`ed second — were built and
+        // dropped on every pass, and this runs about 1.2M times a second.
+        descriptors.clear();
+        let mut every_endpoint_has_one = true;
 
-        if descriptors.iter().all(Option::is_some) {
-            let present: Vec<crate::sys::socket::Descriptor> =
-                descriptors.into_iter().flatten().collect();
+        for (_, endpoint) in endpoints.iter() {
+            match endpoint.descriptor() {
+                Some(descriptor) => descriptors.push(descriptor),
+                None => every_endpoint_has_one = false,
+            }
+        }
 
-            if poller.ready(&present, readable).is_err() {
+        if every_endpoint_has_one {
+            if poller.ready(descriptors, readable).is_err() {
                 readable.clear();
                 readable.extend(0..endpoints.len());
             }
