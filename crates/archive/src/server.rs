@@ -6,3 +6,5 @@
 //! sources, LOCAL source location) and therefore must live on the same host
 //! as the streams it records; cross-site movement goes through
 //! archive-to-archive replication.
+
+pub mod config;
