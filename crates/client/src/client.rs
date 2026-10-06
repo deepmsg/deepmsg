@@ -324,6 +324,27 @@ enum Ready {
     OperationSucceeded,
 }
 
+/// Which kind of resource an [`AsyncAdd`] is for.
+///
+/// Not needed to *find* what an add produced — every kind is found by its
+/// registration id — but needed to give it back: each takes a different removal
+/// command, and a handle that did not say which would send the wrong one. The
+/// reference keeps the same distinction as a type on its registering resource
+/// and matches on it when a cancellation arrives
+/// (`aeron_client_conductor_resource_type_match`,
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncResource {
+    /// Given back with `REMOVE_SUBSCRIPTION`.
+    Subscription,
+    /// Given back with `REMOVE_PUBLICATION` — which is also what an exclusive
+    /// publication's cancellation sends, because the driver keys a publication
+    /// by registration id and not by how many producers it has.
+    Publication,
+    /// Given back with `REMOVE_COUNTER`.
+    Counter,
+}
+
 /// A handle on an `ADD_*` that has been sent and not yet answered.
 ///
 /// Returned by [`Client::async_add_subscription`], the two publication twins
@@ -340,6 +361,7 @@ enum Ready {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AsyncAdd {
     registration_id: i64,
+    resource: AsyncResource,
 }
 
 impl AsyncAdd {
@@ -1047,7 +1069,10 @@ impl Client {
     ) -> Result<AsyncAdd, CommandError> {
         let registration_id = self.submit_add_subscription(channel, stream_id, timeout)?;
 
-        Ok(AsyncAdd { registration_id })
+        Ok(AsyncAdd {
+            registration_id,
+            resource: AsyncResource::Subscription,
+        })
     }
 
     /// Send an `ADD_PUBLICATION` and return without waiting for the answer.
@@ -1063,7 +1088,10 @@ impl Client {
     ) -> Result<AsyncAdd, CommandError> {
         let registration_id = self.submit_add_publication(false, channel, stream_id, timeout)?;
 
-        Ok(AsyncAdd { registration_id })
+        Ok(AsyncAdd {
+            registration_id,
+            resource: AsyncResource::Publication,
+        })
     }
 
     /// The same, for a publication with one producer
@@ -1076,7 +1104,10 @@ impl Client {
     ) -> Result<AsyncAdd, CommandError> {
         let registration_id = self.submit_add_publication(true, channel, stream_id, timeout)?;
 
-        Ok(AsyncAdd { registration_id })
+        Ok(AsyncAdd {
+            registration_id,
+            resource: AsyncResource::Publication,
+        })
     }
 
     /// What has become of an [`AsyncAdd`] — and the last step of accepting it.
@@ -1148,52 +1179,88 @@ impl Client {
     /// That is what this does, and it does not wait for the removal's answer —
     /// the caller asked to give up, not to hear how the driver took it.
     ///
+    /// A counter is the one kind whose removal is not a `REMOVE_PUBLICATION`
+    /// with a different registration id: it is `REMOVE_COUNTER`, which is what
+    /// the handle's [`AsyncResource`] is for. The reference's own cancel for one
+    /// says what a caller can expect — "if a counter gets created by the time
+    /// cancellation happens, it will get removed"
+    /// (`aeron_async_add_counter_cancel`, `aeronc.h:698-714`) — and sending the
+    /// removal at once is how that works out here too, since the command was
+    /// already in the ring and the driver processes its ring in order.
+    ///
     /// Anything the add had already put in this client's list comes back out,
     /// so a cancelled add stops being visible at the same moment.
     pub fn async_add_cancel(&mut self, add: AsyncAdd) -> Result<(), CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
-        // Which kind it was is not in the handle, and does not need to be: a
-        // subscription add registers its subscription immediately while a
-        // publication add registers nothing, so what this client holds is what
-        // the add was. A publication add whose response never came holds
-        // nothing, and the remove below still names it by the id the driver
+        // What the add had registered by now, if anything: a subscription
+        // registers on the way in, a counter and a publication only when their
+        // answer has been polled — so an add whose answer never came holds
+        // nothing, and the removal below still names it by the id the driver
         // knows it by.
-        let subscription = self.forget_subscription(add.registration_id);
-        self.forget_publication(add.registration_id);
-        self.forget_exclusive_publication(add.registration_id);
+        match add.resource {
+            AsyncResource::Subscription => {
+                self.forget_subscription(add.registration_id);
+            }
+            AsyncResource::Publication => {
+                self.forget_publication(add.registration_id);
+                self.forget_exclusive_publication(add.registration_id);
+            }
+            AsyncResource::Counter => {
+                self.forget_counter(add.registration_id);
+            }
+        }
 
-        let (type_id, payload) = if subscription {
-            let command = deepmsg_cnc::command::RemoveSubscription {
-                correlated: deepmsg_cnc::command::Correlated {
-                    client_id: self.client_id,
-                    correlation_id,
-                },
-                registration_id: add.registration_id,
-            };
+        let correlated = || deepmsg_cnc::command::Correlated {
+            client_id: self.client_id,
+            correlation_id,
+        };
 
-            let mut payload = vec![0u8; deepmsg_cnc::command::RemoveSubscription::encoded_length()];
-            if !command.encode_into(&mut payload) {
-                return Err(CommandError::Encoding);
+        let (type_id, payload) = match add.resource {
+            AsyncResource::Subscription => {
+                let command = deepmsg_cnc::command::RemoveSubscription {
+                    correlated: correlated(),
+                    registration_id: add.registration_id,
+                };
+
+                let mut payload =
+                    vec![0u8; deepmsg_cnc::command::RemoveSubscription::encoded_length()];
+                if !command.encode_into(&mut payload) {
+                    return Err(CommandError::Encoding);
+                }
+
+                (deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID, payload)
             }
 
-            (deepmsg_cnc::command::REMOVE_SUBSCRIPTION_TYPE_ID, payload)
-        } else {
-            let command = deepmsg_cnc::command::RemovePublication {
-                correlated: deepmsg_cnc::command::Correlated {
-                    client_id: self.client_id,
-                    correlation_id,
-                },
-                registration_id: add.registration_id,
-                flags: 0,
-            };
+            AsyncResource::Publication => {
+                let command = deepmsg_cnc::command::RemovePublication {
+                    correlated: correlated(),
+                    registration_id: add.registration_id,
+                    flags: 0,
+                };
 
-            let mut payload = vec![0u8; deepmsg_cnc::command::RemovePublication::encoded_length()];
-            if !command.encode_into(&mut payload) {
-                return Err(CommandError::Encoding);
+                let mut payload =
+                    vec![0u8; deepmsg_cnc::command::RemovePublication::encoded_length()];
+                if !command.encode_into(&mut payload) {
+                    return Err(CommandError::Encoding);
+                }
+
+                (deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID, payload)
             }
 
-            (deepmsg_cnc::command::REMOVE_PUBLICATION_TYPE_ID, payload)
+            AsyncResource::Counter => {
+                let command = deepmsg_cnc::command::RemoveCounter {
+                    correlated: correlated(),
+                    registration_id: add.registration_id,
+                };
+
+                let mut payload = vec![0u8; command.encoded_length()];
+                if !command.encode_into(&mut payload) {
+                    return Err(CommandError::Encoding);
+                }
+
+                (deepmsg_cnc::command::REMOVE_COUNTER_TYPE_ID, payload)
+            }
         };
 
         // The add is no longer waited for, so its answer — if it comes — is
@@ -1294,7 +1361,10 @@ impl Client {
     ) -> Result<AsyncAdd, CommandError> {
         let registration_id = self.submit_add_counter(type_id, key, label, timeout)?;
 
-        Ok(AsyncAdd { registration_id })
+        Ok(AsyncAdd {
+            registration_id,
+            resource: AsyncResource::Counter,
+        })
     }
 
     /// The command both counter adds send, and the pending entry that answers
@@ -1834,6 +1904,26 @@ impl Client {
         };
 
         let _ = self.exclusive_publications.swap_remove(index);
+
+        true
+    }
+
+    /// The same for a counter.
+    ///
+    /// A counter this client did not ask for is not in this list at all — the
+    /// limit of the list is the limit of what a cancellation can take back —
+    /// and there is no second list to look in, because a static counter is a
+    /// different type the removal does not take.
+    fn forget_counter(&mut self, registration_id: i64) -> bool {
+        let Some(index) = self
+            .counters
+            .iter()
+            .position(|counter| counter.registration_id() == registration_id)
+        else {
+            return false;
+        };
+
+        let _ = self.counters.swap_remove(index);
 
         true
     }

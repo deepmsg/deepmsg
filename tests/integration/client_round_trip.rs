@@ -18,8 +18,8 @@ use deepmsg_client::client::{AsyncAddPoll, Client, CommandError};
 use deepmsg_cnc::command::{
     ADD_DESTINATION_TYPE_ID, ADD_RECEIVE_DESTINATION_TYPE_ID, ADD_SUBSCRIPTION_TYPE_ID,
     CLIENT_CLOSE_TYPE_ID, CORRELATED_COMMAND_LENGTH, ON_ERROR_TYPE_ID,
-    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID,
-    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID,
+    ON_OPERATION_SUCCEEDED_TYPE_ID, ON_SUBSCRIPTION_READY_TYPE_ID, REMOVE_COUNTER_TYPE_ID,
+    REMOVE_DESTINATION_BY_ID_TYPE_ID, REMOVE_DESTINATION_TYPE_ID, REMOVE_PUBLICATION_TYPE_ID,
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, REMOVE_SUBSCRIPTION_TYPE_ID,
     decode_destination_by_id_command, decode_destination_command,
 };
@@ -329,6 +329,47 @@ fn cancelling_an_async_add_asks_the_driver_to_remove_it() {
         i64::from_le_bytes(removal.1[16..24].try_into().expect("eight")),
         "the removal names the subscription the add made"
     );
+}
+
+/// The removal a cancelled add sends is the one for *its* kind of resource.
+///
+/// Which kind that is comes from the handle, not from what the client happens
+/// to be holding — a publication add registers nothing until its answer is
+/// polled, and a counter registers nothing either, so state cannot tell the two
+/// apart and the wrong command would be a wrong removal rather than a missing
+/// one. The publication here is never adopted, which is the case that has no
+/// local evidence at all.
+#[test]
+fn a_cancelled_add_sends_the_removal_for_its_own_kind() {
+    let cnc = live_cnc();
+
+    let mut client = Client::connect(cnc.path()).expect("connect");
+    let publication = client
+        .async_add_publication("aeron:ipc", 1001, Duration::from_secs(1))
+        .expect("the command is written");
+    let counter = client
+        .async_add_counter(1001, b"a-key", "a counter", Duration::from_secs(1))
+        .expect("the command is written");
+
+    for (add, type_id) in [
+        (publication, REMOVE_PUBLICATION_TYPE_ID),
+        (counter, REMOVE_COUNTER_TYPE_ID),
+    ] {
+        client
+            .async_add_cancel(add)
+            .expect("the removal is written");
+
+        let removal = commands_written(cnc.path())
+            .into_iter()
+            .find(|(written, _)| *written == type_id)
+            .unwrap_or_else(|| panic!("no removal of type {type_id} reached the ring"));
+
+        assert_eq!(
+            add.registration_id(),
+            i64::from_le_bytes(removal.1[16..24].try_into().expect("eight")),
+            "the removal names the resource the add drew"
+        );
+    }
 }
 
 /// Going out of scope closes too, which is the half a caller cannot see.

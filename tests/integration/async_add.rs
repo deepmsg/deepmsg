@@ -151,6 +151,63 @@ fn an_async_counter_is_allocated_by_the_time_the_poll_says_ready() {
     );
 }
 
+/// Giving up on a counter is the one cancellation that is not a publication
+/// removal, which is what the handle had to start saying.
+///
+/// The reference's cancel for one spells out what a caller gets: "if a counter
+/// gets created by the time cancellation happens, it will get removed"
+/// (`aeron_async_add_counter_cancel`, `aeronc.h:698-714`). So the counter is
+/// waited for here, and then the driver's own metadata region is what says it
+/// went — a `REMOVE_PUBLICATION` under the same registration id would have freed
+/// nothing.
+#[test]
+fn cancelling_a_counter_add_gives_the_counter_back() {
+    let Some((_own, mut client)) = own_driver_and_client("async-add-counter-cancel") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    const TYPE_ID: i32 = 1001;
+
+    let add = client
+        .async_add_counter(TYPE_ID, b"a-key", "a counter given up on", DEFAULT_TIMEOUT)
+        .expect("the command is written");
+
+    assert!(matches!(until_ready(&mut client, add), AsyncAddPoll::Ready));
+
+    let counter_id = client
+        .counter(add.registration_id())
+        .expect("the counter the add drew")
+        .counter_id();
+
+    client
+        .async_add_cancel(add)
+        .expect("the removal is written");
+
+    assert!(
+        client.counter(add.registration_id()).is_none(),
+        "a cancelled add stops being visible at once"
+    );
+
+    let deadline = Instant::now() + DEADLINE;
+
+    while Instant::now() < deadline {
+        client.poll();
+
+        if !client
+            .counters_reader()
+            .expect("the counter regions")
+            .is_active(counter_id, TYPE_ID, add.registration_id())
+        {
+            return;
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    panic!("the counter was never given back to the driver");
+}
+
 #[test]
 fn an_async_subscription_is_ready_and_cancelling_it_gives_it_back() {
     let Some((_own, mut client)) = own_driver_and_client("async-add-cancel") else {
