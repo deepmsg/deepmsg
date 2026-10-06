@@ -967,6 +967,7 @@ impl Conductor {
             config.receiver_window_length,
             config.receiver_cycle_threshold_ns,
             config.re_resolution_check_interval_ns,
+            config.timer_interval_ns,
         )
         .map_err(ConductorError::Sender)?;
 
