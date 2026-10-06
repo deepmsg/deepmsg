@@ -250,17 +250,53 @@ impl SubscriptionLink {
                 || self.session_id == Some(session_id))
     }
 
+    /// Whether this link is one of the reference's **`ipc_subscriptions`**
+    /// (`aeron-driver/src/main/c/aeron_driver_conductor.h:236`, with
+    /// `network_subscriptions` at `:255` and `spy_subscriptions` at `:263`).
+    ///
+    /// The reference keeps three arrays of links, and which one a link lands in
+    /// is part of the match rules rather than storage: an IPC publication is
+    /// offered only to the links in `ipc_subscriptions`
+    /// (`aeron_driver_conductor_link_ipc_subscriptions`, `:3693-3705`), which
+    /// is the walk this build's one list has to reproduce.
+    ///
+    /// The array is decided where the link is made, by what its channel was: a
+    /// subscription on `aeron:ipc` (`:4768`) and a multi-destination IPC link
+    /// (`:5646`) go to `ipc_subscriptions`; a subscription on a UDP channel
+    /// (`:5096`, in `aeron_driver_conductor_execute_add_network_subscription`)
+    /// goes to `network_subscriptions`; a spy subscription (`:4873`) and a spy
+    /// destination (`:5755`) go to `spy_subscriptions`.
+    ///
+    /// This build keeps the one list and decides by the two fields that were
+    /// set when the link was made, which is the same partition seen from the
+    /// other side: a link with an endpoint is a network one, and one carrying a
+    /// spy channel is a spy. What is left — no endpoint, no spy channel — is
+    /// the `ipc_subscriptions` of the reference, and it is what an IPC
+    /// publication may be linked to.
+    pub fn is_ipc_link(&self) -> bool {
+        self.endpoint_id.is_none() && self.spy_channel.is_none()
+    }
+
     /// Whether this subscription reads that publication
     /// (`aeron_driver_conductor_subscription_link_matches_ipc_publication`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:110-117`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:110-117`, which the
+    /// `ipc_subscriptions` walk above applies only to links of this kind).
     ///
-    /// The session rule is the whole of it, and it is asymmetric: a
+    /// The session rule is the rest of it, and it is asymmetric: a
     /// subscription that named a session is looking for that one stream, while
     /// one that named none is looking for whatever appears — including a
     /// publication that is created after the subscription, which is the case
     /// the reference calls "wildcard".
+    ///
+    /// The kind clause is not decoration. A UDP subscription on the same
+    /// `(stream_id)` is a different channel over a different transport, and
+    /// linking it would hand its client an image of a log buffer it cannot
+    /// read — which is what a real archive's local control setup runs into:
+    /// its network control subscription and its IPC one carry the same stream
+    /// id, and the first ConnectRequest it answers arrives twice.
     pub fn matches(&self, publication: &IpcPublication) -> bool {
-        self.stream_id == publication.stream_id
+        self.is_ipc_link()
+            && self.stream_id == publication.stream_id
             && ((self.session_id.is_none() && !self.is_response)
                 || self.session_id == Some(publication.session_id))
     }
@@ -985,10 +1021,7 @@ impl IpcSubscriptions {
         events: &mut impl ClientEvents,
     ) -> bool {
         let Some(index) = self.links.iter().position(|link| {
-            link.registration_id == registration_id
-                && link.endpoint_id.is_none()
-                && link.spy_channel.is_none()
-                && link.channel == channel
+            link.registration_id == registration_id && link.is_ipc_link() && link.channel == channel
         }) else {
             return false;
         };
@@ -2611,6 +2644,44 @@ mod tests {
         let ipc = link(1001, None, false);
         assert!(ipc.endpoint_id.is_none());
         assert!(!ipc.matches_image(3, 1001, 100));
+    }
+
+    #[test]
+    fn an_ipc_publication_is_read_by_no_link_that_is_not_an_ipc_one() {
+        // The reference never asks the question: the two kinds of subscription
+        // live in different arrays and an IPC publication is offered to one of
+        // them (`aeron_driver_conductor_link_ipc_subscriptions`, `:3693-3705`).
+        // This build has the one list, so the split has to be in the rule.
+        //
+        // Getting it wrong is not academic. A real archive subscribes on a UDP
+        // control channel *and* on the IPC one its clients are told to use,
+        // with the same stream id; the client's request publication goes out on
+        // the second, and linking it to the first hands the archive an image of
+        // a log buffer over a transport it did not open — so it reads the same
+        // ConnectRequest twice and answers it twice.
+        let network = {
+            let mut link = link(1001, None, false);
+            link.endpoint_id = Some(3);
+            link
+        };
+        assert!(!network.is_ipc_link());
+        assert!(
+            !network.matches(&publication(100, 1001, false)),
+            "a UDP subscription on the same stream is a different channel"
+        );
+
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
+        assert!(!spy.is_ipc_link());
+        assert!(
+            !spy.matches(&publication(100, 1001, false)),
+            "a spy reads network publications, in its own array"
+        );
+
+        // And the kind that is left — which is the one an IPC publication is
+        // for, and the one a deleted multi-destination link is looked up as.
+        let ipc = link(1001, None, false);
+        assert!(ipc.is_ipc_link());
+        assert!(ipc.matches(&publication(100, 1001, false)));
     }
 
     #[test]
