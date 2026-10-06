@@ -47,7 +47,7 @@ use deepmsg_cnc::command::OwnedPublicationError;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
-use crate::driver::Role;
+use crate::driver::{Role, Timer};
 use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
 use crate::network_publication::NetworkPublication;
@@ -580,6 +580,7 @@ impl Sender {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
     ) -> io::Result<Self> {
         let SenderParts { proxy, agent } = Self::split(
             cnc,
@@ -591,6 +592,7 @@ impl Sender {
             re_resolution_interval_ns,
             status_message_timeout_ns,
             send_to_sm_poll_ratio,
+            timer_interval_ns,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -624,6 +626,7 @@ impl Sender {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -648,6 +651,7 @@ impl Sender {
                 re_resolution_interval_ns,
                 status_message_timeout_ns,
                 send_to_sm_poll_ratio,
+                timer_interval_ns,
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -702,6 +706,9 @@ pub(crate) struct SenderThread {
     /// at all.
     re_resolution_interval_ns: i64,
     re_resolution_deadline_ns: i64,
+    /// When the maintenance the reference runs on its timer tier next runs.
+    /// See [`Timer`].
+    maintenance: Timer,
     publications: Vec<NetworkPublication>,
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
@@ -711,6 +718,11 @@ pub(crate) struct SenderThread {
     /// (`aeron_driver_sender.c:150-180` polls through `sender->poller`).
     poller: crate::media::poller::TransportPoller,
     readable: Vec<usize>,
+    /// The descriptors those endpoints listen on, in the same order — held
+    /// rather than built fresh each pass, as the receiver holds its own
+    /// (`receiver.rs`): a `Vec` here is a `malloc` and a `free` in every one of
+    /// the million-odd passes a second this thread makes.
+    descriptors: Vec<crate::sys::socket::Descriptor>,
     /// Destination changes waiting for a pass that has the counters.
     ///
     /// The command loop has none — they arrive with [`SenderThread::do_work`] —
@@ -741,6 +753,7 @@ impl SenderThread {
         re_resolution_interval_ns: i64,
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
+        timer_interval_ns: i64,
         now_ns: i64,
         events: Channel<SenderEvent>,
         commands: Receiver<SenderCommand>,
@@ -753,6 +766,7 @@ impl SenderThread {
             linger_timeout_ns,
             re_resolution_interval_ns,
             re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
+            maintenance: Timer::new(timer_interval_ns, now_ns),
             duty_cycle: DutyCycle::new(send_to_sm_poll_ratio, status_message_timeout_ns),
             events,
             endpoints: Vec::new(),
@@ -762,6 +776,7 @@ impl SenderThread {
             datagrams: Datagrams::new(),
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
+            descriptors: Vec::new(),
             pending_destinations: Vec::new(),
             pending_subscribers: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
@@ -887,8 +902,29 @@ impl SenderThread {
             &self.counters,
             &regions,
         );
-        self.check_untethered_subscriptions(&regions, now_ns);
-        self.check_for_blocked_publishers(&regions, now_ns);
+        // The reference runs both of these from the conductor, on its timer
+        // tier — `aeron_network_publication_check_managed_resources`
+        // (`aeron_network_publication.c:1270-1290`), reached from
+        // `aeron_driver_conductor_on_check_managed_resources` (`:1692`), whose
+        // `on_time_event` the publication list is wired to at `:766`. They run
+        // here because the publications are this thread's; the deadline is the
+        // same one. See [`Timer`].
+        //
+        // The comment on `check_for_blocked_publishers` below already says the
+        // whole of what the divergence costs: "how soon a deadline is noticed,
+        // not which transitions happen". Noticing it every pass instead of
+        // every interval therefore buys nothing.
+        // One decision for the pass: the send loop notices a revoke under the
+        // same gate the two checks below run under, and all three are the
+        // reference's `aeron_network_publication_check_managed_resources`
+        // (`aeron_network_publication.c:1240-1290`) on the conductor's tier.
+        let maintenance_due = self.maintenance.is_due(now_ns);
+
+        if maintenance_due {
+            self.check_untethered_subscriptions(&regions, now_ns);
+            self.check_for_blocked_publishers(&regions, now_ns);
+            self.maintenance.ran(now_ns);
+        }
 
         let system = System::new(&self.counters, &regions);
 
@@ -919,6 +955,8 @@ impl SenderThread {
             &regions,
             self.linger_timeout_ns,
             &self.events,
+            now_ns,
+            maintenance_due,
         );
 
         let short_sends_after = system.value(system_counters::id::SHORT_SENDS);
@@ -944,6 +982,7 @@ impl SenderThread {
                 &self.events,
                 &mut self.poller,
                 &mut self.readable,
+                &mut self.descriptors,
             );
 
             self.duty_cycle.polled(now_ns);
@@ -954,6 +993,7 @@ impl SenderThread {
             &regions,
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
+            now_ns,
         );
 
         work + resolved
@@ -1254,6 +1294,7 @@ impl SenderThread {
         events: &Channel<SenderEvent>,
         poller: &mut crate::media::poller::TransportPoller,
         readable: &mut Vec<usize>,
+        descriptors: &mut Vec<crate::sys::socket::Descriptor>,
     ) -> usize {
         let mut work = 0;
 
@@ -1264,16 +1305,22 @@ impl SenderThread {
         // transport has no descriptor — a test's — makes the pass read every
         // one, because a poller that cannot see a socket must not be the reason
         // it is skipped.
-        let descriptors: Vec<Option<crate::sys::socket::Descriptor>> = endpoints
-            .iter()
-            .map(|(_, endpoint)| endpoint.descriptor())
-            .collect();
+        // One held vector and a flag, which is the shape the receiver's twin
+        // of this already has (`receiver.rs`): the pair of `Vec`s that stood
+        // here — one of `Option`s, then a `flatten`ed second — were built and
+        // dropped on every pass, and this runs about 1.2M times a second.
+        descriptors.clear();
+        let mut every_endpoint_has_one = true;
 
-        if descriptors.iter().all(Option::is_some) {
-            let present: Vec<crate::sys::socket::Descriptor> =
-                descriptors.into_iter().flatten().collect();
+        for (_, endpoint) in endpoints.iter() {
+            match endpoint.descriptor() {
+                Some(descriptor) => descriptors.push(descriptor),
+                None => every_endpoint_has_one = false,
+            }
+        }
 
-            if poller.ready(&present, readable).is_err() {
+        if every_endpoint_has_one {
+            if poller.ready(descriptors, readable).is_err() {
                 readable.clear();
                 readable.extend(0..endpoints.len());
             }
@@ -1652,8 +1699,9 @@ impl SenderThread {
         regions: &CounterRegions<'_>,
         linger_timeout_ns: i64,
         events: &Channel<SenderEvent>,
+        now_ns: i64,
+        maintenance_due: bool,
     ) -> usize {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         // Bytes, not publications: the reference's `do_send` returns
         // `bytes_sent` and its duty cycle keys on that (`:150`, `:455`), so a
         // pass that walked ten publications and sent nothing is a pass that
@@ -1671,10 +1719,16 @@ impl SenderThread {
             let registration_id = publication.registration_id;
 
             // A revoked publication has one last thing to do — say so — and
-            // this is where it is noticed, on the thread that owns it
-            // (`aeron_network_publication_check_managed_resources`'s ACTIVE and
-            // LINGER arms, `:1240-1340`).
-            if publication.notice_revoke(now_ns, linger_timeout_ns, system, counters, regions) {
+            // the reference notices it on the managed-resource tier, in the
+            // same function as the two checks above
+            // (`aeron_network_publication_check_managed_resources`'s ACTIVE
+            // arm, `aeron_network_publication.c:1246-1250`). It runs there
+            // here too: what that tier decides is how soon a revoked
+            // publication is told, and the reference's answer is an interval,
+            // not a pass.
+            if maintenance_due
+                && publication.notice_revoke(now_ns, linger_timeout_ns, system, counters, regions)
+            {
                 let _ = events.send(SenderEvent::PublicationDrained { registration_id });
             }
 
@@ -1711,8 +1765,8 @@ impl SenderThread {
         regions: &CounterRegions<'_>,
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
+        now_ns: i64,
     ) {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 
@@ -2281,6 +2335,7 @@ mod tests {
             0,
             crate::config::RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             crate::config::SEND_TO_STATUS_POLL_RATIO_DEFAULT,
+            crate::config::TIMER_INTERVAL_NS_DEFAULT,
         )
         .expect("a sender");
 

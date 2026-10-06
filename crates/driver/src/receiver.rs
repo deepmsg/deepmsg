@@ -35,7 +35,7 @@ use std::thread::JoinHandle;
 use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
-use crate::driver::Role;
+use crate::driver::{Role, Timer};
 
 use crate::media::dispatcher::{Interest, SetupInterest};
 use crate::media::receive_endpoint::ReceiveChannelEndpoint;
@@ -657,6 +657,7 @@ impl Receiver {
         initial_window_length: i32,
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
+        timer_interval_ns: i64,
     ) -> io::Result<Self> {
         // A test-only constructor: it puts the loss report beside the CnC file
         // it was handed, which is where a driver puts it too.
@@ -678,6 +679,7 @@ impl Receiver {
             initial_window_length,
             cycle_threshold_ns,
             re_resolution_interval_ns,
+            timer_interval_ns,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -711,6 +713,7 @@ impl Receiver {
         initial_window_length: i32,
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
+        timer_interval_ns: i64,
     ) -> io::Result<ReceiverParts> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
         let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
@@ -735,6 +738,7 @@ impl Receiver {
                 initial_window_length,
                 cycle_threshold_ns,
                 re_resolution_interval_ns,
+                timer_interval_ns,
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -831,6 +835,8 @@ pub(crate) struct ReceiverThread {
     /// (`aeron_driver_receiver.c:254-258`). Zero is a driver that does not look.
     re_resolution_interval_ns: i64,
     re_resolution_deadline_ns: i64,
+    /// When an image's own maintenance next runs. See [`Timer`].
+    image_maintenance: Timer,
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
     /// Which destinations have something to read (G4-3): the reference's
@@ -864,6 +870,7 @@ impl ReceiverThread {
         initial_window_length: i32,
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
+        timer_interval_ns: i64,
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
         commands: Inbox<ReceiverCommand>,
@@ -880,6 +887,7 @@ impl ReceiverThread {
             cycle_threshold_ns,
             re_resolution_interval_ns,
             re_resolution_deadline_ns: now_ns + re_resolution_interval_ns,
+            image_maintenance: Timer::new(timer_interval_ns, now_ns),
             events,
             endpoints: Vec::new(),
             images: Vec::new(),
@@ -1329,14 +1337,20 @@ impl ReceiverThread {
             now_ns,
         );
 
-        work += Self::check_untethered_subscriptions(
-            &mut self.images,
-            &mut self.counters,
-            &regions,
-            &self.events,
-            now_ns,
-        );
-        work += self.run_time_events(&regions, now_ns);
+        // The pair the reference runs on its timer rather than per pass. See
+        // [`Timer`] for what the gate does and does not change.
+        if self.image_maintenance.is_due(now_ns) {
+            work += Self::check_untethered_subscriptions(
+                &mut self.images,
+                &mut self.counters,
+                &regions,
+                &self.events,
+                now_ns,
+            );
+            work += self.run_time_events(&regions, now_ns);
+            self.image_maintenance.ran(now_ns);
+        }
+
         Self::track_cycle(
             &self.counters,
             &regions,
@@ -2161,6 +2175,7 @@ mod tests {
             128 * 1024,
             100_000_000,
             0,
+            crate::config::TIMER_INTERVAL_NS_DEFAULT,
         )
         .expect("a receiver");
 
