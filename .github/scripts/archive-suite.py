@@ -123,8 +123,10 @@ def run_binary(
     binary: str,
     reports: Path,
     cases: list[str],
-    driver: str | None,
+    binaries: list[str | None],
     java: str,
+    binary_timeout: int,
+    case_timeout: int,
 ) -> dict[str, str]:
     """One binary, one gtest XML, a mapping of case name to outcome.
 
@@ -150,7 +152,7 @@ def run_binary(
         subprocess.run(
             [str(path), f"--gtest_output=xml:{report}"],
             cwd=cwd,
-            timeout=PER_BINARY_TIMEOUT,
+            timeout=binary_timeout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -158,7 +160,7 @@ def run_binary(
         # The suite's own readiness wait has no timeout, so a process that
         # never comes up is a hang. Naming the cases here is the only way the
         # report does not read as "the whole binary passed".
-        print(f"  TIMEOUT after {PER_BINARY_TIMEOUT}s", flush=True)
+        print(f"  TIMEOUT after {binary_timeout}s", flush=True)
 
     outcomes = read_report(report)
     if outcomes or not cases:
@@ -171,7 +173,7 @@ def run_binary(
             subprocess.run(
                 [str(path), f"--gtest_output=xml:{one}", f"--gtest_filter={case}"],
                 cwd=cwd,
-                timeout=PER_CASE_TIMEOUT,
+                timeout=case_timeout,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -184,22 +186,35 @@ def run_binary(
         # the next case then fails to start a driver rather than failing on its
         # own merits. `kill_leftovers` is called by the caller between binaries;
         # inside the fallback the cases are the loop.
-        for line in kill_leftovers(driver, java):
+        for line in kill_leftovers(binaries, java):
             print(f"\n    killed a leftover between cases: {line}", flush=True)
     return outcomes
 
 
-def write_shim_config(shim: Path, *, mode: str, java: str, log: Path, driver: str | None) -> None:
+def write_shim_config(
+    shim: Path,
+    *,
+    mode: str,
+    java: str,
+    log: Path,
+    binaries: dict[str, str | None],
+) -> None:
     """Beside the binary, which is the only place it looks.
 
     Paths are absolute because the shim's working directory is whatever the C
     test's was, and one of the nine runs from a different subdirectory than the
     others.
 
-    `driver=` is written only when one was named. It is what a mode that
-    replaces the reference's driver points the shim at, and without it `hybrid`
-    has nothing to start — but writing a path nobody gave would be this script
-    guessing, which is the failure it exists to avoid.
+    The three binaries are the three main classes the reference's suite spawns
+    (`archive-shim.rs` names them): `driver=` is `io.aeron.driver.MediaDriver`,
+    `archiving-media-driver=` is `io.aeron.archive.ArchivingMediaDriver`, and
+    `archive=` is the standalone `io.aeron.archive.Archive`. A mode refuses by
+    name for one it needs that is not here.
+
+    Each is written **only** when one was named. A mode that replaces a class
+    the shim has no path for starts nothing and says so; writing a path nobody
+    gave would be this script guessing, which is the failure it exists to
+    avoid.
     """
     config = shim.parent / "archive-shim.conf"
     lines = [
@@ -208,12 +223,13 @@ def write_shim_config(shim: Path, *, mode: str, java: str, log: Path, driver: st
         f"mode={mode}",
         f"log={log.resolve()}",
     ]
-    if driver is not None:
-        lines.append(f"driver={Path(driver).resolve()}")
+    for key, path in binaries.items():
+        if path is not None:
+            lines.append(f"{key}={Path(path).resolve()}")
     config.write_text("\n".join(lines) + "\n")
 
 
-def kill_leftovers(driver: str | None, java: str) -> list[str]:
+def kill_leftovers(binaries: list[str | None], java: str) -> list[str]:
     """Kill what a previous binary left behind, and say what it killed.
 
     A hybrid run does not start one process, it starts a pair — the shim
@@ -223,10 +239,15 @@ def kill_leftovers(driver: str | None, java: str) -> list[str]:
     binary cannot bind and reports zero cases, which reads as "this binary
     produced nothing" rather than "something else is holding the port".
 
+    Every binary a run was configured with is matched, not just the driver:
+    under `deepmsg` it is *our* binary that plays the archive, so looking only
+    for java would leave exactly the process this is here to clear.
+
     Matched on `/proc/<pid>/exe` and not on the environment, because a
     supervised half is started with `-D` arguments rather than environment
     variables and has no `AERON_DIR` to grep for.
     """
+    ours_paths = {str(Path(one).resolve()) for one in binaries if one is not None}
     killed = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -241,7 +262,7 @@ def kill_leftovers(driver: str | None, java: str) -> list[str]:
         except OSError:
             pass
 
-        ours = driver is not None and exe == str(Path(driver).resolve())
+        ours = exe in ours_paths
         # The archive half: the reference's java, running an archive main class.
         theirs = exe == str(Path(java).resolve()) and "io.aeron.archive." in cmdline
         if ours or theirs:
@@ -287,10 +308,55 @@ def main() -> int:
     )
     parser.add_argument(
         "--driver",
-        help="the binary a mode replaces the reference's driver with; required by "
+        help="the binary that replaces `io.aeron.driver.MediaDriver`; required by "
         "every mode but `transparent`, because the shim will not guess",
     )
+    parser.add_argument(
+        "--archiving-media-driver",
+        dest="archiving_media_driver",
+        help="the binary that replaces `io.aeron.archive.ArchivingMediaDriver`: one "
+        "process that is a driver and an archive, and the class 214 of the 276 "
+        "spawns a rehearsal counted; a `deepmsg` run without it refuses on the "
+        "first case that starts an archive",
+    )
+    parser.add_argument(
+        "--binary-timeout",
+        type=int,
+        default=PER_BINARY_TIMEOUT,
+        help=f"how long one binary's whole run may take, in seconds; ctest's own "
+        f"TIMEOUT for these is {PER_BINARY_TIMEOUT} and is the default. Raise it for "
+        "a run whose archive does not answer every request: an unanswered request "
+        "costs the client its whole retry budget (~20 s), which can push a "
+        "mostly-green binary past the timeout — and the fallback that then takes "
+        "over reads *worse* than the run it replaced, because a case killed at "
+        "its timeout leaves the aeron directory behind and every case after it "
+        "meets a driver that will not start",
+    )
+    parser.add_argument(
+        "--case-timeout",
+        type=int,
+        default=PER_CASE_TIMEOUT,
+        help=f"how long one case may take in the per-case fallback, in seconds; "
+        f"ctest's own per-test TIMEOUT is {PER_CASE_TIMEOUT} and is the default. A case "
+        "that hangs there holds its whole binary's reading hostage for that long, "
+        "so a run against a build where most of a suite cannot start wants this "
+        "lower — every case it cuts is one the aggregate already failed to report",
+    )
+    parser.add_argument(
+        "--archive",
+        help="the binary that replaces the standalone `io.aeron.archive.Archive`; "
+        "nothing in this repository builds one yet, so a `deepmsg` run that meets "
+        "that class refuses by name rather than starting the reference's",
+    )
     args = parser.parse_args()
+
+    # One dict, because the shim reads one file: the key is the shim's own
+    # spelling of each binary, and a `None` is a key the run did not name.
+    named = {
+        "driver": args.driver,
+        "archive": args.archive,
+        "archiving-media-driver": args.archiving_media_driver,
+    }
 
     # Absolute before anything uses it. A binary is spawned with `cwd=` set to
     # its own directory (`working_directory`), and a relative executable path is
@@ -309,12 +375,14 @@ def main() -> int:
             # that is never going to appear — and the suite's readiness wait has
             # no timeout, so that reads as a hang.
             sys.exit(f"--mode {args.mode} needs --driver: it replaces the reference's driver with ours")
-        if args.driver is not None and not os.access(args.driver, os.X_OK):
-            sys.exit(f"--driver {args.driver} is not an executable file")
-        write_shim_config(shim, mode=args.mode, java=args.java, log=args.log, driver=args.driver)
+        for key, path in named.items():
+            if path is not None and not os.access(path, os.X_OK):
+                sys.exit(f"--{key} {path} is not an executable file")
+        write_shim_config(shim, mode=args.mode, java=args.java, log=args.log, binaries=named)
         print(f"shim       {shim} (mode {args.mode})")
-        if args.driver is not None:
-            print(f"driver     {args.driver}")
+        for key, path in named.items():
+            if path is not None:
+                print(f"{key:24} {path}")
     else:
         print("shim       none (the real java)")
 
@@ -327,7 +395,7 @@ def main() -> int:
         # Before the first binary too: a run started on top of an earlier run's
         # leftovers fails on the control port, and the failure lands on whichever
         # binary happened to go first.
-        for line in kill_leftovers(args.driver, args.java):
+        for line in kill_leftovers(list(named.values()), args.java):
             print(f"killed a leftover before starting: {line}")
 
         # Before the run, because a binary that dies is re-run case by case and
@@ -345,11 +413,13 @@ def main() -> int:
                 binary,
                 reports,
                 sorted(cases_for.get(binary, [])),
-                args.driver,
+                list(named.values()),
                 args.java,
+                args.binary_timeout,
+                args.case_timeout,
             )
             outcomes.update(found)
-            left = kill_leftovers(args.driver, args.java)
+            left = kill_leftovers(list(named.values()), args.java)
             if left:
                 print()
                 for line in left:
