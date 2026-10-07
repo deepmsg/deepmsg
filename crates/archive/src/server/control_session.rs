@@ -62,6 +62,8 @@ use deepmsg_client::client::CommandError;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_core::logbuffer::append::Appended;
 
+use crate::server::auth::Authenticator;
+
 /// Where a session is (`ControlSession.java:64-67`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -317,32 +319,8 @@ pub enum Answer {
     Reject,
 }
 
-/// The archive's authenticator, as far as a session sees it
-/// (`Authenticator.java:26-69`).
-pub trait Authenticator {
-    /// A connect request arrived (`Authenticator.java:36`).
-    fn on_connect_request(&mut self, session_id: i64, encoded_credentials: &[u8], now_ms: i64);
-
-    /// The publication is connected: offer the session
-    /// (`ControlSession.java:945`).
-    fn on_connected_session(&mut self, session_id: i64, now_ms: i64) -> Answer;
-
-    /// Still challenged; the reference calls this every turn
-    /// (`ControlSession.java:954-958`).
-    fn on_challenged_session(&mut self, session_id: i64, now_ms: i64) -> Answer;
-
-    /// The client answered the challenge
-    /// (`ControlSession.java:313`).
-    fn on_challenge_response(
-        &mut self,
-        session_id: i64,
-        encoded_credentials: &[u8],
-        now_ms: i64,
-    ) -> Answer;
-}
-
 /// One control session.
-pub struct ControlSession<E: Egress, A: Authenticator> {
+pub struct ControlSession<E: Egress> {
     /// The id the client is answered with, which the conductor allocates.
     session_id: i64,
     /// The connect request's correlation id, which the connect answer echoes.
@@ -363,7 +341,6 @@ pub struct ControlSession<E: Egress, A: Authenticator> {
 
     state: State,
     egress: E,
-    authenticator: A,
 
     /// `NULL_VALUE` in the reference; the deadline is the one place its
     /// sentinel is load-bearing, so it is an `Option` here.
@@ -392,7 +369,7 @@ pub struct ControlSession<E: Egress, A: Authenticator> {
     sync_responses: Vec<Response>,
 }
 
-impl<E: Egress, A: Authenticator> ControlSession<E, A> {
+impl<E: Egress> ControlSession<E> {
     /// A session in `INIT`, with the deadlines the reference starts them at
     /// (`ControlSession.java:128-129`).
     #[allow(clippy::too_many_arguments)] // one per thing the conductor decided
@@ -406,7 +383,6 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
         liveness_check_interval_ms: i64,
         now_ms: i64,
         egress: E,
-        authenticator: A,
     ) -> Self {
         Self {
             session_id,
@@ -418,7 +394,6 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
             liveness_check_interval_ms,
             state: State::Init,
             egress,
-            authenticator,
             activity_deadline_ms: Some(now_ms + connect_timeout_ms),
             resend_deadline_ms: 0,
             liveness_check_deadline_ms: now_ms + liveness_check_interval_ms,
@@ -474,7 +449,12 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// One turn (`ControlSession.java:212-271`).
     ///
     /// Returns the work done, for the cycle counter.
-    pub fn do_work<P: Publications>(&mut self, now_ms: i64, publications: &mut P) -> usize {
+    pub fn do_work<P: Publications, A: Authenticator + ?Sized>(
+        &mut self,
+        now_ms: i64,
+        publications: &mut P,
+        authenticator: &mut A,
+    ) -> usize {
         let mut work = 0;
 
         if self.has_no_activity(now_ms) {
@@ -499,8 +479,10 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
         work += match self.state {
             State::Init => self.init(publications),
             State::Connecting => self.wait_for_connection(publications),
-            State::Connected => self.send_connect_response(now_ms, publications),
-            State::Challenged => self.wait_for_challenge_response(now_ms, publications),
+            State::Connected => self.send_connect_response(now_ms, publications, authenticator),
+            State::Challenged => {
+                self.wait_for_challenge_response(now_ms, publications, authenticator)
+            }
             State::Authenticated => self.wait_for_request(now_ms, publications),
             State::Active => {
                 self.perform_liveness_check(now_ms, publications)
@@ -523,12 +505,13 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
     /// The client answered a challenge (`ControlSession.java:308-315`), which
     /// is the one request that is not gated on being `ACTIVE`.
-    pub fn on_challenge_response<P: Publications>(
+    pub fn on_challenge_response<P: Publications, A: Authenticator + ?Sized>(
         &mut self,
         correlation_id: i64,
         encoded_credentials: &[u8],
         now_ms: i64,
         publications: &mut P,
+        authenticator: &mut A,
     ) {
         if self.state != State::Challenged {
             return;
@@ -536,8 +519,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
         self.connect_correlation_id = correlation_id;
         let answer =
-            self.authenticator
-                .on_challenge_response(self.session_id, encoded_credentials, now_ms);
+            authenticator.on_challenge_response(self.session_id, encoded_credentials, now_ms);
         self.apply(answer, publications);
     }
 
@@ -636,10 +618,11 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
     /// `CONNECTED`: tell the authenticator, or refuse the client's version
     /// (`ControlSession.java:926-952`).
-    fn send_connect_response<P: Publications>(
+    fn send_connect_response<P: Publications, A: Authenticator + ?Sized>(
         &mut self,
         now_ms: i64,
         publications: &mut P,
+        authenticator: &mut A,
     ) -> usize {
         if now_ms <= self.resend_deadline_ms {
             return 0;
@@ -660,9 +643,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
                 );
                 Answer::None
             }
-            None => self
-                .authenticator
-                .on_connected_session(self.session_id, now_ms),
+            None => authenticator.on_connected_session(self.session_id, now_ms),
         };
         self.apply(answer, publications);
 
@@ -671,14 +652,13 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
     /// `CHALLENGED`: the reference asks again every turn, with no resend
     /// interval (`ControlSession.java:954-958`).
-    fn wait_for_challenge_response<P: Publications>(
+    fn wait_for_challenge_response<P: Publications, A: Authenticator + ?Sized>(
         &mut self,
         now_ms: i64,
         publications: &mut P,
+        authenticator: &mut A,
     ) -> usize {
-        let answer = self
-            .authenticator
-            .on_challenged_session(self.session_id, now_ms);
+        let answer = authenticator.on_challenged_session(self.session_id, now_ms);
         self.apply(answer, publications);
         1
     }
@@ -1034,7 +1014,7 @@ mod tests {
     }
 
     /// A session whose publication is already there, connected and answering.
-    fn active_session() -> ControlSession<FakeEgress, FakeAuthenticator> {
+    fn active_session() -> (ControlSession<FakeEgress>, FakeAuthenticator) {
         // The publication is there from the first turn, so INIT is one turn.
         let egress = FakeEgress {
             ready: true,
@@ -1042,6 +1022,7 @@ mod tests {
             ..FakeEgress::default()
         };
 
+        let mut authenticator = FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]);
         let mut session = ControlSession::new(
             7,
             42,
@@ -1052,23 +1033,23 @@ mod tests {
             1_000,
             0,
             egress,
-            FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
         // INIT -> CONNECTING
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         // CONNECTING -> CONNECTED
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         // CONNECTED -> AUTHENTICATED, and the OK goes out
-        session.do_work(201, &mut NoPublications);
+        session.do_work(201, &mut NoPublications, &mut authenticator);
         session.attempt_to_activate();
 
         assert_eq!(session.state(), State::Active);
-        session
+        (session, authenticator)
     }
 
     #[test]
     fn a_session_walks_the_states_in_the_references_order() {
+        let mut authenticator = FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]);
         let mut session = ControlSession::new(
             1,
             42,
@@ -1079,30 +1060,29 @@ mod tests {
             1_000,
             0,
             FakeEgress::default(),
-            FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
         assert_eq!(session.state(), State::Init);
 
         // Nothing is ready yet, so the publication is asked for and INIT is
         // where it stays.
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Init);
 
         // The driver answers.
         session.egress.ready = true;
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Connecting);
 
         // ...and a subscriber attaches. That is the whole of CONNECTING's
         // question, so one turn is enough (`ControlSession.java:913-924`).
         session.egress.connected = true;
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Connected);
 
         // The authenticator is offered the session on the next turn, at the
         // first moment the resend interval allows.
-        session.do_work(201, &mut NoPublications);
+        session.do_work(201, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -1114,6 +1094,7 @@ mod tests {
         // `ControlSession.java:874-881`: the registration id is forgotten and
         // another publication asked for. It is why a driver that takes its time
         // gets more than one publication to answer.
+        let mut authenticator = FakeAuthenticator::default();
         let mut session = ControlSession::new(
             1,
             42,
@@ -1124,13 +1105,12 @@ mod tests {
             1_000,
             0,
             FakeEgress::default(),
-            FakeAuthenticator::default(),
         );
 
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
 
         assert_eq!(session.egress.publications_added.len(), 2);
         assert_eq!(
@@ -1148,6 +1128,7 @@ mod tests {
         };
         egress.ready = true;
 
+        let mut authenticator = FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]);
         let mut session = ControlSession::new(
             1,
             42,
@@ -1158,12 +1139,11 @@ mod tests {
             1_000,
             0,
             egress,
-            FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
-        session.do_work(1, &mut NoPublications);
-        session.do_work(1, &mut NoPublications);
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         // The first answer went out with the transition: `authenticate`
@@ -1173,11 +1153,11 @@ mod tests {
 
         // Too soon: the interval runs from the turn that answered, which was
         // `now = 1`.
-        session.do_work(200, &mut NoPublications);
+        session.do_work(200, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), after_connect);
 
         // The interval has passed.
-        session.do_work(202, &mut NoPublications);
+        session.do_work(202, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), after_connect + 1);
 
         // And what it sends is an OK carrying the connect's correlation id and
@@ -1203,6 +1183,10 @@ mod tests {
         };
         egress.ready = true;
 
+        let mut authenticator = FakeAuthenticator::with(&[
+            Answer::Challenge(b"challenge!".to_vec()),
+            Answer::Authenticate(Vec::new()),
+        ]);
         let mut session = ControlSession::new(
             1,
             42,
@@ -1213,15 +1197,11 @@ mod tests {
             1_000,
             0,
             egress,
-            FakeAuthenticator::with(&[
-                Answer::Challenge(b"challenge!".to_vec()),
-                Answer::Authenticate(Vec::new()),
-            ]),
         );
 
-        session.do_work(1, &mut NoPublications);
-        session.do_work(1, &mut NoPublications);
-        session.do_work(201, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(201, &mut NoPublications, &mut authenticator);
 
         assert_eq!(session.state(), State::Challenged);
         assert_eq!(
@@ -1237,7 +1217,7 @@ mod tests {
         session.attempt_to_activate();
         assert_eq!(session.state(), State::Challenged);
 
-        session.on_challenge_response(99, b"answer", 300, &mut NoPublications);
+        session.on_challenge_response(99, b"answer", 300, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -1253,6 +1233,7 @@ mod tests {
         };
         egress.ready = true;
 
+        let mut authenticator = FakeAuthenticator::with(&[Answer::Reject]);
         let mut session = ControlSession::new(
             1,
             42,
@@ -1263,16 +1244,15 @@ mod tests {
             1_000,
             0,
             egress,
-            FakeAuthenticator::with(&[Answer::Reject]),
         );
 
-        session.do_work(1, &mut NoPublications);
-        session.do_work(1, &mut NoPublications);
-        session.do_work(201, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(201, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Rejected);
 
         let sent = session.egress.offered.len();
-        session.do_work(402, &mut NoPublications);
+        session.do_work(402, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), sent + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1298,6 +1278,7 @@ mod tests {
         };
         egress.ready = true;
 
+        let mut authenticator = FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]);
         let mut session = ControlSession::new(
             1,
             42,
@@ -1308,12 +1289,11 @@ mod tests {
             1_000,
             0,
             egress,
-            FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
-        session.do_work(1, &mut NoPublications);
-        session.do_work(1, &mut NoPublications);
-        session.do_work(201, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(201, &mut NoPublications, &mut authenticator);
 
         assert_eq!(
             session.egress.offered.last(),
@@ -1327,7 +1307,7 @@ mod tests {
             "the authenticator is not consulted at all"
         );
         assert_eq!(
-            session.authenticator.connect_requests, 0,
+            authenticator.connect_requests, 0,
             "and it was never offered a connect request"
         );
 
@@ -1337,7 +1317,7 @@ mod tests {
 
     #[test]
     fn a_response_queued_behind_another_is_not_offered_out_of_order() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
         // The connect answer is already in the list; what is being watched is
         // what these two turns send.
         let before = session.egress.offered.len();
@@ -1355,11 +1335,11 @@ mod tests {
         // liveness ping shares this list, so the assertion is about the
         // responses.
         session.egress.refuse_offers = false;
-        session.do_work(1_001, &mut NoPublications);
+        session.do_work(1_001, &mut NoPublications, &mut authenticator);
         assert_eq!(correlations(&session.egress.offered[before..]), vec![10]);
         assert_eq!(session.sync_responses.len(), 1);
 
-        session.do_work(1_002, &mut NoPublications);
+        session.do_work(1_002, &mut NoPublications, &mut authenticator);
         assert_eq!(
             correlations(&session.egress.offered[before..]),
             vec![10, 11]
@@ -1380,7 +1360,7 @@ mod tests {
 
     #[test]
     fn the_activity_deadline_is_armed_by_a_pending_response_and_cleared_by_a_sent_one() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
         assert_eq!(session.activity_deadline_ms(), None, "nothing is owed");
 
         session.egress.refuse_offers = true;
@@ -1399,7 +1379,7 @@ mod tests {
         // A send that takes clears it, and the next pending one arms a fresh
         // one.
         session.egress.refuse_offers = false;
-        session.do_work(3_000, &mut NoPublications);
+        session.do_work(3_000, &mut NoPublications, &mut authenticator);
         assert_eq!(session.activity_deadline_ms(), None);
 
         session.egress.refuse_offers = true;
@@ -1409,14 +1389,14 @@ mod tests {
 
     #[test]
     fn a_session_that_cannot_get_its_answer_out_is_aborted_in_the_references_words() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
         session.egress.refuse_offers = true;
         session.send_ok_response(10, 0, 1_000, &mut NoPublications);
 
         // The deadline is 6_000 and the session is ACTIVE, so the message is
         // the ACTIVE one — which does not say what the number is
         // (`ControlSession.java:217-221`).
-        session.do_work(6_001, &mut NoPublications);
+        session.do_work(6_001, &mut NoPublications, &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1427,6 +1407,7 @@ mod tests {
 
     #[test]
     fn a_session_that_never_connects_is_aborted_with_its_state_named() {
+        let mut authenticator = FakeAuthenticator::default();
         let mut session = ControlSession::new(
             1,
             42,
@@ -1437,14 +1418,13 @@ mod tests {
             1_000,
             0,
             FakeEgress::default(),
-            FakeAuthenticator::default(),
         );
 
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications, &mut authenticator);
         assert_eq!(session.state(), State::Init);
 
-        session.do_work(5_001, &mut NoPublications);
+        session.do_work(5_001, &mut NoPublications, &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1455,10 +1435,10 @@ mod tests {
 
     #[test]
     fn an_active_session_whose_publication_lost_its_subscriber_says_so() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
 
         session.egress.connected = false;
-        session.do_work(1_001, &mut NoPublications);
+        session.do_work(1_001, &mut NoPublications, &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(session.abort_reason(), Some(RESPONSE_NOT_CONNECTED_MSG));
@@ -1466,15 +1446,15 @@ mod tests {
 
     #[test]
     fn an_active_session_pings_on_its_liveness_interval() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
         let before = session.egress.offered.len();
 
         // The interval is a second and the session started at 0; nothing is
         // due yet.
-        session.do_work(500, &mut NoPublications);
+        session.do_work(500, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), before);
 
-        session.do_work(1_001, &mut NoPublications);
+        session.do_work(1_001, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1484,20 +1464,23 @@ mod tests {
         );
 
         // Once per interval, not once per turn.
-        session.do_work(1_500, &mut NoPublications);
+        session.do_work(1_500, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 1);
-        session.do_work(2_002, &mut NoPublications);
+        session.do_work(2_002, &mut NoPublications, &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 2);
     }
 
     #[test]
     fn a_done_session_does_nothing_more() {
-        let mut session = active_session();
+        let (mut session, mut authenticator) = active_session();
         session.abort(SESSION_CLOSED_MSG);
         assert!(session.is_done());
 
         let before = session.egress.offered.len();
-        assert_eq!(session.do_work(1_000, &mut NoPublications), 0);
+        assert_eq!(
+            session.do_work(1_000, &mut NoPublications, &mut authenticator),
+            0
+        );
         assert_eq!(session.egress.offered.len(), before);
 
         // A second reason is not taken over the first, except for a plain
@@ -1510,7 +1493,9 @@ mod tests {
 
     #[test]
     fn closing_gives_the_publication_back() {
-        let mut session = active_session();
+        // Closing asks the authenticator nothing, which is why it is dropped
+        // here rather than lent.
+        let (mut session, _) = active_session();
 
         session.close(&mut NoPublications);
 

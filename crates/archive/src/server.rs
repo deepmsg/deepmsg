@@ -7,6 +7,7 @@
 //! as the streams it records; cross-site movement goes through
 //! archive-to-archive replication.
 
+pub mod auth;
 pub mod config;
 pub mod control_adapter;
 pub mod control_session;

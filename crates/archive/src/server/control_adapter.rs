@@ -77,6 +77,7 @@ use deepmsg_codec::archive::{
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
 };
 
+use crate::server::auth::AuthorisationService;
 use crate::server::control_session::SESSION_CLOSED_MSG;
 
 /// How many fragments one subscription is read for in a turn
@@ -213,48 +214,6 @@ impl fmt::Display for ControlError {
 }
 
 impl std::error::Error for ControlError {}
-
-/// The reference's `AuthorisationService` (`AuthorisationService.java:24-59`):
-/// asked whether an authenticated session may perform an action.
-///
-/// The reference's signature carries a fourth parameter — an optional action
-/// *type*, which the cluster's admin requests use to say which kind of request
-/// they are (`AdminRequestType`). The archive passes `null` everywhere it calls
-/// this, and this slice has no cluster in it, so the parameter is left out
-/// rather than carried as an argument that is always `None`.
-pub trait AuthorisationService {
-    /// `isAuthorised(protocolId, actionId, type, encodedPrincipal)`, with the
-    /// protocol id a schema id and the action id a template id
-    /// (`ControlSessionAdapter.java:1207`).
-    fn is_authorised(
-        &self,
-        protocol_id: i32,
-        action_id: i32,
-        encoded_principal: Option<&[u8]>,
-    ) -> bool;
-}
-
-/// `AuthorisationService.ALLOW_ALL` (`AuthorisationService.java:29`), which is
-/// what the archive's default supplier builds
-/// (`Archive.java:610-611`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AllowAll;
-
-impl AuthorisationService for AllowAll {
-    fn is_authorised(&self, _: i32, _: i32, _: Option<&[u8]>) -> bool {
-        true
-    }
-}
-
-/// `AuthorisationService.DENY_ALL` (`AuthorisationService.java:34`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DenyAll;
-
-impl AuthorisationService for DenyAll {
-    fn is_authorised(&self, _: i32, _: i32, _: Option<&[u8]>) -> bool {
-        false
-    }
-}
 
 /// The archive's control plane, as the adapter uses it.
 ///
@@ -738,6 +697,8 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
+
+    use crate::server::auth::{AllowAll, DenyAll};
 
     use deepmsg_codec::archive::WriteBuf;
     use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestEncoder;
