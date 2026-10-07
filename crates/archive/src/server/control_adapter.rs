@@ -40,6 +40,13 @@
 //!   checker forces and nothing more: the adapter keeps each session's
 //!   **identity**, and [`ControlPlane`] is asked for everything that has to
 //!   touch the session itself.
+//!
+//!   That is also why the control plane is **lent per call** rather than held.
+//!   The reference hands its conductor to the adapter's constructor and the
+//!   conductor keeps the adapter (`ArchiveConductor.java:242-243`) — one
+//!   object reachable from the other both ways, which is free in Java and
+//!   impossible for a value. The client's publication side gets the same
+//!   treatment for the same reason.
 //! * **The image is identified by what the driver assigned it.** The reference
 //!   compares `Image` *objects*; this build's `Image` is borrowed from the
 //!   subscription for the length of a poll and cannot be held. [`ImageId`] is
@@ -223,6 +230,10 @@ impl std::error::Error for ControlError {}
 /// [`crate::server::control_session::ControlSession`] for the one reason the
 /// module note gives: the sessions live with the conductor, and the adapter has
 /// their ids.
+///
+/// **It is lent per call**, not held — see the module note. A caller therefore
+/// passes the same control plane to [`ControlAdapter::poll`] and to
+/// [`ControlAdapter::on_message`] every turn, and may use it in between.
 pub trait ControlPlane {
     /// A connect request, which is the only request that makes a session
     /// (`ControlSessionAdapter.java:766-802`). Answers with the id the client
@@ -274,15 +285,16 @@ pub trait ControlPlane {
 
 /// The fragments of a client's control requests, and the sessions they belong
 /// to.
-pub struct ControlAdapter<C: ControlPlane, A: AuthorisationService> {
+pub struct ControlAdapter<A: AuthorisationService> {
     /// The control subscription, absent when `aeron.archive.control.channel
     /// .enabled` is false (`ArchiveConductor.java:227-237`).
     remote_subscription_id: Option<i64>,
     /// The local one, which is always there (`:239-240`).
     local_subscription_id: i64,
-    /// What a dispatched request is handed to.
-    control: C,
     /// Who decides whether a request may be performed at all.
+    ///
+    /// The reference hands this to the adapter's constructor and nothing else
+    /// (`:243`), so it is the one collaborator the adapter does own.
     authorisation: A,
 
     /// `controlSessionByIdMap` (`ControlSessionAdapter.java:88`), holding the
@@ -306,18 +318,16 @@ pub struct ControlAdapter<C: ControlPlane, A: AuthorisationService> {
     images: Vec<ImageId>,
 }
 
-impl<C: ControlPlane, A: AuthorisationService> ControlAdapter<C, A> {
+impl<A: AuthorisationService> ControlAdapter<A> {
     /// An adapter over two subscriptions, one of which may not exist.
     pub fn new(
         remote_subscription_id: Option<i64>,
         local_subscription_id: i64,
-        control: C,
         authorisation: A,
     ) -> Self {
         Self {
             remote_subscription_id,
             local_subscription_id,
-            control,
             authorisation,
             sessions: HashMap::new(),
             assembler: FragmentAssembler::new(),
@@ -338,23 +348,29 @@ impl<C: ControlPlane, A: AuthorisationService> ControlAdapter<C, A> {
     /// [`ControlError`] for a message the archive will not read. The reference
     /// throws from here, so a turn that fails is a turn the caller should not
     /// continue past.
-    pub fn poll(&mut self, client: &mut Client, now_ms: i64) -> Result<usize, ControlError> {
+    pub fn poll<C: ControlPlane>(
+        &mut self,
+        client: &mut Client,
+        control: &mut C,
+        now_ms: i64,
+    ) -> Result<usize, ControlError> {
         let mut fragments = 0;
 
         if let Some(subscription_id) = self.remote_subscription_id {
-            fragments += self.poll_subscription(client, subscription_id, now_ms)?;
+            fragments += self.poll_subscription(client, control, subscription_id, now_ms)?;
         }
 
-        fragments += self.poll_subscription(client, self.local_subscription_id, now_ms)?;
+        fragments += self.poll_subscription(client, control, self.local_subscription_id, now_ms)?;
 
         Ok(fragments)
     }
 
     /// Read one subscription's images for up to [`FRAGMENT_LIMIT`] fragments
     /// between them.
-    fn poll_subscription(
+    fn poll_subscription<C: ControlPlane>(
         &mut self,
         client: &mut Client,
+        control: &mut C,
         subscription_id: i64,
         now_ms: i64,
     ) -> Result<usize, ControlError> {
@@ -383,7 +399,6 @@ impl<C: ControlPlane, A: AuthorisationService> ControlAdapter<C, A> {
             images,
             assembler,
             sessions,
-            control,
             authorisation,
             ..
         } = self;
@@ -433,15 +448,15 @@ impl<C: ControlPlane, A: AuthorisationService> ControlAdapter<C, A> {
     /// # Errors
     ///
     /// [`ControlError`] for a message the archive will not read.
-    pub fn on_message(
+    pub fn on_message<C: ControlPlane>(
         &mut self,
+        control: &mut C,
         image: ImageId,
         message: Message<'_>,
         now_ms: i64,
     ) -> Result<(), ControlError> {
         let Self {
             sessions,
-            control,
             authorisation,
             ..
         } = self;
@@ -874,8 +889,11 @@ mod tests {
     }
 
     /// An adapter over a `Recorder`, with the authorisation service given.
-    fn adapter_with<A: AuthorisationService>(authorisation: A) -> ControlAdapter<Recorder, A> {
-        ControlAdapter::new(Some(7), 8, Recorder::default(), authorisation)
+    fn adapter_with<A: AuthorisationService>(authorisation: A) -> (ControlAdapter<A>, Recorder) {
+        (
+            ControlAdapter::new(Some(7), 8, authorisation),
+            Recorder::default(),
+        )
     }
 
     /// The message the tests dispatch, as the assembler would hand it over.
@@ -999,13 +1017,16 @@ mod tests {
     }
 
     /// Open a session on [`IMAGE`] and hand back its id.
-    fn an_open_session<A: AuthorisationService>(adapter: &mut ControlAdapter<Recorder, A>) -> i64 {
+    fn an_open_session<A: AuthorisationService>(
+        adapter: &mut ControlAdapter<A>,
+        control: &mut Recorder,
+    ) -> i64 {
         let connect = a_connect(1);
         adapter
-            .on_message(IMAGE, message(&connect), 0)
+            .on_message(control, IMAGE, message(&connect), 0)
             .expect("a connect is read");
 
-        let Call::NewSession { session_id, .. } = adapter.control.calls[0] else {
+        let Call::NewSession { session_id, .. } = control.calls[0] else {
             panic!("the connect did not make a session");
         };
 
@@ -1016,7 +1037,7 @@ mod tests {
     /// carried reaches the control plane (`ControlSessionAdapter.java:766-802`).
     #[test]
     fn a_connect_makes_a_session_from_what_it_carried() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
         let connect = auth_connect(
             17,
             21,
@@ -1027,7 +1048,7 @@ mod tests {
         );
 
         adapter
-            .on_message(IMAGE, message(&connect), 1_000)
+            .on_message(&mut control, IMAGE, message(&connect), 1_000)
             .expect("read");
 
         assert_eq!(
@@ -1041,10 +1062,10 @@ mod tests {
                 encoded_credentials: b"credentials".to_vec(),
                 client_info: "a client".to_owned(),
             }],
-            adapter.control.calls
+            control.calls
         );
         assert_eq!(Some(IMAGE), adapter.session_image(1));
-        assert!(adapter.control.warnings.is_empty());
+        assert!(control.warnings.is_empty());
     }
 
     /// An empty credentials blob and an absent client info are read as the
@@ -1052,11 +1073,11 @@ mod tests {
     /// var-data fields unconditionally (`ControlSessionAdapter.java:775-793`).
     #[test]
     fn a_connect_with_empty_var_data_is_still_read() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
         let connect = auth_connect(1, 20, 0x0001_0000, "aeron:ipc", &[], "");
 
         adapter
-            .on_message(IMAGE, message(&connect), 0)
+            .on_message(&mut control, IMAGE, message(&connect), 0)
             .expect("read");
 
         let Call::NewSession {
@@ -1064,9 +1085,9 @@ mod tests {
             client_info,
             response_channel,
             ..
-        } = &adapter.control.calls[0]
+        } = &control.calls[0]
         else {
-            panic!("not a connect: {:?}", adapter.control.calls);
+            panic!("not a connect: {:?}", control.calls);
         };
 
         assert!(encoded_credentials.is_empty());
@@ -1079,7 +1100,7 @@ mod tests {
     /// and what makes it fail the archive's version gate.
     #[test]
     fn an_absent_version_reads_as_zero() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
 
         let mut buffer = vec![0u8; 512];
         let length = {
@@ -1099,10 +1120,10 @@ mod tests {
         buffer.truncate(length);
 
         adapter
-            .on_message(IMAGE, message(&buffer), 0)
+            .on_message(&mut control, IMAGE, message(&buffer), 0)
             .expect("read");
 
-        let Call::NewSession { version, .. } = adapter.control.calls[0] else {
+        let Call::NewSession { version, .. } = control.calls[0] else {
             panic!("not a connect");
         };
         assert_eq!(0, version);
@@ -1112,17 +1133,17 @@ mod tests {
     /// of what a session does with one (`ControlSession.java:317-320`).
     #[test]
     fn a_keep_alive_reaches_the_session_it_names() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = keep_alive(session_id, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
         assert_eq!(
             vec![Call::KeepAlive { session_id }],
-            adapter.control.calls[1..],
+            control.calls[1..],
             "the connect is the first call"
         );
     }
@@ -1131,12 +1152,12 @@ mod tests {
     /// the id (`ControlSession.java:541-548`).
     #[test]
     fn an_archive_id_request_reaches_the_session() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = archive_id_request(session_id, 7);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
         assert_eq!(
@@ -1144,7 +1165,7 @@ mod tests {
                 session_id,
                 correlation_id: 7,
             }],
-            adapter.control.calls[1..]
+            control.calls[1..]
         );
     }
 
@@ -1152,12 +1173,12 @@ mod tests {
     /// (`ControlSessionAdapter.java:144-160`).
     #[test]
     fn a_close_ends_the_session_it_names() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = close_session(session_id);
         adapter
-            .on_message(IMAGE, message(&payload), 3_000)
+            .on_message(&mut control, IMAGE, message(&payload), 3_000)
             .expect("read");
 
         assert_eq!(
@@ -1165,7 +1186,7 @@ mod tests {
                 session_id,
                 reason: SESSION_CLOSED_MSG.to_owned(),
             }],
-            adapter.control.calls[1..]
+            control.calls[1..]
         );
     }
 
@@ -1174,17 +1195,17 @@ mod tests {
     /// (`ControlSessionAdapter.java:155-158`).
     #[test]
     fn a_close_from_another_image_is_ignored() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = close_session(session_id);
         adapter
-            .on_message(OTHER_IMAGE, message(&payload), 3_000)
+            .on_message(&mut control, OTHER_IMAGE, message(&payload), 3_000)
             .expect("read");
 
-        assert_eq!(1, adapter.control.calls.len(), "only the connect");
+        assert_eq!(1, control.calls.len(), "only the connect");
         assert_eq!(Some(IMAGE), adapter.session_image(session_id));
-        assert!(adapter.control.warnings.is_empty(), "and no word about it");
+        assert!(control.warnings.is_empty(), "and no word about it");
     }
 
     /// The first gate: a request that arrives on an image other than the one
@@ -1192,16 +1213,16 @@ mod tests {
     /// (`ControlSessionAdapter.java:1196-1203`).
     #[test]
     fn a_request_on_another_image_is_dropped_in_silence() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = keep_alive(session_id, 99);
         adapter
-            .on_message(OTHER_IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, OTHER_IMAGE, message(&payload), 2_000)
             .expect("read");
 
-        assert_eq!(1, adapter.control.calls.len(), "only the connect");
-        assert_warned_unauthorised(&adapter);
+        assert_eq!(1, control.calls.len(), "only the connect");
+        assert_warned_unauthorised(&control);
     }
 
     /// A request that names no session at all warns and is dropped — the
@@ -1209,19 +1230,19 @@ mod tests {
     /// request that never arrived (`ControlSessionAdapter.java:1219-1224`).
     #[test]
     fn a_request_for_an_unknown_session_is_dropped() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
 
         let payload = keep_alive(4_242, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
-        assert!(adapter.control.calls.is_empty());
-        assert_eq!(1, adapter.control.warnings.len());
+        assert!(control.calls.is_empty());
+        assert_eq!(1, control.warnings.len());
         assert!(
-            adapter.control.warnings[0].starts_with("control request for unknown session:"),
+            control.warnings[0].starts_with("control request for unknown session:"),
             "{:?}",
-            adapter.control.warnings
+            control.warnings
         );
     }
 
@@ -1230,12 +1251,12 @@ mod tests {
     /// (`ControlSessionAdapter.java:1205-1216`).
     #[test]
     fn a_denied_request_is_answered_with_the_error_the_reference_sends() {
-        let mut adapter = adapter_with(DenyAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = keep_alive(session_id, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
         assert_eq!(
@@ -1245,10 +1266,10 @@ mod tests {
                 relevant_id: i64::from(UNAUTHORISED_ACTION),
                 message: UNAUTHORISED_ACTION_MSG.to_owned(),
             }],
-            adapter.control.calls[1..],
+            control.calls[1..],
             "refused before it reached the session, and the refusal was sent"
         );
-        assert_warned_unauthorised(&adapter);
+        assert_warned_unauthorised(&control);
     }
 
     /// The authorisation service is asked about the **schema** and the
@@ -1257,14 +1278,14 @@ mod tests {
     /// (`ControlSessionAdapter.java:1206-1207`).
     #[test]
     fn the_authorisation_service_is_asked_about_the_template_and_the_principal() {
-        let mut adapter = adapter_with(Recording::default());
-        adapter.control.principal = Some(b"a principal".to_vec());
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(Recording::default());
+        control.principal = Some(b"a principal".to_vec());
+        let session_id = an_open_session(&mut adapter, &mut control);
         adapter.authorisation.calls.borrow_mut().clear();
 
         let payload = keep_alive(session_id, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
         assert_eq!(
@@ -1283,12 +1304,12 @@ mod tests {
     /// (`ControlSessionAdapter.java:804-833`).
     #[test]
     fn a_challenge_answer_is_not_gated() {
-        let mut adapter = adapter_with(DenyAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         let payload = challenge_answer(session_id, 5, b"an answer");
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
 
         assert_eq!(
@@ -1297,7 +1318,7 @@ mod tests {
                 correlation_id: 5,
                 encoded_credentials: b"an answer".to_vec(),
             }],
-            adapter.control.calls[1..]
+            control.calls[1..]
         );
     }
 
@@ -1306,13 +1327,13 @@ mod tests {
     /// on; this is the same statement as a value, one frame earlier.
     #[test]
     fn a_message_in_another_schema_is_refused() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
         let mut connect = a_connect(1);
         // `schemaId` is the third of the header's four fields.
         connect[4..6].copy_from_slice(&999u16.to_le_bytes());
 
         let error = adapter
-            .on_message(IMAGE, message(&connect), 0)
+            .on_message(&mut control, IMAGE, message(&connect), 0)
             .expect_err("refused");
 
         assert_eq!(
@@ -1322,17 +1343,17 @@ mod tests {
             },
             error
         );
-        assert!(adapter.control.calls.is_empty());
+        assert!(control.calls.is_empty());
     }
 
     /// A message too short to carry a header cannot name a schema, and reading
     /// one would index past the end of the buffer rather than throw.
     #[test]
     fn a_message_shorter_than_a_header_is_refused() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
 
         let error = adapter
-            .on_message(IMAGE, message(&[1, 2, 3]), 0)
+            .on_message(&mut control, IMAGE, message(&[1, 2, 3]), 0)
             .expect_err("refused");
 
         assert_eq!(ControlError::ShortMessage { length: 3 }, error);
@@ -1344,7 +1365,7 @@ mod tests {
     /// request nobody answers is a client timing out.
     #[test]
     fn a_template_this_slice_does_not_answer_is_named() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
 
         let mut buffer = vec![0u8; 128];
         let length = {
@@ -1362,15 +1383,15 @@ mod tests {
         buffer.truncate(length);
 
         adapter
-            .on_message(IMAGE, message(&buffer), 0)
+            .on_message(&mut control, IMAGE, message(&buffer), 0)
             .expect("read");
 
-        assert!(adapter.control.calls.is_empty());
-        assert_eq!(1, adapter.control.warnings.len());
+        assert!(control.calls.is_empty());
+        assert_eq!(1, control.warnings.len());
         assert!(
-            adapter.control.warnings[0].contains(&format!("templateId={START_RECORDING}")),
+            control.warnings[0].contains(&format!("templateId={START_RECORDING}")),
             "{:?}",
-            adapter.control.warnings
+            control.warnings
         );
     }
 
@@ -1379,8 +1400,8 @@ mod tests {
     /// (`ControlSessionAdapter.java:1150-1155`).
     #[test]
     fn forgetting_a_session_hands_back_its_image() {
-        let mut adapter = adapter_with(AllowAll);
-        let session_id = an_open_session(&mut adapter);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
 
         assert_eq!(Some(IMAGE), adapter.remove_session(session_id));
         assert_eq!(None, adapter.session_image(session_id));
@@ -1389,12 +1410,12 @@ mod tests {
         // And a request for it is now a request for an unknown session.
         let payload = keep_alive(session_id, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 2_000)
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
             .expect("read");
         assert!(
-            adapter.control.warnings[0].starts_with("control request for unknown session:"),
+            control.warnings[0].starts_with("control request for unknown session:"),
             "{:?}",
-            adapter.control.warnings
+            control.warnings
         );
     }
 
@@ -1404,14 +1425,14 @@ mod tests {
     /// (`ArchiveConductor.java:239-240`).
     #[test]
     fn two_images_are_two_sessions() {
-        let mut adapter = adapter_with(AllowAll);
+        let (mut adapter, mut control) = adapter_with(AllowAll);
 
         let connect = a_connect(1);
         adapter
-            .on_message(IMAGE, message(&connect), 0)
+            .on_message(&mut control, IMAGE, message(&connect), 0)
             .expect("read");
         adapter
-            .on_message(OTHER_IMAGE, message(&connect), 0)
+            .on_message(&mut control, OTHER_IMAGE, message(&connect), 0)
             .expect("read");
 
         assert_eq!(2, adapter.session_count());
@@ -1420,12 +1441,9 @@ mod tests {
 
         let payload = keep_alive(1, 99);
         adapter
-            .on_message(IMAGE, message(&payload), 1_000)
+            .on_message(&mut control, IMAGE, message(&payload), 1_000)
             .expect("read");
-        assert_eq!(
-            vec![Call::KeepAlive { session_id: 1 }],
-            adapter.control.calls[2..]
-        );
+        assert_eq!(vec![Call::KeepAlive { session_id: 1 }], control.calls[2..]);
     }
 
     fn archive_id_request(control_session_id: i64, correlation_id: i64) -> Vec<u8> {
@@ -1447,12 +1465,12 @@ mod tests {
 
     /// Both warnings in the gate are the reference's one line
     /// (`ControlSessionAdapter.java:1200-1202`, `:1209-1213`).
-    fn assert_warned_unauthorised<A: AuthorisationService>(adapter: &ControlAdapter<Recorder, A>) {
-        assert_eq!(1, adapter.control.warnings.len());
+    fn assert_warned_unauthorised(control: &Recorder) {
+        assert_eq!(1, control.warnings.len());
         assert!(
-            adapter.control.warnings[0].starts_with("unauthorised archive action="),
+            control.warnings[0].starts_with("unauthorised archive action="),
             "{:?}",
-            adapter.control.warnings
+            control.warnings
         );
     }
 }
