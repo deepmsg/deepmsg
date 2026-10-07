@@ -11,6 +11,11 @@ deepmsg-core = { path = "../core" }
 deepmsg-client = { path = "../client" }
 deepmsg-codec = { path = "../codec" }
 deepmsg-cnc = { path = "../cnc" }
+# For `deepmsg-archiving-media-driver` only: the reference's aggregate launcher
+# puts a media driver and an archive in one process (`ArchivingMediaDriver
+# .java:79-106`), so the binary that is that process needs both crates. The
+# library does not use it.
+deepmsg-driver = { path = "../driver" }
 
 [lints]
 workspace = true

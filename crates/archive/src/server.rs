@@ -6,3 +6,11 @@
 //! sources, LOCAL source location) and therefore must live on the same host
 //! as the streams it records; cross-site movement goes through
 //! archive-to-archive replication.
+
+pub mod auth;
+pub mod conductor;
+pub mod config;
+pub mod control_adapter;
+pub mod control_session;
+pub mod counters;
+pub mod response_proxy;
