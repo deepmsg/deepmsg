@@ -572,6 +572,44 @@ pub fn format_size(value: i32) -> String {
     value.to_string()
 }
 
+/// A byte count read back, as `SystemUtil.parseSize` and
+/// `aeron_parse_size64` (`aeron_parse_util.c:42-105`) read one.
+///
+/// Digits, then **at most one** `k`/`m`/`g`, and nothing after it is looked
+/// at: `1mb` is 1048576 bytes because the `b` is never reached
+/// (`aeron_parse_util.c:60-70`). The pair with [`format_size`] round-trips for
+/// everything `format_size` writes, which is what the archive's stripped
+/// channel builder needs — a client's `so-sndbuf=1m` has to come back as `1m`
+/// and not as nothing at all.
+///
+/// `None` for anything that does not begin with a digit, or that overflows an
+/// `i32` — the width the URI's size parameters have.
+pub fn parse_size(text: &str) -> Option<i32> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut value: i64 = 0;
+
+    while let Some(digit) = bytes.get(index).filter(|byte| byte.is_ascii_digit()) {
+        value = value
+            .checked_mul(10)?
+            .checked_add(i64::from(digit - b'0'))?;
+        index += 1;
+    }
+
+    if 0 == index {
+        return None;
+    }
+
+    let multiplier: i64 = match bytes.get(index) {
+        Some(b'k' | b'K') => 1024,
+        Some(b'm' | b'M') => 1024 * 1024,
+        Some(b'g' | b'G') => 1024 * 1024 * 1024,
+        _ => 1,
+    };
+
+    i32::try_from(value.checked_mul(multiplier)?).ok()
+}
+
 /// A duration in agrona's canonical spelling (`SystemUtil.formatDuration`).
 ///
 /// The same divisibility rule as [`format_size`], over seconds, milliseconds
