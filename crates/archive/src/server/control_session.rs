@@ -12,7 +12,7 @@
 //! (`ControlSession.java:64-67`):
 //!
 //! ```text
-//! INIT ──publication ready──► CONNECTING ──isConnected──► CONNECTED
+//! INIT ──publication *and* counter──► CONNECTING ──isConnected──► CONNECTED
 //!                                                             │
 //!                        ┌────────── authenticator ───────────┤
 //!                        ▼                                    ▼
@@ -28,6 +28,23 @@
 //! `controlPublication.isConnected()`, which says a subscriber has attached to
 //! the response publication and nothing about the client having heard anything
 //! (`ControlSession.java:917`).
+//!
+//! # Leaving `INIT` takes two things, not one
+//!
+//! The response publication **and** the session's counter: the reference will
+//! not move on until `null != controlPublication && null != sessionCounter`
+//! (`ControlSession.java:895`), and the counter is the session's own. It is
+//! allocated by the conductor, because that is where the archive asks the
+//! driver for things (`ArchiveConductor.java:493-498`), and handed over with
+//! [`ControlSession::set_counter`]; from there the session owns all four of its
+//! steps — claim it once the driver has answered (`:890-893`), bind it when
+//! both are in hand (`:898-903`), and give it back when the session goes
+//! (`:176-183`).
+//!
+//! The values region travels with the call, as the client does, because the
+//! bind is a write the archive makes to its own mapping of the CnC file: a
+//! counter is a slot in shared memory, and a session cannot hold a window into
+//! a file that a conductor also owns.
 //!
 //! # The deadline
 //!
@@ -59,10 +76,13 @@ use std::fmt;
 use std::time::Duration;
 
 use deepmsg_client::client::CommandError;
+use deepmsg_cnc::counters::CountersReader;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
+use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::logbuffer::append::Appended;
 
 use crate::server::auth::Authenticator;
+use crate::server::counters::{ControlSessionCounter, Counters};
 
 /// Where a session is (`ControlSession.java:64-67`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +321,15 @@ pub trait Egress {
     /// `revokeOnClose()` and close, which is what a session's close does first
     /// (`ControlSession.java:163-174`).
     fn close_publication<P: Publications>(&mut self, publications: &mut P);
+
+    /// `controlPublication.registrationId()`, the other half of what a
+    /// session's counter is bound to (`ControlSession.java:898-902`).
+    ///
+    /// `None` until the publication is in hand, which is the same moment
+    /// [`Egress::is_publication_ready`] starts answering `true` — the reference
+    /// keeps the id in the same field until the object arrives and then reads
+    /// it off the object (`:883-887`), and this build keeps it throughout.
+    fn publication_registration_id(&self) -> Option<i64>;
 }
 
 /// What an authenticator decided, as the reference's `SessionProxy` would have
@@ -341,6 +370,14 @@ pub struct ControlSession<E: Egress> {
 
     state: State,
     egress: E,
+
+    /// The session's own counter, once the conductor has allocated it
+    /// (`ArchiveConductor.java:493-498`). `None` for the turns between the
+    /// session being made and the conductor reaching it, and in a conductor
+    /// that keeps no counters at all — the session simply will not leave
+    /// `INIT` without one, which is what the reference's `null !=
+    /// sessionCounter` says (`ControlSession.java:895`).
+    counter: Option<ControlSessionCounter>,
 
     /// `NULL_VALUE` in the reference; the deadline is the one place its
     /// sentinel is load-bearing, so it is an `Option` here.
@@ -394,6 +431,7 @@ impl<E: Egress> ControlSession<E> {
             liveness_check_interval_ms,
             state: State::Init,
             egress,
+            counter: None,
             activity_deadline_ms: Some(now_ms + connect_timeout_ms),
             resend_deadline_ms: 0,
             liveness_check_deadline_ms: now_ms + liveness_check_interval_ms,
@@ -406,6 +444,21 @@ impl<E: Egress> ControlSession<E> {
     /// The id this session is known by.
     pub const fn session_id(&self) -> i64 {
         self.session_id
+    }
+
+    /// Hand the session its counter, which the conductor allocated
+    /// (`ArchiveConductor.java:493-498`).
+    ///
+    /// Called once, before the session is driven: the registration id exists
+    /// from the moment the driver is asked, so a session that never gets one is
+    /// a session the archive chose not to count.
+    pub fn set_counter(&mut self, counter: ControlSessionCounter) {
+        self.counter = Some(counter);
+    }
+
+    /// The counter this session is counted by, if it has been given one.
+    pub const fn counter(&self) -> Option<&ControlSessionCounter> {
+        self.counter.as_ref()
     }
 
     /// Where it is.
@@ -449,10 +502,11 @@ impl<E: Egress> ControlSession<E> {
     /// One turn (`ControlSession.java:212-271`).
     ///
     /// Returns the work done, for the cycle counter.
-    pub fn do_work<P: Publications, A: Authenticator + ?Sized>(
+    pub fn do_work<P: Publications + Counters, A: Authenticator + ?Sized>(
         &mut self,
         now_ms: i64,
         publications: &mut P,
+        counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut A,
     ) -> usize {
         let mut work = 0;
@@ -477,7 +531,7 @@ impl<E: Egress> ControlSession<E> {
         }
 
         work += match self.state {
-            State::Init => self.init(publications),
+            State::Init => self.init(publications, counters),
             State::Connecting => self.wait_for_connection(publications),
             State::Connected => self.send_connect_response(now_ms, publications, authenticator),
             State::Challenged => {
@@ -567,21 +621,39 @@ impl<E: Egress> ControlSession<E> {
         );
     }
 
-    /// Give the publication back (`ControlSession.java:163-174`). Closing the
-    /// session's counter and telling the adapter belong to the conductor and
-    /// the counters.
-    pub fn close<P: Publications>(&mut self, publications: &mut P) {
+    /// Give the publication and the counter back (`ControlSession.java:163-183`).
+    ///
+    /// The reference's two arms for the counter — close the one it holds, or
+    /// `asyncRemoveCounter` the registration id it never got one for — are one
+    /// call here, because this client's counter removal covers both and neither
+    /// waits for the driver (`ControlSession.close` is async on both arms).
+    /// Telling the adapter belongs to the conductor.
+    pub fn close<P: Publications + Counters>(&mut self, publications: &mut P) {
         self.egress.close_publication(publications);
+
+        if let Some(counter) = &mut self.counter {
+            // Nothing to do about a failure: the session is going, and the
+            // reference cannot fail here either — its `asyncRemoveCounter` is a
+            // command into a ring.
+            let _ = counter.release(publications);
+        }
+
         self.sync_responses.clear();
     }
 
-    /// `INIT`: ask for the response publication, and take it up when the driver
-    /// answers (`ControlSession.java:855-911`).
+    /// `INIT`: take up the response publication **and** the counter, then move
+    /// on (`ControlSession.java:855-911`).
     ///
-    /// The session's own counter is allocated and bound to this publication by
-    /// the conductor (`ArchiveConductor.java:493-498`), and belongs to the
-    /// counters module.
-    fn init<P: Publications>(&mut self, publications: &mut P) -> usize {
+    /// The two are asked about in the reference's order — the publication
+    /// first, because that is what `init` is mostly about, and the counter
+    /// second — but the move to `CONNECTING` is gated on both (`:895`). Only
+    /// the bind needs the values region; a session with no counter at all skips
+    /// both counter steps and behaves as this build did before there were any.
+    fn init<P: Publications + Counters>(
+        &mut self,
+        publications: &mut P,
+        counters: &CountersReader<'_, ReadWrite>,
+    ) -> usize {
         if !self.egress.is_publication_ready(publications) {
             // The reference forgets the registration id here and asks again
             // next turn (`:874-881`), which is what makes a slow driver answer
@@ -598,6 +670,39 @@ impl<E: Egress> ControlSession<E> {
                 self.abort(error.message());
             }
 
+            return 1;
+        }
+
+        // `sessionCounter = aeron.getCounter(regId)` (`:890-893`). "Not yet" is
+        // not a failure and not a move: the reference stays in `INIT` and asks
+        // again next turn, which is also what a client with a slow driver sees
+        // — the same wait its connect timeout is there to bound.
+        let claim = match &mut self.counter {
+            Some(counter) => counter.claim(publications),
+            None => Ok(true),
+        };
+
+        match claim {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(error) => {
+                self.abort(&format!("the session counter was refused: {error}"));
+                return 1;
+            }
+        }
+
+        // Both in hand. The reference binds here, in the same `if` that moves
+        // the state, so a counter is never left holding a session id and no
+        // publication to point at (`:898-903`). A slot that has gone missing
+        // since the claim is the one way this can fail, and it is the
+        // reference's throw out of `setRelease`.
+        let bound = match (&self.counter, self.egress.publication_registration_id()) {
+            (Some(counter), Some(publication)) => counter.bind(counters, publication).is_some(),
+            _ => false,
+        };
+
+        if !bound && self.counter.is_some() {
+            self.abort("the session counter could not be bound to the response publication");
             return 1;
         }
 
@@ -871,6 +976,11 @@ const SESSION_REJECTED_MSG: &str = "authentication rejected";
 mod tests {
     use super::*;
 
+    use deepmsg_client::client::AsyncAddPoll;
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    use crate::server::counters::CounterError;
+
     /// An egress that records what it was asked to send, and can be told
     /// whether the publication exists and has a subscriber.
     #[derive(Default)]
@@ -926,17 +1036,170 @@ mod tests {
         fn close_publication<P: Publications>(&mut self, _publications: &mut P) {
             self.closed = true;
         }
+
+        fn publication_registration_id(&self) -> Option<i64> {
+            self.ready.then_some(PUBLICATION_REGISTRATION_ID)
+        }
     }
 
-    /// The publications a session's egress writes through.
-    ///
-    /// The fake egress *is* the publication as far as a session can see, so
-    /// nothing ever reaches this — which is why every method here is a panic
-    /// rather than a plausible answer: a test that got here would be testing
-    /// something other than what it meant to.
-    struct NoPublications;
+    /// What the fake egress answers [`Egress::publication_registration_id`]
+    /// with — the id a session's counter is bound to.
+    const PUBLICATION_REGISTRATION_ID: i64 = 31_337;
 
-    impl Publications for NoPublications {
+    /// A counter values region, leaked so it can be handed to `do_work` for the
+    /// length of a call.
+    ///
+    /// Aligned by the wrapper rather than by the allocation, which is the same
+    /// thing `deepmsg-cnc`'s own counter tests do one lifetime shorter. The
+    /// metadata half describes no counters: the tests that care what a bind
+    /// wrote read the value, and the reference id's offset is pinned in
+    /// `counters.rs`.
+    fn counters_region() -> CountersReader<'static, ReadWrite> {
+        #[repr(align(64))]
+        struct Region([u8; 32 * 128]);
+
+        let metadata: &'static mut Region = Box::leak(Box::new(Region([0; 32 * 128])));
+        let values: &'static mut Region = Box::leak(Box::new(Region([0; 32 * 128])));
+
+        CountersReader::new(
+            AtomicBuffer::from_slice_mut(&mut metadata.0).expect("aligned region"),
+            AtomicBuffer::from_slice_mut(&mut values.0).expect("aligned region"),
+        )
+    }
+
+    /// A client that has the counter the session is waiting for, and answers
+    /// the questions the fake egress does not.
+    ///
+    /// The publication side still panics: these tests are about the counter
+    /// half of `INIT`, and a session that reached the client for a publication
+    /// would have gone somewhere the test did not mean.
+    #[derive(Default)]
+    struct FakeClient {
+        /// Whether the driver has answered the `ADD_COUNTER`.
+        ready: bool,
+        /// Whether it answered by refusing, which it can.
+        refused: bool,
+        /// The slot it answered with.
+        slot: i32,
+        registration_id: i64,
+        released: Vec<i64>,
+    }
+
+    impl Counters for FakeClient {
+        fn add_counter(
+            &mut self,
+            _type_id: i32,
+            _key: &[u8],
+            _label: &str,
+            _timeout: Duration,
+        ) -> Result<i32, CounterError> {
+            panic!("this session's counter is asked for asynchronously")
+        }
+
+        fn async_add_counter(
+            &mut self,
+            _type_id: i32,
+            _key: &[u8],
+            _label: &str,
+            _timeout: Duration,
+        ) -> Result<i64, CounterError> {
+            Ok(self.registration_id)
+        }
+
+        fn poll_counter(&mut self, _registration_id: i64) -> AsyncAddPoll {
+            match (self.refused, self.ready) {
+                (true, _) => AsyncAddPoll::Failed(CommandError::Encoding),
+                (false, true) => AsyncAddPoll::Ready,
+                (false, false) => AsyncAddPoll::Awaiting,
+            }
+        }
+
+        fn counter_id(&self, _registration_id: i64) -> Option<i32> {
+            self.ready.then_some(self.slot)
+        }
+
+        fn release_counter(&mut self, registration_id: i64) -> Result<(), CounterError> {
+            self.released.push(registration_id);
+            Ok(())
+        }
+    }
+
+    impl Publications for FakeClient {
+        fn async_add_exclusive_publication(
+            &mut self,
+            _channel: &str,
+            _stream_id: i32,
+            _timeout: Duration,
+        ) -> Result<i64, CommandError> {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> bool {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn is_exclusive_connected(&self, _registration_id: i64) -> bool {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn max_payload_length(&self, _registration_id: i64) -> usize {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn offer_exclusive(&mut self, _registration_id: i64, _payload: &[u8]) -> Option<Appended> {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn release_exclusive(&mut self, _registration_id: i64, _timeout: Duration) {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+    }
+
+    /// The client a session's egress writes through, and the driver it would
+    /// ask for a counter.
+    ///
+    /// The fake egress *is* the publication and the counter as far as a session
+    /// can see, so nothing ever reaches this — which is why every method here
+    /// is a panic rather than a plausible answer: a test that got here would be
+    /// testing something other than what it meant to. The counter tests swap in
+    /// [`FakeClient`], which answers instead.
+    struct NoClient;
+
+    impl Counters for NoClient {
+        fn add_counter(
+            &mut self,
+            _type_id: i32,
+            _key: &[u8],
+            _label: &str,
+            _timeout: Duration,
+        ) -> Result<i32, CounterError> {
+            panic!("the fake egress is the counter; nothing asks the client")
+        }
+
+        fn async_add_counter(
+            &mut self,
+            _type_id: i32,
+            _key: &[u8],
+            _label: &str,
+            _timeout: Duration,
+        ) -> Result<i64, CounterError> {
+            panic!("the fake egress is the counter; nothing asks the client")
+        }
+
+        fn poll_counter(&mut self, _registration_id: i64) -> AsyncAddPoll {
+            panic!("the fake egress is the counter; nothing asks the client")
+        }
+
+        fn counter_id(&self, _registration_id: i64) -> Option<i32> {
+            panic!("the fake egress is the counter; nothing asks the client")
+        }
+
+        fn release_counter(&mut self, _registration_id: i64) -> Result<(), CounterError> {
+            panic!("the fake egress is the counter; nothing asks the client")
+        }
+    }
+
+    impl Publications for NoClient {
         fn async_add_exclusive_publication(
             &mut self,
             _channel: &str,
@@ -1036,11 +1299,11 @@ mod tests {
         );
 
         // INIT -> CONNECTING
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         // CONNECTING -> CONNECTED
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         // CONNECTED -> AUTHENTICATED, and the OK goes out
-        session.do_work(201, &mut NoPublications, &mut authenticator);
+        session.do_work(201, &mut NoClient, &counters_region(), &mut authenticator);
         session.attempt_to_activate();
 
         assert_eq!(session.state(), State::Active);
@@ -1066,23 +1329,23 @@ mod tests {
 
         // Nothing is ready yet, so the publication is asked for and INIT is
         // where it stays.
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Init);
 
         // The driver answers.
         session.egress.ready = true;
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Connecting);
 
         // ...and a subscriber attaches. That is the whole of CONNECTING's
         // question, so one turn is enough (`ControlSession.java:913-924`).
         session.egress.connected = true;
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Connected);
 
         // The authenticator is offered the session on the next turn, at the
         // first moment the resend interval allows.
-        session.do_work(201, &mut NoPublications, &mut authenticator);
+        session.do_work(201, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -1108,9 +1371,9 @@ mod tests {
         );
 
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(session.egress.publications_added.len(), 2);
         assert_eq!(
@@ -1141,9 +1404,9 @@ mod tests {
             egress,
         );
 
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         // The first answer went out with the transition: `authenticate`
@@ -1153,11 +1416,11 @@ mod tests {
 
         // Too soon: the interval runs from the turn that answered, which was
         // `now = 1`.
-        session.do_work(200, &mut NoPublications, &mut authenticator);
+        session.do_work(200, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), after_connect);
 
         // The interval has passed.
-        session.do_work(202, &mut NoPublications, &mut authenticator);
+        session.do_work(202, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), after_connect + 1);
 
         // And what it sends is an OK carrying the connect's correlation id and
@@ -1199,9 +1462,9 @@ mod tests {
             egress,
         );
 
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(201, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(201, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(session.state(), State::Challenged);
         assert_eq!(
@@ -1217,7 +1480,7 @@ mod tests {
         session.attempt_to_activate();
         assert_eq!(session.state(), State::Challenged);
 
-        session.on_challenge_response(99, b"answer", 300, &mut NoPublications, &mut authenticator);
+        session.on_challenge_response(99, b"answer", 300, &mut NoClient, &mut authenticator);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -1246,13 +1509,13 @@ mod tests {
             egress,
         );
 
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(201, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(201, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Rejected);
 
         let sent = session.egress.offered.len();
-        session.do_work(402, &mut NoPublications, &mut authenticator);
+        session.do_work(402, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), sent + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1291,9 +1554,9 @@ mod tests {
             egress,
         );
 
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(1, &mut NoPublications, &mut authenticator);
-        session.do_work(201, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
+        session.do_work(201, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(
             session.egress.offered.last(),
@@ -1326,8 +1589,8 @@ mod tests {
         // way the ordering rule has anything to order
         // (`ControlSession.java:721-726`).
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
-        session.send_ok_response(11, 0, 1_000, &mut NoPublications);
+        session.send_ok_response(10, 0, 1_000, &mut NoClient);
+        session.send_ok_response(11, 0, 1_000, &mut NoClient);
 
         assert_eq!(session.sync_responses.len(), 2, "both are owed");
 
@@ -1335,11 +1598,11 @@ mod tests {
         // liveness ping shares this list, so the assertion is about the
         // responses.
         session.egress.refuse_offers = false;
-        session.do_work(1_001, &mut NoPublications, &mut authenticator);
+        session.do_work(1_001, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(correlations(&session.egress.offered[before..]), vec![10]);
         assert_eq!(session.sync_responses.len(), 1);
 
-        session.do_work(1_002, &mut NoPublications, &mut authenticator);
+        session.do_work(1_002, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(
             correlations(&session.egress.offered[before..]),
             vec![10, 11]
@@ -1364,7 +1627,7 @@ mod tests {
         assert_eq!(session.activity_deadline_ms(), None, "nothing is owed");
 
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
+        session.send_ok_response(10, 0, 1_000, &mut NoClient);
 
         assert_eq!(
             session.activity_deadline_ms(),
@@ -1373,17 +1636,17 @@ mod tests {
         );
 
         // Arming again does not push it out (`ControlSession.java:1064-1067`).
-        session.send_ok_response(11, 0, 2_000, &mut NoPublications);
+        session.send_ok_response(11, 0, 2_000, &mut NoClient);
         assert_eq!(session.activity_deadline_ms(), Some(6_000));
 
         // A send that takes clears it, and the next pending one arms a fresh
         // one.
         session.egress.refuse_offers = false;
-        session.do_work(3_000, &mut NoPublications, &mut authenticator);
+        session.do_work(3_000, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.activity_deadline_ms(), None);
 
         session.egress.refuse_offers = true;
-        session.send_ok_response(12, 0, 4_000, &mut NoPublications);
+        session.send_ok_response(12, 0, 4_000, &mut NoClient);
         assert_eq!(session.activity_deadline_ms(), Some(9_000));
     }
 
@@ -1391,12 +1654,12 @@ mod tests {
     fn a_session_that_cannot_get_its_answer_out_is_aborted_in_the_references_words() {
         let (mut session, mut authenticator) = active_session();
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
+        session.send_ok_response(10, 0, 1_000, &mut NoClient);
 
         // The deadline is 6_000 and the session is ACTIVE, so the message is
         // the ACTIVE one — which does not say what the number is
         // (`ControlSession.java:217-221`).
-        session.do_work(6_001, &mut NoPublications, &mut authenticator);
+        session.do_work(6_001, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1421,10 +1684,10 @@ mod tests {
         );
 
         session.egress.ready = false;
-        session.do_work(1, &mut NoPublications, &mut authenticator);
+        session.do_work(1, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.state(), State::Init);
 
-        session.do_work(5_001, &mut NoPublications, &mut authenticator);
+        session.do_work(5_001, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1438,7 +1701,7 @@ mod tests {
         let (mut session, mut authenticator) = active_session();
 
         session.egress.connected = false;
-        session.do_work(1_001, &mut NoPublications, &mut authenticator);
+        session.do_work(1_001, &mut NoClient, &counters_region(), &mut authenticator);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(session.abort_reason(), Some(RESPONSE_NOT_CONNECTED_MSG));
@@ -1451,10 +1714,10 @@ mod tests {
 
         // The interval is a second and the session started at 0; nothing is
         // due yet.
-        session.do_work(500, &mut NoPublications, &mut authenticator);
+        session.do_work(500, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), before);
 
-        session.do_work(1_001, &mut NoPublications, &mut authenticator);
+        session.do_work(1_001, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1464,9 +1727,9 @@ mod tests {
         );
 
         // Once per interval, not once per turn.
-        session.do_work(1_500, &mut NoPublications, &mut authenticator);
+        session.do_work(1_500, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 1);
-        session.do_work(2_002, &mut NoPublications, &mut authenticator);
+        session.do_work(2_002, &mut NoClient, &counters_region(), &mut authenticator);
         assert_eq!(session.egress.offered.len(), before + 2);
     }
 
@@ -1478,7 +1741,7 @@ mod tests {
 
         let before = session.egress.offered.len();
         assert_eq!(
-            session.do_work(1_000, &mut NoPublications, &mut authenticator),
+            session.do_work(1_000, &mut NoClient, &counters_region(), &mut authenticator),
             0
         );
         assert_eq!(session.egress.offered.len(), before);
@@ -1497,9 +1760,157 @@ mod tests {
         // here rather than lent.
         let (mut session, _) = active_session();
 
-        session.close(&mut NoPublications);
+        session.close(&mut NoClient);
 
         assert!(session.egress.closed);
         assert!(session.sync_responses.is_empty());
+    }
+
+    /// The egress a session has when its response publication is there and has
+    /// a subscriber.
+    fn ready_egress() -> FakeEgress {
+        FakeEgress {
+            ready: true,
+            connected: true,
+            ..FakeEgress::default()
+        }
+    }
+
+    /// A session that has been given a counter, and the client it will claim it
+    /// through.
+    fn session_with_counter(client: &mut FakeClient) -> ControlSession<FakeEgress> {
+        let counter = ControlSessionCounter::allocate(client, 42, 7, "", Duration::from_secs(5))
+            .expect("the add was written");
+
+        let mut session = ControlSession::new(
+            7,
+            42,
+            "aeron:ipc".to_owned(),
+            20,
+            None,
+            5_000,
+            1_000,
+            0,
+            ready_egress(),
+        );
+        session.set_counter(counter);
+
+        session
+    }
+
+    /// The counter is the second half of leaving `INIT`
+    /// (`ControlSession.java:895`), and the half that is easy to lose: the
+    /// publication being there is not enough.
+    #[test]
+    fn a_counted_session_waits_for_its_counter() {
+        let counters = counters_region();
+        let mut client = FakeClient {
+            registration_id: 5,
+            slot: 3,
+            ..FakeClient::default()
+        };
+        let mut session = session_with_counter(&mut client);
+        let mut authenticator = FakeAuthenticator::default();
+
+        assert_eq!(State::Init, session.state());
+        assert_eq!(
+            0,
+            session.do_work(1, &mut client, &counters, &mut authenticator),
+            "the driver has not answered"
+        );
+        assert_eq!(
+            State::Init,
+            session.state(),
+            "the publication is in hand and that is not enough"
+        );
+        assert_eq!(
+            Some(0),
+            counters.value(3),
+            "nothing is bound yet — the slot reads what the bind has not written"
+        );
+
+        client.ready = true;
+
+        assert_eq!(
+            1,
+            session.do_work(1, &mut client, &counters, &mut authenticator)
+        );
+        assert_eq!(State::Connecting, session.state());
+        assert_eq!(
+            Some(7),
+            counters.value(3),
+            "the counter holds the session id, as setRelease does"
+        );
+    }
+
+    /// A counter that can never arrive is not a counter that has not arrived
+    /// yet: waiting it out would burn the whole connect timeout on something
+    /// that is not coming.
+    #[test]
+    fn a_refused_counter_aborts_the_session() {
+        let counters = counters_region();
+        let mut client = FakeClient {
+            registration_id: 5,
+            refused: true,
+            ..FakeClient::default()
+        };
+        let mut session = session_with_counter(&mut client);
+        let mut authenticator = FakeAuthenticator::default();
+
+        assert_eq!(
+            1,
+            session.do_work(1, &mut client, &counters, &mut authenticator)
+        );
+        assert_eq!(State::Done, session.state());
+        assert!(
+            session
+                .abort_reason()
+                .is_some_and(|reason| reason.contains("counter")),
+            "the reason names what was refused: {:?}",
+            session.abort_reason()
+        );
+    }
+
+    /// A session with no counter at all is not held back — the reference's
+    /// `null != sessionCounter` is a gate only when there is something to wait
+    /// for, and a conductor that keeps no counters still connects its clients.
+    #[test]
+    fn a_session_with_no_counter_is_not_held_back() {
+        let counters = counters_region();
+        let mut client = FakeClient::default();
+        let mut session = ControlSession::new(
+            7,
+            42,
+            "aeron:ipc".to_owned(),
+            20,
+            None,
+            5_000,
+            1_000,
+            0,
+            ready_egress(),
+        );
+        let mut authenticator = FakeAuthenticator::default();
+
+        assert!(session.counter().is_none());
+        assert_eq!(
+            1,
+            session.do_work(1, &mut client, &counters, &mut authenticator)
+        );
+        assert_eq!(State::Connecting, session.state());
+    }
+
+    /// `ControlSession.close` gives both back (`:163-183`).
+    #[test]
+    fn closing_gives_the_counter_back() {
+        let mut client = FakeClient {
+            registration_id: 5,
+            ..FakeClient::default()
+        };
+        let mut session = session_with_counter(&mut client);
+
+        session.close(&mut client);
+
+        assert_eq!(vec![5], client.released);
+        assert!(session.egress.closed);
     }
 }

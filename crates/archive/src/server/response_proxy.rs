@@ -180,6 +180,10 @@ impl Egress for ControlResponseProxy {
         }
     }
 
+    fn publication_registration_id(&self) -> Option<i64> {
+        self.publication()
+    }
+
     fn max_payload_length<P: Publications>(&self, publications: &P) -> usize {
         match self.publication {
             Publication::InHand(registration_id) => {
