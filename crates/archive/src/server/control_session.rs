@@ -429,10 +429,23 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     }
 
     /// Queue an ERROR (`ControlSession.java:692-701`).
-    pub fn send_error_response(&mut self, correlation_id: i64, message: &str, now_ms: i64) {
+    ///
+    /// The reference has two of these: one that names no relevant id and sends
+    /// its `GENERIC` — zero (`client/ArchiveException.java:29`) — and one that
+    /// carries whatever the caller says the error is about
+    /// (`:697-701`). A denial of an unauthorised action is the second kind and
+    /// says `UNAUTHORISED_ACTION` (`ControlSessionAdapter.java:1209-1211`), so
+    /// the id is a parameter here rather than a zero written in.
+    pub fn send_error_response(
+        &mut self,
+        correlation_id: i64,
+        relevant_id: i64,
+        message: &str,
+        now_ms: i64,
+    ) {
         self.send_response(
             correlation_id,
-            0,
+            relevant_id,
             ControlResponseCode::ERROR,
             Some(message.to_owned()),
             now_ms,

@@ -8,4 +8,5 @@
 //! archive-to-archive replication.
 
 pub mod config;
+pub mod control_adapter;
 pub mod control_session;
