@@ -106,7 +106,10 @@ use crate::server::control_adapter::{
 use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
 };
-use crate::server::counters::{ControlSessionCounter, ControlSessionsCounter, ErrorCounter};
+use crate::server::counters::{
+    ControlSessionCounter, ControlSessionsCounter, ErrorCounter, claim_control_sessions_counter,
+    request_control_sessions_counter,
+};
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
@@ -529,7 +532,10 @@ pub struct Sessions {
     /// reference's two writes are a release on creation and a release on
     /// removal, so the net of one turn is what the region has to move by.
     session_count_delta: i64,
-    /// The aggregate counter itself, allocated on the first turn
+    /// The aggregate counter's add, from the turn it was asked for until the
+    /// driver answers it.
+    session_counter_registration_id: Option<i64>,
+    /// The aggregate counter itself, taken up on the turn the driver answers
     /// (`Archive.java:1560-1561`).
     control_sessions: Option<ControlSessionsCounter>,
     /// Warnings the callbacks raised, for the conductor to log (`:443-446`).
@@ -560,6 +566,7 @@ impl Sessions {
             pending: Vec::new(),
             ended: Vec::new(),
             session_count_delta: 0,
+            session_counter_registration_id: None,
             control_sessions: None,
             warnings: Vec::new(),
         }
@@ -618,7 +625,15 @@ impl Sessions {
         self.apply_session_count_delta(counters);
     }
 
-    /// `ctx.controlSessionsCounter()`, allocated once (`Archive.java:1560-1561`).
+    /// `ctx.controlSessionsCounter()`, asked for once and taken up when the
+    /// driver answers (`Archive.java:1560-1561`).
+    ///
+    /// **Not** through `ControlSessionsCounter::allocate`, which blocks. This
+    /// runs inside `drive`, which the launcher calls inside the turn that
+    /// drives the driver, so a blocking command here waits for a driver nobody
+    /// is driving — the same seam the adapter's callbacks run into, one layer
+    /// down. The command goes out on one turn and the answer is read on a
+    /// later one, which is how the 113 already works.
     fn allocate_session_counter(
         &mut self,
         client: &mut Client,
@@ -628,16 +643,32 @@ impl Sessions {
             return;
         }
 
-        match ControlSessionsCounter::allocate(
-            client,
-            counters,
-            self.archive_id,
-            self.command_timeout,
-        ) {
-            Ok(counter) => self.control_sessions = Some(counter),
-            Err(error) => self.warnings.push(format!(
-                "could not allocate the archive control sessions counter: {error}"
-            )),
+        let Some(registration_id) = self.session_counter_registration_id else {
+            match request_control_sessions_counter(client, self.archive_id, self.command_timeout) {
+                Ok(registration_id) => {
+                    self.session_counter_registration_id = Some(registration_id);
+                }
+                Err(error) => self.warnings.push(format!(
+                    "could not ask for the archive control sessions counter: {error}"
+                )),
+            }
+            return;
+        };
+
+        match claim_control_sessions_counter(client, counters, registration_id) {
+            Ok(Some(counter)) => {
+                self.control_sessions = Some(counter);
+                self.session_counter_registration_id = None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // The driver refused it, which can never become a counter; the
+                // archive runs on without one rather than asking forever.
+                self.session_counter_registration_id = None;
+                self.warnings.push(format!(
+                    "could not allocate the archive control sessions counter: {error}"
+                ));
+            }
         }
     }
 
@@ -1091,6 +1122,15 @@ impl ArchiveConductor {
     /// How many control sessions are live.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Mark the archive as stopped in its mark file
+    /// (`ArchiveMarkFile.signalTerminated`, `:344-347`).
+    ///
+    /// That is the ready byte written back to `NULL_VALUE`, which is what tells
+    /// a reader that the process is gone rather than merely quiet.
+    pub fn signal_terminated(&self) {
+        let _ = self.mark_file.signal_terminated();
     }
 
     /// One turn (`ArchiveConductor.java:364-396`).

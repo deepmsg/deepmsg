@@ -228,6 +228,7 @@ dependencies = [
  "deepmsg-cnc",
  "deepmsg-codec",
  "deepmsg-core",
+ "deepmsg-driver",
 ]
 
 [[package]]

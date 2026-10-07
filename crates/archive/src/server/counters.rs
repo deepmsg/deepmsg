@@ -375,6 +375,78 @@ impl ControlSessionsCounter {
     }
 }
 
+/// Ask the driver for the archive's control-sessions counter, and do not wait
+/// for the answer.
+///
+/// [`ControlSessionsCounter::allocate`] sends the same command and blocks until
+/// the driver answers it. That is fine for a process that has a driver running
+/// on its own threads, and impossible for one that **is** the driver's loop: a
+/// conductor is driven inside the turn that drives the driver, so a blocking
+/// command waits for a driver nobody is driving, and the wait runs out against
+/// the driver's own heartbeat.
+///
+/// So the 102 is asked for the way the 113 already is — a command out, the
+/// answer read on a later turn — and the two halves are here rather than on the
+/// type because the key, the label and the type check are this module's
+/// knowledge, not the caller's.
+///
+/// # Errors
+///
+/// [`CounterError`] if the command could not be written or sent. The driver's
+/// own answer arrives through [`claim_control_sessions_counter`].
+pub fn request_control_sessions_counter<C: Counters>(
+    client: &mut C,
+    archive_id: i64,
+    timeout: Duration,
+) -> Result<i64, CounterError> {
+    let key = control_sessions_key(archive_id);
+    let label = control_sessions_label(archive_id);
+
+    client.async_add_counter(ARCHIVE_CONTROL_SESSIONS_TYPE_ID, &key, &label, timeout)
+}
+
+/// Take up the counter [`request_control_sessions_counter`] asked for, once the
+/// driver has allocated it.
+///
+/// `Ok(None)` means "not yet" rather than "no", exactly as
+/// [`ControlSessionCounter::claim`] does, and the type check is
+/// `validateCounterTypeId` (`Archive.java:1563`) — the reference throws rather
+/// than start an archive whose session count no tool can find.
+///
+/// # Errors
+///
+/// [`CounterError`] if the driver refused the add, if the counter it allocated
+/// is not a 102, or if its slot cannot be read back.
+pub fn claim_control_sessions_counter<C: Counters, Access>(
+    client: &mut C,
+    counters: &CountersReader<'_, Access>,
+    registration_id: i64,
+) -> Result<Option<ControlSessionsCounter>, CounterError> {
+    let counter_id = match client.poll_counter(registration_id) {
+        AsyncAddPoll::Ready => {
+            let Some(counter_id) = client.counter_id(registration_id) else {
+                return Ok(None);
+            };
+            counter_id
+        }
+        AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+        AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
+    };
+
+    match counters.get(counter_id) {
+        Some(descriptor) if descriptor.type_id == ARCHIVE_CONTROL_SESSIONS_TYPE_ID => {}
+        Some(descriptor) => {
+            return Err(CounterError::WrongTypeId {
+                expected: ARCHIVE_CONTROL_SESSIONS_TYPE_ID,
+                actual: descriptor.type_id,
+            });
+        }
+        None => return Err(CounterError::UnknownCounter { counter_id }),
+    }
+
+    Ok(Some(ControlSessionsCounter { counter_id }))
+}
+
 /// The 113 counter: one control session.
 ///
 /// Made when a session is (`ArchiveConductor.java:493-498`), bound when its
@@ -731,6 +803,41 @@ mod tests {
             }
         ));
         assert_eq!("counter has typeId=113, expected=102", error.to_string());
+    }
+
+    /// The 102 asked for and taken up on a later turn, which is the whole
+    /// reason it is not [`ControlSessionsCounter::allocate`]: that one blocks
+    /// on the driver, and a conductor runs *inside* the turn that drives the
+    /// driver, so the wait would run out against the driver's own heartbeat.
+    #[test]
+    fn the_session_count_is_asked_for_and_taken_up_later() {
+        let mut client = FakeCounters::default();
+        let mut meta = metadata(0, ARCHIVE_CONTROL_SESSIONS_TYPE_ID);
+        let mut vals = values(1);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        let registration_id =
+            request_control_sessions_counter(&mut client, ARCHIVE_ID, TIMEOUT).unwrap();
+
+        let (type_id, key, label) = client.only_add().clone();
+        assert_eq!(ARCHIVE_CONTROL_SESSIONS_TYPE_ID, type_id);
+        assert_eq!(control_sessions_key(ARCHIVE_ID).to_vec(), key);
+        assert_eq!(control_sessions_label(ARCHIVE_ID), label);
+
+        assert!(
+            claim_control_sessions_counter(&mut client, &counters, registration_id)
+                .unwrap()
+                .is_none(),
+            "the driver has not answered"
+        );
+
+        client.answer(registration_id, 0);
+
+        let counter = claim_control_sessions_counter(&mut client, &counters, registration_id)
+            .unwrap()
+            .expect("the driver has answered by now");
+
+        assert_eq!(0, counter.counter_id());
     }
 
     #[test]
