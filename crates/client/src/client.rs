@@ -382,6 +382,21 @@ impl AsyncAdd {
         }
     }
 
+    /// The same, for a counter — `ControlSessionCounter` in the reference's
+    /// archive, whose sessions keep the registration id their
+    /// `asyncAddCounter` drew across turns and put it back together to poll.
+    ///
+    /// The kind matters here rather than in the poll: a counter's removal is
+    /// `REMOVE_COUNTER`, which is neither of the two a publication's removal
+    /// can be, so a handle put together with the wrong kind would send a
+    /// command the driver would refuse.
+    pub const fn counter(registration_id: i64) -> Self {
+        Self {
+            registration_id,
+            resource: AsyncResource::Counter,
+        }
+    }
+
     /// The registration id the `ADD_*` drew — and the id the resource has, if
     /// it arrived.
     pub const fn registration_id(&self) -> i64 {

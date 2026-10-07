@@ -397,6 +397,32 @@ impl<'a> CountersReader<'a, ReadWrite> {
         self.values
             .store_i64_release(offset + layout::COUNTER_VALUE_OFFSET, value)
     }
+
+    /// Write a counter's `reference_id`.
+    ///
+    /// Relaxed, matching
+    /// [`CounterManager::set_reference_id`](crate::counter_manager::CounterManager::set_reference_id)
+    /// (`counter_manager.rs:313-324`, which is the manager's spelling of
+    /// `aeron_counters_manager.c:159-166`) — the field is not a position
+    /// anything synchronises on, and `CountersReader::describe` reads it back
+    /// with the same ordering this writes it.
+    ///
+    /// The field names *the other resource this counter is about*: an image's
+    /// registration id for a subscriber position, a control session's response
+    /// publication for an archive's session counter. It is here as well as on
+    /// the manager because the writer is often not the allocator — the archive
+    /// writes its control sessions' reference ids, having asked the driver for
+    /// those counters rather than allocating them itself
+    /// (`ControlSession.java:898-902`).
+    pub fn set_reference_id(&self, counter_id: i32, value: i64) -> Option<()> {
+        if counter_id < 0 || counter_id > self.max_counter_id {
+            return None;
+        }
+
+        let offset = counter_id as usize * layout::COUNTER_VALUE_LENGTH;
+        self.values
+            .store_i64_relaxed(offset + layout::COUNTER_REFERENCE_ID_OFFSET, value)
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +442,13 @@ mod tests {
 
         fn buffer(&self) -> AtomicBuffer<'_> {
             AtomicBuffer::from_slice(&self.0).expect("aligned region")
+        }
+
+        /// The same bytes, with the write half — what
+        /// [`CountersReader::set_value`] and [`CountersReader::set_reference_id`]
+        /// are built from.
+        fn buffer_mut(&mut self) -> AtomicBuffer<'_, ReadWrite> {
+            AtomicBuffer::from_slice_mut(&mut self.0).expect("aligned region")
         }
 
         fn put_i32(&mut self, offset: usize, v: i32) {
@@ -449,6 +482,14 @@ mod tests {
 
     fn reader_pair<'a>(metadata: &'a Region, values: &'a Region) -> CountersReader<'a> {
         CountersReader::new(metadata.buffer(), values.buffer())
+    }
+
+    /// The same pair with the write half, for the two stores that need it.
+    fn writer_pair<'a>(
+        metadata: &'a mut Region,
+        values: &'a mut Region,
+    ) -> CountersReader<'a, ReadWrite> {
+        CountersReader::new(metadata.buffer_mut(), values.buffer_mut())
     }
 
     /// Write a counter's registration id, which is what ties it to its owner.
@@ -873,5 +914,29 @@ mod tests {
             "",
             LocalSocketAddress::decode(&empty).expect("empty").address
         );
+    }
+
+    /// `set_reference_id` lands in the field `describe` reads it from, and
+    /// leaves the neighbours alone — the value record is one 128-byte slot and
+    /// three of its four fields are written by somebody else.
+    #[test]
+    fn a_reference_id_is_written_where_it_is_read_back() {
+        let mut metadata = Region::zeroed(2 * layout::COUNTER_METADATA_LENGTH);
+        let mut values = Region::zeroed(2 * layout::COUNTER_VALUE_LENGTH);
+
+        allocate(&mut metadata, 0, 113, "control-session");
+        set_value(&mut values, 0, 7_000);
+
+        let writer = writer_pair(&mut metadata, &mut values);
+        assert_eq!(Some(()), writer.set_reference_id(0, 42_424_242));
+
+        let descriptor = writer.describe(0, 0).expect("allocated");
+        assert_eq!(42_424_242, descriptor.reference_id);
+        assert_eq!(7_000, descriptor.value, "the value is left where it was");
+
+        // Out of range is `None` rather than a store past the region, which is
+        // also what the manager answers (`counter_manager.rs:447-453`).
+        assert_eq!(None, writer.set_reference_id(-1, 1));
+        assert_eq!(None, writer.set_reference_id(2, 1));
     }
 }
