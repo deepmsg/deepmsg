@@ -212,9 +212,26 @@ const CONNECT_TIMEOUT_DEFAULT_NS: i64 = 5 * 1_000_000_000;
 const SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS: i64 = 1_000_000_000;
 /// `Archive.java:597`.
 const AUTHENTICATOR_SUPPLIER_DEFAULT: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
-/// `Archive.java:610`.
-const AUTHORISATION_SERVICE_SUPPLIER_DEFAULT: &str =
-    "io.aeron.security.DefaultAuthorisationServiceSupplier";
+/// `Archive.java:610-611` — and this one is **not a class name**.
+///
+/// The two suppliers default differently, and the difference is in the
+/// reference rather than in this build. The authenticator's default is a class
+/// name, resolved through `Class.forName` (`:956-964`). The authorisation
+/// service's is a *supplier* — `DEFAULT_AUTHORISATION_SERVICE_SUPPLIER =
+/// () -> AuthorisationService.ALLOW_ALL` — and the property is read with no
+/// default at all, so an archive that does not set it gets the empty name and
+/// the built-in allow-all service (`:982-1002`):
+///
+/// ```text
+/// final String supplierClassName = System.getProperty(AUTHORISATION_SERVICE_SUPPLIER_PROP_NAME);
+/// if (Strings.isEmpty(supplierClassName)) { return DEFAULT_AUTHORISATION_SERVICE_SUPPLIER; }
+/// ```
+///
+/// Writing the lambda's *behaviour* here as though it were a class name is the
+/// mistake this constant used to make, and it is not a harmless one: nothing
+/// can build that supplier, so an archive with a default configuration refused
+/// to start.
+const AUTHORISATION_SERVICE_SUPPLIER_DEFAULT: &str = "";
 
 /// Everything an archive is told, resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,6 +614,25 @@ mod tests {
         );
         assert_eq!(config.archive_id, Some(42));
         assert!(!config.delete_dir_on_start);
+    }
+
+    /// A default-configured archive has to be able to *start*, so the two
+    /// names it hands its security collaborators have to be names this build
+    /// can build. Asserting the strings alone would not have caught the defect
+    /// this test was written for: the authorisation default used to be a class
+    /// name that nothing can instantiate, and the archive refused to start
+    /// with it.
+    #[test]
+    fn an_unconfigured_archive_can_build_its_security_collaborators() {
+        let config = ArchiveConfig::resolve(&archive_defaults()).expect("resolves");
+
+        assert_eq!("", config.authorisation_service_supplier);
+        assert!(
+            crate::server::auth::authorisation_service(&config.authorisation_service_supplier)
+                .is_ok(),
+            "an archive that cannot build this one cannot start at all"
+        );
+        assert!(crate::server::auth::authenticator(&config.authenticator_supplier).is_ok());
     }
 
     #[test]
