@@ -365,6 +365,23 @@ pub struct AsyncAdd {
 }
 
 impl AsyncAdd {
+    /// A handle on an `ADD_EXCLUSIVE_PUBLICATION` this client has already made,
+    /// from the registration id that add drew.
+    ///
+    /// For a caller that keeps the **id** across turns rather than the handle —
+    /// the archive's control sessions do, their publications outliving the call
+    /// that asked for them — and has to put it back together to ask
+    /// [`Client::async_add_poll`] what became of it. Every lookup a handle is
+    /// used for is by the registration id; the kind it also carries is read by
+    /// [`Client::async_add_cancel`] alone, and that one is already sending the
+    /// removal a publication takes.
+    pub const fn publication(registration_id: i64) -> Self {
+        Self {
+            registration_id,
+            resource: AsyncResource::Publication,
+        }
+    }
+
     /// The registration id the `ADD_*` drew — and the id the resource has, if
     /// it arrived.
     pub const fn registration_id(&self) -> i64 {

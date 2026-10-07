@@ -55,7 +55,12 @@
 //!   and the [`Egress`] encodes it when the turn comes. The ordering and the
 //!   one-attempt-per-turn policy are the reference's.
 
+use std::fmt;
+use std::time::Duration;
+
+use deepmsg_client::client::CommandError;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
+use deepmsg_core::logbuffer::append::Appended;
 
 /// Where a session is (`ControlSession.java:64-67`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +108,12 @@ pub const RESPONSE_NOT_CONNECTED_MSG: &str = "control response publication is no
 /// See [`SESSION_CLOSED_MSG`]. Not raised here yet: nothing in this slice can
 /// be the image that went away — the conductor is what knows about images.
 pub const REQUEST_IMAGE_NOT_AVAILABLE_MSG: &str = "control request publication image unavailable";
+/// See [`SESSION_CLOSED_MSG`], and this one is raised: the client no longer
+/// holds the response publication (`ControlResponseProxy.java:252`).
+pub const RESPONSE_PUBLICATION_CLOSED_MSG: &str = "control response publication is closed";
+/// See [`SESSION_CLOSED_MSG`] (`ControlResponseProxy.java:258`).
+pub const RESPONSE_PUBLICATION_MAX_POSITION_MSG: &str =
+    "control response publication is at max position";
 
 /// How often `CONNECTED`, `AUTHENTICATED` and `REJECTED` repeat themselves
 /// (`ControlSession.java:57`).
@@ -135,6 +146,10 @@ pub enum Response {
     Challenge {
         /// The session being challenged.
         control_session_id: i64,
+        /// The correlation id the challenge answers: the session's own, which
+        /// is the connect's until a challenge answer replaces it
+        /// (`ControlSessionProxy.java:53-57`, `ControlSession.java:312`).
+        correlation_id: i64,
         /// The opaque bytes the challenge carries.
         encoded_challenge: Vec<u8>,
     },
@@ -146,15 +161,28 @@ pub enum Response {
     },
 }
 
-/// What a session needs of the publication it answers on.
+/// The client's publication side, as a session's egress uses it.
 ///
-/// `ControlResponseProxy` writes to it directly with no queue of its own
-/// (`ControlResponseProxy.java:34-273`), so this is the whole of the session's
-/// egress.
-pub trait Egress {
-    /// `aeron.asyncAddExclusivePublication(channel, streamId)`: the registration
-    /// id, at once (`ControlSession.java:863-865`).
-    fn add_publication(&mut self, channel: &str, stream_id: i32) -> i64;
+/// Every method is one call the reference's `ControlResponseProxy` makes on an
+/// `Aeron` client or on the `Publication` it was handed
+/// (`ControlResponseProxy.java:34-273`), named by the registration id the
+/// `ADD_*` drew instead of by an object reference. That id is the whole of what
+/// can cross a turn boundary here: the publication itself lives inside the
+/// client, which is the caller's, so it is lent to the egress rather than held
+/// by it.
+pub trait Publications {
+    /// `aeron.asyncAddExclusivePublication(channel, streamId)`, which answers
+    /// with a handle rather than waiting (`ControlSession.java:863-865`).
+    ///
+    /// `timeout` is the one thing the reference has no equivalent of: its
+    /// asynchronous add never blocks, and this one waits for the command to
+    /// reach the driver before answering.
+    fn async_add_exclusive_publication(
+        &mut self,
+        channel: &str,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError>;
 
     /// `aeron.getExclusivePublication(registrationId)`: whether the driver has
     /// answered yet, draining the client on the way as Java's does.
@@ -164,21 +192,113 @@ pub trait Egress {
     /// (`ControlSession.java:874-881`) — so a slow driver is answered with
     /// several publications, only the first of which the later ones can be
     /// refused for.
-    fn is_publication_ready(&mut self) -> bool;
+    fn poll_exclusive_publication(&mut self, registration_id: i64) -> bool;
 
     /// `controlPublication.isConnected()` (`ControlSession.java:917`, `:1005`).
-    fn is_connected(&self) -> bool;
+    fn is_exclusive_connected(&self, registration_id: i64) -> bool;
 
     /// `controlPublication.maxPayloadLength()` (`ControlSession.java:812-815`),
     /// which the descriptor sends are bounded by.
-    fn max_payload_length(&self) -> usize;
+    fn max_payload_length(&self, registration_id: i64) -> usize;
 
-    /// One `offer`. `true` is the reference's `position > 0`.
-    fn offer(&mut self, response: &Response) -> bool;
+    /// One `offer`. `None` is Java's `CLOSED` — there is no such publication
+    /// any more — and everything else is [`Appended`]'s own answer, which the
+    /// proxy is what turns into a position, a retry or an abort.
+    fn offer_exclusive(&mut self, registration_id: i64, payload: &[u8]) -> Option<Appended>;
 
     /// `revokeOnClose()` and close, which is what a session's close does first
     /// (`ControlSession.java:163-174`).
-    fn close_publication(&mut self);
+    fn release_exclusive(&mut self, registration_id: i64, timeout: Duration);
+}
+
+/// What became of one response, as the reference's `checkResult` reads it
+/// (`ControlResponseProxy.java:242-262`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offered {
+    /// It is out. Java's `position > 0`.
+    Sent,
+    /// Nothing went out and nothing is wrong: the window is used up, or the log
+    /// is turning over. Java's `BACK_PRESSURED` and `ADMIN_ACTION`, which its
+    /// proxy retries and the next turn retries again.
+    Retry,
+    /// The session is over, in the reference's words: the publication is not
+    /// connected, is closed, or is at its maximum position. Java's `checkResult`
+    /// ends the session *and* raises an `ArchiveEvent`; the message here is that
+    /// event, and ending the session is the session's to do — the egress does
+    /// not own it.
+    Fatal(ResponseError),
+}
+
+/// Why a session's own egress is ending it (`ControlResponseProxy.java:246`,
+/// `:252`, `:258`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseError(String);
+
+impl ResponseError {
+    /// A reason, in the reference's words.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The reason as the reference words it.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResponseError {}
+
+/// What a session needs of the publication it answers on.
+///
+/// `ControlResponseProxy` writes to it directly with no queue of its own
+/// (`ControlResponseProxy.java:34-273`), so this is the whole of the session's
+/// egress — and the publications it writes through are lent per call, for the
+/// reason [`Publications`] gives.
+pub trait Egress {
+    /// `aeron.asyncAddExclusivePublication(channel, streamId)`: the registration
+    /// id, at once (`ControlSession.java:863-865`). Java lets a refusal climb
+    /// out of `doWork`; here it ends the session that asked, with the client's
+    /// own words.
+    ///
+    /// Nothing comes back but success: which publication this is belongs to the
+    /// egress, and the reference's session, which keeps the registration id,
+    /// has no use for it either.
+    fn add_publication<P: Publications>(
+        &mut self,
+        publications: &mut P,
+        channel: &str,
+        stream_id: i32,
+    ) -> Result<(), ResponseError>;
+
+    /// `aeron.getExclusivePublication(registrationId)`: whether the driver has
+    /// answered yet, draining the client on the way as Java's does.
+    ///
+    /// `false` is Java's `RESOURCE_TEMPORARILY_UNAVAILABLE`, and the reference
+    /// treats it by **forgetting the registration id and asking again**
+    /// (`ControlSession.java:874-881`) — so a slow driver is answered with
+    /// several publications, only the first of which the later ones can be
+    /// refused for.
+    fn is_publication_ready<P: Publications>(&mut self, publications: &mut P) -> bool;
+
+    /// `controlPublication.isConnected()` (`ControlSession.java:917`, `:1005`).
+    fn is_connected<P: Publications>(&self, publications: &P) -> bool;
+
+    /// `controlPublication.maxPayloadLength()` (`ControlSession.java:812-815`),
+    /// which the descriptor sends are bounded by.
+    fn max_payload_length<P: Publications>(&self, publications: &P) -> usize;
+
+    /// One `offer`, and what the reference's `checkResult` makes of it.
+    fn offer<P: Publications>(&mut self, publications: &mut P, response: &Response) -> Offered;
+
+    /// `revokeOnClose()` and close, which is what a session's close does first
+    /// (`ControlSession.java:163-174`).
+    fn close_publication<P: Publications>(&mut self, publications: &mut P);
 }
 
 /// What an authenticator decided, as the reference's `SessionProxy` would have
@@ -354,7 +474,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// One turn (`ControlSession.java:212-271`).
     ///
     /// Returns the work done, for the cycle counter.
-    pub fn do_work(&mut self, now_ms: i64) -> usize {
+    pub fn do_work<P: Publications>(&mut self, now_ms: i64, publications: &mut P) -> usize {
         let mut work = 0;
 
         if self.has_no_activity(now_ms) {
@@ -377,13 +497,16 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
         }
 
         work += match self.state {
-            State::Init => self.init(),
-            State::Connecting => self.wait_for_connection(),
-            State::Connected => self.send_connect_response(now_ms),
-            State::Challenged => self.wait_for_challenge_response(now_ms),
-            State::Authenticated => self.wait_for_request(now_ms),
-            State::Active => self.perform_liveness_check(now_ms) + self.send_responses(),
-            State::Rejected => self.send_reject(now_ms),
+            State::Init => self.init(publications),
+            State::Connecting => self.wait_for_connection(publications),
+            State::Connected => self.send_connect_response(now_ms, publications),
+            State::Challenged => self.wait_for_challenge_response(now_ms, publications),
+            State::Authenticated => self.wait_for_request(now_ms, publications),
+            State::Active => {
+                self.perform_liveness_check(now_ms, publications)
+                    + self.send_responses(publications)
+            }
+            State::Rejected => self.send_reject(now_ms, publications),
             State::Done => 0,
         };
 
@@ -400,11 +523,12 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
     /// The client answered a challenge (`ControlSession.java:308-315`), which
     /// is the one request that is not gated on being `ACTIVE`.
-    pub fn on_challenge_response(
+    pub fn on_challenge_response<P: Publications>(
         &mut self,
         correlation_id: i64,
         encoded_credentials: &[u8],
         now_ms: i64,
+        publications: &mut P,
     ) {
         if self.state != State::Challenged {
             return;
@@ -414,17 +538,24 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
         let answer =
             self.authenticator
                 .on_challenge_response(self.session_id, encoded_credentials, now_ms);
-        self.apply(answer);
+        self.apply(answer, publications);
     }
 
     /// Queue an OK (`ControlSession.java:682-690`).
-    pub fn send_ok_response(&mut self, correlation_id: i64, relevant_id: i64, now_ms: i64) {
+    pub fn send_ok_response<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        relevant_id: i64,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
         self.send_response(
             correlation_id,
             relevant_id,
             ControlResponseCode::OK,
             None,
             now_ms,
+            publications,
         );
     }
 
@@ -436,12 +567,13 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// (`:697-701`). A denial of an unauthorised action is the second kind and
     /// says `UNAUTHORISED_ACTION` (`ControlSessionAdapter.java:1209-1211`), so
     /// the id is a parameter here rather than a zero written in.
-    pub fn send_error_response(
+    pub fn send_error_response<P: Publications>(
         &mut self,
         correlation_id: i64,
         relevant_id: i64,
         message: &str,
         now_ms: i64,
+        publications: &mut P,
     ) {
         self.send_response(
             correlation_id,
@@ -449,14 +581,15 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
             ControlResponseCode::ERROR,
             Some(message.to_owned()),
             now_ms,
+            publications,
         );
     }
 
     /// Give the publication back (`ControlSession.java:163-174`). Closing the
     /// session's counter and telling the adapter belong to the conductor and
     /// the counters.
-    pub fn close(&mut self) {
-        self.egress.close_publication();
+    pub fn close<P: Publications>(&mut self, publications: &mut P) {
+        self.egress.close_publication(publications);
         self.sync_responses.clear();
     }
 
@@ -466,13 +599,23 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// The session's own counter is allocated and bound to this publication by
     /// the conductor (`ArchiveConductor.java:493-498`), and belongs to the
     /// counters module.
-    fn init(&mut self) -> usize {
-        if !self.egress.is_publication_ready() {
+    fn init<P: Publications>(&mut self, publications: &mut P) -> usize {
+        if !self.egress.is_publication_ready(publications) {
             // The reference forgets the registration id here and asks again
             // next turn (`:874-881`), which is what makes a slow driver answer
             // one request with several publications.
-            self.egress
-                .add_publication(&self.response_channel, self.response_stream_id);
+            if let Err(error) = self.egress.add_publication(
+                publications,
+                &self.response_channel,
+                self.response_stream_id,
+            ) {
+                // Java's exception out of `asyncAddExclusivePublication` climbs
+                // out of `doWork` and takes the process with it; a session that
+                // can be ended without the archive is ended instead, with the
+                // client's own words as its reason.
+                self.abort(error.message());
+            }
+
             return 1;
         }
 
@@ -482,8 +625,8 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     }
 
     /// `CONNECTING`: the publication has a subscriber (`ControlSession.java:913-924`).
-    fn wait_for_connection(&mut self) -> usize {
-        if self.egress.is_connected() {
+    fn wait_for_connection<P: Publications>(&mut self, publications: &mut P) -> usize {
+        if self.egress.is_connected(publications) {
             self.state = State::Connected;
             return 1;
         }
@@ -493,7 +636,11 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
 
     /// `CONNECTED`: tell the authenticator, or refuse the client's version
     /// (`ControlSession.java:926-952`).
-    fn send_connect_response(&mut self, now_ms: i64) -> usize {
+    fn send_connect_response<P: Publications>(
+        &mut self,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> usize {
         if now_ms <= self.resend_deadline_ms {
             return 0;
         }
@@ -509,6 +656,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
                     ControlResponseCode::ERROR,
                     Some(message),
                     now_ms,
+                    publications,
                 );
                 Answer::None
             }
@@ -516,24 +664,28 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
                 .authenticator
                 .on_connected_session(self.session_id, now_ms),
         };
-        self.apply(answer);
+        self.apply(answer, publications);
 
         1
     }
 
     /// `CHALLENGED`: the reference asks again every turn, with no resend
     /// interval (`ControlSession.java:954-958`).
-    fn wait_for_challenge_response(&mut self, now_ms: i64) -> usize {
+    fn wait_for_challenge_response<P: Publications>(
+        &mut self,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> usize {
         let answer = self
             .authenticator
             .on_challenged_session(self.session_id, now_ms);
-        self.apply(answer);
+        self.apply(answer, publications);
         1
     }
 
     /// `AUTHENTICATED`: keep saying so until a request arrives
     /// (`ControlSession.java:960-981`).
-    fn wait_for_request(&mut self, now_ms: i64) -> usize {
+    fn wait_for_request<P: Publications>(&mut self, now_ms: i64, publications: &mut P) -> usize {
         if now_ms <= self.resend_deadline_ms {
             return 0;
         }
@@ -545,12 +697,17 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
             ControlResponseCode::OK,
             None,
             now_ms,
+            publications,
         );
         1
     }
 
     /// `ACTIVE`: the liveness ping (`ControlSession.java:983-999`).
-    fn perform_liveness_check(&mut self, now_ms: i64) -> usize {
+    fn perform_liveness_check<P: Publications>(
+        &mut self,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> usize {
         if self.liveness_check_deadline_ms - now_ms >= 0 {
             return 0;
         }
@@ -560,10 +717,13 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
         let ping = Response::Ping {
             control_session_id: self.session_id,
         };
-        if self.egress.offer(&ping) {
-            self.activity_deadline_ms = None;
-        } else {
-            self.update_activity_deadline(now_ms);
+        match self.egress.offer(publications, &ping) {
+            Offered::Sent => self.activity_deadline_ms = None,
+            Offered::Retry => self.update_activity_deadline(now_ms),
+            Offered::Fatal(error) => {
+                let reason = error.message().to_owned();
+                self.abort(&reason);
+            }
         }
 
         1
@@ -576,27 +736,37 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// place that re-arms from here is the async queue's failed send
     /// (`:1033`), which arrives with the sessions that fill it from another
     /// thread.
-    fn send_responses(&mut self) -> usize {
-        if !self.egress.is_connected() {
+    fn send_responses<P: Publications>(&mut self, publications: &mut P) -> usize {
+        if !self.egress.is_connected(publications) {
             self.abort(RESPONSE_NOT_CONNECTED_MSG);
             return 1;
         }
 
-        let mut work = 0;
+        // The outcome is taken out of the borrow of the queue before anything
+        // is done about it: one arm takes the head off, and a queue borrowed
+        // for the length of its own `first()` cannot be shortened.
+        let Some(owed) = self.sync_responses.first() else {
+            return 0;
+        };
+        let outcome = self.egress.offer(publications, owed);
 
-        if let Some(response) = self.sync_responses.first() {
-            if self.egress.offer(response) {
+        match outcome {
+            Offered::Sent => {
                 self.sync_responses.remove(0);
                 self.activity_deadline_ms = None;
-                work += 1;
+                1
+            }
+            Offered::Retry => 0,
+            Offered::Fatal(error) => {
+                let reason = error.message().to_owned();
+                self.abort(&reason);
+                1
             }
         }
-
-        work
     }
 
     /// `REJECTED`: keep saying that too (`ControlSession.java:1041-1055`).
-    fn send_reject(&mut self, now_ms: i64) -> usize {
+    fn send_reject<P: Publications>(&mut self, now_ms: i64, publications: &mut P) -> usize {
         if now_ms <= self.resend_deadline_ms {
             return 0;
         }
@@ -608,6 +778,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
             ControlResponseCode::ERROR,
             Some(SESSION_REJECTED_MSG.to_owned()),
             now_ms,
+            publications,
         );
         1
     }
@@ -615,13 +786,14 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// The one response path (`ControlSession.java:713-731`): send it now, and
     /// if anything is already queued or the send fails, queue it and arm the
     /// deadline instead.
-    fn send_response(
+    fn send_response<P: Publications>(
         &mut self,
         correlation_id: i64,
         relevant_id: i64,
         code: ControlResponseCode,
         message: Option<String>,
         now_ms: i64,
+        publications: &mut P,
     ) {
         let response = Response::Control {
             control_session_id: self.session_id,
@@ -631,7 +803,24 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
             message,
         };
 
-        if self.sync_responses.is_empty() && self.egress.offer(&response) {
+        let sent = if self.sync_responses.is_empty() {
+            match self.egress.offer(publications, &response) {
+                Offered::Sent => true,
+                Offered::Retry => false,
+                // The reference's `checkResult` ends the session and raises the
+                // event; a response that would not go out is not queued behind
+                // the reason the session is over.
+                Offered::Fatal(error) => {
+                    let reason = error.message().to_owned();
+                    self.abort(&reason);
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+
+        if sent {
             self.activity_deadline_ms = None;
         } else {
             self.update_activity_deadline(now_ms);
@@ -645,15 +834,16 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
     /// send took — a session whose answer would not go out stays where it is
     /// and is offered again on the next turn. `reject` is the one that moves
     /// unconditionally (`:91-94`).
-    fn apply(&mut self, answer: Answer) {
+    fn apply<P: Publications>(&mut self, answer: Answer, publications: &mut P) {
         match answer {
             Answer::None => {}
             Answer::Challenge(encoded_challenge) => {
                 let challenge = Response::Challenge {
                     control_session_id: self.session_id,
+                    correlation_id: self.connect_correlation_id,
                     encoded_challenge,
                 };
-                if self.egress.offer(&challenge) {
+                if let Offered::Sent = self.egress.offer(publications, &challenge) {
                     self.state = State::Challenged;
                 }
             }
@@ -668,7 +858,7 @@ impl<E: Egress, A: Authenticator> ControlSession<E, A> {
                     code: ControlResponseCode::OK,
                     message: None,
                 };
-                if self.egress.offer(&ok) {
+                if let Offered::Sent = self.egress.offer(publications, &ok) {
                     self.encoded_principal = Some(encoded_principal);
                     self.activity_deadline_ms = None;
                     self.state = State::Authenticated;
@@ -715,37 +905,85 @@ mod tests {
     }
 
     impl Egress for FakeEgress {
-        fn add_publication(&mut self, channel: &str, stream_id: i32) -> i64 {
+        fn add_publication<P: Publications>(
+            &mut self,
+            _publications: &mut P,
+            channel: &str,
+            stream_id: i32,
+        ) -> Result<(), ResponseError> {
             self.publications_added
                 .push((channel.to_owned(), stream_id));
             self.ready = true;
             self.connected = true;
-            i64::try_from(self.publications_added.len()).expect("small")
+            Ok(())
         }
 
-        fn is_publication_ready(&mut self) -> bool {
+        fn is_publication_ready<P: Publications>(&mut self, _publications: &mut P) -> bool {
             self.ready
         }
 
-        fn is_connected(&self) -> bool {
+        fn is_connected<P: Publications>(&self, _publications: &P) -> bool {
             self.connected
         }
 
-        fn max_payload_length(&self) -> usize {
+        fn max_payload_length<P: Publications>(&self, _publications: &P) -> usize {
             1024
         }
 
-        fn offer(&mut self, response: &Response) -> bool {
+        fn offer<P: Publications>(
+            &mut self,
+            _publications: &mut P,
+            response: &Response,
+        ) -> Offered {
             if self.refuse_offers {
-                return false;
+                return Offered::Retry;
             }
 
             self.offered.push(response.clone());
-            true
+            Offered::Sent
         }
 
-        fn close_publication(&mut self) {
+        fn close_publication<P: Publications>(&mut self, _publications: &mut P) {
             self.closed = true;
+        }
+    }
+
+    /// The publications a session's egress writes through.
+    ///
+    /// The fake egress *is* the publication as far as a session can see, so
+    /// nothing ever reaches this — which is why every method here is a panic
+    /// rather than a plausible answer: a test that got here would be testing
+    /// something other than what it meant to.
+    struct NoPublications;
+
+    impl Publications for NoPublications {
+        fn async_add_exclusive_publication(
+            &mut self,
+            _channel: &str,
+            _stream_id: i32,
+            _timeout: Duration,
+        ) -> Result<i64, CommandError> {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> bool {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn is_exclusive_connected(&self, _registration_id: i64) -> bool {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn max_payload_length(&self, _registration_id: i64) -> usize {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn offer_exclusive(&mut self, _registration_id: i64, _payload: &[u8]) -> Option<Appended> {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn release_exclusive(&mut self, _registration_id: i64, _timeout: Duration) {
+            panic!("the fake egress is the publication; nothing asks the client")
         }
     }
 
@@ -818,11 +1056,11 @@ mod tests {
         );
 
         // INIT -> CONNECTING
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         // CONNECTING -> CONNECTED
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         // CONNECTED -> AUTHENTICATED, and the OK goes out
-        session.do_work(201);
+        session.do_work(201, &mut NoPublications);
         session.attempt_to_activate();
 
         assert_eq!(session.state(), State::Active);
@@ -848,23 +1086,23 @@ mod tests {
 
         // Nothing is ready yet, so the publication is asked for and INIT is
         // where it stays.
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         assert_eq!(session.state(), State::Init);
 
         // The driver answers.
         session.egress.ready = true;
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         assert_eq!(session.state(), State::Connecting);
 
         // ...and a subscriber attaches. That is the whole of CONNECTING's
         // question, so one turn is enough (`ControlSession.java:913-924`).
         session.egress.connected = true;
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         assert_eq!(session.state(), State::Connected);
 
         // The authenticator is offered the session on the next turn, at the
         // first moment the resend interval allows.
-        session.do_work(201);
+        session.do_work(201, &mut NoPublications);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -890,9 +1128,9 @@ mod tests {
         );
 
         session.egress.ready = false;
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         session.egress.ready = false;
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
 
         assert_eq!(session.egress.publications_added.len(), 2);
         assert_eq!(
@@ -923,9 +1161,9 @@ mod tests {
             FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
-        session.do_work(1);
-        session.do_work(1);
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications);
         assert_eq!(session.state(), State::Authenticated);
 
         // The first answer went out with the transition: `authenticate`
@@ -935,11 +1173,11 @@ mod tests {
 
         // Too soon: the interval runs from the turn that answered, which was
         // `now = 1`.
-        session.do_work(200);
+        session.do_work(200, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), after_connect);
 
         // The interval has passed.
-        session.do_work(202);
+        session.do_work(202, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), after_connect + 1);
 
         // And what it sends is an OK carrying the connect's correlation id and
@@ -981,15 +1219,16 @@ mod tests {
             ]),
         );
 
-        session.do_work(1);
-        session.do_work(1);
-        session.do_work(201);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(201, &mut NoPublications);
 
         assert_eq!(session.state(), State::Challenged);
         assert_eq!(
             session.egress.offered.last(),
             Some(&Response::Challenge {
                 control_session_id: 1,
+                correlation_id: 42,
                 encoded_challenge: b"challenge!".to_vec(),
             })
         );
@@ -998,7 +1237,7 @@ mod tests {
         session.attempt_to_activate();
         assert_eq!(session.state(), State::Challenged);
 
-        session.on_challenge_response(99, b"answer", 300);
+        session.on_challenge_response(99, b"answer", 300, &mut NoPublications);
         assert_eq!(session.state(), State::Authenticated);
 
         session.attempt_to_activate();
@@ -1027,13 +1266,13 @@ mod tests {
             FakeAuthenticator::with(&[Answer::Reject]),
         );
 
-        session.do_work(1);
-        session.do_work(1);
-        session.do_work(201);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(201, &mut NoPublications);
         assert_eq!(session.state(), State::Rejected);
 
         let sent = session.egress.offered.len();
-        session.do_work(402);
+        session.do_work(402, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), sent + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1072,9 +1311,9 @@ mod tests {
             FakeAuthenticator::with(&[Answer::Authenticate(Vec::new())]),
         );
 
-        session.do_work(1);
-        session.do_work(1);
-        session.do_work(201);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(1, &mut NoPublications);
+        session.do_work(201, &mut NoPublications);
 
         assert_eq!(
             session.egress.offered.last(),
@@ -1107,8 +1346,8 @@ mod tests {
         // way the ordering rule has anything to order
         // (`ControlSession.java:721-726`).
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000);
-        session.send_ok_response(11, 0, 1_000);
+        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
+        session.send_ok_response(11, 0, 1_000, &mut NoPublications);
 
         assert_eq!(session.sync_responses.len(), 2, "both are owed");
 
@@ -1116,11 +1355,11 @@ mod tests {
         // liveness ping shares this list, so the assertion is about the
         // responses.
         session.egress.refuse_offers = false;
-        session.do_work(1_001);
+        session.do_work(1_001, &mut NoPublications);
         assert_eq!(correlations(&session.egress.offered[before..]), vec![10]);
         assert_eq!(session.sync_responses.len(), 1);
 
-        session.do_work(1_002);
+        session.do_work(1_002, &mut NoPublications);
         assert_eq!(
             correlations(&session.egress.offered[before..]),
             vec![10, 11]
@@ -1145,7 +1384,7 @@ mod tests {
         assert_eq!(session.activity_deadline_ms(), None, "nothing is owed");
 
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000);
+        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
 
         assert_eq!(
             session.activity_deadline_ms(),
@@ -1154,17 +1393,17 @@ mod tests {
         );
 
         // Arming again does not push it out (`ControlSession.java:1064-1067`).
-        session.send_ok_response(11, 0, 2_000);
+        session.send_ok_response(11, 0, 2_000, &mut NoPublications);
         assert_eq!(session.activity_deadline_ms(), Some(6_000));
 
         // A send that takes clears it, and the next pending one arms a fresh
         // one.
         session.egress.refuse_offers = false;
-        session.do_work(3_000);
+        session.do_work(3_000, &mut NoPublications);
         assert_eq!(session.activity_deadline_ms(), None);
 
         session.egress.refuse_offers = true;
-        session.send_ok_response(12, 0, 4_000);
+        session.send_ok_response(12, 0, 4_000, &mut NoPublications);
         assert_eq!(session.activity_deadline_ms(), Some(9_000));
     }
 
@@ -1172,12 +1411,12 @@ mod tests {
     fn a_session_that_cannot_get_its_answer_out_is_aborted_in_the_references_words() {
         let mut session = active_session();
         session.egress.refuse_offers = true;
-        session.send_ok_response(10, 0, 1_000);
+        session.send_ok_response(10, 0, 1_000, &mut NoPublications);
 
         // The deadline is 6_000 and the session is ACTIVE, so the message is
         // the ACTIVE one — which does not say what the number is
         // (`ControlSession.java:217-221`).
-        session.do_work(6_001);
+        session.do_work(6_001, &mut NoPublications);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1202,10 +1441,10 @@ mod tests {
         );
 
         session.egress.ready = false;
-        session.do_work(1);
+        session.do_work(1, &mut NoPublications);
         assert_eq!(session.state(), State::Init);
 
-        session.do_work(5_001);
+        session.do_work(5_001, &mut NoPublications);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(
@@ -1219,7 +1458,7 @@ mod tests {
         let mut session = active_session();
 
         session.egress.connected = false;
-        session.do_work(1_001);
+        session.do_work(1_001, &mut NoPublications);
 
         assert_eq!(session.state(), State::Done);
         assert_eq!(session.abort_reason(), Some(RESPONSE_NOT_CONNECTED_MSG));
@@ -1232,10 +1471,10 @@ mod tests {
 
         // The interval is a second and the session started at 0; nothing is
         // due yet.
-        session.do_work(500);
+        session.do_work(500, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), before);
 
-        session.do_work(1_001);
+        session.do_work(1_001, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), before + 1);
         assert_eq!(
             session.egress.offered.last(),
@@ -1245,9 +1484,9 @@ mod tests {
         );
 
         // Once per interval, not once per turn.
-        session.do_work(1_500);
+        session.do_work(1_500, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), before + 1);
-        session.do_work(2_002);
+        session.do_work(2_002, &mut NoPublications);
         assert_eq!(session.egress.offered.len(), before + 2);
     }
 
@@ -1258,7 +1497,7 @@ mod tests {
         assert!(session.is_done());
 
         let before = session.egress.offered.len();
-        assert_eq!(session.do_work(1_000), 0);
+        assert_eq!(session.do_work(1_000, &mut NoPublications), 0);
         assert_eq!(session.egress.offered.len(), before);
 
         // A second reason is not taken over the first, except for a plain
@@ -1273,7 +1512,7 @@ mod tests {
     fn closing_gives_the_publication_back() {
         let mut session = active_session();
 
-        session.close();
+        session.close(&mut NoPublications);
 
         assert!(session.egress.closed);
         assert!(session.sync_responses.is_empty());
