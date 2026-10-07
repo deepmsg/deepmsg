@@ -169,17 +169,31 @@ pub fn stripped_channel_builder(uri: &ChannelUri) -> ChannelUriStringBuilder {
 
 /// The channel a session is answered on (`ArchiveConductor.java:458-481`).
 ///
-/// The client's channel, stripped, with the archive's own term length, sparse
-/// flag and MTU written over whatever the client asked for; and, when the
-/// client asked for a response channel, the correlation id of the image the
-/// request arrived on. That last one is what lets a client tell an answer
-/// meant for it from one meant for another subscription on the same endpoint.
+/// The client's channel, stripped, with its term length, sparse flag and MTU
+/// put back and, when the client asked for a response channel, the correlation
+/// id of the image the request arrived on. That last one is what lets a client
+/// tell an answer meant for it from one meant for another subscription on the
+/// same endpoint.
 ///
-/// # Errors
+/// # The three the strip list drops are the client's, not the archive's
 ///
-/// [`UriError`] if the client's channel cannot be read. The reference throws
-/// out of `ChannelUri.parse` here, which takes the archive with it; this
-/// answers with the reason and leaves the decision to the caller.
+/// `strippedChannelBuilder` drops `term-length`, `mtu` and `sparse`, and
+/// `newControlSession` writes all three back — but it writes **the client's
+/// values**, reading them out of the channel before they are dropped, and
+/// reaches for `ctx.control*` only for the ones the client did not name
+/// (`:460-474`):
+///
+/// ```text
+/// final String termLengthStr = channelUri.get(TERM_LENGTH_PARAM_NAME);
+/// final int termLength = null == termLengthStr ?
+///     ctx.controlTermBufferLength() : (int)SystemUtil.parseSize(..., termLengthStr);
+/// ```
+///
+/// So a client that asks for a 128 KiB term and a 2048 MTU is answered on a
+/// channel that has them, and one that asks for neither is answered on the
+/// archive's own settings. Reading the strip list as "the archive sets these"
+/// is the easy mistake here, and it is the wrong way round: what the archive
+/// sets is only the fallback.
 pub fn response_channel(
     requested: &str,
     image_correlation_id: i64,
@@ -189,10 +203,10 @@ pub fn response_channel(
     let mut builder = stripped_channel_builder(&uri);
 
     builder
-        .term_length(defaults.term_buffer_length)
-        .sparse(defaults.term_buffer_sparse);
+        .term_length(term_length(&uri, defaults))
+        .sparse(sparse(&uri, defaults));
 
-    if let Some(mtu) = defaults.mtu_length {
+    if let Some(mtu) = mtu_length(&uri, defaults) {
         builder.mtu(mtu);
     }
 
@@ -201,6 +215,41 @@ pub fn response_channel(
     }
 
     Ok(builder.build())
+}
+
+/// The client's `term-length`, or the archive's when it named none
+/// (`ArchiveConductor.java:463-465`).
+///
+/// A value that is there and will not read falls back too, where the reference
+/// throws; that is the same divergence [`copy_text`] makes for the parameters
+/// it keeps, and the module note says why.
+fn term_length(uri: &ChannelUri, defaults: &ResponseChannelDefaults) -> i32 {
+    uri.get("term-length")
+        .and_then(parse_size)
+        .unwrap_or(defaults.term_buffer_length)
+}
+
+/// The client's `sparse`, or the archive's when it named none (`:466-468`).
+///
+/// `Boolean.parseBoolean` is false for anything that is not "true", which is
+/// what the fallback here matches.
+fn sparse(uri: &ChannelUri, defaults: &ResponseChannelDefaults) -> bool {
+    uri.get("sparse")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(defaults.term_buffer_sparse)
+}
+
+/// The client's `mtu`, or the archive's when it named none (`:460-462`).
+///
+/// The reference's `controlMtuLength` is an `int` with a default of its own;
+/// this build's is an `Option`, so an archive that has not set one and a
+/// client that did not ask for one leave the parameter out rather than writing
+/// the zero the reference would have resolved away.
+fn mtu_length(uri: &ChannelUri, defaults: &ResponseChannelDefaults) -> Option<i32> {
+    match uri.get("mtu") {
+        Some(value) => parse_size(value).or(defaults.mtu_length),
+        None => defaults.mtu_length,
+    }
 }
 
 /// Copy a parameter's text into the matching field, if the channel carries it.
@@ -1189,13 +1238,50 @@ mod tests {
         );
     }
 
-    /// A plain control channel is answered on the channel it asked for, with
-    /// the archive's own three parameters written over it.
+    /// A plain control channel is answered on the channel it asked for. It
+    /// named none of the three the strip list drops, so all three come from
+    /// the archive.
     #[test]
-    fn a_control_channel_gets_the_archives_own_three_parameters() {
+    fn a_client_that_names_none_of_the_three_gets_the_archives() {
         assert_eq!(
             "aeron:udp?endpoint=localhost:8010|mtu=1408|term-length=64k|sparse=false",
             derive("aeron:udp?endpoint=localhost:8010")
+        );
+    }
+
+    /// ...and a client that names them keeps them. This is the direction the
+    /// strip list makes easy to read backwards: the three are dropped and
+    /// written back, but what is written back is the client's own
+    /// (`ArchiveConductor.java:460-474`), which is what the `null == ... ?`
+    /// in each line is choosing between.
+    #[test]
+    fn a_client_that_names_the_three_keeps_them() {
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8010|mtu=1500|term-length=128k|sparse=true",
+            derive("aeron:udp?endpoint=localhost:8010|term-length=128k|mtu=1500|sparse=true")
+        );
+    }
+
+    /// Each of the three falls back on its own, so naming one does not drag
+    /// the other two with it.
+    #[test]
+    fn each_of_the_three_falls_back_on_its_own() {
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8010|mtu=1408|term-length=256k|sparse=false",
+            derive("aeron:udp?endpoint=localhost:8010|term-length=256k"),
+            "the term length is the client's, the other two are not"
+        );
+
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8010|mtu=1500|term-length=64k|sparse=false",
+            derive("aeron:udp?endpoint=localhost:8010|mtu=1500"),
+            "the MTU is the client's, the other two are not"
+        );
+
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8010|mtu=1408|term-length=64k|sparse=true",
+            derive("aeron:udp?endpoint=localhost:8010|sparse=true"),
+            "sparse is the client's, the other two are not"
         );
     }
 
