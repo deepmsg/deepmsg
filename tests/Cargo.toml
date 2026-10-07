@@ -201,6 +201,15 @@ path = "integration/reject_image.rs"
 name = "next_session_id"
 path = "integration/next_session_id.rs"
 
+# P2-S1's acceptance: our archiving media driver, our client, and one connect
+# the archive answers. The control plane's first end-to-end run. Needs our own
+# archiving media driver binary, not the reference's, so it runs in CI — which
+# is why it is here and not in `interop/`, where a `required-features` target
+# would only ever be compiled.
+[[test]]
+name = "archive_connect"
+path = "integration/archive_connect.rs"
+
 # Our client's REJECT_IMAGE against the reference driver: whether the record
 # this build writes is one the reference reads, and whether its
 # ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.
