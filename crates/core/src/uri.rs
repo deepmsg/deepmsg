@@ -182,6 +182,63 @@ impl ChannelUri {
     pub fn params(&self) -> &[(String, String)] {
         &self.params
     }
+
+    /// Set a parameter, in the place the URI already carries it.
+    ///
+    /// This is the writer for a URI that was *read* rather than built, which
+    /// `ArchiveConductor.java:231-232` needs: the archive forces its own
+    /// `sparse` into the configured control channel before subscribing to it.
+    ///
+    /// **In place, because a channel's identity is its text** — see the type's
+    /// note. A parameter that is already there keeps its position and only its
+    /// value changes, so setting a value can never reorder a channel into a
+    /// different one. A parameter that is not there is appended, which is
+    /// where the reference's `put` adds it too.
+    ///
+    /// Every occurrence is replaced rather than the first: [`get`](Self::get)
+    /// is last-wins, so leaving an earlier duplicate behind would make the
+    /// value written here the one that does *not* win.
+    pub fn put(&mut self, key: &str, value: impl Into<String>) {
+        let value = value.into();
+        let position = self.params.iter().position(|(name, _)| name == key);
+
+        self.params.retain(|(name, _)| name != key);
+
+        let at = position.map_or(self.params.len(), |at| at.min(self.params.len()));
+        self.params.insert(at, (key.to_owned(), value));
+    }
+
+    /// The URI written back out — as it was read, apart from any
+    /// [`put`](Self::put).
+    ///
+    /// Emptiness is not preserved: [`parse`](Self::parse) drops an empty
+    /// parameter, so a URI that ended in a separator comes back without one.
+    pub fn build(&self) -> String {
+        let mut out = String::with_capacity(64);
+
+        if let Some(prefix) = &self.prefix {
+            out.push_str(prefix);
+            out.push(':');
+        }
+
+        out.push_str(SCHEME);
+        out.push_str(&self.media);
+
+        if !self.params.is_empty() {
+            out.push(PARAM_SEPARATOR);
+
+            for (index, (name, value)) in self.params.iter().enumerate() {
+                if index > 0 {
+                    out.push(PARAM_DELIMITER);
+                }
+                out.push_str(name);
+                out.push('=');
+                out.push_str(value);
+            }
+        }
+
+        out
+    }
 }
 
 /// The reference's `ChannelUriStringBuilder`: a channel URI written out rather
@@ -780,5 +837,61 @@ mod tests {
         assert_eq!(Some("64k"), uri.get("term-length"));
         assert_eq!(Some("false"), uri.get("sparse"));
         assert_eq!(Some("7"), uri.get("response-correlation-id"));
+    }
+
+    /// A channel read and written back is the same channel: its identity is
+    /// its text, so anything this loses or reorders is a different one.
+    #[test]
+    fn a_uri_read_and_written_back_is_the_same_text() {
+        for text in [
+            "aeron:udp?endpoint=localhost:40123",
+            "aeron:ipc",
+            "aeron-spy:aeron:udp?endpoint=localhost:1|term-length=64k|sparse=true",
+            "aeron:udp?control=localhost:9090|control-mode=response",
+        ] {
+            assert_eq!(text, ChannelUri::parse(text).unwrap().build());
+        }
+    }
+
+    /// Setting a parameter that is already there leaves it where it was, which
+    /// is the whole point: `ArchiveConductor.java:231-232` forces `sparse` into
+    /// a configured control channel, and a rewrite that moved it to the end
+    /// would be a different channel.
+    #[test]
+    fn setting_a_parameter_that_is_there_leaves_it_where_it_was() {
+        let mut uri =
+            ChannelUri::parse("aeron:udp?endpoint=localhost:1|sparse=false|term-length=64k")
+                .unwrap();
+
+        uri.put("sparse", "true");
+
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:1|sparse=true|term-length=64k",
+            uri.build()
+        );
+    }
+
+    /// ...and one that is not there goes at the end, which is where the
+    /// reference's `put` adds it.
+    #[test]
+    fn setting_a_parameter_that_is_not_there_appends_it() {
+        let mut uri = ChannelUri::parse("aeron:udp?endpoint=localhost:1").unwrap();
+
+        uri.put("sparse", "true");
+
+        assert_eq!("aeron:udp?endpoint=localhost:1|sparse=true", uri.build());
+    }
+
+    /// All of them, not just the first: `get` is last-wins, so replacing only
+    /// the first occurrence would leave the written value losing.
+    #[test]
+    fn setting_a_parameter_replaces_every_spelling_of_it() {
+        let mut uri =
+            ChannelUri::parse("aeron:udp?sparse=false|endpoint=localhost:1|sparse=false").unwrap();
+
+        uri.put("sparse", "true");
+
+        assert_eq!("aeron:udp?sparse=true|endpoint=localhost:1", uri.build());
+        assert_eq!(Some("true"), uri.get("sparse"));
     }
 }
