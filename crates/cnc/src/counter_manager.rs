@@ -325,6 +325,15 @@ impl CounterManager {
 
     /// The counter's value, read with an acquire — the same load a driver makes
     /// when it decides whether a client is still alive.
+    ///
+    /// `#[inline]` because the driver is built without LTO, so nothing below
+    /// the crate boundary is visible to LLVM unless it is marked: the id's
+    /// range check, the multiply by 128 and `AtomicBuffer::slot_i64`'s two
+    /// checks are 4.7 of the 5.1 cycles one access costs, measured in
+    /// `b1-out/countercost/`, and a driver pass makes about fifteen of them
+    /// (`b1-out/r10-on-main/per-pass/`: 78.7 cycles a pass, against the C
+    /// reference's zero — its hot paths hold `int64_t *`).
+    #[inline]
     pub fn value(&self, regions: &CounterRegions<'_>, counter_id: i32) -> Option<i64> {
         let offset = self.value_offset(counter_id)?;
         regions
@@ -333,6 +342,7 @@ impl CounterManager {
     }
 
     /// Publish a counter's value.
+    #[inline]
     pub fn set_value(
         &self,
         regions: &CounterRegions<'_>,
@@ -436,6 +446,7 @@ impl CounterManager {
     }
 
     /// A counter id as a byte-offset multiplier, refusing negatives.
+    #[inline]
     fn to_offset(value: i32) -> Option<usize> {
         usize::try_from(value).ok()
     }
@@ -444,6 +455,7 @@ impl CounterManager {
         Self::to_offset(counter_id)?.checked_mul(layout::COUNTER_METADATA_LENGTH)
     }
 
+    #[inline]
     fn value_offset(&self, counter_id: i32) -> Option<usize> {
         if counter_id < 0 || counter_id > self.max_counter_id {
             return None;
