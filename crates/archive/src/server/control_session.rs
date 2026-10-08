@@ -78,6 +78,7 @@ use std::time::Duration;
 use deepmsg_client::client::CommandError;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
+use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::logbuffer::append::Appended;
 
@@ -180,6 +181,25 @@ pub enum Response {
     Ping {
         /// The session being kept alive.
         control_session_id: i64,
+    },
+    /// A `RecordingSignalEvent` (`ControlResponseProxy.java:161-199`): what a
+    /// recording the client asked for has done since it asked.
+    Signal {
+        /// The session it is sent on.
+        control_session_id: i64,
+        /// The correlation id of the request that started this — the `START`
+        /// carries the start request's, and the `STOP` the stop's
+        /// (`ArchiveConductor.java:2046-2051`, `:1342-1347`).
+        correlation_id: i64,
+        /// The recording the signal is about.
+        recording_id: i64,
+        /// The recording *subscription* it belongs to, which is the
+        /// registration id the start answered with (`:2049`).
+        subscription_id: i64,
+        /// Where the recording had got to.
+        position: i64,
+        /// Which signal.
+        signal: RecordingSignal,
     },
 }
 
@@ -888,6 +908,50 @@ impl<E: Egress> ControlSession<E> {
             message,
         };
 
+        self.send_or_queue(response, now_ms, publications);
+    }
+
+    /// A recording signal (`ControlSession.java:779-800`), which is the third
+    /// kind of thing a session sends and the only one that is not an answer:
+    /// `START`, `STOP` and `EXTEND` tell the client that asked to record what
+    /// its recording went on to do (`ArchiveConductor.java:2046-2051`,
+    /// `:1342-1347`, `:2121-2122`).
+    ///
+    /// It shares [`ControlSession::send_or_queue`] with the answers because the
+    /// reference shares the code too: same queue, same deadline, same three
+    /// attempts inside the proxy (`ControlResponseProxy.java:170-198`).
+    #[allow(clippy::too_many_arguments)] // one per field a RecordingSignalEvent carries
+    pub fn send_signal<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        recording_id: i64,
+        subscription_id: i64,
+        position: i64,
+        signal: RecordingSignal,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
+        let response = Response::Signal {
+            control_session_id: self.session_id,
+            correlation_id,
+            recording_id,
+            subscription_id,
+            position,
+            signal,
+        };
+
+        self.send_or_queue(response, now_ms, publications);
+    }
+
+    /// Send it now, or queue it and arm the deadline (`ControlSession.java:713-731`
+    /// for the answers, `:787-799` for the signals — the same four lines twice
+    /// in the reference).
+    fn send_or_queue<P: Publications>(
+        &mut self,
+        response: Response,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
         let sent = if self.sync_responses.is_empty() {
             match self.egress.offer(publications, &response) {
                 Offered::Sent => true,
@@ -1607,6 +1671,52 @@ mod tests {
             correlations(&session.egress.offered[before..]),
             vec![10, 11]
         );
+        assert!(session.sync_responses.is_empty());
+    }
+
+    /// A signal is not an answer, but it is queued and sent by the same four
+    /// lines — the reference writes them twice
+    /// (`ControlSession.java:713-731`, `:787-799`).
+    #[test]
+    fn a_signal_takes_the_same_queue_as_an_answer() {
+        let (mut session, mut authenticator) = active_session();
+
+        session.egress.refuse_offers = true;
+        session.send_signal(12, 3, 5, 4096, RecordingSignal::START, 1_000, &mut NoClient);
+
+        assert_eq!(session.sync_responses.len(), 1, "the signal is owed");
+        assert_eq!(
+            Some(6_000),
+            session.activity_deadline_ms(),
+            "armed from the connect timeout, as a response's would be"
+        );
+
+        session.egress.refuse_offers = false;
+        session.do_work(1_001, &mut NoClient, &counters_region(), &mut authenticator);
+
+        let offered = session
+            .egress
+            .offered
+            .iter()
+            .find_map(|response| match response {
+                Response::Signal {
+                    correlation_id,
+                    recording_id,
+                    subscription_id,
+                    position,
+                    signal,
+                    ..
+                } => Some((
+                    *correlation_id,
+                    *recording_id,
+                    *subscription_id,
+                    *position,
+                    *signal,
+                )),
+                _ => None,
+            });
+
+        assert_eq!(Some((12, 3, 5, 4096, RecordingSignal::START)), offered);
         assert!(session.sync_responses.is_empty());
     }
 

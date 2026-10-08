@@ -50,6 +50,7 @@ use deepmsg_codec::archive::challenge_codec::{self, ChallengeEncoder};
 use deepmsg_codec::archive::control_response_codec::{self, ControlResponseEncoder};
 use deepmsg_codec::archive::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec::archive::ping_codec::{self, PingEncoder};
+use deepmsg_codec::archive::recording_signal_event_codec::{self, RecordingSignalEventEncoder};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::version::semantic_version_compose;
 
@@ -338,6 +339,38 @@ fn encode(buffer: &mut Vec<u8>, response: &Response) -> usize {
 
             MESSAGE_HEADER_LENGTH + encoder.encoded_length()
         }
+
+        // Fixed length: every field of a `RecordingSignalEvent` is in its block
+        // (`RecordingSignalEventEncoder.BLOCK_LENGTH`), so there is no var-data
+        // and no `grow` by anything but the block.
+        Response::Signal {
+            control_session_id,
+            correlation_id,
+            recording_id,
+            subscription_id,
+            position,
+            signal,
+        } => {
+            grow(
+                buffer,
+                MESSAGE_HEADER_LENGTH + recording_signal_event_codec::SBE_BLOCK_LENGTH as usize,
+            );
+
+            let encoder = RecordingSignalEventEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(*control_session_id)
+                .correlation_id(*correlation_id)
+                .recording_id(*recording_id)
+                .subscription_id(*subscription_id)
+                .position(*position)
+                .signal(*signal);
+
+            MESSAGE_HEADER_LENGTH + encoder.encoded_length()
+        }
     }
 }
 
@@ -412,6 +445,8 @@ mod tests {
     use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;
     use deepmsg_codec::archive::message_header_codec::MessageHeaderDecoder;
     use deepmsg_codec::archive::ping_codec::PingDecoder;
+    use deepmsg_codec::archive::recording_signal::RecordingSignal;
+    use deepmsg_codec::archive::recording_signal_event_codec::RecordingSignalEventDecoder;
     use deepmsg_codec::archive::{ReadBuf, SBE_SCHEMA_ID};
     use deepmsg_core::logbuffer::position::Position;
 
@@ -601,6 +636,45 @@ mod tests {
         let decoder = PingDecoder::default().header(header, 0);
 
         assert_eq!(7, decoder.control_session_id());
+    }
+
+    /// The signal is the third message a session can send, and the only one
+    /// that is not an answer — so it is worth checking on the wire rather than
+    /// by name.
+    #[test]
+    fn a_signal_decodes_back_to_what_was_sent() {
+        let (mut proxy, mut publications) = a_proxy();
+
+        let signal = Response::Signal {
+            control_session_id: 7,
+            correlation_id: 11,
+            recording_id: 3,
+            subscription_id: 5,
+            position: 4096,
+            signal: RecordingSignal::EXTEND,
+        };
+        assert_eq!(Offered::Sent, proxy.offer(&mut publications, &signal));
+
+        let payload = publications.last_offered();
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+
+        assert_eq!(
+            recording_signal_event_codec::SBE_TEMPLATE_ID,
+            header.template_id()
+        );
+        assert_eq!(
+            recording_signal_event_codec::SBE_BLOCK_LENGTH,
+            header.block_length()
+        );
+
+        let decoder = RecordingSignalEventDecoder::default().header(header, 0);
+
+        assert_eq!(7, decoder.control_session_id());
+        assert_eq!(11, decoder.correlation_id());
+        assert_eq!(3, decoder.recording_id());
+        assert_eq!(5, decoder.subscription_id());
+        assert_eq!(4096, decoder.position());
+        assert_eq!(RecordingSignal::EXTEND, decoder.signal());
     }
 
     /// The reused buffer is not allowed to show through: a challenge after a
