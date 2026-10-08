@@ -77,7 +77,11 @@ use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
+use deepmsg_codec::archive::find_last_matching_recording_request_codec::{
+    self, FindLastMatchingRecordingRequestDecoder,
+};
 use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestDecoder;
+use deepmsg_codec::archive::list_recording_request_codec::{self, ListRecordingRequestDecoder};
 use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
@@ -299,6 +303,20 @@ pub trait ControlPlane {
     /// argument. What is *not* collapsed is the answer: it is the reference's,
     /// field for field.
     fn on_query(&mut self, session_id: i64, correlation_id: i64, query: Query, now_ms: i64);
+
+    /// `ControlSession.onListRecording` (`ControlSession.java:383-390`), which
+    /// the conductor answers with the recording's descriptor or with
+    /// `RECORDING_UNKNOWN`.
+    ///
+    /// The two refusals in front of it are the conductor's, so this carries the
+    /// intent and no decision — see the conductor's `Deferred::ListRecording`.
+    fn on_list_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
 }
 
 /// The fragments of a client's control requests, and the sessions they belong
@@ -690,6 +708,68 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // The last of the questions about a recording, and the one that does not
+        // name one: it asks which recording matches a session, a stream and a
+        // piece of a channel (`ArchiveConductor.java:742-761`).
+        find_last_matching_recording_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = FindLastMatchingRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let min_recording_id = decoder.min_recording_id();
+            let matching_session_id = decoder.session_id();
+            let stream_id = decoder.stream_id();
+            let coordinates = decoder.channel_decoder();
+            let channel_fragment = decoder.channel_slice(coordinates).to_vec();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_query(
+                    session_id,
+                    correlation_id,
+                    Query::FindLastMatching {
+                        min_recording_id,
+                        session_id: matching_session_id,
+                        stream_id,
+                        channel_fragment,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        // One recording's descriptor (`ArchiveConductor.java:688-706`). The
+        // answer is not this turn's to send: the listing session the conductor
+        // starts is what offers the message until the client takes it.
+        list_recording_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = ListRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_list_recording(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
         archive_id_request_codec::SBE_TEMPLATE_ID => {
             let decoder = ArchiveIdRequestDecoder::default().header(header, 0);
 
@@ -862,6 +942,11 @@ mod tests {
             correlation_id: i64,
             query: Query,
         },
+        ListRecording {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
     }
 
     /// A control plane that writes down what it was asked and hands out session
@@ -959,6 +1044,20 @@ mod tests {
                 session_id,
                 correlation_id,
                 query,
+            });
+        }
+
+        fn on_list_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::ListRecording {
+                session_id,
+                correlation_id,
+                recording_id,
             });
         }
     }
@@ -1610,6 +1709,123 @@ mod tests {
         MaxRecordedPositionRequestEncoder
     );
 
+    /// A match, which is the one of these requests that carries a channel — as
+    /// a length and then the bytes, the shape every variable-length field in
+    /// this protocol has (`FindLastMatchingRecordingRequestDecoder`).
+    fn find_last_matching_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        min_recording_id: i64,
+        session_id: i32,
+        stream_id: i32,
+        channel_fragment: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::find_last_matching_recording_request_codec::FindLastMatchingRecordingRequestEncoder;
+
+        let mut buffer = vec![0u8; 96];
+        let length = {
+            let encoder = FindLastMatchingRecordingRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .min_recording_id(min_recording_id)
+                .session_id(session_id)
+                .stream_id(stream_id)
+                .channel(channel_fragment.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    fn list_recording_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::list_recording_request_codec::ListRecordingRequestEncoder;
+
+        let mut buffer = vec![0u8; 64];
+        let length = {
+            let encoder =
+                ListRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A match reaches the session as a question with its channel fragment
+    /// whole — the fragment is bytes on the wire and is compared as the client
+    /// wrote it (`ArchiveConductor.java:742-761` over `Catalog.findLast`).
+    #[test]
+    fn a_match_reaches_the_session_with_its_fragment_whole() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let fragment = "endpoint=localhost:3333";
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&find_last_matching_request(
+                    session_id, 7, 0, 1001, 33, fragment,
+                )),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::Query {
+                session_id,
+                correlation_id: 7,
+                query: Query::FindLastMatching {
+                    min_recording_id: 0,
+                    session_id: 1001,
+                    stream_id: 33,
+                    channel_fragment: fragment.as_bytes().to_vec(),
+                },
+            }),
+            control.calls.last()
+        );
+    }
+
+    /// A listing request reaches the session as an intent of its own — not as a
+    /// question, because the answer is a message the conductor offers over
+    /// several turns (`ArchiveConductor.java:688-706`).
+    #[test]
+    fn a_listing_request_reaches_the_session_as_its_own_intent() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&list_recording_request(session_id, 7, 100)),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::ListRecording {
+                session_id,
+                correlation_id: 7,
+                recording_id: 100,
+            }),
+            control.calls.last()
+        );
+    }
+
     /// The four questions whose answer is a position, each reaching the session
     /// as the same kind of [`Query`] and differing only in which one
     /// (`ArchiveConductor.java:1159-1195`).
@@ -1650,7 +1866,7 @@ mod tests {
                 Some(&Call::Query {
                     session_id,
                     correlation_id: 7,
-                    query,
+                    query: query.clone(),
                 }),
                 control.calls.last(),
                 "{query:?}"

@@ -60,7 +60,7 @@
 //! sessions are driven, which is the order the reference's two calls already
 //! have.
 //!
-//! Three more things the callbacks cannot do for the same reason, and which
+//! More things the callbacks cannot do for the same reason, and which
 //! therefore also happen in `drive`:
 //!
 //! - **Making a session** needs the image's `sourceIdentity` for the session
@@ -72,6 +72,15 @@
 //!   conductor holds and the callbacks do not.
 //! - **`logWarning`** (`:443-446`) goes to the error handler, which the
 //!   conductor owns.
+//! - **The questions about a recording** (`:1159-1195`, `:742-761`) are
+//!   answered out of the catalog, which is the *conductor's* — so what a
+//!   callback records is the question ([`Deferred::Query`]) and `drive` is
+//!   what reads the catalog for the answer.
+//! - **Serving a recording's descriptor** (`:688-706`) needs the same catalog
+//!   for the two refusals in front of it, so a callback records the intent
+//!   ([`Deferred::ListRecording`]) and the listing is started in `drive` —
+//!   which then offers the message once a turn until the client takes it
+//!   ([`Sessions::drive_listings`]).
 //!
 //! `Sessions` consequently does not hold a `CncFile`: the region arrives each
 //! turn as an argument. That also makes it testable without one.
@@ -420,8 +429,8 @@ enum Deferred {
         correlation_id: i64,
         encoded_credentials: Vec<u8>,
     },
-    /// One of the four questions about a recording whose answer is in the
-    /// **catalog** (`ArchiveConductor.java:1159-1195`).
+    /// One of the questions about a recording whose answer is in the
+    /// **catalog** (`ArchiveConductor.java:1159-1195`, `:742-761`).
     ///
     /// It is the first thing the callbacks defer that is not a message: the
     /// answer is not known yet, because the catalog belongs to the conductor
@@ -433,17 +442,36 @@ enum Deferred {
         correlation_id: i64,
         query: Query,
     },
+    /// `ArchiveConductor.listRecording` (`:688-706`): a request for one
+    /// recording's **descriptor**, which is not answered once but by a session
+    /// that keeps offering the message until the client takes it
+    /// (`ListRecordingByIdSession.java:60-80`).
+    ///
+    /// Deferred for the same reason the questions are, and with a second one on
+    /// top: the two refusals in front of the session are both catalog
+    /// questions — `hasRecording`, and whether this session already has a
+    /// listing in flight (`:690-706`). What is deferred is the intent, and the
+    /// listing starts in the turn the intent is replayed in.
+    ListRecording {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
 }
 
 /// A question about a recording that the catalog can answer.
 ///
 /// The reference has one `ArchiveConductor` method per question
 /// (`getStartPosition`, `getRecordingPosition`, `getStopPosition`,
-/// `getMaxRecordedPosition` — `ArchiveConductor.java:1159-1195`), each four
-/// lines long and three of them identical but for which field they read. Here
-/// the question is the value and the reading is in one place; the *answers* are
-/// the reference's, field for field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `getMaxRecordedPosition`, `findLastMatchingRecording` —
+/// `ArchiveConductor.java:1159-1195`, `:742-761`), four of them four lines long
+/// and identical but for which field they read. Here the question is the value
+/// and the reading is in one place; the *answers* are the reference's, field for
+/// field.
+///
+/// Not `Copy`, which the four positions were: a match has a channel fragment,
+/// and a fragment is however many bytes the client sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// `catalog.startPosition(recordingId)` (`:1159-1165`).
     StartPosition {
@@ -467,34 +495,83 @@ pub enum Query {
         /// The recording asked about.
         recording_id: i64,
     },
+    /// The id of the newest recording at or after a floor whose session,
+    /// stream and channel match (`:742-761` over `Catalog.findLast`,
+    /// `Catalog.java:544-578`).
+    ///
+    /// The one question here with no recording id: the id is what it is
+    /// looking for. `-1` is its "no match", which is an answer rather than a
+    /// refusal (`:756-757`).
+    FindLastMatching {
+        /// The lowest id that may be answered with, which the reference
+        /// refuses to take a negative of (`:749-753`).
+        min_recording_id: i64,
+        /// The session the client is looking for.
+        session_id: i32,
+        /// The stream it is looking for.
+        stream_id: i32,
+        /// A fragment the **original** channel must contain.
+        channel_fragment: Vec<u8>,
+    },
 }
 
 impl Query {
-    /// The recording this question is about.
+    /// The recording this question is about, for the four that name one.
     #[must_use]
-    pub const fn recording_id(&self) -> i64 {
+    pub const fn recording_id(&self) -> Option<i64> {
         match self {
             Self::StartPosition { recording_id }
             | Self::RecordingPosition { recording_id }
             | Self::StopPosition { recording_id }
-            | Self::MaxRecordedPosition { recording_id } => *recording_id,
+            | Self::MaxRecordedPosition { recording_id } => Some(*recording_id),
+            Self::FindLastMatching { .. } => None,
         }
     }
 }
 
 /// The answer to a question about a recording
-/// (`ArchiveConductor.java:1159-1195`).
+/// (`ArchiveConductor.java:1159-1195`, `:742-761`).
 ///
-/// Every one of the reference's four starts with `hasRecording`, which refuses
-/// for a recording the catalog does not hold and says so in the words the C
-/// client prints (`:1950-1960` over `client/ArchiveException.java:272-275`).
+/// The four that name a recording all start with `hasRecording`, which refuses
+/// for one the catalog does not hold and says so in the words the C client
+/// prints (`:1950-1960` over `client/ArchiveException.java:272-275`). A match
+/// has no such id to check — the floor is checked instead, and it is the one
+/// question whose "not found" is a value.
 ///
 /// # Errors
 ///
 /// The refusal's message, for [`Sessions::run_deferred`] to send as
 /// [`UNKNOWN_RECORDING`].
-fn answer_query(catalog: &Catalog, query: Query) -> Result<i64, String> {
-    let recording_id = query.recording_id();
+fn answer_query(catalog: &Catalog, query: &Query) -> Result<i64, String> {
+    // A match first, because it is the question with no recording id to check.
+    if let Query::FindLastMatching {
+        min_recording_id,
+        session_id,
+        stream_id,
+        channel_fragment,
+    } = query
+    {
+        // A floor below zero is refused before the catalog is asked at all, and
+        // the refusal is the reference's own line (`:749-753`). It carries
+        // `UNKNOWN_RECORDING` as its relevant id like the refusals below,
+        // because that is the id `ArchiveConductor` hands `sendErrorResponse`
+        // there too.
+        if *min_recording_id < 0 {
+            return Err(format!("minRecordingId={min_recording_id} < 0"));
+        }
+
+        // A match that is not found is `NULL_RECORD_ID` on the wire rather than
+        // a refusal: the reference answers `OK` with the value its `findLast`
+        // returned and says so in a comment (`:754-757`).
+        return catalog
+            .find_last(*min_recording_id, *session_id, *stream_id, channel_fragment)
+            .map(|found| found.unwrap_or(NULL_RECORD_ID))
+            .map_err(|error| format!("catalog could not search for a recording: {error}"));
+    }
+
+    let recording_id = query
+        .recording_id()
+        .expect("a match is the only question without a recording id, and it returned");
 
     if !catalog.has_recording(recording_id) {
         return Err(unknown_recording_message(recording_id));
@@ -514,6 +591,7 @@ fn answer_query(catalog: &Catalog, query: Query) -> Result<i64, String> {
         // when it does.
         Query::RecordingPosition { .. } => NULL_POSITION,
         Query::MaxRecordedPosition { .. } => recording.stop_position,
+        Query::FindLastMatching { .. } => unreachable!("a match returns above"),
     })
 }
 
@@ -522,11 +600,26 @@ fn answer_query(catalog: &Catalog, query: Query) -> Result<i64, String> {
 /// (`ArchiveConductor.java:1170-1173`).
 pub const NULL_POSITION: i64 = -1;
 
+/// `Catalog.NULL_RECORD_ID` (`Catalog.java:111`), which is `Aeron.NULL_VALUE`
+/// as well: the id a match answers with when nothing matched. It is an `OK`
+/// carrying `-1` and not a refusal — "matches client side specification", as
+/// the reference puts it (`ArchiveConductor.java:756-757`).
+pub const NULL_RECORD_ID: i64 = -1;
+
 /// `ArchiveException.UNKNOWN_RECORDING` (`client/ArchiveException.java:54`),
 /// which is what the C client prints as `errorCode=5`
 /// (`aeron_archive_client.c:189-192`, and `aeron_archive_test.cpp:1125` asserts
 /// the whole line).
 pub const UNKNOWN_RECORDING: i64 = 5;
+
+/// `ArchiveException.ACTIVE_LISTING` (`client/ArchiveException.java:34`), the
+/// relevant id of the refusal a second listing on one session gets
+/// (`ArchiveConductor.java:690-694`).
+pub const ACTIVE_LISTING: i64 = 1;
+
+/// That refusal's message, which is the reference's own line
+/// (`ArchiveConductor.java:692`).
+pub const ACTIVE_LISTING_MSG: &str = "active listing already in progress";
 
 /// `ArchiveException.buildUnknownRecordingErrorMsg` (`:272-275`), which is the
 /// **message** half of that same line and has to match it word for word.
@@ -553,6 +646,53 @@ struct PendingConnect {
     /// Set when the adapter aborted this session in the same poll that made
     /// it — see [`Sessions::abort_session`].
     abort_reason: Option<String>,
+}
+
+/// One recording's descriptor, on its way to the client that asked for it.
+///
+/// This is the reference's `ListRecordingByIdSession`
+/// (`ListRecordingByIdSession.java:26-96`), which is a `Session` in the
+/// conductor's own `SessionWorker` — the same worker control sessions live in —
+/// and which the asking session holds a reference to in `activeListing`
+/// (`ControlSession.java:91`, `:298-306`).
+///
+/// **What is not the reference's shape**: the two objects are one here. Java has
+/// the listing in the worker's list *and* the control session pointing at it;
+/// a value cannot be in two places, so the listing lives in this list and the
+/// asking session is named by id — the same one-owner rule the adapter's module
+/// note gives for the sessions themselves.
+///
+/// The state is three fields because that is all the reference's session has
+/// beyond the collaborator references it is handed each turn: a listing does its
+/// work against the catalog and the session it was created from, both of which
+/// are arguments here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Listing {
+    /// The control session that asked, and the one the descriptor goes to.
+    control_session_id: i64,
+    /// The correlation id of the request (`ListRecordingByIdSession.sessionId`
+    /// is this one, `:83-86`).
+    correlation_id: i64,
+    /// The recording whose descriptor it is.
+    recording_id: i64,
+    /// Set when the descriptor went out, or when the recording turned out not
+    /// to be there any more — and by [`Sessions::drive_listings`] when the
+    /// session that asked is gone (`Session.abort`, `:42-46`).
+    is_done: bool,
+}
+
+/// Why a listing request is not going to be served
+/// (`ArchiveConductor.listRecording`, `ArchiveConductor.java:690-698`).
+///
+/// Both are answers the client is sent, and they are two different answers:
+/// one is an `ERROR` naming the action that is already in progress, the other is
+/// `RECORDING_UNKNOWN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingRefusal {
+    /// The session that asked is already being served (`:690-694`).
+    ActiveListing,
+    /// The catalog does not hold the recording (`:695-698`).
+    UnknownRecording,
 }
 
 /// A live control session and the identity it is reachable by.
@@ -637,6 +777,14 @@ pub struct Sessions {
     pending_connects: Vec<PendingConnect>,
     /// Responses the callbacks owed and could not send.
     pending: Vec<Deferred>,
+    /// Descriptors on their way out, one per listing request that is still
+    /// being served (`SessionWorker.sessions`, `SessionWorker.java:23`).
+    ///
+    /// A list rather than one slot on the asking session: the reference's
+    /// worker holds every session in one array, and a client is allowed one
+    /// listing *per session* — which is what
+    /// [`Sessions::has_active_listing`] is the check for.
+    listings: Vec<Listing>,
     /// Sessions finished this turn, waiting for the conductor to collect them.
     ended: Vec<EndedSession>,
     /// The net movement of the aggregate session counter (102), applied once
@@ -678,6 +826,7 @@ impl Sessions {
             sessions: HashMap::new(),
             pending_connects: Vec::new(),
             pending: Vec::new(),
+            listings: Vec::new(),
             ended: Vec::new(),
             session_count_delta: 0,
             session_counter_registration_id: None,
@@ -736,8 +885,120 @@ impl Sessions {
         self.allocate_session_counter(client, counters);
         self.run_pending_connects(client, authenticator, now_ms);
         self.run_deferred(client, authenticator, catalog, now_ms);
+        self.drive_listings(client, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
+    }
+
+    /// Whether this session already has a listing in flight
+    /// (`ControlSession.hasActiveListing`, `ControlSession.java:298-301`).
+    ///
+    /// The reference asks the session's own `activeListing` slot; the listing
+    /// lives in [`Sessions::listings`] here, so the question is asked of the
+    /// list — same question, one owner further out.
+    #[must_use]
+    fn has_active_listing(&self, control_session_id: i64) -> bool {
+        self.listings
+            .iter()
+            .any(|listing| listing.control_session_id == control_session_id)
+    }
+
+    /// Start the listing a request asked for, or say why it will not be started
+    /// (`ArchiveConductor.listRecording`, `ArchiveConductor.java:688-706`).
+    ///
+    /// `None` is the listing itself, which is in [`Sessions::listings`] by the
+    /// time this returns: the two refusals are the caller's to send, and the
+    /// descriptor is [`Sessions::drive_listings`]'s.
+    #[must_use]
+    fn start_listing(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        catalog: &Catalog,
+    ) -> Option<ListingRefusal> {
+        if self.has_active_listing(session_id) {
+            return Some(ListingRefusal::ActiveListing);
+        }
+
+        if !catalog.has_recording(recording_id) {
+            return Some(ListingRefusal::UnknownRecording);
+        }
+
+        self.listings.push(Listing {
+            control_session_id: session_id,
+            correlation_id,
+            recording_id,
+            is_done: false,
+        });
+
+        None
+    }
+
+    /// Serve the listings, one attempt each (`SessionWorker.doWork` over
+    /// `ListRecordingByIdSession.java:60-80`).
+    ///
+    /// The reference's session asks the catalog to wrap the descriptor and hands
+    /// the wrapped bytes to `sendDescriptor`, which answers whether they went
+    /// out. `false` is not a failure to report but a turn to try again — a full
+    /// window or a log turning over — so the listing stays until the send takes,
+    /// which is the whole of its pagination.
+    ///
+    /// A listing whose recording can no longer be read is answered with
+    /// `RECORDING_UNKNOWN` and is done: that is what the reference's `false` from
+    /// `wrapDescriptor` means (`:63-73`), and a client that asked about a
+    /// recording that has since been retired hears the same thing as one that
+    /// asked about a recording that was never there.
+    ///
+    /// A listing whose session is done is finished without an attempt: the
+    /// reference's `SessionWorker` would have removed the listing as soon as its
+    /// session aborted (`ControlSession.abort`, `ControlSession.java:145-157`,
+    /// which aborts the listing it holds). Sessions are driven after listings
+    /// here, so a session that ended last turn is caught here first.
+    ///
+    /// Runs before [`Sessions::drive_sessions`] because the reference's worker
+    /// walks its sessions newest-first and a listing is always added after the
+    /// session that asked for it.
+    fn drive_listings(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
+        for listing in &mut self.listings {
+            if listing.is_done {
+                continue;
+            }
+
+            let Some(entry) = self.sessions.get_mut(&listing.control_session_id) else {
+                listing.is_done = true;
+                continue;
+            };
+
+            if entry.control.is_done() {
+                listing.is_done = true;
+                continue;
+            }
+
+            let Ok(Some(descriptor)) = catalog.descriptor_body(listing.recording_id) else {
+                entry.control.send_recording_unknown(
+                    listing.correlation_id,
+                    listing.recording_id,
+                    now_ms,
+                    client,
+                );
+                listing.is_done = true;
+                continue;
+            };
+
+            if entry
+                .control
+                .send_descriptor(listing.correlation_id, descriptor, now_ms, client)
+            {
+                listing.is_done = true;
+            }
+        }
+
+        // The worker's `fastUnorderedRemove` is what takes a finished listing
+        // out where it stands (the last one fills its place) — and the order
+        // listings are driven in is not a contract, so a `retain` says the same
+        // thing about the result.
+        self.listings.retain(|listing| !listing.is_done);
     }
 
     /// `ctx.controlSessionsCounter()`, asked for once and taken up when the
@@ -950,7 +1211,7 @@ impl Sessions {
                         continue;
                     };
 
-                    match answer_query(catalog, query) {
+                    match answer_query(catalog, &query) {
                         Ok(value) => {
                             entry
                                 .control
@@ -963,6 +1224,44 @@ impl Sessions {
                             now_ms,
                             client,
                         ),
+                    }
+                }
+                // `ArchiveConductor.listRecording` (`:688-706`): the two
+                // refusals, and then the listing itself — which is not sent from
+                // here but handed to `drive_listings`, in this same turn
+                // (`ArchiveConductor.addSession` at `:703`, driven by
+                // `super.doWork` at `:395` in the reference too).
+                Deferred::ListRecording {
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                } => {
+                    let Some(refusal) =
+                        self.start_listing(session_id, correlation_id, recording_id, catalog)
+                    else {
+                        continue;
+                    };
+
+                    let Some(entry) = self.sessions.get_mut(&session_id) else {
+                        continue;
+                    };
+
+                    match refusal {
+                        ListingRefusal::ActiveListing => entry.control.send_error_response(
+                            correlation_id,
+                            ACTIVE_LISTING,
+                            ACTIVE_LISTING_MSG,
+                            now_ms,
+                            client,
+                        ),
+                        ListingRefusal::UnknownRecording => {
+                            entry.control.send_recording_unknown(
+                                correlation_id,
+                                recording_id,
+                                now_ms,
+                                client,
+                            );
+                        }
                     }
                 }
             }
@@ -1153,6 +1452,20 @@ impl ControlPlane for Sessions {
             session_id,
             correlation_id,
             query,
+        });
+    }
+
+    fn on_list_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::ListRecording {
+            session_id,
+            correlation_id,
+            recording_id,
         });
     }
 
@@ -1416,20 +1729,20 @@ mod tests {
 
         assert_eq!(
             Ok(4096),
-            answer_query(&catalog, Query::StartPosition { recording_id: 0 })
+            answer_query(&catalog, &Query::StartPosition { recording_id: 0 })
         );
         assert_eq!(
             Ok(8192),
-            answer_query(&catalog, Query::StopPosition { recording_id: 0 })
+            answer_query(&catalog, &Query::StopPosition { recording_id: 0 })
         );
         assert_eq!(
             Ok(NULL_POSITION),
-            answer_query(&catalog, Query::RecordingPosition { recording_id: 0 }),
+            answer_query(&catalog, &Query::RecordingPosition { recording_id: 0 }),
             "a recording that is not in flight has no position to report"
         );
         assert_eq!(
             Ok(8192),
-            answer_query(&catalog, Query::MaxRecordedPosition { recording_id: 0 }),
+            answer_query(&catalog, &Query::MaxRecordedPosition { recording_id: 0 }),
             "which for one that is not active is where it stopped"
         );
     }
@@ -1447,7 +1760,7 @@ mod tests {
             Err("unknown recording id: 12345".to_owned()),
             answer_query(
                 &catalog,
-                Query::StartPosition {
+                &Query::StartPosition {
                     recording_id: 12345
                 }
             )
@@ -1459,11 +1772,186 @@ mod tests {
             Err(format!("unknown recording id: {}", i64::MIN)),
             answer_query(
                 &catalog,
-                Query::MaxRecordedPosition {
+                &Query::MaxRecordedPosition {
                     recording_id: i64::MIN
                 }
             )
         );
+    }
+
+    /// A match is answered with the id the catalog found, and with **`-1`** when
+    /// nothing matched — an `OK` carrying a value, not the refusal the four
+    /// questions about a named recording get (`ArchiveConductor.java:754-761`).
+    ///
+    /// The fixture catalog holds one recording: session 1001, stream 33, on
+    /// `aeron:udp?endpoint=localhost:3333`.
+    #[test]
+    fn a_match_is_answered_with_an_id_or_with_minus_one() {
+        let (_dir, catalog) = catalog_with_a_recording();
+
+        assert_eq!(
+            Ok(0),
+            answer_query(
+                &catalog,
+                &Query::FindLastMatching {
+                    min_recording_id: 0,
+                    session_id: 1001,
+                    stream_id: 33,
+                    channel_fragment: b"endpoint=localhost:3333".to_vec(),
+                }
+            )
+        );
+
+        assert_eq!(
+            Ok(0),
+            answer_query(
+                &catalog,
+                &Query::FindLastMatching {
+                    min_recording_id: 0,
+                    session_id: 1001,
+                    stream_id: 33,
+                    channel_fragment: Vec::new(),
+                }
+            ),
+            "an empty fragment is in every channel"
+        );
+
+        assert_eq!(
+            Ok(NULL_RECORD_ID),
+            answer_query(
+                &catalog,
+                &Query::FindLastMatching {
+                    min_recording_id: 0,
+                    session_id: 1001,
+                    stream_id: 33,
+                    channel_fragment: b"endpoint=localhost:4444".to_vec(),
+                }
+            ),
+            "a match that is not there is an answer, and -1 is it"
+        );
+
+        for (session_id, stream_id) in [(1002, 33), (1001, 34)] {
+            assert_eq!(
+                Ok(NULL_RECORD_ID),
+                answer_query(
+                    &catalog,
+                    &Query::FindLastMatching {
+                        min_recording_id: 0,
+                        session_id,
+                        stream_id,
+                        channel_fragment: Vec::new(),
+                    }
+                ),
+                "session {session_id}, stream {stream_id}"
+            );
+        }
+
+        assert_eq!(
+            Ok(NULL_RECORD_ID),
+            answer_query(
+                &catalog,
+                &Query::FindLastMatching {
+                    min_recording_id: 1,
+                    session_id: 1001,
+                    stream_id: 33,
+                    channel_fragment: Vec::new(),
+                }
+            ),
+            "the floor excludes the one recording there is"
+        );
+    }
+
+    /// A negative floor is refused before the catalog is asked, in the
+    /// reference's own words (`ArchiveConductor.java:749-753`).
+    #[test]
+    fn a_negative_floor_is_refused_with_the_references_line() {
+        let (_dir, catalog) = catalog_with_a_recording();
+
+        assert_eq!(
+            Err("minRecordingId=-1 < 0".to_owned()),
+            answer_query(
+                &catalog,
+                &Query::FindLastMatching {
+                    min_recording_id: -1,
+                    session_id: 1,
+                    stream_id: 2,
+                    channel_fragment: Vec::new(),
+                }
+            )
+        );
+    }
+
+    /// A listing request is recorded, not started: what it needs first is the
+    /// catalog and the session, and a callback holds neither.
+    #[test]
+    fn a_listing_request_is_recorded_rather_than_started() {
+        let mut sessions = sessions();
+        sessions.on_list_recording(3, 7, 100, 0);
+
+        assert_eq!(
+            vec![Deferred::ListRecording {
+                session_id: 3,
+                correlation_id: 7,
+                recording_id: 100,
+            }],
+            sessions.pending
+        );
+        assert!(sessions.listings.is_empty(), "nothing is served yet");
+    }
+
+    /// The three answers `ArchiveConductor.listRecording` can give
+    /// (`ArchiveConductor.java:688-706`): the listing itself, a refusal because
+    /// the asking session is already being served, and `RECORDING_UNKNOWN` for a
+    /// recording the catalog does not hold.
+    ///
+    /// What is asserted is the **decision**, which is what can be wrong; the two
+    /// refusal messages and the descriptor are asserted where they are built
+    /// (`control_session`'s tests and `response_proxy`'s).
+    #[test]
+    fn a_listing_is_started_once_per_session_and_only_for_a_recording_there_is() {
+        let (_dir, catalog) = catalog_with_a_recording();
+        let mut sessions = sessions();
+
+        assert_eq!(
+            None,
+            sessions.start_listing(3, 7, 0, &catalog),
+            "a recording the catalog holds is served"
+        );
+        assert_eq!(
+            vec![Listing {
+                control_session_id: 3,
+                correlation_id: 7,
+                recording_id: 0,
+                is_done: false,
+            }],
+            sessions.listings
+        );
+        assert!(sessions.has_active_listing(3));
+
+        // The same session asking again: one listing per session, which is what
+        // `hasActiveListing` is for (`:690-694`). A *different* session may
+        // ask, and gets its own.
+        assert_eq!(
+            Some(ListingRefusal::ActiveListing),
+            sessions.start_listing(3, 8, 0, &catalog)
+        );
+        assert_eq!(None, sessions.start_listing(4, 9, 0, &catalog));
+        assert_eq!(2, sessions.listings.len());
+        assert_eq!(9, sessions.listings[1].correlation_id);
+        assert!(!sessions.has_active_listing(5));
+
+        // A recording that is not there is not a listing, wherever the id came
+        // from: `hasRecording` refuses it (`:695-698`).
+        assert_eq!(
+            Some(ListingRefusal::UnknownRecording),
+            sessions.start_listing(5, 10, 1, &catalog),
+            "the id next to the one the catalog holds"
+        );
+        assert_eq!(
+            Some(ListingRefusal::UnknownRecording),
+            sessions.start_listing(5, 11, -1, &catalog)
+        );
+        assert_eq!(2, sessions.listings.len());
     }
 
     /// What the archive's own control settings are for these tests, and the
