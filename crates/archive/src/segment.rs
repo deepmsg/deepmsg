@@ -127,8 +127,9 @@ pub enum SegmentError {
         /// What the frame said its length was.
         frame_length: i32,
     },
-    /// The next segment file is already there
-    /// (`RecordingWriter.onFileRollOver`, `:242-245`).
+    /// The **next** segment file is already there, which a roll-over refuses
+    /// (`RecordingWriter.onFileRollOver`, `:241-244`). Opening a segment that is
+    /// there is not this error — that is an extension.
     Exists {
         /// The file that was there.
         path: PathBuf,
@@ -257,9 +258,9 @@ impl SegmentWriter {
     ///
     /// # Errors
     ///
-    /// [`SegmentError::Io`] for the file system, and
-    /// [`SegmentError::Exists`] when a segment of this recording is already
-    /// there — a recording does not overwrite one.
+    /// [`SegmentError::Io`] for the file system. A segment file that is already
+    /// there is **not** an error: it is the one this recording is continuing
+    /// into (see [`SegmentWriter::open_segment`]).
     pub fn create(
         directory: &Path,
         spec: SegmentSpec,
@@ -337,17 +338,20 @@ impl SegmentWriter {
     ///
     /// The offset advances by the block's **length**, not by what was written —
     /// the two differ by the padding rule, and it is the length that says where
-    /// the next frame goes.
+    /// the next frame goes. What is *returned* is the other one: the bytes that
+    /// went to the file, which is the reference's `dataLength`
+    /// (`RecordingWriter.java:114`) and what a recorder counts as written
+    /// (`:144`).
     ///
     /// # Errors
     ///
     /// [`SegmentError::Malformed`] for a block that is not a walkable run of
     /// frames, and [`SegmentError::Io`] for the file system — including the next
     /// segment being in the way when this one fills.
-    pub fn write_block(&mut self, block: &[u8]) -> Result<(), SegmentError> {
+    pub fn write_block(&mut self, block: &[u8]) -> Result<u64, SegmentError> {
         let length = block.len();
         if 0 == length {
-            return Ok(());
+            return Ok(0);
         }
 
         let padding = is_padding_frame(block);
@@ -396,7 +400,7 @@ impl SegmentWriter {
             self.roll_over()?;
         }
 
-        Ok(())
+        Ok(written)
     }
 
     /// Close the segment being written and start the next one
@@ -406,29 +410,59 @@ impl SegmentWriter {
     /// reference's arithmetic and only true because a segment is filled from its
     /// beginning: the file's last block is one that did not fit the one before
     /// it.
+    ///
+    /// # Every refusal is made before anything moves
+    ///
+    /// The reference moves its base position and its offset **first** and checks
+    /// for an existing file second (`:236-244`), which is safe there only because
+    /// the throw that follows takes the writer with it: its caller catches, closes
+    /// the channel and stops the recording (`RecordingWriter.java:157-165`,
+    /// `RecordingSession.java:262-275`). This writer has no throw to unwind with,
+    /// so the two mutations happen **after** both refusals — a roll-over that
+    /// fails leaves the segment it was writing exactly where it was, and a caller
+    /// that writes again rolls over again and fails again rather than writing
+    /// over the segment from its beginning.
     fn roll_over(&mut self) -> Result<(), SegmentError> {
-        self.segment_base_position += i64::try_from(self.segment_length).unwrap_or(i64::MAX);
-        self.offset = 0;
+        let next_base =
+            self.segment_base_position + i64::try_from(self.segment_length).unwrap_or(i64::MAX);
+        let path = self
+            .directory
+            .join(segment_file_name(self.recording_id, next_base));
 
-        let path = self.path();
+        // **This** is where an existing segment is refused, and it is the only
+        // place the reference refuses one (`:241-244`): rolling onto a file that
+        // is already there would append to another recording's bytes, where
+        // *opening* one that is there is what an extension does.
+        if path.exists() {
+            return Err(SegmentError::Exists { path });
+        }
+
         let next = Self::open_segment(&path, self.segment_length)?;
+
+        self.segment_base_position = next_base;
+        self.offset = 0;
         self.file = next;
 
         Ok(())
     }
 
+    /// Open the segment file, **making it if it is not there**
+    /// (`RecordingWriter.openRecordingSegmentFile`, `:213-232`: a
+    /// `RandomAccessFile` opened `"rw"` and set to the segment's length).
+    ///
+    /// An existing file of the right length is opened where it is, which is what
+    /// a recording being **extended** does: its bytes go into the segments the
+    /// first session already made (`ArchiveConductor.java:2109`). A file of some
+    /// other length is set to this one, which is the reference's `setLength` and
+    /// is where it would lose bytes rather than refuse.
     fn open_segment(path: &Path, segment_length: usize) -> Result<File, SegmentError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(path)
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::AlreadyExists => SegmentError::Exists {
-                    path: path.to_path_buf(),
-                },
-                _ => SegmentError::Io(error),
-            })?;
+            .map_err(SegmentError::Io)?;
 
         // Preallocated, which is what makes a padding frame's "header and
         // nothing else" leave zeroes behind it rather than a hole a reader has

@@ -3,9 +3,21 @@
 //! `ControlResponseProxy` is the one place an archive writes to a client
 //! (`ControlResponseProxy.java:34-273`): it encodes a message into a buffer it
 //! keeps and offers it on the session's own exclusive publication, up to three
-//! times, with no queue of its own in between. What goes out is one of three
-//! messages in this slice — a `ControlResponse`, a `Challenge` and a `Ping` —
-//! and the descriptor and signal sends arrive with the sessions that send them.
+//! times, with no queue of its own in between. What goes out is one of four
+//! messages in this slice — a `ControlResponse`, a `Challenge`, a `Ping` and a
+//! `RecordingDescriptor` — and the signal sends arrive with the sessions that
+//! send them.
+//!
+//! # The descriptor is not encoded, it is moved
+//!
+//! Every other message here is written field by field. A descriptor is the
+//! catalog's own bytes: the reference offers the mapped descriptor straight
+//! onto the publication, prefixing only the message header and the two ids the
+//! listing session fills in (`:54-89`), and this does the same through
+//! [`Response::Descriptor`](crate::server::control_session::Response) — the
+//! body is copied once, and the session's two ids are written over the two the
+//! catalog leaves zero. That is why the catalog can hand out a
+//! `RecordingDescriptor` and mean a **message** by it.
 //!
 //! # The three attempts, and what ends a session
 //!
@@ -50,6 +62,11 @@ use deepmsg_codec::archive::challenge_codec::{self, ChallengeEncoder};
 use deepmsg_codec::archive::control_response_codec::{self, ControlResponseEncoder};
 use deepmsg_codec::archive::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec::archive::ping_codec::{self, PingEncoder};
+use deepmsg_codec::archive::recording_descriptor_codec::RecordingDescriptorEncoder;
+use deepmsg_codec::archive::recording_signal_event_codec::{self, RecordingSignalEventEncoder};
+use deepmsg_codec::archive::recording_subscription_descriptor_codec::{
+    self, RecordingSubscriptionDescriptorEncoder,
+};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::version::semantic_version_compose;
 
@@ -324,6 +341,66 @@ fn encode(buffer: &mut Vec<u8>, response: &Response) -> usize {
             MESSAGE_HEADER_LENGTH + encoder.encoded_length()
         }
 
+        // The catalog's own bytes, and only the two ids written over them: the
+        // reference offers the same body in two parts for the same reason —
+        // it comes out of a mapped file (`ControlResponseProxy.java:54-89`).
+        //
+        // The block this writes is `RecordingDescriptor`'s, so the message
+        // header the client reads says a descriptor is what follows and how
+        // long its fixed part is; the body carries the rest, strings and all.
+        Response::Descriptor {
+            control_session_id,
+            correlation_id,
+            body,
+        } => {
+            grow(buffer, MESSAGE_HEADER_LENGTH + body.len());
+            buffer[MESSAGE_HEADER_LENGTH..MESSAGE_HEADER_LENGTH + body.len()].copy_from_slice(body);
+
+            let encoder = RecordingDescriptorEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(*control_session_id)
+                .correlation_id(*correlation_id);
+
+            MESSAGE_HEADER_LENGTH + body.len()
+        }
+
+        // A subscription descriptor: `controlSessionId`, `correlationId`,
+        // `subscriptionId`, `streamId` and the channel, which is the only
+        // variable-length field (`RecordingSubscriptionDescriptorEncoder`).
+        Response::SubscriptionDescriptor {
+            control_session_id,
+            correlation_id,
+            subscription_id,
+            stream_id,
+            channel,
+        } => {
+            grow(
+                buffer,
+                MESSAGE_HEADER_LENGTH
+                    + recording_subscription_descriptor_codec::SBE_BLOCK_LENGTH as usize
+                    + VAR_DATA_LENGTH_PREFIX
+                    + channel.len(),
+            );
+
+            let encoder = RecordingSubscriptionDescriptorEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(*control_session_id)
+                .correlation_id(*correlation_id)
+                .subscription_id(*subscription_id)
+                .stream_id(*stream_id)
+                .stripped_channel(channel.as_bytes());
+
+            MESSAGE_HEADER_LENGTH + encoder.encoded_length()
+        }
+
         Response::Ping { control_session_id } => {
             grow(
                 buffer,
@@ -335,6 +412,38 @@ fn encode(buffer: &mut Vec<u8>, response: &Response) -> usize {
             let mut encoder = header.parent().unwrap();
 
             encoder.control_session_id(*control_session_id);
+
+            MESSAGE_HEADER_LENGTH + encoder.encoded_length()
+        }
+
+        // Fixed length: every field of a `RecordingSignalEvent` is in its block
+        // (`RecordingSignalEventEncoder.BLOCK_LENGTH`), so there is no var-data
+        // and no `grow` by anything but the block.
+        Response::Signal {
+            control_session_id,
+            correlation_id,
+            recording_id,
+            subscription_id,
+            position,
+            signal,
+        } => {
+            grow(
+                buffer,
+                MESSAGE_HEADER_LENGTH + recording_signal_event_codec::SBE_BLOCK_LENGTH as usize,
+            );
+
+            let encoder = RecordingSignalEventEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(*control_session_id)
+                .correlation_id(*correlation_id)
+                .recording_id(*recording_id)
+                .subscription_id(*subscription_id)
+                .position(*position)
+                .signal(*signal);
 
             MESSAGE_HEADER_LENGTH + encoder.encoded_length()
         }
@@ -412,6 +521,8 @@ mod tests {
     use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;
     use deepmsg_codec::archive::message_header_codec::MessageHeaderDecoder;
     use deepmsg_codec::archive::ping_codec::PingDecoder;
+    use deepmsg_codec::archive::recording_signal::RecordingSignal;
+    use deepmsg_codec::archive::recording_signal_event_codec::RecordingSignalEventDecoder;
     use deepmsg_codec::archive::{ReadBuf, SBE_SCHEMA_ID};
     use deepmsg_core::logbuffer::position::Position;
 
@@ -586,6 +697,99 @@ mod tests {
         assert_eq!(b"a challenge", decoder.encoded_challenge_slice(coordinates));
     }
 
+    /// A descriptor is a `RecordingDescriptor` message whose body is the
+    /// **catalog's own bytes** — so this one is built by a catalog rather than
+    /// by the test, which is the whole point: the two halves have to fit without
+    /// either of them knowing about the other
+    /// (`Catalog.wrapDescriptor` / `ControlResponseProxy.sendDescriptor`,
+    /// `Catalog.java:464-493` and `ControlResponseProxy.java:54-89`).
+    #[test]
+    fn a_catalogs_descriptor_body_is_a_message() {
+        use crate::catalog::{Catalog, DEFAULT_CAPACITY, Recording};
+        use crate::mark::tests::TempDir;
+        use deepmsg_codec::archive::recording_descriptor_codec::{
+            self, RecordingDescriptorDecoder,
+        };
+
+        let dir = TempDir::new();
+        let mut catalog = Catalog::create(dir.path(), DEFAULT_CAPACITY, 100).expect("a catalog");
+
+        let written = Recording {
+            recording_id: 0,
+            start_timestamp: 1_700_000_000_000,
+            stop_timestamp: 1_700_000_001_000,
+            start_position: 4096,
+            stop_position: 8192,
+            initial_term_id: 7,
+            segment_file_length: 128 * 1024,
+            term_buffer_length: 64 * 1024,
+            mtu_length: 1408,
+            session_id: 1001,
+            stream_id: 33,
+            stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            source_identity: "aeron:ipc".to_owned(),
+        };
+        let recording_id = catalog.add_recording(&written).expect("added");
+        let body = catalog
+            .descriptor_body(recording_id)
+            .expect("a body")
+            .expect("the record is there");
+
+        let (mut proxy, mut publications) = a_proxy();
+        assert_eq!(
+            Offered::Sent,
+            proxy.offer(
+                &mut publications,
+                &Response::Descriptor {
+                    control_session_id: 7,
+                    correlation_id: 11,
+                    body,
+                }
+            )
+        );
+
+        let payload = publications.last_offered();
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+        assert_eq!(SBE_SCHEMA_ID, header.schema_id());
+        assert_eq!(
+            recording_descriptor_codec::SBE_TEMPLATE_ID,
+            header.template_id(),
+            "the client switches on this to know a descriptor arrived"
+        );
+
+        let mut decoder = RecordingDescriptorDecoder::default().header(header, 0);
+        assert_eq!(7, decoder.control_session_id());
+        assert_eq!(11, decoder.correlation_id());
+        assert_eq!(recording_id, decoder.recording_id());
+        assert_eq!(written.start_timestamp, decoder.start_timestamp());
+        assert_eq!(written.stop_timestamp, decoder.stop_timestamp());
+        assert_eq!(written.start_position, decoder.start_position());
+        assert_eq!(written.stop_position, decoder.stop_position());
+        assert_eq!(written.initial_term_id, decoder.initial_term_id());
+        assert_eq!(written.segment_file_length, decoder.segment_file_length());
+        assert_eq!(written.term_buffer_length, decoder.term_buffer_length());
+        assert_eq!(written.mtu_length, decoder.mtu_length());
+        assert_eq!(written.session_id, decoder.session_id());
+        assert_eq!(written.stream_id, decoder.stream_id());
+
+        let coordinates = decoder.stripped_channel_decoder();
+        assert_eq!(
+            written.stripped_channel.as_bytes(),
+            decoder.stripped_channel_slice(coordinates)
+        );
+        let coordinates = decoder.original_channel_decoder();
+        assert_eq!(
+            written.original_channel.as_bytes(),
+            decoder.original_channel_slice(coordinates)
+        );
+        let coordinates = decoder.source_identity_decoder();
+        assert_eq!(
+            written.source_identity.as_bytes(),
+            decoder.source_identity_slice(coordinates)
+        );
+    }
+
     /// A ping carries the session and nothing else.
     #[test]
     fn a_ping_decodes_back_to_what_was_sent() {
@@ -601,6 +805,45 @@ mod tests {
         let decoder = PingDecoder::default().header(header, 0);
 
         assert_eq!(7, decoder.control_session_id());
+    }
+
+    /// The signal is the third message a session can send, and the only one
+    /// that is not an answer — so it is worth checking on the wire rather than
+    /// by name.
+    #[test]
+    fn a_signal_decodes_back_to_what_was_sent() {
+        let (mut proxy, mut publications) = a_proxy();
+
+        let signal = Response::Signal {
+            control_session_id: 7,
+            correlation_id: 11,
+            recording_id: 3,
+            subscription_id: 5,
+            position: 4096,
+            signal: RecordingSignal::EXTEND,
+        };
+        assert_eq!(Offered::Sent, proxy.offer(&mut publications, &signal));
+
+        let payload = publications.last_offered();
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+
+        assert_eq!(
+            recording_signal_event_codec::SBE_TEMPLATE_ID,
+            header.template_id()
+        );
+        assert_eq!(
+            recording_signal_event_codec::SBE_BLOCK_LENGTH,
+            header.block_length()
+        );
+
+        let decoder = RecordingSignalEventDecoder::default().header(header, 0);
+
+        assert_eq!(7, decoder.control_session_id());
+        assert_eq!(11, decoder.correlation_id());
+        assert_eq!(3, decoder.recording_id());
+        assert_eq!(5, decoder.subscription_id());
+        assert_eq!(4096, decoder.position());
+        assert_eq!(RecordingSignal::EXTEND, decoder.signal());
     }
 
     /// The reused buffer is not allowed to show through: a challenge after a

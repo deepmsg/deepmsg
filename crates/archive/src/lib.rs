@@ -13,5 +13,6 @@ pub mod client;
 pub mod mark;
 pub mod mark_file;
 pub mod recording_log;
+pub mod recording_writer;
 pub mod segment;
 pub mod server;

@@ -47,6 +47,7 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 
 use crate::checksum::Checksum;
+use crate::mark::NULL_VALUE;
 use crate::mark_file::{MAJOR_VERSION, SEMANTIC_VERSION};
 
 /// `Archive.FILENAME_CATALOG` (`Archive.java:284`).
@@ -274,6 +275,14 @@ impl CatalogIndex {
         self.entries.iter().map(|(id, _)| *id)
     }
 
+    /// The recordings it knows, newest first: the direction `Catalog.findLast`
+    /// scans in (`Catalog.java:551-559`, where the index is walked `i -= 2` from
+    /// its last position). Not `pub` — it is [`Catalog::find_last`]'s step, and
+    /// nothing outside this module walks a catalog backwards.
+    fn newest_first(&self) -> impl Iterator<Item = i64> + '_ {
+        self.entries.iter().rev().map(|(id, _)| *id)
+    }
+
     /// Record one, keeping the order ids are searched in.
     fn add(&mut self, recording_id: i64, offset: usize) {
         match self
@@ -439,6 +448,71 @@ impl Catalog {
         self.index.offset_of(recording_id)
     }
 
+    /// Whether this catalog holds a recording (`Catalog.hasRecording`,
+    /// `Catalog.java:495-498`).
+    ///
+    /// The reference's test is `recordingId >= 0 && recordingDescriptorOffset
+    /// (recordingId) > 0`, and the index is the same question asked of a map:
+    /// [`CatalogIndex::offset_of`] answers `None` for an id no record carries,
+    /// and a record that was retired is taken out of the index
+    /// (`Catalog.changeState`, `:779-790`), which is what makes `> 0` false for
+    /// it there.
+    ///
+    /// This is the guard every request that names a recording passes through on
+    /// its way to [`Catalog::recording`], and the reason it is a separate
+    /// question: the refusal it produces carries the reference's own words
+    /// (`ArchiveConductor.hasRecording`, `ArchiveConductor.java:1950-1960`).
+    #[must_use]
+    pub fn has_recording(&self, recording_id: i64) -> bool {
+        recording_id >= 0 && self.recording_offset(recording_id).is_some()
+    }
+
+    /// The **newest** recording at or after `min_recording_id` whose session,
+    /// stream and original channel match (`Catalog.findLast`,
+    /// `Catalog.java:544-578`).
+    ///
+    /// `None` is the reference's `NULL_RECORD_ID`, which is what a
+    /// `FindLastMatchingRecordingRequest` answers a client with when nothing
+    /// matches — the "not found" is an `OK` carrying `-1`, not a refusal
+    /// (`ArchiveConductor.java:742-761`).
+    ///
+    /// # The scan
+    ///
+    /// The index is in id order and the reference's is too, so "newest first"
+    /// is the same walk backwards, and the first id below the floor ends it
+    /// rather than being skipped (`:553-559`). Every id at or above the floor is
+    /// asked, and the first one that answers is the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Malformed`] when a record the index holds cannot be
+    /// decoded. The reference throws out of `findLast` on the same record; this
+    /// build answers with what it read, so the caller hears about it.
+    pub fn find_last(
+        &self,
+        min_recording_id: i64,
+        session_id: i32,
+        stream_id: i32,
+        channel_fragment: &[u8],
+    ) -> Result<Option<i64>, CatalogError> {
+        for recording_id in self.index.newest_first() {
+            if recording_id < min_recording_id {
+                break;
+            }
+
+            let recording = self.recording(recording_id)?;
+
+            if recording.session_id == session_id
+                && recording.stream_id == stream_id
+                && channel_contains(&recording.original_channel, channel_fragment)
+            {
+                return Ok(Some(recording_id));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Append a recording, and answer with the id it was given.
     ///
     /// The id is the catalog's to allocate, not the caller's: it is
@@ -591,6 +665,89 @@ impl Catalog {
             })
     }
 
+    /// Write where a recording stopped, and when
+    /// (`Catalog.recordingStopped`, `:627-638`).
+    ///
+    /// This is the one write a live catalog's *record* takes: the row was
+    /// written with `NULL_VALUE` for both fields when the recording started and
+    /// stays that way until it ends — which is what makes "has it stopped?" a
+    /// question a reader can ask of the file itself. The checksum the reference
+    /// recomputes here is the one this build writes as zero, because an archive
+    /// with no checksum provider computes zero (`:911-921`).
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn recording_stopped(
+        &mut self,
+        recording_id: i64,
+        stop_position: i64,
+        now_ms: i64,
+    ) -> Result<(), CatalogError> {
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        self.write_stop(offset, stop_position, now_ms)
+    }
+
+    /// Record that a recording has been **extended**: the row goes back to
+    /// being one that has not stopped, and remembers which control session and
+    /// request did it (`Catalog.extendRecording`, `:648-662`).
+    ///
+    /// Five fields, and the two that matter to a reader are the pair of stop
+    /// ones: an extended recording has not stopped any more, so both go back to
+    /// the null. The descriptor's own `controlSessionId` and `correlationId`
+    /// — the two the *response* framing writes over for a descriptor listing
+    /// (see [`Catalog::descriptor_body`]) — are what an extend leaves behind in
+    /// the file, which is why the reference writes them here and nowhere else.
+    ///
+    /// The checksum the reference recomputes is the one this build writes as
+    /// zero: an archive with no checksum provider computes zero
+    /// (`:911-921`), and the field lives in the record **header**, which this
+    /// window does not reach.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn extend_recording(
+        &mut self,
+        recording_id: i64,
+        control_session_id: i64,
+        correlation_id: i64,
+        image_session_id: i32,
+    ) -> Result<(), CatalogError> {
+        // Within the descriptor's block, which the generated codec puts at
+        // these offsets (`recording_descriptor_codec`: `controlSessionId` at 0,
+        // `correlationId` at 8, `stopTimestamp` at 32, `stopPosition` at 48,
+        // `sessionId` at 72).
+        const CONTROL_SESSION_ID_OFFSET: usize = 0;
+        const CORRELATION_ID_OFFSET: usize = 8;
+        const STOP_TIMESTAMP_OFFSET: usize = 32;
+        const STOP_POSITION_OFFSET: usize = 48;
+        const SESSION_ID_OFFSET: usize = 72;
+
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        let block_length = usize::from(DESCRIPTOR_BLOCK_LENGTH);
+        let region = self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, block_length)?;
+
+        region
+            .store_i64_release(CONTROL_SESSION_ID_OFFSET, control_session_id)
+            .and_then(|()| region.store_i64_release(CORRELATION_ID_OFFSET, correlation_id))
+            .and_then(|()| region.store_i32_release(SESSION_ID_OFFSET, image_session_id))
+            .and_then(|()| region.store_i64_release(STOP_TIMESTAMP_OFFSET, NULL_VALUE))
+            .and_then(|()| region.store_i64_release(STOP_POSITION_OFFSET, NULL_VALUE))
+            .ok_or(CatalogError::Malformed {
+                offset,
+                length: i32::try_from(block_length).unwrap_or(i32::MAX),
+            })
+    }
+
     /// Retire a record, or bring it back: the record's `state` changes and the
     /// index follows (`Catalog.changeState`, `:778-796`).
     ///
@@ -683,6 +840,54 @@ impl Catalog {
             .ok_or(CatalogError::UnknownRecording { recording_id })?;
 
         self.recording_at(offset)
+    }
+
+    /// One record's **body**: the bytes behind its 32-byte header, which are
+    /// exactly what a `RecordingDescriptor` message carries behind its message
+    /// header.
+    ///
+    /// This is what a listing session sends. The bytes are the descriptor as
+    /// the catalog holds it, **including** the two `int64`s in front of
+    /// `recordingId` — `controlSessionId` and `correlationId`, which the
+    /// catalog writes zero and [`crate::server::response_proxy`] writes the
+    /// session's own values over. That is what makes a body a message already:
+    /// the reference builds the same one by copying the catalog's bytes from
+    /// `recordingId` onwards onto the publication and writing the two ids in
+    /// front of them (`ControlResponseProxy.sendDescriptor`,
+    /// `ControlResponseProxy.java:54-89` over `Catalog.wrapDescriptor`,
+    /// `:464-493`) — the same bytes, arranged the other way round.
+    ///
+    /// `None` is `wrapDescriptor` answering `false`: no such record, or one
+    /// whose length field cannot be used (`wrapDescriptorAtOffset` answers `-1`
+    /// for a length that is not positive, `:480-493`). A listing session turns
+    /// either into `RECORDING_UNKNOWN`, which is what the reference's
+    /// `ListRecordingByIdSession.doWork` does with the same `false`
+    /// (`ListRecordingByIdSession.java:60-80`).
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Malformed`] when the header or the body cannot be read.
+    pub fn descriptor_body(&self, recording_id: i64) -> Result<Option<Vec<u8>>, CatalogError> {
+        let Some(offset) = self.recording_offset(recording_id) else {
+            return Ok(None);
+        };
+
+        let header_bytes = self.read_at(offset, DESCRIPTOR_HEADER_LENGTH)?;
+        let header = decode_record_header(&header_bytes)?;
+        let length = header.length();
+
+        // The length rule is `wrapDescriptorAtOffset`'s, which is **not**
+        // `recording_at`'s: a length that cannot be used is a record a listing
+        // client is told does not exist, where a read by id calls it malformed.
+        // The reference has the same split across the same two methods.
+        if length <= 0 || DESCRIPTOR_HEADER_LENGTH + length as usize > self.capacity() - offset {
+            return Ok(None);
+        }
+
+        Ok(Some(self.read_at(
+            offset + DESCRIPTOR_HEADER_LENGTH,
+            length as usize,
+        )?))
     }
 
     /// Read every recording the catalog holds, in id order.
@@ -991,6 +1196,24 @@ fn decode_descriptor(bytes: &[u8]) -> Result<RecordingDescriptorDecoder<'_>, Cat
 /// the writer's problem rather than a reason to fail a read.
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// `Catalog.originalChannelContains` (`Catalog.java:585-625`): whether the
+/// recording's **original** channel has `fragment` in it, anywhere.
+///
+/// An empty fragment is in every channel, which is the reference's first test
+/// and the reason a caller with nothing to match on passes nothing. The search
+/// is over the channel's bytes rather than its characters — the schema calls the
+/// field US-ASCII, and a fragment is compared as the client wrote it.
+fn channel_contains(channel: &str, fragment: &[u8]) -> bool {
+    if fragment.is_empty() {
+        return true;
+    }
+
+    channel
+        .as_bytes()
+        .windows(fragment.len())
+        .any(|window| window == fragment)
 }
 
 /// Round up to a multiple of `alignment`, which the reference gets from Agrona's
@@ -1614,5 +1837,218 @@ mod tests {
         assert!(matches!(error, CatalogError::Full { .. }), "{error:?}");
         assert_eq!(before, catalog.capacity(), "and nothing changed");
         assert_eq!(Some(id), catalog.recording_ids().next());
+    }
+
+    /// `findLast` answers with the **newest** match, not the first one written:
+    /// three recordings of one session and stream on different channels, and the
+    /// fragment picks out which of them the client meant.
+    #[test]
+    fn the_newest_matching_recording_is_the_one_find_last_answers_with() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        // The fixture's channels are `…:<port>|sparse=true`, so a fragment can
+        // pick one recording out of the three.
+        let older = catalog.add_recording(&recording(0)).expect("added");
+        let also_older = catalog.add_recording(&recording(0)).expect("added");
+        let newest = catalog.add_recording(&recording(0)).expect("added");
+
+        assert!(also_older > older && newest > also_older);
+
+        // Every one of them is session 42, stream 1001, port 9000.
+        let found = catalog
+            .find_last(0, 42, 1001, b"endpoint=localhost:9000")
+            .expect("a scan");
+        assert_eq!(Some(newest), found, "the last record written wins");
+
+        // A floor above the older two picks the same one; a floor above all
+        // three ends the scan where the reference's `break` is
+        // (`Catalog.java:556-559`).
+        assert_eq!(
+            Some(newest),
+            catalog
+                .find_last(also_older + 1, 42, 1001, b"")
+                .expect("a scan"),
+            "an empty fragment is in every channel"
+        );
+        assert_eq!(
+            None,
+            catalog
+                .find_last(newest + 1, 42, 1001, b"")
+                .expect("a scan")
+        );
+
+        // Nothing matches for another session, stream or channel.
+        assert_eq!(None, catalog.find_last(0, 43, 1001, b"").expect("a scan"));
+        assert_eq!(None, catalog.find_last(0, 42, 1002, b"").expect("a scan"));
+        assert_eq!(
+            None,
+            catalog
+                .find_last(0, 42, 1001, b"endpoint=localhost:9001")
+                .expect("a scan")
+        );
+    }
+
+    /// A record that is no longer in the index is not found, whatever it
+    /// matches: `findLast` walks the index, and a retired record is out of it
+    /// (`Catalog.changeState`, `Catalog.java:779-790`).
+    #[test]
+    fn a_retired_recording_is_not_found() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        assert!(
+            catalog
+                .change_state(id, RecordingState::INVALID)
+                .expect("retired"),
+            "the id was there to retire"
+        );
+
+        assert_eq!(None, catalog.find_last(0, 42, 1001, b"").expect("a scan"));
+    }
+
+    /// A recording is written with no stop position and is given one when it
+    /// stops (`Catalog.recordingStopped`, `Catalog.java:627-638`).
+    ///
+    /// The write is two fields **in place** — the record is not rewritten and
+    /// its neighbours are not touched — so what is asserted is that the two
+    /// moved, that the rest did not, and that the file still walks: a record
+    /// whose length or state had been clobbered would come back as a different
+    /// answer or as nothing at all.
+    #[test]
+    fn a_recording_is_given_a_stop_position_when_it_stops() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        let started = catalog.recording(id).expect("read");
+
+        assert_eq!(-1, started.stop_position, "the fixture's NULL_VALUE");
+        assert_eq!(-1, started.stop_timestamp);
+
+        catalog.recording_stopped(id, 65_536, NOW).expect("stopped");
+
+        let stopped = catalog.recording(id).expect("read");
+        assert_eq!(65_536, stopped.stop_position);
+        assert_eq!(NOW, stopped.stop_timestamp);
+        assert_eq!(started.start_position, stopped.start_position);
+        assert_eq!(started.recording_id, stopped.recording_id);
+        assert_eq!(started.original_channel, stopped.original_channel);
+        assert_eq!(started.source_identity, stopped.source_identity);
+
+        assert!(
+            matches!(
+                catalog.recording_stopped(id + 1, 0, NOW),
+                Err(CatalogError::UnknownRecording { .. })
+            ),
+            "a recording the catalog does not hold has nothing to stop"
+        );
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        assert_eq!(
+            65_536,
+            reopened.recording(id).expect("read back").stop_position,
+            "and it is in the file, not only in this process's view of it"
+        );
+    }
+
+    /// An extended recording is one that has not stopped again, and its row
+    /// remembers which session and request extended it
+    /// (`Catalog.extendRecording`, `Catalog.java:648-662`).
+    #[test]
+    fn an_extended_recording_has_not_stopped_any_more() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        catalog.recording_stopped(id, 65_536, NOW).expect("stopped");
+
+        let stopped = catalog.recording(id).expect("read");
+        assert_eq!(65_536, stopped.stop_position);
+
+        catalog.extend_recording(id, 99, 7, 4242).expect("extended");
+
+        let extended = catalog.recording(id).expect("read");
+        assert_eq!(NULL_VALUE, extended.stop_position, "which is -1");
+        assert_eq!(NULL_VALUE, extended.stop_timestamp);
+        assert_eq!(4242, extended.session_id, "the image's session, not ours");
+        assert_eq!(
+            stopped.start_position, extended.start_position,
+            "an extend appends: where the recording *starts* does not move"
+        );
+        assert_eq!(stopped.stream_id, extended.stream_id);
+        assert_eq!(stopped.stripped_channel, extended.stripped_channel);
+
+        assert!(
+            matches!(
+                catalog.extend_recording(id + 1, 0, 0, 0),
+                Err(CatalogError::UnknownRecording { .. })
+            ),
+            "a recording the catalog does not hold cannot be extended"
+        );
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        assert_eq!(
+            NULL_VALUE,
+            reopened.recording(id).expect("read back").stop_position,
+            "and the file says so too"
+        );
+    }
+
+    /// The body a listing session sends is the record behind its header, whole:
+    /// its length is the header's, and it decodes as the `RecordingDescriptor`
+    /// it was written as.
+    ///
+    /// The two eight-byte fields in front of `recordingId` are the message's
+    /// `controlSessionId` and `correlationId`, which the catalog leaves zero —
+    /// the response proxy is what fills those in, which is why this body can be
+    /// copied onto the wire as it stands
+    /// (`ControlResponseProxy.java:54-89`).
+    #[test]
+    fn a_descriptor_body_is_the_record_behind_its_header() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        let offset = catalog.recording_offset(id).expect("an offset");
+        let header_bytes = catalog
+            .read_at(offset, DESCRIPTOR_HEADER_LENGTH)
+            .expect("the record header");
+        let header = decode_record_header(&header_bytes).expect("decodes");
+        let length = usize::try_from(header.length()).expect("positive");
+
+        let body = catalog
+            .descriptor_body(id)
+            .expect("a body")
+            .expect("the record is there");
+
+        assert_eq!(length, body.len());
+        assert_eq!(
+            body,
+            catalog
+                .read_at(offset + DESCRIPTOR_HEADER_LENGTH, length)
+                .expect("the same bytes")
+        );
+        assert_eq!(
+            [0_u8; 16],
+            body[..16],
+            "the two ids the response proxy writes are zero in the file"
+        );
+
+        let descriptor = decode_descriptor(&body).expect("decodes");
+        assert_eq!(id, descriptor.recording_id());
+        assert_eq!(42, descriptor.session_id());
+        assert_eq!(1001, descriptor.stream_id());
+
+        // A record the catalog does not hold has no body, which is the
+        // `wrapDescriptor` false a listing session answers with
+        // `RECORDING_UNKNOWN`.
+        assert_eq!(None, catalog.descriptor_body(id + 1).expect("a body"));
+        assert_eq!(None, catalog.descriptor_body(-1).expect("a body"));
     }
 }

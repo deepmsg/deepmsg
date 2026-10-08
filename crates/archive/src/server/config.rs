@@ -98,6 +98,21 @@ pub enum ConfigError {
     InvalidValue { name: String, value: String },
     /// A threading mode that is not one of the three.
     UnknownThreadingMode { value: String },
+    /// `aeron.archive.segment.file.length` is not a power of two
+    /// (`Archive.java:1482-1485`).
+    SegmentFileLengthNotPowerOfTwo { length: usize },
+    /// ...or is outside the term buffer's own range (`:1486-1489`).
+    SegmentFileLengthOutOfRange { length: usize },
+    /// `aeron.archive.file.io.max.length` is below a term or not a power of
+    /// two (`:1208-1211`). It is also a recording session's
+    /// `blockLengthLimit`'s upper bound (`RecordingSession.java:81`).
+    InvalidFileIoMaxLength { length: usize },
+    /// The archive was told to publish recording events
+    /// (`aeron.archive.recording.events.enabled`), which this build does not
+    /// do yet — the P2-S2 plan's §4. Refused rather than accepted-and-ignored:
+    /// a client waiting for events that will never come is the silent kind of
+    /// wrong.
+    RecordingEventsNotImplemented,
 }
 
 impl fmt::Display for ConfigError {
@@ -126,6 +141,20 @@ impl fmt::Display for ConfigError {
                 write!(f, "local control channel must be IPC media: uri={channel}")
             }
             Self::InvalidValue { name, value } => write!(f, "{name}={value} is not a valid value"),
+            Self::SegmentFileLengthNotPowerOfTwo { length } => {
+                write!(f, "segment file length not a power of 2: {length}")
+            }
+            Self::SegmentFileLengthOutOfRange { length } => {
+                write!(f, "segment file length not in valid range: {length}")
+            }
+            Self::InvalidFileIoMaxLength { length } => {
+                write!(f, "invalid fileIoMaxLength={length}")
+            }
+            Self::RecordingEventsNotImplemented => write!(
+                f,
+                "aeron.archive.recording.events.enabled is not supported by this build \
+                 (see the P2-S2 plan, which defers the events publication)"
+            ),
             Self::UnknownThreadingMode { value } => {
                 write!(
                     f,
@@ -194,6 +223,19 @@ mod settings {
     pub const CONTROL_TERM_BUFFER_LENGTH: &str = "aeron.archive.control.term.buffer.length";
     /// `AeronArchive.java:2834`, default: the media driver's own MTU (`:2840`).
     pub const CONTROL_MTU_LENGTH: &str = "aeron.archive.control.mtu.length";
+
+    /// `Archive.java:429`, default 20 (`:438`).
+    pub const MAX_CONCURRENT_RECORDINGS: &str = "aeron.archive.max.concurrent.recordings";
+    /// `Archive.java:328`, default 128 MiB (`:336`).
+    pub const SEGMENT_FILE_LENGTH: &str = "aeron.archive.segment.file.length";
+    /// `Archive.java:301`, default 1 MiB (`:295`).
+    pub const FILE_IO_MAX_LENGTH: &str = "aeron.archive.file.io.max.length";
+    /// `Archive.java:342`, default: the segment file length (`:350`).
+    pub const LOW_STORAGE_SPACE_THRESHOLD: &str = "aeron.archive.low.storage.space.threshold";
+    /// `Archive.java:361`, default 0 (`:369`).
+    pub const FILE_SYNC_LEVEL: &str = "aeron.archive.file.sync.level";
+    /// `AeronArchive.java:2797`, default false (`:2803`).
+    pub const RECORDING_EVENTS_ENABLED: &str = "aeron.archive.recording.events.enabled";
 }
 
 /// The reference's default archive directory (`Archive.java:315`).
@@ -210,6 +252,17 @@ const CONTROL_TERM_BUFFER_LENGTH_DEFAULT: usize = 64 * 1024;
 const CONNECT_TIMEOUT_DEFAULT_NS: i64 = 5 * 1_000_000_000;
 /// `Archive.java:520`.
 const SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS: i64 = 1_000_000_000;
+/// `Archive.java:438`.
+const MAX_CONCURRENT_RECORDINGS_DEFAULT: i32 = 20;
+/// `Archive.java:336`.
+const SEGMENT_FILE_LENGTH_DEFAULT: usize = 128 * 1024 * 1024;
+/// `Archive.java:295`.
+const FILE_IO_MAX_LENGTH_DEFAULT: usize = 1024 * 1024;
+/// `LogBufferDescriptor.java:58` and `:63`, which the segment file length is
+/// bounded by (`Archive.java:1486-1489`).
+const TERM_MIN_LENGTH: usize = 64 * 1024;
+/// See [`TERM_MIN_LENGTH`].
+const TERM_MAX_LENGTH: usize = 1024 * 1024 * 1024;
 /// `Archive.java:597`.
 const AUTHENTICATOR_SUPPLIER_DEFAULT: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
 /// `Archive.java:610-611` — and this one is **not a class name**.
@@ -287,6 +340,27 @@ pub struct ArchiveConfig {
     pub authorisation_service_supplier: String,
     /// The channel replication streams arrive on (`Archive.java:584`).
     pub replication_channel: Option<String>,
+
+    /// How many recordings may be active at once (`Archive.java:429`, `:438`).
+    pub max_concurrent_recordings: i32,
+    /// How long one segment file of a recording is (`Archive.java:328`,
+    /// `:336`).
+    pub segment_file_length: usize,
+    /// The largest block a recording session hands to its writer
+    /// (`Archive.java:301`, `:295`). A session's limit is
+    /// `min(image.termBufferLength(), this)` (`RecordingSession.java:81`).
+    pub file_io_max_length: usize,
+    /// Below this much usable space a recording is refused
+    /// (`ArchiveConductor.java:2597-2617`), and it defaults to the segment
+    /// file length (`Archive.java:350`).
+    pub low_storage_space_threshold: u64,
+    /// Above zero every recorded block is forced to disk, above one the
+    /// metadata as well (`RecordingWriter.java:88-89`).
+    pub file_sync_level: i32,
+    /// Whether the archive publishes recording events
+    /// (`AeronArchive.java:2797`). This build refuses it — see
+    /// [`ConfigError::RecordingEventsNotImplemented`].
+    pub recording_events_enabled: bool,
 }
 
 impl ArchiveConfig {
@@ -388,6 +462,46 @@ impl ArchiveConfig {
             },
         };
 
+        // The segment file length is checked where the reference checks it —
+        // in the archive's own constructor rather than in the context
+        // (`Archive.java:1480-1489`) — and refused with its words.
+        let segment_file_length = size(
+            get(settings::SEGMENT_FILE_LENGTH),
+            settings::SEGMENT_FILE_LENGTH,
+        )?
+        .unwrap_or(SEGMENT_FILE_LENGTH_DEFAULT);
+
+        if !segment_file_length.is_power_of_two() {
+            return Err(ConfigError::SegmentFileLengthNotPowerOfTwo {
+                length: segment_file_length,
+            });
+        }
+
+        if !(TERM_MIN_LENGTH..=TERM_MAX_LENGTH).contains(&segment_file_length) {
+            return Err(ConfigError::SegmentFileLengthOutOfRange {
+                length: segment_file_length,
+            });
+        }
+
+        let file_io_max_length = size(
+            get(settings::FILE_IO_MAX_LENGTH),
+            settings::FILE_IO_MAX_LENGTH,
+        )?
+        .unwrap_or(FILE_IO_MAX_LENGTH_DEFAULT);
+
+        if file_io_max_length < TERM_MIN_LENGTH || !file_io_max_length.is_power_of_two() {
+            return Err(ConfigError::InvalidFileIoMaxLength {
+                length: file_io_max_length,
+            });
+        }
+
+        let recording_events_enabled =
+            boolean(get(settings::RECORDING_EVENTS_ENABLED)).unwrap_or(false);
+
+        if recording_events_enabled {
+            return Err(ConfigError::RecordingEventsNotImplemented);
+        }
+
         Ok(Self {
             aeron_dir: PathBuf::from(aeron_dir),
             archive_dir: PathBuf::from(
@@ -447,6 +561,25 @@ impl ArchiveConfig {
             .unwrap_or(AUTHORISATION_SERVICE_SUPPLIER_DEFAULT)
             .to_owned(),
             replication_channel: non_empty(get(settings::REPLICATION_CHANNEL)).map(str::to_owned),
+            max_concurrent_recordings: integer(
+                get(settings::MAX_CONCURRENT_RECORDINGS),
+                settings::MAX_CONCURRENT_RECORDINGS,
+            )?
+            .unwrap_or(MAX_CONCURRENT_RECORDINGS_DEFAULT),
+            segment_file_length,
+            file_io_max_length,
+            // The **constant**, not whatever the segment file length resolved
+            // to: `LOW_STORAGE_SPACE_THRESHOLD_DEFAULT = SEGMENT_FILE_LENGTH_DEFAULT`
+            // (`Archive.java:350`), so a build with a 1 MB segment length
+            // still gets a 128 MB threshold.
+            low_storage_space_threshold: size(
+                get(settings::LOW_STORAGE_SPACE_THRESHOLD),
+                settings::LOW_STORAGE_SPACE_THRESHOLD,
+            )?
+            .unwrap_or(SEGMENT_FILE_LENGTH_DEFAULT) as u64,
+            file_sync_level: integer(get(settings::FILE_SYNC_LEVEL), settings::FILE_SYNC_LEVEL)?
+                .unwrap_or(0),
+            recording_events_enabled,
         })
     }
 
@@ -473,9 +606,8 @@ fn boolean(value: Option<&str>) -> Option<bool> {
     value.map(|value| value.eq_ignore_ascii_case("true"))
 }
 
-/// A stream id, which is an `i32` with one of the reference's defaults — hence
-/// its own reader rather than [`integer`].
-fn stream_id(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError> {
+/// An `i32` property, with the name only there to say which one was wrong.
+fn integer(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError> {
     match value {
         None => Ok(None),
         Some(value) => value
@@ -486,6 +618,13 @@ fn stream_id(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError
                 value: value.to_owned(),
             }),
     }
+}
+
+/// A stream id, which is an `i32` with one of the reference's defaults — named
+/// apart from [`integer`] because a stream id is what most of them are, and a
+/// reader looking for one should not have to notice that it is an `i32`.
+fn stream_id(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError> {
+    integer(value, name)
 }
 
 /// A size with a suffix: `64k`, `1m`, `1408` (`SystemUtil.parseSize`, the
@@ -590,6 +729,8 @@ mod tests {
             ("aeron.archive.idle.strategy", "yield"),
             ("aeron.archive.max.concurrent.replays", "100"),
             ("aeron.archive.control.channel.enabled", "true"),
+            ("aeron.archive.segment.file.length", "131072"),
+            ("aeron.archive.recording.events.enabled", "false"),
         ])
     }
 
@@ -614,6 +755,114 @@ mod tests {
         );
         assert_eq!(config.archive_id, Some(42));
         assert!(!config.delete_dir_on_start);
+    }
+
+    /// The recording settings, whose defaults the harness mostly does not
+    /// override — so they are the reference's own, checked name by name.
+    #[test]
+    fn the_recording_defaults_are_the_references() {
+        let config = ArchiveConfig::resolve(&archive_defaults()).expect("resolves");
+
+        // `TestArchive.h:43` sets this one; the rest are defaults.
+        assert_eq!(config.segment_file_length, 128 * 1024);
+        assert_eq!(config.max_concurrent_recordings, 20);
+        assert_eq!(config.file_io_max_length, 1024 * 1024);
+        assert_eq!(config.file_sync_level, 0);
+        assert!(!config.recording_events_enabled);
+        assert_eq!(
+            config.low_storage_space_threshold,
+            128 * 1024 * 1024,
+            "the **constant**, not the configured segment file length (Archive.java:350)"
+        );
+    }
+
+    #[test]
+    fn the_segment_file_length_is_refused_the_references_way() {
+        let not_a_power_of_two = ArchiveConfig::resolve(&props(&[
+            ("aeron.dir", "/dev/shm/a"),
+            (
+                "aeron.archive.control.channel",
+                "aeron:udp?endpoint=localhost:8010",
+            ),
+            ("aeron.archive.segment.file.length", "100000"),
+        ]))
+        .expect_err("100000 is not a power of two");
+        assert_eq!(
+            not_a_power_of_two.to_string(),
+            "segment file length not a power of 2: 100000"
+        );
+
+        let too_small = ArchiveConfig::resolve(&props(&[
+            ("aeron.dir", "/dev/shm/a"),
+            (
+                "aeron.archive.control.channel",
+                "aeron:udp?endpoint=localhost:8010",
+            ),
+            ("aeron.archive.segment.file.length", "32k"),
+        ]))
+        .expect_err("a term is at least 64k");
+        assert_eq!(
+            too_small.to_string(),
+            "segment file length not in valid range: 32768"
+        );
+
+        let too_big = ArchiveConfig::resolve(&props(&[
+            ("aeron.dir", "/dev/shm/a"),
+            (
+                "aeron.archive.control.channel",
+                "aeron:udp?endpoint=localhost:8010",
+            ),
+            ("aeron.archive.segment.file.length", "2g"),
+        ]))
+        .expect_err("a term is at most 1g");
+        assert_eq!(
+            too_big.to_string(),
+            "segment file length not in valid range: 2147483648"
+        );
+    }
+
+    #[test]
+    fn the_file_io_max_length_is_refused_the_references_way() {
+        let too_small = ArchiveConfig::resolve(&props(&[
+            ("aeron.dir", "/dev/shm/a"),
+            (
+                "aeron.archive.control.channel",
+                "aeron:udp?endpoint=localhost:8010",
+            ),
+            ("aeron.archive.file.io.max.length", "32k"),
+        ]))
+        .expect_err("a term is at least 64k");
+        assert_eq!(too_small.to_string(), "invalid fileIoMaxLength=32768");
+
+        let not_a_power_of_two = ArchiveConfig::resolve(&props(&[
+            ("aeron.dir", "/dev/shm/a"),
+            (
+                "aeron.archive.control.channel",
+                "aeron:udp?endpoint=localhost:8010",
+            ),
+            ("aeron.archive.file.io.max.length", "96k"),
+        ]))
+        .expect_err("96k is not a power of two");
+        assert_eq!(
+            not_a_power_of_two.to_string(),
+            "invalid fileIoMaxLength=98304"
+        );
+    }
+
+    /// The events publication is a later slice's, and a build that was told to
+    /// publish events it will never publish is the silent kind of wrong — so
+    /// the name is read and **refused**, not ignored. The harness sets it
+    /// false (`TestArchive.h:47`), which is the branch this slice runs.
+    #[test]
+    fn recording_events_are_refused_rather_than_ignored() {
+        let mut properties = archive_defaults();
+        properties.push((
+            "aeron.archive.recording.events.enabled".to_owned(),
+            "true".to_owned(),
+        ));
+
+        let refused = ArchiveConfig::resolve(&properties).expect_err("not this build's");
+        assert_eq!(refused, ConfigError::RecordingEventsNotImplemented);
     }
 
     /// A default-configured archive has to be able to *start*, so the two

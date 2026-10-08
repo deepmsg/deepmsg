@@ -78,6 +78,7 @@ use std::time::Duration;
 use deepmsg_client::client::CommandError;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
+use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::logbuffer::append::Appended;
 
@@ -143,9 +144,9 @@ const RESEND_INTERVAL_MS: i64 = 200;
 
 /// What a session owes the client, as the queues carry it.
 ///
-/// The variants are the reference's three egress paths for this slice —
-/// `sendResponse` (`ControlResponseProxy.java:110-144`), `sendChallenge`
-/// (`:146-159`) and `sendPing` (`:201-222`). Signals and descriptors belong to
+/// The variants are the reference's egress paths — `sendResponse`
+/// (`ControlResponseProxy.java:110-144`), `sendChallenge` (`:146-159`),
+/// `sendPing` (`:201-222`) and `sendDescriptor` (`:54-89`). Signals belong to
 /// the sessions that send them and arrive with those.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
@@ -180,6 +181,62 @@ pub enum Response {
     Ping {
         /// The session being kept alive.
         control_session_id: i64,
+    },
+    /// A recording's descriptor: the whole of a `RecordingDescriptor` message
+    /// behind its message header, which is what the reference offers when a
+    /// listing session sends one (`ControlResponseProxy.sendDescriptor`,
+    /// `:54-89`).
+    ///
+    /// `body` is the catalog's own bytes
+    /// ([`crate::catalog::Catalog::descriptor_body`]): a `RecordingDescriptor`
+    /// behind its message header, with the two ids its block starts with left
+    /// **zero** for this session to write over. The reference offers the same
+    /// descriptor in two parts for the same reason — it comes out of a mapped
+    /// file and is never copied into a buffer of its own.
+    Descriptor {
+        /// The session it is sent on.
+        control_session_id: i64,
+        /// The listing request's correlation id.
+        correlation_id: i64,
+        /// The descriptor, as the catalog holds it.
+        body: Vec<u8>,
+    },
+    /// One recording **subscription**, as a listing answers with it
+    /// (`ControlResponseProxy.sendSubscriptionDescriptor`, `:91-107`).
+    ///
+    /// The sibling of [`Response::Descriptor`] and the same shape of send: the
+    /// reference offers it once and answers whether it took, and the **listing**
+    /// is what tries again (`ListRecordingSubscriptionsSession.doWork`, `:109-113`).
+    SubscriptionDescriptor {
+        /// The session it is sent on.
+        control_session_id: i64,
+        /// The listing request's correlation id.
+        correlation_id: i64,
+        /// The subscription's registration id.
+        subscription_id: i64,
+        /// The stream it was added for.
+        stream_id: i32,
+        /// Its channel, as it was added on.
+        channel: String,
+    },
+    /// A `RecordingSignalEvent` (`ControlResponseProxy.java:161-199`): what a
+    /// recording the client asked for has done since it asked.
+    Signal {
+        /// The session it is sent on.
+        control_session_id: i64,
+        /// The correlation id of the request that started this — the `START`
+        /// carries the start request's, and the `STOP` the stop's
+        /// (`ArchiveConductor.java:2046-2051`, `:1342-1347`).
+        correlation_id: i64,
+        /// The recording the signal is about.
+        recording_id: i64,
+        /// The recording *subscription* it belongs to, which is the
+        /// registration id the start answered with (`:2049`).
+        subscription_id: i64,
+        /// Where the recording had got to.
+        position: i64,
+        /// Which signal.
+        signal: RecordingSignal,
     },
 }
 
@@ -595,6 +652,129 @@ impl<E: Egress> ControlSession<E> {
         );
     }
 
+    /// Answer that a recording is not there (`ControlSession.java:703-706`),
+    /// which is **not** the refusal [`ControlSession::send_error_response`]
+    /// carries: the code is `RECORDING_UNKNOWN` and the message is absent, and
+    /// what the C client prints is nothing at all (`aeron_archive_recording_
+    /// descriptor_poller.c:186-194` reads it as "there is nothing to list").
+    pub fn send_recording_unknown<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
+        self.send_response(
+            correlation_id,
+            recording_id,
+            ControlResponseCode::RECORDING_UNKNOWN,
+            None,
+            now_ms,
+            publications,
+        );
+    }
+
+    /// Send one recording **subscription**'s descriptor
+    /// (`ControlSession.java:764-776`), answering with whether it went out.
+    ///
+    /// [`ControlSession::send_descriptor`]'s twin, queue and all: a listing
+    /// that did not get its descriptor out tries again next turn rather than
+    /// queueing it, because the *listing* is what knows where the walk was.
+    pub fn send_subscription_descriptor<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        subscription_id: i64,
+        stream_id: i32,
+        channel: &str,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> bool {
+        let response = Response::SubscriptionDescriptor {
+            control_session_id: self.session_id,
+            correlation_id,
+            subscription_id,
+            stream_id,
+            channel: channel.to_owned(),
+        };
+
+        match self.egress.offer(publications, &response) {
+            Offered::Sent => {
+                self.activity_deadline_ms = None;
+                true
+            }
+            Offered::Retry => {
+                self.update_activity_deadline(now_ms);
+                false
+            }
+            Offered::Fatal(error) => {
+                let reason = error.message().to_owned();
+                self.abort(&reason);
+                false
+            }
+        }
+    }
+
+    /// Answer that a listing has nothing left to send
+    /// (`ControlSession.sendSubscriptionUnknown`, `:708-711`), which is an
+    /// `OK`'s shape with `SUBSCRIPTION_UNKNOWN` for a code, a zero for the
+    /// relevant id and nothing to say.
+    pub fn send_subscription_unknown<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
+        self.send_response(
+            correlation_id,
+            0,
+            ControlResponseCode::SUBSCRIPTION_UNKNOWN,
+            None,
+            now_ms,
+            publications,
+        );
+    }
+
+    /// Send a recording's descriptor (`ControlSession.java:747-762`), answering
+    /// with whether it went out.
+    ///
+    /// The one egress path that does **not** queue: the reference's
+    /// `sendDescriptor` returns `false` and the **session** that is sending
+    /// offers it again next turn (`ListRecordingByIdSession.doWork`, `:60-80`),
+    /// which is what makes a listing paginate. A queued copy would be a second
+    /// one besides.
+    pub fn send_descriptor<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        body: Vec<u8>,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> bool {
+        let response = Response::Descriptor {
+            control_session_id: self.session_id,
+            correlation_id,
+            body,
+        };
+
+        match self.egress.offer(publications, &response) {
+            Offered::Sent => {
+                self.activity_deadline_ms = None;
+                true
+            }
+            Offered::Retry => {
+                self.update_activity_deadline(now_ms);
+                false
+            }
+            // The reference's `checkResult` is called on the same failure and
+            // ends the session (`ControlResponseProxy.java:88`, `:242-262`);
+            // the listing that called this is finished by the session going.
+            Offered::Fatal(error) => {
+                let reason = error.message().to_owned();
+                self.abort(&reason);
+                false
+            }
+        }
+    }
+
     /// Queue an ERROR (`ControlSession.java:692-701`).
     ///
     /// The reference has two of these: one that names no relevant id and sends
@@ -888,6 +1068,50 @@ impl<E: Egress> ControlSession<E> {
             message,
         };
 
+        self.send_or_queue(response, now_ms, publications);
+    }
+
+    /// A recording signal (`ControlSession.java:779-800`), which is the third
+    /// kind of thing a session sends and the only one that is not an answer:
+    /// `START`, `STOP` and `EXTEND` tell the client that asked to record what
+    /// its recording went on to do (`ArchiveConductor.java:2046-2051`,
+    /// `:1342-1347`, `:2121-2122`).
+    ///
+    /// It shares [`ControlSession::send_or_queue`] with the answers because the
+    /// reference shares the code too: same queue, same deadline, same three
+    /// attempts inside the proxy (`ControlResponseProxy.java:170-198`).
+    #[allow(clippy::too_many_arguments)] // one per field a RecordingSignalEvent carries
+    pub fn send_signal<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        recording_id: i64,
+        subscription_id: i64,
+        position: i64,
+        signal: RecordingSignal,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
+        let response = Response::Signal {
+            control_session_id: self.session_id,
+            correlation_id,
+            recording_id,
+            subscription_id,
+            position,
+            signal,
+        };
+
+        self.send_or_queue(response, now_ms, publications);
+    }
+
+    /// Send it now, or queue it and arm the deadline (`ControlSession.java:713-731`
+    /// for the answers, `:787-799` for the signals — the same four lines twice
+    /// in the reference).
+    fn send_or_queue<P: Publications>(
+        &mut self,
+        response: Response,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
         let sent = if self.sync_responses.is_empty() {
             match self.egress.offer(publications, &response) {
                 Offered::Sent => true,
@@ -1608,6 +1832,115 @@ mod tests {
             vec![10, 11]
         );
         assert!(session.sync_responses.is_empty());
+    }
+
+    /// A signal is not an answer, but it is queued and sent by the same four
+    /// lines — the reference writes them twice
+    /// (`ControlSession.java:713-731`, `:787-799`).
+    #[test]
+    fn a_signal_takes_the_same_queue_as_an_answer() {
+        let (mut session, mut authenticator) = active_session();
+
+        session.egress.refuse_offers = true;
+        session.send_signal(12, 3, 5, 4096, RecordingSignal::START, 1_000, &mut NoClient);
+
+        assert_eq!(session.sync_responses.len(), 1, "the signal is owed");
+        assert_eq!(
+            Some(6_000),
+            session.activity_deadline_ms(),
+            "armed from the connect timeout, as a response's would be"
+        );
+
+        session.egress.refuse_offers = false;
+        session.do_work(1_001, &mut NoClient, &counters_region(), &mut authenticator);
+
+        let offered = session
+            .egress
+            .offered
+            .iter()
+            .find_map(|response| match response {
+                Response::Signal {
+                    correlation_id,
+                    recording_id,
+                    subscription_id,
+                    position,
+                    signal,
+                    ..
+                } => Some((
+                    *correlation_id,
+                    *recording_id,
+                    *subscription_id,
+                    *position,
+                    *signal,
+                )),
+                _ => None,
+            });
+
+        assert_eq!(Some((12, 3, 5, 4096, RecordingSignal::START)), offered);
+        assert!(session.sync_responses.is_empty());
+    }
+
+    /// A descriptor is the one egress path that does not queue
+    /// (`ControlSession.java:747-762`): a send that does not take answers
+    /// `false` and arms the deadline, and the session that asked tries again —
+    /// which is what a listing is.
+    #[test]
+    fn a_descriptor_that_will_not_go_out_is_not_queued() {
+        let (mut session, _authenticator) = active_session();
+
+        session.egress.refuse_offers = true;
+        let sent = session.send_descriptor(12, vec![1, 2, 3], 1_000, &mut NoClient);
+
+        assert!(!sent, "the offer was refused");
+        assert!(
+            session.sync_responses.is_empty(),
+            "nothing is queued behind it — the listing is what tries again"
+        );
+        assert_eq!(
+            Some(6_000),
+            session.activity_deadline_ms(),
+            "and the deadline is armed, as a failed response's would be"
+        );
+
+        session.egress.refuse_offers = false;
+        let sent = session.send_descriptor(12, vec![1, 2, 3], 1_001, &mut NoClient);
+
+        assert!(sent);
+        assert_eq!(
+            Some(&Response::Descriptor {
+                control_session_id: 7,
+                correlation_id: 12,
+                body: vec![1, 2, 3],
+            }),
+            session.egress.offered.last()
+        );
+        assert_eq!(None, session.activity_deadline_ms(), "nothing is owed now");
+    }
+
+    /// The "there is no such recording" answer a listing gets is not the
+    /// `ERROR` the position questions get: the code is `RECORDING_UNKNOWN`, and
+    /// the message is absent rather than the client's words
+    /// (`ControlSession.java:703-706`).
+    #[test]
+    fn an_unknown_recording_is_answered_with_its_own_code() {
+        let (mut session, _authenticator) = active_session();
+
+        session.send_recording_unknown(12, 4_242, 1_000, &mut NoClient);
+
+        assert_eq!(
+            Some(&Response::Control {
+                control_session_id: 7,
+                correlation_id: 12,
+                relevant_id: 4_242,
+                code: ControlResponseCode::RECORDING_UNKNOWN,
+                message: None,
+            }),
+            session.egress.offered.last()
+        );
+        assert!(
+            session.sync_responses.is_empty(),
+            "it went out, so there is nothing owed"
+        );
     }
 
     /// The correlation ids of the control responses that went out, in order.

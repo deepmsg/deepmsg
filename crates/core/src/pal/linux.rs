@@ -160,6 +160,50 @@ pub fn error_string(code: i32) -> String {
         .into_owned()
 }
 
+/// The bytes free to an unprivileged process on the filesystem holding `path`
+/// — or **zero**, when the filesystem cannot be asked.
+///
+/// This is the reference's `aeron_usable_fs_space`
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`): `statvfs`'s
+/// `f_frsize * f_bavail`, and nothing when the call fails.
+///
+/// Zero is the reference's own answer to a failure, and it is the safe side to
+/// fail on for the one caller this has: the archive compares the answer against
+/// a threshold and refuses to start a recording below it
+/// (`ArchiveConductor.java:2597-2617`), so "cannot ask" reads as "no space"
+/// rather than as "plenty". Its other caller in this workspace — the driver's
+/// log-buffer sizing (`crates/driver/src/sys.rs`) — reads it the same way.
+///
+/// # One port, two owners
+///
+/// The driver's `sys` shim has this same function, because ADR-0002 gives each
+/// of them its own unsafe zone and the archive may not reach into the driver's.
+/// It is eleven lines; sharing them would mean widening the driver's public
+/// surface, which is a change this slice is not allowed to make.
+pub fn usable_space(path: &Path) -> u64 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+
+    // SAFETY: `statvfs` writes its out-parameter only when it succeeds, so
+    // this begins from zeroes rather than from whatever the stack held.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `path` is a live NUL-terminated string for the duration of the
+    // call and `vfs` is a plain-out struct the call may write through, which
+    // is what `statvfs(3)` promises for these two pointers.
+    if 0 != unsafe { libc::statvfs(path.as_ptr(), &mut vfs) } {
+        return 0;
+    }
+
+    // `f_frsize` is a filesystem block size and `f_bavail` a count of them, so
+    // the product is the byte count the reference computes.
+    (vfs.f_frsize as u64) * vfs.f_bavail
+}
+
 // SAFETY: a mapping is process-wide memory, not thread-local state — every
 // thread of this process may address it, and the kernel does not care which one
 // faults on it. What the type tracks is `addr`, `len` and `writable`, all plain
@@ -574,6 +618,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Free space is answered for a filesystem that exists and is **zero** for
+    /// one that cannot be asked about, which is what the reference's
+    /// `aeron_usable_fs_space` does with a failed `statvfs` and what makes the
+    /// archive's low-storage check fail closed.
+    #[test]
+    fn free_space_is_answered_or_zero() {
+        let free = usable_space(&std::env::temp_dir());
+        assert!(
+            free > 0,
+            "the temp directory's filesystem has space: {free}"
+        );
+
+        assert_eq!(0, usable_space(Path::new("/no/such/directory/anywhere")));
     }
 
     /// Growing is what a caller that ran out of room does, and the thing it must

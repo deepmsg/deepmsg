@@ -62,9 +62,13 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::catalog::Catalog;
 use deepmsg_archive::mark_file::{ArchiveMarkFile, ERROR_BUFFER_LENGTH_DEFAULT, Header};
 use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
 use deepmsg_archive::server::config::ArchiveConfig;
+use deepmsg_archive::server::counters::{
+    ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, find_archive_id_counter,
+};
 use deepmsg_client::client::{AsyncAddPoll, Client};
 use deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT;
 use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
@@ -78,6 +82,12 @@ use deepmsg_driver::{cpuset, dir, sys};
 /// the driver's error counter, which the archive writes its own errors into
 /// instead of keeping one of its own.
 const DRIVER_ERROR_COUNTER_ID: i32 = 15;
+
+/// `Archive.Configuration.MAX_CATALOG_ENTRIES_DEFAULT` (`Archive.java:472`).
+///
+/// Reached through `getSizeAsLong` (`:849-851`), so a property may spell it
+/// `128` or `8k`; this build does not read the name yet and uses the default.
+const MAX_CATALOG_ENTRIES_DEFAULT: usize = 8 * 1024;
 
 /// `AeronArchive.Configuration.RECORDING_EVENTS_STREAM_ID_DEFAULT`
 /// (`client/AeronArchive.java:2791`).
@@ -190,6 +200,39 @@ fn run(
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let aeron_dir = driver_config.aeron_dir.as_path();
 
+    // The archive's own directory, before anything is put in it
+    // (`Archive.java:1275-1282`), where the reference does it in `conclude`:
+    // an archive told to start clean deletes what is there, and either way both
+    // directories are made if they are missing.
+    //
+    // **This is not housekeeping.** The reference's `IoUtil.ensureDirectoryExists`
+    // is what makes `<archive.dir>/source` exist before the catalog and the mark
+    // file are created inside it, and a harness that hands the archive a
+    // directory it expects the archive to make — which is what the C suite does
+    // (`TestArchive.h:203` deletes it on teardown) — meets an archive that will
+    // not start without it.
+    if archive_config.delete_dir_on_start {
+        // `IoUtil.delete(archiveDir, false)`: the second argument is
+        // `ignoreFailures`, and it is **false** — a directory that will not go
+        // is an archive that will not start.
+        match std::fs::remove_dir_all(&archive_config.archive_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not delete the archive directory {}: {error}",
+                    archive_config.archive_dir.display()
+                ));
+            }
+        }
+    }
+
+    ensure_directory(&archive_config.archive_dir, "archive")?;
+
+    if let Some(directory) = archive_config.mark_file_path().parent() {
+        ensure_directory(directory, "mark file")?;
+    }
+
     // The CnC file is created unpublished, and the driver's conductor is what
     // publishes it; a client cannot connect until it has (`CncFile::try_open`
     // is the same gate the test harness waits on, `tests/src/driver.rs:505`).
@@ -259,10 +302,49 @@ fn run(
     let cnc = CncFile::open_writable(aeron_dir, COMMAND_TIMEOUT)
         .map_err(|error| format!("could not open the counter region: {error}"))?;
 
+    // An archive id that is already being recorded by is one this archive
+    // refuses to serve (`Archive.java:1589-1595`): the reference looks for a
+    // 105 — the recorder's max write time, the one counter a second archive
+    // would fight the first over — and throws out of `conclude` if it finds one.
+    // The check is a **read** of the counters region, so unlike the allocation
+    // itself it can happen here, before anything is served.
+    let archive_id = archive_config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT);
+
+    if let Some(counters) = cnc.counters() {
+        if find_archive_id_counter(
+            &counters,
+            ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+            archive_id,
+        )
+        .is_some()
+        {
+            return Err(format!(
+                "existing max write time counter detected for archiveId={archive_id}"
+            ));
+        }
+    }
+
+    // The recordings this archive holds. Opened here rather than inside the
+    // conductor for the same reason the mark file is made here: it is a
+    // file-system step, and this is where the file system is already being
+    // dealt with.
+    //
+    // Two things about the call are worth stating, because the reference's are
+    // implicit. The capacity is `aeron.archive.max.catalog.entries`'s default
+    // (`Archive.java:472`, read as a size at `:849-851`) — the property itself
+    // is not read yet, so a deployment that sets it gets the default. And a
+    // **fresh** catalog starts at recording id 0, because the reference's field
+    // starts at 0 and `Archive` constructs its `Catalog` without seeding it
+    // (`Catalog.java:148`, `Archive.java:1503-1511`).
+    let catalog =
+        Catalog::open_or_create(&archive_config.archive_dir, MAX_CATALOG_ENTRIES_DEFAULT, 0)
+            .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
+
     let mut conductor = ArchiveConductor::new(
         archive_config,
         cnc,
         mark_file,
+        catalog,
         DRIVER_ERROR_COUNTER_ID,
         remote_subscription_id,
         local_subscription_id,
@@ -362,6 +444,29 @@ fn add_subscription(
             ));
         }
     }
+}
+
+/// `IoUtil.ensureDirectoryExists` (`Archive.java:1281-1282`), which makes the
+/// directory and refuses a path that is something else.
+///
+/// `create_dir_all` is Agrona's `mkdirs`; the second check is Agrona's, and the
+/// words are this build's — nothing reads them but a person.
+fn ensure_directory(path: &Path, name: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "the {name} directory {} does not exist and could not be created: {error}",
+            path.display()
+        )
+    })?;
+
+    if !path.is_dir() {
+        return Err(format!(
+            "the {name} path {} is not a directory",
+            path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Create the archive's mark file, sized and ready to be written.
