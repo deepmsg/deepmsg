@@ -95,6 +95,7 @@ use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
 
+use crate::catalog::Catalog;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
@@ -419,6 +420,119 @@ enum Deferred {
         correlation_id: i64,
         encoded_credentials: Vec<u8>,
     },
+    /// One of the four questions about a recording whose answer is in the
+    /// **catalog** (`ArchiveConductor.java:1159-1195`).
+    ///
+    /// It is the first thing the callbacks defer that is not a message: the
+    /// answer is not known yet, because the catalog belongs to the conductor
+    /// and a callback runs holding the adapter. So what is recorded is the
+    /// question, and [`Sessions::drive`] answers it — into the same
+    /// `Ok`/`Error` shape as everything else.
+    Query {
+        session_id: i64,
+        correlation_id: i64,
+        query: Query,
+    },
+}
+
+/// A question about a recording that the catalog can answer.
+///
+/// The reference has one `ArchiveConductor` method per question
+/// (`getStartPosition`, `getRecordingPosition`, `getStopPosition`,
+/// `getMaxRecordedPosition` — `ArchiveConductor.java:1159-1195`), each four
+/// lines long and three of them identical but for which field they read. Here
+/// the question is the value and the reading is in one place; the *answers* are
+/// the reference's, field for field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Query {
+    /// `catalog.startPosition(recordingId)` (`:1159-1165`).
+    StartPosition {
+        /// The recording asked about.
+        recording_id: i64,
+    },
+    /// The recording's **live** position, or `NULL_POSITION` for one that is
+    /// not being recorded (`:1167-1176`).
+    RecordingPosition {
+        /// The recording asked about.
+        recording_id: i64,
+    },
+    /// `catalog.stopPosition(recordingId)` (`:1178-1184`).
+    StopPosition {
+        /// The recording asked about.
+        recording_id: i64,
+    },
+    /// The live position, or the stop position for a recording that is not
+    /// active (`:1186-1195`).
+    MaxRecordedPosition {
+        /// The recording asked about.
+        recording_id: i64,
+    },
+}
+
+impl Query {
+    /// The recording this question is about.
+    #[must_use]
+    pub const fn recording_id(&self) -> i64 {
+        match self {
+            Self::StartPosition { recording_id }
+            | Self::RecordingPosition { recording_id }
+            | Self::StopPosition { recording_id }
+            | Self::MaxRecordedPosition { recording_id } => *recording_id,
+        }
+    }
+}
+
+/// The answer to a question about a recording
+/// (`ArchiveConductor.java:1159-1195`).
+///
+/// Every one of the reference's four starts with `hasRecording`, which refuses
+/// for a recording the catalog does not hold and says so in the words the C
+/// client prints (`:1950-1960` over `client/ArchiveException.java:272-275`).
+///
+/// # Errors
+///
+/// The refusal's message, for [`Sessions::run_deferred`] to send as
+/// [`UNKNOWN_RECORDING`].
+fn answer_query(catalog: &Catalog, query: Query) -> Result<i64, String> {
+    let recording_id = query.recording_id();
+
+    if !catalog.has_recording(recording_id) {
+        return Err(unknown_recording_message(recording_id));
+    }
+
+    let recording = catalog
+        .recording(recording_id)
+        .map_err(|error| format!("catalog could not read recording {recording_id}: {error}"))?;
+
+    Ok(match query {
+        Query::StartPosition { .. } => recording.start_position,
+        Query::StopPosition { .. } => recording.stop_position,
+        // The reference asks the live recording session first and falls back
+        // when there is none (`:1168-1172`, `:1190-1194`). This build has no
+        // recording sessions yet — they arrive with the slice that records —
+        // so the fallback is the whole answer, and the live counter joins here
+        // when it does.
+        Query::RecordingPosition { .. } => NULL_POSITION,
+        Query::MaxRecordedPosition { .. } => recording.stop_position,
+    })
+}
+
+/// `AeronArchive.NULL_POSITION`, which is `Aeron.NULL_VALUE`: what a
+/// recording-position question answers for a recording that is not in flight
+/// (`ArchiveConductor.java:1170-1173`).
+pub const NULL_POSITION: i64 = -1;
+
+/// `ArchiveException.UNKNOWN_RECORDING` (`client/ArchiveException.java:54`),
+/// which is what the C client prints as `errorCode=5`
+/// (`aeron_archive_client.c:189-192`, and `aeron_archive_test.cpp:1125` asserts
+/// the whole line).
+pub const UNKNOWN_RECORDING: i64 = 5;
+
+/// `ArchiveException.buildUnknownRecordingErrorMsg` (`:272-275`), which is the
+/// **message** half of that same line and has to match it word for word.
+#[must_use]
+pub fn unknown_recording_message(recording_id: i64) -> String {
+    format!("unknown recording id: {recording_id}")
 }
 
 /// A connect request whose session has not been made yet.
@@ -616,11 +730,12 @@ impl Sessions {
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
+        catalog: &Catalog,
         now_ms: i64,
     ) {
         self.allocate_session_counter(client, counters);
         self.run_pending_connects(client, authenticator, now_ms);
-        self.run_deferred(client, authenticator, now_ms);
+        self.run_deferred(client, authenticator, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
@@ -779,6 +894,7 @@ impl Sessions {
         &mut self,
         client: &mut Client,
         authenticator: &mut dyn Authenticator,
+        catalog: &Catalog,
         now_ms: i64,
     ) {
         for intent in std::mem::take(&mut self.pending) {
@@ -823,6 +939,30 @@ impl Sessions {
                             client,
                             authenticator,
                         );
+                    }
+                }
+                Deferred::Query {
+                    session_id,
+                    correlation_id,
+                    query,
+                } => {
+                    let Some(entry) = self.sessions.get_mut(&session_id) else {
+                        continue;
+                    };
+
+                    match answer_query(catalog, query) {
+                        Ok(value) => {
+                            entry
+                                .control
+                                .send_ok_response(correlation_id, value, now_ms, client)
+                        }
+                        Err(message) => entry.control.send_error_response(
+                            correlation_id,
+                            UNKNOWN_RECORDING,
+                            &message,
+                            now_ms,
+                            client,
+                        ),
                     }
                 }
             }
@@ -1008,6 +1148,14 @@ impl ControlPlane for Sessions {
         });
     }
 
+    fn on_query(&mut self, session_id: i64, correlation_id: i64, query: Query, _now_ms: i64) {
+        self.pending.push(Deferred::Query {
+            session_id,
+            correlation_id,
+            query,
+        });
+    }
+
     fn send_error_response(
         &mut self,
         session_id: i64,
@@ -1059,6 +1207,15 @@ pub struct ArchiveConductor {
     /// (`ArchiveConductor.java:443-446`, via the error handler).
     error_counter: ErrorCounter,
     cnc: CncFile,
+    /// The recordings the archive holds (`ArchiveConductor.java:196` and its
+    /// `ctx.catalog()`).
+    ///
+    /// The conductor rather than the sessions, which is the reference's shape
+    /// too — the catalog is the archive's, outlives every session, and is what
+    /// the answers to the questions about a recording are read out of. It
+    /// reaches [`Sessions::drive`] as an argument for the same reason the
+    /// counters do.
+    catalog: Catalog,
     command_timeout: Duration,
 }
 
@@ -1077,6 +1234,7 @@ impl ArchiveConductor {
         config: &ArchiveConfig,
         cnc: CncFile,
         mark_file: ArchiveMarkFile,
+        catalog: Catalog,
         error_counter_id: i32,
         remote_subscription_id: Option<i64>,
         local_subscription_id: i64,
@@ -1115,6 +1273,7 @@ impl ArchiveConductor {
             cached_epoch_ms: i64::MIN,
             error_counter: ErrorCounter::new(error_counter_id),
             cnc,
+            catalog,
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -1158,6 +1317,7 @@ impl ArchiveConductor {
             authenticator,
             sessions,
             cnc,
+            catalog,
             error_counter,
             command_timeout,
             ..
@@ -1173,7 +1333,7 @@ impl ArchiveConductor {
 
         work += adapter.poll(client, sessions, now_ms)?;
 
-        sessions.drive(client, &counters, authenticator.as_mut(), now_ms);
+        sessions.drive(client, &counters, authenticator.as_mut(), catalog, now_ms);
 
         // The adapter is told about every session that ended, and the image is
         // rejected only for the ones that ended badly. The image comes from
@@ -1212,6 +1372,99 @@ impl ArchiveConductor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::catalog::Recording;
+    use crate::mark::tests::TempDir;
+
+    /// A catalog holding one recording, so that a question about it has
+    /// something to read. Its fields are the ones the questions read, and the
+    /// values are distinct so that a question answered with the wrong one
+    /// shows.
+    fn catalog_with_a_recording() -> (TempDir, Catalog) {
+        let dir = TempDir::new();
+        let mut catalog =
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+
+        catalog
+            .add_recording(&Recording {
+                recording_id: 0,
+                start_timestamp: 1_000,
+                stop_timestamp: 2_000,
+                start_position: 4096,
+                stop_position: 8192,
+                initial_term_id: 3,
+                segment_file_length: 128 * 1024,
+                term_buffer_length: 64 * 1024,
+                mtu_length: 1408,
+                session_id: 1001,
+                stream_id: 33,
+                stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+                original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+                source_identity: "aeron:ipc".to_owned(),
+            })
+            .expect("added");
+
+        (dir, catalog)
+    }
+
+    /// Each question reads the field the reference reads, and the two that fall
+    /// back do so with the reference's own values
+    /// (`ArchiveConductor.java:1159-1195`).
+    #[test]
+    fn a_question_about_a_recording_is_answered_from_the_catalog() {
+        let (_dir, catalog) = catalog_with_a_recording();
+
+        assert_eq!(
+            Ok(4096),
+            answer_query(&catalog, Query::StartPosition { recording_id: 0 })
+        );
+        assert_eq!(
+            Ok(8192),
+            answer_query(&catalog, Query::StopPosition { recording_id: 0 })
+        );
+        assert_eq!(
+            Ok(NULL_POSITION),
+            answer_query(&catalog, Query::RecordingPosition { recording_id: 0 }),
+            "a recording that is not in flight has no position to report"
+        );
+        assert_eq!(
+            Ok(8192),
+            answer_query(&catalog, Query::MaxRecordedPosition { recording_id: 0 }),
+            "which for one that is not active is where it stopped"
+        );
+    }
+
+    /// The refusal is the one the C client prints — `errorCode=5, error:
+    /// unknown recording id: <id>` — and it is asserted here **word for word**,
+    /// because the acceptance test asserts the same line
+    /// (`aeron_archive_test.cpp:1125`).
+    #[test]
+    fn a_question_about_a_recording_the_catalog_does_not_hold_is_refused() {
+        let (_dir, catalog) = catalog_with_a_recording();
+
+        assert_eq!(5, UNKNOWN_RECORDING);
+        assert_eq!(
+            Err("unknown recording id: 12345".to_owned()),
+            answer_query(
+                &catalog,
+                Query::StartPosition {
+                    recording_id: 12345
+                }
+            )
+        );
+
+        // A negative id is refused by the guard rather than by the lookup
+        // (`Catalog.hasRecording`, `Catalog.java:495-498`).
+        assert_eq!(
+            Err(format!("unknown recording id: {}", i64::MIN)),
+            answer_query(
+                &catalog,
+                Query::MaxRecordedPosition {
+                    recording_id: i64::MIN
+                }
+            )
+        );
+    }
 
     /// What the archive's own control settings are for these tests, and the
     /// correlation id of the image a request arrived on.

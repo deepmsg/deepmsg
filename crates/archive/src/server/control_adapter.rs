@@ -78,13 +78,22 @@ use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecode
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
 use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestDecoder;
+use deepmsg_codec::archive::max_recorded_position_request_codec::{
+    self, MaxRecordedPositionRequestDecoder,
+};
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
+use deepmsg_codec::archive::recording_position_request_codec::{
+    self, RecordingPositionRequestDecoder,
+};
+use deepmsg_codec::archive::start_position_request_codec::{self, StartPositionRequestDecoder};
+use deepmsg_codec::archive::stop_position_request_codec::{self, StopPositionRequestDecoder};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
 };
 
 use crate::server::auth::AuthorisationService;
+use crate::server::conductor::Query;
 use crate::server::control_session::SESSION_CLOSED_MSG;
 
 /// How many fragments one subscription is read for in a turn
@@ -281,6 +290,15 @@ pub trait ControlPlane {
     /// `ArchiveConductor.logWarning` (`ArchiveConductor.java:443-446`), which
     /// the reference routes into the archive's error handler.
     fn log_warning(&mut self, message: &str);
+
+    /// A question about a recording (`ArchiveConductor.java:1159-1195`), which
+    /// the conductor answers out of its catalog.
+    ///
+    /// The reference has four methods here and they differ only in which field
+    /// they read, so this is one — see [`Query`] for the whole of that
+    /// argument. What is *not* collapsed is the answer: it is the reference's,
+    /// field for field.
+    fn on_query(&mut self, session_id: i64, correlation_id: i64, query: Query, now_ms: i64);
 }
 
 /// The fragments of a client's control requests, and the sessions they belong
@@ -601,6 +619,77 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // The four questions whose answer is a position
+        // (`ArchiveConductor.java:1159-1195`). They are the same request shape
+        // four times over — session, correlation, recording — so they are the
+        // same arm four times over, and the difference is which
+        // [`Query`] is named.
+        start_position_request_codec::SBE_TEMPLATE_ID
+        | recording_position_request_codec::SBE_TEMPLATE_ID
+        | stop_position_request_codec::SBE_TEMPLATE_ID
+        | max_recorded_position_request_codec::SBE_TEMPLATE_ID => {
+            let (control_session_id, correlation_id, recording_id) = match template_id {
+                start_position_request_codec::SBE_TEMPLATE_ID => {
+                    let decoder = StartPositionRequestDecoder::default().header(header, 0);
+                    (
+                        decoder.control_session_id(),
+                        decoder.correlation_id(),
+                        decoder.recording_id(),
+                    )
+                }
+                recording_position_request_codec::SBE_TEMPLATE_ID => {
+                    let decoder = RecordingPositionRequestDecoder::default().header(header, 0);
+                    (
+                        decoder.control_session_id(),
+                        decoder.correlation_id(),
+                        decoder.recording_id(),
+                    )
+                }
+                stop_position_request_codec::SBE_TEMPLATE_ID => {
+                    let decoder = StopPositionRequestDecoder::default().header(header, 0);
+                    (
+                        decoder.control_session_id(),
+                        decoder.correlation_id(),
+                        decoder.recording_id(),
+                    )
+                }
+                _ => {
+                    let decoder = MaxRecordedPositionRequestDecoder::default().header(header, 0);
+                    (
+                        decoder.control_session_id(),
+                        decoder.correlation_id(),
+                        decoder.recording_id(),
+                    )
+                }
+            };
+
+            let query = match template_id {
+                start_position_request_codec::SBE_TEMPLATE_ID => {
+                    Query::StartPosition { recording_id }
+                }
+                recording_position_request_codec::SBE_TEMPLATE_ID => {
+                    Query::RecordingPosition { recording_id }
+                }
+                stop_position_request_codec::SBE_TEMPLATE_ID => {
+                    Query::StopPosition { recording_id }
+                }
+                _ => Query::MaxRecordedPosition { recording_id },
+            };
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_query(session_id, correlation_id, query, now_ms);
+            }
+        }
+
         archive_id_request_codec::SBE_TEMPLATE_ID => {
             let decoder = ArchiveIdRequestDecoder::default().header(header, 0);
 
@@ -768,6 +857,11 @@ mod tests {
             relevant_id: i64,
             message: String,
         },
+        Query {
+            session_id: i64,
+            correlation_id: i64,
+            query: Query,
+        },
     }
 
     /// A control plane that writes down what it was asked and hands out session
@@ -858,6 +952,14 @@ mod tests {
 
         fn log_warning(&mut self, message: &str) {
             self.warnings.push(message.to_owned());
+        }
+
+        fn on_query(&mut self, session_id: i64, correlation_id: i64, query: Query, _now_ms: i64) {
+            self.calls.push(Call::Query {
+                session_id,
+                correlation_id,
+                query,
+            });
         }
     }
 
@@ -1461,6 +1563,99 @@ mod tests {
         };
         buffer.truncate(length);
         buffer
+    }
+
+    /// The four position questions, which are the same request shape four times
+    /// over — session, correlation, recording.
+    macro_rules! position_request {
+        ($name:ident, $codec:ident, $encoder:ident) => {
+            fn $name(control_session_id: i64, correlation_id: i64, recording_id: i64) -> Vec<u8> {
+                use deepmsg_codec::archive::$codec::$encoder;
+
+                let mut buffer = vec![0u8; 64];
+                let length = {
+                    let encoder = $encoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+                    let mut header = encoder.header(0);
+                    let mut encoder = header.parent().unwrap();
+                    encoder
+                        .control_session_id(control_session_id)
+                        .correlation_id(correlation_id)
+                        .recording_id(recording_id);
+                    BODY + encoder.encoded_length()
+                };
+                buffer.truncate(length);
+                buffer
+            }
+        };
+    }
+
+    position_request!(
+        start_position_request,
+        start_position_request_codec,
+        StartPositionRequestEncoder
+    );
+    position_request!(
+        recording_position_request,
+        recording_position_request_codec,
+        RecordingPositionRequestEncoder
+    );
+    position_request!(
+        stop_position_request,
+        stop_position_request_codec,
+        StopPositionRequestEncoder
+    );
+    position_request!(
+        max_recorded_position_request,
+        max_recorded_position_request_codec,
+        MaxRecordedPositionRequestEncoder
+    );
+
+    /// The four questions whose answer is a position, each reaching the session
+    /// as the same kind of [`Query`] and differing only in which one
+    /// (`ArchiveConductor.java:1159-1195`).
+    ///
+    /// One test rather than four because the arm is one arm: what can go wrong
+    /// is a template decoded as its neighbour's question, which only four
+    /// payloads side by side can show.
+    #[test]
+    fn the_four_position_questions_reach_the_session_as_queries() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let questions = [
+            (
+                start_position_request(session_id, 7, 100),
+                Query::StartPosition { recording_id: 100 },
+            ),
+            (
+                recording_position_request(session_id, 7, 100),
+                Query::RecordingPosition { recording_id: 100 },
+            ),
+            (
+                stop_position_request(session_id, 7, 100),
+                Query::StopPosition { recording_id: 100 },
+            ),
+            (
+                max_recorded_position_request(session_id, 7, 100),
+                Query::MaxRecordedPosition { recording_id: 100 },
+            ),
+        ];
+
+        for (payload, query) in questions {
+            adapter
+                .on_message(&mut control, IMAGE, message(&payload), 2_000)
+                .expect("read");
+
+            assert_eq!(
+                Some(&Call::Query {
+                    session_id,
+                    correlation_id: 7,
+                    query,
+                }),
+                control.calls.last(),
+                "{query:?}"
+            );
+        }
     }
 
     /// Both warnings in the gate are the reference's one line

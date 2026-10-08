@@ -439,6 +439,25 @@ impl Catalog {
         self.index.offset_of(recording_id)
     }
 
+    /// Whether this catalog holds a recording (`Catalog.hasRecording`,
+    /// `Catalog.java:495-498`).
+    ///
+    /// The reference's test is `recordingId >= 0 && recordingDescriptorOffset
+    /// (recordingId) > 0`, and the index is the same question asked of a map:
+    /// [`CatalogIndex::offset_of`] answers `None` for an id no record carries,
+    /// and a record that was retired is taken out of the index
+    /// (`Catalog.changeState`, `:779-790`), which is what makes `> 0` false for
+    /// it there.
+    ///
+    /// This is the guard every request that names a recording passes through on
+    /// its way to [`Catalog::recording`], and the reason it is a separate
+    /// question: the refusal it produces carries the reference's own words
+    /// (`ArchiveConductor.hasRecording`, `ArchiveConductor.java:1950-1960`).
+    #[must_use]
+    pub fn has_recording(&self, recording_id: i64) -> bool {
+        recording_id >= 0 && self.recording_offset(recording_id).is_some()
+    }
+
     /// Append a recording, and answer with the id it was given.
     ///
     /// The id is the catalog's to allocate, not the caller's: it is

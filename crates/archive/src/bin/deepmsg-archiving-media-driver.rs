@@ -62,6 +62,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::catalog::Catalog;
 use deepmsg_archive::mark_file::{ArchiveMarkFile, ERROR_BUFFER_LENGTH_DEFAULT, Header};
 use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
 use deepmsg_archive::server::config::ArchiveConfig;
@@ -78,6 +79,12 @@ use deepmsg_driver::{cpuset, dir, sys};
 /// the driver's error counter, which the archive writes its own errors into
 /// instead of keeping one of its own.
 const DRIVER_ERROR_COUNTER_ID: i32 = 15;
+
+/// `Archive.Configuration.MAX_CATALOG_ENTRIES_DEFAULT` (`Archive.java:472`).
+///
+/// Reached through `getSizeAsLong` (`:849-851`), so a property may spell it
+/// `128` or `8k`; this build does not read the name yet and uses the default.
+const MAX_CATALOG_ENTRIES_DEFAULT: usize = 8 * 1024;
 
 /// `AeronArchive.Configuration.RECORDING_EVENTS_STREAM_ID_DEFAULT`
 /// (`client/AeronArchive.java:2791`).
@@ -259,10 +266,27 @@ fn run(
     let cnc = CncFile::open_writable(aeron_dir, COMMAND_TIMEOUT)
         .map_err(|error| format!("could not open the counter region: {error}"))?;
 
+    // The recordings this archive holds. Opened here rather than inside the
+    // conductor for the same reason the mark file is made here: it is a
+    // file-system step, and this is where the file system is already being
+    // dealt with.
+    //
+    // Two things about the call are worth stating, because the reference's are
+    // implicit. The capacity is `aeron.archive.max.catalog.entries`'s default
+    // (`Archive.java:472`, read as a size at `:849-851`) — the property itself
+    // is not read yet, so a deployment that sets it gets the default. And a
+    // **fresh** catalog starts at recording id 0, because the reference's field
+    // starts at 0 and `Archive` constructs its `Catalog` without seeding it
+    // (`Catalog.java:148`, `Archive.java:1503-1511`).
+    let catalog =
+        Catalog::open_or_create(&archive_config.archive_dir, MAX_CATALOG_ENTRIES_DEFAULT, 0)
+            .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
+
     let mut conductor = ArchiveConductor::new(
         archive_config,
         cnc,
         mark_file,
+        catalog,
         DRIVER_ERROR_COUNTER_ID,
         remote_subscription_id,
         local_subscription_id,
