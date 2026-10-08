@@ -5,10 +5,13 @@
 //! does the same for this workspace's own archiving media driver, whose
 //! readiness is a mark file's version rather than a file's existence. Both are
 //! compiled unconditionally, so CI lints them even though the tests that call
-//! [`driver`] are behind the `interop` feature.
+//! [`driver`] are behind the `interop` feature. [`archive`] is the fourth: a
+//! client for our archive, written by hand because this workspace has no archive
+//! client crate yet.
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod archiving_driver;
 pub mod driver;
 pub mod java;

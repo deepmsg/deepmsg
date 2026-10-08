@@ -210,6 +210,13 @@ path = "integration/next_session_id.rs"
 name = "archive_connect"
 path = "integration/archive_connect.rs"
 
+# P2-S2's acceptance, and the same criterion: our archiving media driver binary,
+# our client, one recording made and stopped. The C suite is this slice's
+# judgement and needs the reference checkout; this is the claim CI can run.
+[[test]]
+name = "archive_recording"
+path = "integration/archive_recording.rs"
+
 # Our client's REJECT_IMAGE against the reference driver: whether the record
 # this build writes is one the reference reads, and whether its
 # ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.
