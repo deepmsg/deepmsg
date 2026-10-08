@@ -34,15 +34,27 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 
-# The load test rig is built with more than the default release profile, and
-# these are the settings that can be given per package. `lto` and `panic` cannot
-# — cargo refuses to parse them here — so they come from the build invocation
-# instead; see `analysis/bench/build-rig.sh`.
+# `lto` and `panic` cannot be given per package — cargo refuses to parse them
+# inside `[profile.release.package.*]` — so the two that cannot live below are
+# the workspace's, and the rest of what the rig wants is beside them.
+#
+# **`lto = "fat"` was measured, not assumed.** The driver built with it runs a
+# receiver pass in 3114 cycles against 3226 at 501K:32, in one session, ABBA:
+# the receiver takes 3.59% more turns and p50 falls 1.79%, the two rounds within
+# 0.01 points of each other. Without it the executable held 2,852 more `call`
+# instructions — every one a crate boundary LLVM cannot see through, and the
+# reason a counter read cost 78.7 cycles a pass against the C reference's zero.
+# `b1-out/r10-on-main/lto-pair/prereg.md` has the prediction, the static
+# evidence and the result.
 #
 # The rig is the measuring instrument *and* half of what R3/R4 measure, so its
 # own overhead lands in the numbers: a monomorphised call chain is worth having.
-# The driver and every other crate keep the default profile, so nothing that has
-# already been measured moves.
+# `analysis/bench/build-rig.sh` still passes `lto` and `panic` on the command
+# line, where they are recorded beside the rig's digest.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [profile.release.package.deepmsg-bench]
 opt-level = 3
 codegen-units = 1
