@@ -544,6 +544,14 @@ impl ArchiveIdCounter {
         self.counter_id
     }
 
+    /// A counter that is already in a slot, for a caller that knows the id —
+    /// which is a test that is not about the allocation, and nothing else.
+    /// `pub(crate)` and test-only for that reason.
+    #[cfg(test)]
+    pub(crate) const fn for_test(counter_id: i32) -> Self {
+        Self { counter_id }
+    }
+
     /// What the counter reads now, which is what `AeronStat` shows and what the
     /// C harness reads a recording's position out of
     /// (`aeron_archive_test.cpp:267-273`).

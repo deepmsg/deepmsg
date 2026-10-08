@@ -366,6 +366,20 @@ impl RecordingPos {
         self.registration_id
     }
 
+    /// A handle for a counter that does not exist, which is the state
+    /// [`RecordingPos::request`] leaves one in before the driver answers.
+    ///
+    /// `pub(crate)` and test-only: a caller outside this crate builds one by
+    /// asking for it, and the only other thing that wants a handle with no slot
+    /// is a test that is not about the counter.
+    #[cfg(test)]
+    pub(crate) const fn for_test(registration_id: i64) -> Self {
+        Self {
+            registration_id,
+            counter_id: None,
+        }
+    }
+
     /// The values-region slot, once the claim has read it.
     pub const fn counter_id(&self) -> Option<i32> {
         self.counter_id
