@@ -66,6 +66,9 @@ use deepmsg_archive::catalog::Catalog;
 use deepmsg_archive::mark_file::{ArchiveMarkFile, ERROR_BUFFER_LENGTH_DEFAULT, Header};
 use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
 use deepmsg_archive::server::config::ArchiveConfig;
+use deepmsg_archive::server::counters::{
+    ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, find_archive_id_counter,
+};
 use deepmsg_client::client::{AsyncAddPoll, Client};
 use deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT;
 use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
@@ -298,6 +301,28 @@ fn run(
 
     let cnc = CncFile::open_writable(aeron_dir, COMMAND_TIMEOUT)
         .map_err(|error| format!("could not open the counter region: {error}"))?;
+
+    // An archive id that is already being recorded by is one this archive
+    // refuses to serve (`Archive.java:1589-1595`): the reference looks for a
+    // 105 — the recorder's max write time, the one counter a second archive
+    // would fight the first over — and throws out of `conclude` if it finds one.
+    // The check is a **read** of the counters region, so unlike the allocation
+    // itself it can happen here, before anything is served.
+    let archive_id = archive_config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT);
+
+    if let Some(counters) = cnc.counters() {
+        if find_archive_id_counter(
+            &counters,
+            ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+            archive_id,
+        )
+        .is_some()
+        {
+            return Err(format!(
+                "existing max write time counter detected for archiveId={archive_id}"
+            ));
+        }
+    }
 
     // The recordings this archive holds. Opened here rather than inside the
     // conductor for the same reason the mark file is made here: it is a

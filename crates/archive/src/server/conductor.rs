@@ -3758,7 +3758,7 @@ impl ArchiveConductor {
             error_counter: ErrorCounter::new(error_counter_id),
             cnc,
             catalog,
-            recorder: Recorder::new(),
+            recorder: Recorder::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -3832,6 +3832,14 @@ impl ArchiveConductor {
         // sessions (`SharedModeArchiveConductor.java:56-63`). What a session
         // that ended this turn owes is collected here, where the catalog and
         // the control sessions are.
+        //
+        // Its three counters are asked for here too, before it is driven, so
+        // that the first turn which writes anything has somewhere to publish to
+        // — the reference allocates them in `conclude` (`Archive.java:1587-1626`)
+        // and this build spends a turn per add doing the same, by the same two
+        // steps every counter here takes.
+        recorder.allocate(client, &counters, *command_timeout);
+
         work += recorder.drive(client, &counters);
 
         for session in recorder.take_finished() {

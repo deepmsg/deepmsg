@@ -39,7 +39,12 @@ use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
 use crate::recording_writer::WriteStats;
-use crate::server::counters::ArchiveIdCounter;
+use crate::server::counters::{
+    ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
+    ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID, ArchiveIdCounter, RECORDER_MAX_WRITE_TIME_NAME,
+    RECORDER_TOTAL_WRITE_BYTES_NAME, RECORDER_TOTAL_WRITE_TIME_NAME, claim_archive_id_counter,
+    request_archive_id_counter,
+};
 use crate::server::recording_session::RecordingSession;
 
 /// What every recording this archive has made adds up to
@@ -102,8 +107,54 @@ pub struct RecorderCounters {
     pub total_write_time: ArchiveIdCounter,
 }
 
+/// The three write counters, in the order the reference allocates them
+/// (`Archive.java:1587-1626`).
+///
+/// The order is not decoration: the reference asks for the max-write-time one
+/// first and **refuses to start** if a 105 for this archive id is already there
+/// (`:1589-1595`), and this build does that check where its archive starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderCounter {
+    /// 105: the longest single write, whose duplicate is refused.
+    MaxWriteTime,
+    /// 106: the bytes every recording has written.
+    TotalWriteBytes,
+    /// 107: the nanoseconds those writes took.
+    TotalWriteTime,
+}
+
+impl RecorderCounter {
+    /// All three, in the order the reference allocates them.
+    const ORDER: [Self; 3] = [
+        Self::MaxWriteTime,
+        Self::TotalWriteBytes,
+        Self::TotalWriteTime,
+    ];
+
+    /// The type id `ArchiveCounters.allocate` is called with (`:1598`, `:1610`,
+    /// `:1622` over `AeronCounters`).
+    #[must_use]
+    const fn type_id(self) -> i32 {
+        match self {
+            Self::MaxWriteTime => ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+            Self::TotalWriteBytes => ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
+            Self::TotalWriteTime => ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID,
+        }
+    }
+
+    /// The name its label is built from (`:1600`, `:1612`, `:1624`).
+    #[must_use]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::MaxWriteTime => RECORDER_MAX_WRITE_TIME_NAME,
+            Self::TotalWriteBytes => RECORDER_TOTAL_WRITE_BYTES_NAME,
+            Self::TotalWriteTime => RECORDER_TOTAL_WRITE_TIME_NAME,
+        }
+    }
+}
+
 /// Every recording session, and the numbers they add up to.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Recorder {
     /// The sessions still in flight, which is the reference's
     /// `SessionWorker.sessions` (`SessionWorker.java:23`).
@@ -115,12 +166,29 @@ pub struct Recorder {
     /// `None` until the three counters have been allocated — and an archive that
     /// never allocated them still records, it just does not count.
     counters: Option<RecorderCounters>,
+    /// The counters that are in hand while the rest are still on their way.
+    ///
+    /// The reference allocates all three at once, in `Archive.Context.conclude`
+    /// (`:1587-1626`), because its archive drives the driver. Here each is a
+    /// command the driver answers on a later turn, so they are asked for **one
+    /// at a time** and this holds the ones already claimed.
+    held: Vec<(RecorderCounter, ArchiveIdCounter)>,
+    /// The counter being asked for, and the registration id the add drew —
+    /// `None` between one counter arriving and the next being asked for.
+    pending: Option<(RecorderCounter, i64)>,
+    /// The archive id every one of the three is keyed by
+    /// (`ArchiveCounters.allocate`, `ArchiveCounters.java:52-69`).
+    archive_id: i64,
 }
 
 impl Recorder {
-    /// A recorder with nothing in it.
+    /// A recorder with nothing in it, for an archive with this id.
+    ///
+    /// The id is what the three counters are keyed by — the reference's
+    /// `ArchiveCounters.allocate` writes it into the key and into the label's
+    /// suffix — so a recorder has to know it before it can count.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(archive_id: i64) -> Self {
         Self {
             sessions: Vec::new(),
             finished: Vec::new(),
@@ -130,7 +198,93 @@ impl Recorder {
                 max_write_time_ns: 0,
             },
             counters: None,
+            held: Vec::new(),
+            pending: None,
+            archive_id,
         }
+    }
+
+    /// Ask for the three counters, one at a time, and take each up when the
+    /// driver answers (`Archive.java:1587-1626`).
+    ///
+    /// The reference does all three in `Archive.Context.conclude` — at startup,
+    /// synchronously, because its archive drives the driver. This build cannot:
+    /// it runs inside the turn that drives the driver, so each add goes out on
+    /// one turn and its answer is read on a later one (the same two steps the
+    /// control-session counters take, `Sessions::allocate_session_counter`).
+    ///
+    /// One at a time rather than three at once, because that keeps the state one
+    /// registration id instead of three and the order is the reference's anyway.
+    /// A refusal is not retried: a counter the driver will not make can never
+    /// become one, and a recorder with no counters still records.
+    pub fn allocate(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        timeout: std::time::Duration,
+    ) {
+        if self.counters.is_some() {
+            return;
+        }
+
+        let Some((counter, registration_id)) = self.pending else {
+            let Some(counter) = RecorderCounter::ORDER
+                .into_iter()
+                .find(|counter| !self.holds(*counter))
+            else {
+                return;
+            };
+
+            match request_archive_id_counter(
+                client,
+                counter.type_id(),
+                counter.name(),
+                self.archive_id,
+                timeout,
+            ) {
+                Ok(registration_id) => self.pending = Some((counter, registration_id)),
+                Err(_) => {
+                    // A command that would not go out is one this build has
+                    // already given up on: the next turn asks again for the
+                    // first counter it does not hold, and the archive records
+                    // without counting until one takes.
+                    self.pending = None;
+                }
+            }
+
+            return;
+        };
+
+        match claim_archive_id_counter(client, counters, counter.type_id(), registration_id) {
+            Ok(Some(counter_id)) => {
+                self.held.push((counter, counter_id));
+
+                if self.held.len() == RecorderCounter::ORDER.len() {
+                    let held = std::mem::take(&mut self.held);
+                    let take = |want: RecorderCounter| {
+                        held.iter()
+                            .find(|(counter, _)| *counter == want)
+                            .map(|(_, counter)| *counter)
+                            .expect("all three are in hand")
+                    };
+
+                    self.counters = Some(RecorderCounters {
+                        max_write_time: take(RecorderCounter::MaxWriteTime),
+                        total_write_bytes: take(RecorderCounter::TotalWriteBytes),
+                        total_write_time: take(RecorderCounter::TotalWriteTime),
+                    });
+                }
+
+                self.pending = None;
+            }
+            Ok(None) => {}
+            Err(_) => self.pending = None,
+        }
+    }
+
+    /// Whether one of the three is in hand.
+    fn holds(&self, counter: RecorderCounter) -> bool {
+        self.held.iter().any(|(held, _)| *held == counter)
     }
 
     /// `recorder.addSession` (`ArchiveConductor.java:2055`).
@@ -272,7 +426,7 @@ mod tests {
     /// a region of its own.
     fn recorder_with_counters() -> (Recorder, CountersReader<'static, ReadWrite>) {
         let counters = values_region();
-        let mut recorder = Recorder::new();
+        let mut recorder = Recorder::new(42);
 
         recorder.set_counters(RecorderCounters {
             max_write_time: ArchiveIdCounter::for_test(0),
@@ -355,7 +509,7 @@ mod tests {
     #[test]
     fn a_recorder_with_no_counters_publishes_nothing() {
         let counters = values_region();
-        let mut recorder = Recorder::new();
+        let mut recorder = Recorder::new(42);
 
         recorder.totals.bytes_written(8);
 
@@ -367,12 +521,57 @@ mod tests {
         assert_eq!((8, 0, 0), recorder.totals().totals(), "but it was counted");
     }
 
+    /// The three counters are the reference's three, by **type id and label**:
+    /// what `AeronStat` reads to tell a 105 from a 106, and what a comparison
+    /// against the reference's own reader turns on (`Archive.java:1587-1626`).
+    #[test]
+    fn the_three_counters_are_the_references_three() {
+        assert_eq!(
+            105,
+            RecorderCounter::MaxWriteTime.type_id(),
+            "AeronCounters.ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID"
+        );
+        assert_eq!(106, RecorderCounter::TotalWriteBytes.type_id());
+        assert_eq!(107, RecorderCounter::TotalWriteTime.type_id());
+
+        assert_eq!(
+            "archive-recorder max write time in ns",
+            RecorderCounter::MaxWriteTime.name()
+        );
+        assert_eq!(
+            "archive-recorder total write bytes",
+            RecorderCounter::TotalWriteBytes.name()
+        );
+        assert_eq!(
+            "archive-recorder total write time in ns",
+            RecorderCounter::TotalWriteTime.name()
+        );
+
+        // And the label the reader sees is that name with the archive id's
+        // suffix, which is the one thing about these counters that a reader has
+        // to agree with us about (`ArchiveCounters.java:35`, `:52-69`).
+        assert_eq!(
+            "archive-recorder total write bytes - archiveId=42",
+            crate::server::counters::archive_id_label(RecorderCounter::TotalWriteBytes.name(), 42)
+        );
+
+        assert_eq!(
+            [
+                RecorderCounter::MaxWriteTime,
+                RecorderCounter::TotalWriteBytes,
+                RecorderCounter::TotalWriteTime
+            ],
+            RecorderCounter::ORDER,
+            "and they are asked for in the reference's order (`:1587-1626`)"
+        );
+    }
+
     /// A recorder is empty until a session is added, and a session that has
     /// finished is handed back rather than closed
     /// (`SessionWorker.java:56-81`).
     #[test]
     fn an_empty_recorder_hands_back_nothing() {
-        let mut recorder = Recorder::new();
+        let mut recorder = Recorder::new(42);
 
         assert!(recorder.is_empty());
         assert_eq!(0, recorder.session_count());
