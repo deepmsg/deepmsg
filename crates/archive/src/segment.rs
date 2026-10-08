@@ -127,8 +127,9 @@ pub enum SegmentError {
         /// What the frame said its length was.
         frame_length: i32,
     },
-    /// The next segment file is already there
-    /// (`RecordingWriter.onFileRollOver`, `:242-245`).
+    /// The **next** segment file is already there, which a roll-over refuses
+    /// (`RecordingWriter.onFileRollOver`, `:241-244`). Opening a segment that is
+    /// there is not this error — that is an extension.
     Exists {
         /// The file that was there.
         path: PathBuf,
@@ -257,9 +258,9 @@ impl SegmentWriter {
     ///
     /// # Errors
     ///
-    /// [`SegmentError::Io`] for the file system, and
-    /// [`SegmentError::Exists`] when a segment of this recording is already
-    /// there — a recording does not overwrite one.
+    /// [`SegmentError::Io`] for the file system. A segment file that is already
+    /// there is **not** an error: it is the one this recording is continuing
+    /// into (see [`SegmentWriter::open_segment`]).
     pub fn create(
         directory: &Path,
         spec: SegmentSpec,
@@ -414,24 +415,38 @@ impl SegmentWriter {
         self.offset = 0;
 
         let path = self.path();
+
+        // **This** is where an existing segment is refused, and it is the only
+        // place the reference refuses one (`:241-244`): rolling onto a file that
+        // is already there would append to another recording's bytes, where
+        // *opening* one that is there is what an extension does.
+        if path.exists() {
+            return Err(SegmentError::Exists { path });
+        }
+
         let next = Self::open_segment(&path, self.segment_length)?;
         self.file = next;
 
         Ok(())
     }
 
+    /// Open the segment file, **making it if it is not there**
+    /// (`RecordingWriter.openRecordingSegmentFile`, `:213-232`: a
+    /// `RandomAccessFile` opened `"rw"` and set to the segment's length).
+    ///
+    /// An existing file of the right length is opened where it is, which is what
+    /// a recording being **extended** does: its bytes go into the segments the
+    /// first session already made (`ArchiveConductor.java:2109`). A file of some
+    /// other length is set to this one, which is the reference's `setLength` and
+    /// is where it would lose bytes rather than refuse.
     fn open_segment(path: &Path, segment_length: usize) -> Result<File, SegmentError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(path)
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::AlreadyExists => SegmentError::Exists {
-                    path: path.to_path_buf(),
-                },
-                _ => SegmentError::Io(error),
-            })?;
+            .map_err(SegmentError::Io)?;
 
         // Preallocated, which is what makes a padding frame's "header and
         // nothing else" leave zeroes behind it rather than a hole a reader has

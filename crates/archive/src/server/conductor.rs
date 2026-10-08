@@ -125,7 +125,8 @@ use crate::server::auth::{
 };
 use crate::server::config::ArchiveConfig;
 use crate::server::control_adapter::{
-    ConnectRequest, ControlAdapter, ControlError, ControlPlane, ImageId, StartRecordingRequest,
+    ConnectRequest, ControlAdapter, ControlError, ControlPlane, ExtendRecordingRequest, ImageId,
+    StartRecordingRequest,
 };
 use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
@@ -695,6 +696,15 @@ pub const ACTIVE_LISTING: i64 = 1;
 /// (`ArchiveConductor.java:692`).
 pub const ACTIVE_LISTING_MSG: &str = "active listing already in progress";
 
+/// `ArchiveException.ACTIVE_RECORDING` (`client/ArchiveException.java:39`), the
+/// refusal an extend gets for a recording that is still in flight
+/// (`ArchiveConductor.java:1093-1098`, `:2066-2072`).
+pub const ACTIVE_RECORDING: i64 = 2;
+
+/// `ArchiveException.INVALID_EXTENSION` (`:74`), the refusal an image that does
+/// not continue the recording gets (`ArchiveConductor.java:2155-2194`).
+pub const INVALID_EXTENSION: i64 = 9;
+
 /// `ArchiveException.MAX_RECORDINGS` (`client/ArchiveException.java:69`), the
 /// refusal a start gets while too many recordings are in flight
 /// (`ArchiveConductor.java:538-543`).
@@ -790,6 +800,9 @@ enum Action {
         stream_id: i32,
         original_channel: String,
     },
+    /// `ArchiveConductor.extendRecording` (`:1067-1157`): a client asking to
+    /// go on recording a channel whose first session ended.
+    ExtendRecording(ExtendRecordingRequest),
     /// `ArchiveConductor.stopRecordingByIdentity` (`:1301-1327`), which names
     /// the *recording* — and answers with whether there was one to stop, not
     /// with a position.
@@ -798,6 +811,25 @@ enum Action {
         correlation_id: i64,
         recording_id: i64,
     },
+}
+
+/// What one image says about itself (`ArchiveConductor.java:1999-2005`), read
+/// out of the client in one go.
+///
+/// A value rather than a borrow, because everything below needs the client
+/// **mutably** — to add the position counter, to validate an extension, to
+/// answer — and an image is borrowed from the client it came out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageFacts {
+    session_id: i32,
+    stream_id: i32,
+    /// Where the image joined the stream: where a start begins (`:2005`), and
+    /// what an extension is checked against (`:2161`).
+    join_position: i64,
+    initial_term_id: i32,
+    term_buffer_length: i32,
+    mtu_length: i32,
+    source_identity: String,
 }
 
 /// What a stop named by a channel resolves to
@@ -843,6 +875,27 @@ enum StartDecision {
     },
 }
 
+/// What a recording subscription was asked for: a recording that **starts**
+/// here, or one that is being **appended to** (`ArchiveConductor.java:562-570`
+/// against `:1124-1150`).
+///
+/// The two are the same request from the driver's side — add a subscription on
+/// this channel — and they differ in everything after that: what is written to
+/// the catalog, which signal the client gets, and whether the image is checked
+/// against a recording that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingRequest {
+    /// Record this channel, from wherever its image joins.
+    Start,
+    /// Append the image's bytes to the recording this id names.
+    Extend {
+        /// The recording the bytes belong to — the **same** recording id the
+        /// first session had, which is what makes this an append and not a
+        /// second recording.
+        recording_id: i64,
+    },
+}
+
 /// One recording subscription this archive holds
 /// (`ArchiveConductor.recordingSubscriptionByKeyMap`'s value, `:152`).
 ///
@@ -875,10 +928,13 @@ struct RecordingSubscription {
     /// from.
     is_auto_stop: bool,
     /// The control session that asked and the correlation id of its request,
-    /// which are what the `START` signal is sent with (`:2046-2051`) — captured
-    /// per start, as the reference's handler closure captures them.
+    /// which are what the `START`/`EXTEND` signal is sent with (`:2046-2051`,
+    /// `:2121-2122`) — captured per request, as the reference's handler closure
+    /// captures them.
     session_id: i64,
     correlation_id: i64,
+    /// Whether this subscription is making a recording or appending to one.
+    request: RecordingRequest,
 }
 
 /// A start whose subscription the driver has not answered yet.
@@ -908,6 +964,8 @@ struct PendingStartRecording {
     original_channel: String,
     /// Whether the recording ends with the client that asked (`:2044`).
     is_auto_stop: bool,
+    /// Whether this subscription is making a recording or appending to one.
+    request: RecordingRequest,
 }
 
 /// What the conductor remembers about one live recording
@@ -942,6 +1000,17 @@ struct PendingRecording {
     /// (`ArchiveConductor.java:2005`), which is also where the counter is set
     /// before anything is read (`:2029-2030`).
     start_position: i64,
+    /// Where the **writer** starts, which is what a segment's base positions are
+    /// counted from. A start's is its join position; an extend's is where the
+    /// recording began the first time (`:2109`), because the bytes go into the
+    /// same segments (`:2005` against `:2109` is the whole of that difference).
+    session_start_position: i64,
+    /// Whether this is the recording's first session or a continuation
+    /// (`:2046-2051` against `:2121-2122`).
+    request: RecordingRequest,
+    /// The **image's** session id, which is what an extension writes into the
+    /// row (`:2120`: `image.sessionId()`, not the archive's).
+    image_session_id: i32,
     segment_file_length: usize,
     subscription_id: i64,
     image_id: i64,
@@ -1274,7 +1343,7 @@ impl Sessions {
         self.run_pending_connects(client, authenticator, now_ms);
         self.run_deferred(client, counters, authenticator, catalog, recorder, now_ms);
         self.start_recordings(client, catalog, now_ms);
-        self.claim_recordings(client, counters, recorder, now_ms);
+        self.claim_recordings(client, catalog, counters, recorder, now_ms);
         self.drive_listings(client, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
@@ -1373,41 +1442,97 @@ impl Sessions {
 
             // The image itself, for the five things only it knows: the catalog
             // row keeps every one of them (`:1999-2019`).
-            let Some(image) = client
+            // Everything the image says about itself, read out **before**
+            // anything below needs the client mutably: an image is borrowed
+            // from the client it came out of, and the decisions this method
+            // makes are about to call it.
+            let facts = match client
                 .subscription(subscription_registration_id)
                 .and_then(|subscription| subscription.image(publication_registration_id))
-            else {
-                continue;
+            {
+                Some(image) => ImageFacts {
+                    session_id: image.session_id(),
+                    stream_id: image.stream_id(),
+                    join_position: image.join_position(),
+                    initial_term_id: image.initial_term_id(),
+                    term_buffer_length: image.term_buffer_length(),
+                    mtu_length: image.mtu_length().unwrap_or(0),
+                    source_identity: image.source_identity().to_owned(),
+                },
+                None => continue,
             };
 
-            let start_position = image.join_position();
-            let term_buffer_length = image.term_buffer_length();
-            let segment_file_length =
-                segment_file_length(self.recording.segment_file_length, term_buffer_length);
+            let start_position = facts.join_position;
+            let term_buffer_length = facts.term_buffer_length;
 
-            let recording = Recording {
-                recording_id: 0,
-                start_timestamp: now_ms,
-                stop_timestamp: NULL_VALUE,
-                start_position,
-                stop_position: NULL_VALUE,
-                initial_term_id: image.initial_term_id(),
-                segment_file_length,
-                term_buffer_length,
-                mtu_length: image.mtu_length().unwrap_or(0),
-                session_id: image.session_id(),
-                stream_id: image.stream_id(),
-                stripped_channel: subscription.stripped_channel.clone(),
-                original_channel: subscription.original_channel.clone(),
-                source_identity: image.source_identity().to_owned(),
-            };
+            // What the row says and which recording the bytes belong to: a start
+            // writes a new one, an extend appends to the one it named (`:2059-2137`).
+            let (recording_id, session_start_position, segment_file_length) = match subscription
+                .request
+            {
+                RecordingRequest::Start => {
+                    let segment_file_length =
+                        segment_file_length(self.recording.segment_file_length, term_buffer_length);
 
-            let recording_id = match catalog.add_recording(&recording) {
-                Ok(recording_id) => recording_id,
-                Err(error) => {
-                    self.warnings
-                        .push(format!("could not write a recording row: {error}"));
-                    continue;
+                    let recording = Recording {
+                        // The catalog allocates the id and writes it over this
+                        // (`Catalog.addNewRecording`), which is why the field is
+                        // not read here.
+                        recording_id: 0,
+                        start_timestamp: now_ms,
+                        stop_timestamp: NULL_VALUE,
+                        start_position,
+                        stop_position: NULL_VALUE,
+                        initial_term_id: facts.initial_term_id,
+                        segment_file_length,
+                        term_buffer_length,
+                        mtu_length: facts.mtu_length,
+                        session_id: facts.session_id,
+                        stream_id: facts.stream_id,
+                        stripped_channel: subscription.stripped_channel.clone(),
+                        original_channel: subscription.original_channel.clone(),
+                        source_identity: facts.source_identity.clone(),
+                    };
+
+                    match catalog.add_recording(&recording) {
+                        Ok(recording_id) => (
+                            recording_id,
+                            start_position,
+                            usize::try_from(segment_file_length).unwrap_or(0),
+                        ),
+                        Err(error) => {
+                            self.warnings
+                                .push(format!("could not write a recording row: {error}"));
+                            continue;
+                        }
+                    }
+                }
+                RecordingRequest::Extend { recording_id } => {
+                    let segment_file_length = catalog
+                        .recording(recording_id)
+                        .map(|summary| summary.segment_file_length)
+                        .unwrap_or(i32::MAX);
+
+                    match self.validate_extension(
+                        client,
+                        catalog,
+                        subscription.session_id,
+                        subscription.correlation_id,
+                        recording_id,
+                        &subscription,
+                        &facts,
+                        now_ms,
+                    ) {
+                        Some(session_start_position) => (
+                            recording_id,
+                            // An extend's writer starts where the **recording**
+                            // started (`:2109`), not where this image joined:
+                            // the bytes go into the same segments.
+                            session_start_position,
+                            usize::try_from(segment_file_length).unwrap_or(0),
+                        ),
+                        None => continue,
+                    }
                 }
             };
 
@@ -1418,10 +1543,10 @@ impl Sessions {
                 client,
                 self.archive_id,
                 recording_id,
-                recording.session_id,
-                recording.stream_id,
-                &recording.stripped_channel,
-                &recording.source_identity,
+                facts.session_id,
+                facts.stream_id,
+                &subscription.stripped_channel,
+                &facts.source_identity,
                 self.command_timeout,
             ) {
                 Ok(position) => self.pending_recordings.push(PendingRecording {
@@ -1429,7 +1554,10 @@ impl Sessions {
                     correlation_id: subscription.correlation_id,
                     recording_id,
                     start_position,
-                    segment_file_length: usize::try_from(segment_file_length).unwrap_or(0),
+                    session_start_position,
+                    segment_file_length,
+                    request: subscription.request,
+                    image_session_id: facts.session_id,
                     subscription_id: subscription_registration_id,
                     image_id: publication_registration_id,
                     term_buffer_length,
@@ -1461,6 +1589,7 @@ impl Sessions {
     fn claim_recordings(
         &mut self,
         client: &mut Client,
+        catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
         recorder: &mut Recorder,
         now_ms: i64,
@@ -1473,7 +1602,7 @@ impl Sessions {
             {
                 Ok(true) => {
                     let pending = self.pending_recordings.swap_remove(index);
-                    let session = self.finish_recording(client, counters, pending, now_ms);
+                    let session = self.finish_recording(client, catalog, counters, pending, now_ms);
 
                     recorder.add_session(session);
                 }
@@ -1494,6 +1623,7 @@ impl Sessions {
     fn finish_recording(
         &mut self,
         client: &mut Client,
+        catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
         pending: PendingRecording,
         now_ms: i64,
@@ -1503,7 +1633,10 @@ impl Sessions {
             correlation_id,
             recording_id,
             start_position,
+            session_start_position,
             segment_file_length,
+            request,
+            image_session_id,
             subscription_id,
             image_id,
             term_buffer_length,
@@ -1521,10 +1654,12 @@ impl Sessions {
             session_id,
             correlation_id,
             recording_id,
-            start_position,
-            // A start's join position **is** its start position
-            // (`:2005` against `:2109`, which is where an extend differs): the
-            // recording begins where the image joined it.
+            // Where the **recording** starts, which for an extend is where it
+            // started the first time (`:2109`) and for a start is where the image
+            // joined (`:2005`) — the caller decided which.
+            session_start_position,
+            // And where this **session** joins it, which is where the image is
+            // (`:2005`, `:2109`: the same number on both paths).
             start_position,
             segment_file_length,
             subscription_id,
@@ -1542,15 +1677,34 @@ impl Sessions {
             None,
         );
 
-        // `controlSession.sendSignal(…, START)` (`:2046-2051`), to the session
-        // that asked and with the registration id it was answered with.
+        // What the two requests differ in from here: an extend writes itself
+        // into the row (`:2120`) and tells the client `EXTEND` (`:2121-2122`)
+        // where a start writes nothing more and tells it `START` (`:2046-2051`).
+        let signal = match request {
+            RecordingRequest::Start => RecordingSignal::START,
+            RecordingRequest::Extend { .. } => {
+                if let Err(error) = catalog.extend_recording(
+                    recording_id,
+                    session_id,
+                    correlation_id,
+                    image_session_id,
+                ) {
+                    self.warnings.push(format!(
+                        "could not write the extension of {recording_id}: {error}"
+                    ));
+                }
+
+                RecordingSignal::EXTEND
+            }
+        };
+
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             entry.control.send_signal(
                 correlation_id,
                 recording_id,
                 subscription_id,
                 start_position,
-                RecordingSignal::START,
+                signal,
                 now_ms,
                 client,
             );
@@ -1710,6 +1864,9 @@ impl Sessions {
                 subscription_id,
                 now_ms,
             ),
+            Action::ExtendRecording(request) => {
+                self.extend_recording(client, catalog, &request, now_ms);
+            }
             Action::StopRecording {
                 session_id,
                 correlation_id,
@@ -1794,6 +1951,7 @@ impl Sessions {
                 stripped_channel,
                 original_channel: request.original_channel.clone(),
                 is_auto_stop: request.auto_stop,
+                request: RecordingRequest::Start,
             }),
             Err(error) => self.send_error(
                 client,
@@ -1902,6 +2060,7 @@ impl Sessions {
                             is_auto_stop: start.is_auto_stop,
                             session_id: start.session_id,
                             correlation_id: start.correlation_id,
+                            request: start.request,
                         },
                     );
                     *self
@@ -2061,6 +2220,300 @@ impl Sessions {
                 now_ms,
             ),
         }
+    }
+
+    /// `ArchiveConductor.extendRecording` (`:1067-1157`), up to the point the
+    /// driver is asked — which is where it joins [`Sessions::start_recording`],
+    /// because from there the two are the same request.
+    ///
+    /// The gates are the reference's six, in its order, and two of them are
+    /// worth reading twice because they are *nearly* the start's:
+    ///
+    /// * the concurrent-recording refusal says "reached **at** N" here
+    ///   (`:1078-1082`) and "reached N" there (`:540`) — one word, and it is the
+    ///   reference's;
+    /// * and the spy test is `originalChannel.contains("udp")` (`:1130`), a
+    ///   **substring** test, where the start asks the parsed channel
+    ///   (`:559-560`). The two agree on every channel either is likely to meet
+    ///   and are not the same test, which is the kind of thing to copy rather
+    ///   than to tidy.
+    ///
+    /// The gate this build has nothing for is the outstanding-delete one
+    /// (`:1100-1108`): delete-segments sessions are a later slice, and
+    /// `deleteSegmentsSessionByIdMap` has no counterpart here.
+    fn extend_recording(
+        &mut self,
+        client: &mut Client,
+        catalog: &Catalog,
+        request: &ExtendRecordingRequest,
+        now_ms: i64,
+    ) {
+        let ExtendRecordingRequest {
+            session_id,
+            correlation_id,
+            recording_id,
+            stream_id,
+            source_location,
+            auto_stop,
+            original_channel,
+        } = request;
+
+        let (key, channel, stripped_channel) = match self.decide_extend(
+            catalog,
+            *recording_id,
+            *stream_id,
+            *source_location,
+            original_channel,
+        ) {
+            StartDecision::Add {
+                key,
+                channel,
+                stripped_channel,
+            } => (key, channel, stripped_channel),
+            StartDecision::Refuse {
+                relevant_id,
+                message,
+            } => {
+                self.send_error(
+                    client,
+                    *session_id,
+                    *correlation_id,
+                    relevant_id,
+                    &message,
+                    now_ms,
+                );
+                return;
+            }
+        };
+
+        match client.async_add_subscription(&channel, *stream_id, self.command_timeout) {
+            Ok(add) => self.pending_starts.push(PendingStartRecording {
+                session_id: *session_id,
+                correlation_id: *correlation_id,
+                key,
+                registration_id: add.registration_id(),
+                stripped_channel,
+                original_channel: original_channel.clone(),
+                is_auto_stop: *auto_stop,
+                request: RecordingRequest::Extend {
+                    recording_id: *recording_id,
+                },
+            }),
+            Err(error) => self.send_error(
+                client,
+                *session_id,
+                *correlation_id,
+                0,
+                &format!("subscription could not be added: {error}"),
+                now_ms,
+            ),
+        }
+    }
+
+    /// The gates in front of an extend (`ArchiveConductor.java:1076-1118`).
+    ///
+    /// The answer is the same shape a start's is — a channel to add a
+    /// subscription on, or a refusal — because from the driver's side the two
+    /// requests **are** the same request.
+    fn decide_extend(
+        &self,
+        catalog: &Catalog,
+        recording_id: i64,
+        stream_id: i32,
+        source_location: SourceLocation,
+        original_channel: &str,
+    ) -> StartDecision {
+        let maximum = self.recording.max_concurrent_recordings;
+        if self.num_active_recordings >= maximum {
+            return StartDecision::Refuse {
+                relevant_id: MAX_RECORDINGS,
+                // `reached **at**` — the start's says `reached` (`:1079` against
+                // `:540`), and the reference means it.
+                message: format!("max concurrent recordings reached at {maximum}"),
+            };
+        }
+
+        if !catalog.has_recording(recording_id) {
+            return StartDecision::Refuse {
+                relevant_id: UNKNOWN_RECORDING,
+                message: unknown_recording_message(recording_id),
+            };
+        }
+
+        let summary = match catalog.recording(recording_id) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return StartDecision::Refuse {
+                    relevant_id: 0,
+                    message: format!("catalog could not read recording {recording_id}: {error}"),
+                };
+            }
+        };
+
+        if stream_id != summary.stream_id {
+            return StartDecision::Refuse {
+                relevant_id: UNKNOWN_RECORDING,
+                message: format!(
+                    "cannot extend recording {recording_id} with streamId={stream_id} for existing streamId={}",
+                    summary.stream_id
+                ),
+            };
+        }
+
+        if self.recording_session_by_id.contains_key(&recording_id) {
+            return StartDecision::Refuse {
+                relevant_id: ACTIVE_RECORDING,
+                message: format!("cannot extend active recording {recording_id}"),
+            };
+        }
+
+        if let Some(message) = self.is_low_storage_space() {
+            return StartDecision::Refuse {
+                relevant_id: STORAGE_SPACE,
+                message,
+            };
+        }
+
+        let Ok(uri) = ChannelUri::parse(original_channel) else {
+            return StartDecision::Refuse {
+                relevant_id: 0,
+                message: format!("{original_channel} is not a channel"),
+            };
+        };
+
+        let key = make_key(stream_id, &uri);
+        if self.recording_subscriptions.contains_key(&key) {
+            return StartDecision::Refuse {
+                relevant_id: ACTIVE_SUBSCRIPTION,
+                message: format!(
+                    "recording exists for streamId={stream_id} channel={original_channel}"
+                ),
+            };
+        }
+
+        let stripped_channel = stripped_channel_builder(&uri).build();
+
+        // `originalChannel.contains("udp")` (`:1130`) — the **string**, not the
+        // parsed media. See this method's caller for why it is copied as it is.
+        let channel =
+            if original_channel.contains(UDP_MEDIA) && source_location == SourceLocation::LOCAL {
+                format!("{SPY_PREFIX}{stripped_channel}")
+            } else {
+                stripped_channel.clone()
+            };
+
+        StartDecision::Add {
+            key,
+            channel,
+            stripped_channel,
+        }
+    }
+
+    /// `validateImageForExtendRecording` (`ArchiveConductor.java:2155-2194`):
+    /// four questions, and an image that fails any of them is not a
+    /// continuation of the recording.
+    ///
+    /// The four are the four things the *file* was laid out with — where the
+    /// recording stopped, which term it began in, how long its terms are and how
+    /// big its frames are — so an image that differs in any of them would be
+    /// appended at a position the segments do not describe (`:2161-2192`).
+    ///
+    /// **Answers with where the recording started**, or `None` when it refused:
+    /// the caller needs the first for the writer of a continuation, and the
+    /// second is what a `continue` in the caller's loop means.
+    #[allow(clippy::too_many_arguments)] // the request, the image, and the clock
+    fn validate_extension(
+        &mut self,
+        client: &mut Client,
+        catalog: &Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        subscription: &RecordingSubscription,
+        facts: &ImageFacts,
+        now_ms: i64,
+    ) -> Option<i64> {
+        // The reference re-checks the active-recording gate here as well as at
+        // the request (`:2066-2072`): the image arrives a turn or more later,
+        // and a second session on the same recording may have started in
+        // between.
+        if self.recording_session_by_id.contains_key(&recording_id) {
+            self.send_error(
+                client,
+                session_id,
+                correlation_id,
+                ACTIVE_RECORDING,
+                &format!(
+                    "cannot extend active recording {recording_id} streamId={} channel={}",
+                    facts.stream_id, subscription.original_channel
+                ),
+                now_ms,
+            );
+
+            return None;
+        }
+
+        let Ok(summary) = catalog.recording(recording_id) else {
+            self.warnings.push(format!(
+                "could not read recording {recording_id} to extend it"
+            ));
+
+            return None;
+        };
+
+        let refusal = if facts.join_position != summary.stop_position {
+            Some(format!(
+                "cannot extend recording {recording_id} image.joinPosition={} != rec.stopPosition={}",
+                facts.join_position, summary.stop_position
+            ))
+        } else if facts.initial_term_id != summary.initial_term_id {
+            Some(format!(
+                "cannot extend recording {recording_id} image.initialTermId={} != rec.initialTermId={}",
+                facts.initial_term_id, summary.initial_term_id
+            ))
+        } else if facts.term_buffer_length != summary.term_buffer_length {
+            Some(format!(
+                "cannot extend recording {recording_id} image.termBufferLength={} != rec.termBufferLength={}",
+                facts.term_buffer_length, summary.term_buffer_length
+            ))
+        } else if facts.mtu_length != summary.mtu_length {
+            Some(format!(
+                "cannot extend recording {recording_id} image.mtuLength={} != rec.mtuLength={}",
+                facts.mtu_length, summary.mtu_length
+            ))
+        } else {
+            None
+        };
+
+        let Some(message) = refusal else {
+            return Some(summary.start_position);
+        };
+
+        self.send_error(
+            client,
+            session_id,
+            correlation_id,
+            INVALID_EXTENSION,
+            &message,
+            now_ms,
+        );
+
+        // `if (autoStop) closeAndRemoveRecordingSubscription(…)` (`:2130-2136`):
+        // a subscription whose extension was refused has nothing left to read,
+        // and an archive told to stop with the client does that now rather than
+        // leaving a subscription that will never have a session.
+        if subscription.is_auto_stop {
+            // The reference's `closeAndRemoveRecordingSubscription`
+            // (`:2580-2595`) less its abort loop: the gate above refused
+            // *because* the recording is not in flight, so no session is reading
+            // this subscription and the loop would have had nothing to walk.
+            self.subscription_ref_counts
+                .remove(&subscription.registration_id);
+            self.remove_recording_subscription(subscription.registration_id);
+            self.release_recording_subscription(client, subscription.registration_id);
+        }
+
+        None
     }
 
     /// What a stop by channel and stream finds
@@ -2876,6 +3329,11 @@ impl ControlPlane for Sessions {
             }));
     }
 
+    fn on_extend_recording(&mut self, request: ExtendRecordingRequest, _now_ms: i64) {
+        self.pending
+            .push(Deferred::Action(Action::ExtendRecording(request)));
+    }
+
     fn on_stop_recording(
         &mut self,
         session_id: i64,
@@ -3599,6 +4057,142 @@ mod tests {
         );
     }
 
+    /// The six gates in front of an extend (`ArchiveConductor.java:1076-1118`),
+    /// and the two that are *nearly* the start's:
+    ///
+    /// * the concurrent-recording refusal says "reached **at** N" here and
+    ///   "reached N" there (`:1079` against `:540`) — one word;
+    /// * and the spy test is over the **channel string**
+    ///   (`originalChannel.contains("udp")`, `:1130`) where the start asks the
+    ///   parsed channel (`:559-560`).
+    #[test]
+    fn an_extend_is_gated_by_six_checks_of_its_own() {
+        let (_dir, catalog) = catalog_with_a_recording();
+
+        // Built before the first binding shadows the helper.
+        let mut live = sessions();
+        live.recording_session_by_id.insert(
+            0,
+            RecordingHandle {
+                position: RecordingPos::for_test(1),
+                subscription_id: 11,
+            },
+        );
+
+        let mut full = sessions();
+        full.num_active_recordings = 20;
+
+        let sessions = sessions();
+
+        // The recording the fixture holds is stream 33 on a UDP endpoint, so
+        // this is an extend that gets all the way through.
+        assert_eq!(
+            StartDecision::Add {
+                key: "33:udp?endpoint=localhost:3333".to_owned(),
+                channel: "aeron-spy:aeron:udp?endpoint=localhost:3333".to_owned(),
+                stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            },
+            sessions.decide_extend(
+                &catalog,
+                0,
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // A channel that carries "udp" anywhere is a spy's, which is the
+        // reference's substring test and not the parsed media.
+        assert!(matches!(
+            sessions.decide_extend(
+                &catalog,
+                0,
+                33,
+                SourceLocation::LOCAL,
+                "aeron:ipc?alias=udp"
+            ),
+            StartDecision::Add { .. }
+        ));
+
+        // A remote archive records the network channel itself.
+        assert_eq!(
+            StartDecision::Add {
+                key: "33:udp?endpoint=localhost:3333".to_owned(),
+                channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+                stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            },
+            sessions.decide_extend(
+                &catalog,
+                0,
+                33,
+                SourceLocation::REMOTE,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // An id the catalog does not hold (`:1084-1090`).
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: UNKNOWN_RECORDING,
+                message: "unknown recording id: 7".to_owned(),
+            },
+            sessions.decide_extend(
+                &catalog,
+                7,
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // Another stream than the recording's (`:1091-1098`), which is the same
+        // refusal id and a different message.
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: UNKNOWN_RECORDING,
+                message: "cannot extend recording 0 with streamId=34 for existing streamId=33"
+                    .to_owned(),
+            },
+            sessions.decide_extend(
+                &catalog,
+                0,
+                34,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // A recording in flight cannot be extended (`:1099-1104`).
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: ACTIVE_RECORDING,
+                message: "cannot extend active recording 0".to_owned(),
+            },
+            live.decide_extend(
+                &catalog,
+                0,
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // And the bound, whose words are this arm's own (`:1079`).
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: MAX_RECORDINGS,
+                message: "max concurrent recordings reached at 20".to_owned(),
+            },
+            full.decide_extend(
+                &catalog,
+                0,
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+    }
+
     /// The free-space refusal is the reference's line, word for word
     /// (`ArchiveConductor.java:2606`), and it is asked of the **archive
     /// directory's** filesystem.
@@ -4060,6 +4654,7 @@ mod tests {
             is_auto_stop: false,
             session_id: 3,
             correlation_id: 7,
+            request: RecordingRequest::Start,
         }
     }
 

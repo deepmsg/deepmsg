@@ -78,6 +78,9 @@ use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecode
 use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
+use deepmsg_codec::archive::extend_recording_request_2_codec::{
+    self, ExtendRecordingRequest2Decoder,
+};
 use deepmsg_codec::archive::find_last_matching_recording_request_codec::{
     self, FindLastMatchingRecordingRequestDecoder,
 };
@@ -232,6 +235,31 @@ pub struct StartRecordingRequest {
     /// Whether the recording stops when the client that asked goes away
     /// (`:1329-1363`). The request version that has no such field is passed
     /// `false` for it (`ControlSessionAdapter.java:180-185`).
+    pub auto_stop: bool,
+    /// The channel as the client wrote it.
+    pub original_channel: String,
+}
+
+/// One `ExtendRecordingRequest2`, as the adapter decoded it
+/// (`ControlSessionAdapter.java:917-943`).
+///
+/// [`StartRecordingRequest`]'s twin, field for field with one more: the
+/// **recording** the extension belongs to (`ArchiveConductor.java:1067-1076`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendRecordingRequest {
+    /// The session that asked.
+    pub session_id: i64,
+    /// The request's correlation id, which its answer echoes.
+    pub correlation_id: i64,
+    /// The recording being appended to.
+    pub recording_id: i64,
+    /// The stream it must already be on (`:1090-1097` refuses any other).
+    pub stream_id: i32,
+    /// Whether the archive is local to the driver, which is what decides
+    /// whether the recording goes through a spy link (`:1129-1131`).
+    pub source_location: SourceLocation,
+    /// Whether the recording stops when the client that asked goes away
+    /// (`:2044`).
     pub auto_stop: bool,
     /// The channel as the client wrote it.
     pub original_channel: String,
@@ -395,6 +423,11 @@ pub trait ControlPlane {
         original_channel: &str,
         now_ms: i64,
     );
+
+    /// `ControlSession.onExtendRecording` (`ControlSession.java:481-494`), which
+    /// the conductor answers with the new subscription's registration id
+    /// (`ArchiveConductor.java:1067-1157`) — or with one of its six refusals.
+    fn on_extend_recording(&mut self, request: ExtendRecordingRequest, now_ms: i64);
 
     /// `ControlSession.onStopRecordingByIdentity` (`ControlSession.java:572-579`),
     /// whose answer carries whether a recording was stopped
@@ -955,6 +988,49 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // Asking an archive to go on recording a channel whose session ended.
+        // The older version of this request (11) has no `autoStop` and is not
+        // answered here: the C client sends the second
+        // (`aeron_archive_proxy.c:758-793`), and this slice answers what the
+        // acceptance sends.
+        extend_recording_request_2_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = ExtendRecordingRequest2Decoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let stream_id = decoder.stream_id();
+            let source_location = decoder.source_location();
+            let auto_stop = decoder.auto_stop() == BooleanType::TRUE;
+            let coordinates = decoder.channel_decoder();
+            let original_channel =
+                String::from_utf8_lossy(decoder.channel_slice(coordinates)).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_extend_recording(
+                    ExtendRecordingRequest {
+                        session_id,
+                        correlation_id,
+                        recording_id,
+                        stream_id,
+                        source_location,
+                        auto_stop,
+                        original_channel,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
         // The two stops that are not named by a subscription id: one names the
         // channel and stream a recording was started with
         // (`ArchiveConductor.java:585-610`), the other the recording itself
@@ -1197,6 +1273,7 @@ mod tests {
             stream_id: i32,
             original_channel: String,
         },
+        ExtendRecording(ExtendRecordingRequest),
         StopRecordingByIdentity {
             session_id: i64,
             correlation_id: i64,
@@ -1332,6 +1409,10 @@ mod tests {
                 correlation_id,
                 subscription_id,
             });
+        }
+
+        fn on_extend_recording(&mut self, request: ExtendRecordingRequest, _now_ms: i64) {
+            self.calls.push(Call::ExtendRecording(request));
         }
 
         fn on_stop_recording(
@@ -2075,6 +2156,42 @@ mod tests {
         buffer
     }
 
+    fn extend_recording_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        stream_id: i32,
+        source_location: SourceLocation,
+        auto_stop: bool,
+        channel: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::boolean_type::BooleanType;
+        use deepmsg_codec::archive::extend_recording_request_2_codec::ExtendRecordingRequest2Encoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder =
+                ExtendRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .stream_id(stream_id)
+                .source_location(source_location)
+                .auto_stop(if auto_stop {
+                    BooleanType::TRUE
+                } else {
+                    BooleanType::FALSE
+                })
+                .channel(channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
     fn stop_recording_request(
         control_session_id: i64,
         correlation_id: i64,
@@ -2209,6 +2326,47 @@ mod tests {
                 correlation_id: 8,
                 stream_id: 33,
                 source_location: SourceLocation::REMOTE,
+                auto_stop: false,
+                original_channel: channel.to_owned(),
+            })),
+            control.calls.last()
+        );
+    }
+
+    /// An extend reaches the session with everything the six gates in front of
+    /// it need — including the recording it is appending to, which is the one
+    /// field a start does not have (`ArchiveConductor.java:1067-1076`).
+    #[test]
+    fn an_extend_reaches_the_session_with_the_recording_it_appends_to() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let channel = "aeron:udp?endpoint=localhost:3333";
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&extend_recording_request(
+                    session_id,
+                    7,
+                    4_242,
+                    33,
+                    SourceLocation::LOCAL,
+                    false,
+                    channel,
+                )),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::ExtendRecording(ExtendRecordingRequest {
+                session_id,
+                correlation_id: 7,
+                recording_id: 4_242,
+                stream_id: 33,
+                source_location: SourceLocation::LOCAL,
                 auto_stop: false,
                 original_channel: channel.to_owned(),
             })),

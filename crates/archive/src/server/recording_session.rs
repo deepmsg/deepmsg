@@ -505,20 +505,22 @@ mod tests {
         );
     }
 
-    /// A recording whose first segment is already there never starts, and the
-    /// message it will send the client is the one the writer gave it
+    /// A recording whose segment cannot be opened never starts, and the message
+    /// it will send the client is the one the writer gave it
     /// (`RecordingSession.java:206-216`).
+    ///
+    /// What makes it fail is a **file system** refusal — the directory it is
+    /// told to write into is a file — because a segment that is already there is
+    /// not one: that is an extension, and it opens it.
     #[test]
     fn a_session_that_cannot_open_its_segment_is_stopped_with_the_error() {
         let dir = crate::mark::tests::TempDir::new();
         let recording_id = 7;
 
-        // A segment of this recording already there is what the writer refuses
-        // (`SegmentWriter.create`, over `RecordingWriter.init`).
-        let existing = crate::segment::segment_file_name(recording_id, 0);
-        std::fs::write(dir.path().join(existing), b"in the way").expect("written");
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"a file where a directory should be").expect("written");
 
-        let mut session = a_session(dir.path(), recording_id);
+        let mut session = a_session(&not_a_directory, recording_id);
 
         assert_eq!(1, session.do_work_without_a_client());
         assert_eq!(State::Stopped, session.state());

@@ -153,9 +153,11 @@ impl RecordingWriter {
     ///
     /// # Errors
     ///
-    /// [`SegmentError::Exists`] when a segment of this recording is already
-    /// there — a recording does not overwrite one — and [`SegmentError::Io`]
-    /// for the file system.
+    /// [`SegmentError::Io`] for the file system. A segment that is already there
+    /// is opened rather than refused, which is what makes this the same call for
+    /// a recording starting and for one being **extended**
+    /// (`RecordingWriter.java:190-197`: the reference's `init` opens the file
+    /// and seeks to the join offset).
     pub fn init(&mut self) -> Result<(), SegmentError> {
         let segment = SegmentWriter::create(
             &self.directory,
@@ -422,22 +424,35 @@ mod tests {
         assert_eq!(2 * half as u64 + 64, tally.bytes);
     }
 
-    /// A segment that is already there is refused rather than overwritten
-    /// (`RecordingWriter.java:241-244`).
+    /// Opening the file a recording is already writing into is **not** a
+    /// refusal: it is what an extension does, and the reference's `init` opens
+    /// the segment and seeks to the join offset (`RecordingWriter.java:190-197`).
+    ///
+    /// The refusal is the roll-over's, and it is a different file: see
+    /// `a_segment_that_is_already_there_is_refused` in `segment`'s tests.
     #[test]
-    fn a_segment_that_is_already_there_is_refused() {
+    fn opening_a_segment_that_is_there_continues_it() {
         let directory = directory("already-there");
 
         let mut first = writer(&directory, 0);
         first.init().expect("opens");
+        first
+            .write_block(&frame(0, 7, 64), &mut NoStats)
+            .expect("written");
 
         let mut second = writer(&directory, 0);
-        let error = second.init().expect_err("the file is in the way");
+        second.init().expect("opens the file that is there");
 
-        assert!(
-            matches!(error, SegmentError::Exists { .. }),
-            "a recording does not overwrite a segment: {error:?}"
-        );
+        // Where it *is* comes from the join position it was made with, not from
+        // the file's length: the bytes a reader is continuing from are the ones
+        // the image told it about (`ArchiveConductor.java:2109`).
+        assert_eq!(0, second.position());
+
+        second
+            .write_block(&frame(8, 7, 64), &mut NoStats)
+            .expect("written into the file that was already there");
+
+        assert_eq!(64, second.position());
     }
 
     #[test]

@@ -47,6 +47,7 @@ use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::pal::MappedFile;
 
 use crate::checksum::Checksum;
+use crate::mark::NULL_VALUE;
 use crate::mark_file::{MAJOR_VERSION, SEMANTIC_VERSION};
 
 /// `Archive.FILENAME_CATALOG` (`Archive.java:284`).
@@ -689,6 +690,62 @@ impl Catalog {
             .ok_or(CatalogError::UnknownRecording { recording_id })?;
 
         self.write_stop(offset, stop_position, now_ms)
+    }
+
+    /// Record that a recording has been **extended**: the row goes back to
+    /// being one that has not stopped, and remembers which control session and
+    /// request did it (`Catalog.extendRecording`, `:648-662`).
+    ///
+    /// Five fields, and the two that matter to a reader are the pair of stop
+    /// ones: an extended recording has not stopped any more, so both go back to
+    /// the null. The descriptor's own `controlSessionId` and `correlationId`
+    /// — the two the *response* framing writes over for a descriptor listing
+    /// (see [`Catalog::descriptor_body`]) — are what an extend leaves behind in
+    /// the file, which is why the reference writes them here and nowhere else.
+    ///
+    /// The checksum the reference recomputes is the one this build writes as
+    /// zero: an archive with no checksum provider computes zero
+    /// (`:911-921`), and the field lives in the record **header**, which this
+    /// window does not reach.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn extend_recording(
+        &mut self,
+        recording_id: i64,
+        control_session_id: i64,
+        correlation_id: i64,
+        image_session_id: i32,
+    ) -> Result<(), CatalogError> {
+        // Within the descriptor's block, which the generated codec puts at
+        // these offsets (`recording_descriptor_codec`: `controlSessionId` at 0,
+        // `correlationId` at 8, `stopTimestamp` at 32, `stopPosition` at 48,
+        // `sessionId` at 72).
+        const CONTROL_SESSION_ID_OFFSET: usize = 0;
+        const CORRELATION_ID_OFFSET: usize = 8;
+        const STOP_TIMESTAMP_OFFSET: usize = 32;
+        const STOP_POSITION_OFFSET: usize = 48;
+        const SESSION_ID_OFFSET: usize = 72;
+
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        let block_length = usize::from(DESCRIPTOR_BLOCK_LENGTH);
+        let region = self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, block_length)?;
+
+        region
+            .store_i64_release(CONTROL_SESSION_ID_OFFSET, control_session_id)
+            .and_then(|()| region.store_i64_release(CORRELATION_ID_OFFSET, correlation_id))
+            .and_then(|()| region.store_i32_release(SESSION_ID_OFFSET, image_session_id))
+            .and_then(|()| region.store_i64_release(STOP_TIMESTAMP_OFFSET, NULL_VALUE))
+            .and_then(|()| region.store_i64_release(STOP_POSITION_OFFSET, NULL_VALUE))
+            .ok_or(CatalogError::Malformed {
+                offset,
+                length: i32::try_from(block_length).unwrap_or(i32::MAX),
+            })
     }
 
     /// Retire a record, or bring it back: the record's `state` changes and the
@@ -1895,6 +1952,51 @@ mod tests {
             65_536,
             reopened.recording(id).expect("read back").stop_position,
             "and it is in the file, not only in this process's view of it"
+        );
+    }
+
+    /// An extended recording is one that has not stopped again, and its row
+    /// remembers which session and request extended it
+    /// (`Catalog.extendRecording`, `Catalog.java:648-662`).
+    #[test]
+    fn an_extended_recording_has_not_stopped_any_more() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        catalog.recording_stopped(id, 65_536, NOW).expect("stopped");
+
+        let stopped = catalog.recording(id).expect("read");
+        assert_eq!(65_536, stopped.stop_position);
+
+        catalog.extend_recording(id, 99, 7, 4242).expect("extended");
+
+        let extended = catalog.recording(id).expect("read");
+        assert_eq!(NULL_VALUE, extended.stop_position, "which is -1");
+        assert_eq!(NULL_VALUE, extended.stop_timestamp);
+        assert_eq!(4242, extended.session_id, "the image's session, not ours");
+        assert_eq!(
+            stopped.start_position, extended.start_position,
+            "an extend appends: where the recording *starts* does not move"
+        );
+        assert_eq!(stopped.stream_id, extended.stream_id);
+        assert_eq!(stopped.stripped_channel, extended.stripped_channel);
+
+        assert!(
+            matches!(
+                catalog.extend_recording(id + 1, 0, 0, 0),
+                Err(CatalogError::UnknownRecording { .. })
+            ),
+            "a recording the catalog does not hold cannot be extended"
+        );
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        assert_eq!(
+            NULL_VALUE,
+            reopened.recording(id).expect("read back").stop_position,
+            "and the file says so too"
         );
     }
 
