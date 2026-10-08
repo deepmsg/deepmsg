@@ -119,6 +119,14 @@ fn step(read: Option<usize>, is_end_of_stream: Option<bool>) -> Step {
 /// being true) and the error handler (the conductor's, reached through the
 /// conductor).
 pub struct RecordingSession {
+    /// The control session that asked, which is where the `STOP` signal goes
+    /// and where a failure is answered (`:1345-1347`).
+    ///
+    /// The reference holds the `ControlSession` **object** here (`:54`); this
+    /// build holds the id, because the object lives in the conductor's map and
+    /// a value cannot be in two places — the same substitution the registry
+    /// makes for a `Subscription`.
+    session_id: i64,
     /// The start request's correlation id, which is what a `START`/`STOP`
     /// signal carries and what a failure is answered on (`:2051`).
     correlation_id: i64,
@@ -170,6 +178,7 @@ impl RecordingSession {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // one per thing the reference's constructor takes
     pub fn new(
+        session_id: i64,
         correlation_id: i64,
         recording_id: i64,
         start_position: i64,
@@ -193,6 +202,7 @@ impl RecordingSession {
             usize::try_from(term_buffer_length.min(file_io_max_length)).unwrap_or(0);
 
         Self {
+            session_id,
             correlation_id,
             recording_id,
             subscription_id,
@@ -223,6 +233,12 @@ impl RecordingSession {
     #[must_use]
     pub const fn recording_id(&self) -> i64 {
         self.recording_id
+    }
+
+    /// The control session that asked (`:54`).
+    #[must_use]
+    pub const fn session_id(&self) -> i64 {
+        self.session_id
     }
 
     /// The request that started it (`:2051`).
@@ -448,6 +464,7 @@ impl std::fmt::Debug for RecordingSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingSession")
             .field("recording_id", &self.recording_id)
+            .field("session_id", &self.session_id)
             .field("correlation_id", &self.correlation_id)
             .field("subscription_id", &self.subscription_id)
             .field("image_id", &self.image_id)
@@ -524,6 +541,7 @@ mod tests {
         assert_eq!(State::Init, session.state());
         assert!(!session.is_done());
         assert_eq!(7, session.recording_id());
+        assert_eq!(5, session.session_id());
         assert_eq!(3, session.correlation_id());
         assert_eq!(9, session.subscription_id());
         assert!(!session.is_auto_stop());
@@ -534,6 +552,7 @@ mod tests {
     /// else: the pieces that need a client are what `do_work` is for.
     fn a_session(directory: &Path, recording_id: i64) -> RecordingSession {
         RecordingSession::new(
+            5,
             3,
             recording_id,
             0,

@@ -664,6 +664,33 @@ impl Catalog {
             })
     }
 
+    /// Write where a recording stopped, and when
+    /// (`Catalog.recordingStopped`, `:627-638`).
+    ///
+    /// This is the one write a live catalog's *record* takes: the row was
+    /// written with `NULL_VALUE` for both fields when the recording started and
+    /// stays that way until it ends — which is what makes "has it stopped?" a
+    /// question a reader can ask of the file itself. The checksum the reference
+    /// recomputes here is the one this build writes as zero, because an archive
+    /// with no checksum provider computes zero (`:911-921`).
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn recording_stopped(
+        &mut self,
+        recording_id: i64,
+        stop_position: i64,
+        now_ms: i64,
+    ) -> Result<(), CatalogError> {
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        self.write_stop(offset, stop_position, now_ms)
+    }
+
     /// Retire a record, or bring it back: the record's `state` changes and the
     /// index follows (`Catalog.changeState`, `:778-796`).
     ///
@@ -1822,6 +1849,53 @@ mod tests {
         );
 
         assert_eq!(None, catalog.find_last(0, 42, 1001, b"").expect("a scan"));
+    }
+
+    /// A recording is written with no stop position and is given one when it
+    /// stops (`Catalog.recordingStopped`, `Catalog.java:627-638`).
+    ///
+    /// The write is two fields **in place** — the record is not rewritten and
+    /// its neighbours are not touched — so what is asserted is that the two
+    /// moved, that the rest did not, and that the file still walks: a record
+    /// whose length or state had been clobbered would come back as a different
+    /// answer or as nothing at all.
+    #[test]
+    fn a_recording_is_given_a_stop_position_when_it_stops() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        let started = catalog.recording(id).expect("read");
+
+        assert_eq!(-1, started.stop_position, "the fixture's NULL_VALUE");
+        assert_eq!(-1, started.stop_timestamp);
+
+        catalog.recording_stopped(id, 65_536, NOW).expect("stopped");
+
+        let stopped = catalog.recording(id).expect("read");
+        assert_eq!(65_536, stopped.stop_position);
+        assert_eq!(NOW, stopped.stop_timestamp);
+        assert_eq!(started.start_position, stopped.start_position);
+        assert_eq!(started.recording_id, stopped.recording_id);
+        assert_eq!(started.original_channel, stopped.original_channel);
+        assert_eq!(started.source_identity, stopped.source_identity);
+
+        assert!(
+            matches!(
+                catalog.recording_stopped(id + 1, 0, NOW),
+                Err(CatalogError::UnknownRecording { .. })
+            ),
+            "a recording the catalog does not hold has nothing to stop"
+        );
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        assert_eq!(
+            65_536,
+            reopened.recording(id).expect("read back").stop_position,
+            "and it is in the file, not only in this process's view of it"
+        );
     }
 
     /// The body a listing session sends is the record behind its header, whole:

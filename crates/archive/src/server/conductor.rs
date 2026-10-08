@@ -87,18 +87,17 @@
 //!
 //! # What this slice does not have
 //!
-//! The reference's `doWork` also runs the recorder, the replayer and the
-//! replay-token sweep (`:389-395`). Those belong to the sessions that use
-//! them, and none of them exist yet — the recording and replay sessions are
-//! their own slices. What is here is the control plane: connect, authenticate,
-//! answer, count, and remember what it has been asked to record.
+//! The reference's `doWork` also runs the replayer and the replay-token sweep
+//! (`:389-395`), which are the replay slice's. What is here is the control
+//! plane and the recording half of the data plane: connect, authenticate,
+//! answer, count, remember what it has been asked to record — and, when an
+//! image arrives for one of those, write the catalog row, publish a position
+//! and hand a [`crate::server::recording_session::RecordingSession`] to the
+//! recorder.
 //!
-//! That last part is the whole of what a start does so far. It is not a
-//! half-finished start: the reference's own start registers a subscription and
-//! answers, and what makes it a *recording* is an image arriving later
-//! (`startRecordingSession`, `:1991-2057`) — the piece this build is missing.
-//! So a start here answers with a registration id for a subscription the driver
-//! has really made, and nothing records on it yet.
+//! The recorder itself is **not** here: [`ArchiveConductor`] holds it, and the
+//! one parameter that costs is on [`Sessions::drive`], which is lent it for the
+//! length of a turn. See that method for why two of the asks reach into it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -108,15 +107,18 @@ use deepmsg_client::client::{
     AsyncAdd, AsyncAddPoll, AsyncRemove, Client, DEFAULT_TIMEOUT, RemovePoll,
 };
 use deepmsg_client::image::Image;
+use deepmsg_client::image_event::ImageEvent;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_cnc::file::CncFile;
+use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::pal::usable_space;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Recording};
+use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
@@ -129,9 +131,13 @@ use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
 };
 use crate::server::counters::{
-    ControlSessionCounter, ControlSessionsCounter, ErrorCounter, claim_control_sessions_counter,
-    request_control_sessions_counter,
+    ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID, ArchiveIdCounter, ControlSessionCounter,
+    ControlSessionsCounter, ErrorCounter, RECORDING_SESSIONS_NAME, claim_archive_id_counter,
+    claim_control_sessions_counter, request_archive_id_counter, request_control_sessions_counter,
 };
+use crate::server::recorder::Recorder;
+use crate::server::recording_pos::RecordingPos;
+use crate::server::recording_session::RecordingSession;
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
@@ -308,6 +314,17 @@ fn make_key(stream_id: i32, uri: &ChannelUri) -> String {
     key.truncate(key.len() - 1);
 
     key
+}
+
+/// `max(ctx.segmentFileLength(), termBufferLength)`
+/// (`ArchiveConductor.java:2006`): a segment has to be able to hold one term,
+/// whatever the archive was configured with. The result is what the catalog
+/// records, so a recording made by an archive with a smaller setting than the
+/// driver's own term is still a recording a reader can walk.
+fn segment_file_length(configured: usize, term_buffer_length: i32) -> i32 {
+    i32::try_from(configured)
+        .unwrap_or(i32::MAX)
+        .max(term_buffer_length)
 }
 
 /// Copy a parameter's text into the matching field, if the channel carries it.
@@ -590,7 +607,12 @@ impl Query {
 ///
 /// The refusal's message, for [`Sessions::run_deferred`] to send as
 /// [`UNKNOWN_RECORDING`].
-fn answer_query(catalog: &Catalog, query: &Query) -> Result<i64, String> {
+fn answer_query(
+    catalog: &Catalog,
+    live: &HashMap<i64, RecordingHandle>,
+    counters: &CountersReader<'_, ReadWrite>,
+    query: &Query,
+) -> Result<i64, String> {
     // A match first, because it is the question with no recording id to check.
     if let Query::FindLastMatching {
         min_recording_id,
@@ -629,16 +651,20 @@ fn answer_query(catalog: &Catalog, query: &Query) -> Result<i64, String> {
         .recording(recording_id)
         .map_err(|error| format!("catalog could not read recording {recording_id}: {error}"))?;
 
+    // The two that ask a recording **in flight** where it has got to
+    // (`:1167-1176`, `:1186-1195`). The reference asks the session first and
+    // falls back when there is none; the session's answer is its position
+    // counter, which is the number a client reads for a live recording and the
+    // number `MaxRecordedPosition` means by "recorded so far".
+    let live_position = live
+        .get(&recording_id)
+        .and_then(|handle| handle.position.value(counters));
+
     Ok(match query {
         Query::StartPosition { .. } => recording.start_position,
         Query::StopPosition { .. } => recording.stop_position,
-        // The reference asks the live recording session first and falls back
-        // when there is none (`:1168-1172`, `:1190-1194`). This build has no
-        // recording sessions yet — they arrive with the slice that records —
-        // so the fallback is the whole answer, and the live counter joins here
-        // when it does.
-        Query::RecordingPosition { .. } => NULL_POSITION,
-        Query::MaxRecordedPosition { .. } => recording.stop_position,
+        Query::RecordingPosition { .. } => live_position.unwrap_or(NULL_POSITION),
+        Query::MaxRecordedPosition { .. } => live_position.unwrap_or(recording.stop_position),
         Query::FindLastMatching { .. } => unreachable!("a match returns above"),
     })
 }
@@ -721,9 +747,19 @@ pub struct RecordingSettings {
     /// The free space below which a start is refused
     /// (`aeron.archive.low.storage.space.threshold`), in bytes.
     pub low_storage_space_threshold: u64,
+    /// How long a segment file is
+    /// (`aeron.archive.segment.file.length`, default 128 MiB) — which the
+    /// catalog records, so it is written down per recording and not read back.
+    pub segment_file_length: usize,
+    /// `aeron.archive.file.io.max.length` (default 1 MiB), which bounds how
+    /// much one turn of a recording may read (`RecordingSession.java:81`).
+    pub file_io_max_length: usize,
+    /// `aeron.archive.file.sync.level` (default 0), passed to the segment
+    /// writer.
+    pub file_sync_level: i32,
     /// The directory whose filesystem the threshold is about
-    /// (`ctx.archiveFileStore()`, `:2602`): the archive's own, which is where
-    /// the segments will be written.
+    /// (`ctx.archiveFileStore()`, `:2602`) — and where the segments are
+    /// written, which is the same place.
     pub archive_dir: PathBuf,
 }
 
@@ -758,6 +794,15 @@ enum StartDecision {
         /// The channel to subscribe on: the stripped one, with the spy prefix
         /// when the publication is local to this driver (`:558-560`).
         channel: String,
+        /// The stripped channel **without** that prefix, which is the one the
+        /// catalog records and the position counter's label names
+        /// (`:2008-2019`, `RecordingPos.java:114-128`).
+        ///
+        /// The two are not interchangeable and the reference is easy to misread
+        /// here: `strippedChannel` is what the handler closure captures
+        /// (`:558-566`), and `channel` is only ever the argument to
+        /// `addSubscription`.
+        stripped_channel: String,
     },
     /// Answer the client with this refusal instead
     /// (`ControlSession.sendErrorResponse`).
@@ -769,6 +814,44 @@ enum StartDecision {
         /// The refusal's words.
         message: String,
     },
+}
+
+/// One recording subscription this archive holds
+/// (`ArchiveConductor.recordingSubscriptionByKeyMap`'s value, `:152`).
+///
+/// The reference keeps the `Subscription` object, which is why its
+/// `AvailableImageHandler` closure can capture the two channels and `autoStop`
+/// and still know which subscription an image belongs to. The object is the
+/// client's here and a registration id is not a handle on it, so the facts the
+/// conductor would have had from the object are kept beside its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingSubscription {
+    /// The registration id the start answered with (`:570`), and what an image
+    /// arrives for.
+    ///
+    /// The `makeKey` is **not** a field: it is what the map is keyed by, which
+    /// is how the reference holds it too (`Subscription` does not know its own
+    /// key) and how a stop finds it again (`:2139-2153`).
+    registration_id: i64,
+    /// The stripped channel, **without** the spy prefix the subscription was
+    /// added on (`:558-560`).
+    ///
+    /// This is what the catalog records and what the position counter's label
+    /// names (`:2008-2019`) — not the key, which is a different string for the
+    /// same channel, and not the channel the subscription was added on, which
+    /// carries `aeron-spy:` in front of it for a local publication.
+    stripped_channel: String,
+    /// The channel the client asked for, which the catalog records too.
+    original_channel: String,
+    /// Whether the recording stops when the client that asked goes away
+    /// (`:1329-1363`), captured per start because the request is where it comes
+    /// from.
+    is_auto_stop: bool,
+    /// The control session that asked and the correlation id of its request,
+    /// which are what the `START` signal is sent with (`:2046-2051`) — captured
+    /// per start, as the reference's handler closure captures them.
+    session_id: i64,
+    correlation_id: i64,
 }
 
 /// A start whose subscription the driver has not answered yet.
@@ -789,6 +872,55 @@ struct PendingStartRecording {
     key: String,
     /// The registration id the add drew — the id the start will answer with.
     registration_id: i64,
+    /// The stripped channel, which is what the catalog records and what the
+    /// position counter's label names (`:2008-2019`) — **without** the spy
+    /// prefix the subscription was added on, and a different string again from
+    /// the key.
+    stripped_channel: String,
+    /// The channel the client asked for.
+    original_channel: String,
+    /// Whether the recording ends with the client that asked (`:2044`).
+    is_auto_stop: bool,
+}
+
+/// What the conductor remembers about one live recording
+/// (`ArchiveConductor.recordingSessionByIdMap`'s value, `:158`).
+///
+/// Two facts, and both are asked by id: the **position counter**, which is what
+/// `getRecordingPosition` and `getMaxRecordedPosition` answer with while a
+/// recording is in flight (`:1167-1195`), and the **subscription**, which is
+/// what a stop by identity takes off (`:1301-1327`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordingHandle {
+    position: RecordingPos,
+    subscription_id: i64,
+}
+
+/// A recording whose row is in the catalog and whose position counter the
+/// driver has not allocated yet.
+///
+/// `RecordingPos.allocate` is synchronous in the reference
+/// (`RecordingPos.java:130-131`) because its archive drives the driver from the
+/// turn it is in. Here the counter is asked for on one turn and taken up on a
+/// later one — see [`Sessions::claim_recordings`] — so a recording spends a turn
+/// between its catalog row and its session. What the acceptance sees is a
+/// counter that appears a turn later, which the C harness's own polling
+/// accommodates (`aeron_archive_test.cpp:275-286`).
+struct PendingRecording {
+    /// The control session that asked, which the `START` signal is sent to.
+    session_id: i64,
+    correlation_id: i64,
+    recording_id: i64,
+    /// Where the recording starts: the **image's join position**
+    /// (`ArchiveConductor.java:2005`), which is also where the counter is set
+    /// before anything is read (`:2029-2030`).
+    start_position: i64,
+    segment_file_length: usize,
+    subscription_id: i64,
+    image_id: i64,
+    term_buffer_length: i32,
+    is_auto_stop: bool,
+    position: RecordingPos,
 }
 
 /// A connect request whose session has not been made yet.
@@ -943,10 +1075,12 @@ pub struct Sessions {
     /// `recordingSubscriptionByKeyMap` (`ArchiveConductor.java:152`): what this
     /// archive has been asked to record, by the key [`make_key`] builds.
     ///
-    /// A key and the id it was registered under, where the reference holds a
-    /// `Subscription` — the object is the client's here, and the id is what a
-    /// stop names and what a start answers with (`:570`).
-    recording_subscriptions: HashMap<String, i64>,
+    /// The reference holds a `Subscription` here — the object itself, which
+    /// carries its own registration id and stream id and which the
+    /// `AvailableImageHandler` closure captured the two channels and `autoStop`
+    /// beside. The object is the client's in this build, so what is kept is
+    /// [`RecordingSubscription`]: the same facts, without the resource.
+    recording_subscriptions: HashMap<String, RecordingSubscription>,
     /// `subscriptionRefCountMap` (`:151`): how many things hold each recording
     /// subscription, which is what decides when it is given back
     /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1780`).
@@ -962,6 +1096,25 @@ pub struct Sessions {
     /// Removals sent and not answered (`Client::remove_subscription_poll` is
     /// what collects them, and what takes the subscription out of the client).
     pending_removals: Vec<AsyncRemove>,
+
+    /// `recordingSessionByIdMap` (`ArchiveConductor.java:158`): the recordings
+    /// that are in flight, by the id a client names them by.
+    ///
+    /// The reference holds the session **objects**, because the two things it
+    /// asks them are the session's own: where it has got to, and which
+    /// subscription it reads. A session is the recorder's here, so what the
+    /// conductor keeps is those two facts — [`RecordingHandle`] — and the
+    /// recorder is asked for everything else.
+    recording_session_by_id: HashMap<i64, RecordingHandle>,
+    /// Recordings whose row is written and whose position counter the driver
+    /// has not answered about yet (see [`PendingRecording`]).
+    pending_recordings: Vec<PendingRecording>,
+    /// The recording-session counter (111), asked for once and taken up when
+    /// the driver answers (`Archive.java:1565-1574`).
+    recording_session_counter_registration_id: Option<i64>,
+    /// That counter, which every recording session moves in and out of
+    /// (`ArchiveConductor.java:2056`, `:1362`).
+    recording_session_counter: Option<ArchiveIdCounter>,
 
     /// Descriptors on their way out, one per listing request that is still
     /// being served (`SessionWorker.sessions`, `SessionWorker.java:23`).
@@ -1019,6 +1172,10 @@ impl Sessions {
             num_active_recordings: 0,
             pending_starts: Vec::new(),
             pending_removals: Vec::new(),
+            recording_session_by_id: HashMap::new(),
+            pending_recordings: Vec::new(),
+            recording_session_counter_registration_id: None,
+            recording_session_counter: None,
             listings: Vec::new(),
             ended: Vec::new(),
             session_count_delta: 0,
@@ -1067,27 +1224,450 @@ impl Sessions {
     ///
     /// `counters` is the writable counters region, which only the conductor
     /// holds — hence the argument rather than a field.
+    ///
+    /// `recorder` is the conductor's, and is lent for the length of the call:
+    /// two of the things a control session can ask for — a stop, and a
+    /// recording session ending — are things the *recorder* has to be told
+    /// about (`ArchiveConductor.java:1766-1772`, `:1356-1359`), and this build
+    /// keeps the recorder where the reference keeps it, on the conductor.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per clock
     pub fn drive(
         &mut self,
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
-        catalog: &Catalog,
+        catalog: &mut Catalog,
+        recorder: &mut Recorder,
         now_ms: i64,
     ) {
         self.allocate_session_counter(client, counters);
+        self.allocate_recording_session_counter(client, counters);
         self.claim_pending_starts(client, now_ms);
         self.collect_pending_removals(client);
         self.run_pending_connects(client, authenticator, now_ms);
-        self.run_deferred(client, authenticator, catalog, now_ms);
+        self.run_deferred(client, counters, authenticator, catalog, recorder, now_ms);
+        self.start_recordings(client, catalog, now_ms);
+        self.claim_recordings(client, counters, recorder, now_ms);
         self.drive_listings(client, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
 
+    /// The recording-session counter (111), asked for once and taken up when
+    /// the driver answers (`Archive.java:1565-1574`).
+    ///
+    /// **Not** [`ArchiveIdCounter::allocate`], which blocks, for the reason
+    /// [`Sessions::allocate_session_counter`] gives: this runs inside the turn
+    /// that drives the driver, so a command that waits for an answer waits for
+    /// a driver nobody is driving.
+    fn allocate_recording_session_counter(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+    ) {
+        if self.recording_session_counter.is_some() {
+            return;
+        }
+
+        let Some(registration_id) = self.recording_session_counter_registration_id else {
+            match request_archive_id_counter(
+                client,
+                ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID,
+                RECORDING_SESSIONS_NAME,
+                self.archive_id,
+                self.command_timeout,
+            ) {
+                Ok(registration_id) => {
+                    self.recording_session_counter_registration_id = Some(registration_id);
+                }
+                Err(error) => self.warnings.push(format!(
+                    "could not ask for the archive recording sessions counter: {error}"
+                )),
+            }
+            return;
+        };
+
+        match claim_archive_id_counter(
+            client,
+            counters,
+            ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID,
+            registration_id,
+        ) {
+            Ok(Some(counter)) => {
+                self.recording_session_counter = Some(counter);
+                self.recording_session_counter_registration_id = None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A refusal can never become a counter, so the archive runs on
+                // without one rather than asking forever.
+                self.recording_session_counter_registration_id = None;
+                self.warnings.push(format!(
+                    "could not allocate the archive recording sessions counter: {error}"
+                ));
+            }
+        }
+    }
+
+    /// Answer the images that arrived with a recording row and a position
+    /// counter (`ArchiveConductor.startRecordingSession`, `:1991-2057`, up to
+    /// the counter).
+    ///
+    /// This is the one place the plan calls "the same turn", and it is why this
+    /// runs right after `client.poll()` and before anything else that could
+    /// take a turn: an image is announced at a **join position**, and a
+    /// recording session made a turn later would still start there — but a
+    /// *subscription* the archive has stopped serving would not have a session
+    /// made for it at all, so the events are drained every turn whether or not
+    /// anything is waiting for them.
+    ///
+    /// An image whose subscription this archive does not record is not an
+    /// error: the client is shared (the archive's own control subscriptions
+    /// live in it too) and an image for something else is simply not ours.
+    fn start_recordings(&mut self, client: &mut Client, catalog: &mut Catalog, now_ms: i64) {
+        for event in client.image_events() {
+            let ImageEvent::Available {
+                subscription_registration_id,
+                publication_registration_id,
+                ..
+            } = event
+            else {
+                // An image going away is the recording session's to notice: it
+                // asks for its image every turn and records the `None`
+                // (`recording_session.rs`, the module note on `isClosed`).
+                continue;
+            };
+
+            let Some(subscription) =
+                self.subscription_by_registration_id(subscription_registration_id)
+            else {
+                continue;
+            };
+
+            // The image itself, for the five things only it knows: the catalog
+            // row keeps every one of them (`:1999-2019`).
+            let Some(image) = client
+                .subscription(subscription_registration_id)
+                .and_then(|subscription| subscription.image(publication_registration_id))
+            else {
+                continue;
+            };
+
+            let start_position = image.join_position();
+            let term_buffer_length = image.term_buffer_length();
+            let segment_file_length =
+                segment_file_length(self.recording.segment_file_length, term_buffer_length);
+
+            let recording = Recording {
+                recording_id: 0,
+                start_timestamp: now_ms,
+                stop_timestamp: NULL_VALUE,
+                start_position,
+                stop_position: NULL_VALUE,
+                initial_term_id: image.initial_term_id(),
+                segment_file_length,
+                term_buffer_length,
+                mtu_length: image.mtu_length().unwrap_or(0),
+                session_id: image.session_id(),
+                stream_id: image.stream_id(),
+                stripped_channel: subscription.stripped_channel.clone(),
+                original_channel: subscription.original_channel.clone(),
+                source_identity: image.source_identity().to_owned(),
+            };
+
+            let recording_id = match catalog.add_recording(&recording) {
+                Ok(recording_id) => recording_id,
+                Err(error) => {
+                    self.warnings
+                        .push(format!("could not write a recording row: {error}"));
+                    continue;
+                }
+            };
+
+            // `RecordingPos.allocate` (`:2021-2030`) is synchronous in the
+            // reference; here it is asked for now and taken up by
+            // `claim_recordings`.
+            match RecordingPos::request(
+                client,
+                self.archive_id,
+                recording_id,
+                recording.session_id,
+                recording.stream_id,
+                &recording.stripped_channel,
+                &recording.source_identity,
+                self.command_timeout,
+            ) {
+                Ok(position) => self.pending_recordings.push(PendingRecording {
+                    session_id: subscription.session_id,
+                    correlation_id: subscription.correlation_id,
+                    recording_id,
+                    start_position,
+                    segment_file_length: usize::try_from(segment_file_length).unwrap_or(0),
+                    subscription_id: subscription_registration_id,
+                    image_id: publication_registration_id,
+                    term_buffer_length,
+                    is_auto_stop: subscription.is_auto_stop,
+                    position,
+                }),
+                Err(error) => self
+                    .warnings
+                    .push(format!("could not ask for a recording position: {error}")),
+            }
+        }
+    }
+
+    /// Take up the position counters the driver has allocated, and make the
+    /// sessions they belong to (`ArchiveConductor.java:2032-2057`).
+    ///
+    /// This is the second half of [`Sessions::start_recordings`], one turn
+    /// later: the reference's `RecordingPos.allocate` waits for the driver
+    /// (`RecordingPos.java:130-131`) and this build's cannot, so the counter is
+    /// asked for where the image arrives and taken up here. What the delay
+    /// costs is a counter that appears a turn after the row — which the C
+    /// harness's own `while` loop over it accommodates
+    /// (`aeron_archive_test.cpp:275-286`).
+    ///
+    /// A counter the driver **refuses** is not a counter that will arrive: the
+    /// recording is dropped with a warning and its row stays as one that never
+    /// recorded, which is what the reference's `refreshAndFixDescriptor` is
+    /// there to repair later.
+    fn claim_recordings(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        recorder: &mut Recorder,
+        now_ms: i64,
+    ) {
+        let mut index = 0;
+        while index < self.pending_recordings.len() {
+            match self.pending_recordings[index]
+                .position
+                .claim(client, counters)
+            {
+                Ok(true) => {
+                    let pending = self.pending_recordings.swap_remove(index);
+                    let session = self.finish_recording(client, counters, pending, now_ms);
+
+                    recorder.add_session(session);
+                }
+                Ok(false) => index += 1,
+                Err(error) => {
+                    let pending = self.pending_recordings.swap_remove(index);
+                    self.warnings.push(format!(
+                        "could not take up the recording position for {}: {error}",
+                        pending.recording_id
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The rest of `startRecordingSession` (`:2029-2057`), from the counter
+    /// this session has in hand.
+    fn finish_recording(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        pending: PendingRecording,
+        now_ms: i64,
+    ) -> RecordingSession {
+        let PendingRecording {
+            session_id,
+            correlation_id,
+            recording_id,
+            start_position,
+            segment_file_length,
+            subscription_id,
+            image_id,
+            term_buffer_length,
+            is_auto_stop,
+            position,
+        } = pending;
+
+        // `position.setRelease(startPosition)` (`:2029-2030`): the counter says
+        // where the recording is before it has read anything, which is what
+        // makes `waitUntilCaughtUp` a question about the recording and not about
+        // the writer.
+        position.set_position(counters, start_position);
+
+        let session = RecordingSession::new(
+            session_id,
+            correlation_id,
+            recording_id,
+            start_position,
+            // A start's join position **is** its start position
+            // (`:2005` against `:2109`, which is where an extend differs): the
+            // recording begins where the image joined it.
+            start_position,
+            segment_file_length,
+            subscription_id,
+            image_id,
+            term_buffer_length,
+            self.recording.file_io_max_length,
+            self.recording.file_sync_level,
+            is_auto_stop,
+            position,
+            &self.recording.archive_dir,
+            // `aeron.archive.record.checksum` is not read yet (P2-9c), and the
+            // reference's own default is no checksum at all
+            // (`Archive.java:3666-3674`: the property is unset unless a
+            // deployment sets it).
+            None,
+        );
+
+        // `controlSession.sendSignal(…, START)` (`:2046-2051`), to the session
+        // that asked and with the registration id it was answered with.
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry.control.send_signal(
+                correlation_id,
+                recording_id,
+                subscription_id,
+                start_position,
+                RecordingSignal::START,
+                now_ms,
+                client,
+            );
+        }
+
+        // `subscriptionRefCountMap.incrementAndGet` and the two counts
+        // (`:2053-2056`).
+        *self
+            .subscription_ref_counts
+            .entry(subscription_id)
+            .or_insert(0) += 1;
+        self.num_active_recordings += 1;
+
+        if let Some(counter) = &self.recording_session_counter {
+            counter.increment(counters);
+        }
+
+        // `recordingSessionByIdMap.put(recordingId, session)` (`:2054`), which
+        // is what the two position questions read while this recording is live.
+        self.recording_session_by_id.insert(
+            recording_id,
+            RecordingHandle {
+                position,
+                subscription_id,
+            },
+        );
+
+        session
+    }
+
+    /// `ArchiveConductor.closeRecordingSession` (`:1329-1363`): everything the
+    /// conductor does about a recording that has ended.
+    ///
+    /// The session has already closed its own writer — that is what `STOPPED`
+    /// means — so what is left is what needs the catalog, the control session
+    /// and the registry, which is why this is here and not on the recorder.
+    pub fn close_recording_session(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        counters: &CountersReader<'_, ReadWrite>,
+        recorder: &mut Recorder,
+        mut session: RecordingSession,
+        now_ms: i64,
+    ) {
+        let recording_id = session.recording_id();
+        let subscription_id = session.subscription_id();
+        let position = session.recorded_position(counters).unwrap_or(NULL_POSITION);
+
+        // `if (!isAbort)`: the reference writes nothing when the archive itself
+        // is going down. This build has no such path yet — a session is only
+        // ever collected while the archive is running — so the guard has
+        // nothing to test, and the two writes below are unconditional.
+        if let Err(error) = catalog.recording_stopped(recording_id, position, now_ms) {
+            self.warnings.push(format!(
+                "could not write the stop position of {recording_id}: {error}"
+            ));
+        }
+
+        // `session.sendPendingError()` (`:1346`), so a client whose recording
+        // never started hears why before it hears that it stopped.
+        if let Some(message) = session.error_message() {
+            let message = message.to_owned();
+            self.send_error(
+                client,
+                session.session_id(),
+                session.correlation_id(),
+                0,
+                &message,
+                now_ms,
+            );
+        }
+
+        if let Some(entry) = self.sessions.get_mut(&session.session_id()) {
+            entry.control.send_signal(
+                session.correlation_id(),
+                recording_id,
+                subscription_id,
+                position,
+                RecordingSignal::STOP,
+                now_ms,
+                client,
+            );
+        }
+
+        // `if (subscriptionRefCountMap.decrementAndGet(subscriptionId) <= 0 ||
+        // session.isAutoStop())` (`:1357-1360`): `<= 0` and not `== 0`, because
+        // the two paths that move this count both move it.
+        let remaining = self
+            .subscription_ref_counts
+            .get_mut(&subscription_id)
+            .map(|count| {
+                *count -= 1;
+                *count
+            })
+            .unwrap_or(0);
+
+        if remaining <= 0 || session.is_auto_stop() {
+            self.close_and_remove_recording_subscription(
+                client,
+                recorder,
+                subscription_id,
+                "close recording session",
+            );
+        }
+
+        session.close(client);
+
+        // `recordingSessionByIdMap.remove(recordingId)` (`:1360`): from here the
+        // two position questions fall back to the catalog again.
+        self.recording_session_by_id.remove(&recording_id);
+
+        self.num_active_recordings = self.num_active_recordings.saturating_sub(1);
+
+        if let Some(counter) = &self.recording_session_counter {
+            counter.decrement(counters);
+        }
+    }
+
+    /// `ArchiveConductor.closeAndRemoveRecordingSubscription` (`:2580-2595`):
+    /// the subscription is given up altogether, along with every session
+    /// reading it.
+    fn close_and_remove_recording_subscription(
+        &mut self,
+        client: &mut Client,
+        recorder: &mut Recorder,
+        subscription_id: i64,
+        reason: &str,
+    ) {
+        self.subscription_ref_counts.remove(&subscription_id);
+        recorder.abort_sessions_for(subscription_id, reason);
+        self.remove_recording_subscription(subscription_id);
+        self.release_recording_subscription(client, subscription_id);
+    }
+
     /// Carry out what the callbacks could not (`ArchiveConductor.java:562`,
     /// `:1766-1780`).
-    fn run_action(&mut self, client: &mut Client, action: Action, now_ms: i64) {
+    fn run_action(
+        &mut self,
+        client: &mut Client,
+        action: Action,
+        recorder: &mut Recorder,
+        now_ms: i64,
+    ) {
         match action {
             Action::StartRecording(request) => self.start_recording(client, &request, now_ms),
             Action::StopRecordingSubscription {
@@ -1096,6 +1676,7 @@ impl Sessions {
                 subscription_id,
             } => self.stop_recording_subscription(
                 client,
+                recorder,
                 session_id,
                 correlation_id,
                 subscription_id,
@@ -1123,15 +1704,16 @@ impl Sessions {
         request: &StartRecordingRequest,
         now_ms: i64,
     ) {
-        // `auto_stop` is carried and deliberately not read here: it is read when
-        // the recording session ends, and the session is what the recorder
-        // brings (`ArchiveConductor.java:2044`).
-        let (key, channel) = match self.decide_start(
+        let (key, channel, stripped_channel) = match self.decide_start(
             request.stream_id,
             request.source_location,
             &request.original_channel,
         ) {
-            StartDecision::Add { key, channel } => (key, channel),
+            StartDecision::Add {
+                key,
+                channel,
+                stripped_channel,
+            } => (key, channel, stripped_channel),
             StartDecision::Refuse {
                 relevant_id,
                 message,
@@ -1154,6 +1736,9 @@ impl Sessions {
                 correlation_id: request.correlation_id,
                 key,
                 registration_id: add.registration_id(),
+                stripped_channel,
+                original_channel: request.original_channel.clone(),
+                is_auto_stop: request.auto_stop,
             }),
             Err(error) => self.send_error(
                 client,
@@ -1231,10 +1816,14 @@ impl Sessions {
         let channel = if source_location == SourceLocation::LOCAL && uri.media() == UDP_MEDIA {
             format!("{SPY_PREFIX}{stripped_channel}")
         } else {
-            stripped_channel
+            stripped_channel.clone()
         };
 
-        StartDecision::Add { key, channel }
+        StartDecision::Add {
+            key,
+            channel,
+            stripped_channel,
+        }
     }
 
     /// The answer to the adds that have gone out
@@ -1249,8 +1838,17 @@ impl Sessions {
                 AsyncAddPoll::Ready => {
                     let start = self.pending_starts.swap_remove(index);
 
-                    self.recording_subscriptions
-                        .insert(start.key, start.registration_id);
+                    self.recording_subscriptions.insert(
+                        start.key,
+                        RecordingSubscription {
+                            registration_id: start.registration_id,
+                            stripped_channel: start.stripped_channel,
+                            original_channel: start.original_channel,
+                            is_auto_stop: start.is_auto_stop,
+                            session_id: start.session_id,
+                            correlation_id: start.correlation_id,
+                        },
+                    );
                     *self
                         .subscription_ref_counts
                         .entry(start.registration_id)
@@ -1314,9 +1912,11 @@ impl Sessions {
     }
 
     /// `ArchiveConductor.stopRecordingSubscription` (`:612-624`).
+    #[allow(clippy::too_many_arguments)] // the request's four fields, the recorder, the clock
     fn stop_recording_subscription(
         &mut self,
         client: &mut Client,
+        recorder: &mut Recorder,
         session_id: i64,
         correlation_id: i64,
         subscription_id: i64,
@@ -1337,7 +1937,7 @@ impl Sessions {
             return;
         }
 
-        self.abort_recording_session_and_close_subscription(client, subscription_id);
+        self.abort_recording_session_and_close_subscription(client, recorder, subscription_id);
 
         // `sendOkResponse(correlationId)` — the one-argument form, whose
         // relevant id is `GENERIC`, zero (`ControlSession.java:682-690`).
@@ -1346,6 +1946,25 @@ impl Sessions {
                 .control
                 .send_ok_response(correlation_id, 0, now_ms, client);
         }
+    }
+
+    /// The subscription an image belongs to, found the way the reference's
+    /// `AvailableImageHandler` knows it without looking: it **is** a closure
+    /// over the subscription it was made for (`:562-565`).
+    ///
+    /// This build's image events carry the subscription's registration id and
+    /// nothing else, so the registry — which is keyed by `makeKey` — is searched
+    /// by id. The clone is what lets the caller go on to mutate the catalog
+    /// while holding the facts: one small copy per image, on the path where an
+    /// image arrives.
+    fn subscription_by_registration_id(
+        &self,
+        registration_id: i64,
+    ) -> Option<RecordingSubscription> {
+        self.recording_subscriptions
+            .values()
+            .find(|held| held.registration_id == registration_id)
+            .cloned()
     }
 
     /// `ArchiveConductor.removeRecordingSubscription` (`:2139-2153`): the
@@ -1362,7 +1981,7 @@ impl Sessions {
         let key = self
             .recording_subscriptions
             .iter()
-            .find(|(_, id)| **id == subscription_id)
+            .find(|(_, held)| held.registration_id == subscription_id)
             .map(|(key, _)| key.clone())?;
 
         self.recording_subscriptions.remove(&key);
@@ -1371,18 +1990,26 @@ impl Sessions {
     }
 
     /// `ArchiveConductor.abortRecordingSessionAndCloseSubscription`
-    /// (`:1766-1780`).
+    /// (`:1766-1780`): a client asked for a recording to stop.
     ///
-    /// The reference does three things: abort every recording session that holds
-    /// this subscription, take one off the refcount, and give the subscription
-    /// back when the count reaches zero. **There are no recording sessions yet**
-    /// — they arrive with the recorder — so the loop is what this slice leaves
-    /// out, and it is the whole of the difference.
+    /// Three things, in the reference's order: every session reading this
+    /// subscription is aborted — they notice on their next turn and end, which
+    /// is where the catalog's stop position and the `STOP` signal come from —
+    /// one comes off the refcount, and the subscription is given back when the
+    /// count reaches zero.
+    ///
+    /// `0 ==` here and `<= 0` in [`Sessions::close_recording_session`], which is
+    /// the reference's own pair of comparisons (`:1778` against `:1357`) and not
+    /// a slip: this path says "the last holder has let go", that one tolerates a
+    /// count that has already gone past zero.
     fn abort_recording_session_and_close_subscription(
         &mut self,
         client: &mut Client,
+        recorder: &mut Recorder,
         subscription_id: i64,
     ) {
+        recorder.abort_sessions_for(subscription_id, "stop recording");
+
         let count = self
             .subscription_ref_counts
             .get_mut(&subscription_id)
@@ -1396,9 +2023,16 @@ impl Sessions {
             return;
         }
 
-        // The reference's `subscription.close()` waits for the driver on its own
-        // thread. This one cannot: the command is sent here and the answer is
-        // collected on a later turn (`Client::async_remove_subscription`).
+        self.release_recording_subscription(client, subscription_id);
+    }
+
+    /// `subscription.close()` (`:1780`), which the reference's client does on a
+    /// thread of its own.
+    ///
+    /// This one cannot: the command is sent here and the answer collected on a
+    /// later turn (`Client::async_remove_subscription` is where that argument
+    /// is written down).
+    fn release_recording_subscription(&mut self, client: &mut Client, subscription_id: i64) {
         match client.async_remove_subscription(subscription_id, self.command_timeout) {
             Ok(remove) => self.pending_removals.push(remove),
             Err(error) => self.warnings.push(format!(
@@ -1708,11 +2342,14 @@ impl Sessions {
     }
 
     /// Send what the callbacks owed (`ControlSession.java:682-815`).
+    #[allow(clippy::too_many_arguments)] // one per thing a deferred intent may need
     fn run_deferred(
         &mut self,
         client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
         catalog: &Catalog,
+        recorder: &mut Recorder,
         now_ms: i64,
     ) {
         for intent in std::mem::take(&mut self.pending) {
@@ -1768,7 +2405,7 @@ impl Sessions {
                         continue;
                     };
 
-                    match answer_query(catalog, &query) {
+                    match answer_query(catalog, &self.recording_session_by_id, counters, &query) {
                         Ok(value) => {
                             entry
                                 .control
@@ -1825,7 +2462,7 @@ impl Sessions {
                 // one — and the only kind that needs the client for something
                 // other than talking to the client (`ArchiveConductor.java:562`,
                 // `:1766-1780`).
-                Deferred::Action(action) => self.run_action(client, action, now_ms),
+                Deferred::Action(action) => self.run_action(client, action, recorder, now_ms),
             }
         }
     }
@@ -2111,6 +2748,16 @@ pub struct ArchiveConductor {
     /// reaches [`Sessions::drive`] as an argument for the same reason the
     /// counters do.
     catalog: Catalog,
+    /// The recordings in flight (`ArchiveConductor.java:180`, `:250`).
+    ///
+    /// Held here rather than by the sessions because that is where the reference
+    /// holds it: its conductor owns the recorder and drives it on its own turn,
+    /// **after** its own sessions (`SharedModeArchiveConductor.java:56-63`). The
+    /// cost of the split is one parameter: two of the things a control session
+    /// can ask for are things the recorder has to be told about
+    /// (`:1766-1772`, `:1356-1359`), so [`Sessions::drive`] is lent it for the
+    /// length of a turn.
+    recorder: Recorder,
     command_timeout: Duration,
 }
 
@@ -2159,6 +2806,9 @@ impl ArchiveConductor {
                 max_concurrent_recordings: usize::try_from(config.max_concurrent_recordings)
                     .unwrap_or(0),
                 low_storage_space_threshold: config.low_storage_space_threshold,
+                segment_file_length: config.segment_file_length,
+                file_io_max_length: config.file_io_max_length,
+                file_sync_level: config.file_sync_level,
                 archive_dir: config.archive_dir.clone(),
             },
             subscription_ids,
@@ -2178,6 +2828,7 @@ impl ArchiveConductor {
             error_counter: ErrorCounter::new(error_counter_id),
             cnc,
             catalog,
+            recorder: Recorder::new(),
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -2222,6 +2873,7 @@ impl ArchiveConductor {
             sessions,
             cnc,
             catalog,
+            recorder,
             error_counter,
             command_timeout,
             ..
@@ -2237,7 +2889,24 @@ impl ArchiveConductor {
 
         work += adapter.poll(client, sessions, now_ms)?;
 
-        sessions.drive(client, &counters, authenticator.as_mut(), catalog, now_ms);
+        sessions.drive(
+            client,
+            &counters,
+            authenticator.as_mut(),
+            catalog,
+            recorder,
+            now_ms,
+        );
+
+        // The recorder gets its own turn, and it is the turn **after** the
+        // sessions (`SharedModeArchiveConductor.java:56-63`). What a session
+        // that ended this turn owes is collected here, where the catalog and
+        // the control sessions are.
+        work += recorder.drive(client, &counters);
+
+        for session in recorder.take_finished() {
+            sessions.close_recording_session(client, catalog, &counters, recorder, session, now_ms);
+        }
 
         // The adapter is told about every session that ended, and the image is
         // rejected only for the ones that ended badly. The image comes from
@@ -2320,20 +2989,40 @@ mod tests {
 
         assert_eq!(
             Ok(4096),
-            answer_query(&catalog, &Query::StartPosition { recording_id: 0 })
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &counters_region(),
+                &Query::StartPosition { recording_id: 0 }
+            )
         );
         assert_eq!(
             Ok(8192),
-            answer_query(&catalog, &Query::StopPosition { recording_id: 0 })
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &counters_region(),
+                &Query::StopPosition { recording_id: 0 }
+            )
         );
         assert_eq!(
             Ok(NULL_POSITION),
-            answer_query(&catalog, &Query::RecordingPosition { recording_id: 0 }),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &counters_region(),
+                &Query::RecordingPosition { recording_id: 0 }
+            ),
             "a recording that is not in flight has no position to report"
         );
         assert_eq!(
             Ok(8192),
-            answer_query(&catalog, &Query::MaxRecordedPosition { recording_id: 0 }),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &counters_region(),
+                &Query::MaxRecordedPosition { recording_id: 0 }
+            ),
             "which for one that is not active is where it stopped"
         );
     }
@@ -2351,6 +3040,8 @@ mod tests {
             Err("unknown recording id: 12345".to_owned()),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::StartPosition {
                     recording_id: 12345
                 }
@@ -2363,6 +3054,8 @@ mod tests {
             Err(format!("unknown recording id: {}", i64::MIN)),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::MaxRecordedPosition {
                     recording_id: i64::MIN
                 }
@@ -2384,6 +3077,8 @@ mod tests {
             Ok(0),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
                     session_id: 1001,
@@ -2397,6 +3092,8 @@ mod tests {
             Ok(0),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
                     session_id: 1001,
@@ -2411,6 +3108,8 @@ mod tests {
             Ok(NULL_RECORD_ID),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
                     session_id: 1001,
@@ -2426,6 +3125,8 @@ mod tests {
                 Ok(NULL_RECORD_ID),
                 answer_query(
                     &catalog,
+                    &HashMap::new(),
+                    &counters_region(),
                     &Query::FindLastMatching {
                         min_recording_id: 0,
                         session_id,
@@ -2441,6 +3142,8 @@ mod tests {
             Ok(NULL_RECORD_ID),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 1,
                     session_id: 1001,
@@ -2462,6 +3165,8 @@ mod tests {
             Err("minRecordingId=-1 < 0".to_owned()),
             answer_query(
                 &catalog,
+                &HashMap::new(),
+                &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: -1,
                     session_id: 1,
@@ -2469,6 +3174,23 @@ mod tests {
                     channel_fragment: Vec::new(),
                 }
             )
+        );
+    }
+
+    /// A segment is never shorter than a term, whatever the archive was
+    /// configured with (`ArchiveConductor.java:2006`).
+    #[test]
+    fn a_segment_holds_at_least_one_term() {
+        assert_eq!(64 * 1024, segment_file_length(64 * 1024, 64 * 1024));
+        assert_eq!(
+            64 * 1024,
+            segment_file_length(16 * 1024, 64 * 1024),
+            "a configured length below the driver's term does not shrink the segment"
+        );
+        assert_eq!(
+            128 * 1024,
+            segment_file_length(128 * 1024, 64 * 1024),
+            "and one above it is left alone"
         );
     }
 
@@ -2532,6 +3254,7 @@ mod tests {
             StartDecision::Add {
                 key: "33:udp?endpoint=localhost:3333".to_owned(),
                 channel: "aeron-spy:aeron:udp?endpoint=localhost:3333".to_owned(),
+                stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
             },
             sessions.decide_start(
                 33,
@@ -2546,6 +3269,7 @@ mod tests {
             StartDecision::Add {
                 key: "33:ipc".to_owned(),
                 channel: "aeron:ipc".to_owned(),
+                stripped_channel: "aeron:ipc".to_owned(),
             },
             sessions.decide_start(33, SourceLocation::LOCAL, "aeron:ipc")
         );
@@ -2556,6 +3280,7 @@ mod tests {
             StartDecision::Add {
                 key: "33:udp?endpoint=localhost:3333".to_owned(),
                 channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+                stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
             },
             sessions.decide_start(
                 33,
@@ -2577,7 +3302,7 @@ mod tests {
         // The same channel and stream twice is one recording (`:574-577`).
         sessions
             .recording_subscriptions
-            .insert("33:udp?endpoint=localhost:3333".to_owned(), 11);
+            .insert("33:udp?endpoint=localhost:3333".to_owned(), held(11));
         assert_eq!(
             StartDecision::Refuse {
                 relevant_id: ACTIVE_SUBSCRIPTION,
@@ -2637,6 +3362,40 @@ mod tests {
         );
     }
 
+    /// The registry is **keyed by `makeKey` and searched by registration id**,
+    /// which is the one thing about it that is not the reference's shape: its
+    /// handler closure simply *is* the subscription it was made for (`:562-565`),
+    /// and this build's image events carry the id instead.
+    #[test]
+    fn a_subscription_is_found_by_the_id_an_image_arrives_for() {
+        let mut sessions = sessions();
+
+        sessions
+            .recording_subscriptions
+            .insert("33:ipc".to_owned(), held(11));
+        sessions
+            .recording_subscriptions
+            .insert("34:udp?endpoint=localhost:3333".to_owned(), held(22));
+
+        assert_eq!(
+            Some(11),
+            sessions
+                .subscription_by_registration_id(11)
+                .map(|held| held.registration_id)
+        );
+        assert_eq!(
+            Some(22),
+            sessions
+                .subscription_by_registration_id(22)
+                .map(|held| held.registration_id)
+        );
+        assert_eq!(
+            None,
+            sessions.subscription_by_registration_id(33),
+            "an image for something this archive does not record is not an error"
+        );
+    }
+
     /// A stop takes the subscription out of the registry by **id**, which is
     /// the only thing a client holds (`ArchiveConductor.java:2139-2153`).
     ///
@@ -2648,10 +3407,10 @@ mod tests {
         let mut sessions = sessions();
         sessions
             .recording_subscriptions
-            .insert("33:udp?endpoint=localhost:3333".to_owned(), 11);
+            .insert("33:udp?endpoint=localhost:3333".to_owned(), held(11));
         sessions
             .recording_subscriptions
-            .insert("34:ipc".to_owned(), 22);
+            .insert("34:ipc".to_owned(), held(22));
         sessions.num_active_recordings = 2;
 
         assert_eq!(
@@ -2972,6 +3731,26 @@ mod tests {
     /// names it: the publication's registration id and its session id.
     const IMAGE: ImageId = ImageId::new(11, 22);
 
+    /// A values region, empty, for the questions whose answer does not read one.
+    ///
+    /// The same ten lines `control_session`'s tests and `recorder`'s keep their
+    /// own copy of: a region has to be aligned, and the metadata half describes
+    /// no counters — which is why a slot reads zero rather than "absent".
+    fn counters_region() -> CountersReader<'static, ReadWrite> {
+        #[repr(align(64))]
+        struct Region([u8; 64 * 64]);
+
+        let metadata: &'static mut Region = Box::leak(Box::new(Region([0; 64 * 64])));
+        let values: &'static mut Region = Box::leak(Box::new(Region([0; 64 * 64])));
+
+        CountersReader::new(
+            deepmsg_core::buffer::AtomicBuffer::from_slice_mut(&mut metadata.0)
+                .expect("an aligned region"),
+            deepmsg_core::buffer::AtomicBuffer::from_slice_mut(&mut values.0)
+                .expect("an aligned region"),
+        )
+    }
+
     /// The recording settings a test archive runs with: the reference's
     /// defaults, and a **threshold of zero** so that the free-space check reads
     /// the temp directory's real filesystem and finds it above the line.
@@ -2983,6 +3762,9 @@ mod tests {
         RecordingSettings {
             max_concurrent_recordings: 20,
             low_storage_space_threshold: 0,
+            segment_file_length: 128 * 1024,
+            file_io_max_length: 1024 * 1024,
+            file_sync_level: 0,
             archive_dir: std::env::temp_dir(),
         }
     }
@@ -2997,6 +3779,19 @@ mod tests {
             recording_settings(),
             Vec::new(),
         )
+    }
+
+    /// One registry entry, for tests that are about what a stop or an image
+    /// does with one rather than about how it is made.
+    fn held(registration_id: i64) -> RecordingSubscription {
+        RecordingSubscription {
+            registration_id,
+            stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            is_auto_stop: false,
+            session_id: 3,
+            correlation_id: 7,
+        }
     }
 
     fn connect_request(channel: &str, version: i32) -> ConnectRequest<'_> {
