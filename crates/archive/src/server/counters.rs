@@ -142,11 +142,24 @@ pub fn archive_id_key(archive_id: i64) -> [u8; CONTROL_SESSIONS_KEY_LENGTH] {
     archive_id.to_le_bytes()
 }
 
+/// `" - archiveId=" + archiveId`, the piece every archive counter's label ends
+/// with — named apart from the label itself because the 100 has to measure it
+/// before it writes its own (`ArchiveCounters.appendArchiveIdLabel`, `:102-110`,
+/// and `lengthOfArchiveIdLabel`, `:117-130`).
+pub fn archive_id_suffix(archive_id: i64) -> String {
+    format!("{ARCHIVE_ID_LABEL_SUFFIX}{archive_id}")
+}
+
 /// `name + " - archiveId=" + archiveId`, which is the label every counter
-/// [`archive_id_key`] keys (`ArchiveCounters.allocate`, `:64-67`, and
-/// [`ARCHIVE_ID_LABEL_SUFFIX`]).
+/// [`archive_id_key`] keys (`ArchiveCounters.allocate`, `:64-67`).
 pub fn archive_id_label(name: &str, archive_id: i64) -> String {
-    format!("{name}{ARCHIVE_ID_LABEL_SUFFIX}{archive_id}")
+    format!("{name}{}", archive_id_suffix(archive_id))
+}
+
+/// `ArchiveCounters.lengthOfArchiveIdLabel` (`:117-130`), which the 100's label
+/// is truncated against.
+pub fn length_of_archive_id_label(archive_id: i64) -> usize {
+    archive_id_suffix(archive_id).len()
 }
 
 /// The key of the 102 counter: the archive id.
@@ -657,7 +670,7 @@ pub fn claim_archive_id_counter<C: Counters, Access>(
 /// `validateCounterTypeId` (`AeronCounters.java:1540-1547`), which the four
 /// archive-id-keyed counters do at `Archive.java:1574`, `:1604`, `:1615` and
 /// `:1626`.
-fn check_type_id<Access>(
+pub(super) fn check_type_id<Access>(
     counters: &CountersReader<'_, Access>,
     counter_id: i32,
     expected: i32,
