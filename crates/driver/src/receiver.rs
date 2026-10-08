@@ -1929,6 +1929,13 @@ impl ReceiverThread {
         let mut work = 0;
 
         for image in images.iter_mut() {
+            // Every pass, whatever else this image has to say: the reference
+            // zeroes a whole status message's worth behind the slowest reader
+            // in one call, and this pays the same bytes off in chunks so that
+            // no single pass holds the thread for it. See
+            // [`CLEAN_BYTES_PER_PASS`].
+            image.clean_buffer_ahead();
+
             let Some((_, endpoint)) = endpoints
                 .iter_mut()
                 .find(|(id, _)| *id == image.endpoint_id)
