@@ -337,17 +337,20 @@ impl SegmentWriter {
     ///
     /// The offset advances by the block's **length**, not by what was written —
     /// the two differ by the padding rule, and it is the length that says where
-    /// the next frame goes.
+    /// the next frame goes. What is *returned* is the other one: the bytes that
+    /// went to the file, which is the reference's `dataLength`
+    /// (`RecordingWriter.java:114`) and what a recorder counts as written
+    /// (`:144`).
     ///
     /// # Errors
     ///
     /// [`SegmentError::Malformed`] for a block that is not a walkable run of
     /// frames, and [`SegmentError::Io`] for the file system — including the next
     /// segment being in the way when this one fills.
-    pub fn write_block(&mut self, block: &[u8]) -> Result<(), SegmentError> {
+    pub fn write_block(&mut self, block: &[u8]) -> Result<u64, SegmentError> {
         let length = block.len();
         if 0 == length {
-            return Ok(());
+            return Ok(0);
         }
 
         let padding = is_padding_frame(block);
@@ -396,7 +399,7 @@ impl SegmentWriter {
             self.roll_over()?;
         }
 
-        Ok(())
+        Ok(written)
     }
 
     /// Close the segment being written and start the next one
