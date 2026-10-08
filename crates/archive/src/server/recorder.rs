@@ -333,6 +333,21 @@ impl Recorder {
         }
     }
 
+    /// Abort **one** session, by the recording it is making
+    /// (`ArchiveConductor.stopRecordingByIdentity`, `:1306-1310`).
+    ///
+    /// Not [`Recorder::abort_sessions_for`]: a subscription can carry more than
+    /// one image over its life, so "the session for this recording" and "every
+    /// session reading this subscription" are different sets, and a stop named
+    /// by identity is about one recording.
+    pub fn abort_session(&mut self, recording_id: i64, reason: &str) {
+        for session in &mut self.sessions {
+            if session.recording_id() == recording_id {
+                session.abort(reason);
+            }
+        }
+    }
+
     /// One turn of every session (`SessionWorker.doWork` over
     /// `RecordingSession.doWork`).
     ///
@@ -400,6 +415,8 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::server::recording_pos::RecordingPos;
 
     use deepmsg_core::buffer::AtomicBuffer;
 
@@ -501,6 +518,70 @@ mod tests {
             counters.value(1),
             "and the next one catches up"
         );
+    }
+
+    /// A stop **by identity** aborts the recording it names and leaves the
+    /// other sessions alone, even the ones reading the same subscription
+    /// (`ArchiveConductor.stopRecordingByIdentity`, `:1306-1310`).
+    ///
+    /// `abort_sessions_for` is the subscription's question
+    /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1774`); this is the
+    /// recording's, and a subscription can carry more than one image over its
+    /// life, so the two sets are not the same.
+    #[test]
+    fn a_stop_by_identity_aborts_one_recording_and_not_its_subscription() {
+        let dir = crate::mark::tests::TempDir::new();
+        let mut recorder = Recorder::new(42);
+
+        // Two recordings on one subscription — the shape a recording whose
+        // publisher restarted leaves behind for a turn.
+        recorder.add_session(a_session(dir.path(), 0, 9));
+        recorder.add_session(a_session(dir.path(), 1, 9));
+        assert_eq!(2, recorder.session_count());
+
+        recorder.abort_session(0, "stop recording by identity");
+
+        assert!(
+            recorder.sessions[0].abort_reason().is_some(),
+            "the recording that was named is aborted"
+        );
+        assert!(
+            recorder.sessions[1].abort_reason().is_none(),
+            "and the other recording on the same subscription is not"
+        );
+
+        recorder.abort_sessions_for(9, "stop recording");
+
+        assert!(
+            recorder.sessions[1].abort_reason().is_some(),
+            "while the subscription's own question aborts what is left on it"
+        );
+    }
+
+    /// One session, made without a client: enough of one for the two aborts
+    /// above, and nothing that opens a file.
+    fn a_session(
+        directory: &std::path::Path,
+        recording_id: i64,
+        subscription_id: i64,
+    ) -> RecordingSession {
+        RecordingSession::new(
+            3,
+            7,
+            recording_id,
+            recording_id * 1024,
+            recording_id * 1024,
+            128 * 1024,
+            subscription_id,
+            11,
+            64 * 1024,
+            1024 * 1024,
+            0,
+            false,
+            RecordingPos::for_test(1),
+            directory,
+            None,
+        )
     }
 
     /// A recorder with no counters still records: the numbers are accumulated

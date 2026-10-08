@@ -430,11 +430,22 @@ impl RecordingPos {
     /// Give the counter back, without waiting for the driver to say it is gone
     /// (`RecordingSession.java:120` over `CloseHelper.close`).
     ///
+    /// The handle forgets its slot, because that is what the reference's
+    /// `Counter.close()` does and what its readers depend on: a session asks
+    /// `position.isClosed()` before it reports where a recording got to and
+    /// answers `NULL_POSITION` rather than a stale value
+    /// (`RecordingSession.java:171-179`). Here "closed" is [`Self::value`]
+    /// answering `None` — there is no separate flag to read.
+    ///
     /// # Errors
     ///
-    /// [`CounterError`] if the command could not be written or sent.
-    pub fn release<C: Counters>(&self, client: &mut C) -> Result<(), CounterError> {
-        client.release_counter(self.registration_id)
+    /// [`CounterError`] if the command could not be written or sent. The slot is
+    /// forgotten either way: the counter is going back whatever the driver says.
+    pub fn release<C: Counters>(&mut self, client: &mut C) -> Result<(), CounterError> {
+        let released = client.release_counter(self.registration_id);
+        self.counter_id = None;
+
+        released
     }
 }
 

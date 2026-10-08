@@ -402,6 +402,20 @@ impl RecordingSession {
                 *image_id,
                 *block_length_limit,
                 |block| {
+                    // Once a block has failed there is nothing to write the rest
+                    // of the run with: the reference throws out of its handler on
+                    // the first exception and the poll stops there
+                    // (`RecordingSession.java:262-275`, whose `catch` moves the
+                    // session to `INACTIVE`). A Rust handler cannot throw, so the
+                    // rest of the run is dropped instead — which is also what
+                    // keeps a **half-rolled** writer from being used: a failed
+                    // roll-over leaves the segment writer with its offset reset
+                    // and its file still the old one, and writing into it would
+                    // overwrite the bytes already recorded.
+                    if failure.is_some() {
+                        return;
+                    }
+
                     let length = block.length();
 
                     let copied = match scratch.get_mut(..length) {

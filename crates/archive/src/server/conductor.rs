@@ -1288,9 +1288,18 @@ pub struct Sessions {
     /// subscription, which is what decides when it is given back
     /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1780`).
     subscription_ref_counts: HashMap<i64, i64>,
-    /// `numActiveRecordings` (`:139`): how many starts have been accepted,
-    /// which is what [`RecordingSettings::max_concurrent_recordings`] bounds
+    /// `numActiveRecordings` (`:139`): how many recordings are in flight, which
+    /// is what [`RecordingSettings::max_concurrent_recordings`] bounds
     /// (`:538-543`).
+    ///
+    /// **Two movements, and they are not the pair they look like.** It goes
+    /// **up where the subscription is added** (`:569`, in
+    /// [`Sessions::claim_pending_starts`]) and **down where a recording
+    /// *session* closes** (`:1361`, in [`Sessions::close_recording_session`]) —
+    /// *not* where an image arrives, and *not* where a subscription is stopped.
+    /// Getting either wrong is invisible until the bound is reached: an extra
+    /// increment per recording walks the count up to the maximum and leaves it
+    /// there, refusing every later recording for the life of the process.
     num_active_recordings: usize,
     /// The settings those requests are answered from.
     recording: RecordingSettings,
@@ -1817,13 +1826,17 @@ impl Sessions {
             );
         }
 
-        // `subscriptionRefCountMap.incrementAndGet` and the two counts
-        // (`:2053-2056`).
+        // `subscriptionRefCountMap.incrementAndGet`, `recordingSessionByIdMap
+        // .put` and `ctx.recordingSessionCounter().incrementRelease()`
+        // (`:2053-2056`) — and **not** `numActiveRecordings`, which the
+        // reference moves at the subscription add (`:569`) and nowhere else.
+        // Moving it here as well would count every recording twice and never
+        // give the second one back: the count would climb to the configured
+        // maximum and stay there, refusing every later recording and extension.
         *self
             .subscription_ref_counts
             .entry(subscription_id)
             .or_insert(0) += 1;
-        self.num_active_recordings += 1;
 
         if let Some(counter) = &self.recording_session_counter {
             counter.increment(counters);
@@ -2689,7 +2702,11 @@ impl Sessions {
         let mut found = 0;
 
         if let Some(handle) = self.recording_session_by_id.get(&recording_id).copied() {
-            recorder.abort_sessions_for(handle.subscription_id, "stop recording by identity");
+            // **This** recording's session, not every session reading the same
+            // subscription: the reference aborts the one it looked up
+            // (`:1306-1310`), and a subscription can carry more than one image
+            // over its life.
+            recorder.abort_session(recording_id, "stop recording by identity");
 
             if self
                 .remove_recording_subscription(handle.subscription_id)
@@ -2955,7 +2972,6 @@ impl Sessions {
                     let size =
                         i32::try_from(self.recording_subscriptions.len()).unwrap_or(i32::MAX);
                     let mut index = 0;
-                    let mut stopped = false;
 
                     for subscription in self.recording_subscriptions.values() {
                         let examined = index;
@@ -2982,9 +2998,13 @@ impl Sessions {
                                 // `isDone = controlSession.isDone()` (`:110`): a
                                 // send that did not take leaves the walk where it
                                 // is, and a session that ended under the listing
-                                // takes the listing with it.
+                                // takes the listing with it. A **live** session
+                                // whose last offer failed still reaches the
+                                // terminal answer below, which is the reference's
+                                // own behaviour: the listing ends and the client
+                                // is told there is nothing more (`:120-125`), even
+                                // though one descriptor did not go out.
                                 listing.is_done = entry.control.is_done();
-                                stopped = true;
                                 break;
                             }
 
@@ -2992,7 +3012,6 @@ impl Sessions {
 
                             if listing.sent >= listing.subscription_count {
                                 listing.is_done = true;
-                                stopped = true;
                                 break;
                             }
                         }
@@ -3004,7 +3023,7 @@ impl Sessions {
                         listing.pseudo_index = index - 1;
                     }
 
-                    if !listing.is_done && !stopped && index >= size {
+                    if !listing.is_done && index >= size {
                         // The walk ran off the end without filling the page: the
                         // client is told there is nothing more (`:120-125`),
                         // which its poller reads as "this listing is complete".

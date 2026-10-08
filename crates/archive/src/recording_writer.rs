@@ -424,6 +424,53 @@ mod tests {
         assert_eq!(2 * half as u64 + 64, tally.bytes);
     }
 
+    /// A roll-over onto a segment that is already there is refused, and the
+    /// writer is left **where it was** — the reference's own order
+    /// (`RecordingWriter.java:236-244`) moves its offset and its base first and
+    /// relies on the throw that follows to take the writer with it
+    /// (`:157-165`); this writer has no throw, so both mutations wait until
+    /// after both refusals and a caller that writes again fails again rather
+    /// than writing over the segment from its beginning.
+    #[test]
+    fn a_roll_over_onto_a_segment_that_is_there_leaves_the_writer_alone() {
+        let directory = directory("rollover-in-the-way");
+        let mut writer = writer(&directory, 0);
+        writer.init().expect("opens");
+
+        let half = SEGMENT_LENGTH / 2;
+        writer
+            .write_block(&frame(0, 0, half), &mut Tally::default())
+            .expect("the first half");
+
+        let before = writer.position();
+
+        // The next segment, already there: what a second recording of the same
+        // id over a directory that was not cleaned would meet.
+        std::fs::write(directory.join("7-131072.rec"), b"in the way").expect("written");
+
+        let error = writer
+            .write_block(&frame(half as i32, 0, half), &mut Tally::default())
+            .expect_err("the roll-over refuses");
+
+        assert!(
+            matches!(
+                error,
+                RecordingWriterError::Segment(SegmentError::Exists { .. })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            before,
+            writer.position(),
+            "the writer is where it was, not one segment further on"
+        );
+        assert_eq!(
+            directory.join("7-0.rec"),
+            writer.path().expect("the segment it is still writing"),
+            "and still writing the segment it was"
+        );
+    }
+
     /// Opening the file a recording is already writing into is **not** a
     /// refusal: it is what an extension does, and the reference's `init` opens
     /// the segment and seeks to the join offset (`RecordingWriter.java:190-197`).

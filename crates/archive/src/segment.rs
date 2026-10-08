@@ -410,11 +410,24 @@ impl SegmentWriter {
     /// reference's arithmetic and only true because a segment is filled from its
     /// beginning: the file's last block is one that did not fit the one before
     /// it.
+    ///
+    /// # Every refusal is made before anything moves
+    ///
+    /// The reference moves its base position and its offset **first** and checks
+    /// for an existing file second (`:236-244`), which is safe there only because
+    /// the throw that follows takes the writer with it: its caller catches, closes
+    /// the channel and stops the recording (`RecordingWriter.java:157-165`,
+    /// `RecordingSession.java:262-275`). This writer has no throw to unwind with,
+    /// so the two mutations happen **after** both refusals — a roll-over that
+    /// fails leaves the segment it was writing exactly where it was, and a caller
+    /// that writes again rolls over again and fails again rather than writing
+    /// over the segment from its beginning.
     fn roll_over(&mut self) -> Result<(), SegmentError> {
-        self.segment_base_position += i64::try_from(self.segment_length).unwrap_or(i64::MAX);
-        self.offset = 0;
-
-        let path = self.path();
+        let next_base =
+            self.segment_base_position + i64::try_from(self.segment_length).unwrap_or(i64::MAX);
+        let path = self
+            .directory
+            .join(segment_file_name(self.recording_id, next_base));
 
         // **This** is where an existing segment is refused, and it is the only
         // place the reference refuses one (`:241-244`): rolling onto a file that
@@ -425,6 +438,9 @@ impl SegmentWriter {
         }
 
         let next = Self::open_segment(&path, self.segment_length)?;
+
+        self.segment_base_position = next_base;
+        self.offset = 0;
         self.file = next;
 
         Ok(())
