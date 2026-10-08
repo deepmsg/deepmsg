@@ -86,6 +86,9 @@ use deepmsg_codec::archive::find_last_matching_recording_request_codec::{
 };
 use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestDecoder;
 use deepmsg_codec::archive::list_recording_request_codec::{self, ListRecordingRequestDecoder};
+use deepmsg_codec::archive::list_recording_subscriptions_request_codec::{
+    self, ListRecordingSubscriptionsRequestDecoder,
+};
 use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
@@ -421,6 +424,22 @@ pub trait ControlPlane {
         correlation_id: i64,
         stream_id: i32,
         original_channel: &str,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onListRecordingSubscriptions`
+    /// (`ControlSession.java:550-568`), which asks what this archive has been
+    /// told to record (`ArchiveConductor.java:1266-1300`).
+    #[allow(clippy::too_many_arguments)] // one per field the request carries
+    fn on_list_recording_subscriptions(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        pseudo_index: i32,
+        subscription_count: i32,
+        apply_stream_id: bool,
+        stream_id: i32,
+        channel_fragment: &str,
         now_ms: i64,
     );
 
@@ -988,6 +1007,46 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // What this archive has been told to record
+        // (`ArchiveConductor.java:1266-1300`). Its two gates are the session's,
+        // so the decision is the callback's — see the conductor's
+        // `on_list_recording_subscriptions`.
+        list_recording_subscriptions_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = ListRecordingSubscriptionsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let pseudo_index = decoder.pseudo_index();
+            let subscription_count = decoder.subscription_count();
+            let apply_stream_id = decoder.apply_stream_id() == BooleanType::TRUE;
+            let stream_id = decoder.stream_id();
+            let coordinates = decoder.channel_decoder();
+            let channel_fragment =
+                String::from_utf8_lossy(decoder.channel_slice(coordinates)).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_list_recording_subscriptions(
+                    session_id,
+                    correlation_id,
+                    pseudo_index,
+                    subscription_count,
+                    apply_stream_id,
+                    stream_id,
+                    &channel_fragment,
+                    now_ms,
+                );
+            }
+        }
+
         // Asking an archive to go on recording a channel whose session ended.
         // The older version of this request (11) has no `autoStop` and is not
         // answered here: the C client sends the second
@@ -1274,6 +1333,15 @@ mod tests {
             original_channel: String,
         },
         ExtendRecording(ExtendRecordingRequest),
+        ListRecordingSubscriptions {
+            session_id: i64,
+            correlation_id: i64,
+            pseudo_index: i32,
+            subscription_count: i32,
+            apply_stream_id: bool,
+            stream_id: i32,
+            channel_fragment: String,
+        },
         StopRecordingByIdentity {
             session_id: i64,
             correlation_id: i64,
@@ -1413,6 +1481,28 @@ mod tests {
 
         fn on_extend_recording(&mut self, request: ExtendRecordingRequest, _now_ms: i64) {
             self.calls.push(Call::ExtendRecording(request));
+        }
+
+        fn on_list_recording_subscriptions(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            pseudo_index: i32,
+            subscription_count: i32,
+            apply_stream_id: bool,
+            stream_id: i32,
+            channel_fragment: &str,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::ListRecordingSubscriptions {
+                session_id,
+                correlation_id,
+                pseudo_index,
+                subscription_count,
+                apply_stream_id,
+                stream_id,
+                channel_fragment: channel_fragment.to_owned(),
+            });
         }
 
         fn on_stop_recording(
@@ -2156,6 +2246,42 @@ mod tests {
         buffer
     }
 
+    fn list_recording_subscriptions_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        pseudo_index: i32,
+        subscription_count: i32,
+        apply_stream_id: bool,
+        stream_id: i32,
+        channel_fragment: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::boolean_type::BooleanType;
+        use deepmsg_codec::archive::list_recording_subscriptions_request_codec::ListRecordingSubscriptionsRequestEncoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder = ListRecordingSubscriptionsRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .pseudo_index(pseudo_index)
+                .subscription_count(subscription_count)
+                .apply_stream_id(if apply_stream_id {
+                    BooleanType::TRUE
+                } else {
+                    BooleanType::FALSE
+                })
+                .stream_id(stream_id)
+                .channel(channel_fragment.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
     fn extend_recording_request(
         control_session_id: i64,
         correlation_id: i64,
@@ -2329,6 +2455,45 @@ mod tests {
                 auto_stop: false,
                 original_channel: channel.to_owned(),
             })),
+            control.calls.last()
+        );
+    }
+
+    /// The request that asks what this archive records reaches the session with
+    /// every field its two gates and its walk need, the channel fragment whole
+    /// (`ArchiveConductor.java:1266-1300`).
+    #[test]
+    fn a_listing_of_subscriptions_reaches_the_session_with_its_whole_question() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&list_recording_subscriptions_request(
+                    session_id,
+                    7,
+                    0,
+                    5,
+                    true,
+                    33,
+                    "endpoint=localhost:3333",
+                )),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::ListRecordingSubscriptions {
+                session_id,
+                correlation_id: 7,
+                pseudo_index: 0,
+                subscription_count: 5,
+                apply_stream_id: true,
+                stream_id: 33,
+                channel_fragment: "endpoint=localhost:3333".to_owned(),
+            }),
             control.calls.last()
         );
     }

@@ -201,6 +201,24 @@ pub enum Response {
         /// The descriptor, as the catalog holds it.
         body: Vec<u8>,
     },
+    /// One recording **subscription**, as a listing answers with it
+    /// (`ControlResponseProxy.sendSubscriptionDescriptor`, `:91-107`).
+    ///
+    /// The sibling of [`Response::Descriptor`] and the same shape of send: the
+    /// reference offers it once and answers whether it took, and the **listing**
+    /// is what tries again (`ListRecordingSubscriptionsSession.doWork`, `:109-113`).
+    SubscriptionDescriptor {
+        /// The session it is sent on.
+        control_session_id: i64,
+        /// The listing request's correlation id.
+        correlation_id: i64,
+        /// The subscription's registration id.
+        subscription_id: i64,
+        /// The stream it was added for.
+        stream_id: i32,
+        /// Its channel, as it was added on.
+        channel: String,
+    },
     /// A `RecordingSignalEvent` (`ControlResponseProxy.java:161-199`): what a
     /// recording the client asked for has done since it asked.
     Signal {
@@ -650,6 +668,66 @@ impl<E: Egress> ControlSession<E> {
             correlation_id,
             recording_id,
             ControlResponseCode::RECORDING_UNKNOWN,
+            None,
+            now_ms,
+            publications,
+        );
+    }
+
+    /// Send one recording **subscription**'s descriptor
+    /// (`ControlSession.java:764-776`), answering with whether it went out.
+    ///
+    /// [`ControlSession::send_descriptor`]'s twin, queue and all: a listing
+    /// that did not get its descriptor out tries again next turn rather than
+    /// queueing it, because the *listing* is what knows where the walk was.
+    pub fn send_subscription_descriptor<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        subscription_id: i64,
+        stream_id: i32,
+        channel: &str,
+        now_ms: i64,
+        publications: &mut P,
+    ) -> bool {
+        let response = Response::SubscriptionDescriptor {
+            control_session_id: self.session_id,
+            correlation_id,
+            subscription_id,
+            stream_id,
+            channel: channel.to_owned(),
+        };
+
+        match self.egress.offer(publications, &response) {
+            Offered::Sent => {
+                self.activity_deadline_ms = None;
+                true
+            }
+            Offered::Retry => {
+                self.update_activity_deadline(now_ms);
+                false
+            }
+            Offered::Fatal(error) => {
+                let reason = error.message().to_owned();
+                self.abort(&reason);
+                false
+            }
+        }
+    }
+
+    /// Answer that a listing has nothing left to send
+    /// (`ControlSession.sendSubscriptionUnknown`, `:708-711`), which is an
+    /// `OK`'s shape with `SUBSCRIPTION_UNKNOWN` for a code, a zero for the
+    /// relevant id and nothing to say.
+    pub fn send_subscription_unknown<P: Publications>(
+        &mut self,
+        correlation_id: i64,
+        now_ms: i64,
+        publications: &mut P,
+    ) {
+        self.send_response(
+            correlation_id,
+            0,
+            ControlResponseCode::SUBSCRIPTION_UNKNOWN,
             None,
             now_ms,
             publications,

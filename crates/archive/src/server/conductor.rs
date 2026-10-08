@@ -520,6 +520,13 @@ enum Deferred {
         correlation_id: i64,
         recording_id: i64,
     },
+    /// The answer a listing with nothing to send gets
+    /// (`ControlSession.sendSubscriptionUnknown`, `:708-711`): an `OK`'s shape
+    /// with `SUBSCRIPTION_UNKNOWN` for a code.
+    SubscriptionUnknown {
+        session_id: i64,
+        correlation_id: i64,
+    },
     /// A request that has to move something (`ArchiveConductor.java:562`,
     /// `:1766-1780`) — see [`Action`].
     Action(Action),
@@ -927,6 +934,18 @@ struct RecordingSubscription {
     /// (`:1329-1363`), captured per start because the request is where it comes
     /// from.
     is_auto_stop: bool,
+    /// The channel the subscription was **added on**, which is the stripped one
+    /// with the spy prefix in front of it for a local UDP publication
+    /// (`:558-560`).
+    ///
+    /// This is what a recording-subscription descriptor carries, because it is
+    /// what the reference has: it sends `subscription.channel()`
+    /// (`ControlResponseProxy.java:91-107`), the object's own channel, however
+    /// odd that reads next to a field called `strippedChannel`.
+    channel: String,
+    /// The stream it was added for, which the descriptor carries too and which
+    /// `applyStreamId` filters on (`:104-105`).
+    stream_id: i32,
     /// The control session that asked and the correlation id of its request,
     /// which are what the `START`/`EXTEND` signal is sent with (`:2046-2051`,
     /// `:2121-2122`) — captured per request, as the reference's handler closure
@@ -960,6 +979,12 @@ struct PendingStartRecording {
     /// prefix the subscription was added on, and a different string again from
     /// the key.
     stripped_channel: String,
+    /// The channel the subscription was actually added on, which a
+    /// recording-subscription descriptor carries (`:91-107` of the response
+    /// proxy sends the subscription's own channel).
+    channel: String,
+    /// The stream it is for.
+    stream_id: i32,
     /// The channel the client asked for.
     original_channel: String,
     /// Whether the recording ends with the client that asked (`:2044`).
@@ -1058,7 +1083,35 @@ struct PendingConnect {
 /// work against the catalog and the session it was created from, both of which
 /// are arguments here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Listing {
+enum Listing {
+    /// One recording's descriptor (`ListRecordingByIdSession`, `:60-80`).
+    Recording(RecordingListing),
+    /// A page of recording **subscriptions**
+    /// (`ListRecordingSubscriptionsSession`, `:96-127`).
+    Subscriptions(SubscriptionListing),
+}
+
+impl Listing {
+    /// The session being served, which is what a listing that outlived its
+    /// session is found by.
+    const fn control_session_id(&self) -> i64 {
+        match self {
+            Self::Recording(listing) => listing.control_session_id,
+            Self::Subscriptions(listing) => listing.control_session_id,
+        }
+    }
+
+    /// Whether it is finished with.
+    const fn is_done(&self) -> bool {
+        match self {
+            Self::Recording(listing) => listing.is_done,
+            Self::Subscriptions(listing) => listing.is_done,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingListing {
     /// The control session that asked, and the one the descriptor goes to.
     control_session_id: i64,
     /// The correlation id of the request (`ListRecordingByIdSession.sessionId`
@@ -1070,6 +1123,60 @@ struct Listing {
     /// to be there any more — and by [`Sessions::drive_listings`] when the
     /// session that asked is gone (`Session.abort`, `:42-46`).
     is_done: bool,
+}
+
+/// A walk through this archive's recording subscriptions, `subscriptionCount` at
+/// a time (`ListRecordingSubscriptionsSession`, `:26-39`).
+///
+/// The three fields that move are the reference's: `pseudo_index` is where the
+/// walk resumes — updated after **every** entry it passes, sent or not — and
+/// `sent` is how many descriptors the client has taken. What makes the walk
+/// resumable is that both survive a turn in which the send did not take
+/// (`:109-113`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubscriptionListing {
+    control_session_id: i64,
+    correlation_id: i64,
+    /// How many entries of the registry to skip before answering.
+    pseudo_index: i32,
+    /// How many descriptors the client asked for.
+    subscription_count: i32,
+    /// How many have gone out.
+    sent: i32,
+    /// The stream to answer about, when `apply_stream_id`.
+    stream_id: i32,
+    /// Whether the stream is part of the question at all (`:104`).
+    apply_stream_id: bool,
+    /// A piece of channel every answered subscription's must contain.
+    channel_fragment: String,
+    is_done: bool,
+}
+
+/// Finish a listing whichever kind it is — what the reference does with
+/// `abort` (`Session.abort`, `ListRecordingByIdSession.java:42-46`).
+fn mark_done(listing: &mut Listing) {
+    match listing {
+        Listing::Recording(listing) => listing.is_done = true,
+        Listing::Subscriptions(listing) => listing.is_done = true,
+    }
+}
+
+/// Whether a subscription is one the client asked about
+/// (`ListRecordingSubscriptionsSession.doWork`, `:104-105`).
+///
+/// The channel test is a **substring** of the channel the subscription was
+/// added on, and an empty fragment is in every string — which is why a client
+/// with nothing to match on passes nothing. The stream is part of the question
+/// only when `apply_stream_id`, which is what lets one request ask "this stream
+/// on any channel" or "any stream on this channel".
+fn matches_listing(
+    subscription: &RecordingSubscription,
+    stream_id: i32,
+    apply_stream_id: bool,
+    channel_fragment: &str,
+) -> bool {
+    !(apply_stream_id && subscription.stream_id != stream_id)
+        && subscription.channel.contains(channel_fragment)
 }
 
 /// Why a listing request is not going to be served
@@ -1949,6 +2056,8 @@ impl Sessions {
                 key,
                 registration_id: add.registration_id(),
                 stripped_channel,
+                channel,
+                stream_id: request.stream_id,
                 original_channel: request.original_channel.clone(),
                 is_auto_stop: request.auto_stop,
                 request: RecordingRequest::Start,
@@ -2058,6 +2167,8 @@ impl Sessions {
                             stripped_channel: start.stripped_channel,
                             original_channel: start.original_channel,
                             is_auto_stop: start.is_auto_stop,
+                            channel: start.channel,
+                            stream_id: start.stream_id,
                             session_id: start.session_id,
                             correlation_id: start.correlation_id,
                             request: start.request,
@@ -2293,6 +2404,8 @@ impl Sessions {
                 key,
                 registration_id: add.registration_id(),
                 stripped_channel,
+                channel,
+                stream_id: *stream_id,
                 original_channel: original_channel.clone(),
                 is_auto_stop: *auto_stop,
                 request: RecordingRequest::Extend {
@@ -2730,7 +2843,7 @@ impl Sessions {
     fn has_active_listing(&self, control_session_id: i64) -> bool {
         self.listings
             .iter()
-            .any(|listing| listing.control_session_id == control_session_id)
+            .any(|listing| listing.control_session_id() == control_session_id)
     }
 
     /// Start the listing a request asked for, or say why it will not be started
@@ -2755,12 +2868,12 @@ impl Sessions {
             return Some(ListingRefusal::UnknownRecording);
         }
 
-        self.listings.push(Listing {
+        self.listings.push(Listing::Recording(RecordingListing {
             control_session_id: session_id,
             correlation_id,
             recording_id,
             is_done: false,
-        });
+        }));
 
         None
     }
@@ -2791,36 +2904,118 @@ impl Sessions {
     /// session that asked for it.
     fn drive_listings(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
         for listing in &mut self.listings {
-            if listing.is_done {
+            if listing.is_done() {
                 continue;
             }
 
-            let Some(entry) = self.sessions.get_mut(&listing.control_session_id) else {
-                listing.is_done = true;
+            let control_session_id = listing.control_session_id();
+            let Some(entry) = self.sessions.get_mut(&control_session_id) else {
+                mark_done(listing);
                 continue;
             };
 
             if entry.control.is_done() {
-                listing.is_done = true;
+                mark_done(listing);
                 continue;
             }
 
-            let Ok(Some(descriptor)) = catalog.descriptor_body(listing.recording_id) else {
-                entry.control.send_recording_unknown(
-                    listing.correlation_id,
-                    listing.recording_id,
-                    now_ms,
-                    client,
-                );
-                listing.is_done = true;
-                continue;
-            };
+            match listing {
+                Listing::Recording(listing) => {
+                    let Ok(Some(descriptor)) = catalog.descriptor_body(listing.recording_id) else {
+                        entry.control.send_recording_unknown(
+                            listing.correlation_id,
+                            listing.recording_id,
+                            now_ms,
+                            client,
+                        );
+                        listing.is_done = true;
+                        continue;
+                    };
 
-            if entry
-                .control
-                .send_descriptor(listing.correlation_id, descriptor, now_ms, client)
-            {
-                listing.is_done = true;
+                    if entry.control.send_descriptor(
+                        listing.correlation_id,
+                        descriptor,
+                        now_ms,
+                        client,
+                    ) {
+                        listing.is_done = true;
+                    }
+                }
+                // `ListRecordingSubscriptionsSession.doWork` (`:96-127`), walked
+                // the way the reference walks it: an index that skips the entries
+                // already passed, a filter, and two ways to stop — the client
+                // having taken what it asked for, or the map running out.
+                //
+                // The order is this map's, which — like the reference's
+                // `Object2ObjectHashMap` — is unspecified. What matters is that
+                // it does not change under one listing, which it cannot: a
+                // `HashMap` is only reordered by insertion, and the walk never
+                // inserts.
+                Listing::Subscriptions(listing) => {
+                    let size =
+                        i32::try_from(self.recording_subscriptions.len()).unwrap_or(i32::MAX);
+                    let mut index = 0;
+                    let mut stopped = false;
+
+                    for subscription in self.recording_subscriptions.values() {
+                        let examined = index;
+                        index += 1;
+
+                        if examined < listing.pseudo_index {
+                            continue;
+                        }
+
+                        if matches_listing(
+                            subscription,
+                            listing.stream_id,
+                            listing.apply_stream_id,
+                            &listing.channel_fragment,
+                        ) {
+                            if !entry.control.send_subscription_descriptor(
+                                listing.correlation_id,
+                                subscription.registration_id,
+                                subscription.stream_id,
+                                &subscription.channel,
+                                now_ms,
+                                client,
+                            ) {
+                                // `isDone = controlSession.isDone()` (`:110`): a
+                                // send that did not take leaves the walk where it
+                                // is, and a session that ended under the listing
+                                // takes the listing with it.
+                                listing.is_done = entry.control.is_done();
+                                stopped = true;
+                                break;
+                            }
+
+                            listing.sent += 1;
+
+                            if listing.sent >= listing.subscription_count {
+                                listing.is_done = true;
+                                stopped = true;
+                                break;
+                            }
+                        }
+
+                        // `pseudoIndex = index - 1` (`:117`): every entry the
+                        // walk passes moves it on, whether it answered with a
+                        // descriptor or not, which is what keeps a listing that
+                        // sent nothing this turn from starting over.
+                        listing.pseudo_index = index - 1;
+                    }
+
+                    if !listing.is_done && !stopped && index >= size {
+                        // The walk ran off the end without filling the page: the
+                        // client is told there is nothing more (`:120-125`),
+                        // which its poller reads as "this listing is complete".
+                        entry.control.send_subscription_unknown(
+                            listing.correlation_id,
+                            now_ms,
+                            client,
+                        );
+                        listing.is_done = true;
+                    }
+                }
             }
         }
 
@@ -2828,7 +3023,7 @@ impl Sessions {
         // out where it stands (the last one fills its place) — and the order
         // listings are driven in is not a contract, so a `retain` says the same
         // thing about the result.
-        self.listings.retain(|listing| !listing.is_done);
+        self.listings.retain(|listing| !listing.is_done());
     }
 
     /// `ctx.controlSessionsCounter()`, asked for once and taken up when the
@@ -3101,6 +3296,16 @@ impl Sessions {
                 // one — and the only kind that needs the client for something
                 // other than talking to the client (`ArchiveConductor.java:562`,
                 // `:1766-1780`).
+                Deferred::SubscriptionUnknown {
+                    session_id,
+                    correlation_id,
+                } => {
+                    if let Some(entry) = self.sessions.get_mut(&session_id) {
+                        entry
+                            .control
+                            .send_subscription_unknown(correlation_id, now_ms, client);
+                    }
+                }
                 Deferred::Action(action) => {
                     self.run_action(client, catalog, action, recorder, now_ms);
                 }
@@ -3332,6 +3537,54 @@ impl ControlPlane for Sessions {
     fn on_extend_recording(&mut self, request: ExtendRecordingRequest, _now_ms: i64) {
         self.pending
             .push(Deferred::Action(Action::ExtendRecording(request)));
+    }
+
+    #[allow(clippy::too_many_arguments)] // one per field the request carries
+    fn on_list_recording_subscriptions(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        pseudo_index: i32,
+        subscription_count: i32,
+        apply_stream_id: bool,
+        stream_id: i32,
+        channel_fragment: &str,
+        _now_ms: i64,
+    ) {
+        // `ArchiveConductor.listRecordingSubscriptions` (`:1266-1300`) is
+        // decided **here**, unlike the other listings: both of its gates are the
+        // session's own state — whether it is already being served, and whether
+        // the page it asked for can exist — and neither needs the client or the
+        // catalog a callback runs without.
+        if self.has_active_listing(session_id) {
+            self.pending.push(Deferred::Error {
+                session_id,
+                correlation_id,
+                relevant_id: ACTIVE_LISTING,
+                message: ACTIVE_LISTING_MSG.to_owned(),
+            });
+        } else if pseudo_index < 0
+            || pseudo_index >= i32::try_from(self.recording_subscriptions.len()).unwrap_or(i32::MAX)
+            || subscription_count <= 0
+        {
+            self.pending.push(Deferred::SubscriptionUnknown {
+                session_id,
+                correlation_id,
+            });
+        } else {
+            self.listings
+                .push(Listing::Subscriptions(SubscriptionListing {
+                    control_session_id: session_id,
+                    correlation_id,
+                    pseudo_index,
+                    subscription_count,
+                    sent: 0,
+                    stream_id,
+                    apply_stream_id,
+                    channel_fragment: channel_fragment.to_owned(),
+                    is_done: false,
+                }));
+        }
     }
 
     fn on_stop_recording(
@@ -4339,6 +4592,53 @@ mod tests {
         );
     }
 
+    /// The filter a subscription listing walks by
+    /// (`ListRecordingSubscriptionsSession.doWork`, `:104-105`): a **substring**
+    /// of the channel the subscription was added on, and the stream only when
+    /// the client says the stream is part of the question.
+    #[test]
+    fn a_subscription_listing_filters_by_a_piece_of_channel_and_maybe_a_stream() {
+        let mut ipc = held(11);
+        ipc.channel = "aeron:ipc".to_owned();
+        ipc.stream_id = 33;
+
+        let mut udp = held(22);
+        udp.channel = "aeron-spy:aeron:udp?endpoint=localhost:5678".to_owned();
+        udp.stream_id = 34;
+
+        // The channel fragment, with the stream not part of the question.
+        assert!(matches_listing(&ipc, 33, false, ""));
+        assert!(
+            matches_listing(&udp, 33, false, ""),
+            "an empty fragment is in every channel, which is what the C suite's second query passes"
+        );
+        assert!(matches_listing(&ipc, 33, false, "ipc"));
+        assert!(
+            !matches_listing(&udp, 33, false, "ipc"),
+            "a substring **of the channel it was added on**"
+        );
+        assert!(
+            matches_listing(&udp, 33, false, "spy:aeron:udp"),
+            "so the spy prefix a local recording carries is part of what a client matches on"
+        );
+
+        // And the stream, when the client says so.
+        assert!(matches_listing(&ipc, 33, true, ""));
+        assert!(
+            !matches_listing(&udp, 33, true, ""),
+            "another stream is not this one"
+        );
+        assert!(matches_listing(&udp, 34, true, ""));
+        assert_eq!(
+            2,
+            [&ipc, &udp]
+                .iter()
+                .filter(|subscription| matches_listing(subscription, 33, false, ""))
+                .count(),
+            "which is the whole of what `applyStreamId` decides"
+        );
+    }
+
     /// A listing request is recorded, not started: what it needs first is the
     /// catalog and the session, and a callback holds neither.
     #[test]
@@ -4376,12 +4676,12 @@ mod tests {
             "a recording the catalog holds is served"
         );
         assert_eq!(
-            vec![Listing {
+            vec![Listing::Recording(RecordingListing {
                 control_session_id: 3,
                 correlation_id: 7,
                 recording_id: 0,
                 is_done: false,
-            }],
+            })],
             sessions.listings
         );
         assert!(sessions.has_active_listing(3));
@@ -4395,7 +4695,11 @@ mod tests {
         );
         assert_eq!(None, sessions.start_listing(4, 9, 0, &catalog));
         assert_eq!(2, sessions.listings.len());
-        assert_eq!(9, sessions.listings[1].correlation_id);
+        let second = match &sessions.listings[1] {
+            Listing::Recording(listing) => listing.correlation_id,
+            Listing::Subscriptions(listing) => listing.correlation_id,
+        };
+        assert_eq!(9, second);
         assert!(!sessions.has_active_listing(5));
 
         // A recording that is not there is not a listing, wherever the id came
@@ -4650,6 +4954,8 @@ mod tests {
         RecordingSubscription {
             registration_id,
             stripped_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            channel: "aeron-spy:aeron:udp?endpoint=localhost:3333".to_owned(),
+            stream_id: 33,
             original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
             is_auto_stop: false,
             session_id: 3,

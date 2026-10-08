@@ -64,6 +64,9 @@ use deepmsg_codec::archive::message_header_codec::ENCODED_LENGTH as MESSAGE_HEAD
 use deepmsg_codec::archive::ping_codec::{self, PingEncoder};
 use deepmsg_codec::archive::recording_descriptor_codec::RecordingDescriptorEncoder;
 use deepmsg_codec::archive::recording_signal_event_codec::{self, RecordingSignalEventEncoder};
+use deepmsg_codec::archive::recording_subscription_descriptor_codec::{
+    self, RecordingSubscriptionDescriptorEncoder,
+};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::version::semantic_version_compose;
 
@@ -363,6 +366,39 @@ fn encode(buffer: &mut Vec<u8>, response: &Response) -> usize {
                 .correlation_id(*correlation_id);
 
             MESSAGE_HEADER_LENGTH + body.len()
+        }
+
+        // A subscription descriptor: `controlSessionId`, `correlationId`,
+        // `subscriptionId`, `streamId` and the channel, which is the only
+        // variable-length field (`RecordingSubscriptionDescriptorEncoder`).
+        Response::SubscriptionDescriptor {
+            control_session_id,
+            correlation_id,
+            subscription_id,
+            stream_id,
+            channel,
+        } => {
+            grow(
+                buffer,
+                MESSAGE_HEADER_LENGTH
+                    + recording_subscription_descriptor_codec::SBE_BLOCK_LENGTH as usize
+                    + VAR_DATA_LENGTH_PREFIX
+                    + channel.len(),
+            );
+
+            let encoder = RecordingSubscriptionDescriptorEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(*control_session_id)
+                .correlation_id(*correlation_id)
+                .subscription_id(*subscription_id)
+                .stream_id(*stream_id)
+                .stripped_channel(channel.as_bytes());
+
+            MESSAGE_HEADER_LENGTH + encoder.encoded_length()
         }
 
         Response::Ping { control_session_id } => {
