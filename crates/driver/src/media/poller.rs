@@ -13,6 +13,20 @@
 //! saves, and above it a driver with a hundred transports should not make a
 //! hundred calls to find out that two have data.
 //!
+//! **Being in an `epoll` set is not free.** A registered socket has a waiter on
+//! its sleep queue, so *every* datagram delivered to it runs the wake-up walk —
+//! `sock_def_readable` → `__wake_up_common` → `ep_poll_callback`, plus two
+//! interrupt-disabling spinlocks — whether or not anything ever asked about
+//! readiness. On the loopback that delivery happens in the *sending* thread's
+//! softirq, so a driver pays it for its own sends. The reference registers on
+//! every add (`:96`), including the ones its own below-threshold branch is
+//! about to read one syscall at a time (`:190-206`) and never wait on: at
+//! 501,000 messages/s that walk measured 6.09% of its sender thread's kernel
+//! instructions, and it goes to zero with the sockets left out of the set. So
+//! here the set is empty — and the instance itself absent — at or below the
+//! threshold: what is registered is exactly what `epoll_wait` is about to be
+//! asked about.
+//!
 //! The poller is per **transport**, which for a receive endpoint is per
 //! destination — an endpoint with three destinations has three sockets, and the
 //! reference registers each one (`poller_add_func`, `:120-145`).
@@ -34,9 +48,13 @@ pub const ITERATION_THRESHOLD: usize = 5;
 /// caller's order matters: which endpoint is read first decides which image
 /// sees a datagram first, and that is not something a poller should shuffle.
 pub struct TransportPoller {
-    /// Created the first time it is needed. A driver with one channel never
-    /// makes one, which is the reference's behaviour too: its poller's `fd` is
-    /// only touched on the epoll branch.
+    /// Made the first time a pass leaves more than [`ITERATION_THRESHOLD`]
+    /// transports to watch, and given back — with every registration it held —
+    /// when a pass falls back to that many or fewer. A driver with a handful of
+    /// channels never makes one, and never has a socket in a set nobody waits
+    /// on either. The reference is the other way round: it makes its instance
+    /// once, in `_init` (`:45`), and fills it on every add (`:96`) whether or
+    /// not the branch it is on will ever wait on it.
     poller: Option<Poller>,
     /// The descriptors the poller was last told about, to avoid a syscall per
     /// pass when nothing has changed. Registration happens when this differs
@@ -59,9 +77,11 @@ impl TransportPoller {
     /// The indices of `descriptors` this pass should read, appended to `ready`.
     ///
     /// At or below [`ITERATION_THRESHOLD`] that is every index and no syscall
-    /// is made; above it, the ones `epoll_wait` reported. A descriptor that is
-    /// not found in `descriptors` — a socket closed between the registration
-    /// and the wait — is skipped rather than guessed at.
+    /// is made — and the set is left empty, so that a pass which arrives here
+    /// after having been above the threshold takes its sockets out with it;
+    /// above it, the ones `epoll_wait` reported. A descriptor that is not found
+    /// in `descriptors` — a socket closed between the registration and the wait
+    /// — is skipped rather than guessed at.
     ///
     /// # Errors
     ///
@@ -71,6 +91,7 @@ impl TransportPoller {
         ready.clear();
 
         if descriptors.len() <= ITERATION_THRESHOLD {
+            self.unregister();
             ready.extend(0..descriptors.len());
             return Ok(());
         }
@@ -127,6 +148,25 @@ impl TransportPoller {
         self.registered.extend_from_slice(descriptors);
 
         Ok(())
+    }
+
+    /// Leave the set empty, and give up the instance that held it.
+    ///
+    /// This is the other half of the branch rule the module note explains: the
+    /// set belongs to the branch that waits on it, so the branch that reads
+    /// every transport directly is the one that has to give it back. A pass
+    /// that falls to at or below the threshold after having been above it has
+    /// registrations to drop; one that has always been below it has neither a
+    /// registration nor an instance, and this does nothing.
+    ///
+    /// Dropping the instance is what does the work: `close(2)` takes it out of
+    /// every wait queue it installed, so this is one call rather than an
+    /// `EPOLL_CTL_DEL` for each transport — and it leaves the driver in the same
+    /// state as one that never crossed the threshold at all.
+    fn unregister(&mut self) {
+        self.poller = None;
+        self.registered.clear();
+        self.readable.clear();
     }
 }
 
@@ -218,5 +258,42 @@ mod tests {
 
         poller.ready(&descriptors[1..], &mut ready).expect("a poll");
         assert_eq!(&descriptors[1..], poller.registered.as_slice());
+    }
+
+    /// A driver that shrinks back to the threshold keeps nothing registered —
+    /// and a driver that grows past it again registers from nothing. Below the
+    /// threshold a registration is not idle bookkeeping: the socket pays the
+    /// wake-up walk for every datagram delivered to it (see the module note).
+    #[test]
+    fn falling_back_to_the_threshold_empties_the_set() {
+        let many = sockets(ITERATION_THRESHOLD + 1);
+        let descriptors: Vec<Descriptor> = many.iter().map(|(_, d)| *d).collect();
+        let mut poller = TransportPoller::new();
+        let mut ready = Vec::new();
+
+        poller.ready(&descriptors, &mut ready).expect("a poll");
+        assert!(
+            poller.poller.is_some(),
+            "above it, epoll is what it waits on"
+        );
+        assert_eq!(descriptors.len(), poller.registered.len());
+
+        // One transport goes away, and the rest are read directly again.
+        poller
+            .ready(&descriptors[..ITERATION_THRESHOLD], &mut ready)
+            .expect("a poll");
+        assert_eq!(vec![0, 1, 2, 3, 4], ready);
+        assert!(
+            poller.poller.is_none(),
+            "the instance it waited through went with it"
+        );
+        assert!(poller.registered.is_empty());
+
+        // And crossing back up registers the whole list, from an empty set.
+        let more = sockets(ITERATION_THRESHOLD + 1);
+        let descriptors: Vec<Descriptor> = more.iter().map(|(_, d)| *d).collect();
+        poller.ready(&descriptors, &mut ready).expect("a poll");
+        assert!(poller.poller.is_some());
+        assert_eq!(descriptors.len(), poller.registered.len());
     }
 }
