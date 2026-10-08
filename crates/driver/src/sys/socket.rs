@@ -714,7 +714,16 @@ impl DatagramSocket {
         // The one thing the caller may change between calls: where each message
         // is to be written. The headers that carry the pointers to these
         // iovecs were built once, in `RecvMessages::new`, and are not touched.
-        for (index, buffer) in buffers.iter_mut().take(count).enumerate() {
+        //
+        // Nothing to do for the single-message path: `recvfrom` takes the
+        // buffer itself, and the whole point of it is that there is no `iovec`
+        // to build. See the branch below.
+        for (index, buffer) in buffers
+            .iter_mut()
+            .take(count)
+            .enumerate()
+            .skip(usize::from(count == 1))
+        {
             // SAFETY: `RecvMessages::new` set this entry's `msg_iov` to the
             // `io_vectors` entry of the same index, in the same allocation, and
             // nothing has written it since — so the pointer is live, and this
@@ -738,14 +747,64 @@ impl DatagramSocket {
         // `RecvMessages::new`; each points at that allocation's own `names`
         // entry, which is a whole `sockaddr_storage`, and at a buffer the
         // caller lent for the duration of the call.
+        // One message is `recvfrom`; more than one is `recvmmsg`.
+        //
+        // `recvfrom` is what the **Java** driver's data path lands on — its
+        // `DataTransportPoller` reads one datagram per transport per poll into
+        // a preallocated buffer (`media/DataTransportPoller.java:222-225`,
+        // `media/UdpChannelTransport.java:450-471`), and the JDK maps
+        // `DatagramChannel.receive` to it — and it is the cheapest of the
+        // three by a wide margin on an empty queue, which is what 98.5% of
+        // this driver's polls are: measured on one socket, 889 instructions per
+        // empty call against 1,366 for `recvmsg` and 1,463 for a sixteen-wide
+        // `recvmmsg` (`b1-out/pollcost/`, and
+        // `doc/deepmsg-driver-perf-map.md` §5.4). The reason is that it takes
+        // the buffer and the address directly and there is no `msghdr` — with
+        // its `msg_iov` array and its `msg_control` region — to marshal in and
+        // out of the kernel.
+        //
+        // The two differ in how the length comes back: `recvmmsg` writes it
+        // into the messages it was given, `recvfrom` returns it, so the one
+        // result is put where the loop below reads it — and its address length
+        // likewise, because that loop reads `msg_namelen` for the source.
+        //
+        // SAFETY: `recvfrom` writes at most `length` bytes into the caller's
+        // buffer, which it was handed with that length and which lives as long
+        // as this call; the address goes into this socket's own `names[0]`, a
+        // whole `sockaddr_storage`, with `namelen` saying how much of it is
+        // meaningful. Every one of the first `count` messages on the other
+        // branch was built by `RecvMessages::new`, points at that allocation's
+        // own `names` entry, and at a buffer the caller lent for the duration.
         let received = unsafe {
-            libc::recvmmsg(
-                self.fd,
-                receive.messages.as_mut_ptr(),
-                count as libc::c_uint,
-                0,
-                std::ptr::null_mut(),
-            )
+            if count == 1 {
+                let buffer = &mut buffers[0];
+                let mut namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+                let length = libc::recvfrom(
+                    self.fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                    0,
+                    std::ptr::from_mut(&mut receive.names[0]).cast::<libc::sockaddr>(),
+                    &mut namelen,
+                );
+
+                if length < 0 {
+                    -1
+                } else {
+                    receive.messages[0].msg_len = u32::try_from(length).unwrap_or(u32::MAX);
+                    receive.messages[0].msg_hdr.msg_namelen = namelen;
+                    1
+                }
+            } else {
+                libc::recvmmsg(
+                    self.fd,
+                    receive.messages.as_mut_ptr(),
+                    count as libc::c_uint,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
         };
 
         if received < 0 {
@@ -1155,6 +1214,67 @@ mod tests {
                 .expect("a receive")
         );
         assert_eq!(b"three", &other[0][..5]);
+    }
+
+    #[test]
+    fn a_batch_of_one_takes_one_datagram_however_many_are_queued() {
+        // The length of the slice is the `vlen`, and the sender's control read
+        // is a slice of one: `aeron_driver_sender.c:154` builds a
+        // `struct mmsghdr mmsghdr[1]` and `:170` passes `vlen = 1`, so a burst
+        // of control frames takes as many polls as it has frames. This is what
+        // makes that true on this side.
+        let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        receiver
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        receiver.set_nonblocking().expect("non-blocking");
+
+        let local = receiver.local_address().expect("a bound address");
+        let sender = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        assert_eq!(
+            3,
+            sender
+                .send_batch(Some(local), &[b"one", b"two", b"three"])
+                .expect("a send")
+        );
+
+        let mut buffers = vec![vec![0u8; 64]];
+        let mut datagrams = Datagrams::new();
+
+        for expected in [b"one".as_slice(), b"two", b"three"] {
+            assert_eq!(
+                1,
+                receiver
+                    .receive_batch(&mut buffers, &mut datagrams)
+                    .expect("a receive"),
+                "one buffer in, one datagram out"
+            );
+            assert_eq!(
+                expected,
+                &buffers[0][..datagrams.as_slice()[0].length],
+                "and they come out in the order they went in"
+            );
+            // The source is what `recvfrom` writes its address length back
+            // for, and the only thing this path does not share with the
+            // `recvmmsg` branch — so it is the thing worth pinning.
+            assert_eq!(
+                Some(local),
+                datagrams.as_slice()[0]
+                    .source
+                    .map(|source| SocketAddr::new(source.ip(), local.port())),
+                "and the address is the one they came from"
+            );
+        }
+
+        // And the queue is what says when to stop, not the slice. The socket
+        // reports an empty queue the way the kernel does — `EAGAIN` — and it is
+        // the transport above it that turns that into the zero a pass reads
+        // (`media::udp_transport`'s `is_back_pressure`).
+        match receiver.receive_batch(&mut buffers, &mut datagrams) {
+            Ok(0) => {}
+            Err(error) => assert_eq!(io::ErrorKind::WouldBlock, error.kind()),
+            Ok(other) => panic!("a fourth datagram appeared: {other}"),
+        }
     }
 
     #[test]

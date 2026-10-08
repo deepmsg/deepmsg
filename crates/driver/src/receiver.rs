@@ -47,10 +47,22 @@ use crate::sys::socket::Datagrams;
 use crate::system_counters::{self, System};
 use crate::udp_channel::UdpChannel;
 
-/// How many datagrams one poll may read
-/// (`AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX`,
-/// `aeron-driver/src/main/c/aeron_driver_context.h:59`).
-const RECEIVE_SLOTS: usize = 16;
+/// How many datagrams a receiver with no `aeron.receiver.io.vector.capacity`
+/// of its own keeps.
+///
+/// The configured value is this by default. In the **C** driver that value is
+/// also the `vlen` its poll reads with (`aeron_driver_receiver.c:127` reads
+/// `recv_buffers.vector_capacity`, set from `receiver_io_vector_capacity` at
+/// `:47`); in the **Java** driver it is read nowhere at all and the poll takes
+/// one datagram per transport (`media/DataTransportPoller.java:222-225`). This
+/// build keeps the pool the size the setting asks for and reads one, which is
+/// Java's cadence over C's allocation.
+pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT;
+
+/// How many datagrams one receive poll takes from one destination, which is
+/// one — the Java driver's shape. See the call site for why a burst is not
+/// paced by it.
+const DATAGRAMS_PER_POLL: usize = 1;
 
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
@@ -653,6 +665,7 @@ impl Receiver {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -675,6 +688,7 @@ impl Receiver {
             values_length,
             free_to_reuse_timeout_ms,
             mtu_length,
+            io_vector_capacity,
             status_message_timeout_ns,
             initial_window_length,
             cycle_threshold_ns,
@@ -709,6 +723,7 @@ impl Receiver {
         values_length: usize,
         free_to_reuse_timeout_ms: i64,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -734,6 +749,7 @@ impl Receiver {
                 loss_report,
                 counters,
                 mtu_length,
+                io_vector_capacity,
                 status_message_timeout_ns,
                 initial_window_length,
                 cycle_threshold_ns,
@@ -866,6 +882,7 @@ impl ReceiverThread {
         loss_report: Arc<LossReportFile>,
         counters: CounterManager,
         mtu_length: usize,
+        io_vector_capacity: usize,
         status_message_timeout_ns: i64,
         initial_window_length: i32,
         cycle_threshold_ns: i64,
@@ -893,7 +910,13 @@ impl ReceiverThread {
             images: Vec::new(),
             pending_setups: Vec::new(),
             pending_resolutions: Vec::new(),
-            buffers: (0..RECEIVE_SLOTS).map(|_| vec![0u8; mtu_length]).collect(),
+            // `receiver->recv_buffers.vector_capacity`
+            // (`aeron_driver_receiver.c:47`), which is also the `vlen` its poll
+            // reads with (`:127`) — so this is the one setting that decides how
+            // much of a burst one turn takes.
+            buffers: (0..io_vector_capacity.max(RECEIVE_SLOTS_DEFAULT))
+                .map(|_| vec![0u8; mtu_length])
+                .collect(),
             datagrams: Datagrams::new(),
             poller: crate::media::poller::TransportPoller::new(),
             readable: Vec::new(),
@@ -1278,8 +1301,14 @@ impl ReceiverThread {
     /// The work of one pass (`aeron_driver_receiver_do_work`'s second half,
     /// `aeron-driver/src/main/c/aeron_driver_receiver.c:130-260`).
     fn do_receive(&mut self) -> usize {
-        let cnc = Arc::clone(&self.cnc);
-        let Some(regions) = cnc.counter_regions() else {
+        // The regions borrow `self.cnc` — one field — and every call below
+        // borrows other fields, so the split this wants is one the borrow
+        // checker already makes: it was only the `&mut self` calls that forced
+        // a clone, and both are field-scoped now. Cloning the `Arc` instead put
+        // two atomic read-modify-writes on a pass on a refcount line the sender
+        // thread writes too — 89 cycles a pass in the receiver and 238 in the
+        // sender, measured in `b1-out/r10-on-main/arc-pair/prereg.md`.
+        let Some(regions) = self.cnc.counter_regions() else {
             return 0;
         };
         let system = System::new(&self.counters, &regions);
@@ -1304,7 +1333,19 @@ impl ReceiverThread {
         let mut work = Self::receive_datagrams(
             &mut self.endpoints,
             &mut self.images,
-            &mut self.buffers,
+            // One datagram per destination per pass, which is the reference's
+            // **Java** shape: its poller reads each transport once into a
+            // preallocated buffer (`media/DataTransportPoller.java:222-225`),
+            // where the C driver reads `recv_buffers.vector_capacity` at a
+            // time (`aeron_driver_receiver.c:127`). The pool below is still
+            // sized by `aeron.receiver.io.vector.capacity`, as both references
+            // size theirs; only the first entry is ever filled.
+            //
+            // What keeps a burst from being paced by this is that a pass reads
+            // *every* ready destination, so the drain rate is the pass rate
+            // times the destination count — 676,000 a second at 501K against
+            // the 500,000 arriving.
+            &mut self.buffers[..DATAGRAMS_PER_POLL],
             &mut self.datagrams,
             &mut self.poller,
             &mut self.readable,
@@ -1315,7 +1356,6 @@ impl ReceiverThread {
             &self.counters,
             &regions,
             &self.events,
-            &cnc,
             now_ns,
         );
 
@@ -1347,7 +1387,13 @@ impl ReceiverThread {
                 &self.events,
                 now_ns,
             );
-            work += self.run_time_events(&regions, now_ns);
+            work += Self::run_time_events(
+                &mut self.images,
+                &self.counters,
+                &self.events,
+                &regions,
+                now_ns,
+            );
             self.image_maintenance.ran(now_ns);
         }
 
@@ -1356,6 +1402,7 @@ impl ReceiverThread {
             &regions,
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
+            now_ns,
         );
 
         work + re_resolved
@@ -1463,10 +1510,8 @@ impl ReceiverThread {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         events: &Outbox<ReceiverEvent>,
-        cnc: &Arc<CncFile>,
         now_ns: i64,
     ) -> usize {
-        let _ = cnc;
         let mut work = 0;
 
         // Which destinations have something to read this pass (G4-3). At or
@@ -2053,14 +2098,23 @@ impl ReceiverThread {
     }
 
     /// The image lifecycle, once per pass.
-    fn run_time_events(&mut self, regions: &CounterRegions<'_>, now_ns: i64) -> usize {
+    ///
+    /// Fields rather than `&mut self`, so that the caller can hold the counter
+    /// regions — which borrow `self.cnc` — across it ([`Self::do_receive`]).
+    fn run_time_events(
+        images: &mut [PublicationImage],
+        counters: &CounterManager,
+        events: &Outbox<ReceiverEvent>,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> usize {
         let mut work = 0;
         let mut done = Vec::new();
 
         let mut lingering = Vec::new();
 
-        for image in self.images.iter_mut() {
-            if image.on_time_event(&self.counters, regions, now_ns) {
+        for image in images.iter_mut() {
+            if image.on_time_event(counters, regions, now_ns) {
                 work += 1;
             }
 
@@ -2074,30 +2128,35 @@ impl ReceiverThread {
         }
 
         for registration_id in lingering {
-            let _ = self
-                .events
-                .send(ReceiverEvent::ImageLingering { registration_id });
+            let _ = events.send(ReceiverEvent::ImageLingering { registration_id });
             work += 1;
         }
 
         for registration_id in done {
-            let _ = self
-                .events
-                .send(ReceiverEvent::ImageDone { registration_id });
+            let _ = events.send(ReceiverEvent::ImageDone { registration_id });
         }
 
         work
     }
 
-    /// The cycle-time counters, which are 30 and 31
-    /// (`aeron_driver_receiver.c:262-276`).
+    /// The cycle-time counters, which are 30 and 31 — the receiver's
+    /// duty-cycle stall tracker in the reference, whose two counter addresses
+    /// the conductor binds once at startup (`aeron_driver_conductor.c:839-842`)
+    /// and which `aeron_duty_cycle_tracker.h:50-61` reads and writes.
+    ///
+    /// `now_ns` is the pass's own reading, taken once at the top of
+    /// `do_receive`, rather than a second one taken here. The reference reads
+    /// the clock once (`aeron_driver_receiver.c:145`) and hands that same
+    /// instant to its tracker (`:150`), so the counters and the work they
+    /// describe are stamped from one reading — which is also what the sender
+    /// and the conductor do with theirs.
     fn track_cycle(
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
+        now_ns: i64,
     ) {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 
@@ -2171,6 +2230,7 @@ mod tests {
             deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN,
             1_000,
             1408,
+            crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT,
             crate::publication_image::STATUS_MESSAGE_TIMEOUT_NS,
             128 * 1024,
             100_000_000,

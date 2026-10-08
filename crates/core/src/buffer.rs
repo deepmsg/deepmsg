@@ -223,6 +223,11 @@ impl<'a, Access> AtomicBuffer<'a, Access> {
 
     /// The 8-byte slot at `offset`, or `None` if it is out of bounds or not
     /// 8-byte aligned.
+    ///
+    /// `#[inline]` for the same reason as the accessors below it: the driver is
+    /// built without LTO, and this is the function whose two checks stand
+    /// between a counter read and its load (`b1-out/countercost/`).
+    #[inline]
     fn slot_i64(&self, offset: usize) -> Option<&AtomicI64> {
         if 0 != offset % 8 {
             return None;
@@ -273,11 +278,13 @@ impl<'a, Access> AtomicBuffer<'a, Access> {
     }
 
     /// Load an 8-byte field the reference reads under `AERON_GET_ACQUIRE`.
+    #[inline]
     pub fn load_i64_acquire(&self, offset: usize) -> Option<i64> {
         Some(self.slot_i64(offset)?.load(Ordering::Acquire))
     }
 
     /// Load an 8-byte field the reference reads plainly.
+    #[inline]
     pub fn load_i64_relaxed(&self, offset: usize) -> Option<i64> {
         Some(self.slot_i64(offset)?.load(Ordering::Relaxed))
     }
@@ -397,6 +404,7 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     }
 
     /// Store an 8-byte field with no ordering of its own.
+    #[inline]
     pub fn store_i64_relaxed(&self, offset: usize, value: i64) -> Option<()> {
         self.slot_i64(offset)?.store(value, Ordering::Relaxed);
         Some(())
@@ -409,6 +417,7 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     }
 
     /// Store an 8-byte field under `AERON_SET_RELEASE`.
+    #[inline]
     pub fn store_i64_release(&self, offset: usize, value: i64) -> Option<()> {
         self.slot_i64(offset)?.store(value, Ordering::Release);
         Some(())

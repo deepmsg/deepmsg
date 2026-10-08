@@ -42,8 +42,8 @@ use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::ipc_publications::IpcPublications;
 use crate::ipc_subscriptions::IpcSubscriptions;
+use crate::network_publications::NetworkPublications;
 use crate::receiver::ReceiverProxy;
-use crate::sender::SenderProxy;
 use crate::system_counters;
 
 /// Where a driver→client event goes.
@@ -389,10 +389,10 @@ impl Clients {
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
+        network_publications: &mut NetworkPublications,
         subscriptions: &mut IpcSubscriptions,
         endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
-        sender: &SenderProxy,
     ) -> usize {
         let mut reaped = 0;
         let mut index = self.records.len();
@@ -411,10 +411,10 @@ impl Clients {
                 regions,
                 events,
                 publications,
+                network_publications,
                 subscriptions,
                 endpoints,
                 receiver,
-                sender,
             );
             self.records.swap_remove(index);
             reaped += 1;
@@ -456,10 +456,10 @@ impl Clients {
         regions: &CounterRegions<'_>,
         events: &mut impl ClientEvents,
         publications: &mut IpcPublications,
+        network_publications: &mut NetworkPublications,
         subscriptions: &mut IpcSubscriptions,
         endpoints: &mut crate::receive_endpoints::ReceiveChannelEndpoints,
         receiver: Option<&ReceiverProxy>,
-        sender: &SenderProxy,
     ) {
         let record = &mut self.records[index];
 
@@ -479,9 +479,9 @@ impl Clients {
             manager,
             regions,
             publications,
+            network_publications,
             endpoints,
             receiver,
-            sender,
             now_ms,
         );
 
@@ -530,13 +530,24 @@ mod tests {
     /// The agent is the driver's — the conductor owns it — so these tests start
     /// one and keep it alive for the manager's lifetime, which is what the
     /// conductor does too.
-    fn managers() -> (NativeResourceAgent, IpcPublications, IpcSubscriptions) {
+    fn managers() -> (
+        NativeResourceAgent,
+        IpcPublications,
+        NetworkPublications,
+        IpcSubscriptions,
+    ) {
         let agent = NativeResourceAgent::start(StorageChecks::new(false, 0, PathBuf::new()))
             .expect("an agent thread");
 
         let publications = IpcPublications::start(-1, 1000, agent.handle());
+        let network_publications = NetworkPublications::start(-1, 1000, agent.handle());
 
-        (agent, publications, IpcSubscriptions::new())
+        (
+            agent,
+            publications,
+            network_publications,
+            IpcSubscriptions::new(),
+        )
     }
 
     /// A recording sink: the events, in the order they were raised.
@@ -750,7 +761,7 @@ mod tests {
     fn a_silent_client_is_reaped_and_announced_in_the_references_order() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (_agent, mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -782,10 +793,10 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
+                &mut network_publications,
                 &mut subscriptions,
                 &mut endpoints,
                 None,
-                &SenderProxy::disconnected()
             )
         );
         assert_eq!(
@@ -809,7 +820,7 @@ mod tests {
         let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (_agent, mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -827,10 +838,10 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
+                &mut network_publications,
                 &mut subscriptions,
                 &mut endpoints,
                 None,
-                &SenderProxy::disconnected()
             ),
             "a zeroed heartbeat expires on the next tick, without a timeout"
         );
@@ -845,7 +856,7 @@ mod tests {
     fn a_clients_counters_go_before_its_heartbeat() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (_agent, mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
         clients
@@ -877,10 +888,10 @@ mod tests {
             &regions,
             &mut events,
             &mut publications,
+            &mut network_publications,
             &mut subscriptions,
             &mut endpoints,
             None,
-            &SenderProxy::disconnected(),
         );
 
         assert_eq!(
@@ -905,7 +916,7 @@ mod tests {
         // record and its counters for the driver's whole life.
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (_agent, mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -929,10 +940,10 @@ mod tests {
                 &regions,
                 &mut events,
                 &mut publications,
+                &mut network_publications,
                 &mut subscriptions,
                 &mut endpoints,
                 None,
-                &SenderProxy::disconnected()
             )
         );
         assert!(clients.is_empty());
@@ -948,7 +959,7 @@ mod tests {
         // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let (_agent, mut publications, mut subscriptions) = managers();
+        let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
         let mut clients = Clients::new();
         let mut events = Events::default();
 
@@ -988,10 +999,10 @@ mod tests {
             &regions,
             &mut events,
             &mut publications,
+            &mut network_publications,
             &mut subscriptions,
             &mut endpoints,
             None,
-            &SenderProxy::disconnected(),
         );
         assert!(
             events

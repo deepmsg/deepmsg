@@ -764,6 +764,30 @@ and `::a_pass_that_sent_nothing_reads_and_does_not_count` — and the flow
 control the poll exists for — status messages, NAKs, error frames — is the
 interop suite's, which runs against this sender on every CI run.
 
+`aeron.receiver.io.vector.capacity` and `aeron.sender.io.vector.capacity` are
+read, which they were not: this driver answered sixteen to both whatever the
+configuration said, because each side carried its own `const RECEIVE_SLOTS`.
+The reference's defaults are four each (`aeron_driver_context.c:240-241`,
+`:523-524`) and both are clamped to `1..=AERON_DRIVER_{RECEIVER,SENDER}_IO_VECTOR_LENGTH_MAX`,
+sixteen (`aeron_driver_context.h:55`, `:59`; `aeron_driver_context.c:3348-3371`).
+The receiver's capacity **is** the `vlen` its poll reads with — it is what
+`aeron_driver_receiver.c:47` stores and `:127` passes. The sender's is not:
+`aeron_driver_sender.c:154` builds a `struct mmsghdr mmsghdr[1]` and `:170`
+hands the poller `vlen = 1`, so the reference's sender is always on
+`aeron_udp_channel_transport_recvmsg` rather than `..._recvmmsg`
+(`media/aeron_udp_channel_transport.c:551-554`) however many buffers the
+capacity sized for it — the capacity sizes a pool whose first entry is the only
+one a poll fills, and a datagram that arrives while another is being dispatched
+waits one pass for the next poll.
+
+The names are pinned by
+`crates/driver/src/config.rs::tests::the_two_io_vector_capacities_answer_to_the_references_names`
+and `::the_settings_named_after_an_environment_variable_answer_to_their_property`;
+the one-datagram control read by
+`crates/driver/src/sys/socket.rs::tests::a_batch_of_one_takes_one_datagram_however_many_are_queued`.
+Both are bounded settings like the rest, so the reference clamps and this
+refuses (`1..=16`), which is the divergence recorded above.
+
 One divergence remains, and it is in the configuration rather than the sender:
 the reference parses `1..=INT32_MAX` and then casts through a `uint8_t`, so
 `256` arrives as *zero* reads between passes, and `0` is out of its own range
