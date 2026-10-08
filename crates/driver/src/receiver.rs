@@ -1301,8 +1301,14 @@ impl ReceiverThread {
     /// The work of one pass (`aeron_driver_receiver_do_work`'s second half,
     /// `aeron-driver/src/main/c/aeron_driver_receiver.c:130-260`).
     fn do_receive(&mut self) -> usize {
-        let cnc = Arc::clone(&self.cnc);
-        let Some(regions) = cnc.counter_regions() else {
+        // The regions borrow `self.cnc` — one field — and every call below
+        // borrows other fields, so the split this wants is one the borrow
+        // checker already makes: it was only the `&mut self` calls that forced
+        // a clone, and both are field-scoped now. Cloning the `Arc` instead put
+        // two atomic read-modify-writes on a pass on a refcount line the sender
+        // thread writes too — 89 cycles a pass in the receiver and 238 in the
+        // sender, measured in `b1-out/r10-on-main/arc-pair/prereg.md`.
+        let Some(regions) = self.cnc.counter_regions() else {
             return 0;
         };
         let system = System::new(&self.counters, &regions);
@@ -1350,7 +1356,6 @@ impl ReceiverThread {
             &self.counters,
             &regions,
             &self.events,
-            &cnc,
             now_ns,
         );
 
@@ -1382,7 +1387,13 @@ impl ReceiverThread {
                 &self.events,
                 now_ns,
             );
-            work += self.run_time_events(&regions, now_ns);
+            work += Self::run_time_events(
+                &mut self.images,
+                &self.counters,
+                &self.events,
+                &regions,
+                now_ns,
+            );
             self.image_maintenance.ran(now_ns);
         }
 
@@ -1499,10 +1510,8 @@ impl ReceiverThread {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         events: &Outbox<ReceiverEvent>,
-        cnc: &Arc<CncFile>,
         now_ns: i64,
     ) -> usize {
-        let _ = cnc;
         let mut work = 0;
 
         // Which destinations have something to read this pass (G4-3). At or
@@ -2089,14 +2098,23 @@ impl ReceiverThread {
     }
 
     /// The image lifecycle, once per pass.
-    fn run_time_events(&mut self, regions: &CounterRegions<'_>, now_ns: i64) -> usize {
+    ///
+    /// Fields rather than `&mut self`, so that the caller can hold the counter
+    /// regions — which borrow `self.cnc` — across it ([`Self::do_receive`]).
+    fn run_time_events(
+        images: &mut [PublicationImage],
+        counters: &CounterManager,
+        events: &Outbox<ReceiverEvent>,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) -> usize {
         let mut work = 0;
         let mut done = Vec::new();
 
         let mut lingering = Vec::new();
 
-        for image in self.images.iter_mut() {
-            if image.on_time_event(&self.counters, regions, now_ns) {
+        for image in images.iter_mut() {
+            if image.on_time_event(counters, regions, now_ns) {
                 work += 1;
             }
 
@@ -2110,16 +2128,12 @@ impl ReceiverThread {
         }
 
         for registration_id in lingering {
-            let _ = self
-                .events
-                .send(ReceiverEvent::ImageLingering { registration_id });
+            let _ = events.send(ReceiverEvent::ImageLingering { registration_id });
             work += 1;
         }
 
         for registration_id in done {
-            let _ = self
-                .events
-                .send(ReceiverEvent::ImageDone { registration_id });
+            let _ = events.send(ReceiverEvent::ImageDone { registration_id });
         }
 
         work

@@ -795,11 +795,13 @@ impl SenderThread {
     /// are visibly disjoint — which is what the borrow checker asks for, and
     /// what makes it obvious that this pass touches nothing else.
     fn do_send(&mut self) -> usize {
-        // The Arc is cloned rather than borrowed so that the regions' borrow is
-        // of this local: a region view holds the mapping, and holding `self`
-        // borrowed for its lifetime would forbid every mutation below.
-        let cnc = Arc::clone(&self.cnc);
-        let Some(regions) = cnc.counter_regions() else {
+        // The regions borrow `self.cnc` — one field — and every call below
+        // borrows other fields. The `&mut self` call that used to force a clone
+        // is field-scoped now; cloning the `Arc` instead put two atomic
+        // read-modify-writes a pass on a refcount line the receiver thread
+        // writes too — 238 cycles a pass here and 89 there, measured in
+        // `b1-out/r10-on-main/arc-pair/prereg.md`.
+        let Some(regions) = self.cnc.counter_regions() else {
             return 0;
         };
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
@@ -829,7 +831,12 @@ impl SenderThread {
         let maintenance_due = self.maintenance.is_due(now_ns);
 
         if maintenance_due {
-            self.check_for_blocked_publishers(&regions, now_ns);
+            Self::check_for_blocked_publishers(
+                &mut self.publications,
+                &self.counters,
+                &regions,
+                now_ns,
+            );
             self.maintenance.ran(now_ns);
         }
 
@@ -979,10 +986,15 @@ impl SenderThread {
     /// (`network_publications.rs`), not the log buffer itself. What the
     /// difference amounts to is how soon a deadline is noticed, not which
     /// transitions happen.
-    fn check_for_blocked_publishers(&mut self, regions: &CounterRegions<'_>, now_ns: i64) {
-        let counters = &self.counters;
-
-        for publication in &mut self.publications {
+    /// Fields rather than `&mut self`, so that the caller can hold the counter
+    /// regions — which borrow `self.cnc` — across it ([`Self::do_send`]).
+    fn check_for_blocked_publishers(
+        publications: &mut [NetworkPublication],
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ns: i64,
+    ) {
+        for publication in publications.iter_mut() {
             let sender_position = counters
                 .value(regions, publication.counters.snd_pos)
                 .unwrap_or(0);
