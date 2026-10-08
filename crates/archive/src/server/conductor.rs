@@ -91,16 +91,28 @@
 //! replay-token sweep (`:389-395`). Those belong to the sessions that use
 //! them, and none of them exist yet — the recording and replay sessions are
 //! their own slices. What is here is the control plane: connect, authenticate,
-//! answer, and count.
+//! answer, count, and remember what it has been asked to record.
+//!
+//! That last part is the whole of what a start does so far. It is not a
+//! half-finished start: the reference's own start registers a subscription and
+//! answers, and what makes it a *recording* is an image arriving later
+//! (`startRecordingSession`, `:1991-2057`) — the piece this build is missing.
+//! So a start here answers with a registration id for a subscription the driver
+//! has really made, and nothing records on it yet.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
+use deepmsg_client::client::{
+    AsyncAdd, AsyncAddPoll, AsyncRemove, Client, DEFAULT_TIMEOUT, RemovePoll,
+};
 use deepmsg_client::image::Image;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_cnc::file::CncFile;
+use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_core::buffer::ReadWrite;
+use deepmsg_core::pal::usable_space;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
 
@@ -111,7 +123,7 @@ use crate::server::auth::{
 };
 use crate::server::config::ArchiveConfig;
 use crate::server::control_adapter::{
-    ConnectRequest, ControlAdapter, ControlError, ControlPlane, ImageId,
+    ConnectRequest, ControlAdapter, ControlError, ControlPlane, ImageId, StartRecordingRequest,
 };
 use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
@@ -263,6 +275,39 @@ fn mtu_length(uri: &ChannelUri, defaults: &ResponseChannelDefaults) -> Option<i3
         Some(value) => parse_size(value).or(defaults.mtu_length),
         None => defaults.mtu_length,
     }
+}
+
+/// `ArchiveConductor.makeKey` (`ArchiveConductor.java:1909-1948`): what an
+/// archive remembers a recording request by.
+///
+/// It is a **process-local map key**. It never reaches the wire and never
+/// reaches the catalog, so no byte contract rests on it — what rests on it is
+/// whether two starts are the same recording, and that is decided by five
+/// parameters in this order, each followed by a `|`.
+///
+/// The last line is the one worth reading twice: the reference strikes the last
+/// character off **unconditionally** (`sb.setLength(sb.length() - 1)`), so with
+/// all five absent it is the `?` that goes, not a separator. Two channels that
+/// differ only in a parameter this key does not carry are one recording.
+fn make_key(stream_id: i32, uri: &ChannelUri) -> String {
+    // `CommonContext`'s own names for the five, in the order the reference
+    // appends them (`:1913-1943`).
+    const PARAMETERS: [&str; 5] = ["endpoint", "interface", "control", "session-id", "tags"];
+
+    let mut key = format!("{stream_id}:{}?", uri.media());
+
+    for parameter in PARAMETERS {
+        if let Some(value) = uri.get(parameter) {
+            key.push_str(parameter);
+            key.push('=');
+            key.push_str(value);
+            key.push('|');
+        }
+    }
+
+    key.truncate(key.len() - 1);
+
+    key
 }
 
 /// Copy a parameter's text into the matching field, if the channel carries it.
@@ -457,6 +502,9 @@ enum Deferred {
         correlation_id: i64,
         recording_id: i64,
     },
+    /// A request that has to move something (`ArchiveConductor.java:562`,
+    /// `:1766-1780`) — see [`Action`].
+    Action(Action),
 }
 
 /// A question about a recording that the catalog can answer.
@@ -621,11 +669,126 @@ pub const ACTIVE_LISTING: i64 = 1;
 /// (`ArchiveConductor.java:692`).
 pub const ACTIVE_LISTING_MSG: &str = "active listing already in progress";
 
+/// `ArchiveException.MAX_RECORDINGS` (`client/ArchiveException.java:69`), the
+/// refusal a start gets while too many recordings are in flight
+/// (`ArchiveConductor.java:538-543`).
+pub const MAX_RECORDINGS: i64 = 8;
+
+/// `ArchiveException.ACTIVE_SUBSCRIPTION` (`:44`), the refusal a second start
+/// on one channel and stream gets (`ArchiveConductor.java:574-577`).
+pub const ACTIVE_SUBSCRIPTION: i64 = 3;
+
+/// `ArchiveException.UNKNOWN_SUBSCRIPTION` (`:49`), the refusal a stop gets for
+/// a subscription id no recording was registered under
+/// (`ArchiveConductor.java:621-622`).
+pub const UNKNOWN_SUBSCRIPTION: i64 = 4;
+
+/// `ArchiveException.STORAGE_SPACE` (`:84`), the refusal a start gets when the
+/// archive's filesystem is below the configured threshold
+/// (`ArchiveConductor.java:2597-2617`).
+pub const STORAGE_SPACE: i64 = 11;
+
+/// `CommonContext.SPY_PREFIX` (`CommonContext.java:246`): the channel prefix a
+/// **local** UDP publication is recorded through, because a driver's own
+/// publication is not a network one and a spy link is what carries it to a
+/// subscriber (`ArchiveConductor.java:559-560`).
+pub const SPY_PREFIX: &str = "aeron-spy:";
+
+/// `CommonContext.UDP_MEDIA`, which `ChannelUri.isUdp` compares the media
+/// against (`ChannelUri.java:152-155`) — the test that decides whether a local
+/// publication is a spy's or a network subscription's.
+const UDP_MEDIA: &str = "udp";
+
 /// `ArchiveException.buildUnknownRecordingErrorMsg` (`:272-275`), which is the
 /// **message** half of that same line and has to match it word for word.
 #[must_use]
 pub fn unknown_recording_message(recording_id: i64) -> String {
     format!("unknown recording id: {recording_id}")
+}
+
+/// What an archive was configured to record with
+/// (`Archive.Context.maxConcurrentRecordings` and
+/// `lowStorageSpaceThreshold`, `Archive.java:429-438`, `:342-350`).
+///
+/// One argument to [`Sessions::new`] rather than three, and the same shape
+/// [`ResponseChannelDefaults`] has for the control settings: what the archive
+/// was configured with, as the requests that use it see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingSettings {
+    /// How many recordings may be in flight at once
+    /// (`aeron.archive.max.concurrent.recordings`, default 20).
+    pub max_concurrent_recordings: usize,
+    /// The free space below which a start is refused
+    /// (`aeron.archive.low.storage.space.threshold`), in bytes.
+    pub low_storage_space_threshold: u64,
+    /// The directory whose filesystem the threshold is about
+    /// (`ctx.archiveFileStore()`, `:2602`): the archive's own, which is where
+    /// the segments will be written.
+    pub archive_dir: PathBuf,
+}
+
+/// A request that **moves a resource** rather than answering about one.
+///
+/// The second kind of thing a callback defers, after the messages and the
+/// questions, and the same reason: the reference's `startRecording` calls
+/// `aeron.addSubscription` and its stop calls `subscription.close()`
+/// (`ArchiveConductor.java:562`, `:1766-1780`), and both need the client a
+/// callback is running without.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    /// `ArchiveConductor.startRecording` (`:530-583`), all of it but the
+    /// answer, which waits for the driver.
+    StartRecording(StartRecordingRequest),
+    /// `ArchiveConductor.stopRecordingSubscription` (`:612-624`).
+    StopRecordingSubscription {
+        session_id: i64,
+        correlation_id: i64,
+        subscription_id: i64,
+    },
+}
+
+/// What a start is going to do, once the four checks in front of it have run
+/// (`ArchiveConductor.java:538-577`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartDecision {
+    /// Add a subscription on `channel`, and remember it under `key`.
+    Add {
+        /// The `makeKey` the recording is registered by (`:553`).
+        key: String,
+        /// The channel to subscribe on: the stripped one, with the spy prefix
+        /// when the publication is local to this driver (`:558-560`).
+        channel: String,
+    },
+    /// Answer the client with this refusal instead
+    /// (`ControlSession.sendErrorResponse`).
+    Refuse {
+        /// The relevant id the refusal carries, which is one of
+        /// [`MAX_RECORDINGS`], [`STORAGE_SPACE`], [`ACTIVE_SUBSCRIPTION`] or
+        /// the generic zero (`client/ArchiveException.java:29`).
+        relevant_id: i64,
+        /// The refusal's words.
+        message: String,
+    },
+}
+
+/// A start whose subscription the driver has not answered yet.
+///
+/// The reference's `aeron.addSubscription` **waits** and answers with the
+/// `Subscription` in the same call (`ArchiveConductor.java:562-565`), because
+/// the reference drives the driver's conductor from inside its own turn
+/// (`invokeDriverConductor`, `:392`). This build's launcher owns that loop, so
+/// the command goes out on one turn and the answer is read on a later one —
+/// which is the two steps the counters and the control publications already
+/// take, and the answer the client gets is still the registration id the
+/// `ADD_SUBSCRIPTION` drew (`:570`).
+struct PendingStartRecording {
+    session_id: i64,
+    correlation_id: i64,
+    /// The `makeKey` the start was accepted under, which is what the registry
+    /// is filed by (`:567`).
+    key: String,
+    /// The registration id the add drew — the id the start will answer with.
+    registration_id: i64,
 }
 
 /// A connect request whose session has not been made yet.
@@ -777,6 +940,29 @@ pub struct Sessions {
     pending_connects: Vec<PendingConnect>,
     /// Responses the callbacks owed and could not send.
     pending: Vec<Deferred>,
+    /// `recordingSubscriptionByKeyMap` (`ArchiveConductor.java:152`): what this
+    /// archive has been asked to record, by the key [`make_key`] builds.
+    ///
+    /// A key and the id it was registered under, where the reference holds a
+    /// `Subscription` — the object is the client's here, and the id is what a
+    /// stop names and what a start answers with (`:570`).
+    recording_subscriptions: HashMap<String, i64>,
+    /// `subscriptionRefCountMap` (`:151`): how many things hold each recording
+    /// subscription, which is what decides when it is given back
+    /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1780`).
+    subscription_ref_counts: HashMap<i64, i64>,
+    /// `numActiveRecordings` (`:139`): how many starts have been accepted,
+    /// which is what [`RecordingSettings::max_concurrent_recordings`] bounds
+    /// (`:538-543`).
+    num_active_recordings: usize,
+    /// The settings those requests are answered from.
+    recording: RecordingSettings,
+    /// Starts whose `ADD_SUBSCRIPTION` has gone out and not been answered.
+    pending_starts: Vec<PendingStartRecording>,
+    /// Removals sent and not answered (`Client::remove_subscription_poll` is
+    /// what collects them, and what takes the subscription out of the client).
+    pending_removals: Vec<AsyncRemove>,
+
     /// Descriptors on their way out, one per listing request that is still
     /// being served (`SessionWorker.sessions`, `SessionWorker.java:23`).
     ///
@@ -813,6 +999,7 @@ impl Sessions {
         liveness_check_interval_ms: i64,
         command_timeout: Duration,
         response_channel_defaults: ResponseChannelDefaults,
+        recording: RecordingSettings,
         subscription_ids: Vec<i64>,
     ) -> Self {
         Self {
@@ -822,10 +1009,16 @@ impl Sessions {
             liveness_check_interval_ms,
             command_timeout,
             response_channel_defaults,
+            recording,
             subscription_ids,
             sessions: HashMap::new(),
             pending_connects: Vec::new(),
             pending: Vec::new(),
+            recording_subscriptions: HashMap::new(),
+            subscription_ref_counts: HashMap::new(),
+            num_active_recordings: 0,
+            pending_starts: Vec::new(),
+            pending_removals: Vec::new(),
             listings: Vec::new(),
             ended: Vec::new(),
             session_count_delta: 0,
@@ -883,11 +1076,375 @@ impl Sessions {
         now_ms: i64,
     ) {
         self.allocate_session_counter(client, counters);
+        self.claim_pending_starts(client, now_ms);
+        self.collect_pending_removals(client);
         self.run_pending_connects(client, authenticator, now_ms);
         self.run_deferred(client, authenticator, catalog, now_ms);
         self.drive_listings(client, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
+    }
+
+    /// Carry out what the callbacks could not (`ArchiveConductor.java:562`,
+    /// `:1766-1780`).
+    fn run_action(&mut self, client: &mut Client, action: Action, now_ms: i64) {
+        match action {
+            Action::StartRecording(request) => self.start_recording(client, &request, now_ms),
+            Action::StopRecordingSubscription {
+                session_id,
+                correlation_id,
+                subscription_id,
+            } => self.stop_recording_subscription(
+                client,
+                session_id,
+                correlation_id,
+                subscription_id,
+                now_ms,
+            ),
+        }
+    }
+
+    /// `ArchiveConductor.startRecording` (`ArchiveConductor.java:530-583`), with
+    /// the reference's nine steps in its order and two of them split across
+    /// turns: the add, and the answer it draws ([`PendingStartRecording`]).
+    ///
+    /// The two checks that refuse before anything is registered are the
+    /// reference's, in its order: the concurrent-recording bound (`:538-543`)
+    /// and the filesystem's free space (`:545-548`).
+    ///
+    /// The reference wraps the rest in a `try` whose `catch` answers the client
+    /// with the exception's message (`:578-582`). The one failure this build can
+    /// meet there is a channel that will not parse, and it is answered the same
+    /// way — with this build's words for it rather than the JDK's, which is the
+    /// one thing about that refusal that is not the reference's.
+    fn start_recording(
+        &mut self,
+        client: &mut Client,
+        request: &StartRecordingRequest,
+        now_ms: i64,
+    ) {
+        // `auto_stop` is carried and deliberately not read here: it is read when
+        // the recording session ends, and the session is what the recorder
+        // brings (`ArchiveConductor.java:2044`).
+        let (key, channel) = match self.decide_start(
+            request.stream_id,
+            request.source_location,
+            &request.original_channel,
+        ) {
+            StartDecision::Add { key, channel } => (key, channel),
+            StartDecision::Refuse {
+                relevant_id,
+                message,
+            } => {
+                self.send_error(
+                    client,
+                    request.session_id,
+                    request.correlation_id,
+                    relevant_id,
+                    &message,
+                    now_ms,
+                );
+                return;
+            }
+        };
+
+        match client.async_add_subscription(&channel, request.stream_id, self.command_timeout) {
+            Ok(add) => self.pending_starts.push(PendingStartRecording {
+                session_id: request.session_id,
+                correlation_id: request.correlation_id,
+                key,
+                registration_id: add.registration_id(),
+            }),
+            Err(error) => self.send_error(
+                client,
+                request.session_id,
+                request.correlation_id,
+                0,
+                &format!("subscription could not be added: {error}"),
+                now_ms,
+            ),
+        }
+    }
+
+    /// Everything `startRecording` decides before the driver is asked
+    /// (`ArchiveConductor.java:538-577`).
+    ///
+    /// Split out for the same reason [`Sessions::start_listing`] is: the
+    /// decisions are what can be wrong, and they are four refusals and one
+    /// channel — none of which needs the client that the add does.
+    fn decide_start(
+        &self,
+        stream_id: i32,
+        source_location: SourceLocation,
+        original_channel: &str,
+    ) -> StartDecision {
+        let maximum = self.recording.max_concurrent_recordings;
+        if self.num_active_recordings >= maximum {
+            return StartDecision::Refuse {
+                relevant_id: MAX_RECORDINGS,
+                message: format!("max concurrent recordings reached {maximum}"),
+            };
+        }
+
+        if let Some(message) = self.is_low_storage_space() {
+            return StartDecision::Refuse {
+                relevant_id: STORAGE_SPACE,
+                message,
+            };
+        }
+
+        // The reference's `catch` around the whole of the rest answers the
+        // client with the exception's message (`:578-582`). The one failure
+        // this build can meet there is a channel that will not parse, and its
+        // relevant id is the zero the one-argument `sendErrorResponse` writes
+        // (`ControlSession.java:692-695`).
+        //
+        // The message is this build's parser's where the reference's is the
+        // JDK's — `ChannelUri.parse` throwing is the whole of that answer, and
+        // no test in the C suite reaches it, because a start with a channel
+        // that will not read is a client that could not have published on it
+        // either.
+        let Ok(uri) = ChannelUri::parse(original_channel) else {
+            return StartDecision::Refuse {
+                relevant_id: 0,
+                message: format!("{original_channel} is not a channel"),
+            };
+        };
+
+        let key = make_key(stream_id, &uri);
+        if self.recording_subscriptions.contains_key(&key) {
+            return StartDecision::Refuse {
+                relevant_id: ACTIVE_SUBSCRIPTION,
+                message: format!(
+                    "recording exists for streamId={stream_id} channel={original_channel}"
+                ),
+            };
+        }
+
+        // `strippedChannelBuilder(uri).build()` — the same builder the control
+        // response channel goes through, with none of the three control
+        // settings written back over it (`:558` against `:471-474`).
+        let stripped_channel = stripped_channel_builder(&uri).build();
+
+        // A local publication in the same driver is not a network one: what
+        // carries it to a subscriber is a spy link (`:559-560`).
+        let channel = if source_location == SourceLocation::LOCAL && uri.media() == UDP_MEDIA {
+            format!("{SPY_PREFIX}{stripped_channel}")
+        } else {
+            stripped_channel
+        };
+
+        StartDecision::Add { key, channel }
+    }
+
+    /// The answer to the adds that have gone out
+    /// (`ArchiveConductor.java:567-570`, which is the same three writes one turn
+    /// earlier in the reference).
+    fn claim_pending_starts(&mut self, client: &mut Client, now_ms: i64) {
+        let mut index = 0;
+        while index < self.pending_starts.len() {
+            let start = &self.pending_starts[index];
+
+            match client.async_add_poll(AsyncAdd::subscription(start.registration_id)) {
+                AsyncAddPoll::Ready => {
+                    let start = self.pending_starts.swap_remove(index);
+
+                    self.recording_subscriptions
+                        .insert(start.key, start.registration_id);
+                    *self
+                        .subscription_ref_counts
+                        .entry(start.registration_id)
+                        .or_insert(0) += 1;
+                    self.num_active_recordings += 1;
+
+                    if let Some(entry) = self.sessions.get_mut(&start.session_id) {
+                        entry.control.send_ok_response(
+                            start.correlation_id,
+                            start.registration_id,
+                            now_ms,
+                            client,
+                        );
+                    }
+                }
+                AsyncAddPoll::Awaiting => index += 1,
+                // A refusal and a handle this client knows nothing about are the
+                // same answer to the client: the recording did not start, and
+                // the reference's `catch` says so in the driver's words.
+                AsyncAddPoll::Failed(error) => {
+                    let start = self.pending_starts.swap_remove(index);
+                    self.send_error(
+                        client,
+                        start.session_id,
+                        start.correlation_id,
+                        0,
+                        &format!("subscription could not be added: {error}"),
+                        now_ms,
+                    );
+                }
+                AsyncAddPoll::Unknown => {
+                    let start = self.pending_starts.swap_remove(index);
+                    self.send_error(
+                        client,
+                        start.session_id,
+                        start.correlation_id,
+                        0,
+                        "subscription add is no longer known",
+                        now_ms,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collect the answers to the removals that have gone out, which is what
+    /// takes the subscription out of the client's list.
+    ///
+    /// A removal that failed leaves the subscription in that list, which is why
+    /// the reference's own `close` cannot fail either: it ignores the answer.
+    /// Nothing here does anything about it — the driver's resource is what the
+    /// id names, and a client-side entry for a subscription the archive has
+    /// forgotten is not read by anything.
+    fn collect_pending_removals(&mut self, client: &mut Client) {
+        self.pending_removals.retain_mut(|remove| {
+            matches!(
+                client.remove_subscription_poll(*remove),
+                RemovePoll::Awaiting
+            )
+        });
+    }
+
+    /// `ArchiveConductor.stopRecordingSubscription` (`:612-624`).
+    fn stop_recording_subscription(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        subscription_id: i64,
+        now_ms: i64,
+    ) {
+        if self
+            .remove_recording_subscription(subscription_id)
+            .is_none()
+        {
+            self.send_error(
+                client,
+                session_id,
+                correlation_id,
+                UNKNOWN_SUBSCRIPTION,
+                &format!("no recording subscription found for subscriptionId={subscription_id}"),
+                now_ms,
+            );
+            return;
+        }
+
+        self.abort_recording_session_and_close_subscription(client, subscription_id);
+
+        // `sendOkResponse(correlationId)` — the one-argument form, whose
+        // relevant id is `GENERIC`, zero (`ControlSession.java:682-690`).
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry
+                .control
+                .send_ok_response(correlation_id, 0, now_ms, client);
+        }
+    }
+
+    /// `ArchiveConductor.removeRecordingSubscription` (`:2139-2153`): the
+    /// subscription is found by its **id** and taken out of the map by its key,
+    /// which is the only thing the map is keyed by.
+    ///
+    /// **`numActiveRecordings` does not move here.** The reference's field counts
+    /// live *recording sessions* — it goes up when a start is accepted (`:569`)
+    /// and down when a session closes (`:1361`), and a subscription stopped
+    /// while its recording is still running is a recording that has not ended
+    /// yet. So this slice, which has no recording sessions, has a count that can
+    /// only rise, and the movement down arrives with the recorder.
+    fn remove_recording_subscription(&mut self, subscription_id: i64) -> Option<String> {
+        let key = self
+            .recording_subscriptions
+            .iter()
+            .find(|(_, id)| **id == subscription_id)
+            .map(|(key, _)| key.clone())?;
+
+        self.recording_subscriptions.remove(&key);
+
+        Some(key)
+    }
+
+    /// `ArchiveConductor.abortRecordingSessionAndCloseSubscription`
+    /// (`:1766-1780`).
+    ///
+    /// The reference does three things: abort every recording session that holds
+    /// this subscription, take one off the refcount, and give the subscription
+    /// back when the count reaches zero. **There are no recording sessions yet**
+    /// — they arrive with the recorder — so the loop is what this slice leaves
+    /// out, and it is the whole of the difference.
+    fn abort_recording_session_and_close_subscription(
+        &mut self,
+        client: &mut Client,
+        subscription_id: i64,
+    ) {
+        let count = self
+            .subscription_ref_counts
+            .get_mut(&subscription_id)
+            .map(|count| {
+                *count -= 1;
+                *count
+            })
+            .unwrap_or(0);
+
+        if 0 != count {
+            return;
+        }
+
+        // The reference's `subscription.close()` waits for the driver on its own
+        // thread. This one cannot: the command is sent here and the answer is
+        // collected on a later turn (`Client::async_remove_subscription`).
+        match client.async_remove_subscription(subscription_id, self.command_timeout) {
+            Ok(remove) => self.pending_removals.push(remove),
+            Err(error) => self.warnings.push(format!(
+                "recording subscription {subscription_id} could not be given back: {error}"
+            )),
+        }
+    }
+
+    /// `ArchiveConductor.isLowStorageSpace` (`:2597-2617`), which answers with
+    /// the message the refusal carries or `None` for "there is room".
+    ///
+    /// The check is against the **archive directory's** filesystem, and the
+    /// reference's `FileStore.getUsableSpace` failing is a rethrow that takes
+    /// the archive with it (`:2610-2613`). This build's port of the same
+    /// `statvfs` answers zero when it cannot ask, which is below any positive
+    /// threshold — so a filesystem that cannot be asked about refuses starts
+    /// rather than accepting them blind.
+    fn is_low_storage_space(&self) -> Option<String> {
+        let threshold = self.recording.low_storage_space_threshold;
+        let usable = usable_space(&self.recording.archive_dir);
+
+        if usable <= threshold {
+            return Some(format!(
+                "low storage threshold={threshold} <= usableSpace={usable}"
+            ));
+        }
+
+        None
+    }
+
+    /// Push an `ERROR` at a session, in the two answers that carry no client
+    /// words of their own.
+    fn send_error(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        relevant_id: i64,
+        message: &str,
+        now_ms: i64,
+    ) {
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry
+                .control
+                .send_error_response(correlation_id, relevant_id, message, now_ms, client);
+        }
     }
 
     /// Whether this session already has a listing in flight
@@ -1264,6 +1821,11 @@ impl Sessions {
                         }
                     }
                 }
+                // A request that moves a resource rather than answering about
+                // one — and the only kind that needs the client for something
+                // other than talking to the client (`ArchiveConductor.java:562`,
+                // `:1766-1780`).
+                Deferred::Action(action) => self.run_action(client, action, now_ms),
             }
         }
     }
@@ -1469,6 +2031,26 @@ impl ControlPlane for Sessions {
         });
     }
 
+    fn on_start_recording(&mut self, request: StartRecordingRequest, _now_ms: i64) {
+        self.pending
+            .push(Deferred::Action(Action::StartRecording(request)));
+    }
+
+    fn on_stop_recording_subscription(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        subscription_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::StopRecordingSubscription {
+                session_id,
+                correlation_id,
+                subscription_id,
+            }));
+    }
+
     fn send_error_response(
         &mut self,
         session_id: i64,
@@ -1569,6 +2151,15 @@ impl ArchiveConductor {
                 term_buffer_length: config.control_term_buffer_length as i32,
                 term_buffer_sparse: config.control_term_buffer_sparse,
                 mtu_length: config.control_mtu_length.map(|mtu| mtu as i32),
+            },
+            RecordingSettings {
+                // A negative setting is a bound nothing can be below, which is
+                // what the reference's own `>=` against a negative `int` says
+                // (`ArchiveConductor.java:538-543`).
+                max_concurrent_recordings: usize::try_from(config.max_concurrent_recordings)
+                    .unwrap_or(0),
+                low_storage_space_threshold: config.low_storage_space_threshold,
+                archive_dir: config.archive_dir.clone(),
             },
             subscription_ids,
         );
@@ -1881,6 +2472,251 @@ mod tests {
         );
     }
 
+    /// `makeKey` is the reference's own string, character for character —
+    /// including the last line, which strikes off the `?` when the channel
+    /// carries none of the five parameters (`ArchiveConductor.java:1945`).
+    #[test]
+    fn a_recording_key_is_the_references_string() {
+        let parsed = |channel: &str| ChannelUri::parse(channel).expect("a channel");
+
+        assert_eq!(
+            "33:ipc",
+            make_key(33, &parsed("aeron:ipc")),
+            "the last symbol comes off whether it was a separator or the `?`"
+        );
+
+        assert_eq!(
+            "33:udp?endpoint=localhost:3333",
+            make_key(33, &parsed("aeron:udp?endpoint=localhost:3333"))
+        );
+
+        // The five, in the reference's order, whatever order the channel wrote
+        // them in — and nothing else survives.
+        assert_eq!(
+            "33:udp?endpoint=localhost:3333|interface=eth0|control=localhost:4040\
+             |session-id=7|tags=a,b",
+            make_key(
+                33,
+                &parsed(
+                    "aeron:udp?tags=a,b|endpoint=localhost:3333|session-id=7\
+                     |control=localhost:4040|interface=eth0|mtu=1408|term-length=64k"
+                )
+            ),
+            "the parameters the key does not carry are what a key is not about"
+        );
+
+        // Two channels that differ only in a parameter the key carries no trace
+        // of are one recording, which is the whole of what the key decides.
+        assert_eq!(
+            make_key(33, &parsed("aeron:udp?endpoint=localhost:3333")),
+            make_key(33, &parsed("aeron:udp?endpoint=localhost:3333|mtu=1408"))
+        );
+    }
+
+    /// The five refusals a start can answer with, and the channel a `LOCAL` UDP
+    /// publication is recorded through
+    /// (`ArchiveConductor.java:538-577`).
+    #[test]
+    fn a_start_is_decided_by_four_checks_and_a_spy() {
+        // Built before the one below shadows the helper: a start that has hit
+        // the bound counts recordings, not what has been asked for
+        // (`:538-543`).
+        let mut full = sessions();
+        full.num_active_recordings = 20;
+
+        let mut sessions = sessions();
+
+        // Nothing registered: a local UDP channel is subscribed to through a
+        // spy link, and the channel is the *stripped* one.
+        assert_eq!(
+            StartDecision::Add {
+                key: "33:udp?endpoint=localhost:3333".to_owned(),
+                channel: "aeron-spy:aeron:udp?endpoint=localhost:3333".to_owned(),
+            },
+            sessions.decide_start(
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // An IPC channel is not a network one either way: it is subscribed to
+        // as it is (`:559-560` tests the media, not the location alone).
+        assert_eq!(
+            StartDecision::Add {
+                key: "33:ipc".to_owned(),
+                channel: "aeron:ipc".to_owned(),
+            },
+            sessions.decide_start(33, SourceLocation::LOCAL, "aeron:ipc")
+        );
+
+        // A remote archive records the network channel itself: there is no
+        // driver here to spy on.
+        assert_eq!(
+            StartDecision::Add {
+                key: "33:udp?endpoint=localhost:3333".to_owned(),
+                channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            },
+            sessions.decide_start(
+                33,
+                SourceLocation::REMOTE,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        // A channel that will not parse is the reference's `catch` (`:578-582`),
+        // whose message here is this build's.
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: 0,
+                message: "not-a-channel is not a channel".to_owned(),
+            },
+            sessions.decide_start(33, SourceLocation::LOCAL, "not-a-channel")
+        );
+
+        // The same channel and stream twice is one recording (`:574-577`).
+        sessions
+            .recording_subscriptions
+            .insert("33:udp?endpoint=localhost:3333".to_owned(), 11);
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: ACTIVE_SUBSCRIPTION,
+                message:
+                    "recording exists for streamId=33 channel=aeron:udp?endpoint=localhost:3333"
+                        .to_owned(),
+            },
+            sessions.decide_start(
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: MAX_RECORDINGS,
+                message: "max concurrent recordings reached 20".to_owned(),
+            },
+            full.decide_start(
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+    }
+
+    /// The free-space refusal is the reference's line, word for word
+    /// (`ArchiveConductor.java:2606`), and it is asked of the **archive
+    /// directory's** filesystem.
+    ///
+    /// A directory that cannot be asked about answers zero — so an archive whose
+    /// directory is gone refuses starts rather than accepting them blind, which
+    /// is the reference's own answer to a failed `statvfs` one step further in.
+    #[test]
+    fn a_start_below_the_storage_threshold_is_refused() {
+        let mut sessions = sessions();
+
+        assert_eq!(None, sessions.is_low_storage_space(), "the temp directory");
+
+        let usable = usable_space(&sessions.recording.archive_dir);
+        sessions.recording.low_storage_space_threshold = usable;
+
+        assert_eq!(
+            Some(format!(
+                "low storage threshold={usable} <= usableSpace={usable}"
+            )),
+            sessions.is_low_storage_space(),
+            "the reference refuses at `<=`, not at `<`"
+        );
+
+        sessions.recording.archive_dir = PathBuf::from("/no/such/archive/directory");
+        assert_eq!(
+            Some(format!("low storage threshold={usable} <= usableSpace=0")),
+            sessions.is_low_storage_space(),
+            "a filesystem that cannot be asked about answers zero, which is below any threshold"
+        );
+    }
+
+    /// A stop takes the subscription out of the registry by **id**, which is
+    /// the only thing a client holds (`ArchiveConductor.java:2139-2153`).
+    ///
+    /// The count of active recordings is deliberately **not** touched: it counts
+    /// live recording sessions, not registrations (`:569` and `:1361` are its
+    /// two movements and this is neither).
+    #[test]
+    fn a_stop_finds_the_subscription_by_its_id() {
+        let mut sessions = sessions();
+        sessions
+            .recording_subscriptions
+            .insert("33:udp?endpoint=localhost:3333".to_owned(), 11);
+        sessions
+            .recording_subscriptions
+            .insert("34:ipc".to_owned(), 22);
+        sessions.num_active_recordings = 2;
+
+        assert_eq!(
+            Some("34:ipc".to_owned()),
+            sessions.remove_recording_subscription(22)
+        );
+        assert_eq!(1, sessions.recording_subscriptions.len());
+
+        assert_eq!(None, sessions.remove_recording_subscription(22));
+        assert_eq!(1, sessions.recording_subscriptions.len(), "nothing moved");
+
+        assert_eq!(
+            Some("33:udp?endpoint=localhost:3333".to_owned()),
+            sessions.remove_recording_subscription(11)
+        );
+        assert!(sessions.recording_subscriptions.is_empty());
+        assert_eq!(
+            2, sessions.num_active_recordings,
+            "a stopped subscription is a recording session that has not ended"
+        );
+    }
+
+    /// The two requests that move something are recorded, not carried out: what
+    /// they need is the client, and a callback runs without it.
+    #[test]
+    fn a_recording_request_is_recorded_rather_than_started() {
+        let mut sessions = sessions();
+
+        sessions.on_start_recording(
+            StartRecordingRequest {
+                session_id: 3,
+                correlation_id: 7,
+                stream_id: 33,
+                source_location: SourceLocation::LOCAL,
+                auto_stop: true,
+                original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+            },
+            0,
+        );
+        sessions.on_stop_recording_subscription(3, 8, 11, 0);
+
+        assert_eq!(
+            vec![
+                Deferred::Action(Action::StartRecording(StartRecordingRequest {
+                    session_id: 3,
+                    correlation_id: 7,
+                    stream_id: 33,
+                    source_location: SourceLocation::LOCAL,
+                    auto_stop: true,
+                    original_channel: "aeron:udp?endpoint=localhost:3333".to_owned(),
+                })),
+                Deferred::Action(Action::StopRecordingSubscription {
+                    session_id: 3,
+                    correlation_id: 8,
+                    subscription_id: 11,
+                }),
+            ],
+            sessions.pending
+        );
+        assert!(
+            sessions.recording_subscriptions.is_empty(),
+            "nothing is registered until the driver answers the add"
+        );
+    }
+
     /// A listing request is recorded, not started: what it needs first is the
     /// catalog and the session, and a callback holds neither.
     #[test]
@@ -2136,6 +2972,21 @@ mod tests {
     /// names it: the publication's registration id and its session id.
     const IMAGE: ImageId = ImageId::new(11, 22);
 
+    /// The recording settings a test archive runs with: the reference's
+    /// defaults, and a **threshold of zero** so that the free-space check reads
+    /// the temp directory's real filesystem and finds it above the line.
+    ///
+    /// The directory is the temp directory rather than a temporary one of the
+    /// test's own: the check is a `statvfs` of it, and a directory that a
+    /// `TempDir` had already removed would answer zero and refuse every start.
+    fn recording_settings() -> RecordingSettings {
+        RecordingSettings {
+            max_concurrent_recordings: 20,
+            low_storage_space_threshold: 0,
+            archive_dir: std::env::temp_dir(),
+        }
+    }
+
     fn sessions() -> Sessions {
         Sessions::new(
             ARCHIVE_ID,
@@ -2143,6 +2994,7 @@ mod tests {
             1_000,
             Duration::from_secs(1),
             DEFAULTS,
+            recording_settings(),
             Vec::new(),
         )
     }

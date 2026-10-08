@@ -382,6 +382,22 @@ impl AsyncAdd {
         }
     }
 
+    /// The same, for a subscription — the reference's archive adds a
+    /// *recording* subscription asynchronously and keeps the id the
+    /// `ADD_SUBSCRIPTION` drew until it answers the client
+    /// (`ArchiveConductor.java:562-570`, where the answer is the registration
+    /// id).
+    ///
+    /// The kind is read by [`Client::async_add_cancel`], which sends the removal
+    /// the resource takes, so a handle put together with the wrong kind would
+    /// send a command the driver would refuse.
+    pub const fn subscription(registration_id: i64) -> Self {
+        Self {
+            registration_id,
+            resource: AsyncResource::Subscription,
+        }
+    }
+
     /// The same, for a counter — `ControlSessionCounter` in the reference's
     /// archive, whose sessions keep the registration id their
     /// `asyncAddCounter` drew across turns and put it back together to poll.
@@ -2064,6 +2080,83 @@ impl Client {
         registration_id: i64,
         timeout: Duration,
     ) -> Result<(), CommandError> {
+        let correlation_id = self.send_remove_subscription(registration_id, timeout)?;
+
+        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        self.forget_subscription(registration_id);
+
+        Ok(())
+    }
+
+    /// The same removal, sent and **not** waited for — the shape the
+    /// reference's `Subscription.close()` has, whose own conductor answers
+    /// later on a thread of its own.
+    ///
+    /// This exists because a caller can be inside the turn that drives the
+    /// driver: the archive's conductor is, since the archive and the driver are
+    /// one process whose loop the launcher owns. A command that waits for an
+    /// answer there waits for a driver nobody is driving, so the removal goes
+    /// out and the answer is collected with
+    /// [`Client::remove_subscription_poll`] on a later turn.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::remove_publication`].
+    pub fn async_remove_subscription(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<AsyncRemove, CommandError> {
+        let correlation_id = self.send_remove_subscription(registration_id, timeout)?;
+
+        Ok(AsyncRemove {
+            correlation_id,
+            registration_id,
+        })
+    }
+
+    /// What [`Client::async_remove_subscription`] has heard back.
+    ///
+    /// The counterpart of [`Client::async_add_poll`] and identical to
+    /// [`Client::remove_publication_poll`] but for what leaves the list when it
+    /// answers: the driver keys these two resources in two lists, so a
+    /// subscription's removal is what takes the subscription out.
+    pub fn remove_subscription_poll(&mut self, remove: AsyncRemove) -> RemovePoll {
+        let correlation_id = remove.correlation_id;
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == correlation_id)
+        else {
+            return RemovePoll::Unknown;
+        };
+
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return RemovePoll::Awaiting;
+        };
+
+        self.pending.swap_remove(index);
+
+        match outcome {
+            Ok(Ready::OperationSucceeded) => {
+                self.forget_subscription(remove.registration_id);
+                RemovePoll::Ready
+            }
+            Ok(_) => RemovePoll::Failed(CommandError::Encoding),
+            Err(error) => RemovePoll::Failed(error),
+        }
+    }
+
+    /// Send `REMOVE_SUBSCRIPTION` and answer with the correlation id its
+    /// answer will carry. The two removals above are what poll for it.
+    fn send_remove_subscription(
+        &mut self,
+        registration_id: i64,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = deepmsg_cnc::command::RemoveSubscription {
@@ -2086,13 +2179,7 @@ impl Client {
             timeout,
         )?;
 
-        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
-            return Err(CommandError::Encoding);
-        };
-
-        self.forget_subscription(registration_id);
-
-        Ok(())
+        Ok(correlation_id)
     }
 
     /// Forget a publication without telling the driver

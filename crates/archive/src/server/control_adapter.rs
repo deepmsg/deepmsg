@@ -75,6 +75,7 @@ use deepmsg_client::fragment_assembler::{FragmentAssembler, Message};
 use deepmsg_client::image::Fragment;
 use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
+use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
 use deepmsg_codec::archive::find_last_matching_recording_request_codec::{
@@ -89,8 +90,16 @@ use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_position_request_codec::{
     self, RecordingPositionRequestDecoder,
 };
+use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_codec::archive::start_position_request_codec::{self, StartPositionRequestDecoder};
+use deepmsg_codec::archive::start_recording_request_2_codec::{
+    self, StartRecordingRequest2Decoder,
+};
+use deepmsg_codec::archive::start_recording_request_codec::{self, StartRecordingRequestDecoder};
 use deepmsg_codec::archive::stop_position_request_codec::{self, StopPositionRequestDecoder};
+use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
+    self, StopRecordingSubscriptionRequestDecoder,
+};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
@@ -194,6 +203,34 @@ pub struct ConnectRequest<'a> {
     pub encoded_credentials: &'a [u8],
     /// What it calls itself, which the session counter's label carries.
     pub client_info: &'a str,
+}
+
+/// One `StartRecordingRequest`, as the adapter decoded it
+/// (`ControlSessionAdapter.java:162-186` for the version without `autoStop`,
+/// `:891-915` for the one with it).
+///
+/// Owned rather than borrowed, unlike [`ConnectRequest`]: the channel is
+/// variable-length data at the end of the message, and what the conductor does
+/// with it happens a turn later — the request is deferred, and a borrow of the
+/// fragment could not outlive the poll that read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRecordingRequest {
+    /// The session that asked.
+    pub session_id: i64,
+    /// The request's correlation id, which its answer echoes.
+    pub correlation_id: i64,
+    /// The stream to record.
+    pub stream_id: i32,
+    /// Whether the archive is local to the driver, which is what decides
+    /// whether the recording goes through a spy link
+    /// (`ArchiveConductor.java:559-560`).
+    pub source_location: SourceLocation,
+    /// Whether the recording stops when the client that asked goes away
+    /// (`:1329-1363`). The request version that has no such field is passed
+    /// `false` for it (`ControlSessionAdapter.java:180-185`).
+    pub auto_stop: bool,
+    /// The channel as the client wrote it.
+    pub original_channel: String,
 }
 
 /// A message the adapter will not read, and why.
@@ -315,6 +352,31 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStartRecording` (`ControlSession.java:340-352`), which
+    /// the conductor answers with the recording subscription's registration id
+    /// (`ArchiveConductor.java:530-583`).
+    ///
+    /// The request asks the archive to **add a subscription**, which the
+    /// reference does inside this call and this build cannot: the add is a
+    /// command to a driver the callback's own turn is what drives. So this
+    /// carries the intent and the conductor runs it — see `Deferred::Action`.
+    ///
+    /// `auto_stop` is the request's own field and is not read here: it is read
+    /// when the recording session ends, and the session is what the recorder
+    /// brings (`:1329-1363`).
+    fn on_start_recording(&mut self, request: StartRecordingRequest, now_ms: i64);
+
+    /// `ControlSession.onStopRecordingSubscription`
+    /// (`ControlSession.java:331-338`), which the conductor answers with an `OK`
+    /// or with `UNKNOWN_SUBSCRIPTION` (`ArchiveConductor.java:612-624`).
+    fn on_stop_recording_subscription(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        subscription_id: i64,
         now_ms: i64,
     );
 }
@@ -770,6 +832,102 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // Asking an archive to record a channel. Two templates, and the only
+        // difference between them is what the second one added: `autoStop`
+        // (`ArchiveConductor.java:530-536` against `:162-186` of the adapter,
+        // whose v1 arm reads four fields and not five). The C client uses the
+        // second (`aeron_archive_proxy.c:248-280`), and the first is answered
+        // the same way, as a request that did not ask for it.
+        start_recording_request_2_codec::SBE_TEMPLATE_ID
+        | start_recording_request_codec::SBE_TEMPLATE_ID => {
+            let (
+                control_session_id,
+                correlation_id,
+                stream_id,
+                source_location,
+                auto_stop,
+                channel,
+            ) = if template_id == start_recording_request_2_codec::SBE_TEMPLATE_ID {
+                let mut decoder = StartRecordingRequest2Decoder::default().header(header, 0);
+                let coordinates = decoder.channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.stream_id(),
+                    decoder.source_location(),
+                    decoder.auto_stop() == BooleanType::TRUE,
+                    decoder.channel_slice(coordinates).to_vec(),
+                )
+            } else {
+                let mut decoder = StartRecordingRequestDecoder::default().header(header, 0);
+                let coordinates = decoder.channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.stream_id(),
+                    decoder.source_location(),
+                    // The version without the field is passed `false` for it
+                    // (`ControlSessionAdapter.java:180-185`), which leaves the
+                    // recording running when the client goes away.
+                    false,
+                    decoder.channel_slice(coordinates).to_vec(),
+                )
+            };
+
+            let original_channel = String::from_utf8_lossy(&channel).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_start_recording(
+                    StartRecordingRequest {
+                        session_id,
+                        correlation_id,
+                        stream_id,
+                        source_location,
+                        auto_stop,
+                        original_channel,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        stop_recording_subscription_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopRecordingSubscriptionRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let subscription_id = decoder.subscription_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_recording_subscription(
+                    session_id,
+                    correlation_id,
+                    subscription_id,
+                    now_ms,
+                );
+            }
+        }
+
         archive_id_request_codec::SBE_TEMPLATE_ID => {
             let decoder = ArchiveIdRequestDecoder::default().header(header, 0);
 
@@ -947,6 +1105,12 @@ mod tests {
             correlation_id: i64,
             recording_id: i64,
         },
+        StartRecording(StartRecordingRequest),
+        StopRecordingSubscription {
+            session_id: i64,
+            correlation_id: i64,
+            subscription_id: i64,
+        },
     }
 
     /// A control plane that writes down what it was asked and hands out session
@@ -1058,6 +1222,24 @@ mod tests {
                 session_id,
                 correlation_id,
                 recording_id,
+            });
+        }
+
+        fn on_start_recording(&mut self, request: StartRecordingRequest, _now_ms: i64) {
+            self.calls.push(Call::StartRecording(request));
+        }
+
+        fn on_stop_recording_subscription(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            subscription_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopRecordingSubscription {
+                session_id,
+                correlation_id,
+                subscription_id,
             });
         }
     }
@@ -1708,6 +1890,188 @@ mod tests {
         max_recorded_position_request_codec,
         MaxRecordedPositionRequestEncoder
     );
+
+    /// A start, in the version that carries `autoStop` (63).
+    fn start_recording_request_2(
+        control_session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        source_location: deepmsg_codec::archive::source_location::SourceLocation,
+        auto_stop: bool,
+        channel: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::boolean_type::BooleanType;
+        use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder =
+                StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .stream_id(stream_id)
+                .source_location(source_location)
+                .auto_stop(if auto_stop {
+                    BooleanType::TRUE
+                } else {
+                    BooleanType::FALSE
+                })
+                .channel(channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// The same request in the version that does not (4).
+    fn start_recording_request_v1(
+        control_session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        source_location: deepmsg_codec::archive::source_location::SourceLocation,
+        channel: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::start_recording_request_codec::StartRecordingRequestEncoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder =
+                StartRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .stream_id(stream_id)
+                .source_location(source_location)
+                .channel(channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    fn stop_recording_subscription_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        subscription_id: i64,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::stop_recording_subscription_request_codec::StopRecordingSubscriptionRequestEncoder;
+
+        let mut buffer = vec![0u8; 64];
+        let length = {
+            let encoder = StopRecordingSubscriptionRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .subscription_id(subscription_id);
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// Both start templates reach the session, and the one thing they differ by
+    /// is the field the second one added: `autoStop` (`ArchiveConductor.java
+    /// :530-536`), which the version without it answers as `false`.
+    ///
+    /// The channel arrives whole — it is the last thing in the message and the
+    /// only variable-length field, so a fragment of it would be a fragment of a
+    /// channel that a recording is registered under.
+    #[test]
+    fn the_two_start_requests_differ_by_auto_stop() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let channel = "aeron:udp?endpoint=localhost:3333";
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&start_recording_request_2(
+                    session_id,
+                    7,
+                    33,
+                    SourceLocation::LOCAL,
+                    true,
+                    channel,
+                )),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StartRecording(StartRecordingRequest {
+                session_id,
+                correlation_id: 7,
+                stream_id: 33,
+                source_location: SourceLocation::LOCAL,
+                auto_stop: true,
+                original_channel: channel.to_owned(),
+            })),
+            control.calls.last()
+        );
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&start_recording_request_v1(
+                    session_id,
+                    8,
+                    33,
+                    SourceLocation::REMOTE,
+                    channel,
+                )),
+                2_001,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StartRecording(StartRecordingRequest {
+                session_id,
+                correlation_id: 8,
+                stream_id: 33,
+                source_location: SourceLocation::REMOTE,
+                auto_stop: false,
+                original_channel: channel.to_owned(),
+            })),
+            control.calls.last()
+        );
+    }
+
+    /// A stop names the subscription the start answered with, and nothing else
+    /// (`ArchiveConductor.java:612-624`).
+    #[test]
+    fn a_stop_names_the_subscription_the_start_answered_with() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&stop_recording_subscription_request(session_id, 7, 11)),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StopRecordingSubscription {
+                session_id,
+                correlation_id: 7,
+                subscription_id: 11,
+            }),
+            control.calls.last()
+        );
+    }
 
     /// A match, which is the one of these requests that carries a channel — as
     /// a length and then the bytes, the shape every variable-length field in
