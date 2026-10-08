@@ -25,7 +25,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use deepmsg_codec::archive_mark::mark_file_header_codec::{
-    MarkFileHeaderDecoder, MarkFileHeaderEncoder, SBE_BLOCK_LENGTH,
+    self, MarkFileHeaderDecoder, MarkFileHeaderEncoder, SBE_BLOCK_LENGTH, SBE_SCHEMA_ID,
 };
 use deepmsg_codec::archive_mark::message_header_codec::{
     ENCODED_LENGTH as MESSAGE_HEADER_LENGTH, MessageHeaderDecoder,
@@ -598,8 +598,35 @@ fn encode(
 }
 
 /// Decode the header in `bytes`.
+///
+/// Both of the message header's ids are checked here, **before** the typed
+/// decoder is wrapped, because the generated one asserts them
+/// (`mark_file_header_codec`, "assertion left == right" in its own `header`): a
+/// file that has been created and not yet written — which is exactly what a
+/// reader starting at the same moment as the archive sees, and what this
+/// build's own launcher leaves behind between `create` and its first write — is
+/// an error here rather than a panic there. [`ArchiveMarkError::NotAMarkFile`]
+/// is the variant that says so, and a reader that meets one waits rather than
+/// dying (`tests/src/archiving_driver.rs`, `await_ready`).
+///
+/// The length is checked for the same reason: the header cannot be read out of
+/// a file shorter than one.
 fn decoder(bytes: &[u8]) -> Result<MarkFileHeaderDecoder<'_>, ArchiveMarkError> {
+    if bytes.len() < MESSAGE_HEADER_LENGTH {
+        return Err(ArchiveMarkError::NotAMarkFile {
+            path: PathBuf::new(),
+        });
+    }
+
     let message_header = MessageHeaderDecoder::default().wrap(ReadBuf::new(bytes), 0);
+
+    if message_header.schema_id() != SBE_SCHEMA_ID
+        || message_header.template_id() != mark_file_header_codec::SBE_TEMPLATE_ID
+    {
+        return Err(ArchiveMarkError::NotAMarkFile {
+            path: PathBuf::new(),
+        });
+    }
 
     Ok(MarkFileHeaderDecoder::default().header(message_header, 0))
 }
@@ -844,6 +871,43 @@ mod tests {
             TIMESTAMP,
             decoded.activity_timestamp(),
             "and what sits at ACTIVITY_TIMESTAMP_OFFSET is `activityTimestamp`"
+        );
+    }
+
+    /// A file that is not a mark file is an **error**, not a panic — including
+    /// the one a reader meets when it starts at the same moment as the archive:
+    /// created, and not yet written.
+    ///
+    /// This is the decoder's own guard and it is load-bearing: the generated
+    /// decoder asserts the message header's ids when it is wrapped, so a zeroed
+    /// file used to come back as a `debug_assert` inside a codec rather than as
+    /// the [`ArchiveMarkError::NotAMarkFile`] this module already had a variant
+    /// for. A reader that waits for readiness — `tests/src/archiving_driver.rs`
+    /// is one — treats an error as "not yet" and a panic as a dead test, and
+    /// which of the two it gets is a race.
+    #[test]
+    fn a_file_that_is_not_a_mark_file_is_an_error() {
+        let dir = TempDir::new();
+
+        // Created and not written: every byte of the header is zero, which is a
+        // template id no schema has.
+        std::fs::write(dir.file(FILENAME), [0_u8; 8192]).expect("a zeroed file");
+        assert!(
+            matches!(
+                ArchiveMarkFile::open(dir.path()),
+                Err(ArchiveMarkError::NotAMarkFile { .. })
+            ),
+            "a file nobody has written is not a mark file"
+        );
+
+        // A file too short to hold a message header is refused too, by the
+        // generic layer underneath rather than by this one — either way it is an
+        // error and not a panic, which is the whole of what a reader waiting for
+        // readiness needs from it.
+        std::fs::write(dir.file(FILENAME), [0_u8; 4]).expect("a short file");
+        assert!(
+            ArchiveMarkFile::open(dir.path()).is_err(),
+            "a file that cannot hold the header it would start with is not one"
         );
     }
 
