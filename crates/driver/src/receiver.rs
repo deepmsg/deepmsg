@@ -1391,6 +1391,7 @@ impl ReceiverThread {
             &regions,
             self.cycle_threshold_ns,
             &mut self.last_cycle_ns,
+            now_ns,
         );
 
         work + re_resolved
@@ -2124,15 +2125,24 @@ impl ReceiverThread {
         work
     }
 
-    /// The cycle-time counters, which are 30 and 31
-    /// (`aeron_driver_receiver.c:262-276`).
+    /// The cycle-time counters, which are 30 and 31 — the receiver's
+    /// duty-cycle stall tracker in the reference, whose two counter addresses
+    /// the conductor binds once at startup (`aeron_driver_conductor.c:839-842`)
+    /// and which `aeron_duty_cycle_tracker.h:50-61` reads and writes.
+    ///
+    /// `now_ns` is the pass's own reading, taken once at the top of
+    /// `do_receive`, rather than a second one taken here. The reference reads
+    /// the clock once (`aeron_driver_receiver.c:145`) and hands that same
+    /// instant to its tracker (`:150`), so the counters and the work they
+    /// describe are stamped from one reading — which is also what the sender
+    /// and the conductor do with theirs.
     fn track_cycle(
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         cycle_threshold_ns: i64,
         last_cycle_ns: &mut i64,
+        now_ns: i64,
     ) {
-        let now_ns = deepmsg_core::clock::monotonic_nano_time();
         let cycle_ns = now_ns.saturating_sub(*last_cycle_ns);
         *last_cycle_ns = now_ns;
 
