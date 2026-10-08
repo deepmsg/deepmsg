@@ -97,6 +97,10 @@ use deepmsg_codec::archive::start_recording_request_2_codec::{
 };
 use deepmsg_codec::archive::start_recording_request_codec::{self, StartRecordingRequestDecoder};
 use deepmsg_codec::archive::stop_position_request_codec::{self, StopPositionRequestDecoder};
+use deepmsg_codec::archive::stop_recording_by_identity_request_codec::{
+    self, StopRecordingByIdentityRequestDecoder,
+};
+use deepmsg_codec::archive::stop_recording_request_codec::{self, StopRecordingRequestDecoder};
 use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
@@ -377,6 +381,29 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         subscription_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStopRecording` (`ControlSession.java:322-329`), which
+    /// stops the recording registered under a channel and stream
+    /// (`ArchiveConductor.java:585-610`).
+    fn on_stop_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        original_channel: &str,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStopRecordingByIdentity` (`ControlSession.java:572-579`),
+    /// whose answer carries whether a recording was stopped
+    /// (`ArchiveConductor.java:1301-1327`).
+    fn on_stop_recording_by_identity(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
         now_ms: i64,
     );
 }
@@ -928,6 +955,59 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // The two stops that are not named by a subscription id: one names the
+        // channel and stream a recording was started with
+        // (`ArchiveConductor.java:585-610`), the other the recording itself
+        // (`:1301-1327`).
+        stop_recording_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = StopRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let stream_id = decoder.stream_id();
+            let coordinates = decoder.channel_decoder();
+            let channel = String::from_utf8_lossy(decoder.channel_slice(coordinates)).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_recording(session_id, correlation_id, stream_id, &channel, now_ms);
+            }
+        }
+
+        stop_recording_by_identity_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopRecordingByIdentityRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_recording_by_identity(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    now_ms,
+                );
+            }
+        }
+
         archive_id_request_codec::SBE_TEMPLATE_ID => {
             let decoder = ArchiveIdRequestDecoder::default().header(header, 0);
 
@@ -1111,6 +1191,17 @@ mod tests {
             correlation_id: i64,
             subscription_id: i64,
         },
+        StopRecording {
+            session_id: i64,
+            correlation_id: i64,
+            stream_id: i32,
+            original_channel: String,
+        },
+        StopRecordingByIdentity {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
     }
 
     /// A control plane that writes down what it was asked and hands out session
@@ -1240,6 +1331,36 @@ mod tests {
                 session_id,
                 correlation_id,
                 subscription_id,
+            });
+        }
+
+        fn on_stop_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            stream_id: i32,
+            original_channel: &str,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopRecording {
+                session_id,
+                correlation_id,
+                stream_id,
+                original_channel: original_channel.to_owned(),
+            });
+        }
+
+        fn on_stop_recording_by_identity(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopRecordingByIdentity {
+                session_id,
+                correlation_id,
+                recording_id,
             });
         }
     }
@@ -1954,6 +2075,54 @@ mod tests {
         buffer
     }
 
+    fn stop_recording_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        channel: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::stop_recording_request_codec::StopRecordingRequestEncoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder =
+                StopRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .stream_id(stream_id)
+                .channel(channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    fn stop_recording_by_identity_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::stop_recording_by_identity_request_codec::StopRecordingByIdentityRequestEncoder;
+
+        let mut buffer = vec![0u8; 64];
+        let length = {
+            let encoder = StopRecordingByIdentityRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
     fn stop_recording_subscription_request(
         control_session_id: i64,
         correlation_id: i64,
@@ -2043,6 +2212,57 @@ mod tests {
                 auto_stop: false,
                 original_channel: channel.to_owned(),
             })),
+            control.calls.last()
+        );
+    }
+
+    /// The two stops that name something other than a subscription id: the
+    /// channel and stream a recording was started with
+    /// (`ArchiveConductor.java:585-610`), and the recording itself (`:1301-1327`).
+    ///
+    /// The channel travels whole, because it is what `makeKey` is built from —
+    /// a fragment of it would name a different recording.
+    #[test]
+    fn the_two_other_stops_name_a_channel_and_a_recording() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let channel = "aeron:udp?endpoint=localhost:3333";
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&stop_recording_request(session_id, 7, 33, channel)),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StopRecording {
+                session_id,
+                correlation_id: 7,
+                stream_id: 33,
+                original_channel: channel.to_owned(),
+            }),
+            control.calls.last()
+        );
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&stop_recording_by_identity_request(session_id, 8, 4_242)),
+                2_001,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StopRecordingByIdentity {
+                session_id,
+                correlation_id: 8,
+                recording_id: 4_242,
+            }),
             control.calls.last()
         );
     }

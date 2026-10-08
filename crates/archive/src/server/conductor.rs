@@ -781,6 +781,33 @@ enum Action {
         correlation_id: i64,
         subscription_id: i64,
     },
+    /// `ArchiveConductor.stopRecording` (`:585-610`): the same stop, named by
+    /// the **channel and stream** a client started it with rather than by the
+    /// registration id it was answered with.
+    StopRecording {
+        session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        original_channel: String,
+    },
+    /// `ArchiveConductor.stopRecordingByIdentity` (`:1301-1327`), which names
+    /// the *recording* — and answers with whether there was one to stop, not
+    /// with a position.
+    StopRecordingByIdentity {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+}
+
+/// What a stop named by a channel resolves to
+/// (`ArchiveConductor.java:591-600`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopDecision {
+    /// The registration id the key names, which is what the stop takes off.
+    Subscription(i64),
+    /// Refuse, with the words the reference composes.
+    Refuse { relevant_id: i64, message: String },
 }
 
 /// What a start is going to do, once the four checks in front of it have run
@@ -1664,6 +1691,7 @@ impl Sessions {
     fn run_action(
         &mut self,
         client: &mut Client,
+        catalog: &Catalog,
         action: Action,
         recorder: &mut Recorder,
         now_ms: i64,
@@ -1680,6 +1708,33 @@ impl Sessions {
                 session_id,
                 correlation_id,
                 subscription_id,
+                now_ms,
+            ),
+            Action::StopRecording {
+                session_id,
+                correlation_id,
+                stream_id,
+                original_channel,
+            } => self.stop_recording(
+                client,
+                recorder,
+                session_id,
+                correlation_id,
+                stream_id,
+                &original_channel,
+                now_ms,
+            ),
+            Action::StopRecordingByIdentity {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.stop_recording_by_identity(
+                client,
+                catalog,
+                recorder,
+                session_id,
+                correlation_id,
+                recording_id,
                 now_ms,
             ),
         }
@@ -1965,6 +2020,137 @@ impl Sessions {
             .values()
             .find(|held| held.registration_id == registration_id)
             .cloned()
+    }
+
+    /// `ArchiveConductor.stopRecording` (`:585-610`): the stop a client names
+    /// by channel and stream.
+    ///
+    /// It resolves to the same three steps as a stop by registration id, so it
+    /// delegates once it has the id — what differs is what it says when there
+    /// is nothing there, in the reference's own words for this arm
+    /// (`:603-604`) rather than the other arm's (`:621-622`).
+    #[allow(clippy::too_many_arguments)] // the request's fields, the recorder, the clock
+    fn stop_recording(
+        &mut self,
+        client: &mut Client,
+        recorder: &mut Recorder,
+        session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        original_channel: &str,
+        now_ms: i64,
+    ) {
+        match self.decide_stop(stream_id, original_channel) {
+            StopDecision::Subscription(subscription_id) => self.stop_recording_subscription(
+                client,
+                recorder,
+                session_id,
+                correlation_id,
+                subscription_id,
+                now_ms,
+            ),
+            StopDecision::Refuse {
+                relevant_id,
+                message,
+            } => self.send_error(
+                client,
+                session_id,
+                correlation_id,
+                relevant_id,
+                &message,
+                now_ms,
+            ),
+        }
+    }
+
+    /// What a stop by channel and stream finds
+    /// (`ArchiveConductor.stopRecording`, `:589-600`).
+    fn decide_stop(&self, stream_id: i32, original_channel: &str) -> StopDecision {
+        // The reference wraps the lookup in a `try` whose `catch` answers with
+        // the exception's message (`:606-609`); the one thing that can throw
+        // there is the parse, and the words are this build's.
+        let Ok(uri) = ChannelUri::parse(original_channel) else {
+            return StopDecision::Refuse {
+                relevant_id: 0,
+                message: format!("{original_channel} is not a channel"),
+            };
+        };
+
+        let key = make_key(stream_id, &uri);
+
+        match self.recording_subscriptions.get(&key) {
+            Some(held) => StopDecision::Subscription(held.registration_id),
+            None => StopDecision::Refuse {
+                relevant_id: UNKNOWN_SUBSCRIPTION,
+                message: format!(
+                    "no recording found for streamId={stream_id} channel={original_channel}"
+                ),
+            },
+        }
+    }
+
+    /// `ArchiveConductor.stopRecordingByIdentity` (`:1301-1327`).
+    ///
+    /// Two things make this arm different from the other stops. It is guarded by
+    /// `hasRecording` — a recording the catalog does not hold is refused with
+    /// the standard message, not with "no subscription found" (`:1303-1305`) —
+    /// and its answer carries **whether** a recording was stopped, `0` or `1`,
+    /// where the others answer with nothing (`:1323`). A recording that is in
+    /// the catalog but not in flight is therefore an `OK` with a zero in it.
+    #[allow(clippy::too_many_arguments)] // the request's fields, the catalog, the recorder, the clock
+    fn stop_recording_by_identity(
+        &mut self,
+        client: &mut Client,
+        catalog: &Catalog,
+        recorder: &mut Recorder,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.send_error(
+                client,
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                &unknown_recording_message(recording_id),
+                now_ms,
+            );
+            return;
+        }
+
+        let mut found = 0;
+
+        if let Some(handle) = self.recording_session_by_id.get(&recording_id).copied() {
+            recorder.abort_sessions_for(handle.subscription_id, "stop recording by identity");
+
+            if self
+                .remove_recording_subscription(handle.subscription_id)
+                .is_some()
+            {
+                found = 1;
+
+                let remaining = self
+                    .subscription_ref_counts
+                    .get_mut(&handle.subscription_id)
+                    .map(|count| {
+                        *count -= 1;
+                        *count
+                    })
+                    .unwrap_or(0);
+
+                if 0 == remaining {
+                    self.release_recording_subscription(client, handle.subscription_id);
+                }
+            }
+        }
+
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry
+                .control
+                .send_ok_response(correlation_id, found, now_ms, client);
+        }
     }
 
     /// `ArchiveConductor.removeRecordingSubscription` (`:2139-2153`): the
@@ -2462,7 +2648,9 @@ impl Sessions {
                 // one — and the only kind that needs the client for something
                 // other than talking to the client (`ArchiveConductor.java:562`,
                 // `:1766-1780`).
-                Deferred::Action(action) => self.run_action(client, action, recorder, now_ms),
+                Deferred::Action(action) => {
+                    self.run_action(client, catalog, action, recorder, now_ms);
+                }
             }
         }
     }
@@ -2685,6 +2873,37 @@ impl ControlPlane for Sessions {
                 session_id,
                 correlation_id,
                 subscription_id,
+            }));
+    }
+
+    fn on_stop_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        stream_id: i32,
+        original_channel: &str,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::StopRecording {
+            session_id,
+            correlation_id,
+            stream_id,
+            original_channel: original_channel.to_owned(),
+        }));
+    }
+
+    fn on_stop_recording_by_identity(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::StopRecordingByIdentity {
+                session_id,
+                correlation_id,
+                recording_id,
             }));
     }
 
@@ -3327,6 +3546,56 @@ mod tests {
                 SourceLocation::LOCAL,
                 "aeron:udp?endpoint=localhost:3333"
             )
+        );
+    }
+
+    /// A stop named by channel and stream resolves to the registration id the
+    /// **key** names, and refuses in this arm's own words when there is none
+    /// (`ArchiveConductor.java:589-604` — which are not the other arm's,
+    /// `:621-622`).
+    #[test]
+    fn a_stop_by_channel_finds_the_subscription_its_key_names() {
+        let mut sessions = sessions();
+
+        assert_eq!(
+            StopDecision::Refuse {
+                relevant_id: UNKNOWN_SUBSCRIPTION,
+                message:
+                    "no recording found for streamId=33 channel=aeron:udp?endpoint=localhost:3333"
+                        .to_owned(),
+            },
+            sessions.decide_stop(33, "aeron:udp?endpoint=localhost:3333"),
+            "nothing registered under that key"
+        );
+
+        sessions
+            .recording_subscriptions
+            .insert("33:udp?endpoint=localhost:3333".to_owned(), held(11));
+
+        assert_eq!(
+            StopDecision::Subscription(11),
+            sessions.decide_stop(33, "aeron:udp?endpoint=localhost:3333")
+        );
+
+        // The same channel on another stream is another key, and the parameters
+        // the key does not carry are not part of it — `makeKey` decides both,
+        // which is why this arm asks the same question `start` did.
+        assert_eq!(
+            StopDecision::Subscription(11),
+            sessions.decide_stop(33, "aeron:udp?endpoint=localhost:3333|mtu=1408")
+        );
+        assert!(matches!(
+            sessions.decide_stop(34, "aeron:udp?endpoint=localhost:3333"),
+            StopDecision::Refuse { .. }
+        ));
+
+        // A channel that will not parse is the reference's `catch` (`:606-609`).
+        assert_eq!(
+            StopDecision::Refuse {
+                relevant_id: 0,
+                message: "not-a-channel is not a channel".to_owned(),
+            },
+            sessions.decide_stop(33, "not-a-channel")
         );
     }
 
