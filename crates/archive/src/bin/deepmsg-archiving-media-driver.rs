@@ -197,6 +197,39 @@ fn run(
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let aeron_dir = driver_config.aeron_dir.as_path();
 
+    // The archive's own directory, before anything is put in it
+    // (`Archive.java:1275-1282`), where the reference does it in `conclude`:
+    // an archive told to start clean deletes what is there, and either way both
+    // directories are made if they are missing.
+    //
+    // **This is not housekeeping.** The reference's `IoUtil.ensureDirectoryExists`
+    // is what makes `<archive.dir>/source` exist before the catalog and the mark
+    // file are created inside it, and a harness that hands the archive a
+    // directory it expects the archive to make — which is what the C suite does
+    // (`TestArchive.h:203` deletes it on teardown) — meets an archive that will
+    // not start without it.
+    if archive_config.delete_dir_on_start {
+        // `IoUtil.delete(archiveDir, false)`: the second argument is
+        // `ignoreFailures`, and it is **false** — a directory that will not go
+        // is an archive that will not start.
+        match std::fs::remove_dir_all(&archive_config.archive_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not delete the archive directory {}: {error}",
+                    archive_config.archive_dir.display()
+                ));
+            }
+        }
+    }
+
+    ensure_directory(&archive_config.archive_dir, "archive")?;
+
+    if let Some(directory) = archive_config.mark_file_path().parent() {
+        ensure_directory(directory, "mark file")?;
+    }
+
     // The CnC file is created unpublished, and the driver's conductor is what
     // publishes it; a client cannot connect until it has (`CncFile::try_open`
     // is the same gate the test harness waits on, `tests/src/driver.rs:505`).
@@ -386,6 +419,29 @@ fn add_subscription(
             ));
         }
     }
+}
+
+/// `IoUtil.ensureDirectoryExists` (`Archive.java:1281-1282`), which makes the
+/// directory and refuses a path that is something else.
+///
+/// `create_dir_all` is Agrona's `mkdirs`; the second check is Agrona's, and the
+/// words are this build's — nothing reads them but a person.
+fn ensure_directory(path: &Path, name: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "the {name} directory {} does not exist and could not be created: {error}",
+            path.display()
+        )
+    })?;
+
+    if !path.is_dir() {
+        return Err(format!(
+            "the {name} path {} is not a directory",
+            path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Create the archive's mark file, sized and ready to be written.
