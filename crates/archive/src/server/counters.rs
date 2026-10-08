@@ -78,12 +78,46 @@ pub const ARCHIVE_CONTROL_SESSIONS_TYPE_ID: i32 = 102;
 /// `AeronCounters.ARCHIVE_CONTROL_SESSION_TYPE_ID` (`AeronCounters.java:826`).
 pub const ARCHIVE_CONTROL_SESSION_TYPE_ID: i32 = 113;
 
+/// `AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID`
+/// (`AeronCounters.java:739`).
+///
+/// The one archive counter that is **not** keyed by the archive id alone — see
+/// [`crate::server::recording_pos`], which owns its key and label.
+pub const ARCHIVE_RECORDING_POSITION_TYPE_ID: i32 = 100;
+
+/// `AeronCounters.ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID`
+/// (`AeronCounters.java:771`).
+pub const ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID: i32 = 105;
+
+/// `AeronCounters.ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID`
+/// (`AeronCounters.java:778`).
+pub const ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID: i32 = 106;
+
+/// `AeronCounters.ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID`
+/// (`AeronCounters.java:785`).
+pub const ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID: i32 = 107;
+
+/// `AeronCounters.ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID`
+/// (`AeronCounters.java:812`).
+pub const ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID: i32 = 111;
+
 /// `ArchiveCounters.ARCHIVE_ID_LABEL_SUFFIX` (`ArchiveCounters.java:35`), which
 /// every archive counter's label ends with.
 const ARCHIVE_ID_LABEL_SUFFIX: &str = " - archiveId=";
 
 /// The name the 102 counter is allocated under (`Archive.java:1561`).
 const CONTROL_SESSIONS_NAME: &str = "Archive Control Sessions";
+
+/// The name the 111 counter is allocated under (`Archive.java:1568`).
+pub const RECORDING_SESSIONS_NAME: &str = "Archive Recording Sessions";
+
+/// The names the recorder's three counters are allocated under
+/// (`Archive.java:1601`, `:1612`, `:1623`).
+pub const RECORDER_MAX_WRITE_TIME_NAME: &str = "archive-recorder max write time in ns";
+/// See [`RECORDER_MAX_WRITE_TIME_NAME`].
+pub const RECORDER_TOTAL_WRITE_BYTES_NAME: &str = "archive-recorder total write bytes";
+/// See [`RECORDER_MAX_WRITE_TIME_NAME`].
+pub const RECORDER_TOTAL_WRITE_TIME_NAME: &str = "archive-recorder total write time in ns";
 
 /// `ControlSessionCounter.NAME` and the separator after it
 /// (`ControlSessionCounter.java:57`, `:75-76`). One constant, because nothing
@@ -97,12 +131,27 @@ pub const CONTROL_SESSIONS_KEY_LENGTH: usize = 8;
 /// (`ControlSessionCounter.java:70-72`).
 pub const CONTROL_SESSION_KEY_LENGTH: usize = 16;
 
-/// The key of the 102 counter: the archive id.
+/// The key of every archive counter but the 100 and the 113: the archive id.
 ///
 /// `ArchiveCounters.allocate` puts the id at offset 0 and declares the key to
-/// be exactly the 8 bytes it wrote (`:59-62`).
-pub fn control_sessions_key(archive_id: i64) -> [u8; CONTROL_SESSIONS_KEY_LENGTH] {
+/// be exactly the 8 bytes it wrote (`ArchiveCounters.java:59-62`), which is
+/// what makes these counters findable by
+/// [`find_archive_id_counter`] and by the reference's own
+/// `ArchiveCounters.find` (`:139-159`).
+pub fn archive_id_key(archive_id: i64) -> [u8; CONTROL_SESSIONS_KEY_LENGTH] {
     archive_id.to_le_bytes()
+}
+
+/// `name + " - archiveId=" + archiveId`, which is the label every counter
+/// [`archive_id_key`] keys (`ArchiveCounters.allocate`, `:64-67`, and
+/// [`ARCHIVE_ID_LABEL_SUFFIX`]).
+pub fn archive_id_label(name: &str, archive_id: i64) -> String {
+    format!("{name}{ARCHIVE_ID_LABEL_SUFFIX}{archive_id}")
+}
+
+/// The key of the 102 counter: the archive id.
+pub fn control_sessions_key(archive_id: i64) -> [u8; CONTROL_SESSIONS_KEY_LENGTH] {
+    archive_id_key(archive_id)
 }
 
 /// The key of a 113 counter: the archive id, then the control session id.
@@ -125,7 +174,7 @@ pub fn control_session_key(
 /// `"Archive Control Sessions" + " - archiveId=" + archiveId`
 /// (`Archive.java:1561` and `ArchiveCounters.appendArchiveIdLabel`, `:102-109`).
 pub fn control_sessions_label(archive_id: i64) -> String {
-    format!("{CONTROL_SESSIONS_NAME}{ARCHIVE_ID_LABEL_SUFFIX}{archive_id}")
+    archive_id_label(CONTROL_SESSIONS_NAME, archive_id)
 }
 
 /// `"control-session" + ": " + clientInfo + " - archiveId=" + archiveId`
@@ -319,16 +368,7 @@ impl ControlSessionsCounter {
         let counter_id =
             client.add_counter(ARCHIVE_CONTROL_SESSIONS_TYPE_ID, &key, &label, timeout)?;
 
-        match counters.get(counter_id) {
-            Some(descriptor) if descriptor.type_id == ARCHIVE_CONTROL_SESSIONS_TYPE_ID => {}
-            Some(descriptor) => {
-                return Err(CounterError::WrongTypeId {
-                    expected: ARCHIVE_CONTROL_SESSIONS_TYPE_ID,
-                    actual: descriptor.type_id,
-                });
-            }
-            None => return Err(CounterError::UnknownCounter { counter_id }),
-        }
+        check_type_id(counters, counter_id, ARCHIVE_CONTROL_SESSIONS_TYPE_ID)?;
 
         Ok(Self { counter_id })
     }
@@ -433,18 +473,203 @@ pub fn claim_control_sessions_counter<C: Counters, Access>(
         AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
     };
 
-    match counters.get(counter_id) {
-        Some(descriptor) if descriptor.type_id == ARCHIVE_CONTROL_SESSIONS_TYPE_ID => {}
-        Some(descriptor) => {
-            return Err(CounterError::WrongTypeId {
-                expected: ARCHIVE_CONTROL_SESSIONS_TYPE_ID,
-                actual: descriptor.type_id,
-            });
-        }
-        None => return Err(CounterError::UnknownCounter { counter_id }),
-    }
+    check_type_id(counters, counter_id, ARCHIVE_CONTROL_SESSIONS_TYPE_ID)?;
 
     Ok(Some(ControlSessionsCounter { counter_id }))
+}
+
+/// One of the archive's counters that is keyed by nothing but the archive id:
+/// the recording session count (111) and the recorder's three write statistics
+/// (105, 106, 107) — everything `ArchiveCounters.allocate` makes
+/// (`ArchiveCounters.java:52-69`).
+///
+/// The four differ in what moves them and in nothing else: 111 goes up and down
+/// with the recording sessions (`ArchiveConductor.java:2056`, `:1362`), and the
+/// recorder's three are set outright once per turn that wrote something
+/// (`:2732-2743`). So they share one handle rather than four — the type id and
+/// the name are the caller's, and the key and the label suffix are this
+/// module's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveIdCounter {
+    counter_id: i32,
+}
+
+impl ArchiveIdCounter {
+    /// Allocate one and check what came back, for a caller with a driver
+    /// running on its own threads.
+    ///
+    /// The check is `validateCounterTypeId` (`Archive.java:1564`, `:1604`,
+    /// `:1615`, `:1626`), which each of the four does after allocating.
+    ///
+    /// # Errors
+    ///
+    /// [`CounterError`] if the client or the driver refused the counter, if the
+    /// counter it allocated is not the type that was asked for, or if its slot
+    /// cannot be read back.
+    pub fn allocate<C: Counters, Access>(
+        client: &mut C,
+        counters: &CountersReader<'_, Access>,
+        type_id: i32,
+        name: &str,
+        archive_id: i64,
+        timeout: Duration,
+    ) -> Result<Self, CounterError> {
+        let counter_id = client.add_counter(
+            type_id,
+            &archive_id_key(archive_id),
+            &archive_id_label(name, archive_id),
+            timeout,
+        )?;
+
+        check_type_id(counters, counter_id, type_id)?;
+
+        Ok(Self { counter_id })
+    }
+
+    /// The values-region slot.
+    pub const fn counter_id(&self) -> i32 {
+        self.counter_id
+    }
+
+    /// What the counter reads now, which is what `AeronStat` shows and what the
+    /// C harness reads a recording's position out of
+    /// (`aeron_archive_test.cpp:267-273`).
+    pub fn value<Access>(&self, counters: &CountersReader<'_, Access>) -> Option<i64> {
+        counters.value(self.counter_id)
+    }
+
+    /// Set it outright — the recorder's three, once per turn that wrote
+    /// (`ArchiveConductor.java:2737-2739`).
+    pub fn set(&self, counters: &CountersReader<'_, ReadWrite>, value: i64) -> Option<()> {
+        counters.set_value(self.counter_id, value)
+    }
+
+    /// One more recording session (`ArchiveConductor.java:2056`).
+    pub fn increment(&self, counters: &CountersReader<'_, ReadWrite>) -> Option<i64> {
+        self.bump(counters, 1)
+    }
+
+    /// One fewer (`:1362`), with the same `None` as
+    /// [`ControlSessionsCounter::increment`].
+    pub fn decrement(&self, counters: &CountersReader<'_, ReadWrite>) -> Option<i64> {
+        self.bump(counters, -1)
+    }
+
+    fn bump(&self, counters: &CountersReader<'_, ReadWrite>, by: i64) -> Option<i64> {
+        let next = counters.value(self.counter_id)?.wrapping_add(by);
+        counters.set_value(self.counter_id, next).map(|()| next)
+    }
+}
+
+/// The counter of `type_id` belonging to `archive_id`, or `None`
+/// (`ArchiveCounters.find`, `ArchiveCounters.java:139-159`).
+///
+/// The reference walks the metadata region from counter 0 and stops at the
+/// first free slot, comparing the type id and the first eight bytes of the key
+/// — the archive id, which is all any of these keys holds. The walk is
+/// [`CountersReader::for_each`]'s.
+///
+/// One caller so far, and it is the reason the function exists: the 105 is
+/// allocated only if no other archive has one for this archive id, and the
+/// archive refuses to start if one does (`Archive.java:1586-1595`). The
+/// reference checks that one and not the other three.
+pub fn find_archive_id_counter<Access>(
+    counters: &CountersReader<'_, Access>,
+    type_id: i32,
+    archive_id: i64,
+) -> Option<i32> {
+    let wanted = archive_id_key(archive_id);
+    let mut found = None;
+
+    counters.for_each(|descriptor| {
+        if found.is_none()
+            && descriptor.type_id == type_id
+            && counters
+                .key(descriptor.counter_id)
+                .is_some_and(|key| key[..wanted.len()] == wanted)
+        {
+            found = Some(descriptor.counter_id);
+        }
+    });
+
+    found
+}
+
+/// Ask the driver for one of the archive-id-keyed counters, and do not wait for
+/// the answer.
+///
+/// The blocking [`ArchiveIdCounter::allocate`] is fine for a process with a
+/// driver on its own threads and impossible for one that **is** the driver's
+/// loop — see [`request_control_sessions_counter`] for the whole of that
+/// argument, which is the same one.
+///
+/// # Errors
+///
+/// [`CounterError`] if the command could not be written or sent. The driver's
+/// own answer arrives through [`claim_archive_id_counter`].
+pub fn request_archive_id_counter<C: Counters>(
+    client: &mut C,
+    type_id: i32,
+    name: &str,
+    archive_id: i64,
+    timeout: Duration,
+) -> Result<i64, CounterError> {
+    client.async_add_counter(
+        type_id,
+        &archive_id_key(archive_id),
+        &archive_id_label(name, archive_id),
+        timeout,
+    )
+}
+
+/// Take up the counter [`request_archive_id_counter`] asked for, once the
+/// driver has allocated it.
+///
+/// `Ok(None)` means "not yet" rather than "no", exactly as
+/// [`claim_control_sessions_counter`] does.
+///
+/// # Errors
+///
+/// [`CounterError`] if the driver refused the add, if the counter it allocated
+/// is not the type that was asked for, or if its slot cannot be read back.
+pub fn claim_archive_id_counter<C: Counters, Access>(
+    client: &mut C,
+    counters: &CountersReader<'_, Access>,
+    type_id: i32,
+    registration_id: i64,
+) -> Result<Option<ArchiveIdCounter>, CounterError> {
+    let counter_id = match client.poll_counter(registration_id) {
+        AsyncAddPoll::Ready => {
+            let Some(counter_id) = client.counter_id(registration_id) else {
+                return Ok(None);
+            };
+            counter_id
+        }
+        AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+        AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
+    };
+
+    check_type_id(counters, counter_id, type_id)?;
+
+    Ok(Some(ArchiveIdCounter { counter_id }))
+}
+
+/// `validateCounterTypeId` (`AeronCounters.java:1540-1547`), which the four
+/// archive-id-keyed counters do at `Archive.java:1574`, `:1604`, `:1615` and
+/// `:1626`.
+fn check_type_id<Access>(
+    counters: &CountersReader<'_, Access>,
+    counter_id: i32,
+    expected: i32,
+) -> Result<(), CounterError> {
+    match counters.get(counter_id) {
+        Some(descriptor) if descriptor.type_id == expected => Ok(()),
+        Some(descriptor) => Err(CounterError::WrongTypeId {
+            expected,
+            actual: descriptor.type_id,
+        }),
+        None => Err(CounterError::UnknownCounter { counter_id }),
+    }
 }
 
 /// The 113 counter: one control session.
@@ -1061,5 +1286,149 @@ mod tests {
             !counter.claim(&mut client).unwrap(),
             "an answer with no counter is not yet a counter"
         );
+    }
+
+    /// [`metadata`], with the record's key written too — which is what the
+    /// archive-id-keyed counters are found by.
+    fn metadata_with_key(counter_id: i32, type_id: i32, key: &[u8]) -> Region {
+        let mut region = metadata(counter_id, type_id);
+        let base = counter_id as usize * layout::COUNTER_METADATA_LENGTH;
+
+        region.0[base + layout::COUNTER_KEY_OFFSET..base + layout::COUNTER_KEY_OFFSET + key.len()]
+            .copy_from_slice(key);
+
+        region
+    }
+
+    #[test]
+    fn the_recording_session_count_is_keyed_and_labelled_like_the_rest() {
+        let mut client = FakeCounters::default();
+        let mut meta = metadata(0, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID);
+        let mut vals = values(1);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        let counter = ArchiveIdCounter::allocate(
+            &mut client,
+            &counters,
+            ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID,
+            RECORDING_SESSIONS_NAME,
+            ARCHIVE_ID,
+            TIMEOUT,
+        )
+        .expect("the driver answered");
+
+        let (type_id, key, label) = client.only_add();
+        assert_eq!(111, *type_id);
+        assert_eq!(ARCHIVE_ID.to_le_bytes().to_vec(), *key);
+        assert_eq!("Archive Recording Sessions - archiveId=42", label);
+        assert_eq!(0, counter.counter_id());
+    }
+
+    /// The recorder's three names are what an operator reads in `AeronStat`,
+    /// and two of them differ by one word — so they are checked to the byte
+    /// (`Archive.java:1601`, `:1612`, `:1623`).
+    #[test]
+    fn the_recorder_counters_are_named_the_references_way() {
+        let mut client = FakeCounters::default();
+        let mut meta = metadata(0, ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID);
+        let mut vals = values(1);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        ArchiveIdCounter::allocate(
+            &mut client,
+            &counters,
+            ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+            RECORDER_MAX_WRITE_TIME_NAME,
+            ARCHIVE_ID,
+            TIMEOUT,
+        )
+        .expect("the driver answered");
+
+        let (type_id, _, label) = client.only_add();
+        assert_eq!(105, *type_id);
+        assert_eq!(
+            "archive-recorder max write time in ns - archiveId=42",
+            label
+        );
+
+        assert_eq!(
+            "archive-recorder total write bytes - archiveId=42",
+            archive_id_label(RECORDER_TOTAL_WRITE_BYTES_NAME, ARCHIVE_ID)
+        );
+        assert_eq!(
+            "archive-recorder total write time in ns - archiveId=42",
+            archive_id_label(RECORDER_TOTAL_WRITE_TIME_NAME, ARCHIVE_ID)
+        );
+    }
+
+    /// 111 goes up and down with the recording sessions
+    /// (`ArchiveConductor.java:2056`, `:1362`), while the recorder's three are
+    /// set outright once per turn that wrote (`:2737-2739`).
+    #[test]
+    fn an_archive_id_counter_is_moved_or_set_outright() {
+        let mut meta = metadata(0, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID);
+        let mut vals = values(1);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+        let counter = ArchiveIdCounter { counter_id: 0 };
+
+        assert_eq!(Some(1), counter.increment(&counters));
+        assert_eq!(Some(2), counter.increment(&counters));
+        assert_eq!(Some(1), counter.decrement(&counters));
+        assert_eq!(Some(1), counter.value(&counters));
+
+        assert_eq!(Some(()), counter.set(&counters, 4096));
+        assert_eq!(Some(4096), counter.value(&counters));
+    }
+
+    /// The one caller of [`find_archive_id_counter`]: the 105 is not allocated
+    /// for an archive id that already has one, and the archive refuses to start
+    /// rather than make a second (`Archive.java:1586-1595`).
+    #[test]
+    fn a_counter_is_found_by_its_type_and_the_archive_id_in_its_key() {
+        let mut meta = metadata_with_key(
+            0,
+            ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+            &ARCHIVE_ID.to_le_bytes(),
+        );
+        let mut vals = values(1);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        assert_eq!(
+            Some(0),
+            find_archive_id_counter(
+                &counters,
+                ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+                ARCHIVE_ID
+            )
+        );
+        assert_eq!(
+            None,
+            find_archive_id_counter(
+                &counters,
+                ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
+                ARCHIVE_ID + 1
+            ),
+            "another archive's counter is not this archive's"
+        );
+        assert_eq!(
+            None,
+            find_archive_id_counter(
+                &counters,
+                ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
+                ARCHIVE_ID
+            ),
+            "nor is a counter of another type"
+        );
+    }
+
+    /// The four new type ids are the reference's, checked where they are
+    /// declared so a transposed pair cannot pass.
+    #[test]
+    fn the_new_type_ids_are_the_references() {
+        assert_eq!(100, ARCHIVE_RECORDING_POSITION_TYPE_ID);
+        assert_eq!(105, ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID);
+        assert_eq!(106, ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID);
+        assert_eq!(107, ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID);
+        assert_eq!(111, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID);
     }
 }
