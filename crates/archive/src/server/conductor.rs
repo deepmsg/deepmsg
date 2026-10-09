@@ -101,6 +101,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use deepmsg_client::client::{
@@ -1619,6 +1620,16 @@ pub struct Sessions {
     creating_replays: Vec<CreateReplayPublicationSession>,
     /// The settings a replay is answered from.
     replay: ReplaySettings,
+    /// `controlSessionByReplayToken` (`ArchiveConductor.java:153`): the tokens
+    /// a replay on a client's **response channel** is asked for and answered
+    /// with, by the token that names them.
+    ///
+    /// A map keyed by a random `i64` and not a counter, and it is the one place
+    /// in this file where that is true. What it buys is that a token cannot be
+    /// guessed from the one before it, because the request it authorises
+    /// arrives on an image the session was never opened on and so passes none of
+    /// the gate's checks.
+    replay_tokens: HashMap<i64, ReplayToken>,
 
     /// Sessions finished this turn, waiting for the conductor to collect them.
     ended: Vec<EndedSession>,
@@ -1759,6 +1770,15 @@ fn invalid_replay_position(
 /// makes of a replay request (`:2256-2288`), and they are made there, where the
 /// answer is a `ControlResponseCode.ERROR` rather than a `UriError`.
 ///
+/// # `response_correlation_id`, and why it is written **before** the strip
+///
+/// A replay the client asked for on a channel of its own carries the id of the
+/// image its request arrived on (`ControlSessionAdapter.java:1183`), and
+/// `strippedChannelBuilder` copies that parameter along with the rest
+/// (`ArchiveConductor.java:1896`) — the id is written onto the client's channel
+/// and read back off it by the same line that reads `control-mode` back. So
+/// what this does with it is what the reference does with it.
+///
 /// # Errors
 ///
 /// [`UriError`] when the client's own channel will not parse.
@@ -1768,9 +1788,14 @@ pub fn replay_channel(
     initial_term_id: i32,
     term_buffer_length: i32,
     mtu_length: i32,
+    response_correlation_id: Option<i64>,
 ) -> Result<String, UriError> {
     let uri = ChannelUri::parse(requested)?;
     let mut builder = stripped_channel_builder(&uri);
+
+    if let Some(correlation_id) = response_correlation_id {
+        builder.response_correlation_id(correlation_id.to_string());
+    }
 
     let bits_to_shift = bits_to_shift(term_buffer_length).unwrap_or(0);
     let term_id = i32::try_from(replay_position >> bits_to_shift)
@@ -1807,6 +1832,47 @@ pub fn replay_channel(
 /// A URI flag, as the reference's `ChannelUri.getBoolean` reads one.
 fn flag(uri: &ChannelUri, name: &str) -> bool {
     uri.get(name).is_some_and(|value| value == "true")
+}
+
+/// A random `i64` for a replay token.
+///
+/// The reference draws from `ctx.secureRandom()` (`ArchiveConductor.java:207`),
+/// a `SecureRandom` — and here the choice of source is not the formality it is
+/// for a session id. A replay token is a **capability**: the request that spends
+/// it arrives on an image its session was never opened on and is let through
+/// without the image comparison or the authorisation service
+/// (`ControlSessionAdapter.java:1175-1184`), so a token that can be predicted is
+/// a replay of somebody else's recording.
+///
+/// `/dev/urandom` is the source the driver's own `sys::random_i32` reads
+/// (`crates/driver/src/sys.rs:375-390`), and it is read the same way. The
+/// fallback is **weaker than that one's**, and deliberately says so: a clock, a
+/// process id and a counter are guessable by anyone who knows the archive is
+/// running, so an archive that cannot read the device issues tokens that hold
+/// against a client that is not trying and against nothing else.
+fn random_i64() -> i64 {
+    let mut bytes = [0u8; 8];
+    let read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes));
+
+    match read {
+        Ok(()) => i64::from_ne_bytes(bytes),
+        Err(_) => {
+            static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+            let draws = DRAWS.fetch_add(1, Ordering::Relaxed);
+            let mixed = (deepmsg_core::clock::epoch_nano_time() as u64)
+                ^ draws.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ u64::from(std::process::id());
+
+            // A splitmix64 finaliser, so that the low bits are not the clock's
+            // low bits — which is what a naive reader would guess first.
+            let mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+
+            (mixed ^ (mixed >> 31)) as i64
+        }
+    }
 }
 
 /// One replay in flight, as the conductor keeps it.
@@ -1849,6 +1915,24 @@ impl ReplayEntry {
     fn session_id(&self) -> i64 {
         self.session.replay_session_id()
     }
+}
+
+/// `ArchiveConductor.SessionForReplay` (`:2793-2805`): what a replay token
+/// stands for.
+///
+/// The reference keeps the `ControlSession` **object**; this keeps its id,
+/// because the sessions live with the same struct the tokens do and an id is
+/// what every other map here is keyed by.
+struct ReplayToken {
+    /// The recording the token was issued for, which the replay that spends it
+    /// must name too (`ArchiveConductor.java:2659`).
+    recording_id: i64,
+    /// The session the token was issued to, which is the session the replay is
+    /// answered on.
+    session_id: i64,
+    /// When it stops being usable, in the conductor's millisecond clock
+    /// (`:2648`).
+    deadline_ms: i64,
 }
 
 impl Sessions {
@@ -1896,6 +1980,7 @@ impl Sessions {
             num_active_replays: 0,
             replay_sessions: HashMap::new(),
             creating_replays: Vec::new(),
+            replay_tokens: HashMap::new(),
         }
     }
 
@@ -1956,6 +2041,10 @@ impl Sessions {
     ) {
         self.allocate_session_counter(client, counters);
         self.allocate_recording_session_counter(client, counters);
+        // Expired replay tokens are swept before anything is asked of them,
+        // which is where the reference sweeps them: right after the adapter has
+        // read the turn's requests (`ArchiveConductor.java:389-391`).
+        self.check_replay_tokens(now_ms);
         self.claim_pending_starts(client, now_ms);
         self.collect_pending_removals(client);
         self.run_pending_connects(client, authenticator, now_ms);
@@ -2663,6 +2752,7 @@ impl Sessions {
             recording.initial_term_id,
             recording.term_buffer_length,
             recording.mtu_length,
+            request.response_correlation_id,
         ) {
             Ok(channel) => channel,
             Err(error) => {
@@ -2775,6 +2865,82 @@ impl Sessions {
     /// `ArchiveConductor.onReplayEnd` (`:936-939`).
     fn on_replay_end(&mut self) {
         self.num_active_replays = self.num_active_replays.saturating_sub(1);
+    }
+
+    /// `ArchiveConductor.generateReplayToken` (`:2639-2652`): a random `i64`
+    /// that names a session and a recording for as long as a connect timeout.
+    ///
+    /// **Drawn until it is free**, which is the reference's `while` and not
+    /// decoration: a token that collides with a live one would hand its session
+    /// to a client that never asked for it. Drawing again is the only way to
+    /// answer, because the map's key *is* the token.
+    ///
+    /// The deadline is the reference's — `nanoClock.nanoTime()` plus
+    /// `connectTimeoutMs` (`:2648`) — measured in the clock the conductor
+    /// already keeps.
+    fn generate_replay_token(&mut self, session_id: i64, recording_id: i64, now_ms: i64) -> i64 {
+        let mut replay_token = NULL_VALUE;
+
+        while replay_token == NULL_VALUE || self.replay_tokens.contains_key(&replay_token) {
+            replay_token = random_i64();
+        }
+
+        self.replay_tokens.insert(
+            replay_token,
+            ReplayToken {
+                recording_id,
+                session_id,
+                deadline_ms: now_ms.saturating_add(self.connect_timeout_ms),
+            },
+        );
+
+        replay_token
+    }
+
+    /// `ArchiveConductor.getReplaySession` (`:2654-2667`).
+    ///
+    /// Three things must hold and all three are asked here: the token is one
+    /// this archive issued, it was issued for **this** recording, and it has
+    /// not expired. A token is not spent by being used (`:2654-2667` never
+    /// removes one) — it stops working when `check_replay_tokens` sweeps it or
+    /// when the session it names goes away.
+    fn replay_session_by_token(
+        &self,
+        replay_token: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) -> Option<i64> {
+        let token = self.replay_tokens.get(&replay_token)?;
+
+        (recording_id == token.recording_id && now_ms < token.deadline_ms)
+            .then_some(token.session_id)
+    }
+
+    /// `ArchiveConductor.checkReplayTokens` (`:2683-2697`), which the reference
+    /// runs once per `doWork` (`:391`).
+    ///
+    /// Returns how many it removed, which is what the reference adds into its
+    /// `workCount`. Nothing here counts work, so the caller drops it — it is
+    /// the number the sweep's own test reads, and the alternative is a sweep
+    /// whose two halves are asserted apart.
+    fn check_replay_tokens(&mut self, now_ms: i64) -> usize {
+        let before = self.replay_tokens.len();
+        self.replay_tokens
+            .retain(|_, token| token.deadline_ms > now_ms);
+
+        before - self.replay_tokens.len()
+    }
+
+    /// `removeReplayTokensForSession` (`:2669-2681`), called where a control
+    /// session is removed (`ControlSessionAdapter.java:1157`).
+    ///
+    /// Without it a token outlives the session it names, and a session id is a
+    /// number this archive hands out again (`nextSessionId` is a counter) — so
+    /// a later session could be answered on by a token issued to an earlier
+    /// one.
+    fn remove_replay_tokens_for_session(&mut self, session_id: i64) {
+        self.replay_tokens
+            .retain(|_, token| token.session_id != session_id);
     }
 
     /// `replaySessionId` (`:956`): the replay's own counter in the high half,
@@ -4500,6 +4666,10 @@ impl Sessions {
                 continue;
             };
 
+            // A token outlives nothing (`ControlSessionAdapter.java:1157`): its
+            // session is gone, and session ids are handed out again.
+            self.remove_replay_tokens_for_session(session_id);
+
             entry.control.close(client);
 
             let abort_reason = entry.control.abort_reason().map(str::to_owned);
@@ -4716,6 +4886,38 @@ impl ControlPlane for Sessions {
     fn on_start_recording(&mut self, request: StartRecordingRequest, _now_ms: i64) {
         self.pending
             .push(Deferred::Action(Action::StartRecording(request)));
+    }
+
+    fn replay_session_for_token(
+        &self,
+        replay_token: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) -> Option<i64> {
+        self.replay_session_by_token(replay_token, recording_id, now_ms)
+    }
+
+    fn on_replay_token(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        // Generated here and answered next turn, rather than handed to the
+        // conductor as an intent: nothing about it needs the client or the
+        // catalog, and the reference generates it the moment it reads the
+        // request (`ControlSessionAdapter.java:1100`).
+        let replay_token = self.generate_replay_token(session_id, recording_id, now_ms);
+
+        // The token **is** the relevant id (`:1101`), which is what the client
+        // reads it back out of — not a message body, and not a response code of
+        // its own.
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: replay_token,
+        });
     }
 
     fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {
@@ -6948,5 +7150,111 @@ mod tests {
     fn the_protocol_major_comes_from_the_protocol_version() {
         assert_eq!(1, PROTOCOL_MAJOR_VERSION);
         assert_eq!(1, semantic_version_major(PROTOCOL_SEMANTIC_VERSION));
+    }
+
+    /// A replay's channel carries the recording's geometry, and — when the
+    /// client asked for the answer on a channel of its own — the id of the
+    /// image its request arrived on (`ArchiveConductor.java:891-901`,
+    /// `ControlSessionAdapter.java:1183`).
+    #[test]
+    fn a_response_channel_replay_carries_the_image_it_answers() {
+        const RESPONSE_CHANNEL: &str = "aeron:udp?control-mode=response|control=localhost:10002";
+
+        let channel = replay_channel(RESPONSE_CHANNEL, 4096, 3, 64 * 1024, 1408, Some(11))
+            .expect("a channel");
+
+        assert!(
+            channel.contains("control-mode=response"),
+            "the client's own parameters survive the strip: {channel}"
+        );
+        assert!(
+            channel.contains("response-correlation-id=11"),
+            "and the image is written onto them: {channel}"
+        );
+
+        // The ordinary replay, which names no image and gets no parameter.
+        let channel =
+            replay_channel(RESPONSE_CHANNEL, 4096, 3, 64 * 1024, 1408, None).expect("a channel");
+
+        assert!(
+            !channel.contains("response-correlation-id"),
+            "no image to answer: {channel}"
+        );
+    }
+
+    /// A token names a session and a recording for as long as a connect
+    /// timeout, and is drawn until it is free
+    /// (`ArchiveConductor.generateReplayToken`, `:2639-2652`).
+    #[test]
+    fn a_replay_token_names_a_session_until_it_expires() {
+        let mut sessions = sessions();
+        let recording_id = 7;
+
+        // `NULL_VALUE` is what the reference's loop rejects, so it is what this
+        // one must never hand out — a client cannot tell it from no token.
+        let first = sessions.generate_replay_token(1, recording_id, 1_000);
+        assert_ne!(NULL_VALUE, first);
+        assert_eq!(
+            Some(1),
+            sessions.replay_session_by_token(first, recording_id, 1_000)
+        );
+
+        // Another session's token, which is a different number.
+        let second = sessions.generate_replay_token(2, recording_id, 1_000);
+        assert_ne!(first, second);
+        assert_eq!(
+            Some(2),
+            sessions.replay_session_by_token(second, recording_id, 1_000)
+        );
+
+        // The recording is half of what a token stands for (`:2659`).
+        assert_eq!(
+            None,
+            sessions.replay_session_by_token(first, recording_id + 1, 1_000)
+        );
+
+        // And the clock is the other half: the timeout is the archive's
+        // `connectTimeoutNs`, which `sessions()` sets to 5 s.
+        assert_eq!(
+            Some(1),
+            sessions.replay_session_by_token(first, recording_id, 5_999)
+        );
+        assert_eq!(
+            None,
+            sessions.replay_session_by_token(first, recording_id, 6_000)
+        );
+    }
+
+    /// A token dies with the session it names
+    /// (`removeReplayTokensForSession`, `:2669-2681`), because session ids are
+    /// handed out again.
+    #[test]
+    fn a_replay_token_dies_with_its_session() {
+        let mut sessions = sessions();
+
+        let kept = sessions.generate_replay_token(1, 7, 0);
+        let removed = sessions.generate_replay_token(2, 7, 0);
+
+        sessions.remove_replay_tokens_for_session(2);
+
+        assert_eq!(Some(1), sessions.replay_session_by_token(kept, 7, 0));
+        assert_eq!(None, sessions.replay_session_by_token(removed, 7, 0));
+    }
+
+    /// The sweep runs once per turn and takes only what has expired
+    /// (`checkReplayTokens`, `:2683-2697`).
+    #[test]
+    fn the_token_sweep_takes_only_what_has_expired() {
+        let mut sessions = sessions();
+        sessions.connect_timeout_ms = 100;
+
+        let old = sessions.generate_replay_token(1, 7, 0);
+        let new = sessions.generate_replay_token(2, 7, 50);
+
+        assert_eq!(1, sessions.check_replay_tokens(100), "the first is due");
+        assert_eq!(None, sessions.replay_session_by_token(old, 7, 100));
+        assert_eq!(Some(2), sessions.replay_session_by_token(new, 7, 100));
+
+        assert_eq!(0, sessions.check_replay_tokens(100), "and nothing else is");
     }
 }
