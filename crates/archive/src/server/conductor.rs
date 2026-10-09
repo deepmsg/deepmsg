@@ -140,7 +140,7 @@ use crate::server::counters::{
     claim_control_sessions_counter, request_archive_id_counter, request_control_sessions_counter,
 };
 use crate::server::create_replay_publication::{
-    CreateReplayPublicationSession, Progress as CreationProgress, Replay,
+    CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
 };
 use crate::server::recorder::Recorder;
 use crate::server::recording_pos::RecordingPos;
@@ -1657,6 +1657,48 @@ pub const REPLAY_ALL_AND_FOLLOW: i64 = -1;
 /// `AeronArchive.REPLAY_ALL_AND_STOP` (`client/AeronArchive.java:122`).
 pub const REPLAY_ALL_AND_STOP: i64 = -2;
 
+/// `new Counter(aeron.countersReader(), limitCounterId)`
+/// (`ArchiveConductor.startBoundedReplay`, `:1000-1006`), which the reference
+/// wraps in a `try`: a bounded replay whose counter is not there is **refused**,
+/// not replayed to a limit nobody can read.
+///
+/// The three things it keeps are the three the reading needs, and they are kept
+/// rather than the value because the value moves — the whole point of a bounded
+/// replay is that the client can raise the limit while it runs.
+fn resolve_limit_counter<Access>(
+    counters: &CountersReader<'_, Access>,
+    limit_counter_id: i64,
+) -> Option<LimitCounter> {
+    let counter_id = i32::try_from(limit_counter_id).ok()?;
+    let descriptor = counters.get(counter_id)?;
+
+    Some(LimitCounter {
+        counter_id,
+        type_id: descriptor.type_id,
+        registration_id: descriptor.registration_id,
+    })
+}
+
+/// Read a bounded replay's limit now, or `None` for "stop extending"
+/// (`ReplaySession.notExtended`, `:544-578`).
+///
+/// The reference's answer has three cases — the counter is live, it is closed
+/// and still ours, or its slot has been **reused** — and this build can tell
+/// two of them apart: [`CountersReader::get`] walks allocated slots only, so
+/// *closed* and *reused* both come back as `None`. They are answered the way
+/// the reference answers **reuse**, which is to freeze: [`None`] here means the
+/// stop position stops moving, and it never moves backwards either, because
+/// [`ReplaySession::extend_stop_position`] only ever raises it.
+fn read_limit_counter<Access>(
+    counters: &CountersReader<'_, Access>,
+    limit: LimitCounter,
+) -> Option<i64> {
+    let descriptor = counters.get(limit.counter_id)?;
+
+    (descriptor.type_id == limit.type_id && descriptor.registration_id == limit.registration_id)
+        .then_some(descriptor.value)
+}
+
 /// `ArchiveConductor.isInvalidReplayPosition` (`:2256-2288`).
 ///
 /// Three refusals, and the codes are **not** all the same: a position that is
@@ -1791,6 +1833,13 @@ struct ReplayEntry {
     /// waited for, so this is a fact about the conversation and not something
     /// the session can be asked.
     started: bool,
+    /// The bounded limit counter, when the request named one, which is what
+    /// [`Sessions::drive_replay_sessions`] reads each turn in place of the live
+    /// recording's position.
+    limit: Option<LimitCounter>,
+    /// Where the recording began, which the live-position fallback needs and a
+    /// session does not keep.
+    start_position: i64,
     /// The replay itself.
     session: ReplaySession,
 }
@@ -2451,6 +2500,24 @@ impl Sessions {
             return;
         }
 
+        // `startBoundedReplay` (`:996-1035`), which runs **before** the replay
+        // proper and hands it a counter rather than a number.
+        let limit = match request.limit_counter_id {
+            Some(limit_counter_id) => match resolve_limit_counter(counters, limit_counter_id) {
+                Some(limit) => Some(limit),
+                None => {
+                    self.refuse_replay(
+                        session_id,
+                        correlation_id,
+                        0,
+                        format!("failed to find counter: limitCounterId={limit_counter_id}"),
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let Ok(recording) = catalog.recording(request.recording_id) else {
             self.refuse_replay(
                 session_id,
@@ -2515,8 +2582,10 @@ impl Sessions {
         //
         // [`Sessions::live_recording_position`] is where the two states this
         // build has and the reference does not are dealt with.
-        let limit_position =
-            self.live_recording_position(counters, request.recording_id, start_position);
+        let limit_position = match limit {
+            Some(limit) => read_limit_counter(counters, limit),
+            None => self.live_recording_position(counters, request.recording_id, start_position),
+        };
 
         let (stop_position, max_length) = match limit_position {
             Some(limit) => {
@@ -2626,7 +2695,7 @@ impl Sessions {
                 replay_channel: channel,
                 replay_stream_id: request.replay_stream_id,
                 file_io_max_length: request.file_io_max_length,
-                limit_counter_id: None,
+                limit,
             }));
     }
 
@@ -2829,6 +2898,8 @@ impl Sessions {
             control_session_id: replay.control_session_id,
             correlation_id: replay.correlation_id,
             registration_id,
+            limit: replay.limit,
+            start_position: replay.start_position,
             started: false,
             session,
         })
@@ -2852,10 +2923,16 @@ impl Sessions {
             .replay_sessions
             .iter()
             .filter_map(|(replay_session_id, entry)| {
-                self.recording_session_by_id
-                    .get(&entry.session.recording_id())
-                    .and_then(|handle| handle.position.value(counters))
-                    .map(|position| (*replay_session_id, position))
+                let position = match entry.limit {
+                    Some(limit) => read_limit_counter(counters, limit),
+                    None => self.live_recording_position(
+                        counters,
+                        entry.session.recording_id(),
+                        entry.start_position,
+                    ),
+                };
+
+                position.map(|position| (*replay_session_id, position))
             })
             .collect();
 
@@ -5044,6 +5121,140 @@ mod tests {
 
     use crate::catalog::Recording;
     use crate::mark::tests::TempDir;
+
+    use deepmsg_cnc::layout;
+    use deepmsg_core::buffer::AtomicBuffer;
+
+    /// A counters region pair, sized to reach `counter_id`.
+    #[repr(align(64))]
+    struct Region(Vec<u8>);
+
+    impl Region {
+        fn zeroed(len: usize) -> Self {
+            Self(vec![0u8; len])
+        }
+
+        fn buffer_mut(&mut self) -> AtomicBuffer<'_, ReadWrite> {
+            AtomicBuffer::from_slice_mut(&mut self.0).expect("aligned region")
+        }
+    }
+
+    /// One **allocated** counter at `counter_id` with this type and
+    /// registration, and a value of `value`.
+    fn limit_counters(
+        counter_id: i32,
+        type_id: i32,
+        registration_id: i64,
+        value: i64,
+    ) -> (Region, Region) {
+        let slots = counter_id as usize + 1;
+        let mut meta = Region::zeroed(slots * layout::COUNTER_METADATA_LENGTH);
+        let mut vals = Region::zeroed(slots * layout::COUNTER_VALUE_LENGTH);
+        let base = counter_id as usize * layout::COUNTER_METADATA_LENGTH;
+
+        let put = |bytes: &mut [u8], offset: usize, value: &[u8]| {
+            bytes[base + offset..base + offset + value.len()].copy_from_slice(value);
+        };
+
+        // The slots in front of it are `RECLAIMED` rather than `UNUSED`, and
+        // that is not decoration: `CountersReader::for_each` **stops** at the
+        // first unused slot, so a region with one zeroed slot in front of the
+        // counter would never reach it.
+        for slot in 0..counter_id as usize {
+            meta.0[slot * layout::COUNTER_METADATA_LENGTH + layout::COUNTER_STATE_OFFSET
+                ..slot * layout::COUNTER_METADATA_LENGTH + layout::COUNTER_STATE_OFFSET + 4]
+                .copy_from_slice(&layout::COUNTER_STATE_RECLAIMED.to_le_bytes());
+        }
+
+        put(
+            &mut meta.0,
+            layout::COUNTER_TYPE_ID_OFFSET,
+            &type_id.to_le_bytes(),
+        );
+        // Published last, as a writer does.
+        put(
+            &mut meta.0,
+            layout::COUNTER_STATE_OFFSET,
+            &layout::COUNTER_STATE_ALLOCATED.to_le_bytes(),
+        );
+
+        // The value **and the registration id** are in the values region, not
+        // the metadata one — `CountersReader::describe` reads both from there,
+        // which is what `aeron_counters_manager` does too.
+        let base = counter_id as usize * layout::COUNTER_VALUE_LENGTH;
+        let put_value = |bytes: &mut [u8], offset: usize, value: i64| {
+            bytes[base + offset..base + offset + 8].copy_from_slice(&value.to_le_bytes());
+        };
+
+        put_value(&mut vals.0, layout::COUNTER_VALUE_OFFSET, value);
+        put_value(
+            &mut vals.0,
+            layout::COUNTER_REGISTRATION_ID_OFFSET,
+            registration_id,
+        );
+
+        (meta, vals)
+    }
+
+    /// A bounded replay's limit counter is resolved from the slot the request
+    /// names, and **refused** when the slot is not there
+    /// (`ArchiveConductor.startBoundedReplay`, `:996-1035`).
+    #[test]
+    fn a_limit_counter_is_resolved_from_its_slot() {
+        const TYPE_ID: i32 = 10001;
+        const REGISTRATION_ID: i64 = 777;
+
+        let (mut meta, mut vals) = limit_counters(3, TYPE_ID, REGISTRATION_ID, 640);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        assert_eq!(
+            Some(LimitCounter {
+                counter_id: 3,
+                type_id: TYPE_ID,
+                registration_id: REGISTRATION_ID,
+            }),
+            resolve_limit_counter(&counters, 3)
+        );
+
+        // A slot nothing was ever allocated in, and an id no `i32` can hold.
+        assert_eq!(None, resolve_limit_counter(&counters, 2));
+        assert_eq!(
+            None,
+            resolve_limit_counter(&counters, i64::from(i32::MAX) + 1)
+        );
+    }
+
+    /// The limit moves while the slot is still ours, and **freezes** when it
+    /// stops being ours — a reused slot is somebody else's counter
+    /// (`ReplaySession.notExtended`, `:544-578`).
+    #[test]
+    fn a_reused_limit_counter_slot_stops_moving() {
+        const TYPE_ID: i32 = 10001;
+        const REGISTRATION_ID: i64 = 777;
+
+        let (mut meta, mut vals) = limit_counters(3, TYPE_ID, REGISTRATION_ID, 640);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+        let limit = LimitCounter {
+            counter_id: 3,
+            type_id: TYPE_ID,
+            registration_id: REGISTRATION_ID,
+        };
+
+        assert_eq!(Some(640), read_limit_counter(&counters, limit));
+
+        // Another kind of counter in the same slot: id reuse, which is the case
+        // the registration id exists for.
+        let (mut meta, mut vals) = limit_counters(3, TYPE_ID + 1, REGISTRATION_ID, 640);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        assert_eq!(None, read_limit_counter(&counters, limit));
+
+        // And a different registration of the same type.
+        let (mut meta, mut vals) = limit_counters(3, TYPE_ID, REGISTRATION_ID + 1, 640);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        assert_eq!(None, read_limit_counter(&counters, limit));
+    }
 
     /// A catalog holding one recording, so that a question about it has
     /// something to read. Its fields are the ones the questions read, and the

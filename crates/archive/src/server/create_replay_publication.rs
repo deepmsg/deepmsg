@@ -33,6 +33,25 @@ use deepmsg_client::client::{AsyncAddPoll, DEFAULT_TIMEOUT};
 use crate::server::control_session::Publications;
 use crate::server::replay_session::GENERIC;
 
+/// A bounded replay's limit counter, as the conductor reads it.
+///
+/// `ArchiveConductor.startBoundedReplay` (`:996-1035`) resolves the request's
+/// `limitCounterId` into a `Counter` handle and hands it to the replay, which
+/// reads it every turn (`ReplaySession.notExtended`, `:544-578`). What travels
+/// here is the three things that reading needs: which slot, which type, and
+/// which registration must still own it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitCounter {
+    /// The slot in the counters region.
+    pub counter_id: i32,
+    /// The type the slot must still carry: the driver reuses ids, and a slot
+    /// that has become somebody else's counter is not this one
+    /// (`aeron_counters_manager.c`).
+    pub type_id: i32,
+    /// The registration that must still own it (`:544-578`).
+    pub registration_id: i64,
+}
+
 /// Everything one replay was asked for: `ArchiveConductor.startReplay`'s
 /// parameter list (`:764-773`) as it travels from the control arm to the session
 /// that carries it out.
@@ -72,9 +91,10 @@ pub struct Replay {
     /// The request's `fileIoMaxLength`. Not positive means "the whole buffer"
     /// (`AC:958-966`).
     pub file_io_max_length: i32,
-    /// The limit counter a bounded replay named, if it named one
-    /// (`BoundedReplayRequest`, template 18).
-    pub limit_counter_id: Option<i64>,
+    /// A `BoundedReplayRequest`'s limit counter, **resolved**. `None` for a
+    /// plain `ReplayRequest`, whose limit is the live recording's own position
+    /// (`AC:789-802`).
+    pub limit: Option<LimitCounter>,
 }
 
 /// What one turn of publication-making did.
@@ -222,7 +242,7 @@ mod tests {
             replay_channel: "aeron:udp?endpoint=localhost:6666".to_owned(),
             replay_stream_id: 66,
             file_io_max_length: 4096,
-            limit_counter_id: None,
+            limit: None,
         }
     }
 
