@@ -174,9 +174,6 @@ impl CreateReplayPublicationSession {
 
         match publications.poll_exclusive_publication(registration_id) {
             AsyncAddPoll::Ready => {
-                // The publication belongs to the replay now, so this session
-                // must not give it back on the way out (`:610-618`).
-                self.registration_id = None;
                 self.done = true;
 
                 Progress::Created { registration_id }
@@ -190,6 +187,25 @@ impl CreateReplayPublicationSession {
                 "failed to create replay publication: registration is not this client's".to_owned(),
             ),
         }
+    }
+
+    /// Let the publication go, once a replay has taken it.
+    ///
+    /// **The reference has no such call, and the reason is worth stating.** It
+    /// clears `publicationRegistrationId` *before* handing the publication to
+    /// the conductor (`:161-165`), which is only safe because
+    /// `ArchiveConductor.newReplaySession` (`:931-994`) cannot fail: it looks
+    /// nothing up and opens no file, so a publication handed to it is always
+    /// taken. This build's [`Sessions::open_replay`] **can** refuse — the
+    /// recording may have gone from the catalog between the turn that checked it
+    /// and this one, and `ReplaySession::new` rejects a geometry it cannot place
+    /// a position in — and a registration cleared before a handover that then
+    /// did not happen is stranded: nothing holds the id, so nothing will ever
+    /// give the driver its publication back.
+    ///
+    /// [`Sessions::open_replay`]: crate::server::conductor::Sessions
+    pub const fn hand_over(&mut self) {
+        self.registration_id = None;
     }
 
     /// `close` (`:87-93`): a registration that never became a session is **given
@@ -400,7 +416,31 @@ mod tests {
         assert_eq!(vec![REGISTRATION_ID], publications.removed);
     }
 
-    /// One that did become a session is **not**: it belongs to the replay.
+    /// A publication that has been created but **not yet taken** is still this
+    /// session's, and a close gives it back.
+    ///
+    /// This is why [`CreateReplayPublicationSession::hand_over`] exists at all:
+    /// the reference clears its registration as soon as the publication appears
+    /// (`:161`), which is safe only because what it hands the publication to
+    /// cannot refuse. Here it can, and a registration cleared before a handover
+    /// that then did not happen is one nobody holds — so no later turn will ever
+    /// give the driver its publication, its term buffer or its counters back.
+    #[test]
+    fn a_publication_the_replay_has_not_taken_is_given_back() {
+        let mut publications = Fake::new(vec![AsyncAddPoll::Ready]);
+        let mut session = CreateReplayPublicationSession::new(replay());
+
+        assert!(matches!(
+            session.do_work(&mut publications),
+            Progress::Created { .. }
+        ));
+
+        session.close(&mut publications);
+
+        assert_eq!(vec![REGISTRATION_ID], publications.removed);
+    }
+
+    /// One that **has** been handed over is not: it belongs to the replay.
     #[test]
     fn a_registration_that_became_a_session_is_not_taken_back() {
         let mut publications = Fake::new(vec![AsyncAddPoll::Ready]);
@@ -410,7 +450,7 @@ mod tests {
             session.do_work(&mut publications),
             Progress::Created { .. }
         ));
-
+        session.hand_over();
         session.close(&mut publications);
 
         assert!(publications.removed.is_empty(), "the replay owns it now");

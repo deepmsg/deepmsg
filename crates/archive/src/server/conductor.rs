@@ -1740,12 +1740,17 @@ fn invalid_replay_position(
     replay_position: i64,
     recording: &Recording,
 ) -> Option<(i64, String)> {
+    // The three texts are the reference's own, word for word
+    // (`ArchiveConductor.java:2262-2286` and the two builders in
+    // `client/ArchiveException.java:244-268`): they are the strings a client
+    // matches on, and the archive's errors are the one part of the wire a test
+    // asserts verbatim.
     if replay_position % i64::from(FRAME_ALIGNMENT) != 0 {
         return Some((
             0,
             format!(
-                "replayPosition={replay_position} must be aligned to \
-                 FRAME_ALIGNMENT={FRAME_ALIGNMENT} for recording {recording_id}"
+                "requested replay start position={replay_position} is not a multiple of \
+                 FRAME_ALIGNMENT ({FRAME_ALIGNMENT}) for recording {recording_id}"
             ),
         ));
     }
@@ -1754,8 +1759,8 @@ fn invalid_replay_position(
         return Some((
             INVALID_POSITION,
             format!(
-                "replayPosition={replay_position} must be >= startPosition={} for recording \
-                 {recording_id}",
+                "requested replay start position={replay_position} is less than recording start \
+                 position={} for recording {recording_id}",
                 recording.start_position
             ),
         ));
@@ -1764,15 +1769,24 @@ fn invalid_replay_position(
     if recording.stop_position != NULL_VALUE && replay_position >= recording.stop_position {
         return Some((
             INVALID_POSITION,
-            format!(
-                "replayPosition={replay_position} must be < stopPosition={} for recording \
-                 {recording_id}",
-                recording.stop_position
-            ),
+            exceeds_limit_message(replay_position, recording.stop_position, recording_id),
         ));
     }
 
     None
+}
+
+/// `ArchiveException.buildReplayExceedsLimitErrorMsg` (`client/ArchiveException.java:244-251`).
+///
+/// One builder for two refusals, and both call it: a position at or past a
+/// stopped recording's stop (`ArchiveConductor.java:2282`) and one past a
+/// bounded replay's limit (`:837-839`). The word is **limit** in both, which is
+/// the reference's choice and not the recording's field name.
+fn exceeds_limit_message(replay_position: i64, limit_position: i64, recording_id: i64) -> String {
+    format!(
+        "requested replay start position={replay_position} must be less than the limit \
+         position={limit_position} for recording {recording_id}"
+    )
 }
 
 /// The channel a replay publishes on (`ArchiveConductor.java:891-901`).
@@ -1812,6 +1826,15 @@ pub fn replay_channel(
         builder.response_correlation_id(correlation_id.to_string());
     }
 
+    // `positionBitsToShift` and a bitmask, which is what the reference's
+    // `initialPosition` does (`ChannelUriStringBuilder.java:1635-1641`) — not
+    // `Aeron.termId`/`termOffset`'s division and modulo, which some other
+    // callers use. The distinction only shows for a term length that is not a
+    // power of two, where both sides produce a term id neither would defend;
+    // ours shifts by nothing and the reference shifts by `floor(log2)`. No
+    // recording the archive can hold has such a length — the driver refuses
+    // one, and `ReplaySession::new` refuses it again — so this is recorded and
+    // not repaired.
     let bits_to_shift = bits_to_shift(term_buffer_length).unwrap_or(0);
     let term_id = i32::try_from(replay_position >> bits_to_shift)
         .unwrap_or(0)
@@ -2606,6 +2629,12 @@ impl Sessions {
 
         // `startBoundedReplay` (`:996-1035`), which runs **before** the replay
         // proper and hands it a counter rather than a number.
+        //
+        // The refusal's **prefix** is the reference's own (`:1018-1023`); its
+        // reason is not. The reference wraps `new Counter(countersReader, id)`
+        // in a `try` and appends `ex.getMessage()`, which for a missing slot is
+        // whatever the counter's own lookup threw; this build's lookup answers
+        // an `Option` and the reason is spelled out instead.
         let limit = match request.limit_counter_id {
             Some(limit_counter_id) => match resolve_limit_counter(counters, limit_counter_id) {
                 Some(limit) => Some(limit),
@@ -2614,7 +2643,10 @@ impl Sessions {
                         session_id,
                         correlation_id,
                         0,
-                        format!("failed to find counter: limitCounterId={limit_counter_id}"),
+                        format!(
+                            "unable to create replay limit counter id= {limit_counter_id} \
+                             because of: no such counter is allocated"
+                        ),
                     );
                     return;
                 }
@@ -2663,8 +2695,29 @@ impl Sessions {
                 correlation_id,
                 0,
                 format!(
-                    "fileIoMaxLength={} must be at least mtuLength={}",
+                    "fileIoMaxLength={} < mtuLength={}",
                     request.file_io_max_length, recording.mtu_length
+                ),
+            );
+            return;
+        }
+
+        // `:821-829`: and so has the archive's **own** replay buffer, which is
+        // what a request that named no length is read into
+        // (`aeron.archive.file.io.max.length`, 1 MiB by default). An archive
+        // configured below its recordings' MTUs refuses a replay rather than
+        // reading blocks that cannot hold a frame.
+        let archive_buffer = self.recording.file_io_max_length;
+        let mtu_length = usize::try_from(recording.mtu_length).unwrap_or(0);
+
+        if archive_buffer < mtu_length {
+            self.refuse_replay(
+                session_id,
+                correlation_id,
+                0,
+                format!(
+                    "replayBufferCapacity={archive_buffer} < mtuLength={}",
+                    recording.mtu_length
                 ),
             );
             return;
@@ -2698,11 +2751,7 @@ impl Sessions {
                         session_id,
                         correlation_id,
                         INVALID_POSITION,
-                        format!(
-                            "replayPosition={replay_position} must be <= limitPosition={limit} \
-                             for recording {}",
-                            request.recording_id
-                        ),
+                        exceeds_limit_message(replay_position, limit, request.recording_id),
                     );
                     return;
                 }
@@ -2728,6 +2777,15 @@ impl Sessions {
             let to_stop = stop_position - replay_position;
 
             if to_stop == 0 {
+                // **The deviation, recorded.** The reference sends this error
+                // and then **falls through** (`:855-867` has no `return`), so it
+                // goes on to create the publication with `replayLength == 0` and
+                // that session's OK carrying a `replaySessionId` is offered for
+                // the same correlation id the error just answered. One request,
+                // two responses. Neither client can tell — `pollForResponse`
+                // takes the first match, and the error is first — and no C case
+                // asserts the count, so this is a missing `return` upstream
+                // rather than a behaviour. This build refuses and stops.
                 self.refuse_replay(
                     session_id,
                     correlation_id,
@@ -2996,11 +3054,15 @@ impl Sessions {
 
                     match self.open_replay(client, catalog, &replay, registration_id, now_ms) {
                         Some(entry) => {
+                            // **After** the handover succeeds, not before it:
+                            // see [`CreateReplayPublicationSession::hand_over`]
+                            // for what clearing it any earlier strands.
+                            creating.hand_over();
                             self.replay_sessions.insert(entry.session_id(), entry);
                         }
                         None => {
                             // The recording went away between the check and the
-                            // publication: give the slot back and say so.
+                            // publication: give it back to the driver and say so.
                             creating.close(client);
                             self.on_replay_end();
                             self.refuse_replay(
@@ -3044,14 +3106,33 @@ impl Sessions {
         let facts = ReplayPublications::facts(client, registration_id)?;
         let replay_session_id = self.mint_replay_session_id(facts.session_id);
 
-        // `min(fileIoMaxLength, ctx.replayBuffer().capacity())` (`:958-966`): the
-        // request's block size when it named one, the recording's own term when
-        // it did not. A read is bounded by the term as well, so a buffer that
-        // holds one is never the thing that limits it.
-        let buffer_capacity = usize::try_from(replay.file_io_max_length)
-            .ok()
-            .filter(|length| *length > 0)
-            .unwrap_or(recording.term_buffer_length as usize);
+        // `ArchiveConductor.newReplaySession` (`:956-966`): the request's block
+        // size when it named one **and it is smaller than the archive's**, and
+        // the archive's own otherwise.
+        //
+        // The archive's is `ctx.replayBuffer().capacity()`, and that buffer is
+        // allocated once, lazily, at `ctx.fileIoMaxLength()`
+        // (`Archive.java:3717-3720`) — `aeron.archive.file.io.max.length`,
+        // 1 MiB by default. **A first reading of this got it wrong**: the term
+        // buffer of the recording is not what bounds a replay's read here, and
+        // taking it for that made every session allocate up to 16 MiB where the
+        // reference allocates nothing past its one buffer.
+        //
+        // **The deviation, recorded**: the reference has exactly **one** buffer
+        // for the whole archive and every session slices it
+        // (`new UnsafeBuffer(ctx.replayBuffer(), 0, fileIoMaxLength)`), because
+        // a buffer lives only inside one `replay()` call. This build gives each
+        // session its own, which is the same size and the same behaviour and
+        // twenty times the memory at the default bound. Sharing one would mean
+        // a session borrowing the archive's, and the sessions are owned values
+        // in a map.
+        let archive_buffer = self.recording.file_io_max_length;
+        let requested = usize::try_from(replay.file_io_max_length).unwrap_or(0);
+        let buffer_capacity = if requested > 0 && requested < archive_buffer {
+            requested
+        } else {
+            archive_buffer
+        };
 
         // `connectDeadlineMs = epochClock.time() + connectTimeoutMs`
         // (`ReplaySession.java:166`): the publication has this long to connect,
@@ -3176,18 +3257,18 @@ impl Sessions {
             // A replay that ran to its end is **closed**, so the driver's linger
             // can retransmit its tail; one that failed or was cancelled is
             // **revoked** (`ReplaySession.java:175-194`).
-            if entry.session.is_revoking() {
-                ReplayPublications::release_publication(
-                    client,
-                    entry.registration_id,
-                    self.command_timeout,
-                );
-            } else {
-                ReplayPublications::close_publication(
-                    client,
-                    entry.registration_id,
-                    self.command_timeout,
-                );
+            //
+            // Through [`Published`], which is where that pair lives and where
+            // its test is: the session's own `close`/`revoke` cannot be the
+            // caller, because the client a teardown needs is the conductor's.
+            // A publication the client no longer holds is one the driver has
+            // already taken back, so there is nothing to give it.
+            if let Some(mut published) = Published::new(client, entry.registration_id) {
+                if entry.session.is_revoking() {
+                    published.revoke();
+                } else {
+                    published.close();
+                }
             }
 
             self.on_replay_end();
@@ -7168,6 +7249,54 @@ mod tests {
         assert!(EndedSession::reason_rejects_image(Some(
             "authentication rejected"
         )));
+    }
+
+    /// The three refusals of a replay position carry the reference's own words
+    /// and its two codes (`ArchiveConductor.java:2256-2288` over
+    /// `client/ArchiveException.java:244-268`).
+    ///
+    /// They are client-visible protocol text — the archive's error messages are
+    /// the one part of the wire a reference test asserts verbatim — and the
+    /// alignment refusal's code is **zero**, because the reference's
+    /// `sendErrorResponse(correlationId, msg)` there is the overload that
+    /// carries no code.
+    #[test]
+    fn a_replay_position_is_refused_in_the_references_words() {
+        let (dir, catalog) = catalog_with_a_recording();
+        let recording = catalog.recording(0).expect("the recording");
+        let _dir = dir;
+
+        assert_eq!(
+            Some((
+                0,
+                "requested replay start position=1000 is not a multiple of FRAME_ALIGNMENT (32) for \
+                 recording 0"
+                    .to_owned()
+            )),
+            invalid_replay_position(0, 1000, &recording)
+        );
+
+        assert_eq!(
+            Some((
+                INVALID_POSITION,
+                "requested replay start position=2048 is less than recording start position=4096 \
+                 for recording 0"
+                    .to_owned()
+            )),
+            invalid_replay_position(0, 2048, &recording)
+        );
+
+        assert_eq!(
+            Some((
+                INVALID_POSITION,
+                "requested replay start position=8192 must be less than the limit position=8192 \
+                 for recording 0"
+                    .to_owned()
+            )),
+            invalid_replay_position(0, 8192, &recording)
+        );
+
+        assert_eq!(None, invalid_replay_position(0, 4096, &recording));
     }
 
     /// The protocol major is derived from the version stamped on every

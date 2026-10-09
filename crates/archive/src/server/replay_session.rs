@@ -101,11 +101,6 @@ pub trait Publication {
     fn offer_block(&mut self, block: &[u8]) -> Option<Appended>;
     /// `publication.appendPadding(length)`.
     fn append_padding(&mut self, length: usize) -> Option<Appended>;
-    /// `publication.revoke()`: an error or an abort tears the stream down now,
-    /// with no linger (`ReplaySession.java:175-194`).
-    fn revoke(&mut self);
-    /// `publication.close()`, which honours the linger.
-    fn close(&mut self);
 }
 
 /// What one turn did, in the terms the conductor has to act on.
@@ -375,9 +370,20 @@ impl ReplaySession {
 
         if !publication.is_connected() {
             if now_ns >= self.connect_deadline_ns {
+                // The reference names both from the publication
+                // (`ReplaySession.java:346-347`): `…for replayChannel=` +
+                // `publication.channel()` + `, replayStreamId=` +
+                // `publication.streamId()`. **This build can name only the
+                // stream**: the channel is not on this build's publication
+                // object, and plumbing it through the client's add path for one
+                // message on a path only a five-second timeout reaches is not
+                // worth the surface. Recorded rather than left silent.
                 return self.raise(
                     GENERIC,
-                    "no connection established for replayChannel".to_owned(),
+                    format!(
+                        "no connection established for replayStreamId={}",
+                        publication.stream_id()
+                    ),
                 );
             }
 
@@ -507,9 +513,17 @@ impl ReplaySession {
         }
 
         if batch_offset > 0 {
-            let block = self.buffer.get(..batch_offset).unwrap_or_default().to_vec();
+            // The block is the buffer itself, offered in place — the reference
+            // hands `replayBuffer` straight to `offerBlock` (`:400-403`) and
+            // copies nothing. This used to `to_vec()` it, which allocated and
+            // copied up to a whole buffer per batch per turn on the path every
+            // replayed byte goes down, and which ADR-0003 forbids.
+            //
+            // The borrow ends with the call: what `offer_block` answers borrows
+            // nothing, so `commit` may still take `&mut self`.
+            let block = self.buffer.get(..batch_offset).unwrap_or_default();
 
-            if !self.commit(publication.offer_block(&block), batch_offset) {
+            if !self.commit(publication.offer_block(block), batch_offset) {
                 // A padding frame on its own is a term boundary the stream never
                 // had, so it goes the way of the batch that did not go out.
                 padding_frame_length = 0;
@@ -649,9 +663,19 @@ impl ReplaySession {
             || term_id != expected_term_id
             || stream_id != self.summary.stream_id
         {
+            // `raiseError("replayPosition=" + framePosition(0) + " does not
+            // point to a valid frame", …)` (`:332-333`), and `framePosition`
+            // spells the four numbers it is made of (`:463-471`). A reference
+            // test asserts this text whole (`ReplaySessionTest.java:311-313`),
+            // so it is spelled the same way here.
             return Err(format!(
-                "replayPosition={} does not point to a valid frame",
-                self.replay_position
+                "replayPosition={position} (segmentFilePosition={segment_file}, \
+                 segmentOffset={segment_offset}, termOffset={header_term_offset}, frameOffset=0) \
+                 does not point to a valid frame",
+                position = self.replay_position,
+                segment_file = self.placement.segment_file_position,
+                segment_offset = self.placement.term_base_segment_offset,
+                header_term_offset = self.placement.term_offset,
             ));
         }
 
@@ -851,13 +875,26 @@ impl<P: ReplayPublications + ?Sized> Publication for Published<'_, P> {
         self.publications
             .append_padding(self.registration_id, length)
     }
+}
 
-    fn revoke(&mut self) {
+impl<P: ReplayPublications + ?Sized> Published<'_, P> {
+    /// `publication.revoke()`: torn down now, with no linger — what a replay
+    /// that **failed or was cancelled** gets (`ReplaySession.java:175-194`).
+    ///
+    /// The pair below is the wrapper's own, and the **conductor** is what calls
+    /// it. The reference's session closes its own publication (`:184-192`),
+    /// because its conductor is the object that holds the Aeron client; here
+    /// the session has no client at all, so the teardown is the conductor's and
+    /// what it tears down through is this — the wrapper, which is what holds
+    /// the registration id.
+    pub fn revoke(&mut self) {
         self.publications
             .release_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
     }
 
-    fn close(&mut self) {
+    /// `publication.close()`, which honours the linger: what a replay that ran
+    /// to its **end** gets, so the driver can retransmit its tail.
+    pub fn close(&mut self) {
         self.publications
             .close_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
     }
@@ -1006,7 +1043,6 @@ mod tests {
         answer: Answer,
         offers: Vec<Vec<u8>>,
         paddings: Vec<usize>,
-        revoked: bool,
     }
 
     impl Fake {
@@ -1017,7 +1053,6 @@ mod tests {
                 answer: Answer::Ok,
                 offers: Vec::new(),
                 paddings: Vec::new(),
-                revoked: false,
             }
         }
 
@@ -1069,12 +1104,6 @@ mod tests {
 
             self.outcome()
         }
-
-        fn revoke(&mut self) {
-            self.revoked = true;
-        }
-
-        fn close(&mut self) {}
     }
 
     /// Drive until the session ends, answering every turn.

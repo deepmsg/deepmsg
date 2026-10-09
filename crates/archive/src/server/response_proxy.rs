@@ -93,7 +93,7 @@ const INITIAL_BUFFER_LENGTH: usize = 1024;
 const VAR_DATA_LENGTH_PREFIX: usize = 4;
 
 /// Where the publication is (`ControlSession.java:861-887`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Publication {
     /// Nothing has been asked for yet: the reference's `NULL_VALUE`
     /// registration id with no publication.
@@ -106,6 +106,20 @@ enum Publication {
     /// publication — it clears the id when the publication arrives, because
     /// the object is what it uses from then on (`:883-887`).
     InHand(i64),
+    /// The driver refused it, or the registration is no longer this client's.
+    ///
+    /// The reference's `aeron.getExclusivePublication` **throws** here
+    /// (`ControlSession.java:874-882` rethrows anything that is not
+    /// `RESOURCE_TEMPORARILY_UNAVAILABLE`), and the throw climbs out of
+    /// `doWork` and ends the session. This build cannot throw out of a turn, so
+    /// the reason is kept until the session asks for the publication again —
+    /// which it does every turn it is not ready — and
+    /// [`Egress::add_publication`] answers with it, which is the same ending by
+    /// the path the session already has for a channel it cannot use.
+    ///
+    /// Without it the session would poll a registration that will never answer,
+    /// for ever, offering the client nothing and saying nothing.
+    Failed(String),
 }
 
 /// One session's response publication, and the buffer its answers are built in.
@@ -159,8 +173,16 @@ impl Egress for ControlResponseProxy {
         channel: &str,
         stream_id: i32,
     ) -> Result<(), ResponseError> {
-        if self.publication != Publication::NotAskedFor {
-            return Ok(());
+        match &self.publication {
+            // Asked for, and the answer is on its way: not asked for again
+            // (`ControlSession.java:861-867`).
+            Publication::Pending(_) | Publication::InHand(_) => return Ok(()),
+            // The reference's throw, delivered where the session already knows
+            // what to do with it.
+            Publication::Failed(message) => {
+                return Err(ResponseError::new(message.clone()));
+            }
+            Publication::NotAskedFor => {}
         }
 
         let registration_id = publications
@@ -178,18 +200,37 @@ impl Egress for ControlResponseProxy {
 
     fn is_publication_ready<P: Publications>(&mut self, publications: &mut P) -> bool {
         let Publication::Pending(registration_id) = self.publication else {
-            return self.publication != Publication::NotAskedFor;
+            // In hand is ready; **a refusal is not**, and answering `true` for
+            // one would walk the session past this check and leave it offering
+            // into a publication that does not exist. `false` sends it back
+            // through `add_publication`, which is where a refusal is turned
+            // into the session's ending.
+            return matches!(self.publication, Publication::InHand(_));
         };
 
-        if matches!(
-            publications.poll_exclusive_publication(registration_id),
-            AsyncAddPoll::Ready
-        ) {
-            self.publication = Publication::InHand(registration_id);
-            return true;
+        match publications.poll_exclusive_publication(registration_id) {
+            AsyncAddPoll::Ready => {
+                self.publication = Publication::InHand(registration_id);
+                true
+            }
+            // The reference's `RESOURCE_TEMPORARILY_UNAVAILABLE`: wait and look
+            // again (`ControlSession.java:876-880`).
+            AsyncAddPoll::Awaiting => false,
+            AsyncAddPoll::Failed(error) => {
+                self.publication = Publication::Failed(format!(
+                    "control response publication could not be created: {error}"
+                ));
+                false
+            }
+            AsyncAddPoll::Unknown => {
+                self.publication = Publication::Failed(
+                    "control response publication could not be created: registration is not this \
+                     client's"
+                        .to_owned(),
+                );
+                false
+            }
         }
-
-        false
     }
 
     fn is_connected<P: Publications>(&self, publications: &P) -> bool {
@@ -608,6 +649,23 @@ mod tests {
         /// How many publications were asked for, which the reference asks for
         /// at most once (`ControlSession.java:861-867`).
         adds: usize,
+        /// What the driver says about the publication, which is `Ready` unless
+        /// a test is about the other two answers.
+        poll: Poll,
+    }
+
+    /// What `poll_exclusive_publication` answers, as a copyable stand-in for
+    /// [`AsyncAddPoll`] — which is not `Clone`, and should not be, since
+    /// `CommandError` can carry an `io::Error`.
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    enum Poll {
+        #[default]
+        Ready,
+        /// `RESOURCE_TEMPORARILY_UNAVAILABLE`, which the reference waits on.
+        Awaiting,
+        /// The driver refused it, which the reference **throws** on
+        /// (`ControlSession.java:876-881`).
+        Refused,
     }
 
     impl FakePublications {
@@ -628,7 +686,11 @@ mod tests {
         }
 
         fn poll_exclusive_publication(&mut self, _registration_id: i64) -> AsyncAddPoll {
-            AsyncAddPoll::Ready
+            match self.poll {
+                Poll::Ready => AsyncAddPoll::Ready,
+                Poll::Awaiting => AsyncAddPoll::Awaiting,
+                Poll::Refused => AsyncAddPoll::Failed(CommandError::Encoding),
+            }
         }
 
         fn async_remove_publication(&mut self, _registration_id: i64, _timeout: Duration) {}
@@ -1054,6 +1116,75 @@ mod tests {
             proxy.offer(&mut publications, &a_control_response(None))
         );
         assert_eq!(SEND_ATTEMPTS, publications.offered.len());
+    }
+
+    /// A publication the driver **refuses** ends the session, rather than
+    /// leaving it polling a registration that will never answer.
+    ///
+    /// The reference throws here (`ControlSession.java:876-881` rethrows
+    /// anything that is not `RESOURCE_TEMPORARILY_UNAVAILABLE`), and the throw
+    /// climbs out of `doWork`. This build cannot throw out of a turn, so
+    /// `is_publication_ready` keeps the reason and the next `add_publication` —
+    /// which the session makes every turn it is not ready — answers with it,
+    /// which the session already knows how to end on.
+    #[test]
+    fn a_refused_publication_is_answered_with_its_reason() {
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut publications = FakePublications {
+            poll: Poll::Refused,
+            ..FakePublications::default()
+        };
+
+        proxy
+            .add_publication(&mut publications, "aeron:ipc", 20)
+            .expect("added");
+
+        assert!(
+            !proxy.is_publication_ready(&mut publications),
+            "a refusal is not readiness"
+        );
+
+        let error = proxy
+            .add_publication(&mut publications, "aeron:ipc", 20)
+            .expect_err("and the session is told why");
+
+        assert!(
+            error
+                .message()
+                .starts_with("control response publication could not be created"),
+            "{error}"
+        );
+        assert_eq!(1, publications.adds, "and nothing was asked for again");
+
+        // Asked again — which the session does every turn it is not ready — it
+        // is still not ready. Answering `true` for a refusal would walk the
+        // session past this check and leave it offering into a publication that
+        // does not exist, which is the silence this path exists to avoid.
+        assert!(!proxy.is_publication_ready(&mut publications));
+        assert_eq!(None, proxy.publication(), "and it is not in hand");
+    }
+
+    /// A driver that has not answered is **not** a refusal: the session waits,
+    /// and the registration is not asked for a second time.
+    #[test]
+    fn a_publication_the_driver_has_not_answered_yet_is_waited_on() {
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut publications = FakePublications {
+            poll: Poll::Awaiting,
+            ..FakePublications::default()
+        };
+
+        proxy
+            .add_publication(&mut publications, "aeron:ipc", 20)
+            .expect("added");
+
+        assert!(!proxy.is_publication_ready(&mut publications));
+        proxy
+            .add_publication(&mut publications, "aeron:ipc", 20)
+            .expect("waited on, not refused");
+
+        assert_eq!(1, publications.adds, "asked for once");
+        assert_eq!(None, proxy.publication(), "and not in hand");
     }
 
     /// Nothing is asked for twice while the driver has not answered
