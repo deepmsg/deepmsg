@@ -149,6 +149,7 @@ use crate::server::recording_session::RecordingSession;
 use crate::server::replay_session::{
     Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
 };
+use crate::server::replayer::Replayer;
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
@@ -1620,6 +1621,13 @@ pub struct Sessions {
     creating_replays: Vec<CreateReplayPublicationSession>,
     /// The settings a replay is answered from.
     replay: ReplaySettings,
+    /// `ArchiveConductor.Replayer`'s counters (`ArchiveConductor.java:2745-2791`):
+    /// how many replays are open (112) and what the reads have cost (108-110).
+    ///
+    /// The replay sessions are driven from this same struct rather than by a
+    /// worker of their own — that is P2-9a's — so the totals are fed from
+    /// [`Sessions::drive_replay_sessions`] and the four are allocated here.
+    replayer: Replayer,
     /// `controlSessionByReplayToken` (`ArchiveConductor.java:153`): the tokens
     /// a replay on a client's **response channel** is asked for and answered
     /// with, by the token that names them.
@@ -2018,6 +2026,7 @@ impl Sessions {
             num_active_replays: 0,
             replay_sessions: HashMap::new(),
             creating_replays: Vec::new(),
+            replayer: Replayer::new(archive_id),
             replay_tokens: HashMap::new(),
         }
     }
@@ -2079,6 +2088,8 @@ impl Sessions {
     ) {
         self.allocate_session_counter(client, counters);
         self.allocate_recording_session_counter(client, counters);
+        self.replayer
+            .allocate(client, counters, self.command_timeout);
         // Expired replay tokens are swept before anything is asked of them,
         // which is where the reference sweeps them: right after the adapter has
         // read the turn's requests (`ArchiveConductor.java:389-391`).
@@ -3038,13 +3049,19 @@ impl Sessions {
         catalog: &Catalog,
         now_ms: i64,
     ) {
-        self.claim_creating_replays(client, catalog, now_ms);
+        self.claim_creating_replays(client, counters, catalog, now_ms);
         self.drive_replay_sessions(client, counters, now_ms);
     }
 
     /// Take up the publications that have appeared, and give back the slots of
     /// the ones that will not.
-    fn claim_creating_replays(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
+    fn claim_creating_replays(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &Catalog,
+        now_ms: i64,
+    ) {
         for mut creating in std::mem::take(&mut self.creating_replays) {
             match creating.do_work(client) {
                 CreationProgress::Idle => self.creating_replays.push(creating),
@@ -3058,6 +3075,10 @@ impl Sessions {
                             // see [`CreateReplayPublicationSession::hand_over`]
                             // for what clearing it any earlier strands.
                             creating.hand_over();
+                            // `newReplaySession`'s
+                            // `ctx.replaySessionCounter().incrementRelease()`
+                            // (`:993`).
+                            self.replayer.session_opened(counters);
                             self.replay_sessions.insert(entry.session_id(), entry);
                         }
                         None => {
@@ -3177,6 +3198,11 @@ impl Sessions {
         let now_ns = u64::try_from(now_ms.saturating_mul(1_000_000)).unwrap_or(u64::MAX);
         let mut owed: Vec<Deferred> = Vec::new();
         let mut finished: Vec<i64> = Vec::new();
+        // `Replayer.doWork`'s `workCount` (`ArchiveConductor.java:2779-2790`):
+        // what decides whether the three read statistics are published this
+        // turn. A session that did something and a session that was closed both
+        // count, which is what the reference's `SessionWorker` counts too.
+        let mut work = 0;
 
         // `notExtended` (`ReplaySession.java:544-578`), read out before the
         // sessions are walked because it is the conductor that can see a
@@ -3220,7 +3246,23 @@ impl Sessions {
                 continue;
             };
 
-            match entry.session.do_work(&mut published, now_ns) {
+            let progress = entry.session.do_work(&mut published, now_ns);
+
+            // `replayer.bytesRead(bytesRead)` and `replayer.readTimeNs(…)`
+            // (`:431-434`), which the reference does inside the session because
+            // the session holds the replayer. Here the session has worked the
+            // two numbers out for this turn and the replayer is the
+            // conductor's, so they are handed over.
+            self.replayer.read(
+                u64::try_from(entry.session.read_bytes()).unwrap_or(u64::MAX),
+                entry.session.read_time_ns(),
+            );
+
+            if !matches!(progress, ReplayProgress::Idle) {
+                work += 1;
+            }
+
+            match progress {
                 ReplayProgress::Started => {
                     if !entry.started {
                         entry.started = true;
@@ -3271,8 +3313,18 @@ impl Sessions {
                 }
             }
 
+            // `closeReplaySession`'s `ctx.replaySessionCounter().decrementRelease()`
+            // (`:1382`), which is what makes 112 the count of replays that are
+            // **open** rather than the count that have ever run.
+            self.replayer.session_closed(counters);
+            work += 1;
+
             self.on_replay_end();
         }
+
+        // `Replayer.doWork`'s tail (`:2779-2790`): the three statistics go out
+        // on a turn that did work, and not otherwise.
+        self.replayer.publish_if(counters, work);
 
         self.pending.extend(owed);
     }

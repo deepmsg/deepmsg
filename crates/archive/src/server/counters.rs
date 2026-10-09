@@ -97,9 +97,25 @@ pub const ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID: i32 = 106;
 /// (`AeronCounters.java:785`).
 pub const ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID: i32 = 107;
 
+/// `AeronCounters.ARCHIVE_REPLAYER_MAX_READ_TIME_TYPE_ID`
+/// (`AeronCounters.java:792`).
+pub const ARCHIVE_REPLAYER_MAX_READ_TIME_TYPE_ID: i32 = 108;
+
+/// `AeronCounters.ARCHIVE_REPLAYER_TOTAL_READ_BYTES_TYPE_ID`
+/// (`AeronCounters.java:799`).
+pub const ARCHIVE_REPLAYER_TOTAL_READ_BYTES_TYPE_ID: i32 = 109;
+
+/// `AeronCounters.ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID`
+/// (`AeronCounters.java:806`).
+pub const ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID: i32 = 110;
+
 /// `AeronCounters.ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID`
 /// (`AeronCounters.java:812`).
 pub const ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID: i32 = 111;
+
+/// `AeronCounters.ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID`
+/// (`AeronCounters.java:818`).
+pub const ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID: i32 = 112;
 
 /// `ArchiveCounters.ARCHIVE_ID_LABEL_SUFFIX` (`ArchiveCounters.java:35`), which
 /// every archive counter's label ends with.
@@ -118,6 +134,17 @@ pub const RECORDER_MAX_WRITE_TIME_NAME: &str = "archive-recorder max write time 
 pub const RECORDER_TOTAL_WRITE_BYTES_NAME: &str = "archive-recorder total write bytes";
 /// See [`RECORDER_MAX_WRITE_TIME_NAME`].
 pub const RECORDER_TOTAL_WRITE_TIME_NAME: &str = "archive-recorder total write time in ns";
+
+/// The name the 112 counter is allocated under (`Archive.java:1581`).
+pub const REPLAY_SESSIONS_NAME: &str = "Archive Replay Sessions";
+
+/// The names the replayer's three counters are allocated under
+/// (`Archive.java:1635`, `:1646`, `:1657`).
+pub const REPLAYER_MAX_READ_TIME_NAME: &str = "archive-replayer max read time in ns";
+/// See [`REPLAYER_MAX_READ_TIME_NAME`].
+pub const REPLAYER_TOTAL_READ_BYTES_NAME: &str = "archive-replayer total read bytes";
+/// See [`REPLAYER_MAX_READ_TIME_NAME`].
+pub const REPLAYER_TOTAL_READ_TIME_NAME: &str = "archive-replayer total read time in ns";
 
 /// `ControlSessionCounter.NAME` and the separator after it
 /// (`ControlSessionCounter.java:57`, `:75-76`). One constant, because nothing
@@ -673,6 +700,119 @@ pub fn claim_archive_id_counter<C: Counters, Access>(
     check_type_id(counters, counter_id, type_id)?;
 
     Ok(Some(ArchiveIdCounter { counter_id }))
+}
+
+/// One kind of archive-id-keyed counter: the two things
+/// [`ArchiveIdCounter::allocate`] needs, and the list they are allocated in.
+///
+/// The reference allocates a block of these in `Archive.Context.conclude`
+/// (`Archive.java:1575-1660`) — 112 and the replayer's three, then the
+/// recorder's three — and this trait is what makes one loop out of a block
+/// instead of one loop per owner.
+pub trait CounterKind: Copy + PartialEq + 'static {
+    /// Every kind in this block, in the order the reference allocates them.
+    const ORDER: &'static [Self];
+
+    /// The type id `ArchiveCounters.allocate` is called with.
+    fn type_id(self) -> i32;
+
+    /// The name the label is built from.
+    fn name(self) -> &'static str;
+}
+
+/// The reference's `ArchiveCounters.allocate` (`ArchiveCounters.java:52-69`),
+/// as far as a build that does not drive its own driver can take it.
+///
+/// The reference calls it once per counter and blocks until the driver answers,
+/// because its archive drives the driver. Here each add is a command whose
+/// answer arrives on a later turn, so a block of them is a small state machine:
+/// ask for the first kind not in hand, take it up when the driver answers, and
+/// ask for the next.
+///
+/// **One at a time** rather than all at once, which keeps the state one
+/// registration id instead of N — the order is the reference's anyway. A refusal
+/// is not retried and does not stop the others: a counter the driver will not
+/// make can never become one, and an archive without its counters still serves.
+#[derive(Debug)]
+pub struct CounterAllocator<K: CounterKind> {
+    /// The kinds already taken up, while the rest are still on their way.
+    held: Vec<(K, ArchiveIdCounter)>,
+    /// The kind being asked for, and the registration id the add drew — `None`
+    /// between one counter arriving and the next being asked for.
+    pending: Option<(K, i64)>,
+    /// What every one of them is keyed by (`ArchiveCounters.allocate`).
+    archive_id: i64,
+}
+
+impl<K: CounterKind> CounterAllocator<K> {
+    /// An allocator for an archive with this id.
+    #[must_use]
+    pub const fn new(archive_id: i64) -> Self {
+        Self {
+            held: Vec::new(),
+            pending: None,
+            archive_id,
+        }
+    }
+
+    /// One turn of the allocation loop.
+    pub fn drive<C: Counters, Access>(
+        &mut self,
+        client: &mut C,
+        counters: &CountersReader<'_, Access>,
+        timeout: Duration,
+    ) {
+        let Some((kind, registration_id)) = self.pending else {
+            let Some(kind) = K::ORDER.iter().find(|kind| !self.holds(**kind)).copied() else {
+                return;
+            };
+
+            match request_archive_id_counter(
+                client,
+                kind.type_id(),
+                kind.name(),
+                self.archive_id,
+                timeout,
+            ) {
+                Ok(registration_id) => self.pending = Some((kind, registration_id)),
+                // A command that would not go out is one this build has already
+                // given up on: the next turn asks again for the first kind it
+                // does not hold.
+                Err(_) => self.pending = None,
+            }
+
+            return;
+        };
+
+        match claim_archive_id_counter(client, counters, kind.type_id(), registration_id) {
+            Ok(Some(counter)) => {
+                self.held.push((kind, counter));
+                self.pending = None;
+            }
+            Ok(None) => {}
+            Err(_) => self.pending = None,
+        }
+    }
+
+    /// Whether every kind in the block is in hand.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.held.len() == K::ORDER.len()
+    }
+
+    /// One of them, once it is in hand.
+    #[must_use]
+    pub fn counter(&self, kind: K) -> Option<ArchiveIdCounter> {
+        self.held
+            .iter()
+            .find(|(held, _)| *held == kind)
+            .map(|(_, counter)| *counter)
+    }
+
+    /// Whether one of them is in hand.
+    fn holds(&self, kind: K) -> bool {
+        self.counter(kind).is_some()
+    }
 }
 
 /// `validateCounterTypeId` (`AeronCounters.java:1540-1547`), which the four

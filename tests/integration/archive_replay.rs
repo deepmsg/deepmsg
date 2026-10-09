@@ -266,6 +266,41 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
         "the replay ran to the recording's stop position"
     );
 
+    // The replayer's counters, which the archive allocates at startup and the
+    // replay has just moved (`AeronCounters`: 108, 109, 110, 112). The labels
+    // are the reference's own, and they are what a reader of the counters
+    // region — `AeronStat`, or anybody's dashboard — finds them by.
+    let counters = archive.client.counters_reader().expect("a counters region");
+    let by_label = |prefix: &str| {
+        let mut found = None;
+
+        counters.for_each(|descriptor| {
+            if descriptor.label.starts_with(prefix) {
+                found = counters.value(descriptor.counter_id);
+            }
+        });
+
+        found
+    };
+
+    assert_eq!(
+        Some(0),
+        by_label("Archive Replay Sessions"),
+        "112 is the replays that are **open**, and this one ran to its end"
+    );
+    assert!(
+        by_label("archive-replayer total read bytes").is_some_and(|bytes| bytes > 0),
+        "109 counted the bytes the replay read"
+    );
+    assert!(
+        by_label("archive-replayer max read time in ns").is_some_and(|ns| ns > 0),
+        "and 108 the longest single read"
+    );
+    assert!(
+        by_label("archive-replayer total read time in ns").is_some_and(|ns| ns > 0),
+        "and 110 all of them together"
+    );
+
     let _ = archive.stop();
 }
 

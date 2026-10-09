@@ -45,6 +45,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use deepmsg_core::clock::monotonic_nano_time;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::{FRAME_ALIGNMENT, TERM_MAX_LENGTH};
 use deepmsg_core::logbuffer::frame::{
@@ -147,7 +148,16 @@ pub struct ReplaySession {
     error: Option<(i32, String)>,
     revoke: bool,
     aborted: bool,
+    /// What this turn's read was: the bytes `readRecording` answered with, and
+    /// the nanoseconds the read and the frame walk took — the two numbers the
+    /// replayer's counters 108–110 are fed (`ArchiveConductor.java:431-434`).
+    ///
+    /// **This turn's**, not a running total: the totals are the replayer's
+    /// (`crate::server::replayer::ReadTotals`), which is where the reference
+    /// keeps them too, and a session that added up its own would be a second
+    /// copy of the same number.
     read_bytes: usize,
+    read_time_ns: u64,
     connect_deadline_ns: u64,
 }
 
@@ -202,6 +212,7 @@ impl ReplaySession {
             revoke: false,
             aborted: false,
             read_bytes: 0,
+            read_time_ns: 0,
             connect_deadline_ns,
         })
     }
@@ -282,11 +293,20 @@ impl ReplaySession {
         self.revoke
     }
 
-    /// Bytes read from storage, for the replayer's counters 108–110
-    /// (`ArchiveConductor.Replayer`, `:2746-2791`).
+    /// The bytes this turn's read answered with, for the replayer's counters
+    /// 108–110 (`ArchiveConductor.Replayer`, `:2764-2777`). Zero on a turn that
+    /// read nothing.
     #[must_use]
     pub const fn read_bytes(&self) -> usize {
         self.read_bytes
+    }
+
+    /// How long this turn's read and frame walk took, in nanoseconds — the
+    /// reference's `readTimeNs` (`:431`), which is measured around both
+    /// (`:399` against `:431`) and not around the offer.
+    #[must_use]
+    pub const fn read_time_ns(&self) -> u64 {
+        self.read_time_ns
     }
 
     /// `Session.abort` (`ReplaySession.java:249-252`): the **flag**, and
@@ -301,6 +321,11 @@ impl ReplaySession {
 
     /// One turn: `ReplaySession.doWork` (`:209-243`).
     pub fn do_work(&mut self, publication: &mut dyn Publication, now_ns: u64) -> Progress {
+        // This turn's read, which the conductor reads back after this call —
+        // so it starts from nothing rather than from the last turn's.
+        self.read_bytes = 0;
+        self.read_time_ns = 0;
+
         if self.state == State::Done {
             return Progress::Idle;
         }
@@ -437,6 +462,12 @@ impl ReplaySession {
             return Progress::Idle;
         }
 
+        // The reference's `startNs` (`:399`), which is taken **before** the read
+        // and read back **after** the frame walk (`:431`) — so what the
+        // replayer's read-time counters measure is the file read and the
+        // stamping of every frame, and not the offer that follows.
+        let start_ns = monotonic_nano_time();
+
         let available = self.stop_position - self.replay_position;
         let bytes_read = self.read_recording(available);
 
@@ -511,6 +542,12 @@ impl ReplaySession {
                 );
             }
         }
+
+        // `replayer.bytesRead(bytesRead)` and `replayer.readTimeNs(readTimeNs)`
+        // (`:431-434`), which the reference does here — after the walk, before
+        // the offer.
+        self.read_bytes = bytes_read;
+        self.read_time_ns = monotonic_nano_time().saturating_sub(start_ns) as u64;
 
         if batch_offset > 0 {
             // The block is the buffer itself, offered in place — the reference
@@ -606,8 +643,6 @@ impl ReplaySession {
                 Err(_) => break,
             }
         }
-
-        self.read_bytes += limit;
 
         limit
     }
