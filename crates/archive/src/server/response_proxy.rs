@@ -555,10 +555,22 @@ impl ReplayPublications for Client {
     }
 
     fn release_publication(&mut self, registration_id: i64, timeout: Duration) {
-        // `publication.revoke()` is the removal **with the revoke flag**, which
-        // is what tells every reader the stream is not merely over
-        // (`Publication.java:326`).
-        let _ = Client::revoke_publication(self, registration_id, timeout);
+        // `revokeOnClose()` then an **asynchronous** removal, which is the same
+        // command [`Publications::release_exclusive`] sends and the same one the
+        // reference sends — marked, then closed, with the driver's answer left
+        // for a later poll.
+        //
+        // It must not be `Client::revoke_publication`, which waits for the
+        // driver: the archive's conductor and the driver share a thread in
+        // `deepmsg-archiving-media-driver`, so a command that waits for the
+        // driver is a command that waits for the turn that would answer it. The
+        // stall is not merely slow — the driver's clock jumps by the wait, every
+        // network publication's receivers expire together, and the maintenance
+        // pass then writes `is_connected = 0` into a publication whose subscriber
+        // is still there. That is what killed the control session that asked for
+        // the replay's stop.
+        self.revoke_publication_on_close(registration_id);
+        let _ = Client::async_remove_publication(self, registration_id, timeout);
     }
 
     fn close_publication(&mut self, registration_id: i64, timeout: Duration) {
