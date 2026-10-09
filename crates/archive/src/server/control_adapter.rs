@@ -76,6 +76,7 @@ use deepmsg_client::image::Fragment;
 use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
 use deepmsg_codec::archive::boolean_type::BooleanType;
+use deepmsg_codec::archive::bounded_replay_request_codec::{self, BoundedReplayRequestDecoder};
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
 use deepmsg_codec::archive::extend_recording_request_2_codec::{
@@ -100,12 +101,15 @@ use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_position_request_codec::{
     self, RecordingPositionRequestDecoder,
 };
+use deepmsg_codec::archive::replay_request_codec::{self, ReplayRequestDecoder};
+use deepmsg_codec::archive::replay_token_request_codec::{self, ReplayTokenRequestDecoder};
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_codec::archive::start_position_request_codec::{self, StartPositionRequestDecoder};
 use deepmsg_codec::archive::start_recording_request_2_codec::{
     self, StartRecordingRequest2Decoder,
 };
 use deepmsg_codec::archive::start_recording_request_codec::{self, StartRecordingRequestDecoder};
+use deepmsg_codec::archive::stop_all_replays_request_codec::{self, StopAllReplaysRequestDecoder};
 use deepmsg_codec::archive::stop_position_request_codec::{self, StopPositionRequestDecoder};
 use deepmsg_codec::archive::stop_recording_by_identity_request_codec::{
     self, StopRecordingByIdentityRequestDecoder,
@@ -114,14 +118,31 @@ use deepmsg_codec::archive::stop_recording_request_codec::{self, StopRecordingRe
 use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
+use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestDecoder};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
 };
 
+use deepmsg_core::uri::ChannelUri;
+
+use crate::mark::NULL_VALUE;
 use crate::server::auth::AuthorisationService;
-use crate::server::conductor::Query;
+use crate::server::conductor::{CONTROL_MODE_RESPONSE, Query};
 use crate::server::control_session::SESSION_CLOSED_MSG;
+
+/// The version a replay request's `replayToken` arrived in
+/// (`ControlSessionAdapter.java:83`), which both replay templates gate the
+/// field on.
+///
+/// It matters here and not only in the decoder. The generated reader answers
+/// `i64::MIN` for a request older than the field
+/// (`replay_request_codec.rs:336-342`), where the reference substitutes
+/// `Aeron.NULL_VALUE` (`:226-227`) — and the replay asks the token a question
+/// `NULL_VALUE` is the answer to, so the two are not interchangeable.
+/// `file_io_max_length`, the other version-gated field, only has to be
+/// **not positive**, which both values are.
+pub const REPLAY_TOKEN_VERSION: u16 = 10;
 
 /// How many fragments one subscription is read for in a turn
 /// (`ControlSessionAdapter.java:79`).
@@ -245,6 +266,58 @@ pub struct StartRecordingRequest {
     pub auto_stop: bool,
     /// The channel as the client wrote it.
     pub original_channel: String,
+}
+
+/// One `ReplayRequest` (template **6**) or `BoundedReplayRequest` (template
+/// **18**), as the adapter decoded it
+/// (`ControlSessionAdapter.java:209-252`, `:515-560`).
+///
+/// The two templates differ by one field, `limitCounterId`, and that one field
+/// is the whole of what "bounded" means — so this carries it as an `Option`
+/// rather than having two types that agree on everything else.
+///
+/// **`length` is not resolved here.** Its two sentinels — `-1` follows, `-2`
+/// counts to the stop — are resolved in the conductor, because resolving them
+/// needs the recording's stop position and this side has not read the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartReplayRequest {
+    /// The session that asked.
+    pub session_id: i64,
+    /// The request's correlation id, which its answer echoes.
+    pub correlation_id: i64,
+    /// The recording to replay.
+    pub recording_id: i64,
+    /// Where to start; `Aeron.NULL_VALUE` means the recording's own beginning.
+    pub position: i64,
+    /// How much to send, sentinels and all.
+    pub length: i64,
+    /// The channel as the client wrote it. The **recording's** geometry is
+    /// written onto it by the conductor (`AC:891-901`), which is why what
+    /// travels is the client's channel and not a built one.
+    pub replay_channel: String,
+    /// The stream the replayed frames go out on.
+    pub replay_stream_id: i32,
+    /// How big a block one turn may read; not positive means "the whole buffer"
+    /// (`AC:958-966`). Absent in the request's first version, which the adapter
+    /// passes `NULL_VALUE` for (`CSA:220-221`).
+    pub file_io_max_length: i32,
+    /// A `BoundedReplayRequest`'s limit counter, which a plain `ReplayRequest`
+    /// does not name. **Not read yet** — the bounded slice is its own commit.
+    pub limit_counter_id: Option<i64>,
+    /// The image this request arrived on, when the request came in on a
+    /// **response-channel** token rather than on the session's own image
+    /// (`ControlSessionAdapter.java:1183`).
+    ///
+    /// It is `Image.correlationId()` — the publication's registration id — and
+    /// the conductor writes it onto the replay channel as
+    /// `response-correlation-id`, which is what tells the archive's own driver
+    /// which of its images the replay is the answer to.
+    ///
+    /// `None` on every other path, and the field is named for what it becomes
+    /// rather than for where it came from for the same reason the channel is
+    /// carried as the client wrote it: the adapter hands on a fact and the
+    /// conductor decides what to do with it.
+    pub response_correlation_id: Option<i64>,
 }
 
 /// One `ExtendRecordingRequest2`, as the adapter decoded it
@@ -445,6 +518,67 @@ pub trait ControlPlane {
     /// when the recording session ends, and the session is what the recorder
     /// brings (`:1329-1363`).
     fn on_start_recording(&mut self, request: StartRecordingRequest, now_ms: i64);
+
+    /// `ArchiveConductor.getReplaySession` (`:2654-2667`): which session a
+    /// replay token stands for, or `None` for a token that was never issued,
+    /// belongs to another recording, or has expired.
+    ///
+    /// The reference calls this from
+    /// `setupSessionAndChannelForReplay` (`ControlSessionAdapter.java:1177`)
+    /// **in place of** its session gate — a token names its session, so there
+    /// is no `controlSessionId` to look up and no image to compare. That is
+    /// what makes a response-channel replay possible at all: its request
+    /// arrives on an image the session was never opened on, which the gate
+    /// would refuse (`:1196-1203`).
+    fn replay_session_for_token(
+        &self,
+        replay_token: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) -> Option<i64>;
+
+    /// `ControlSessionAdapter`'s `ReplayTokenRequest` case (`:1084-1105`),
+    /// which is `conductor.generateReplayToken(controlSession, recordingId)`
+    /// and an `OK` that carries the token.
+    ///
+    /// The token is generated here rather than deferred: unlike everything
+    /// else that is deferred, it needs neither the client nor the catalog, and
+    /// the reference generates it the moment it reads the request.
+    fn on_replay_token(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStartReplay` (`ControlSession.java:412-435`), which is
+    /// `ArchiveConductor.startReplay` (`:764-929`).
+    ///
+    /// Deferred for the reason [`ControlPlane::on_start_recording`] is: the
+    /// answer waits for a publication to appear, and the channel is built from
+    /// the **catalog**, which a callback runs without.
+    fn on_start_replay(&mut self, request: StartReplayRequest, now_ms: i64);
+
+    /// `ControlSession.onStopReplay` (`:463-470`). Answered with an `OK` whether
+    /// or not there is such a replay (`AC:1037-1054`).
+    fn on_stop_replay(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        replay_session_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStopAllReplays` (`:472-479`); `NULL_VALUE` for the
+    /// recording id means every replay the archive has (`AC:1056-1064`).
+    fn on_stop_all_replays(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
 
     /// `ControlSession.onStopRecordingSubscription`
     /// (`ControlSession.java:331-338`), which the conductor answers with an `OK`
@@ -1093,6 +1227,203 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // Asking an archive to replay a recording. Two templates again, and the
+        // one field the second added is the whole of "bounded"
+        // (`ControlSessionAdapter.java:515-560` against `:209-252`).
+        //
+        // `file_io_max_length` needs no guard here: the generated decoder
+        // answers `int32::MIN` for a request older than its version
+        // (`replay_request_codec.rs:326-333`), and the reference's own guard
+        // passes `NULL_VALUE` for exactly the same case (`:220-221`). Both are
+        // "not positive", which is all the replay asks of that field.
+        // `replay_token` is **not** like it, and is guarded below.
+        replay_request_codec::SBE_TEMPLATE_ID | bounded_replay_request_codec::SBE_TEMPLATE_ID => {
+            // Read before the decoders, which take the header by value.
+            let acting_version = header.version();
+
+            let (
+                control_session_id,
+                correlation_id,
+                recording_id,
+                position,
+                length,
+                replay_stream_id,
+                file_io_max_length,
+                replay_token,
+                limit_counter_id,
+                channel,
+            ) = if template_id == replay_request_codec::SBE_TEMPLATE_ID {
+                let mut decoder = ReplayRequestDecoder::default().header(header, 0);
+                let coordinates = decoder.replay_channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.recording_id(),
+                    decoder.position(),
+                    decoder.length(),
+                    decoder.replay_stream_id(),
+                    decoder.file_io_max_length(),
+                    token(decoder.replay_token(), acting_version),
+                    None,
+                    decoder.replay_channel_slice(coordinates).to_vec(),
+                )
+            } else {
+                let mut decoder = BoundedReplayRequestDecoder::default().header(header, 0);
+                let coordinates = decoder.replay_channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.recording_id(),
+                    decoder.position(),
+                    decoder.length(),
+                    decoder.replay_stream_id(),
+                    decoder.file_io_max_length(),
+                    token(decoder.replay_token(), acting_version),
+                    Some(i64::from(decoder.limit_counter_id())),
+                    decoder.replay_channel_slice(coordinates).to_vec(),
+                )
+            };
+
+            let channel = String::from_utf8_lossy(&channel).into_owned();
+
+            // **Which session answers** is decided before anything else, and on
+            // this path it is not the gate's answer
+            // (`setupSessionAndChannelForReplay`, `:1165-1190`): a request
+            // carrying a token for a `control-mode=response` channel arrived on
+            // the short-lived publication the client made to ask for one, so
+            // its session's image is not the image it came in on and the gate
+            // would drop it in silence. The token stands in for both halves of
+            // the gate — see [`ControlPlane::replay_session_for_token`].
+            let (asked, response_correlation_id) =
+                if is_response_channel(&channel) && replay_token != NULL_VALUE {
+                    match control.replay_session_for_token(replay_token, recording_id, now_ms) {
+                        // The image the request arrived on, which is the one the
+                        // replay answers (`:1183`).
+                        Some(session_id) => (Some(session_id), Some(image.correlation_id())),
+                        None => {
+                            // The reference throws here (`:1180`), which reaches
+                            // the archive's error handler and sends the client
+                            // nothing; this is that outcome as a value, one
+                            // frame earlier.
+                            control.log_warning(&format!(
+                                "Unknown session or token timeout for \
+                                 replayToken={replay_token} recordingId={recording_id}"
+                            ));
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (
+                        gate(
+                            sessions,
+                            control,
+                            authorisation,
+                            image,
+                            control_session_id,
+                            template_id,
+                            correlation_id,
+                            now_ms,
+                        ),
+                        None,
+                    )
+                };
+
+            if let Some(session_id) = asked {
+                control.on_start_replay(
+                    StartReplayRequest {
+                        session_id,
+                        correlation_id,
+                        recording_id,
+                        position,
+                        length,
+                        replay_channel: channel,
+                        replay_stream_id,
+                        file_io_max_length,
+                        limit_counter_id,
+                        response_correlation_id,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        stop_replay_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopReplayRequestDecoder::default().header(header, 0);
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let replay_session_id = decoder.replay_session_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_replay(session_id, correlation_id, replay_session_id, now_ms);
+            }
+        }
+
+        stop_all_replays_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopAllReplaysRequestDecoder::default().header(header, 0);
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_all_replays(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
+        // A client asking for a **token** to replay with
+        // (`ControlSessionAdapter.java:1084-1105`), which is what lets the
+        // replay itself arrive on a channel of the client's own — see
+        // [`ControlPlane::replay_session_for_token`].
+        //
+        // The request is gated like any other, by the ordinary two gates, even
+        // though the request it enables is not: the token is a capability, and
+        // this is where it is earned.
+        //
+        // It names any recording at all. The reference does **not** ask the
+        // catalog whether there is one (`:1097-1101`), and neither does this:
+        // the replay that spends the token is where a recording is looked up,
+        // and a token for a recording that does not exist is an `OK` followed
+        // by `UNKNOWN_RECORDING`.
+        replay_token_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = ReplayTokenRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_replay_token(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
         stop_recording_subscription_request_codec::SBE_TEMPLATE_ID => {
             let decoder = StopRecordingSubscriptionRequestDecoder::default().header(header, 0);
 
@@ -1305,6 +1636,33 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
     Ok(())
 }
 
+/// A replay token as the reference reads it (`ControlSessionAdapter.java:226-227`).
+///
+/// A request older than [`REPLAY_TOKEN_VERSION`] has no such field, and both
+/// Java and this build substitute a value for it — but **not the same one**:
+/// the reference substitutes `Aeron.NULL_VALUE` and the generated decoder
+/// answers `i64::MIN` (`replay_request_codec.rs:336-342`), and the replay
+/// distinguishes a token from no token by comparing against `NULL_VALUE`. Read
+/// the field only when the request has it.
+fn token(decoded: i64, acting_version: u16) -> i64 {
+    if acting_version >= REPLAY_TOKEN_VERSION {
+        decoded
+    } else {
+        NULL_VALUE
+    }
+}
+
+/// Whether the channel a client asked to be replayed on is one it wants the
+/// answer on (`ChannelUri.hasControlModeResponse`, `ChannelUri.java:653-656`).
+///
+/// A channel that will not parse is not one: the conductor parses it again to
+/// build the replay's channel, and refuses the request there, which is the only
+/// refusal that can name a reason.
+fn is_response_channel(requested: &str) -> bool {
+    ChannelUri::parse(requested)
+        .is_ok_and(|uri| uri.get("control-mode") == Some(CONTROL_MODE_RESPONSE))
+}
+
 /// The two gates every request but a connect, a challenge answer and a close
 /// passes through (`ControlSessionAdapter.java:1192-1216`).
 ///
@@ -1374,6 +1732,8 @@ mod tests {
     use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseEncoder;
     use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestEncoder;
     use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestEncoder;
+    use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
+    use deepmsg_codec::archive::replay_token_request_codec::ReplayTokenRequestEncoder;
     use deepmsg_codec::archive::start_recording_request_codec::{
         SBE_TEMPLATE_ID as START_RECORDING, StartRecordingRequestEncoder,
     };
@@ -1426,6 +1786,24 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             query: Query,
+        },
+        ReplayToken {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        StartReplay {
+            request: StartReplayRequest,
+        },
+        StopReplay {
+            session_id: i64,
+            correlation_id: i64,
+            replay_session_id: i64,
+        },
+        StopAllReplays {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
         },
         ListRecording {
             session_id: i64,
@@ -1484,6 +1862,9 @@ mod tests {
         /// What the sessions' authenticator is taken to have vouched for.
         principal: Option<Vec<u8>>,
         next_session_id: i64,
+        /// The tokens that name a session, by `(token, recording id)`, which is
+        /// the pair a real one is checked against.
+        tokens: HashMap<(i64, i64), i64>,
     }
 
     impl ControlPlane for Recorder {
@@ -1621,6 +2002,63 @@ mod tests {
                 count,
                 stream_id,
                 channel_fragment: channel_fragment.to_vec(),
+            });
+        }
+
+        /// The tokens this double knows, which is how a test says which
+        /// session a token names. Empty unless a test put something in it.
+        fn replay_session_for_token(
+            &self,
+            replay_token: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) -> Option<i64> {
+            self.tokens.get(&(replay_token, recording_id)).copied()
+        }
+
+        fn on_replay_token(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::ReplayToken {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {
+            self.calls.push(Call::StartReplay { request });
+        }
+
+        fn on_stop_replay(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            replay_session_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopReplay {
+                session_id,
+                correlation_id,
+                replay_session_id,
+            });
+        }
+
+        fn on_stop_all_replays(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopAllReplays {
+                session_id,
+                correlation_id,
+                recording_id,
             });
         }
 
@@ -1854,6 +2292,73 @@ mod tests {
         buffer
     }
 
+    /// A `ReplayTokenRequest` (template 105).
+    fn replay_token_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 64];
+
+        let length = {
+            let encoder =
+                ReplayTokenRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `ReplayRequest` (template 6), with both of the fields the version
+    /// guard covers.
+    fn replay_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        replay_token: i64,
+        replay_channel: &str,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 512];
+
+        let length = {
+            let encoder = ReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .position(0)
+                .length(4096)
+                .replay_stream_id(66)
+                .file_io_max_length(4096)
+                .replay_token(replay_token)
+                .replay_channel(replay_channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// The channel the reference's own response-channel replay tests use
+    /// (`client/aeron_archive_test.cpp:3434`).
+    const RESPONSE_CHANNEL: &str = "aeron:udp?control-mode=response|control=localhost:10002";
+
+    /// The recording id every request below names, which is what a token is
+    /// checked against.
+    const RECORDING_ID: i64 = 7;
+
+    /// The token every request below carries when it carries one.
+    const REPLAY_TOKEN: i64 = 4_242;
+
     /// Open a session on [`IMAGE`] and hand back its id.
     fn an_open_session<A: AuthorisationService>(
         adapter: &mut ControlAdapter<A>,
@@ -1965,6 +2470,224 @@ mod tests {
             panic!("not a connect");
         };
         assert_eq!(0, version);
+    }
+
+    /// A `ReplayTokenRequest` reaches the conductor, which is what mints the
+    /// token (`ControlSessionAdapter.java:1084-1105`).
+    ///
+    /// It goes through the same two gates as any other request — the reference
+    /// looks its session up with `getControlSession` (`:1094-1096`), the method
+    /// that checks the image and the authorisation service — because the token
+    /// is a capability and this is where it is earned.
+    #[test]
+    fn a_replay_token_request_reaches_the_session_that_asked() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = replay_token_request(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::ReplayToken {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+            }],
+            control.calls[1..]
+        );
+    }
+
+    /// And it is gated like any other, on both gates — the reference reaches
+    /// its session through `getControlSession` (`ControlSessionAdapter.java:1097-1098`)
+    /// and has nothing else in front of the token.
+    #[test]
+    fn a_replay_token_request_is_gated() {
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = replay_token_request(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::ErrorResponse {
+                session_id,
+                correlation_id: 99,
+                relevant_id: i64::from(UNAUTHORISED_ACTION),
+                message: UNAUTHORISED_ACTION_MSG.to_owned(),
+            }],
+            control.calls[1..],
+            "refused before a token was minted"
+        );
+    }
+
+    /// A replay on a `control-mode=response` channel that carries a token is
+    /// let through by the token: the **token's** session answers, and the image
+    /// the request arrived on goes with it
+    /// (`ControlSessionAdapter.java:1175-1184`).
+    ///
+    /// The session the token names is deliberately not the one the request
+    /// names. That is the whole of what the token does — its request arrives on
+    /// an image the session was never opened on, so the gate could not have
+    /// answered it — and a test that let the two coincide would pass with the
+    /// gate still running.
+    #[test]
+    fn a_response_channel_replay_is_answered_by_the_session_its_token_names() {
+        const TOKEN_SESSION: i64 = 5;
+
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        control
+            .tokens
+            .insert((REPLAY_TOKEN, RECORDING_ID), TOKEN_SESSION);
+
+        let payload = replay_request(session_id, 99, RECORDING_ID, REPLAY_TOKEN, RESPONSE_CHANNEL);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let [Call::StartReplay { request }] = &control.calls[1..] else {
+            panic!("not one replay: {:?}", control.calls);
+        };
+
+        assert_eq!(TOKEN_SESSION, request.session_id, "the token's session");
+        assert_eq!(
+            Some(IMAGE.correlation_id()),
+            request.response_correlation_id,
+            "and the image the request came in on"
+        );
+        assert!(
+            control.warnings.is_empty(),
+            "a token is not a gate that complains: {:?}",
+            control.warnings
+        );
+    }
+
+    /// A token the archive never issued, or one for another recording, or one
+    /// that has expired, is **dropped in silence** — the reference throws
+    /// (`ControlSessionAdapter.java:1180`), which reaches the error handler and
+    /// sends the client nothing.
+    #[test]
+    fn a_response_channel_replay_with_a_token_that_names_nothing_is_dropped() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        // A token issued for a **different** recording, which is the second of
+        // the three things `getReplaySession` checks.
+        control
+            .tokens
+            .insert((REPLAY_TOKEN, RECORDING_ID + 1), session_id);
+
+        let payload = replay_request(session_id, 99, RECORDING_ID, REPLAY_TOKEN, RESPONSE_CHANNEL);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(1, control.calls.len(), "only the connect");
+        assert!(
+            control.warnings[0].starts_with("Unknown session or token timeout for replayToken="),
+            "{:?}",
+            control.warnings
+        );
+    }
+
+    /// A replay that carries **no** token goes through the gate even on a
+    /// response channel, which is the ordinary path S4 already had.
+    ///
+    /// It reaches no session because `DenyAll` refuses it — the point is
+    /// *which* gate answered, and the error says so.
+    #[test]
+    fn a_response_channel_replay_without_a_token_is_gated_as_usual() {
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = replay_request(session_id, 99, RECORDING_ID, NULL_VALUE, RESPONSE_CHANNEL);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::ErrorResponse {
+                session_id,
+                correlation_id: 99,
+                relevant_id: i64::from(UNAUTHORISED_ACTION),
+                message: UNAUTHORISED_ACTION_MSG.to_owned(),
+            }],
+            control.calls[1..],
+            "the authorisation service was asked"
+        );
+    }
+
+    /// A token on a channel that is **not** a response channel earns nothing:
+    /// the reference's condition is `hasControlModeResponse() && NULL_VALUE !=
+    /// replayToken` (`ControlSessionAdapter.java:1175`), and the first half is
+    /// not decoration.
+    ///
+    /// The request names a session that does not exist, so the two paths are
+    /// told apart by their answers: the gate warns and drops it, the token path
+    /// would have answered the token's session.
+    #[test]
+    fn a_token_does_not_let_a_plain_channel_through() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        control
+            .tokens
+            .insert((REPLAY_TOKEN, RECORDING_ID), session_id);
+
+        let payload = replay_request(
+            4_242,
+            99,
+            RECORDING_ID,
+            REPLAY_TOKEN,
+            "aeron:udp?endpoint=localhost:6666",
+        );
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(1, control.calls.len(), "only the connect");
+        assert!(
+            control.warnings[0].starts_with("control request for unknown session:"),
+            "{:?}",
+            control.warnings
+        );
+    }
+
+    /// A request written before the token field existed has **no** token, even
+    /// though the bytes here carry one.
+    ///
+    /// This is the one place the generated decoder and the reference disagree
+    /// on an absent field — `i64::MIN` against `Aeron.NULL_VALUE`
+    /// (`replay_request_codec.rs:336-342`, `ControlSessionAdapter.java:226-227`)
+    /// — and the disagreement would be visible: the replay's token path is
+    /// entered by comparing the field against `NULL_VALUE`, so `i64::MIN` would
+    /// walk a version-9 client into a branch its request has no words for.
+    #[test]
+    fn a_replay_from_before_the_token_version_has_no_token() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        control.tokens.insert((REPLAY_TOKEN, RECORDING_ID), 5);
+
+        let mut payload =
+            replay_request(session_id, 99, RECORDING_ID, REPLAY_TOKEN, RESPONSE_CHANNEL);
+        // `version` is the header's fourth field (`message_header_codec.rs:185`).
+        payload[6..8].copy_from_slice(&(REPLAY_TOKEN_VERSION - 1).to_le_bytes());
+
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let [Call::StartReplay { request }] = &control.calls[1..] else {
+            panic!("not one replay: {:?}", control.calls);
+        };
+
+        assert_eq!(session_id, request.session_id, "the gate's session");
+        assert_eq!(
+            None, request.response_correlation_id,
+            "and no response-correlation-id, because there was no token"
+        );
     }
 
     /// A keep-alive reaches the session it names, and activating is the whole

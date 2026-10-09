@@ -114,6 +114,90 @@ pub fn segment_file_base_position(
     start_term_base + (from_base & !segment_mask)
 }
 
+/// Where a stream position sits in a segment file, as three numbers.
+///
+/// The reference computes these three in two places — once in the tool's own
+/// reader (`RecordingReader.java:83-98`) and once in the replay session
+/// (`ReplaySession.java:318-326`) — and they are the whole of "which file, and
+/// where in it":
+///
+/// ```text
+/// segmentOffset         = (fromPosition - startTermBase) & (segmentLength - 1)
+/// termOffset            =  fromPosition & (termLength - 1)
+/// termBaseSegmentOffset = segmentOffset - termOffset
+/// ```
+///
+/// `term_base_segment_offset` is where the term containing the position begins
+/// **in the segment**, which is what makes a term a window of the file rather
+/// than something a reader has to assemble. [`Placement::next_term`] is the
+/// other half, and is `RecordingReader.nextTerm` (`:178-193`) exactly.
+///
+/// Both readers share this rather than each carrying a copy, because a copy of
+/// arithmetic this fiddly is a copy that drifts — and the two are reading the
+/// same files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// Which segment file, named by its base position.
+    pub(crate) segment_file_position: i64,
+    /// How far into the term the position is.
+    pub(crate) term_offset: usize,
+    /// Where that term begins within the segment file.
+    pub(crate) term_base_segment_offset: usize,
+}
+
+impl Placement {
+    /// Place `from_position` in `summary`'s recording
+    /// (`RecordingReader.java:83-98`, `ReplaySession.java:318-326`).
+    pub(crate) fn new(summary: &SegmentSummary, from_position: i64) -> Self {
+        let term_length = i64::from(summary.term_buffer_length);
+        let segment_length = i64::from(summary.segment_file_length);
+        let start_term_base = summary.start_position - (summary.start_position & (term_length - 1));
+
+        let segment_offset = (from_position - start_term_base) & (segment_length - 1);
+        let term_offset = from_position & (term_length - 1);
+
+        let segment_offset = usize::try_from(segment_offset).unwrap_or(0);
+        let term_offset = usize::try_from(term_offset).unwrap_or(0);
+
+        Self {
+            segment_file_position: segment_file_base_position(
+                summary.start_position,
+                from_position,
+                summary.term_buffer_length,
+                summary.segment_file_length,
+            ),
+            term_offset,
+            term_base_segment_offset: segment_offset - term_offset,
+        }
+    }
+
+    /// The offset **in the segment file** the next read starts at.
+    ///
+    /// A term is a window of the file, so where the reader is in the term and
+    /// where the term is in the file are added, not chosen between.
+    pub(crate) const fn file_offset(&self) -> usize {
+        self.term_base_segment_offset + self.term_offset
+    }
+
+    /// `nextTerm` (`RecordingReader.java:178-193`): on to the next term, which is
+    /// a window of this segment until the segment itself runs out. Answers
+    /// whether it rolled into the next segment file, which the caller has to
+    /// open.
+    pub(crate) fn next_term(&mut self, summary: &SegmentSummary) -> bool {
+        self.term_offset = 0;
+        self.term_base_segment_offset += summary.term_buffer_length as usize;
+
+        if self.term_base_segment_offset == summary.segment_file_length as usize {
+            self.segment_file_position += i64::from(summary.segment_file_length);
+            self.term_base_segment_offset = 0;
+
+            return true;
+        }
+
+        false
+    }
+}
+
 /// Why a segment could not be written.
 #[derive(Debug)]
 pub enum SegmentError {
@@ -1268,9 +1352,7 @@ pub struct SegmentReader {
     summary: SegmentSummary,
     replay_position: i64,
     replay_limit: i64,
-    segment_file_position: i64,
-    term_offset: usize,
-    term_base_segment_offset: usize,
+    placement: Placement,
     mapping: MappedFile,
     done: bool,
 }
@@ -1316,34 +1398,23 @@ impl SegmentReader {
             });
         }
 
-        let term_length = summary.term_buffer_length;
-        let segment_file_length = summary.segment_file_length;
-        let start_term_base =
-            summary.start_position - (summary.start_position & i64::from(term_length - 1));
-        let segment_offset =
-            usize::try_from((from - start_term_base) & i64::from(segment_file_length - 1))
-                .unwrap_or(0);
-        let term_offset = usize::try_from(from & i64::from(term_length - 1)).unwrap_or(0);
         let term_id = i32::try_from(from >> bits_to_shift)
             .unwrap_or(0)
             .wrapping_add(summary.initial_term_id);
+        let placement = Placement::new(&summary, from);
 
-        let segment_file_position = segment_file_base_position(
-            summary.start_position,
-            from,
-            term_length,
-            segment_file_length,
-        );
-        let mapping = map_segment(directory, summary.recording_id, segment_file_position)?;
+        let mapping = map_segment(
+            directory,
+            summary.recording_id,
+            placement.segment_file_position,
+        )?;
 
         let reader = Self {
             directory: directory.to_path_buf(),
             summary,
             replay_position: from,
             replay_limit: from + replay_length,
-            segment_file_position,
-            term_offset,
-            term_base_segment_offset: segment_offset - term_offset,
+            placement,
             mapping,
             done: false,
         };
@@ -1388,11 +1459,11 @@ impl SegmentReader {
         let mut fragments = 0;
 
         while self.replay_position < self.replay_limit && fragments < fragment_limit {
-            if self.term_offset == self.summary.term_buffer_length as usize {
+            if self.placement.term_offset == self.summary.term_buffer_length as usize {
                 self.next_term()?;
             }
 
-            let frame_offset = self.term_offset;
+            let frame_offset = self.placement.term_offset;
             let term = self.term();
 
             let Some(frame_length) = read_i32_in(&term, frame_offset + FRAME_LENGTH_OFFSET) else {
@@ -1425,7 +1496,7 @@ impl SegmentReader {
             handler(&fragment);
 
             self.replay_position += i64::try_from(aligned).unwrap_or(0);
-            self.term_offset += aligned;
+            self.placement.term_offset += aligned;
             fragments += 1;
 
             if self.replay_position >= self.replay_limit {
@@ -1440,17 +1511,12 @@ impl SegmentReader {
     /// Move to the next term, which is a window of the segment until the segment
     /// itself runs out (`RecordingReader.nextTerm`, `:178-193`).
     fn next_term(&mut self) -> Result<(), SegmentError> {
-        self.term_offset = 0;
-        self.term_base_segment_offset += self.summary.term_buffer_length as usize;
-
-        if self.term_base_segment_offset == self.summary.segment_file_length as usize {
-            self.segment_file_position += i64::from(self.summary.segment_file_length);
+        if self.placement.next_term(&self.summary) {
             self.mapping = map_segment(
                 &self.directory,
                 self.summary.recording_id,
-                self.segment_file_position,
+                self.placement.segment_file_position,
             )?;
-            self.term_base_segment_offset = 0;
         }
 
         Ok(())
@@ -1464,7 +1530,7 @@ impl SegmentReader {
     fn term(&self) -> AtomicBuffer<'_, ReadOnly> {
         self.mapping
             .region(
-                self.term_base_segment_offset,
+                self.placement.term_base_segment_offset,
                 self.summary.term_buffer_length as usize,
             )
             .unwrap_or_else(|| {
@@ -1479,7 +1545,7 @@ impl SegmentReader {
     /// implies.
     fn check_aligned_to_fragment(&self, term_id: i32) -> Result<(), SegmentError> {
         let term = self.term();
-        let offset = self.term_offset;
+        let offset = self.placement.term_offset;
 
         let frame_term_offset = read_i32_in(&term, offset + TERM_OFFSET_FIELD_OFFSET).unwrap_or(-1);
         let frame_term_id = read_i32_in(&term, offset + TERM_ID_FIELD_OFFSET).unwrap_or(-1);
@@ -1490,7 +1556,7 @@ impl SegmentReader {
             || frame_stream_id != self.summary.stream_id
         {
             return Err(SegmentError::Malformed {
-                offset: self.term_base_segment_offset + offset,
+                offset: self.placement.term_base_segment_offset + offset,
                 frame_length: read_i32_in(&term, offset + FRAME_LENGTH_OFFSET).unwrap_or(0),
             });
         }
@@ -1502,10 +1568,13 @@ impl SegmentReader {
 impl std::fmt::Debug for SegmentReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentReader")
-            .field("segment_file_position", &self.segment_file_position)
+            .field(
+                "segment_file_position",
+                &self.placement.segment_file_position,
+            )
             .field("replay_position", &self.replay_position)
             .field("replay_limit", &self.replay_limit)
-            .field("term_offset", &self.term_offset)
+            .field("term_offset", &self.placement.term_offset)
             .field("done", &self.done)
             .finish()
     }

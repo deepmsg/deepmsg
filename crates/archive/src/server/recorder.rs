@@ -41,9 +41,8 @@ use deepmsg_core::buffer::ReadWrite;
 use crate::recording_writer::WriteStats;
 use crate::server::counters::{
     ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
-    ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID, ArchiveIdCounter, RECORDER_MAX_WRITE_TIME_NAME,
-    RECORDER_TOTAL_WRITE_BYTES_NAME, RECORDER_TOTAL_WRITE_TIME_NAME, claim_archive_id_counter,
-    request_archive_id_counter,
+    ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID, ArchiveIdCounter, CounterAllocator, CounterKind,
+    RECORDER_MAX_WRITE_TIME_NAME, RECORDER_TOTAL_WRITE_BYTES_NAME, RECORDER_TOTAL_WRITE_TIME_NAME,
 };
 use crate::server::recording_session::RecordingSession;
 
@@ -123,9 +122,9 @@ pub enum RecorderCounter {
     TotalWriteTime,
 }
 
-impl RecorderCounter {
+impl CounterKind for RecorderCounter {
     /// All three, in the order the reference allocates them.
-    const ORDER: [Self; 3] = [
+    const ORDER: &'static [Self] = &[
         Self::MaxWriteTime,
         Self::TotalWriteBytes,
         Self::TotalWriteTime,
@@ -133,8 +132,7 @@ impl RecorderCounter {
 
     /// The type id `ArchiveCounters.allocate` is called with (`:1598`, `:1610`,
     /// `:1622` over `AeronCounters`).
-    #[must_use]
-    const fn type_id(self) -> i32 {
+    fn type_id(self) -> i32 {
         match self {
             Self::MaxWriteTime => ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
             Self::TotalWriteBytes => ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
@@ -143,8 +141,7 @@ impl RecorderCounter {
     }
 
     /// The name its label is built from (`:1600`, `:1612`, `:1624`).
-    #[must_use]
-    const fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::MaxWriteTime => RECORDER_MAX_WRITE_TIME_NAME,
             Self::TotalWriteBytes => RECORDER_TOTAL_WRITE_BYTES_NAME,
@@ -166,19 +163,13 @@ pub struct Recorder {
     /// `None` until the three counters have been allocated — and an archive that
     /// never allocated them still records, it just does not count.
     counters: Option<RecorderCounters>,
-    /// The counters that are in hand while the rest are still on their way.
+    /// The three, while they are being asked for and taken up.
     ///
     /// The reference allocates all three at once, in `Archive.Context.conclude`
-    /// (`:1587-1626`), because its archive drives the driver. Here each is a
-    /// command the driver answers on a later turn, so they are asked for **one
-    /// at a time** and this holds the ones already claimed.
-    held: Vec<(RecorderCounter, ArchiveIdCounter)>,
-    /// The counter being asked for, and the registration id the add drew —
-    /// `None` between one counter arriving and the next being asked for.
-    pending: Option<(RecorderCounter, i64)>,
-    /// The archive id every one of the three is keyed by
-    /// (`ArchiveCounters.allocate`, `ArchiveCounters.java:52-69`).
-    archive_id: i64,
+    /// (`:1587-1626`), because its archive drives the driver; here each is a
+    /// command the driver answers on a later turn, which is the loop
+    /// [`CounterAllocator`] runs.
+    allocator: CounterAllocator<RecorderCounter>,
 }
 
 impl Recorder {
@@ -198,9 +189,7 @@ impl Recorder {
                 max_write_time_ns: 0,
             },
             counters: None,
-            held: Vec::new(),
-            pending: None,
-            archive_id,
+            allocator: CounterAllocator::new(archive_id),
         }
     }
 
@@ -227,64 +216,19 @@ impl Recorder {
             return;
         }
 
-        let Some((counter, registration_id)) = self.pending else {
-            let Some(counter) = RecorderCounter::ORDER
-                .into_iter()
-                .find(|counter| !self.holds(*counter))
-            else {
-                return;
-            };
+        self.allocator.drive(client, counters, timeout);
 
-            match request_archive_id_counter(
-                client,
-                counter.type_id(),
-                counter.name(),
-                self.archive_id,
-                timeout,
-            ) {
-                Ok(registration_id) => self.pending = Some((counter, registration_id)),
-                Err(_) => {
-                    // A command that would not go out is one this build has
-                    // already given up on: the next turn asks again for the
-                    // first counter it does not hold, and the archive records
-                    // without counting until one takes.
-                    self.pending = None;
-                }
-            }
-
+        if !self.allocator.is_complete() {
             return;
-        };
-
-        match claim_archive_id_counter(client, counters, counter.type_id(), registration_id) {
-            Ok(Some(counter_id)) => {
-                self.held.push((counter, counter_id));
-
-                if self.held.len() == RecorderCounter::ORDER.len() {
-                    let held = std::mem::take(&mut self.held);
-                    let take = |want: RecorderCounter| {
-                        held.iter()
-                            .find(|(counter, _)| *counter == want)
-                            .map(|(_, counter)| *counter)
-                            .expect("all three are in hand")
-                    };
-
-                    self.counters = Some(RecorderCounters {
-                        max_write_time: take(RecorderCounter::MaxWriteTime),
-                        total_write_bytes: take(RecorderCounter::TotalWriteBytes),
-                        total_write_time: take(RecorderCounter::TotalWriteTime),
-                    });
-                }
-
-                self.pending = None;
-            }
-            Ok(None) => {}
-            Err(_) => self.pending = None,
         }
-    }
 
-    /// Whether one of the three is in hand.
-    fn holds(&self, counter: RecorderCounter) -> bool {
-        self.held.iter().any(|(held, _)| *held == counter)
+        let take = |kind| self.allocator.counter(kind).expect("all three are in hand");
+
+        self.counters = Some(RecorderCounters {
+            max_write_time: take(RecorderCounter::MaxWriteTime),
+            total_write_bytes: take(RecorderCounter::TotalWriteBytes),
+            total_write_time: take(RecorderCounter::TotalWriteTime),
+        });
     }
 
     /// `recorder.addSession` (`ArchiveConductor.java:2055`).

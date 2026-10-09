@@ -75,7 +75,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use deepmsg_client::client::CommandError;
+use deepmsg_client::client::{AsyncAddPoll, CommandError};
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
@@ -266,12 +266,19 @@ pub trait Publications {
     /// `aeron.getExclusivePublication(registrationId)`: whether the driver has
     /// answered yet, draining the client on the way as Java's does.
     ///
-    /// `false` is Java's `RESOURCE_TEMPORARILY_UNAVAILABLE`, and the reference
-    /// treats it by **forgetting the registration id and asking again**
-    /// (`ControlSession.java:874-881`) — so a slow driver is answered with
-    /// several publications, only the first of which the later ones can be
+    /// `Awaiting` is Java's `RESOURCE_TEMPORARILY_UNAVAILABLE`, and the
+    /// reference treats it by **forgetting the registration id and asking
+    /// again** (`ControlSession.java:874-881`) — so a slow driver is answered
+    /// with several publications, only the first of which the later ones can be
     /// refused for.
-    fn poll_exclusive_publication(&mut self, registration_id: i64) -> bool;
+    ///
+    /// The answer is the whole of `AsyncAddPoll` rather than a `bool` because
+    /// the two "no publication yet" cases are not the same case to a caller
+    /// that is not the control session: a replay's publication creation
+    /// (`CreateReplayPublicationSession.java:143-157`) **retries** on
+    /// `RESOURCE_TEMPORARILY_UNAVAILABLE` and **gives up with an error the
+    /// client is told about** on anything else.
+    fn poll_exclusive_publication(&mut self, registration_id: i64) -> AsyncAddPoll;
 
     /// `controlPublication.isConnected()` (`ControlSession.java:917`, `:1005`).
     fn is_exclusive_connected(&self, registration_id: i64) -> bool;
@@ -288,6 +295,14 @@ pub trait Publications {
     /// `revokeOnClose()` and close, which is what a session's close does first
     /// (`ControlSession.java:163-174`).
     fn release_exclusive(&mut self, registration_id: i64, timeout: Duration);
+
+    /// `aeron.asyncRemovePublication(registrationId)`, **without** the revoke
+    /// (`CreateReplayPublicationSession.close`, `:87-93`).
+    ///
+    /// A replay's publication that never got as far as a session is abandoned,
+    /// not revoked: there is no stream to tear down, only a registration to give
+    /// back.
+    fn async_remove_publication(&mut self, registration_id: i64, timeout: Duration);
 }
 
 /// What became of one response, as the reference's `checkResult` reads it
@@ -1358,7 +1373,11 @@ mod tests {
             panic!("the fake egress is the publication; nothing asks the client")
         }
 
-        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> bool {
+        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> AsyncAddPoll {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn async_remove_publication(&mut self, _registration_id: i64, _timeout: Duration) {
             panic!("the fake egress is the publication; nothing asks the client")
         }
 
@@ -1433,7 +1452,11 @@ mod tests {
             panic!("the fake egress is the publication; nothing asks the client")
         }
 
-        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> bool {
+        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> AsyncAddPoll {
+            panic!("the fake egress is the publication; nothing asks the client")
+        }
+
+        fn async_remove_publication(&mut self, _registration_id: i64, _timeout: Duration) {
             panic!("the fake egress is the publication; nothing asks the client")
         }
 

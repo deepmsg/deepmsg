@@ -217,6 +217,14 @@ path = "integration/archive_connect.rs"
 name = "archive_recording"
 path = "integration/archive_recording.rs"
 
+# P2-S4's acceptance, and the same criterion again: a recording, replayed, on
+# the parts of a replay the C suite cannot see — the rewritten frame headers, a
+# replay that crosses segment files, a short read block, and a bounded replay
+# whose limit counter goes away.
+[[test]]
+name = "archive_replay"
+path = "integration/archive_replay.rs"
+
 # P2-S3's acceptance, and the same criterion again: two recordings, and the
 # pages they are answered in — the cursor, the two ways a page ends, and the two
 # filters. Needs our own archiving media driver binary, so it runs in CI.
