@@ -89,6 +89,10 @@ use deepmsg_codec::archive::list_recording_request_codec::{self, ListRecordingRe
 use deepmsg_codec::archive::list_recording_subscriptions_request_codec::{
     self, ListRecordingSubscriptionsRequestDecoder,
 };
+use deepmsg_codec::archive::list_recordings_for_uri_request_codec::{
+    self, ListRecordingsForUriRequestDecoder,
+};
+use deepmsg_codec::archive::list_recordings_request_codec::{self, ListRecordingsRequestDecoder};
 use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
@@ -387,6 +391,44 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onListRecordings` (`ControlSession.java:374-382`), which
+    /// asks for a **page** of this archive's recordings
+    /// (`ArchiveConductor.newListRecordingsSession`, `:638-657`).
+    ///
+    /// One gate, and it is the asking session's own — unlike
+    /// [`ControlPlane::on_list_recording`] there is no catalog question in
+    /// front of it, a page about recordings the catalog does not hold being a
+    /// page of nothing. So this carries the request and the conductor starts
+    /// the listing there and then.
+    fn on_list_recordings(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        count: i32,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onListRecordingsForUri` (`ControlSession.java:354-372`),
+    /// the same page narrowed to one stream on one channel
+    /// (`ArchiveConductor.newListRecordingsForUriSession`, `:659-687`).
+    ///
+    /// The channel fragment is **bytes**: the request's field is a `varData`,
+    /// and the test it is put to on the far side is over the channel's own
+    /// bytes (`ControlSessionAdapter.java:305-313`,
+    /// `Catalog.originalChannelContains` at `Catalog.java:585-625`).
+    #[allow(clippy::too_many_arguments)] // one per field the request carries
+    fn on_list_recordings_for_uri(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        count: i32,
+        stream_id: i32,
+        channel_fragment: &[u8],
         now_ms: i64,
     );
 
@@ -911,6 +953,76 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // A page of recordings (`ArchiveConductor.java:638-657`), which is the
+        // same session shape as the one above with a walk in it instead of one
+        // descriptor. Where it starts and how many it answers with are the
+        // request's own two fields.
+        list_recordings_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = ListRecordingsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let from_recording_id = decoder.from_recording_id();
+            let count = decoder.record_count();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_list_recordings(
+                    session_id,
+                    correlation_id,
+                    from_recording_id,
+                    count,
+                    now_ms,
+                );
+            }
+        }
+
+        // The same page narrowed to a stream and a channel
+        // (`ArchiveConductor.java:659-687`). The C client sends both this and
+        // the one above (`aeron_archive_proxy.c:530-563` against `:505-528`),
+        // and `streamId` with the channel fragment are the whole of the
+        // difference between them.
+        list_recordings_for_uri_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = ListRecordingsForUriRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let from_recording_id = decoder.from_recording_id();
+            let count = decoder.record_count();
+            let stream_id = decoder.stream_id();
+            let coordinates = decoder.channel_decoder();
+            let channel_fragment = decoder.channel_slice(coordinates).to_vec();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_list_recordings_for_uri(
+                    session_id,
+                    correlation_id,
+                    from_recording_id,
+                    count,
+                    stream_id,
+                    &channel_fragment,
+                    now_ms,
+                );
+            }
+        }
+
         // Asking an archive to record a channel. Two templates, and the only
         // difference between them is what the second one added: `autoStop`
         // (`ArchiveConductor.java:530-536` against `:162-186` of the adapter,
@@ -1320,6 +1432,20 @@ mod tests {
             correlation_id: i64,
             recording_id: i64,
         },
+        ListRecordings {
+            session_id: i64,
+            correlation_id: i64,
+            from_recording_id: i64,
+            count: i32,
+        },
+        ListRecordingsForUri {
+            session_id: i64,
+            correlation_id: i64,
+            from_recording_id: i64,
+            count: i32,
+            stream_id: i32,
+            channel_fragment: Vec<u8>,
+        },
         StartRecording(StartRecordingRequest),
         StopRecordingSubscription {
             session_id: i64,
@@ -1458,6 +1584,43 @@ mod tests {
                 session_id,
                 correlation_id,
                 recording_id,
+            });
+        }
+
+        fn on_list_recordings(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            from_recording_id: i64,
+            count: i32,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::ListRecordings {
+                session_id,
+                correlation_id,
+                from_recording_id,
+                count,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // one per field the request carries
+        fn on_list_recordings_for_uri(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            from_recording_id: i64,
+            count: i32,
+            stream_id: i32,
+            channel_fragment: &[u8],
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::ListRecordingsForUri {
+                session_id,
+                correlation_id,
+                from_recording_id,
+                count,
+                stream_id,
+                channel_fragment: channel_fragment.to_vec(),
             });
         }
 
@@ -2671,6 +2834,60 @@ mod tests {
         buffer
     }
 
+    fn list_recordings_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        record_count: i32,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::list_recordings_request_codec::ListRecordingsRequestEncoder;
+
+        let mut buffer = vec![0u8; 64];
+        let length = {
+            let encoder =
+                ListRecordingsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .from_recording_id(from_recording_id)
+                .record_count(record_count);
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
+    fn list_recordings_for_uri_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        record_count: i32,
+        stream_id: i32,
+        channel_fragment: &str,
+    ) -> Vec<u8> {
+        use deepmsg_codec::archive::list_recordings_for_uri_request_codec::ListRecordingsForUriRequestEncoder;
+
+        let mut buffer = vec![0u8; 128];
+        let length = {
+            let encoder = ListRecordingsForUriRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .from_recording_id(from_recording_id)
+                .record_count(record_count)
+                .stream_id(stream_id)
+                .channel(channel_fragment.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+        buffer
+    }
+
     /// A match reaches the session as a question with its channel fragment
     /// whole — the fragment is bytes on the wire and is compared as the client
     /// wrote it (`ArchiveConductor.java:742-761` over `Catalog.findLast`).
@@ -2728,6 +2945,65 @@ mod tests {
                 session_id,
                 correlation_id: 7,
                 recording_id: 100,
+            }),
+            control.calls.last()
+        );
+    }
+
+    /// The two requests for a page of recordings reach the session as their own
+    /// calls, and the second one carries its filter — a stream and a channel
+    /// fragment that is **bytes**, because that is what the far side compares
+    /// (`ArchiveConductor.java:638-657`, `:659-687`;
+    /// `ControlSessionAdapter.java:275-294`, `:296-318`).
+    ///
+    /// One test for both because the two arms decode the same first four fields
+    /// and differ in what they do with the rest: what can go wrong is the
+    /// fragment arriving as text, or the two templates decoding as each other's
+    /// call.
+    #[test]
+    fn a_page_of_recordings_reaches_the_session_with_its_filter_whole() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&list_recordings_request(session_id, 7, i64::MIN, 10)),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::ListRecordings {
+                session_id,
+                correlation_id: 7,
+                from_recording_id: i64::MIN,
+                count: 10,
+            }),
+            control.calls.last()
+        );
+
+        let fragment = "endpoint=localhost:3333";
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&list_recordings_for_uri_request(
+                    session_id, 8, 5, 2, 33, fragment,
+                )),
+                2_000,
+            )
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::ListRecordingsForUri {
+                session_id,
+                correlation_id: 8,
+                from_recording_id: 5,
+                count: 2,
+                stream_id: 33,
+                channel_fragment: fragment.as_bytes().to_vec(),
             }),
             control.calls.last()
         );
