@@ -275,7 +275,7 @@ pub trait Publications {
     /// The answer is the whole of `AsyncAddPoll` rather than a `bool` because
     /// the two "no publication yet" cases are not the same case to a caller
     /// that is not the control session: a replay's publication creation
-    /// (`CreateReplayPublicationSession.java:596-607`) **retries** on
+    /// (`CreateReplayPublicationSession.java:143-157`) **retries** on
     /// `RESOURCE_TEMPORARILY_UNAVAILABLE` and **gives up with an error the
     /// client is told about** on anything else.
     fn poll_exclusive_publication(&mut self, registration_id: i64) -> AsyncAddPoll;

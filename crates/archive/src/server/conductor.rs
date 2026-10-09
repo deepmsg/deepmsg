@@ -1606,8 +1606,8 @@ pub struct Sessions {
     /// Two movements, in two different places, and they are not a pair in the
     /// way a reader expects: **up** in `start_replay`, before a publication is
     /// even asked for (`:931-934`), and **down** either where a publication
-    /// could not be made (`CreateReplayPublicationSession.java:604`, which is a
-    /// rollback of that `++`) or where a replay session closes (`:936-939`).
+    /// could not be made (`CreateReplayPublicationSession.java:152-153`, which is
+    /// a rollback of that `++`) or where a replay session closes (`:936-939`).
     /// Losing one rolls the count down twice and lets the bound be passed;
     /// losing the other leaves it up and refuses every later replay.
     num_active_replays: usize,
@@ -2852,7 +2852,7 @@ impl Sessions {
 
         // `onReplayStart` (`:931-934`), which happens **before** there is a
         // publication — and a creation that fails counts it back out
-        // (`CreateReplayPublicationSession.java:604`).
+        // (`CreateReplayPublicationSession.java:152-153`).
         self.num_active_replays += 1;
         self.creating_replays
             .push(CreateReplayPublicationSession::new(Replay {
