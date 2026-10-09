@@ -1918,7 +1918,7 @@ impl Sessions {
         // sessions are swept, which is where the reference's `SessionWorker`
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
-        self.drive_replays(client, catalog, now_ms);
+        self.drive_replays(client, counters, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
@@ -2426,7 +2426,12 @@ impl Sessions {
     /// that cannot be minted until a publication exists to take its low half
     /// from. So what this does is refuse what it can, build the channel, and
     /// hand the rest to a [`CreateReplayPublicationSession`].
-    fn start_replay(&mut self, catalog: &Catalog, request: &StartReplayRequest) {
+    fn start_replay(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &Catalog,
+        request: &StartReplayRequest,
+    ) {
         let session_id = request.session_id;
         let correlation_id = request.correlation_id;
 
@@ -2457,19 +2462,27 @@ impl Sessions {
         };
 
         let start_position = recording.start_position;
-        // A null position is the recording's own beginning (`:805-814`).
+
+        // A null position is the recording's own beginning — and, more to the
+        // point here, the checks below are **skipped** for it (`:805-814`):
+        // `isInvalidReplayPosition` is called only when the client named a
+        // position. That is not a formality. An empty recording that has stopped
+        // has `startPosition == stopPosition`, so a null position resolved to the
+        // start and then checked would be refused as past the stop, and
+        // `shouldExitOnEmptyRecording` would be told `INVALID_POSITION` where the
+        // reference tells it `EMPTY_RECORDING`.
         let replay_position = if request.position == NULL_VALUE {
             start_position
         } else {
+            if let Some((relevant_id, message)) =
+                invalid_replay_position(request.recording_id, request.position, &recording)
+            {
+                self.refuse_replay(session_id, correlation_id, relevant_id, message);
+                return;
+            }
+
             request.position
         };
-
-        if let Some((relevant_id, message)) =
-            invalid_replay_position(request.recording_id, replay_position, &recording)
-        {
-            self.refuse_replay(session_id, correlation_id, relevant_id, message);
-            return;
-        }
 
         // `:816-819`: the block a replay reads at a time has to be able to hold
         // one of this recording's frames.
@@ -2486,8 +2499,49 @@ impl Sessions {
             return;
         }
 
-        let stop_position = recording.stop_position;
-        let max_length = stop_position - replay_position;
+        // `:789-802`: with no limit counter named, the limit is the **live
+        // recording's own position**.
+        //
+        // This is the step that makes a replay of a recording that has not
+        // stopped work at all, and it does not look like one. The reference
+        // reaches for `recordingSessionByIdMap.get(recordingId).recordingPosition()`
+        // in six lines that read as an optimisation and are load-bearing: with
+        // them, a live recording's `stopPosition` is where it has got to and
+        // `maxLength` is unbounded, so `-1` follows it and `-2` stops at it.
+        // Without them the catalog's `NULL_VALUE` makes both lengths negative.
+        // A recording that has **stopped** has no session, and the catalog's own
+        // stop position is the limit — which is the branch a stopped recording
+        // has always taken.
+        //
+        // [`Sessions::live_recording_position`] is where the two states this
+        // build has and the reference does not are dealt with.
+        let limit_position =
+            self.live_recording_position(counters, request.recording_id, start_position);
+
+        let (stop_position, max_length) = match limit_position {
+            Some(limit) => {
+                if replay_position > limit {
+                    self.refuse_replay(
+                        session_id,
+                        correlation_id,
+                        INVALID_POSITION,
+                        format!(
+                            "replayPosition={replay_position} must be <= limitPosition={limit} \
+                             for recording {}",
+                            request.recording_id
+                        ),
+                    );
+                    return;
+                }
+
+                (limit, i64::MAX - replay_position)
+            }
+            None => {
+                let stop = recording.stop_position;
+
+                (stop, stop - replay_position)
+            }
+        };
 
         // The three branches (`:851-869`), and both sentinels are the client's
         // own. A recording that has not stopped has `NULL_VALUE` for its stop,
@@ -2576,6 +2630,46 @@ impl Sessions {
             }));
     }
 
+    /// Where a recording the archive is **still writing** has got to, as
+    /// `startReplay` needs it (`:790-796`).
+    ///
+    /// `None` for a recording that has stopped, or that this archive is not
+    /// recording — which is the branch that reads the catalog's own stop
+    /// position, and the only branch a stopped recording has ever taken.
+    ///
+    /// # The two ways a live recording has no readable counter
+    ///
+    /// The reference reaches a `Counter` object and reads it, because its
+    /// `RecordingPos.allocate` waits for the driver inside the turn
+    /// (`RecordingPos.java:130-131`). This build asks for the counter on one
+    /// turn and reads its slot on a later one, so there are two states the
+    /// reference does not have:
+    ///
+    /// * a [`PendingRecording`] — asked for, not yet answered. The recording is
+    ///   live and the counter is on its way;
+    /// * a handle whose `counter_id` is not set yet — the same window, one turn
+    ///   further along.
+    ///
+    /// Both answer with the **join position**, which is what a recording
+    /// position counter is set to before anything is read (`:2029-2030`), and
+    /// both are windows a request has to arrive inside to see at all. A live
+    /// recording that has been read from cannot be in either.
+    fn live_recording_position<Access>(
+        &self,
+        counters: &CountersReader<'_, Access>,
+        recording_id: i64,
+        start_position: i64,
+    ) -> Option<i64> {
+        if let Some(handle) = self.recording_session_by_id.get(&recording_id) {
+            return Some(handle.position.value(counters).unwrap_or(start_position));
+        }
+
+        self.pending_recordings
+            .iter()
+            .any(|pending| pending.recording_id == recording_id)
+            .then_some(start_position)
+    }
+
     /// `ArchiveConductor.stopReplay` (`:1037-1054`).
     ///
     /// **Always an OK, even when there is no such replay** — the reference sends
@@ -2629,9 +2723,15 @@ impl Sessions {
 
     /// One turn of the replays: publications still being made, then the ones
     /// that are running.
-    fn drive_replays(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
+    fn drive_replays(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &Catalog,
+        now_ms: i64,
+    ) {
         self.claim_creating_replays(client, catalog, now_ms);
-        self.drive_replay_sessions(client, now_ms);
+        self.drive_replay_sessions(client, counters, now_ms);
     }
 
     /// Take up the publications that have appeared, and give back the slots of
@@ -2735,12 +2835,35 @@ impl Sessions {
     }
 
     /// One turn of every replay in flight.
-    fn drive_replay_sessions(&mut self, client: &mut Client, now_ms: i64) {
+    fn drive_replay_sessions(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        now_ms: i64,
+    ) {
         let now_ns = u64::try_from(now_ms.saturating_mul(1_000_000)).unwrap_or(u64::MAX);
         let mut owed: Vec<Deferred> = Vec::new();
         let mut finished: Vec<i64> = Vec::new();
 
+        // `notExtended`'s live half (`ReplaySession.java:544-578`), read out
+        // before the sessions are walked because it is the conductor that can
+        // see a recording's position and a session cannot.
+        let limits: Vec<(i64, i64)> = self
+            .replay_sessions
+            .iter()
+            .filter_map(|(replay_session_id, entry)| {
+                self.recording_session_by_id
+                    .get(&entry.session.recording_id())
+                    .and_then(|handle| handle.position.value(counters))
+                    .map(|position| (*replay_session_id, position))
+            })
+            .collect();
+
         for (replay_session_id, entry) in &mut self.replay_sessions {
+            if let Some((_, position)) = limits.iter().find(|(id, _)| id == replay_session_id) {
+                entry.session.extend_stop_position(*position);
+            }
+
             let Some(mut published) = Published::new(client, entry.registration_id) else {
                 // The publication is gone; there is nowhere to write.
                 finished.push(*replay_session_id);
@@ -2821,9 +2944,11 @@ impl Sessions {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // one per collaborator the actions use
     fn run_action(
         &mut self,
         client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
         catalog: &Catalog,
         action: Action,
         recorder: &mut Recorder,
@@ -2860,7 +2985,7 @@ impl Sessions {
                 &original_channel,
                 now_ms,
             ),
-            Action::StartReplay(request) => self.start_replay(catalog, &request),
+            Action::StartReplay(request) => self.start_replay(counters, catalog, &request),
             Action::StopReplay {
                 session_id,
                 correlation_id,
@@ -4265,7 +4390,7 @@ impl Sessions {
                     }
                 }
                 Deferred::Action(action) => {
-                    self.run_action(client, catalog, action, recorder, now_ms);
+                    self.run_action(client, counters, catalog, action, recorder, now_ms);
                 }
             }
         }

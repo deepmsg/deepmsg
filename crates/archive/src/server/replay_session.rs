@@ -241,6 +241,21 @@ impl ReplaySession {
         self.stop_position
     }
 
+    /// `notExtended`'s live half (`ReplaySession.java:544-578`): a recording
+    /// that is still being written moves its stop position forward.
+    ///
+    /// It **only ever moves forward** — the reference's `Math.max`, and the rule
+    /// that keeps a following replay from rewinding when the value it reads is
+    /// momentarily behind where it has already got to.
+    ///
+    /// The conductor reads it, not the session: a recording's position lives in
+    /// the driver's counters, which a session has no way to reach.
+    pub fn extend_stop_position(&mut self, position: i64) {
+        if position > self.stop_position {
+            self.stop_position = position;
+        }
+    }
+
     /// Whether the publication is to be torn down rather than closed.
     #[must_use]
     pub const fn is_revoking(&self) -> bool {
