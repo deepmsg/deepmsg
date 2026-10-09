@@ -180,7 +180,10 @@ impl Egress for ControlResponseProxy {
             return self.publication != Publication::NotAskedFor;
         };
 
-        if publications.poll_exclusive_publication(registration_id) {
+        if matches!(
+            publications.poll_exclusive_publication(registration_id),
+            AsyncAddPoll::Ready
+        ) {
             self.publication = Publication::InHand(registration_id);
             return true;
         }
@@ -476,14 +479,11 @@ impl Publications for Client {
             .map(|add| add.registration_id())
     }
 
-    fn poll_exclusive_publication(&mut self, registration_id: i64) -> bool {
+    fn poll_exclusive_publication(&mut self, registration_id: i64) -> AsyncAddPoll {
         // The handle is put back together from the id here and nowhere else:
         // the client's `async_add_poll` is keyed by the id, and the id is what
         // the archive kept.
-        matches!(
-            self.async_add_poll(AsyncAdd::publication(registration_id)),
-            AsyncAddPoll::Ready
-        )
+        self.async_add_poll(AsyncAdd::publication(registration_id))
     }
 
     fn is_exclusive_connected(&self, registration_id: i64) -> bool {
@@ -508,7 +508,11 @@ impl Publications for Client {
         // conductor cannot wait, and the client's own deadline is what finishes
         // a removal that is never polled for.
         self.revoke_publication_on_close(registration_id);
-        let _ = self.async_remove_publication(registration_id, timeout);
+        let _ = Client::async_remove_publication(self, registration_id, timeout);
+    }
+
+    fn async_remove_publication(&mut self, registration_id: i64, timeout: Duration) {
+        let _ = Client::async_remove_publication(self, registration_id, timeout);
     }
 }
 
@@ -559,9 +563,11 @@ mod tests {
             Ok(REGISTRATION_ID)
         }
 
-        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> bool {
-            true
+        fn poll_exclusive_publication(&mut self, _registration_id: i64) -> AsyncAddPoll {
+            AsyncAddPoll::Ready
         }
+
+        fn async_remove_publication(&mut self, _registration_id: i64, _timeout: Duration) {}
 
         fn is_exclusive_connected(&self, _registration_id: i64) -> bool {
             true

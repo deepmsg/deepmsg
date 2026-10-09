@@ -13,6 +13,7 @@ pub mod config;
 pub mod control_adapter;
 pub mod control_session;
 pub mod counters;
+pub mod create_replay_publication;
 pub mod recorder;
 pub mod recording_pos;
 pub mod recording_session;
