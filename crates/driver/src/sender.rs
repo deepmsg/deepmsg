@@ -604,6 +604,26 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "the sender thread has stopped")
 }
 
+/// The publication a pass starts from, advancing the index for the next one.
+///
+/// The reference's own reckoning, wrap included
+/// (`aeron_driver_sender.c:421-427`; Java the same, `Sender.java:227-231`): it
+/// post-increments before it looks, and a wrap resets the index to **one**
+/// rather than to zero, because the pass that wrapped has already been counted.
+/// A count of one or zero publications therefore always starts at zero, and a
+/// count of two alternates.
+fn advance_round_robin(round_robin_index: &mut usize, publications: usize) -> usize {
+    let index = *round_robin_index;
+    *round_robin_index += 1;
+
+    if index >= publications {
+        *round_robin_index = 1;
+        0
+    } else {
+        index
+    }
+}
+
 /// What the thread owns.
 pub(crate) struct SenderThread {
     cnc: Arc<CncFile>,
@@ -627,6 +647,10 @@ pub(crate) struct SenderThread {
     /// See [`Timer`].
     maintenance: Timer,
     publications: Vec<NetworkPublication>,
+    /// Which publication the next pass of [`SenderThread::send_publications`]
+    /// starts from (`aeron_driver_sender.c:421`, `Sender.java:227`; both start
+    /// at zero, `aeron_driver_sender.c:94`).
+    round_robin_index: usize,
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
     datagrams: Datagrams,
@@ -685,6 +709,7 @@ impl SenderThread {
             endpoints: Vec::new(),
             pending_resolutions: Vec::new(),
             publications: Vec::new(),
+            round_robin_index: 0,
             // `sender->recv_buffers.vector_capacity`
             // (`aeron_driver_sender.c:49`) — a pool sized by the setting whose
             // first entry is the only one a poll fills, which is the reference's
@@ -864,6 +889,7 @@ impl SenderThread {
         let mut work = Self::send_publications(
             &mut self.endpoints,
             &mut self.publications,
+            &mut self.round_robin_index,
             &system,
             &self.counters,
             &regions,
@@ -1521,13 +1547,32 @@ impl SenderThread {
         }
     }
 
-    /// Send every publication's share. The reference rotates one publication
-    /// per call of its flywheel; this sends each of them every pass, which is
-    /// the same set of datagrams with a different interleaving.
+    /// Send every publication's share, starting from a different one each pass.
+    ///
+    /// The reference walks its publications from `round_robin_index++`, whoever
+    /// that lands on going first and the rest following in order after the wrap
+    /// (`aeron_driver_sender.c:421-427`, `:429-450`; Java is the same shape,
+    /// `Sender.java:227-231`). This does too. The set of datagrams a pass sends
+    /// is the same either way — what the rotation changes is which one a pass
+    /// reaches *first*.
+    ///
+    /// That order is observable. A publication carries what the far end wrote
+    /// back, and a reply that arrived since the last pass waits until the pass
+    /// reaches its publication. With the order fixed, that wait sits at a fixed
+    /// offset from the request that caused the reply; rotating it spreads the
+    /// same set of waits over two offsets one pass apart. On one echo workload
+    /// with two network publications this is worth a measurable part of the RTT
+    /// body — see `b1-out/r10-on-main/session-03/`.
+    ///
+    /// The earlier comment here said a fixed order was "the same set of
+    /// datagrams with a different interleaving", which is true of the set and
+    /// false of the interleaving: the interleaving is what an RTT histogram
+    /// measures.
     #[allow(clippy::too_many_arguments)] // the fields of one pass, made explicit
     fn send_publications(
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
         publications: &mut [NetworkPublication],
+        round_robin_index: &mut usize,
         system: &System<'_>,
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -1542,7 +1587,14 @@ impl SenderThread {
         // sent nothing.
         let mut bytes_sent = 0;
 
-        for publication in publications.iter_mut() {
+        let starting_index = advance_round_robin(round_robin_index, publications.len());
+
+        // The two loops of `aeron_driver_sender.c:429-455` as one walk: from the
+        // starting publication to the end, then from the beginning to it. The
+        // `continue` below skips a publication for this pass either way, which
+        // is what the reference's does too.
+        for position in (starting_index..publications.len()).chain(0..starting_index) {
+            let publication = &mut publications[position];
             let endpoint_id = publication.endpoint_id;
 
             let Some(position) = endpoints.iter().position(|(id, _)| *id == endpoint_id) else {
@@ -2235,6 +2287,44 @@ mod tests {
             Some(160),
             counters.value(&regions, publication_id(&counters, &regions))
         );
+    }
+
+    /// The starting publication alternates over two, as the reference's does:
+    /// `0, 1, 0, 1, …` — not `0, 1, 1, 0` and not `0, 1, 2, 0`, the shapes a
+    /// plain `% length` or a reset-to-zero-on-wrap would give.
+    #[test]
+    fn the_round_robin_start_alternates_over_two_publications() {
+        let mut index = 0;
+        let starts: Vec<usize> = (0..6).map(|_| advance_round_robin(&mut index, 2)).collect();
+
+        assert_eq!(vec![0, 1, 0, 1, 0, 1], starts);
+    }
+
+    /// A driver with one publication — or none — always starts at the same
+    /// place, and the index stays where the reference leaves it (one, because
+    /// every pass is a wrap).
+    #[test]
+    fn one_publication_the_round_robin_start_never_moves() {
+        let mut index = 0;
+        let starts: Vec<usize> = (0..3).map(|_| advance_round_robin(&mut index, 1)).collect();
+
+        assert_eq!(vec![0, 0, 0], starts);
+        assert_eq!(1, index);
+
+        let mut index = 0;
+        assert_eq!(0, advance_round_robin(&mut index, 0));
+        assert_eq!(1, index);
+    }
+
+    /// Three publications rotate through all three, wrapping to zero and
+    /// leaving the index at one rather than at three.
+    #[test]
+    fn three_publications_the_round_robin_start_rotates() {
+        let mut index = 0;
+        let starts: Vec<usize> = (0..7).map(|_| advance_round_robin(&mut index, 3)).collect();
+
+        assert_eq!(vec![0, 1, 2, 0, 1, 2, 0], starts);
+        assert_eq!(1, index);
     }
 
     /// The `snd-pos` counter's id, recovered by its label — the test allocated

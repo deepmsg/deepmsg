@@ -87,6 +87,38 @@ pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
 /// that same negative number, not the unsigned one.
 pub const RESPONSE_NULL_SESSION_ID: i64 = 0xF000_0000_0000_0000u64 as i64;
 
+/// How much of the term buffer one pass may zero behind the slowest reader.
+///
+/// The reference zeroes the whole of what a status message leaves behind, in
+/// the same breath as that message (`aeron_publication_image.c:551`). With
+/// `aeron.rcv.initial.window.length` at 2 MiB the status message is owed every
+/// quarter window, so that is a 512 KiB `memset` — and it runs **on the
+/// conductor**, where nothing is waiting on it, while ours runs on the receiver
+/// thread, where everything is. Measured on this bench: 512 KiB costs 15-18 µs,
+/// it happens 122 times a second at 501K:32 and 367 times at 301K:288 (it is
+/// driven by the byte rate), and it is the whole of the gap between our p99 and
+/// the reference's — 3.49% of the receiver thread at 301K against the
+/// reference's zero.
+///
+/// Chunking it is not what the reference does, and the difference is only
+/// *when*: the end state is the same bytes zeroed, because
+/// [`PublicationImage::clean_buffer_to`] already cleans towards a position and
+/// stops at a term boundary. What it buys is that no message waits more than
+/// this much of the thread — 16 KiB is about 0.5 µs — instead of 15-18 µs.
+///
+/// The margin makes it safe: the region is `[clean_position, min_sub_pos -
+/// term_length)`, and every reader is at or ahead of `min_sub_pos`, so nothing
+/// reads there; the only writer is this thread, since `insert_packet` and this
+/// are both the receiver's. The intermediate states chunking creates are states
+/// no one can observe.
+///
+/// Capacity is not a concern: a pass may clean this much and there are 1.4
+/// million passes a second, against the 193 MB/s the busiest rate here asks
+/// for.
+///
+/// [`PublicationImage::clean_buffer_to`]: Self::clean_buffer_to
+pub const CLEAN_BYTES_PER_PASS: i64 = 16 * 1024;
+
 /// The three outcomes of the untethered state machine. They live with the
 /// positions they are about ([`crate::subscribable::UntetheredEvent`]) because
 /// a publication's own readers reach them too, not just an image's.
@@ -280,6 +312,10 @@ pub struct PublicationImage {
     /// How far the terms have been zeroed behind the readers
     /// (`aeron_publication_image_clean_buffer_to`, `:430-451`).
     clean_position: i64,
+    /// How far they are *owed* being zeroed: the position the last status
+    /// message left the slowest reader done with. [`Self::clean_buffer_ahead`]
+    /// walks `clean_position` towards it a chunk at a time.
+    clean_target: i64,
     /// The position past which an arrival is an over-run.
     last_overrun_threshold: i64,
     /// The change number the last status message was sent for.
@@ -561,6 +597,7 @@ impl PublicationImage {
             next_sm_receiver_window_length: window,
             last_sm_position: initial_position,
             clean_position: initial_position,
+            clean_target: initial_position,
             last_overrun_threshold: initial_position + i64::from(setup.term_length / 2),
             last_sm_change_number: 0,
             sm_change_number: 0,
@@ -1266,9 +1303,13 @@ impl PublicationImage {
             || window_length != self.next_sm_receiver_window_length
         {
             // A term behind the slowest reader is a term that reader is done
-            // with, and cleaning it here — in the same breath as the status
-            // message that reports it — is what the reference does (`:551`).
-            self.clean_buffer_to(min_sub_pos - i64::from(self.term_length.unsigned_abs() as i32));
+            // with. The reference cleans it here, in the same breath as the
+            // status message that reports it (`:551`); this notes what is owed
+            // and lets [`Self::clean_buffer_ahead`] pay it off a chunk at a
+            // time from the pass that is already running — see
+            // [`CLEAN_BYTES_PER_PASS`] for why, and what it costs.
+            self.clean_target = min_sub_pos - i64::from(self.term_length.unsigned_abs() as i32);
+            self.clean_buffer_ahead();
             self.schedule_status_message(min_sub_pos, window_length, counters, regions, now_ns);
         }
 
@@ -1307,6 +1348,21 @@ impl PublicationImage {
     /// sees a zero length stops, and one that already saw the old length finds
     /// the bytes it describes still untouched. Zeroing the length first would
     /// let a reader see a frame whose body had been cleared underneath it.
+    /// Zero the next chunk of what the slowest reader is done with.
+    ///
+    /// Called every pass from the thread that already walks the images — the
+    /// reference's per-pass conversion of a single `clean_buffer_to` into a
+    /// step towards the same position. Nothing happens on the passes that have
+    /// not accumulated a chunk's worth, which is all but about one in a
+    /// hundred.
+    pub(crate) fn clean_buffer_ahead(&mut self) {
+        if self.clean_target - self.clean_position < CLEAN_BYTES_PER_PASS {
+            return;
+        }
+
+        self.clean_buffer_to(self.clean_position + CLEAN_BYTES_PER_PASS);
+    }
+
     fn clean_buffer_to(&mut self, position: i64) {
         if position <= self.clean_position {
             return;
