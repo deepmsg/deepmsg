@@ -74,6 +74,7 @@ use crate::server::control_session::{
     Egress, Offered, Publications, RESPONSE_NOT_CONNECTED_MSG, RESPONSE_PUBLICATION_CLOSED_MSG,
     RESPONSE_PUBLICATION_MAX_POSITION_MSG, Response, ResponseError,
 };
+use crate::server::replay_session::{PublicationFacts, ReplayPublications};
 
 /// How many times one response is offered before the turn gives up on it
 /// (`ControlResponseProxy.java:36`).
@@ -512,6 +513,57 @@ impl Publications for Client {
     }
 
     fn async_remove_publication(&mut self, registration_id: i64, timeout: Duration) {
+        let _ = Client::async_remove_publication(self, registration_id, timeout);
+    }
+}
+
+/// The same client, seen by a replay.
+///
+/// Separate from the `Publications` impl above for the reason the trait is
+/// separate: past the registration id the two have nothing in common — a
+/// control session offers an encoded `Response`, a replay offers a block of
+/// recorded frames — and a replay reads four header words the control session
+/// never asks for.
+impl ReplayPublications for Client {
+    fn is_connected(&self, registration_id: i64) -> bool {
+        self.exclusive_publication(registration_id)
+            .and_then(|publication| publication.is_connected())
+            .unwrap_or(false)
+    }
+
+    fn facts(&self, registration_id: i64) -> Option<PublicationFacts> {
+        let publication = self.exclusive_publication(registration_id)?;
+
+        Some(PublicationFacts {
+            session_id: publication.session_id(),
+            stream_id: publication.stream_id(),
+            position_bits_to_shift: publication.position_bits_to_shift(),
+            initial_term_id: publication.initial_term_id(),
+        })
+    }
+
+    fn available_window(&self, registration_id: i64) -> Option<i64> {
+        Client::available_window(self, registration_id)
+    }
+
+    fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended> {
+        Client::offer_block_exclusive(self, registration_id, block)
+    }
+
+    fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended> {
+        Client::append_padding_exclusive(self, registration_id, length)
+    }
+
+    fn release_publication(&mut self, registration_id: i64, timeout: Duration) {
+        // `publication.revoke()` is the removal **with the revoke flag**, which
+        // is what tells every reader the stream is not merely over
+        // (`Publication.java:326`).
+        let _ = Client::revoke_publication(self, registration_id, timeout);
+    }
+
+    fn close_publication(&mut self, registration_id: i64, timeout: Duration) {
+        // A plain removal, with no revoke flag: the driver's linger is what
+        // keeps the publication alive long enough to retransmit its tail.
         let _ = Client::async_remove_publication(self, registration_id, timeout);
     }
 }

@@ -1481,6 +1481,48 @@ impl Client {
         Some(publication.offer(limit, payload))
     }
 
+    /// Offer a **block of whole frames** to an exclusive publication.
+    ///
+    /// The archive's replay path and nothing else (`Publication.offerBlock`,
+    /// `Publication.java:509`): the frames were written by a recording, so they
+    /// already have headers and a length, and re-encoding them frame by frame
+    /// would be the archive guessing at what it recorded. The limit is worked
+    /// out the same way [`Client::offer_exclusive`] works it out — from the
+    /// driver's own window counter, not from the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`None`] when no such publication is held; see [`Appended`] for the
+    /// rest.
+    pub fn offer_block_exclusive(
+        &self,
+        registration_id: i64,
+        block: &[u8],
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.exclusive_publication(registration_id)?;
+        let limit = self.position_limit(publication.position_limit_counter_id());
+
+        Some(publication.offer_block(limit, block))
+    }
+
+    /// Append a padding frame to an exclusive publication
+    /// (`ExclusivePublication.appendPadding`, `Publication.java:462`).
+    ///
+    /// # Errors
+    ///
+    /// [`None`] when no such publication is held; see [`Appended`] for the
+    /// rest.
+    pub fn append_padding_exclusive(
+        &self,
+        registration_id: i64,
+        length: usize,
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.exclusive_publication(registration_id)?;
+        let limit = self.position_limit(publication.position_limit_counter_id());
+
+        Some(publication.append_padding(limit, length))
+    }
+
     /// An exclusive publication this client holds.
     pub fn exclusive_publication(&self, registration_id: i64) -> Option<&ExclusivePublication> {
         self.exclusive_publications

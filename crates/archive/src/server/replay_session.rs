@@ -43,6 +43,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::{FRAME_ALIGNMENT, TERM_MAX_LENGTH};
@@ -656,6 +657,149 @@ fn put_i32(bytes: &mut [u8], offset: usize, value: i32) {
     }
 }
 
+/// The four things a replay stamps into every frame's header, and reads every
+/// time it builds one (`ReplaySession.java:391-392`, `:320-321`).
+///
+/// Gathered into one call rather than four trait methods because they are
+/// always wanted together and each would be a one-line delegation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationFacts {
+    /// The Aeron session id the frames go out under — the low half of a
+    /// `replaySessionId` (`AC:956`).
+    pub session_id: i32,
+    /// The stream id the frames go out under.
+    pub stream_id: i32,
+    /// `positionBitsToShift`, which names the term a position falls in.
+    pub position_bits_to_shift: u32,
+    /// `initialTermId`, for the same reason.
+    pub initial_term_id: i32,
+}
+
+/// The archive's client, as far as a replay's publication goes.
+///
+/// Deliberately **not** `control_session::Publications`, which is the seam the
+/// control session's egress uses. Past the registration id the two have nothing
+/// in common — that one offers an encoded `Response` through `offer`, this one
+/// offers blocks of recorded frames through `offer_block` — and keeping them
+/// apart is also what keeps the control session's test doubles from having to
+/// stub out calls they can never make.
+pub trait ReplayPublications {
+    /// `publication.isConnected()`.
+    fn is_connected(&self, registration_id: i64) -> bool;
+
+    /// The four header words. `None` when this client holds no such
+    /// publication, which is where the reference's `CLOSED` lands.
+    fn facts(&self, registration_id: i64) -> Option<PublicationFacts>;
+
+    /// `Publication.availableWindow` (`:409-413`); a replay's whole read is
+    /// gated on it (`:385`). `None` for no such publication.
+    fn available_window(&self, registration_id: i64) -> Option<i64>;
+
+    /// `Publication.offerBlock` (`:509`).
+    fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended>;
+
+    /// `ExclusivePublication.appendPadding` (`:462`).
+    fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended>;
+
+    /// `publication.revoke()`: torn down now, with no linger — what a replay
+    /// that failed or was cancelled gets (`:175-194`).
+    fn release_publication(&mut self, registration_id: i64, timeout: Duration);
+
+    /// `CloseHelper.close(publication)`: **the linger applies**, which is the
+    /// whole point of it for a replay that ran to its end — the driver keeps
+    /// the publication long enough to retransmit the tail.
+    ///
+    /// Named for the publication rather than `close` because `Client` has a
+    /// `close` of its own, and a name that means two things where one of them is
+    /// a whole client is a name that gets read wrong.
+    fn close_publication(&mut self, registration_id: i64, timeout: Duration);
+}
+
+/// The replay publication as it actually is: a registration id at the driver,
+/// reached through the client that holds it.
+///
+/// The four facts are read **once**, when the publication is first reached, and
+/// served from then on. The reference reads them off a live object every time;
+/// here the object is a registration id, and asking the client for four numbers
+/// on every frame's header would be four lookups into a list for values that
+/// cannot have changed — a publication's ids are settled when it is created.
+pub struct Published<'a, P: ReplayPublications + ?Sized> {
+    publications: &'a mut P,
+    registration_id: i64,
+    facts: PublicationFacts,
+}
+
+impl<'a, P: ReplayPublications + ?Sized> Published<'a, P> {
+    /// Reach the publication this registration id names.
+    ///
+    /// `None` when the client holds none, which the conductor only reaches by
+    /// holding a registration id it was never given.
+    pub fn new(publications: &'a mut P, registration_id: i64) -> Option<Self> {
+        let facts = publications.facts(registration_id)?;
+
+        Some(Self {
+            publications,
+            registration_id,
+            facts,
+        })
+    }
+}
+
+impl<P: ReplayPublications + ?Sized> Publication for Published<'_, P> {
+    fn is_connected(&self) -> bool {
+        self.publications.is_connected(self.registration_id)
+    }
+
+    fn session_id(&self) -> i32 {
+        self.facts.session_id
+    }
+
+    fn stream_id(&self) -> i32 {
+        self.facts.stream_id
+    }
+
+    fn position_bits_to_shift(&self) -> u32 {
+        self.facts.position_bits_to_shift
+    }
+
+    fn initial_term_id(&self) -> i32 {
+        self.facts.initial_term_id
+    }
+
+    fn available_window(&self) -> i64 {
+        self.publications
+            .available_window(self.registration_id)
+            .unwrap_or(0)
+    }
+
+    fn offer_block(&mut self, block: &[u8]) -> Option<Appended> {
+        self.publications.offer_block(self.registration_id, block)
+    }
+
+    fn append_padding(&mut self, length: usize) -> Option<Appended> {
+        self.publications
+            .append_padding(self.registration_id, length)
+    }
+
+    fn revoke(&mut self) {
+        self.publications
+            .release_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
+    }
+
+    fn close(&mut self) {
+        self.publications
+            .close_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
+    }
+}
+
+/// How long the client is given to get a publication's removal to the driver.
+///
+/// The reference's own close waits for the driver to answer; a poll-driven
+/// conductor cannot wait, and it is the client's deadline that finishes a
+/// removal nobody polls for. The same one the control session's own publication
+/// is closed with.
+const DEFAULT_CLOSE_TIMEOUT: Duration = deepmsg_client::client::DEFAULT_TIMEOUT;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,5 +1285,174 @@ mod tests {
             }
             other => panic!("expected a checksum failure, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod published_tests {
+    use super::*;
+    use deepmsg_core::logbuffer::position::Position;
+
+    const REGISTRATION_ID: i64 = 0x5EED;
+
+    const FACTS: PublicationFacts = PublicationFacts {
+        session_id: 99,
+        stream_id: 55,
+        position_bits_to_shift: 16,
+        initial_term_id: 7,
+    };
+
+    #[derive(Default)]
+    struct Fake {
+        connected: bool,
+        window: Option<i64>,
+        outcome: Option<Appended>,
+        counts: Vec<(i64, usize)>,
+        released: Vec<i64>,
+        closed: Vec<i64>,
+    }
+
+    impl ReplayPublications for Fake {
+        fn is_connected(&self, _registration_id: i64) -> bool {
+            self.connected
+        }
+
+        fn facts(&self, registration_id: i64) -> Option<PublicationFacts> {
+            (registration_id == REGISTRATION_ID).then_some(FACTS)
+        }
+
+        fn available_window(&self, _registration_id: i64) -> Option<i64> {
+            self.window
+        }
+
+        fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended> {
+            self.counts.push((registration_id, block.len()));
+
+            self.outcome
+        }
+
+        fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended> {
+            self.counts.push((registration_id, length));
+
+            self.outcome
+        }
+
+        fn release_publication(&mut self, registration_id: i64, _timeout: Duration) {
+            self.released.push(registration_id);
+        }
+
+        fn close_publication(&mut self, registration_id: i64, _timeout: Duration) {
+            self.closed.push(registration_id);
+        }
+    }
+
+    fn ok() -> Appended {
+        Appended::Ok {
+            position: Position::from_term_count(0, 0, FACTS.position_bits_to_shift),
+            term_offset: 0,
+        }
+    }
+
+    /// A registration id the client does not hold is not a publication, and
+    /// saying so is the adapter's whole job at construction.
+    #[test]
+    fn a_registration_the_client_does_not_hold_is_not_a_publication() {
+        let mut fake = Fake::default();
+
+        assert!(Published::new(&mut fake, REGISTRATION_ID + 1).is_none());
+        assert!(Published::new(&mut fake, REGISTRATION_ID).is_some());
+    }
+
+    /// The four header words come off the publication, not out of thin air.
+    #[test]
+    fn the_four_header_words_are_the_publications() {
+        let mut fake = Fake::default();
+        let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
+
+        assert_eq!(99, published.session_id());
+        assert_eq!(55, published.stream_id());
+        assert_eq!(16, published.position_bits_to_shift());
+        assert_eq!(7, published.initial_term_id());
+    }
+
+    /// Offers and paddings go out under the registration id, and a client that
+    /// no longer holds the publication answers `None` — which the session reads
+    /// as `CLOSED`.
+    #[test]
+    fn offers_go_out_under_the_registration_id() {
+        let mut fake = Fake {
+            outcome: Some(ok()),
+            ..Fake::default()
+        };
+        {
+            let mut published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
+
+            assert!(matches!(
+                published.offer_block(b"frames"),
+                Some(Appended::Ok { .. })
+            ));
+            assert!(matches!(
+                published.append_padding(32),
+                Some(Appended::Ok { .. })
+            ));
+        }
+
+        assert_eq!(
+            vec![(REGISTRATION_ID, 6), (REGISTRATION_ID, 32)],
+            fake.counts
+        );
+
+        // And a publication the client has let go of says so.
+        fake.outcome = None;
+
+        let mut published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
+
+        assert!(published.offer_block(b"frames").is_none());
+    }
+
+    /// A window the client cannot answer for is no window at all, so the next
+    /// turn reads nothing rather than reading into a full one.
+    #[test]
+    fn a_window_the_client_cannot_answer_for_is_zero() {
+        let mut fake = Fake::default();
+
+        {
+            let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
+
+            assert_eq!(0, published.available_window());
+        }
+
+        fake.window = Some(4096);
+
+        let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
+
+        assert_eq!(4096, published.available_window());
+    }
+
+    /// **Closing is not revoking**, and the difference is the linger: a replay
+    /// that ran to its end is closed so the driver can retransmit its tail, and
+    /// one that failed or was cancelled is torn down at once
+    /// (`ReplaySession.java:175-194`).
+    #[test]
+    fn closing_is_not_revoking() {
+        let mut fake = Fake::default();
+
+        Published::new(&mut fake, REGISTRATION_ID)
+            .expect("a publication")
+            .close();
+
+        assert_eq!(vec![REGISTRATION_ID], fake.closed);
+        assert!(fake.released.is_empty(), "a clean end does not revoke");
+
+        Published::new(&mut fake, REGISTRATION_ID)
+            .expect("a publication")
+            .revoke();
+
+        assert_eq!(vec![REGISTRATION_ID], fake.released);
+        assert_eq!(
+            vec![REGISTRATION_ID],
+            fake.closed,
+            "and the close is not repeated"
+        );
     }
 }
