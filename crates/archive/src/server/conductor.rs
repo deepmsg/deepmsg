@@ -1668,6 +1668,21 @@ pub const REPLAY_ALL_AND_FOLLOW: i64 = -1;
 /// `AeronArchive.REPLAY_ALL_AND_STOP` (`client/AeronArchive.java:122`).
 pub const REPLAY_ALL_AND_STOP: i64 = -2;
 
+/// What a turn reads about a replay's limit, per replay in flight.
+///
+/// The two arms are `ReplaySession.notExtended`'s (`ReplaySession.java:561-577`),
+/// and the difference between them is the whole of how a bounded replay ends:
+/// [`LimitUpdate::ExtendTo`] moves the stop position forward and nothing else,
+/// and [`LimitUpdate::Gone`] clamps what the replay may still send to where it
+/// has already got to — which is what takes it to `INACTIVE`.
+enum LimitUpdate {
+    /// The counter, or the live recording, says this.
+    ExtendTo(i64),
+    /// There is nothing left to read: the counter was closed, or its slot has
+    /// been taken by another counter.
+    Gone,
+}
+
 /// `new Counter(aeron.countersReader(), limitCounterId)`
 /// (`ArchiveConductor.startBoundedReplay`, `:1000-1006`), which the reference
 /// wraps in a `try`: a bounded replay whose counter is not there is **refused**,
@@ -3082,29 +3097,40 @@ impl Sessions {
         let mut owed: Vec<Deferred> = Vec::new();
         let mut finished: Vec<i64> = Vec::new();
 
-        // `notExtended`'s live half (`ReplaySession.java:544-578`), read out
-        // before the sessions are walked because it is the conductor that can
-        // see a recording's position and a session cannot.
-        let limits: Vec<(i64, i64)> = self
+        // `notExtended` (`ReplaySession.java:544-578`), read out before the
+        // sessions are walked because it is the conductor that can see a
+        // recording's position and a session cannot.
+        let limits: Vec<(i64, LimitUpdate)> = self
             .replay_sessions
             .iter()
             .filter_map(|(replay_session_id, entry)| {
-                let position = match entry.limit {
-                    Some(limit) => read_limit_counter(counters, limit),
-                    None => self.live_recording_position(
+                let update = match entry.limit {
+                    Some(limit) => match read_limit_counter(counters, limit) {
+                        Some(position) => LimitUpdate::ExtendTo(position),
+                        // Closed, or its slot taken by another counter — this
+                        // build reads both as absent, and the reference answers
+                        // both by freezing (see [`read_limit_counter`]).
+                        None => LimitUpdate::Gone,
+                    },
+                    None => LimitUpdate::ExtendTo(self.live_recording_position(
                         counters,
                         entry.session.recording_id(),
                         entry.start_position,
-                    ),
+                    )?),
                 };
 
-                position.map(|position| (*replay_session_id, position))
+                Some((*replay_session_id, update))
             })
             .collect();
 
         for (replay_session_id, entry) in &mut self.replay_sessions {
-            if let Some((_, position)) = limits.iter().find(|(id, _)| id == replay_session_id) {
-                entry.session.extend_stop_position(*position);
+            if let Some((_, update)) = limits.iter().find(|(id, _)| id == replay_session_id) {
+                match update {
+                    LimitUpdate::ExtendTo(position) => {
+                        entry.session.extend_stop_position(*position)
+                    }
+                    LimitUpdate::Gone => entry.session.limit_counter_gone(),
+                }
             }
 
             let Some(mut published) = Published::new(client, entry.registration_id) else {

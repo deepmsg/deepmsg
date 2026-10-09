@@ -256,6 +256,31 @@ impl ReplaySession {
         }
     }
 
+    /// `notExtended`'s **other** half (`ReplaySession.java:561-577`): the
+    /// counter that was bounding this replay can no longer be read, so the
+    /// replay is now bounded by where it already stood.
+    ///
+    /// This is the difference between a replay that ends and one that never
+    /// does, and it is worth being exact about which. The reference asks the
+    /// counter what it says every time the reader catches up, and when the
+    /// counter has been closed or its slot **reused** the answer is the stop
+    /// position it had — `replayLimit = oldStopPosition` (`:570`) — after which
+    /// `replayPosition >= replayLimit` is true and the session goes `INACTIVE`
+    /// (`:571-574`).
+    ///
+    /// Without it a bounded replay whose counter went away idles on its last
+    /// stop position for the life of the archive: the session is never done, so
+    /// its publication is never given back and its slot in
+    /// [`ReplaySettings::max_concurrent_replays`] is never returned — the bound
+    /// fills with replays that have nothing left to send and refuses every
+    /// later one. A **plain** replay is not affected: it has no counter, and
+    /// this is only reached for one that named a limit.
+    ///
+    /// [`ReplaySettings::max_concurrent_replays`]: crate::server::conductor::ReplaySettings::max_concurrent_replays
+    pub fn limit_counter_gone(&mut self) {
+        self.replay_limit = self.replay_limit.min(self.stop_position);
+    }
+
     /// Whether the publication is to be torn down rather than closed.
     #[must_use]
     pub const fn is_revoking(&self) -> bool {
@@ -377,6 +402,20 @@ impl ReplaySession {
         }
 
         if self.start_position == self.stop_position && 0 == self.replay_limit {
+            self.state = State::Inactive;
+
+            return Progress::Idle;
+        }
+
+        // The reference's next guard (`:377-381`), which is asked **here** and
+        // not only where a block has just been committed: a replay whose limit
+        // has stopped moving reaches its end without another block to reach it
+        // by, and the commit below would never run again to notice
+        // ([`ReplaySession::limit_counter_gone`]).
+        //
+        // For every other replay this is the same arithmetic `commit` applies
+        // one turn later, and it never fires first.
+        if self.replay_position >= self.replay_limit {
             self.state = State::Inactive;
 
             return Progress::Idle;
@@ -1115,6 +1154,84 @@ mod tests {
 
         assert_eq!(b"the first message", &block[32..49]);
         assert_eq!(b"second", &block[96..102]);
+    }
+
+    /// A bounded replay's stop position moves forward and the replay goes on
+    /// with it (`notExtended`'s live half, `ReplaySession.java:561-567`), and
+    /// never backwards (`:563`).
+    #[test]
+    fn a_limit_that_moves_takes_the_replay_with_it() {
+        let dir = TempDir::new();
+        let blocks = vec![
+            frame(0, b"one"),
+            frame(64, b"two"),
+            frame(128, b"three"),
+            frame(192, b"four"),
+        ];
+        let (summary, stop) = recorded(&dir, &blocks);
+        assert_eq!(256, stop, "four 64-byte frames");
+
+        // A following replay: `ARCHIVE_REPLAY_ALL_AND_FOLLOW` is `NULL_LENGTH`,
+        // so the request's own length bounds nothing and the limit is the whole
+        // of what the replay reads to.
+        let mut publication = Fake::connected();
+        let mut session = reader(&dir, summary, 0, i64::MAX, 128, None);
+
+        run(&mut session, &mut publication);
+        assert_eq!(1, publication.offers.len(), "as far as the limit");
+        assert_eq!(128, session.replay_position());
+        assert_ne!(State::Done, session.state(), "and waiting for more");
+
+        session.extend_stop_position(256);
+        run(&mut session, &mut publication);
+
+        assert_eq!(2, publication.offers.len(), "the rest went out");
+        assert_eq!(256, session.replay_position());
+
+        // And it is still **not** over, which is the whole difference between
+        // this and a limit that has gone: a following replay whose limit stands
+        // on the end of the recording waits there, because nothing has said
+        // there will be no more.
+        assert_ne!(State::Done, session.state());
+        assert_eq!(128, publication.offers[1].len(), "two more frames");
+    }
+
+    /// A limit that has **gone** is a replay that is over: the counter was
+    /// closed or its slot reused, and the reference clamps what the replay may
+    /// send to where it already stands and takes it to `INACTIVE`
+    /// (`ReplaySession.java:568-574`).
+    ///
+    /// Without the clamp the session waits for a counter nobody will ever write
+    /// again, and it waits holding its slot in the archive's replay bound.
+    #[test]
+    fn a_limit_that_has_gone_ends_the_replay() {
+        let dir = TempDir::new();
+        let blocks = vec![
+            frame(0, b"one"),
+            frame(64, b"two"),
+            frame(128, b"three"),
+            frame(192, b"four"),
+        ];
+        let (summary, _stop) = recorded(&dir, &blocks);
+
+        let mut publication = Fake::connected();
+        let mut session = reader(&dir, summary, 0, i64::MAX, 128, None);
+
+        run(&mut session, &mut publication);
+        assert_eq!(128, session.replay_position(), "caught up to the limit");
+        assert_ne!(State::Done, session.state(), "and it was still live");
+
+        session.limit_counter_gone();
+        let seen = run(&mut session, &mut publication);
+
+        assert!(seen.contains(&Progress::Finished), "{seen:?}");
+        assert_eq!(State::Done, session.state());
+        assert_eq!(
+            1,
+            publication.offers.len(),
+            "and it sent nothing more than it had"
+        );
+        assert_eq!(128, session.replay_position());
     }
 
     /// A padding frame **ends the batch** and goes out on its own, as a padding
