@@ -112,6 +112,17 @@ impl Subscription {
     /// need the file borrowed while the subscription is borrowed mutably, which
     /// is exactly the aliasing the borrow checker exists to refuse. The caller
     /// — [`crate::Client::poll_subscription`] — writes them after the poll.
+    ///
+    /// Only an image whose read **moved its position** is handed back, which is
+    /// the reference's own gate: `Image.poll` writes the subscriber position
+    /// counter only `if (newPosition > initialPosition)`
+    /// (`Image.java:374-378`; `aeron_image.c:314-322`), and neither
+    /// `Subscription.poll` (`Subscription.java:188-212`) nor
+    /// `aeron_subscription_poll` (`aeron_subscription.c:426-472`) writes one
+    /// itself. A poll that read nothing has no position to publish, so
+    /// reporting the value already in the counter would be a write the
+    /// reference never makes — as well as the `Vec`'s one allocation on the
+    /// path a waiting reader spends most of its turns on (ADR-0003).
     /// Where the next poll begins, and how many images there are to cover.
     ///
     /// One image later each call, wrapping. The reference advances a counter and
@@ -165,6 +176,7 @@ impl Subscription {
             // closure to count for it — and a closure inside a closure is where
             // the borrow checker's higher-ranked inference gives up.
             let before = assembler.delivered();
+            let position_before = image.position();
 
             // The parameter's type is spelled out because an unannotated
             // closure gets one lifetime inferred from its first use, and the
@@ -176,7 +188,15 @@ impl Subscription {
 
             messages += usize::try_from(assembler.delivered() - before).unwrap_or(0);
 
-            counter_writes.push((image.subscriber_position_id(), image.position()));
+            // Reported only when the read moved the position — the reference's
+            // gate (see the type's own note above). A poll that read nothing
+            // would otherwise push a write of the value already in the counter,
+            // which is both work the reference does not do and the `Vec`'s one
+            // allocation a poll.
+            let position = image.position();
+            if position > position_before {
+                counter_writes.push((image.subscriber_position_id(), position));
+            }
         }
 
         (messages, counter_writes)
@@ -262,9 +282,16 @@ impl Subscription {
                 break;
             }
 
+            let position_before = image.position();
             fragments += image.poll(remaining, &mut *handler);
 
-            counter_writes.push((image.subscriber_position_id(), image.position()));
+            // Same gate as [`Self::poll_messages`]: only a read that moved the
+            // position is reported, which is the reference's
+            // (`Image.java:374-378`; `aeron_image.c:314-322`).
+            let position = image.position();
+            if position > position_before {
+                counter_writes.push((image.subscriber_position_id(), position));
+            }
         }
 
         (fragments, counter_writes)
@@ -529,6 +556,74 @@ mod tests {
             seen[0].1, seen[1].1,
             "the third poll went back to the first image"
         );
+    }
+
+    /// A poll that reads nothing has nothing to publish, and one that reads a
+    /// message publishes the position it moved to.
+    ///
+    /// The reference's gate (`Image.java:374-378`; `aeron_image.c:314-322`):
+    /// the subscriber position counter is written only when the read moved the
+    /// position. An empty poll used to hand back a write of the value already in
+    /// the counter — which is also the caller's one heap allocation a poll on
+    /// the path a waiting reader spends most of its turns on (ADR-0003).
+    #[test]
+    fn an_empty_poll_publishes_nothing_and_a_read_publishes_its_position() {
+        let log = TempLog::new("counter-write-gate");
+        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
+        subscription.add_image(log.image(1));
+
+        let mut handler = |_message: Message<'_>| {};
+
+        let (messages, writes) = subscription.poll_messages(10, &mut handler);
+        assert_eq!(0, messages);
+        assert!(
+            writes.is_empty(),
+            "an empty poll has no position to publish, so it hands back no write"
+        );
+
+        // The term now holds a message: the same poll reads it and reports the
+        // position it moved to, exactly as it did before the gate.
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let (messages, writes) = subscription.poll_messages(10, &mut handler);
+        assert_eq!(1, messages);
+        assert_eq!(
+            1,
+            writes.len(),
+            "a read that moved the position is published"
+        );
+        assert_eq!(
+            subscription.images()[0].subscriber_position_id(),
+            writes[0].0
+        );
+        assert!(writes[0].1 > 0, "the position moved past the join position");
+        assert_eq!(subscription.images()[0].position(), writes[0].1);
+    }
+
+    /// The same gate on the plain fragment path, which had the same push.
+    #[test]
+    fn the_fragment_path_publishes_only_a_read_that_moved_the_position() {
+        let log = TempLog::new("counter-write-gate-fragments");
+        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
+        subscription.add_image(log.image(1));
+
+        let mut handler = |_fragment: &crate::image::Fragment<'_>| {};
+
+        let (fragments, writes) = subscription.poll_fragments(10, &mut handler);
+        assert_eq!(0, fragments);
+        assert!(writes.is_empty(), "an empty poll publishes nothing");
+
+        log.write(|appender| write_message(appender, b"hello"));
+
+        let (fragments, writes) = subscription.poll_fragments(10, &mut handler);
+        assert_eq!(1, fragments);
+        assert_eq!(
+            1,
+            writes.len(),
+            "a read that moved the position is published"
+        );
+        assert!(writes[0].1 > 0);
+        assert_eq!(subscription.images()[0].position(), writes[0].1);
     }
 
     /// A counters region the tests can lay out by hand.
