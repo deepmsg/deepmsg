@@ -217,6 +217,13 @@ path = "integration/archive_connect.rs"
 name = "archive_recording"
 path = "integration/archive_recording.rs"
 
+# P2-S3's acceptance, and the same criterion again: two recordings, and the
+# pages they are answered in — the cursor, the two ways a page ends, and the two
+# filters. Needs our own archiving media driver binary, so it runs in CI.
+[[test]]
+name = "archive_queries"
+path = "integration/archive_queries.rs"
+
 # Our client's REJECT_IMAGE against the reference driver: whether the record
 # this build writes is one the reference reads, and whether its
 # ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.
