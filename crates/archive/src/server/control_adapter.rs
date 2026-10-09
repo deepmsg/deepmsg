@@ -76,6 +76,7 @@ use deepmsg_client::image::Fragment;
 use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
 use deepmsg_codec::archive::boolean_type::BooleanType;
+use deepmsg_codec::archive::bounded_replay_request_codec::{self, BoundedReplayRequestDecoder};
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
 use deepmsg_codec::archive::extend_recording_request_2_codec::{
@@ -100,12 +101,14 @@ use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_position_request_codec::{
     self, RecordingPositionRequestDecoder,
 };
+use deepmsg_codec::archive::replay_request_codec::{self, ReplayRequestDecoder};
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_codec::archive::start_position_request_codec::{self, StartPositionRequestDecoder};
 use deepmsg_codec::archive::start_recording_request_2_codec::{
     self, StartRecordingRequest2Decoder,
 };
 use deepmsg_codec::archive::start_recording_request_codec::{self, StartRecordingRequestDecoder};
+use deepmsg_codec::archive::stop_all_replays_request_codec::{self, StopAllReplaysRequestDecoder};
 use deepmsg_codec::archive::stop_position_request_codec::{self, StopPositionRequestDecoder};
 use deepmsg_codec::archive::stop_recording_by_identity_request_codec::{
     self, StopRecordingByIdentityRequestDecoder,
@@ -114,6 +117,7 @@ use deepmsg_codec::archive::stop_recording_request_codec::{self, StopRecordingRe
 use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
+use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestDecoder};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
@@ -245,6 +249,44 @@ pub struct StartRecordingRequest {
     pub auto_stop: bool,
     /// The channel as the client wrote it.
     pub original_channel: String,
+}
+
+/// One `ReplayRequest` (template **6**) or `BoundedReplayRequest` (template
+/// **18**), as the adapter decoded it
+/// (`ControlSessionAdapter.java:209-252`, `:515-560`).
+///
+/// The two templates differ by one field, `limitCounterId`, and that one field
+/// is the whole of what "bounded" means — so this carries it as an `Option`
+/// rather than having two types that agree on everything else.
+///
+/// **`length` is not resolved here.** Its two sentinels — `-1` follows, `-2`
+/// counts to the stop — are resolved in the conductor, because resolving them
+/// needs the recording's stop position and this side has not read the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartReplayRequest {
+    /// The session that asked.
+    pub session_id: i64,
+    /// The request's correlation id, which its answer echoes.
+    pub correlation_id: i64,
+    /// The recording to replay.
+    pub recording_id: i64,
+    /// Where to start; `Aeron.NULL_VALUE` means the recording's own beginning.
+    pub position: i64,
+    /// How much to send, sentinels and all.
+    pub length: i64,
+    /// The channel as the client wrote it. The **recording's** geometry is
+    /// written onto it by the conductor (`AC:891-901`), which is why what
+    /// travels is the client's channel and not a built one.
+    pub replay_channel: String,
+    /// The stream the replayed frames go out on.
+    pub replay_stream_id: i32,
+    /// How big a block one turn may read; not positive means "the whole buffer"
+    /// (`AC:958-966`). Absent in the request's first version, which the adapter
+    /// passes `NULL_VALUE` for (`CSA:220-221`).
+    pub file_io_max_length: i32,
+    /// A `BoundedReplayRequest`'s limit counter, which a plain `ReplayRequest`
+    /// does not name. **Not read yet** — the bounded slice is its own commit.
+    pub limit_counter_id: Option<i64>,
 }
 
 /// One `ExtendRecordingRequest2`, as the adapter decoded it
@@ -445,6 +487,34 @@ pub trait ControlPlane {
     /// when the recording session ends, and the session is what the recorder
     /// brings (`:1329-1363`).
     fn on_start_recording(&mut self, request: StartRecordingRequest, now_ms: i64);
+
+    /// `ControlSession.onStartReplay` (`ControlSession.java:412-435`), which is
+    /// `ArchiveConductor.startReplay` (`:764-929`).
+    ///
+    /// Deferred for the reason [`ControlPlane::on_start_recording`] is: the
+    /// answer waits for a publication to appear, and the channel is built from
+    /// the **catalog**, which a callback runs without.
+    fn on_start_replay(&mut self, request: StartReplayRequest, now_ms: i64);
+
+    /// `ControlSession.onStopReplay` (`:463-470`). Answered with an `OK` whether
+    /// or not there is such a replay (`AC:1037-1054`).
+    fn on_stop_replay(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        replay_session_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onStopAllReplays` (`:472-479`); `NULL_VALUE` for the
+    /// recording id means every replay the archive has (`AC:1056-1064`).
+    fn on_stop_all_replays(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
 
     /// `ControlSession.onStopRecordingSubscription`
     /// (`ControlSession.java:331-338`), which the conductor answers with an `OK`
@@ -1093,6 +1163,126 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // Asking an archive to replay a recording. Two templates again, and the
+        // one field the second added is the whole of "bounded"
+        // (`ControlSessionAdapter.java:515-560` against `:209-252`).
+        //
+        // The two version-gated fields need no guard here: the generated decoder
+        // answers `file_io_max_length` with `int32::MIN` and `replay_token` with
+        // `int64::MIN` for a request older than their versions
+        // (`replay_request_codec.rs:326-342`), and the reference's own guard
+        // passes `NULL_VALUE` for exactly the same case (`CSA:220-227`). Both are
+        // "not positive", which is all the replay asks of the first.
+        replay_request_codec::SBE_TEMPLATE_ID | bounded_replay_request_codec::SBE_TEMPLATE_ID => {
+            let (
+                control_session_id,
+                correlation_id,
+                recording_id,
+                position,
+                length,
+                replay_stream_id,
+                file_io_max_length,
+                limit_counter_id,
+                channel,
+            ) = if template_id == replay_request_codec::SBE_TEMPLATE_ID {
+                let mut decoder = ReplayRequestDecoder::default().header(header, 0);
+                let coordinates = decoder.replay_channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.recording_id(),
+                    decoder.position(),
+                    decoder.length(),
+                    decoder.replay_stream_id(),
+                    decoder.file_io_max_length(),
+                    None,
+                    decoder.replay_channel_slice(coordinates).to_vec(),
+                )
+            } else {
+                let mut decoder = BoundedReplayRequestDecoder::default().header(header, 0);
+                let coordinates = decoder.replay_channel_decoder();
+
+                (
+                    decoder.control_session_id(),
+                    decoder.correlation_id(),
+                    decoder.recording_id(),
+                    decoder.position(),
+                    decoder.length(),
+                    decoder.replay_stream_id(),
+                    decoder.file_io_max_length(),
+                    Some(i64::from(decoder.limit_counter_id())),
+                    decoder.replay_channel_slice(coordinates).to_vec(),
+                )
+            };
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_start_replay(
+                    StartReplayRequest {
+                        session_id,
+                        correlation_id,
+                        recording_id,
+                        position,
+                        length,
+                        replay_channel: String::from_utf8_lossy(&channel).into_owned(),
+                        replay_stream_id,
+                        file_io_max_length,
+                        limit_counter_id,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        stop_replay_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopReplayRequestDecoder::default().header(header, 0);
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let replay_session_id = decoder.replay_session_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_replay(session_id, correlation_id, replay_session_id, now_ms);
+            }
+        }
+
+        stop_all_replays_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopAllReplaysRequestDecoder::default().header(header, 0);
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_all_replays(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
         stop_recording_subscription_request_codec::SBE_TEMPLATE_ID => {
             let decoder = StopRecordingSubscriptionRequestDecoder::default().header(header, 0);
 
@@ -1427,6 +1617,19 @@ mod tests {
             correlation_id: i64,
             query: Query,
         },
+        StartReplay {
+            request: StartReplayRequest,
+        },
+        StopReplay {
+            session_id: i64,
+            correlation_id: i64,
+            replay_session_id: i64,
+        },
+        StopAllReplays {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
         ListRecording {
             session_id: i64,
             correlation_id: i64,
@@ -1621,6 +1824,38 @@ mod tests {
                 count,
                 stream_id,
                 channel_fragment: channel_fragment.to_vec(),
+            });
+        }
+
+        fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {
+            self.calls.push(Call::StartReplay { request });
+        }
+
+        fn on_stop_replay(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            replay_session_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopReplay {
+                session_id,
+                correlation_id,
+                replay_session_id,
+            });
+        }
+
+        fn on_stop_all_replays(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopAllReplays {
+                session_id,
+                correlation_id,
+                recording_id,
             });
         }
 

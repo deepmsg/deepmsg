@@ -42,6 +42,9 @@ use crate::server::replay_session::GENERIC;
 /// untouched, which is the only thing this session does with most of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replay {
+    /// The control session that asked, which is where the OK and any error go
+    /// (`ControlSession.sendOkResponse`) — several turns after it asked.
+    pub control_session_id: i64,
     /// The control request being answered.
     pub correlation_id: i64,
     /// The recording to replay.
@@ -206,6 +209,7 @@ mod tests {
 
     fn replay() -> Replay {
         Replay {
+            control_session_id: 0x1234,
             correlation_id: 30,
             recording_id: 1,
             replay_position: 0,

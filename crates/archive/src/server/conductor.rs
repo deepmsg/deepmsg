@@ -113,6 +113,8 @@ use deepmsg_cnc::file::CncFile;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_core::buffer::ReadWrite;
+use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
+use deepmsg_core::logbuffer::position::bits_to_shift;
 use deepmsg_core::pal::usable_space;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
@@ -120,13 +122,14 @@ use deepmsg_core::version::{format_version, semantic_version_major};
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
+use crate::segment::SegmentSummary;
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
 };
 use crate::server::config::ArchiveConfig;
 use crate::server::control_adapter::{
     ConnectRequest, ControlAdapter, ControlError, ControlPlane, ExtendRecordingRequest, ImageId,
-    StartRecordingRequest,
+    StartRecordingRequest, StartReplayRequest,
 };
 use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
@@ -136,9 +139,15 @@ use crate::server::counters::{
     ControlSessionsCounter, ErrorCounter, RECORDING_SESSIONS_NAME, claim_archive_id_counter,
     claim_control_sessions_counter, request_archive_id_counter, request_control_sessions_counter,
 };
+use crate::server::create_replay_publication::{
+    CreateReplayPublicationSession, Progress as CreationProgress, Replay,
+};
 use crate::server::recorder::Recorder;
 use crate::server::recording_pos::RecordingPos;
 use crate::server::recording_session::RecordingSession;
+use crate::server::replay_session::{
+    Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
+};
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
@@ -780,6 +789,17 @@ pub struct RecordingSettings {
     pub archive_dir: PathBuf,
 }
 
+/// The settings a replay is answered from (`Archive.java:445-452`), one argument
+/// to [`Sessions::new`] for the reason [`RecordingSettings`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaySettings {
+    /// How many replays may be in flight at once
+    /// (`aeron.archive.max.concurrent.replays`, default 20). The bound is tested
+    /// with `==` rather than `>=` (`ArchiveConductor.java:775`), which is only
+    /// the same thing while nothing can push the count past it.
+    pub max_concurrent_replays: usize,
+}
+
 /// A request that **moves a resource** rather than answering about one.
 ///
 /// The second kind of thing a callback defers, after the messages and the
@@ -814,6 +834,23 @@ enum Action {
     /// the *recording* — and answers with whether there was one to stop, not
     /// with a position.
     StopRecordingByIdentity {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.startReplay` (`:764-929`). Everything up to the answer,
+    /// which waits for a publication to appear.
+    StartReplay(StartReplayRequest),
+    /// `ArchiveConductor.stopReplay` (`:1037-1054`): one replay, by the id its
+    /// OK carried.
+    StopReplay {
+        session_id: i64,
+        correlation_id: i64,
+        replay_session_id: i64,
+    },
+    /// `ArchiveConductor.stopAllReplays` (`:1056-1064`): every replay, or every
+    /// replay **of one recording** — `NULL_VALUE` for the id means all of them.
+    StopAllReplays {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
@@ -1555,6 +1592,34 @@ pub struct Sessions {
     /// listing *per session* — which is what
     /// [`Sessions::has_active_listing`] is the check for.
     listings: Vec<Listing>,
+    /// `replayId` (`ArchiveConductor.java:138`): the counter the **high** half
+    /// of a `replaySessionId` comes from.
+    ///
+    /// **Starts at 1**, never 0 (`:138`). The low half is the replay
+    /// publication's own Aeron session id, and a zero high half would make a
+    /// `replaySessionId` that reads as a bare session id.
+    next_replay_id: i32,
+    /// `numActiveReplays` (`:139`), which [`ReplaySettings`] bounds.
+    ///
+    /// Two movements, in two different places, and they are not a pair in the
+    /// way a reader expects: **up** in `start_replay`, before a publication is
+    /// even asked for (`:931-934`), and **down** either where a publication
+    /// could not be made (`CreateReplayPublicationSession.java:604`, which is a
+    /// rollback of that `++`) or where a replay session closes (`:936-939`).
+    /// Losing one rolls the count down twice and lets the bound be passed;
+    /// losing the other leaves it up and refuses every later replay.
+    num_active_replays: usize,
+    /// `replaySessionByIdMap` (`:146`): the replays in flight, by the id the
+    /// client's OK carried.
+    replay_sessions: HashMap<i64, ReplayEntry>,
+    /// Publications being made, before there is a session to put one in. The
+    /// reference keeps these in the same session array as everything else
+    /// (`addSession`, `:921`); here they are their own list, and a failure in
+    /// one is a rollback rather than a session ending.
+    creating_replays: Vec<CreateReplayPublicationSession>,
+    /// The settings a replay is answered from.
+    replay: ReplaySettings,
+
     /// Sessions finished this turn, waiting for the conductor to collect them.
     ended: Vec<EndedSession>,
     /// The net movement of the aggregate session counter (102), applied once
@@ -1574,6 +1639,169 @@ pub struct Sessions {
     warnings: Vec<String>,
 }
 
+/// `ArchiveException.MAX_REPLAYS` (`ArchiveException.java:64`): what a replay
+/// refused for the concurrency bound carries as its `relevantId`
+/// (`ArchiveConductor.java:777-778`).
+pub const MAX_REPLAYS: i64 = 7;
+
+/// `ArchiveException.EMPTY_RECORDING` (`ArchiveException.java:99`).
+pub const EMPTY_RECORDING: i64 = 15;
+
+/// `ArchiveException.INVALID_POSITION` (`ArchiveException.java:109`).
+pub const INVALID_POSITION: i64 = 16;
+
+/// `AeronArchive.REPLAY_ALL_AND_FOLLOW` (`client/AeronArchive.java:117`), which
+/// is `NULL_LENGTH` — the same `-1` a null position is.
+pub const REPLAY_ALL_AND_FOLLOW: i64 = -1;
+
+/// `AeronArchive.REPLAY_ALL_AND_STOP` (`client/AeronArchive.java:122`).
+pub const REPLAY_ALL_AND_STOP: i64 = -2;
+
+/// `ArchiveConductor.isInvalidReplayPosition` (`:2256-2288`).
+///
+/// Three refusals, and the codes are **not** all the same: a position that is
+/// not frame-aligned is answered with `GENERIC`, because the reference's
+/// `sendErrorResponse(correlationId, msg)` there is the overload that carries no
+/// code (`:2262-2270`), while the two that name a recording are
+/// `INVALID_POSITION`.
+///
+/// Returns the code and the message, or `None` when the position is one this
+/// recording can be replayed from.
+fn invalid_replay_position(
+    recording_id: i64,
+    replay_position: i64,
+    recording: &Recording,
+) -> Option<(i64, String)> {
+    if replay_position % i64::from(FRAME_ALIGNMENT) != 0 {
+        return Some((
+            0,
+            format!(
+                "replayPosition={replay_position} must be aligned to \
+                 FRAME_ALIGNMENT={FRAME_ALIGNMENT} for recording {recording_id}"
+            ),
+        ));
+    }
+
+    if replay_position < recording.start_position {
+        return Some((
+            INVALID_POSITION,
+            format!(
+                "replayPosition={replay_position} must be >= startPosition={} for recording \
+                 {recording_id}",
+                recording.start_position
+            ),
+        ));
+    }
+
+    if recording.stop_position != NULL_VALUE && replay_position >= recording.stop_position {
+        return Some((
+            INVALID_POSITION,
+            format!(
+                "replayPosition={replay_position} must be < stopPosition={} for recording \
+                 {recording_id}",
+                recording.stop_position
+            ),
+        ));
+    }
+
+    None
+}
+
+/// The channel a replay publishes on (`ArchiveConductor.java:891-901`).
+///
+/// The client's channel **stripped**, with the recording's own geometry written
+/// back on. `initialPosition` is four parameters out of three numbers, and it is
+/// spelled out here rather than left as a method on the builder because its
+/// three refusals — a negative position, one that is not frame-aligned, a term
+/// length that is not a power of two — are the **same refusals** the archive
+/// makes of a replay request (`:2256-2288`), and they are made there, where the
+/// answer is a `ControlResponseCode.ERROR` rather than a `UriError`.
+///
+/// # Errors
+///
+/// [`UriError`] when the client's own channel will not parse.
+pub fn replay_channel(
+    requested: &str,
+    replay_position: i64,
+    initial_term_id: i32,
+    term_buffer_length: i32,
+    mtu_length: i32,
+) -> Result<String, UriError> {
+    let uri = ChannelUri::parse(requested)?;
+    let mut builder = stripped_channel_builder(&uri);
+
+    let bits_to_shift = bits_to_shift(term_buffer_length).unwrap_or(0);
+    let term_id = i32::try_from(replay_position >> bits_to_shift)
+        .unwrap_or(0)
+        .wrapping_add(initial_term_id);
+    let term_offset =
+        i32::try_from(replay_position & i64::from(term_buffer_length - 1)).unwrap_or(0);
+
+    builder
+        .term_length(term_buffer_length)
+        .initial_term_id(initial_term_id)
+        .term_id(term_id)
+        .term_offset(term_offset)
+        .sparse(flag(&uri, "sparse"))
+        .eos(flag(&uri, "eos"))
+        .mtu(mtu_length);
+
+    // `linger` is the client's when it named one, and the driver's own default
+    // when it did not. The reference falls back to
+    // `aeron.archive.replay.linger.timeout`, whose own default **is** the
+    // driver's publication linger timeout — and neither is read here yet
+    // (P2-9c), so leaving it out lands on the same number.
+    // `Long.parseLong(lingerValue)` (`:900-901`), a bare number of nanoseconds.
+    if let Some(linger_ns) = uri
+        .get("linger")
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        builder.linger_ns(linger_ns);
+    }
+
+    Ok(builder.build())
+}
+
+/// A URI flag, as the reference's `ChannelUri.getBoolean` reads one.
+fn flag(uri: &ChannelUri, name: &str) -> bool {
+    uri.get(name).is_some_and(|value| value == "true")
+}
+
+/// One replay in flight, as the conductor keeps it.
+///
+/// The reference holds the `ReplaySession` in `replaySessionByIdMap` and reads
+/// its ids and state back off the object. The session here is an owned value
+/// with the same accessors, so what this adds is the two ids that belong to the
+/// **conversation** rather than to the replay: which control session asked, and
+/// under what correlation id — because a replay's OK and its errors are sent to
+/// the client that asked, several turns after it asked, and the session knows
+/// nothing about the control plane.
+struct ReplayEntry {
+    /// The control session that asked for it.
+    control_session_id: i64,
+    /// The request being answered.
+    correlation_id: i64,
+    /// The publication the frames go out on, which the conductor gives back when
+    /// the replay ends.
+    registration_id: i64,
+    /// Whether the OK has gone out.
+    ///
+    /// It goes out **once**, on the turn the segment opens and its header checks
+    /// out (`ReplaySession.java:338`) — which is before the publication is
+    /// waited for, so this is a fact about the conversation and not something
+    /// the session can be asked.
+    started: bool,
+    /// The replay itself.
+    session: ReplaySession,
+}
+
+impl ReplayEntry {
+    /// The id the client's OK carried, which is the map's key too.
+    fn session_id(&self) -> i64 {
+        self.session.replay_session_id()
+    }
+}
+
 impl Sessions {
     /// A session store for one archive.
     #[allow(clippy::too_many_arguments)] // one per setting the archive was configured with
@@ -1584,6 +1812,7 @@ impl Sessions {
         command_timeout: Duration,
         response_channel_defaults: ResponseChannelDefaults,
         recording: RecordingSettings,
+        replay: ReplaySettings,
         subscription_ids: Vec<i64>,
     ) -> Self {
         Self {
@@ -1594,6 +1823,7 @@ impl Sessions {
             command_timeout,
             response_channel_defaults,
             recording,
+            replay,
             subscription_ids,
             sessions: HashMap::new(),
             pending_connects: Vec::new(),
@@ -1613,6 +1843,10 @@ impl Sessions {
             session_counter_registration_id: None,
             control_sessions: None,
             warnings: Vec::new(),
+            next_replay_id: 1,
+            num_active_replays: 0,
+            replay_sessions: HashMap::new(),
+            creating_replays: Vec::new(),
         }
     }
 
@@ -1680,6 +1914,11 @@ impl Sessions {
         self.start_recordings(client, catalog, now_ms);
         self.claim_recordings(client, catalog, counters, recorder, now_ms);
         self.drive_listings(client, catalog, now_ms);
+        // The replays get their turn after the listings and before the control
+        // sessions are swept, which is where the reference's `SessionWorker`
+        // leaves them: everything a turn *does* happens before the sessions that
+        // asked for it are looked at again.
+        self.drive_replays(client, catalog, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
@@ -2181,6 +2420,407 @@ impl Sessions {
 
     /// Carry out what the callbacks could not (`ArchiveConductor.java:562`,
     /// `:1766-1780`).
+    /// `ArchiveConductor.startReplay` (`:764-929`), everything up to the answer.
+    ///
+    /// The answer **waits**: a replay's OK carries the `replaySessionId`, and
+    /// that cannot be minted until a publication exists to take its low half
+    /// from. So what this does is refuse what it can, build the channel, and
+    /// hand the rest to a [`CreateReplayPublicationSession`].
+    fn start_replay(&mut self, catalog: &Catalog, request: &StartReplayRequest) {
+        let session_id = request.session_id;
+        let correlation_id = request.correlation_id;
+
+        // `:775-780`. `==` and not `>=`, which is the reference's own test — it
+        // is only the same thing while nothing can push the count past the
+        // bound, and two movements keep it from doing that.
+        if self.num_active_replays == self.replay.max_concurrent_replays {
+            self.pending.push(Deferred::Error {
+                session_id,
+                correlation_id,
+                relevant_id: MAX_REPLAYS,
+                message: format!(
+                    "max concurrent replays reached {}",
+                    self.replay.max_concurrent_replays
+                ),
+            });
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(request.recording_id) else {
+            self.refuse_replay(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(request.recording_id),
+            );
+            return;
+        };
+
+        let start_position = recording.start_position;
+        // A null position is the recording's own beginning (`:805-814`).
+        let replay_position = if request.position == NULL_VALUE {
+            start_position
+        } else {
+            request.position
+        };
+
+        if let Some((relevant_id, message)) =
+            invalid_replay_position(request.recording_id, replay_position, &recording)
+        {
+            self.refuse_replay(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        // `:816-819`: the block a replay reads at a time has to be able to hold
+        // one of this recording's frames.
+        if request.file_io_max_length > 0 && request.file_io_max_length < recording.mtu_length {
+            self.refuse_replay(
+                session_id,
+                correlation_id,
+                0,
+                format!(
+                    "fileIoMaxLength={} must be at least mtuLength={}",
+                    request.file_io_max_length, recording.mtu_length
+                ),
+            );
+            return;
+        }
+
+        let stop_position = recording.stop_position;
+        let max_length = stop_position - replay_position;
+
+        // The three branches (`:851-869`), and both sentinels are the client's
+        // own. A recording that has not stopped has `NULL_VALUE` for its stop,
+        // which makes `maxLength` negative and lands on the refusal below — the
+        // reference does the same, because a replay that means to follow a live
+        // recording says so with a **limit counter**
+        // (`BoundedReplayRequest`, template 18).
+        let replay_length = if request.length == REPLAY_ALL_AND_FOLLOW {
+            max_length
+        } else if request.length == REPLAY_ALL_AND_STOP {
+            let to_stop = stop_position - replay_position;
+
+            if to_stop == 0 {
+                self.refuse_replay(
+                    session_id,
+                    correlation_id,
+                    EMPTY_RECORDING,
+                    format!(
+                        "when replaying and stopping the replay length must be non-zero, \
+                         recordingId={}",
+                        request.recording_id
+                    ),
+                );
+                return;
+            }
+
+            to_stop
+        } else {
+            request.length.min(max_length)
+        };
+
+        if replay_length < 0 {
+            self.refuse_replay(
+                session_id,
+                correlation_id,
+                0,
+                format!(
+                    "replay length must be positive: replayLength={replay_length}, length={}, \
+                     stopPosition={stop_position}, replayPosition={replay_position} \
+                     for recording {}",
+                    request.length, request.recording_id
+                ),
+            );
+            return;
+        }
+
+        let channel = match replay_channel(
+            &request.replay_channel,
+            replay_position,
+            recording.initial_term_id,
+            recording.term_buffer_length,
+            recording.mtu_length,
+        ) {
+            Ok(channel) => channel,
+            Err(error) => {
+                self.refuse_replay(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!("replay channel could not be built: {error}"),
+                );
+                return;
+            }
+        };
+
+        // `onReplayStart` (`:931-934`), which happens **before** there is a
+        // publication — and a creation that fails counts it back out
+        // (`CreateReplayPublicationSession.java:604`).
+        self.num_active_replays += 1;
+        self.creating_replays
+            .push(CreateReplayPublicationSession::new(Replay {
+                control_session_id: session_id,
+                correlation_id,
+                recording_id: request.recording_id,
+                replay_position,
+                replay_length,
+                start_position,
+                stop_position,
+                segment_file_length: recording.segment_file_length,
+                term_buffer_length: recording.term_buffer_length,
+                stream_id: recording.stream_id,
+                replay_channel: channel,
+                replay_stream_id: request.replay_stream_id,
+                file_io_max_length: request.file_io_max_length,
+                limit_counter_id: None,
+            }));
+    }
+
+    /// `ArchiveConductor.stopReplay` (`:1037-1054`).
+    ///
+    /// **Always an OK, even when there is no such replay** — the reference sends
+    /// one unconditionally and lets the abort be asynchronous, so a client that
+    /// stops a replay twice is told OK twice.
+    fn stop_replay(&mut self, replay_session_id: i64, session_id: i64, correlation_id: i64) {
+        if let Some(entry) = self.replay_sessions.get_mut(&replay_session_id) {
+            entry.session.abort();
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: 0,
+        });
+    }
+
+    /// `ArchiveConductor.stopAllReplays` (`:1056-1064`): every replay, or every
+    /// replay **of one recording** — `NULL_VALUE` for the id means all of them.
+    fn stop_all_replays(&mut self, recording_id: i64, session_id: i64, correlation_id: i64) {
+        for entry in self.replay_sessions.values_mut() {
+            if recording_id == NULL_VALUE || entry.session.recording_id() == recording_id {
+                entry.session.abort();
+            }
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: 0,
+        });
+    }
+
+    /// `ArchiveConductor.onReplayEnd` (`:936-939`).
+    fn on_replay_end(&mut self) {
+        self.num_active_replays = self.num_active_replays.saturating_sub(1);
+    }
+
+    /// `replaySessionId` (`:956`): the replay's own counter in the high half,
+    /// the publication's Aeron session id in the low one.
+    ///
+    /// `next_replay_id` **starts at 1**, so a `replaySessionId` is never
+    /// mistaken for a bare session id, and it is an `i32` that wraps.
+    fn mint_replay_session_id(&mut self, publication_session_id: i32) -> i64 {
+        let replay_session_id = (i64::from(self.next_replay_id) << 32)
+            | (i64::from(publication_session_id) & 0xFFFF_FFFF);
+        self.next_replay_id = self.next_replay_id.wrapping_add(1);
+
+        replay_session_id
+    }
+
+    /// One turn of the replays: publications still being made, then the ones
+    /// that are running.
+    fn drive_replays(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
+        self.claim_creating_replays(client, catalog, now_ms);
+        self.drive_replay_sessions(client, now_ms);
+    }
+
+    /// Take up the publications that have appeared, and give back the slots of
+    /// the ones that will not.
+    fn claim_creating_replays(&mut self, client: &mut Client, catalog: &Catalog, now_ms: i64) {
+        for mut creating in std::mem::take(&mut self.creating_replays) {
+            match creating.do_work(client) {
+                CreationProgress::Idle => self.creating_replays.push(creating),
+                CreationProgress::Created { registration_id } => {
+                    let replay = creating.replay().clone();
+                    let control_session_id = replay.control_session_id;
+
+                    match self.open_replay(client, catalog, &replay, registration_id, now_ms) {
+                        Some(entry) => {
+                            self.replay_sessions.insert(entry.session_id(), entry);
+                        }
+                        None => {
+                            // The recording went away between the check and the
+                            // publication: give the slot back and say so.
+                            creating.close(client);
+                            self.on_replay_end();
+                            self.refuse_replay(
+                                control_session_id,
+                                replay.correlation_id,
+                                UNKNOWN_RECORDING,
+                                unknown_recording_message(replay.recording_id),
+                            );
+                        }
+                    }
+                }
+                CreationProgress::Failed { code, message } => {
+                    // `:604`: the `numActiveReplays++` that `startReplay` did is
+                    // taken back here, and **only** here — the session never
+                    // existed, so nothing else will count it down.
+                    creating.close(client);
+                    self.on_replay_end();
+                    self.refuse_replay(
+                        creating.replay().control_session_id,
+                        creating.replay().correlation_id,
+                        i64::from(code),
+                        message,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ArchiveConductor.newReplaySession` (`:941-994`), as far as this build
+    /// can go without the client: the session is built against the publication
+    /// and put in the map.
+    fn open_replay(
+        &mut self,
+        client: &mut Client,
+        catalog: &Catalog,
+        replay: &Replay,
+        registration_id: i64,
+        now_ms: i64,
+    ) -> Option<ReplayEntry> {
+        let recording = catalog.recording(replay.recording_id).ok()?;
+        let facts = ReplayPublications::facts(client, registration_id)?;
+        let replay_session_id = self.mint_replay_session_id(facts.session_id);
+
+        // `min(fileIoMaxLength, ctx.replayBuffer().capacity())` (`:958-966`): the
+        // request's block size when it named one, the recording's own term when
+        // it did not. A read is bounded by the term as well, so a buffer that
+        // holds one is never the thing that limits it.
+        let buffer_capacity = usize::try_from(replay.file_io_max_length)
+            .ok()
+            .filter(|length| *length > 0)
+            .unwrap_or(recording.term_buffer_length as usize);
+
+        // `connectDeadlineMs = epochClock.time() + connectTimeoutMs`
+        // (`ReplaySession.java:166`): the publication has this long to connect,
+        // and the segment file this long to appear.
+        let deadline_ns = now_ms
+            .saturating_add(self.connect_timeout_ms)
+            .saturating_mul(1_000_000);
+
+        let session = ReplaySession::new(
+            replay.recording_id,
+            replay_session_id,
+            SegmentSummary::from(&recording),
+            replay.replay_position,
+            replay.replay_length,
+            replay.start_position,
+            replay.stop_position,
+            &self.recording.archive_dir,
+            buffer_capacity,
+            None,
+            u64::try_from(deadline_ns).unwrap_or(u64::MAX),
+        )
+        .ok()?;
+
+        Some(ReplayEntry {
+            control_session_id: replay.control_session_id,
+            correlation_id: replay.correlation_id,
+            registration_id,
+            started: false,
+            session,
+        })
+    }
+
+    /// One turn of every replay in flight.
+    fn drive_replay_sessions(&mut self, client: &mut Client, now_ms: i64) {
+        let now_ns = u64::try_from(now_ms.saturating_mul(1_000_000)).unwrap_or(u64::MAX);
+        let mut owed: Vec<Deferred> = Vec::new();
+        let mut finished: Vec<i64> = Vec::new();
+
+        for (replay_session_id, entry) in &mut self.replay_sessions {
+            let Some(mut published) = Published::new(client, entry.registration_id) else {
+                // The publication is gone; there is nowhere to write.
+                finished.push(*replay_session_id);
+                continue;
+            };
+
+            match entry.session.do_work(&mut published, now_ns) {
+                ReplayProgress::Started => {
+                    if !entry.started {
+                        entry.started = true;
+
+                        // The OK carries the `replaySessionId`
+                        // (`ReplaySession.java:338`), which is what a later
+                        // `stopReplay` names.
+                        owed.push(Deferred::Ok {
+                            session_id: entry.control_session_id,
+                            correlation_id: entry.correlation_id,
+                            relevant_id: *replay_session_id,
+                        });
+                    }
+                }
+                ReplayProgress::Finished => finished.push(*replay_session_id),
+                ReplayProgress::Failed { code, message } => {
+                    owed.push(Deferred::Error {
+                        session_id: entry.control_session_id,
+                        correlation_id: entry.correlation_id,
+                        relevant_id: i64::from(code),
+                        message,
+                    });
+                    finished.push(*replay_session_id);
+                }
+                ReplayProgress::Idle | ReplayProgress::Worked => {}
+            }
+        }
+
+        for replay_session_id in finished {
+            let Some(entry) = self.replay_sessions.remove(&replay_session_id) else {
+                continue;
+            };
+
+            // A replay that ran to its end is **closed**, so the driver's linger
+            // can retransmit its tail; one that failed or was cancelled is
+            // **revoked** (`ReplaySession.java:175-194`).
+            if entry.session.is_revoking() {
+                ReplayPublications::release_publication(
+                    client,
+                    entry.registration_id,
+                    self.command_timeout,
+                );
+            } else {
+                ReplayPublications::close_publication(
+                    client,
+                    entry.registration_id,
+                    self.command_timeout,
+                );
+            }
+
+            self.on_replay_end();
+        }
+
+        self.pending.extend(owed);
+    }
+
+    /// One `ERROR` a replay owes, pushed rather than sent for the reason every
+    /// other callback answer is.
+    fn refuse_replay(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        relevant_id: i64,
+        message: String,
+    ) {
+        self.pending.push(Deferred::Error {
+            session_id,
+            correlation_id,
+            relevant_id,
+            message,
+        });
+    }
+
     fn run_action(
         &mut self,
         client: &mut Client,
@@ -2220,6 +2860,17 @@ impl Sessions {
                 &original_channel,
                 now_ms,
             ),
+            Action::StartReplay(request) => self.start_replay(catalog, &request),
+            Action::StopReplay {
+                session_id,
+                correlation_id,
+                replay_session_id,
+            } => self.stop_replay(replay_session_id, session_id, correlation_id),
+            Action::StopAllReplays {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.stop_all_replays(recording_id, session_id, correlation_id),
             Action::StopRecordingByIdentity {
                 session_id,
                 correlation_id,
@@ -3865,6 +4516,39 @@ impl ControlPlane for Sessions {
             .push(Deferred::Action(Action::StartRecording(request)));
     }
 
+    fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {
+        self.pending
+            .push(Deferred::Action(Action::StartReplay(request)));
+    }
+
+    fn on_stop_replay(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        replay_session_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::StopReplay {
+            session_id,
+            correlation_id,
+            replay_session_id,
+        }));
+    }
+
+    fn on_stop_all_replays(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::StopAllReplays {
+            session_id,
+            correlation_id,
+            recording_id,
+        }));
+    }
+
     fn on_stop_recording_subscription(
         &mut self,
         session_id: i64,
@@ -4086,6 +4770,9 @@ impl ArchiveConductor {
                 file_io_max_length: config.file_io_max_length,
                 file_sync_level: config.file_sync_level,
                 archive_dir: config.archive_dir.clone(),
+            },
+            ReplaySettings {
+                max_concurrent_replays: usize::try_from(config.max_concurrent_replays).unwrap_or(0),
             },
             subscription_ids,
         );
@@ -5690,6 +6377,9 @@ mod tests {
             Duration::from_secs(1),
             DEFAULTS,
             recording_settings(),
+            ReplaySettings {
+                max_concurrent_replays: 20,
+            },
             Vec::new(),
         )
     }

@@ -151,6 +151,7 @@ pub struct ReplaySession {
     state: State,
     error: Option<(i32, String)>,
     revoke: bool,
+    aborted: bool,
     read_bytes: usize,
     connect_deadline_ns: u64,
 }
@@ -204,6 +205,7 @@ impl ReplaySession {
             state: State::Init,
             error: None,
             revoke: false,
+            aborted: false,
             read_bytes: 0,
             connect_deadline_ns,
         })
@@ -252,10 +254,25 @@ impl ReplaySession {
         self.read_bytes
     }
 
+    /// `Session.abort` (`ReplaySession.java:249-252`): the **flag**, and
+    /// nothing else.
+    ///
+    /// The session stops on its next turn, which is what lets `stopReplay`
+    /// answer `OK` before the replay has actually stopped (`AC:1037-1054`) — the
+    /// client is told its request was received, not that it has happened.
+    pub const fn abort(&mut self) {
+        self.aborted = true;
+    }
+
     /// One turn: `ReplaySession.doWork` (`:209-243`).
     pub fn do_work(&mut self, publication: &mut dyn Publication, now_ns: u64) -> Progress {
         if self.state == State::Done {
             return Progress::Idle;
+        }
+
+        if self.aborted {
+            self.revoke = true;
+            self.state = State::Inactive;
         }
 
         let progress = match self.state {

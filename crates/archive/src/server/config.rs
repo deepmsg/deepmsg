@@ -226,6 +226,9 @@ mod settings {
 
     /// `Archive.java:429`, default 20 (`:438`).
     pub const MAX_CONCURRENT_RECORDINGS: &str = "aeron.archive.max.concurrent.recordings";
+    /// `Archive.java:445`, default 20 (`:452`). What bounds how many replays may
+    /// be in flight at once (`ArchiveConductor.java:775-780`).
+    pub const MAX_CONCURRENT_REPLAYS: &str = "aeron.archive.max.concurrent.replays";
     /// `Archive.java:328`, default 128 MiB (`:336`).
     pub const SEGMENT_FILE_LENGTH: &str = "aeron.archive.segment.file.length";
     /// `Archive.java:301`, default 1 MiB (`:295`).
@@ -254,6 +257,8 @@ const CONNECT_TIMEOUT_DEFAULT_NS: i64 = 5 * 1_000_000_000;
 const SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS: i64 = 1_000_000_000;
 /// `Archive.java:438`.
 const MAX_CONCURRENT_RECORDINGS_DEFAULT: i32 = 20;
+/// `Archive.java:452`.
+const MAX_CONCURRENT_REPLAYS_DEFAULT: i32 = 20;
 /// `Archive.java:336`.
 const SEGMENT_FILE_LENGTH_DEFAULT: usize = 128 * 1024 * 1024;
 /// `Archive.java:295`.
@@ -343,6 +348,8 @@ pub struct ArchiveConfig {
 
     /// How many recordings may be active at once (`Archive.java:429`, `:438`).
     pub max_concurrent_recordings: i32,
+    /// How many replays may be in flight at once (`Archive.java:445`, `:452`).
+    pub max_concurrent_replays: i32,
     /// How long one segment file of a recording is (`Archive.java:328`,
     /// `:336`).
     pub segment_file_length: usize,
@@ -566,6 +573,11 @@ impl ArchiveConfig {
                 settings::MAX_CONCURRENT_RECORDINGS,
             )?
             .unwrap_or(MAX_CONCURRENT_RECORDINGS_DEFAULT),
+            max_concurrent_replays: integer(
+                get(settings::MAX_CONCURRENT_REPLAYS),
+                settings::MAX_CONCURRENT_REPLAYS,
+            )?
+            .unwrap_or(MAX_CONCURRENT_REPLAYS_DEFAULT),
             segment_file_length,
             file_io_max_length,
             // The **constant**, not whatever the segment file length resolved
