@@ -16,4 +16,5 @@ pub mod counters;
 pub mod recorder;
 pub mod recording_pos;
 pub mod recording_session;
+pub mod replay_session;
 pub mod response_proxy;
