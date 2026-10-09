@@ -1205,7 +1205,12 @@ fn text(bytes: &[u8]) -> String {
 /// and the reason a caller with nothing to match on passes nothing. The search
 /// is over the channel's bytes rather than its characters — the schema calls the
 /// field US-ASCII, and a fragment is compared as the client wrote it.
-fn channel_contains(channel: &str, fragment: &[u8]) -> bool {
+///
+/// The second caller is the listing that answers a page of recordings for a
+/// uri (`ListRecordingsForUriSession.acceptDescriptor`,
+/// `ListRecordingsForUriSession.java:52-61`), which asks the same question of
+/// the same field.
+pub(crate) fn channel_contains(channel: &str, fragment: &[u8]) -> bool {
     if fragment.is_empty() {
         return true;
     }

@@ -117,7 +117,7 @@ use deepmsg_core::pal::usable_space;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
 
-use crate::catalog::{Catalog, Recording};
+use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
 use crate::server::auth::{
@@ -1089,6 +1089,9 @@ enum Listing {
     /// A page of recording **subscriptions**
     /// (`ListRecordingSubscriptionsSession`, `:96-127`).
     Subscriptions(SubscriptionListing),
+    /// A page of **recordings** (`AbstractListRecordingsSession`, `:79-142`
+    /// over its two subclasses).
+    Recordings(RecordingsListing),
 }
 
 impl Listing {
@@ -1098,6 +1101,7 @@ impl Listing {
         match self {
             Self::Recording(listing) => listing.control_session_id,
             Self::Subscriptions(listing) => listing.control_session_id,
+            Self::Recordings(listing) => listing.control_session_id,
         }
     }
 
@@ -1106,6 +1110,7 @@ impl Listing {
         match self {
             Self::Recording(listing) => listing.is_done,
             Self::Subscriptions(listing) => listing.is_done,
+            Self::Recordings(listing) => listing.is_done,
         }
     }
 }
@@ -1152,12 +1157,226 @@ struct SubscriptionListing {
     is_done: bool,
 }
 
+/// How many of the catalog's entries one turn of a recordings listing **looks
+/// at** (`AbstractListRecordingsSession.MAX_SCANS_PER_WORK_CYCLE`, `:22`).
+///
+/// It bounds the scan and not the page: an entry the filter turns down counts
+/// against it and does not fill the page any faster, which is what keeps a
+/// for-uri request over a large catalog from spending a whole turn here.
+const MAX_SCANS_PER_WORK_CYCLE: i32 = 64;
+
+/// A page of this archive's **recordings**, `count` at a time
+/// (`AbstractListRecordingsSession`, `:79-142`).
+///
+/// The reference has the walk in an abstract session and the one thing the two
+/// requests differ in — which recordings are taken — in two subclasses. That is
+/// the shape here too: one walk, and [`RecordingsFilter`] for the subclasses'
+/// `acceptDescriptor`.
+///
+/// The three fields that move are the reference's: `from_recording_id` is the
+/// cursor the walk resumes from, `sent` is how many descriptors the client has
+/// taken, and both survive a turn in which a send did not take (`:117-121`).
+/// The cursor is an **id** and not a position in the catalog, which is what
+/// lets a walk that was interrupted pick up recordings added while it was away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingsListing {
+    control_session_id: i64,
+    correlation_id: i64,
+    /// The id the walk resumes at, and what a walk that ran out of recordings
+    /// names in its terminal answer (`AbstractListRecordingsSession
+    /// .recordingId`, `:29`, read at `:110`).
+    from_recording_id: i64,
+    /// How many descriptors the client asked for (`count`, `:26`).
+    count: i32,
+    /// How many have gone out (`sent`, `:30`).
+    sent: i32,
+    /// Which recordings the page answers about.
+    filter: RecordingsFilter,
+    is_done: bool,
+}
+
+/// Which of the catalog's recordings a page answers about — the whole of what
+/// separates the reference's two listing sessions
+/// (`ListRecordingsSession.acceptDescriptor`, `:39-42`, against
+/// `ListRecordingsForUriSession`, `:52-61`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordingsFilter {
+    /// Every recording the catalog holds (`ListRecordingsRequest`, template 8).
+    All,
+    /// One stream on one channel (`ListRecordingsForUriRequest`, template 9).
+    Uri {
+        stream_id: i32,
+        /// A piece of the recording's **original** channel, compared as bytes
+        /// and anywhere in it (`Catalog.originalChannelContains`,
+        /// `Catalog.java:585-625`). An empty fragment is in every channel, so a
+        /// client asking about a stream on any channel passes nothing.
+        channel_fragment: Vec<u8>,
+    },
+}
+
+impl RecordingsListing {
+    /// Whether this listing's filter takes a recording
+    /// (`acceptDescriptor`, `ListRecordingsSession.java:39-42` against
+    /// `ListRecordingsForUriSession.java:52-61`).
+    ///
+    /// The reference reads the fields out of the descriptor buffer it has
+    /// **already wrapped** and cannot fail; this build reads the record back by
+    /// id to get the same two fields, and that can. A record the filter cannot
+    /// read is answered for the way a record that cannot be wrapped is — see
+    /// [`walk_recordings`].
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Malformed`] when the record the index holds cannot be
+    /// decoded.
+    fn accepts(&self, catalog: &Catalog, recording_id: i64) -> Result<bool, CatalogError> {
+        match &self.filter {
+            RecordingsFilter::All => Ok(true),
+            RecordingsFilter::Uri {
+                stream_id,
+                channel_fragment,
+            } => {
+                let recording = catalog.recording(recording_id)?;
+
+                Ok(*stream_id == recording.stream_id
+                    && channel_contains(&recording.original_channel, channel_fragment))
+            }
+        }
+    }
+}
+
+/// How one turn of a recordings listing ended.
+///
+/// The two ends that need the client are handed back rather than performed,
+/// because the walk is a pure function of the catalog and the listing — the
+/// same split [`Sessions::start_listing`] makes, and what makes the cursor, the
+/// scan cap and the terminal answers testable without a driver to talk to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingsWalk {
+    /// The walk ran out of recordings in the page it was asked for: the client
+    /// is told with `RECORDING_UNKNOWN` naming this id, and the listing is done
+    /// (`AbstractListRecordingsSession.java:107-113`).
+    Unknown(i64),
+    /// A descriptor did not go out — a full window, or a log turning over. The
+    /// cursor has not moved and the listing is tried again next turn (`:117-121`),
+    /// which is the whole of its pagination. Whether the listing is over anyway
+    /// is the asking session's answer, and so the caller's question.
+    SendFailed,
+    /// The turn is over: the page is full, or the scan cap was reached with the
+    /// listing still live.
+    Idle,
+}
+
+/// Serve one turn of a recordings listing (`AbstractListRecordingsSession
+/// .doWork`, `:79-142`).
+///
+/// The walk is the reference's, in the reference's order: find where the cursor
+/// falls, then look at up to [`MAX_SCANS_PER_WORK_CYCLE`] entries, sending the
+/// ones the filter takes, until the page is full or the catalog runs out.
+///
+/// Two of the three ways out need the client, and both are handed back rather
+/// than performed: the walk running out of recordings, which is answered with
+/// `RECORDING_UNKNOWN`, and a descriptor that did not go out, which is a turn to
+/// try again.
+///
+/// **What is not the reference's shape** is where the entries come from. Java
+/// walks a flat `long[]` of `(id, offset)` pairs, searching it and then stepping
+/// two at a time; this takes [`Catalog::recording_ids`] and reads each record by
+/// id. Same answers, different index — the same call [`Catalog::find_last`]
+/// made. What it costs is a copy of the ids and one lookup per candidate, both
+/// on a path a client is waiting on rather than a publish path.
+///
+/// `send` is handed the descriptor and answers whether it went out — the
+/// client's own `sendDescriptor`, and a parameter because this build's
+/// `drive_listings` holds a real `Client` and a test cannot.
+fn walk_recordings(
+    listing: &mut RecordingsListing,
+    catalog: &Catalog,
+    mut send: impl FnMut(Vec<u8>) -> bool,
+) -> RecordingsWalk {
+    let ids: Vec<i64> = catalog.recording_ids().collect();
+
+    // `CatalogIndex.find` followed by the linear scan it falls back to
+    // (`:90-102`): where the walk starts is the first entry whose id is at or
+    // after the cursor, and an id no entry carries is not a sentinel — a
+    // request naming one starts at the next recording there is, and a request
+    // naming a very low one starts at the first.
+    let start = ids.partition_point(|&id| id < listing.from_recording_id);
+
+    // `recordsScanned < MAX_SCANS_PER_WORK_CYCLE` (`:105`), with `position` the
+    // loop's own count: Java starts at a position found by search and steps it
+    // two at a time; here the position is the walk and the two bounds are the
+    // same bound.
+    let scanned_to = start.saturating_add(MAX_SCANS_PER_WORK_CYCLE as usize);
+
+    for position in start..scanned_to {
+        if listing.sent >= listing.count {
+            break;
+        }
+
+        // `position > lastPosition` (`:107`): there is nothing at or after the
+        // cursor, so the client is told there is nothing more — naming the
+        // **cursor**, which is the id it asked from or the one past the last
+        // recording the walk answered about (`:110`, `:129-132`).
+        let Some(&recording_id) = ids.get(position) else {
+            return RecordingsWalk::Unknown(listing.from_recording_id);
+        };
+
+        // `wrapDescriptorAtOffset(…) < 0` (`:108`): a record that cannot be
+        // wrapped or read is answered for by name, and that name is the
+        // **entry's** id rather than the cursor's (`:110`) — a second turn that
+        // starts from the cursor could otherwise walk past it.
+        let Ok(Some(descriptor)) = catalog.descriptor_body(recording_id) else {
+            return RecordingsWalk::Unknown(recording_id);
+        };
+
+        match listing.accepts(catalog, recording_id) {
+            Ok(true) => {
+                if !send(descriptor) {
+                    return RecordingsWalk::SendFailed;
+                }
+
+                listing.sent += 1;
+            }
+            Ok(false) => {}
+            // The record the filter has to read is not readable: the same
+            // answer as a record that cannot be wrapped, and the same id — see
+            // the plan's Q5. Letting the cursor stand still instead would pin
+            // the listing on that record for every turn that followed.
+            Err(_) => return RecordingsWalk::Unknown(recording_id),
+        }
+
+        // `:125-133`, and the difference between the two arms matters: the
+        // cursor moves to the **next entry's** id, so ids the catalog does not
+        // hold are stepped over in one go rather than one at a time — and past
+        // the last entry it moves to one past the **cursor**, which is where a
+        // walk that fell in a gap has to resume from.
+        listing.from_recording_id = match ids.get(position + 1) {
+            Some(&next) => next,
+            None => listing.from_recording_id + 1,
+        };
+    }
+
+    // `if (sent == count)` (`:136-139`) — **not** `==` here, which is the one
+    // place this build departs from the reference: with a negative `count` the
+    // reference's test is never true, so the listing never ends and the
+    // session's `activeListing` slot is held for good. The two are the same
+    // test wherever `count` is positive, because the loop above adds one to
+    // `sent` at a time under `sent < count`. See the plan's Q6.
+    if listing.sent >= listing.count {
+        listing.is_done = true;
+    }
+
+    RecordingsWalk::Idle
+}
+
 /// Finish a listing whichever kind it is — what the reference does with
 /// `abort` (`Session.abort`, `ListRecordingByIdSession.java:42-46`).
 fn mark_done(listing: &mut Listing) {
     match listing {
         Listing::Recording(listing) => listing.is_done = true,
         Listing::Subscriptions(listing) => listing.is_done = true,
+        Listing::Recordings(listing) => listing.is_done = true,
     }
 }
 
@@ -2895,6 +3114,46 @@ impl Sessions {
         None
     }
 
+    /// Start a page-at-a-time listing of the recordings
+    /// (`ArchiveConductor.newListRecordingsSession`, `:638-657`, and `:659-687`
+    /// for the one with a filter).
+    ///
+    /// **One gate**, and it is the asking session's own (`:640-645`, `:661-666`):
+    /// where [`Sessions::start_listing`] also asks the catalog whether the
+    /// recording is there, there is nothing here for the catalog to refuse — a
+    /// page about recordings that are not there is a page of nothing, and the
+    /// walk answers it with the empty answer rather than a refusal. So this
+    /// decides in the callback, the way the subscriptions listing does, and no
+    /// part of it is deferred.
+    fn start_recordings_listing(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        count: i32,
+        filter: RecordingsFilter,
+    ) {
+        if self.has_active_listing(session_id) {
+            self.pending.push(Deferred::Error {
+                session_id,
+                correlation_id,
+                relevant_id: ACTIVE_LISTING,
+                message: ACTIVE_LISTING_MSG.to_owned(),
+            });
+            return;
+        }
+
+        self.listings.push(Listing::Recordings(RecordingsListing {
+            control_session_id: session_id,
+            correlation_id,
+            from_recording_id,
+            count,
+            sent: 0,
+            filter,
+            is_done: false,
+        }));
+    }
+
     /// Serve the listings, one attempt each (`SessionWorker.doWork` over
     /// `ListRecordingByIdSession.java:60-80`).
     ///
@@ -3033,6 +3292,35 @@ impl Sessions {
                             client,
                         );
                         listing.is_done = true;
+                    }
+                }
+                // `AbstractListRecordingsSession.doWork` (`:79-142`), whose
+                // walk is [`walk_recordings`]. What is left here is the part
+                // that needs the client: offering each descriptor until one
+                // does not go out, and the terminal answer a walk that ran out
+                // of recordings owes.
+                Listing::Recordings(listing) => {
+                    let correlation_id = listing.correlation_id;
+
+                    match walk_recordings(listing, catalog, |descriptor| {
+                        entry
+                            .control
+                            .send_descriptor(correlation_id, descriptor, now_ms, client)
+                    }) {
+                        RecordingsWalk::Unknown(recording_id) => {
+                            entry.control.send_recording_unknown(
+                                correlation_id,
+                                recording_id,
+                                now_ms,
+                                client,
+                            );
+                            listing.is_done = true;
+                        }
+                        // `isDone = controlSession.isDone()` (`:119`): the
+                        // cursor stands still and the session is what says
+                        // whether the listing is over anyway.
+                        RecordingsWalk::SendFailed => listing.is_done = entry.control.is_done(),
+                        RecordingsWalk::Idle => {}
                     }
                 }
             }
@@ -3533,6 +3821,45 @@ impl ControlPlane for Sessions {
         });
     }
 
+    fn on_list_recordings(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        count: i32,
+        _now_ms: i64,
+    ) {
+        self.start_recordings_listing(
+            session_id,
+            correlation_id,
+            from_recording_id,
+            count,
+            RecordingsFilter::All,
+        );
+    }
+
+    fn on_list_recordings_for_uri(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        from_recording_id: i64,
+        count: i32,
+        stream_id: i32,
+        channel_fragment: &[u8],
+        _now_ms: i64,
+    ) {
+        self.start_recordings_listing(
+            session_id,
+            correlation_id,
+            from_recording_id,
+            count,
+            RecordingsFilter::Uri {
+                stream_id,
+                channel_fragment: channel_fragment.to_vec(),
+            },
+        );
+    }
+
     fn on_start_recording(&mut self, request: StartRecordingRequest, _now_ms: i64) {
         self.pending
             .push(Deferred::Action(Action::StartRecording(request)));
@@ -3935,6 +4262,90 @@ mod tests {
             .expect("added");
 
         (dir, catalog)
+    }
+
+    /// A catalog holding one recording per `(stream_id, original_channel)` pair,
+    /// added in the order given — so the ids it hands out are 0, 1, 2, … in
+    /// that order, which is what a page of them is walked in.
+    fn catalog_with_recordings(recordings: &[(i32, &str)]) -> (TempDir, Catalog) {
+        let dir = TempDir::new();
+        let mut catalog =
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+
+        for (index, (stream_id, channel)) in recordings.iter().enumerate() {
+            let index = i64::try_from(index).expect("small");
+
+            catalog
+                .add_recording(&Recording {
+                    recording_id: 0,
+                    start_timestamp: 1_000 + index,
+                    stop_timestamp: 2_000 + index,
+                    start_position: (index + 1) * 4096,
+                    stop_position: (index + 1) * 8192,
+                    initial_term_id: 3,
+                    segment_file_length: 128 * 1024,
+                    term_buffer_length: 64 * 1024,
+                    mtu_length: 1408,
+                    session_id: 1001,
+                    stream_id: *stream_id,
+                    stripped_channel: (*channel).to_owned(),
+                    original_channel: (*channel).to_owned(),
+                    source_identity: "aeron:ipc".to_owned(),
+                })
+                .expect("added");
+        }
+
+        (dir, catalog)
+    }
+
+    /// The recording a descriptor body is about, read back the way the client
+    /// reads it — the body is the descriptor as the catalog holds it, so this
+    /// is what a page is checked by.
+    fn descriptor_recording_id(body: &[u8]) -> i64 {
+        use deepmsg_codec::archive::recording_descriptor_codec::{
+            self, RecordingDescriptorDecoder,
+        };
+        use deepmsg_codec::archive::{ReadBuf, SBE_SCHEMA_VERSION};
+
+        RecordingDescriptorDecoder::default()
+            .wrap(
+                ReadBuf::new(body),
+                0,
+                recording_descriptor_codec::SBE_BLOCK_LENGTH,
+                SBE_SCHEMA_VERSION,
+            )
+            .recording_id()
+    }
+
+    /// A page of every recording there is, asked for from the lowest id there
+    /// is — which is what the C client sends for template 8
+    /// (`aeron_archive_proxy.c:505-528`).
+    fn recordings_listing(count: i32) -> RecordingsListing {
+        RecordingsListing {
+            control_session_id: 3,
+            correlation_id: 7,
+            from_recording_id: i64::MIN,
+            count,
+            sent: 0,
+            filter: RecordingsFilter::All,
+            is_done: false,
+        }
+    }
+
+    /// One turn of `walk_recordings` with a client that takes everything, and
+    /// the recordings that went out — read back out of the descriptors rather
+    /// than assumed, so a page that answers about the wrong record shows.
+    fn walk_taking(
+        listing: &mut RecordingsListing,
+        catalog: &Catalog,
+    ) -> (RecordingsWalk, Vec<i64>) {
+        let mut sent = Vec::new();
+        let walk = walk_recordings(listing, catalog, |body| {
+            sent.push(descriptor_recording_id(&body));
+            true
+        });
+
+        (walk, sent)
     }
 
     /// Each question reads the field the reference reads, and the two that fall
@@ -4725,6 +5136,7 @@ mod tests {
         let second = match &sessions.listings[1] {
             Listing::Recording(listing) => listing.correlation_id,
             Listing::Subscriptions(listing) => listing.correlation_id,
+            Listing::Recordings(listing) => listing.correlation_id,
         };
         assert_eq!(9, second);
         assert!(!sessions.has_active_listing(5));
@@ -4741,6 +5153,313 @@ mod tests {
             sessions.start_listing(5, 11, -1, &catalog)
         );
         assert_eq!(2, sessions.listings.len());
+    }
+
+    /// One recording per page, and the page the client asked for is what ends
+    /// the walk — either the catalog running out, which the client is told
+    /// about, or the page filling up, which it is not
+    /// (`AbstractListRecordingsSession.java:107-113`, `:136-139`).
+    #[test]
+    fn a_page_of_recordings_ends_with_the_catalog_or_with_the_page_being_full() {
+        let (_dir, catalog) = catalog_with_recordings(&[
+            (33, "aeron:udp?endpoint=localhost:3333"),
+            (33, "aeron:udp?endpoint=localhost:3334"),
+        ]);
+
+        // A page bigger than the catalog: both recordings go out, and the
+        // client is then told there is nothing more. The name in that answer is
+        // the cursor — one past the last recording there was (`:129-132`) —
+        // and the listing is left for the caller to finish, because sending the
+        // answer is the caller's.
+        let mut listing = recordings_listing(10);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert_eq!(vec![0, 1], sent);
+        assert_eq!(2, listing.sent);
+        assert!(!listing.is_done);
+
+        // A page of one: one descriptor and **no** terminal answer, because the
+        // client reads `count` descriptors as the whole of its page. This is
+        // the second call in `shouldFindMultipleRecordingDescriptors`
+        // (`aeron_archive_test.cpp:2450-2457`), and getting it wrong is what
+        // makes the next request look like the previous page is unfinished.
+        let mut listing = recordings_listing(1);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Idle, walk);
+        assert_eq!(vec![0], sent);
+        assert!(listing.is_done);
+    }
+
+    /// The filter is the whole of what separates the reference's two listing
+    /// sessions, and it takes a recording only when **both** halves hold —
+    /// which is what the three calls of
+    /// `shouldFindRecordingDescriptorForUri` (`aeron_archive_test.cpp:2468-2561`)
+    /// tell apart.
+    #[test]
+    fn a_page_for_a_uri_is_narrowed_by_stream_and_by_channel_fragment() {
+        let (_dir, catalog) = catalog_with_recordings(&[
+            (33, "aeron:udp?endpoint=localhost:3333"),
+            (33, "aeron:udp?endpoint=localhost:3334"),
+        ]);
+
+        let for_uri = |stream_id: i32, fragment: &str, count: i32| RecordingsListing {
+            filter: RecordingsFilter::Uri {
+                stream_id,
+                channel_fragment: fragment.as_bytes().to_vec(),
+            },
+            ..recordings_listing(count)
+        };
+
+        // One channel, and a page of two: the second recording is the only one
+        // taken, and the page is not full, so the walk ends by telling the
+        // client there is nothing more.
+        let mut listing = for_uri(33, "3334", 2);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert_eq!(vec![1], sent);
+
+        // A fragment of both: still one filter, two recordings, and now the
+        // page fills up — which is a different ending again.
+        let mut listing = for_uri(33, "333", 10);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert_eq!(vec![0, 1], sent);
+
+        let mut listing = for_uri(33, "333", 2);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Idle, walk);
+        assert_eq!(vec![0, 1], sent);
+
+        // Nothing matches on the channel, and the walk still runs off the end
+        // of the catalog — the empty page is an answer the client waits for,
+        // not a refusal.
+        let mut listing = for_uri(33, "no-match", 10);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert!(sent.is_empty());
+
+        // And nothing matches on the stream, with a fragment every channel has:
+        // the half that only the intersection catches.
+        let mut listing = for_uri(99, "", 10);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert!(sent.is_empty());
+    }
+
+    /// One turn looks at at most `MAX_SCANS_PER_WORK_CYCLE` entries however few
+    /// of them it answers with, and what it does not get to it picks up from on
+    /// the next turn (`AbstractListRecordingsSession.java:105`).
+    ///
+    /// This is the branch the C suite cannot reach — its catalog is two
+    /// recordings — and the one that would make a for-uri request over a large
+    /// catalog hold a turn of its own.
+    #[test]
+    fn a_turn_scans_a_bounded_number_of_entries_and_goes_on_from_the_cursor() {
+        let channels: Vec<(i32, String)> = (0..100)
+            .map(|index| (33, format!("aeron:udp?endpoint=localhost:{}", 4000 + index)))
+            .collect();
+        let recordings: Vec<(i32, &str)> = channels
+            .iter()
+            .map(|(stream_id, channel)| (*stream_id, channel.as_str()))
+            .collect();
+
+        let (_dir, catalog) = catalog_with_recordings(&recordings);
+
+        // A filter nothing matches, so that every entry is looked at and none
+        // is answered with.
+        let mut listing = RecordingsListing {
+            filter: RecordingsFilter::Uri {
+                stream_id: 99,
+                channel_fragment: Vec::new(),
+            },
+            ..recordings_listing(100)
+        };
+
+        assert_eq!(RecordingsWalk::Idle, walk_taking(&mut listing, &catalog).0);
+        assert_eq!(
+            i64::from(MAX_SCANS_PER_WORK_CYCLE),
+            listing.from_recording_id,
+            "the turn stopped at the scan cap and the cursor is where it got to"
+        );
+        assert_eq!(0, listing.sent);
+        assert!(!listing.is_done, "there is still the rest of the catalog");
+
+        // The next turn starts where that one stopped, and finishes the walk.
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(100), walk);
+        assert!(sent.is_empty());
+    }
+
+    /// A descriptor that did not go out is not a failure to report but a turn
+    /// to try again: the cursor stands still, and the record is offered again
+    /// (`AbstractListRecordingsSession.java:117-121`).
+    #[test]
+    fn a_send_that_does_not_take_leaves_the_cursor_where_it_was() {
+        let (_dir, catalog) = catalog_with_recordings(&[
+            (33, "aeron:udp?endpoint=localhost:3333"),
+            (33, "aeron:udp?endpoint=localhost:3334"),
+        ]);
+
+        let mut listing = recordings_listing(10);
+        let mut offered = 0;
+        let walk = walk_recordings(&mut listing, &catalog, |_| {
+            offered += 1;
+            false
+        });
+
+        assert_eq!(RecordingsWalk::SendFailed, walk);
+        assert_eq!(1, offered, "the turn ended at the offer that did not take");
+        assert_eq!(
+            i64::MIN,
+            listing.from_recording_id,
+            "the cursor stands still"
+        );
+        assert_eq!(0, listing.sent);
+        assert!(
+            !listing.is_done,
+            "whether it is over is the session's answer"
+        );
+
+        // The next turn offers the same recording again, and the page goes out.
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+        assert_eq!(vec![0, 1], sent);
+    }
+
+    /// A id no recording carries is not a special case: the walk starts at the
+    /// next recording there is, and a cursor past the end of the catalog is a
+    /// page of nothing rather than a refusal (`:90-102`, `:107-113`).
+    ///
+    /// The gap is a retired recording, which is what leaves one — and it is
+    /// what tells the two arms of the cursor rule apart, because the answer a
+    /// walk that fell in the gap ends with names `cursor + 1` and not
+    /// `last id + 1`.
+    #[test]
+    fn a_cursor_lands_on_the_next_recording_there_is() {
+        use deepmsg_codec::archive::recording_state::RecordingState;
+
+        let (_dir, mut catalog) = catalog_with_recordings(&[
+            (33, "aeron:udp?endpoint=localhost:3333"),
+            (33, "aeron:udp?endpoint=localhost:3334"),
+            (33, "aeron:udp?endpoint=localhost:3335"),
+        ]);
+
+        assert!(
+            catalog
+                .change_state(1, RecordingState::INVALID)
+                .expect("retired")
+        );
+
+        // From the lowest id: 0 and 2, the retired one stepped over, and the
+        // cursor one past the last whatever it was is 3.
+        let mut listing = recordings_listing(10);
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(vec![0, 2], sent);
+        assert_eq!(RecordingsWalk::Unknown(3), walk);
+
+        // From inside the gap: the walk starts at 2, and the cursor it ends on
+        // is one past **where it was**, which is 2 and not 3. That is the
+        // reference's `recordingId++` and not `index[position] + 1`
+        // (`:129-132`).
+        let mut listing = RecordingsListing {
+            from_recording_id: 1,
+            ..recordings_listing(10)
+        };
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert_eq!(vec![2], sent);
+        assert_eq!(RecordingsWalk::Unknown(2), walk);
+
+        // Past the end of the catalog: nothing to answer with, and the name is
+        // the cursor the client asked from.
+        let mut listing = RecordingsListing {
+            from_recording_id: 1_000,
+            ..recordings_listing(10)
+        };
+        let (walk, sent) = walk_taking(&mut listing, &catalog);
+        assert!(sent.is_empty());
+        assert_eq!(RecordingsWalk::Unknown(1_000), walk);
+    }
+
+    /// A page of nothing is answered by running out of catalog rather than by a
+    /// count of zero, and a **negative** count is the same quiet end.
+    ///
+    /// The reference's own test is `sent == count` (`:136-139`), which for a
+    /// negative count is never true: the listing never ends and the session's
+    /// `activeListing` slot is held for good. This build takes `>=`, which is
+    /// the same test wherever the count is positive — see the plan's Q6.
+    #[test]
+    fn a_count_that_cannot_be_filled_is_a_quiet_end() {
+        let (_dir, catalog) = catalog_with_recordings(&[
+            (33, "aeron:udp?endpoint=localhost:3333"),
+            (33, "aeron:udp?endpoint=localhost:3334"),
+        ]);
+
+        for count in [0, -5] {
+            let mut listing = recordings_listing(count);
+            let (walk, sent) = walk_taking(&mut listing, &catalog);
+
+            assert!(sent.is_empty(), "count {count} asks for no descriptors");
+            assert_eq!(RecordingsWalk::Idle, walk, "and nothing is sent about it");
+            assert!(listing.is_done, "count {count} leaves no listing behind");
+        }
+    }
+
+    /// A page of recordings has one gate and it is the asking session's own
+    /// (`ArchiveConductor.newListRecordingsSession`, `:638-657`): a second
+    /// request on the same session is refused with the reference's own words,
+    /// and one from another session is served.
+    #[test]
+    fn a_page_of_recordings_is_started_once_per_session() {
+        let mut sessions = sessions();
+
+        sessions.on_list_recordings(3, 7, i64::MIN, 10, 0);
+        assert_eq!(
+            vec![Listing::Recordings(RecordingsListing {
+                control_session_id: 3,
+                correlation_id: 7,
+                from_recording_id: i64::MIN,
+                count: 10,
+                sent: 0,
+                filter: RecordingsFilter::All,
+                is_done: false,
+            })],
+            sessions.listings
+        );
+        assert!(
+            sessions.pending.is_empty(),
+            "there is nothing to defer: the one gate is the session's own state"
+        );
+
+        sessions.on_list_recordings(3, 8, i64::MIN, 10, 0);
+        assert_eq!(1, sessions.listings.len(), "one listing per session");
+        assert_eq!(
+            vec![Deferred::Error {
+                session_id: 3,
+                correlation_id: 8,
+                relevant_id: ACTIVE_LISTING,
+                message: ACTIVE_LISTING_MSG.to_owned(),
+            }],
+            sessions.pending
+        );
+
+        // The uri form is the same page with a filter, and a different session
+        // gets its own.
+        sessions.on_list_recordings_for_uri(4, 9, 5, 2, 33, b"3333", 0);
+        assert_eq!(
+            Some(&Listing::Recordings(RecordingsListing {
+                control_session_id: 4,
+                correlation_id: 9,
+                from_recording_id: 5,
+                count: 2,
+                sent: 0,
+                filter: RecordingsFilter::Uri {
+                    stream_id: 33,
+                    channel_fragment: b"3333".to_vec(),
+                },
+                is_done: false,
+            })),
+            sessions.listings.get(1)
+        );
     }
 
     /// What the archive's own control settings are for these tests, and the
