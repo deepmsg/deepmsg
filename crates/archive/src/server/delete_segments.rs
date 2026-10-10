@@ -208,20 +208,27 @@ fn delete_segment_file(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let renamed = rename_target(path);
+    let suffixed = delete_suffix_name(path);
 
-    if std::fs::remove_file(&renamed).is_err() && renamed.exists() {
+    if std::fs::remove_file(&suffixed).is_err() && suffixed.exists() {
         return Err(format!(
             "unable to delete segment file: {}",
-            renamed.display()
+            suffixed.display()
         ));
     }
 
     Ok(())
 }
 
-/// `<name>.del`, which is what a file that will not delete is renamed to.
-fn rename_target(path: &Path) -> PathBuf {
+/// `<name>.del`, **deleted** rather than written.
+///
+/// The reference's variable is called `renamedFile`, and the name is doing the
+/// misleading: nothing in this method renames anything. What it does is try to
+/// delete the `.del` name too (`DeleteSegmentsSession.java:150-166`), which
+/// covers a file that has already been renamed by something else — a half-rolled
+/// delete from an archive that died mid-way, which is exactly what the listing's
+/// two suffixes exist for.
+fn delete_suffix_name(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
 
     name.push(DELETE_SUFFIX);
@@ -441,16 +448,25 @@ mod tests {
         assert!(!dir.path().join("7-0.rec").exists());
     }
 
-    /// A file that is already gone is not a failure, and one that will not go is
-    /// renamed and tried again (`:144-168`).
+    /// A file that is gone is not a delete failure — and the `.del` name is
+    /// tried too, which is how a file renamed by a half-finished delete is
+    /// finished off (`DeleteSegmentsSession.java:150-166`).
     #[test]
-    fn a_file_that_is_gone_is_not_an_error() {
+    fn a_file_that_is_already_gone_is_not_an_error() {
         let dir = with_files(&["7-0.rec"]);
         let path = dir.path().join("7-0.rec");
-        std::fs::remove_file(&path).expect("removed behind the session's back");
+
+        // The `.rec` is not there and neither is its `.del` sibling: nothing to
+        // do, and nothing to complain about.
+        assert_eq!(Ok(()), delete_segment_file(&path));
+
+        // And now the shape a half-finished delete leaves: the `.rec` gone, the
+        // `.del` still there. The delete finds it and takes it.
+        let suffixed = dir.path().join("7-0.rec.del");
+        std::fs::write(&suffixed, b"x").expect("the renamed file");
 
         assert_eq!(Ok(()), delete_segment_file(&path));
-        assert_eq!(Ok(()), delete_segment_file(&dir.path().join("7-0.rec.del")));
+        assert!(!suffixed.exists(), "the .del name went with it");
     }
 
     /// The listing is this recording's files and only this recording's, under
