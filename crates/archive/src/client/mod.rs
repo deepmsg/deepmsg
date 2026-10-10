@@ -35,7 +35,9 @@
 //! other slices and are not here.
 
 pub mod context;
+pub mod poller;
 pub mod proxy;
 
 pub use context::{ArchiveContext, ClientError, ConcludeError, ControlChannels};
+pub use poller::{ControlResponseError, ControlResponsePoller, FRAGMENT_LIMIT_DEFAULT};
 pub use proxy::{ArchiveProxy, ProxyError, ReplayParams, ReplicationParams};
