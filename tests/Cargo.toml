@@ -259,6 +259,12 @@ path = "integration/archive_poller.rs"
 name = "archive_async_connect"
 path = "integration/archive_async_connect.rs"
 
+# P2-C1's `Archive`: the object, its four waits, and the recording signals that
+# must not end one.
+[[test]]
+name = "archive_client_api"
+path = "integration/archive_client_api.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused

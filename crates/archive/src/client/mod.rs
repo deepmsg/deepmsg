@@ -34,11 +34,13 @@
 //! the *async* client (`aeron_archive_async_client.c`, the self-healing one) are
 //! other slices and are not here.
 
+pub mod archive;
 pub mod async_connect;
 pub mod context;
 pub mod poller;
 pub mod proxy;
 
+pub use archive::{Archive, ArchiveError, archive_to_client_error_code};
 pub use async_connect::{
     AsyncConnect, ConnectError, ConnectState, Connected, Credentials, NoCredentials, Polled,
 };
