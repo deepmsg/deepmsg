@@ -294,6 +294,29 @@ struct Descriptor {
 /// reference refuses it, and asking again is what a client does with that
 /// answer. What the retry is **not** is a way past a listing that never ended:
 /// one of those is refused every time, and the deadline says so.
+///
+/// # What the retry is keyed on, and why it is not the answer's code
+///
+/// It is keyed on **how many descriptors came back**: a page that answered with
+/// fewer than were asked for is a page to ask again for, and a full one is the
+/// answer. That is deliberately not `code == ERROR`: the `ACTIVE_LISTING`
+/// refusal this loop was written for arrives as an `ERROR`, but so does every
+/// other refusal, and **a `RECORDING_UNKNOWN` does not arrive as one at all**
+/// (`control_response_code.rs`: `ERROR = 1`, `RECORDING_UNKNOWN = 2`).
+///
+/// The difference matters because the archive answers a listing out of the
+/// catalog **as it stands**, and the catalog is written by the archive's own
+/// recording session — a turn or two behind the request that started the
+/// recording. A listing that arrives in that window is answered with the
+/// honest `RECORDING_UNKNOWN` of an empty catalog, and the criterion that is
+/// waiting for its recording has to ask again rather than take that for the
+/// end of the story. Keyed on the count, it does; keyed on the code, it took
+/// the empty answer as final and the caller waited out its whole deadline.
+///
+/// **The count keys it correctly for the three callers that want an empty
+/// page.** ⑤, ⑥ and ⑦ ask for **zero** descriptors and expect the
+/// `RECORDING_UNKNOWN` that comes back — and `0 < 0` is false, so none of them
+/// ever retries. One ruler separates the two cases; no second flag is needed.
 fn ask(
     session: &mut Session,
     client: &mut Client,
@@ -302,7 +325,7 @@ fn ask(
     request: impl Fn(i64) -> Vec<u8>,
 ) -> (Vec<Descriptor>, Option<archive::Response>) {
     let deadline = Instant::now() + DEADLINE;
-    let mut refusals = 0;
+    let mut attempts = 0;
 
     loop {
         let correlation_id = session.next_correlation_id();
@@ -314,17 +337,21 @@ fn ask(
 
         let (page, end) = read_page(session, client, correlation_id, descriptors, terminal);
 
-        match end {
-            Some(refusal) if refusal.code == ControlResponseCode::ERROR => {
-                refusals += 1;
-                assert!(
-                    Instant::now() < deadline,
-                    "the archive refused {refusals} pages running, the last one saying: {}",
-                    refusal.message()
-                );
-            }
-            end => return (page, end),
+        if page.len() >= descriptors {
+            return (page, end);
         }
+
+        attempts += 1;
+        assert!(
+            Instant::now() < deadline,
+            "the archive answered {attempts} pages short, the last one with {} of \
+             {descriptors} descriptors{}",
+            page.len(),
+            match &end {
+                Some(end) => format!(" and {} saying: {}", end.code, end.message()),
+                None => " and no answer at all".to_owned(),
+            }
+        );
     }
 }
 
@@ -394,12 +421,18 @@ fn read_page(
             }
         });
 
-        // A refusal is the end of the request, so there is nothing left to wait
-        // for — the deadline would only make a wrong answer slow.
-        if end
-            .as_ref()
-            .is_some_and(|end| end.code == ControlResponseCode::ERROR)
-        {
+        // **A terminal answer ends the request, whatever its code.** A listing's
+        // descriptors are sent before the answer that ends it, so an answer in
+        // hand means nothing more is coming: waiting for the rest of a page that
+        // was answered short would only make a wrong answer slow.
+        //
+        // **The code used to be tested here** (`== ControlResponseCode::ERROR`)
+        // and that was a hole. A listing the archive answers out of an empty
+        // catalog ends with `RECORDING_UNKNOWN`, which is not `ERROR`
+        // (`control_response_code.rs`: `1` against `2`), so the wait went on to
+        // its deadline with the answer already in hand — and `ask`, which is the
+        // caller that knows to ask again, never got control back to do it.
+        if end.is_some() {
             break;
         }
 
