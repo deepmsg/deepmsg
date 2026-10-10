@@ -26,7 +26,7 @@ use deepmsg_bench::loadtest::recorder::{self, Recorder};
 use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
 use deepmsg_bench::loadtest::transceiver::{MessageTransceiver, SystemClock};
-use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
+use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
 use deepmsg_bench::loadtest::transport::util::ChannelSettings;
 
 /// What this program accepts.
@@ -40,6 +40,25 @@ usage: loadtest-rig [--print-config] [-Dname=value ...] [file.properties ...]
   The settings and their defaults are the reference's, and
   analysis/bench/deepmsg-rust-loadtestrig-plan.md §2.5 lists them.
 ";
+
+/// The shortest interval between the inline client's duty cycles, as an
+/// environment variable, in nanoseconds.
+///
+/// This build's own switch, and deliberately not a setting: it changes what the
+/// rig *is* rather than what it measures, and keeping it out of the property
+/// namespace means a properties file cannot turn it on by accident. Unset means
+/// the rig as it has always been — `Client::poll` on every `receive()`. A value
+/// of `N` where `N > 0` runs the duty cycle **at most once every N nanoseconds**
+/// of the measured thread's monotonic clock, which is the shape the A/B's
+/// "after" arm asks for: a `receive()` where the driver half of the cycle is not
+/// run on every turn.
+///
+/// It is a measurement and not a setting — `poll` carries liveness, the driver's
+/// replies and `expire_pending` (`crates/client/src/client.rs:970-986`), so a
+/// run with this set is a run that runs the duty cycle less often than the rig
+/// has always run it — and an unset, empty, non-numeric or zero value is the
+/// rig's own shape, so the only way to change a run is to say so.
+const CLIENT_POLL_MIN_NS: &str = "DEEPMSG_RIG_CLIENT_POLL_MIN_NS";
 
 fn main() -> ExitCode {
     match run() {
@@ -131,7 +150,14 @@ fn run() -> Result<(), String> {
         Transceiver::Echo => {
             let channels =
                 ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
-            let transceiver = EchoTransceiver::new(channels, idle, logs_directory)
+            let client_poll_min_ns = poll_min_ns(std::env::var(CLIENT_POLL_MIN_NS).ok().as_deref());
+            let gate = if client_poll_min_ns > 0 {
+                PollGate::EveryInterval(client_poll_min_ns)
+            } else {
+                PollGate::Every
+            };
+
+            let transceiver = EchoTransceiver::new(channels, idle, logs_directory, gate)
                 .map_err(|error| error.to_string())?;
 
             measure(configuration, transceiver)?;
@@ -139,6 +165,21 @@ fn run() -> Result<(), String> {
     }
 
     std::io::stdout().flush().map_err(|error| error.to_string())
+}
+
+/// The interval between the client's duty cycles, in nanoseconds.
+///
+/// A value of [`CLIENT_POLL_MIN_NS`], which is a literal decimal number and
+/// nothing else: an unset, empty, non-numeric or zero value is `0` — the duty
+/// cycle on every `receive()` — so a mistyped switch leaves the rig exactly as
+/// it was and the only way to change a run is to say so.
+fn poll_min_ns(value: Option<&str>) -> u64 {
+    match value {
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value.parse::<u64>().unwrap_or(0)
+        }
+        _ => 0,
+    }
 }
 
 /// Run one measurement, whoever is under test.
@@ -262,6 +303,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The interval is 0 — the rig's own shape — unless a literal number says
+    /// otherwise. An unset variable, anything a caller might mean by "off", and
+    /// anything that is not a plain decimal number all leave the duty cycle on
+    /// every `receive()`.
+    #[test]
+    fn the_interval_switch_is_zero_unless_a_number_says_otherwise() {
+        for (value, expected) in [
+            (None, 0),
+            (Some(""), 0),
+            (Some("0"), 0),
+            (Some("1"), 1),
+            (Some("1000000"), 1_000_000),
+            (Some(" 1000000"), 0),
+            (Some("1000000 "), 0),
+            (Some("+1000000"), 0),
+            (Some("-1"), 0),
+            (Some("1.0"), 0),
+            (Some("0x10"), 0),
+            (Some("one"), 0),
+            (Some("99999999999999999999999"), 0),
+        ] {
+            assert_eq!(poll_min_ns(value), expected, "for {value:?}");
+        }
     }
 
     #[test]

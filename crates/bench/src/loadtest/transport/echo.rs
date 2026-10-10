@@ -8,7 +8,25 @@
 //!
 //! UDP and IPC are the same code with a different channel string; what differs
 //! is what the message crosses, which is the point of having both.
+//!
+//! # Where the client's duty cycle runs
+//!
+//! The reference's client conductor is an agent on a thread of its own
+//! (`Aeron.java:174`, `AgentRunner.startOnThread`), and its transceiver's
+//! `receive` is one line — `subscription.poll(...)`
+//! (`EchoMessageTransceiver.java:176-178`). This rig starts out the other way:
+//! `Client::poll` *is* the duty cycle, and [`EchoTransceiver::receive`] runs it
+//! on the measured thread on the way to reading the subscription. [`Conductor`]
+//! is the switch between running that duty cycle on every turn and gating it by
+//! the measured thread's own clock.
+//!
+//! [`Conductor::Inline`] is the rig's own shape, exactly as it was before the
+//! switch existed, and is what an unset switch gives. [`Conductor::InlineGated`]
+//! is the shape the A/B asks for: the duty cycle runs at most once an interval,
+//! which is what a `receive()` costs when the driver half of the cycle is not
+//! run on every turn.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
@@ -25,11 +43,75 @@ use crate::loadtest::transport::util::{
     ChannelSettings, MIN_MESSAGE_LENGTH, TIMESTAMP_OFFSET, await_connected,
 };
 
+/// How often the inline duty cycle runs, when it is not on every `receive()`.
+///
+/// The rig's duty cycle is [`Client::poll`] on the measured thread (see the
+/// module documentation), and every run but the A/B runs it on every turn: that
+/// is [`PollGate::Every`], the default, and the shape the rig has always had.
+/// [`PollGate::EveryInterval`] is the shape the A/B's "after" arm asks for, read
+/// from an environment variable in the binary rather than from a setting — see
+/// `loadtest-rig.rs` — so an unset or mistyped switch leaves the rig as it was.
+///
+/// The duty cycle is **not free to skip**: `Client::poll` carries
+/// `check_liveness`, the driver's replies and `expire_pending`
+/// (`crates/client/src/client.rs:970-986`). What the gate does *not* touch is
+/// the subscription read ([`EchoTransceiver::receive`]'s `poll_messages`), which
+/// is where a reply is actually taken off the term — so the gate does not make a
+/// run lose a message; it makes it run the driver half of the cycle less often.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollGate {
+    /// `Client::poll` on every `receive()`: the rig's own shape, and what an
+    /// unset switch gives.
+    Every,
+    /// At most one `Client::poll` per `interval` nanoseconds of the measured
+    /// thread's own monotonic clock, checked on every `receive()`. The interval
+    /// is always > 0.
+    EveryInterval(u64),
+}
+
+/// Where the client's duty cycle runs.
+///
+/// `Inline` is the rig's own, and the default; `InlineGated` runs the same duty
+/// cycle at most once an interval. The gate is on the clock and not on a turn
+/// count, because an interval is a property of the run where a turn count is a
+/// property of how fast the machine turns — which is what makes the two arms of
+/// an A/B comparable across an iteration rate.
+// A `Client` is several hundred bytes and `Inline` holds one by value, so the
+// variants differ by an order of magnitude. Boxing it to even them out would put
+// an indirection on the path the switch promises to leave exactly as it was, and
+// that promise is worth more than the enum's size.
+#[allow(clippy::large_enum_variant)]
+enum Conductor {
+    /// This thread runs the duty cycle itself, as it did before the switch
+    /// existed.
+    Inline(Client),
+    /// The inline duty cycle, gated **by time**: `client.poll()` runs only when
+    /// the measured thread's monotonic clock has reached `due`, and the turns
+    /// between only read the subscription.
+    ///
+    /// What a run that asks for it (`DEEPMSG_RIG_CLIENT_POLL_MIN_NS` > 0) is
+    /// asking is what a `receive()` costs when the driver half of the duty cycle
+    /// runs once an interval rather than once a turn.
+    ///
+    /// [`Conductor::Inline`] is what an unset switch — every run but the A/B —
+    /// uses, and its `receive` arm is left byte for byte as it was.
+    InlineGated {
+        /// The client, polled at most once an interval.
+        client: Client,
+        /// The interval, in nanoseconds. Always > 0.
+        interval: u64,
+        /// When the next `poll` is due, on the measured thread's monotonic
+        /// clock. A plain `Cell`, on purpose: one thread's own reading, and the
+        /// transceiver is never shared.
+        due: Cell<i64>,
+    },
+}
+
 /// A client that publishes to a node and reads what comes back.
 pub struct EchoTransceiver {
     settings: ChannelSettings,
     logs_directory: PathBuf,
-    client: Client,
+    conductor: Conductor,
     publication: i64,
     subscription: i64,
     sender: MessageSender,
@@ -52,6 +134,13 @@ impl EchoTransceiver {
     /// against an external one — which is every run this port is for — leaves it
     /// false and goes through `aeron.dir` instead.
     ///
+    /// `gate` selects [`Conductor`], and only matters for the inline shape:
+    /// [`PollGate::Every`] — the default — is [`Conductor::Inline`] and the path
+    /// this rig has always run, and [`PollGate::EveryInterval`] is
+    /// [`Conductor::InlineGated`], the A/B's "after" arm. It is the scene of a
+    /// measurement (how much of a `receive()` the duty cycle is) and not a
+    /// setting a run should carry.
+    ///
     /// # Errors
     ///
     /// [`TransceiverError`] when the driver's CnC file is not where the settings
@@ -60,6 +149,7 @@ impl EchoTransceiver {
         settings: ChannelSettings,
         idle: IdleStrategy,
         logs_directory: PathBuf,
+        gate: PollGate,
     ) -> Result<Self, TransceiverError> {
         let client =
             Client::connect(&settings.directory).map_err(|error| TransceiverError::Failed {
@@ -77,10 +167,23 @@ impl EchoTransceiver {
             settings.receiver_count,
         );
 
+        let conductor = match gate {
+            PollGate::Every => Conductor::Inline(client),
+            PollGate::EveryInterval(interval) => Conductor::InlineGated {
+                client,
+                interval,
+                // Poll on the first call, for the same reason the reference
+                // polls immediately: `due` in the past is what the first
+                // `receive` sees, and every later one is an interval away from
+                // the reading it was set from.
+                due: Cell::new(0),
+            },
+        };
+
         Ok(Self {
             settings,
             logs_directory,
-            client,
+            conductor,
             publication: 0,
             subscription: 0,
             sender,
@@ -97,6 +200,18 @@ impl EchoTransceiver {
     #[must_use]
     pub fn logs_directory(&self) -> &Path {
         &self.logs_directory
+    }
+
+    /// Run `f` with the client borrowed, whichever [`Conductor`] holds it.
+    ///
+    /// The one seam between the two shapes: both hand out the client the
+    /// transceiver owns, and this is where a shape that shared it would take a
+    /// lock instead. Nothing else in this file needs to know which shape it is.
+    fn with_client<R>(&mut self, f: impl FnOnce(&mut Client) -> R) -> R {
+        match &mut self.conductor {
+            Conductor::Inline(client) => f(client),
+            Conductor::InlineGated { client, .. } => f(client),
+        }
     }
 }
 
@@ -120,16 +235,22 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
         );
 
         self.publication = self
-            .client
-            .add_exclusive_publication(&destination_channel, destination_stream, DEFAULT_TIMEOUT)
+            .with_client(|client| {
+                client.add_exclusive_publication(
+                    &destination_channel,
+                    destination_stream,
+                    DEFAULT_TIMEOUT,
+                )
+            })
             .map_err(|error| TransceiverError::Failed {
                 action: "add the publication",
                 message: error.to_string(),
             })?;
 
         self.subscription = self
-            .client
-            .add_subscription(&source_channel, source_stream, DEFAULT_TIMEOUT)
+            .with_client(|client| {
+                client.add_subscription(&source_channel, source_stream, DEFAULT_TIMEOUT)
+            })
             .map_err(|error| TransceiverError::Failed {
                 action: "add the subscription",
                 message: error.to_string(),
@@ -140,20 +261,22 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
             self.subscription,
             usize::try_from(self.settings.receiver_count.max(0)).unwrap_or(1),
         );
-        let client = &mut self.client;
+        let connection_timeout = self.settings.connection_timeout;
 
-        await_connected(
-            || {
-                // The driver tells the client about images and about a
-                // publication becoming connected through responses, and `poll`
-                // takes one of those at a time.
-                client.poll();
+        self.with_client(|client| {
+            await_connected(
+                || {
+                    // The driver tells the client about images and about a
+                    // publication becoming connected through responses, and
+                    // `poll` takes one of those at a time.
+                    client.poll();
 
-                ready(client, publication, subscription, receiver_count)
-            },
-            self.settings.connection_timeout,
-            &SystemClock,
-        )
+                    ready(&*client, publication, subscription, receiver_count)
+                },
+                connection_timeout,
+                &SystemClock,
+            )
+        })
         .map_err(|error| TransceiverError::Failed {
             action: "wait for the node",
             message: error.to_string(),
@@ -161,13 +284,13 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
 
         // Whatever the wait confirmed, so that the first claim does not have to
         // read the counter to find it out again.
-        self.window = window_limit(&self.client, self.publication);
+        self.window = self.with_client(|client| window_limit(client, publication));
 
         Ok(())
     }
 
     fn destroy(&mut self) -> Result<(), TransceiverError> {
-        self.client.close();
+        self.with_client(|client| client.close());
 
         Ok(())
     }
@@ -181,13 +304,25 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
         _recorder: &mut Recorder<C>,
     ) -> usize {
         let registration_id = self.publication;
-        let mut outbound = PublicationOutbound {
-            client: &self.client,
-            registration_id,
-            window: &mut self.window,
+        // Borrowed apart: the window the outbound writes and the sender that
+        // drives it are fields, and so is the conductor the client lives in.
+        let window = &mut self.window;
+        let sender = &mut self.sender;
+
+        // Sending does not run the duty cycle, so the gate changes nothing here:
+        // the client is reached exactly as [`Conductor::Inline`]'s is.
+        let client: &Client = match &self.conductor {
+            Conductor::Inline(client) => client,
+            Conductor::InlineGated { client, .. } => client,
         };
 
-        self.sender.send(
+        let mut outbound = PublicationOutbound {
+            client,
+            registration_id,
+            window,
+        };
+
+        sender.send(
             &mut outbound,
             number_of_messages,
             message_length,
@@ -200,30 +335,70 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
         let fragment_limit = self.settings.fragment_limit;
         let subscription = self.subscription;
 
-        // The client's own duty cycle, and not optional: it is what refreshes the
-        // heartbeat the driver reaps an idle client by, and what takes the
-        // driver's answers off the queue — the counter events, the image
-        // lifecycle. Polling only the subscription reads messages while telling
-        // the driver nothing, and a driver that is watching says so by dropping
-        // the client, which takes the far end's image with it.
-        self.client.poll();
-
-        self.client
-            .poll_subscription(subscription, fragment_limit, |message| {
-                let payload = message.payload;
-
-                if payload.len() < MIN_MESSAGE_LENGTH {
-                    return;
+        match &mut self.conductor {
+            // The rig's own shape: the client's duty cycle runs here, on the
+            // measured thread, on the way to reading the subscription. It is not
+            // optional — it is what refreshes the heartbeat the driver reaps an
+            // idle client by, and what takes the driver's answers off the queue,
+            // the counter events and the image lifecycle. Polling only the
+            // subscription reads messages while telling the driver nothing, and a
+            // driver that is watching says so by dropping the client, which takes
+            // the far end's image with it.
+            //
+            // This arm is the whole of a run that did not ask for the gate: no
+            // clock is read and no branch is added.
+            Conductor::Inline(client) => {
+                client.poll();
+                poll_messages(client, subscription, fragment_limit, recorder);
+            }
+            // The same shape, gated by the measured thread's own clock: every
+            // turn reads the clock and answers one question — has an interval
+            // gone by — so the duty cycle runs at most once an interval and the
+            // subscription is still read every turn. The reading is the same
+            // [`SystemClock`] the run's round trips come from, so the interval is
+            // a duration on the clock the run is measured with.
+            Conductor::InlineGated {
+                client,
+                interval,
+                due,
+            } => {
+                let now = SystemClock.nano_time();
+                if now >= due.get() {
+                    client.poll();
+                    let interval = i64::try_from(*interval).unwrap_or(i64::MAX);
+                    due.set(now.saturating_add(interval));
                 }
-
-                if let (Some(timestamp), Some(checksum)) = (
-                    i64_at(payload, TIMESTAMP_OFFSET),
-                    i64_at(payload, payload.len() - 8),
-                ) {
-                    recorder.on_message_received(timestamp, checksum);
-                }
-            });
+                poll_messages(client, subscription, fragment_limit, recorder);
+            }
+        }
     }
+}
+
+/// Read up to `fragment_limit` messages off a subscription and time each one.
+///
+/// The body of the reference's `receive` (`EchoMessageTransceiver.java:176-178`),
+/// lifted out of [`EchoTransceiver::receive`] so that the two [`Conductor`]
+/// shapes share it.
+fn poll_messages<C: Clock>(
+    client: &mut Client,
+    subscription: i64,
+    fragment_limit: usize,
+    recorder: &mut Recorder<C>,
+) {
+    client.poll_subscription(subscription, fragment_limit, |message| {
+        let payload = message.payload;
+
+        if payload.len() < MIN_MESSAGE_LENGTH {
+            return;
+        }
+
+        if let (Some(timestamp), Some(checksum)) = (
+            i64_at(payload, TIMESTAMP_OFFSET),
+            i64_at(payload, payload.len() - 8),
+        ) {
+            recorder.on_message_received(timestamp, checksum);
+        }
+    });
 }
 
 /// The eight bytes at `offset`, little-endian.

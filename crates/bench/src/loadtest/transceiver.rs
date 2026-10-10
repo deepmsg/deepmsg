@@ -43,19 +43,30 @@ pub trait Clock {
     fn nano_time(&self) -> i64;
 }
 
-/// The clock a run uses: [`deepmsg_core::clock::monotonic_nano_time`], the same
-/// one the driver's sender and receiver read.
+/// The clock a run uses: the kernel's raw `CLOCK_MONOTONIC`, read through
+/// [`deepmsg_core::pal::monotonic_nanos`].
 ///
-/// The value is nanoseconds since this process's first reading, so it is a
-/// duration and not a date. That is also what the reference's `SystemNanoClock`
-/// is — `System.nanoTime()`'s origin is the JVM's, not any calendar's — and it
-/// is why the two sides' absolute numbers never have to agree.
+/// The driver's own timing uses [`deepmsg_core::clock::monotonic_nano_time`]
+/// instead, which counts from this process's first reading. The rig cannot
+/// afford it here: its pacing loop reads the clock once per inner turn —
+/// `LoadTestRig.send`'s `now_ns = self.recorder.nano_time()`
+/// (`crates/bench/src/loadtest/rig.rs:312`, between `receive` calls) — so the
+/// reading is on the measured path, and [`deepmsg_core::pal::monotonic_nanos`]
+/// is the raw `clock_gettime` where `monotonic_nano_time` builds a `Duration`
+/// and multiplies in `u128`. The difference is a few nanoseconds a reading, and
+/// the rig reads the clock once a turn.
+///
+/// The origin is not why this clock is chosen — a run only ever subtracts two of
+/// its own readings — but it is the origin the reference's side of the round
+/// trip is on: the echo node subtracts a stamp from its own `System.nanoTime()`
+/// (`EchoNode.java:165-166`), which on Linux is `CLOCK_MONOTONIC`, so a reading
+/// that ever leaves the process is already comparable and needs no rebasing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn nano_time(&self) -> i64 {
-        deepmsg_core::clock::monotonic_nano_time()
+        deepmsg_core::pal::monotonic_nanos()
     }
 }
 
@@ -199,7 +210,7 @@ mod tests {
         assert!(second >= first, "{second} came after {first}");
         assert!(
             first > 0,
-            "the clock counts from this process's first reading"
+            "the clock counts from the kernel's boot, which is in the past"
         );
     }
 
