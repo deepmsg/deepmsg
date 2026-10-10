@@ -30,6 +30,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
+use deepmsg_client::fragment_assembler::FragmentAssembler;
+use deepmsg_client::image::Fragment;
 use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::logbuffer::append::Appended;
@@ -124,6 +126,17 @@ pub struct EchoTransceiver {
     /// only when the log says there is no room, which is what the reference's
     /// client does inside its own append.
     window: i64,
+    /// Where a **fragmented** message is reassembled.
+    ///
+    /// The receive path reads fragments rather than messages (see
+    /// [`poll_messages`]), because a run's messages fit one frame and a
+    /// one-frame message needs no reassembly — the reference hands one straight
+    /// to the handler (`FragmentAssembler.java:112-124`), which is the shape this
+    /// borrows. A message that did arrive in several frames still has to be put
+    /// back together, and this is where that happens; one per transceiver, which
+    /// is the arrangement the reference's samples use for one subscription
+    /// (`aeron-samples`' `basic_subscriber.c`).
+    assembler: FragmentAssembler,
 }
 
 impl EchoTransceiver {
@@ -188,6 +201,7 @@ impl EchoTransceiver {
             subscription: 0,
             sender,
             window: 0,
+            assembler: FragmentAssembler::new(),
         })
     }
 
@@ -349,7 +363,13 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
             // clock is read and no branch is added.
             Conductor::Inline(client) => {
                 client.poll();
-                poll_messages(client, subscription, fragment_limit, recorder);
+                poll_messages(
+                    client,
+                    subscription,
+                    fragment_limit,
+                    &mut self.assembler,
+                    recorder,
+                );
             }
             // The same shape, gated by the measured thread's own clock: every
             // turn answers one question — has an interval gone by — so the duty
@@ -377,37 +397,92 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
                     let interval = i64::try_from(*interval).unwrap_or(i64::MAX);
                     due.set(now.saturating_add(interval));
                 }
-                poll_messages(client, subscription, fragment_limit, recorder);
+                poll_messages(
+                    client,
+                    subscription,
+                    fragment_limit,
+                    &mut self.assembler,
+                    recorder,
+                );
             }
         }
     }
 }
 
-/// Read up to `fragment_limit` messages off a subscription and time each one.
+/// Read up to `fragment_limit` fragments off a subscription and time each whole
+/// message **where it lies**.
 ///
 /// The body of the reference's `receive` (`EchoMessageTransceiver.java:176-178`),
 /// lifted out of [`EchoTransceiver::receive`] so that the two [`Conductor`]
-/// shapes share it.
+/// shapes share it — and the **fragment** door rather than the message one, for
+/// what a run is measuring. Every message this rig sends fits one frame, so
+/// every message comes back unfragmented, and the reference's own reader hands a
+/// one-frame message straight through to the handler
+/// (`FragmentAssembler.onFragment`, `FragmentAssembler.java:112-124`) with the
+/// frame's own buffer under it. The message door delivers the same thing, but it
+/// reassembles first: it copies every payload into an assembler buffer before the
+/// handler is called at all — the deviation `docs/compat.md` records as "A
+/// delivered message is copied" — and that copy is on the measured path of every
+/// single message in the run. Reading the fragments costs the same walk and no
+/// copy.
+///
+/// What it does **not** cost is the ability to handle a fragmented message: one
+/// that arrived in several frames goes through `assembler` exactly as it did
+/// before, and the handler sees the same whole message. This rig's own traffic
+/// never takes that branch, but a run that asked for a message length past the
+/// MTU does, and it must still be timed.
 fn poll_messages<C: Clock>(
     client: &mut Client,
     subscription: i64,
     fragment_limit: usize,
+    assembler: &mut FragmentAssembler,
     recorder: &mut Recorder<C>,
 ) {
-    client.poll_subscription(subscription, fragment_limit, |message| {
-        let payload = message.payload;
+    client.poll_subscription_fragments(subscription, fragment_limit, |fragment| {
+        if fragment.is_unfragmented() {
+            if let Some((timestamp, checksum)) = fragment_fields(fragment) {
+                recorder.on_message_received(timestamp, checksum);
+            }
 
-        if payload.len() < MIN_MESSAGE_LENGTH {
             return;
         }
 
-        if let (Some(timestamp), Some(checksum)) = (
-            i64_at(payload, TIMESTAMP_OFFSET),
-            i64_at(payload, payload.len() - 8),
-        ) {
-            recorder.on_message_received(timestamp, checksum);
-        }
+        assembler.push(fragment, &mut |message| {
+            if let Some((timestamp, checksum)) = payload_fields(message.payload) {
+                recorder.on_message_received(timestamp, checksum);
+            }
+        });
     });
+}
+
+/// The two fields a run's message carries — when it was meant to go out, and the
+/// run's checksum — read out of the frame **in place**.
+///
+/// `None` for a frame too short to be one of this run's messages, which is the
+/// check the message door made against the assembled payload.
+fn fragment_fields(fragment: &Fragment<'_>) -> Option<(i64, i64)> {
+    let length = fragment.payload_length();
+
+    if length < MIN_MESSAGE_LENGTH {
+        return None;
+    }
+
+    Some((
+        fragment.payload_i64_at(TIMESTAMP_OFFSET)?,
+        fragment.payload_i64_at(length.checked_sub(8)?)?,
+    ))
+}
+
+/// The same two fields, out of an assembled message's payload.
+fn payload_fields(payload: &[u8]) -> Option<(i64, i64)> {
+    if payload.len() < MIN_MESSAGE_LENGTH {
+        return None;
+    }
+
+    Some((
+        i64_at(payload, TIMESTAMP_OFFSET)?,
+        i64_at(payload, payload.len().checked_sub(8)?)?,
+    ))
 }
 
 /// The eight bytes at `offset`, little-endian.
