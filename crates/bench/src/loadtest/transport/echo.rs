@@ -352,17 +352,26 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
                 poll_messages(client, subscription, fragment_limit, recorder);
             }
             // The same shape, gated by the measured thread's own clock: every
-            // turn reads the clock and answers one question — has an interval
-            // gone by — so the duty cycle runs at most once an interval and the
-            // subscription is still read every turn. The reading is the same
-            // [`SystemClock`] the run's round trips come from, so the interval is
-            // a duration on the clock the run is measured with.
+            // turn answers one question — has an interval gone by — so the duty
+            // cycle runs at most once an interval and the subscription is still
+            // read every turn. The reading is the same [`SystemClock`] the run's
+            // round trips come from, so the interval is a duration on the clock
+            // the run is measured with.
+            //
+            // The reading is the **one the rig already took**: the waiting loop
+            // reads this clock at the end of every turn (`LoadTestRig::send`,
+            // `now_ns = self.recorder.nano_time()`), and the gate runs at the top
+            // of the next one, so asking for a second reading here was a
+            // `clock_gettime` a turn (14-19 ns, `doc/deepmsg-rust-rig-delta.md`
+            // §2.1) to answer a question about an interval of a millisecond.
+            // What it costs is that the answer is at most one turn stale, which
+            // on that interval is 127-180 ns out of 1_000_000.
             Conductor::InlineGated {
                 client,
                 interval,
                 due,
             } => {
-                let now = SystemClock.nano_time();
+                let now = recorder.last_nano_time();
                 if now >= due.get() {
                     client.poll();
                     let interval = i64::try_from(*interval).unwrap_or(i64::MAX);
