@@ -37,6 +37,11 @@ name = "loss_report_reference"
 path = "interop/loss_report.rs"
 required-features = ["interop"]
 
+[[test]]
+name = "java_archive_id"
+path = "interop/java_archive_id.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]
@@ -231,6 +236,39 @@ path = "integration/archive_replay.rs"
 [[test]]
 name = "archive_queries"
 path = "integration/archive_queries.rs"
+
+# P2-C1's acceptance, first half: what an archive client's context is — the
+# reference's own `AeronCArchiveIdTest` cases, ported value for value. No
+# archive and no driver: a context is decided before anything is connected, so
+# this runs in CI.
+[[test]]
+name = "archive_client"
+path = "integration/archive_client.rs"
+
+# P2-C1's request proxy: all thirty-two requests published for real and read
+# back off the wire, which is the check that catches a field mix-up in an
+# encoder that is otherwise one of thirty-two near-identical ones.
+[[test]]
+name = "archive_proxy"
+path = "integration/archive_proxy.rs"
+
+# P2-C1's control-response poller: the three templates it understands, the one
+# message per poll it returns, and the templates it steps over.
+[[test]]
+name = "archive_poller"
+path = "integration/archive_poller.rs"
+
+# P2-C1's connect: the state machine driven against a real archive, and the two
+# decisions it makes before anything is sent.
+[[test]]
+name = "archive_async_connect"
+path = "integration/archive_async_connect.rs"
+
+# P2-C1's `Archive`: the object, its four waits, and the recording signals that
+# must not end one.
+[[test]]
+name = "archive_client_api"
+path = "integration/archive_client_api.rs"
 
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the

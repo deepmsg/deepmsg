@@ -433,10 +433,6 @@ impl ReferenceDriver {
         let aeron_dir = temp_aeron_dir(test_name);
         let _ = std::fs::remove_dir_all(&aeron_dir);
 
-        let log_path = aeron_dir.with_extension("driver.log");
-        let log = std::fs::File::create(&log_path).map_err(DriverError::Spawn)?;
-        let log_err = log.try_clone().map_err(DriverError::Spawn)?;
-
         // `delete.on.shutdown` is not merely tidiness: the driver removes its
         // own directory on a clean signal, which is what keeps a day of test
         // runs from filling /dev/shm.
@@ -448,9 +444,37 @@ impl ReferenceDriver {
         ];
         properties.extend(extra_properties.iter().map(|p| (*p).to_string()));
 
-        let mut command = Command::new(binary);
+        Self::spawn_with_args(binary, &aeron_dir, &properties, extra_env)
+    }
+
+    /// Spawn a process whose command line is **not** one binary and a list of
+    /// `-D` properties.
+    ///
+    /// The archiving media driver is a Java process — `java <jvm flags> -D… -cp
+    /// <jar> io.aeron.archive.ArchivingMediaDriver` — and its class path and main
+    /// class come **after** the properties, which a property list cannot spell.
+    /// Everything else is this type's handling: the aeron directory the caller
+    /// decided, the log file beside it, the removal of the inherited `AERON_*`
+    /// (so each test's configuration is its own), and the signal
+    /// [`Self::stop`] sends. Keeping it here rather than in a second harness is
+    /// what stops the two from drifting apart.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Spawn`] when the process could not be started.
+    pub fn spawn_with_args(
+        program: &Path,
+        aeron_dir: &Path,
+        args: &[String],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, DriverError> {
+        let log_path = aeron_dir.with_extension("driver.log");
+        let log = std::fs::File::create(&log_path).map_err(DriverError::Spawn)?;
+        let log_err = log.try_clone().map_err(DriverError::Spawn)?;
+
+        let mut command = Command::new(program);
         command
-            .args(&properties)
+            .args(args)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
 
@@ -469,7 +493,7 @@ impl ReferenceDriver {
 
         Ok(Self {
             child,
-            aeron_dir,
+            aeron_dir: aeron_dir.to_path_buf(),
             log_path,
             stopped: false,
         })
@@ -589,7 +613,7 @@ impl Drop for ReferenceDriver {
 /// tests should exercise, but it is not guaranteed to exist — fall back rather
 /// than fail. The name carries the test name and the process id so two
 /// concurrent `cargo test` runs cannot collide.
-fn temp_aeron_dir(test_name: &str) -> PathBuf {
+pub fn temp_aeron_dir(test_name: &str) -> PathBuf {
     let base = if Path::new("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
     } else {

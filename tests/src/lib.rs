@@ -15,6 +15,7 @@ pub mod archive;
 pub mod archiving_driver;
 pub mod driver;
 pub mod java;
+pub mod java_archiving_driver;
 pub mod samples;
 pub mod synthetic;
 pub mod temp;
