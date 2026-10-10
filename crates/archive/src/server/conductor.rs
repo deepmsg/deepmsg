@@ -155,6 +155,7 @@ use crate::server::replay_session::{
 };
 use crate::server::replayer::Replayer;
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
+use deepmsg_codec::archive::recording_state::RecordingState;
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
 /// client writes when it wants a channel of its own to be answered on
@@ -719,8 +720,10 @@ pub const ACTIVE_LISTING: i64 = 1;
 pub const ACTIVE_LISTING_MSG: &str = "active listing already in progress";
 
 /// `ArchiveException.ACTIVE_RECORDING` (`client/ArchiveException.java:39`), the
-/// refusal an extend gets for a recording that is still in flight
-/// (`ArchiveConductor.java:1093-1098`, `:2066-2072`).
+/// refusal for asking about a recording that is still in flight: an extend
+/// (`ArchiveConductor.java:1093-1098`, `:2066-2072`), a truncate of one
+/// (`:2218-2220`), and a purge of one — or of one a replay is reading
+/// (`:2238-2250`).
 pub const ACTIVE_RECORDING: i64 = 2;
 
 /// `ArchiveException.INVALID_EXTENSION` (`:74`), the refusal an image that does
@@ -892,6 +895,21 @@ pub enum SegmentRequest {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+    },
+    /// `ArchiveConductor.purgeRecording` (`:1251-1263`): every file, and the
+    /// recording out of the catalog with them.
+    PurgeRecording {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`): a detach and the delete
+    /// of what it detached, in one request.
+    PurgeSegments {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
     },
 }
 
@@ -3060,6 +3078,34 @@ impl Sessions {
                 recording_id,
                 now_ms,
             ),
+            SegmentRequest::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.purge_recording(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                now_ms,
+            ),
+            SegmentRequest::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            } => self.purge_segments(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+                now_ms,
+            ),
         }
     }
 
@@ -3168,6 +3214,180 @@ impl Sessions {
             false,
             now_ms,
         );
+    }
+
+    /// `ArchiveConductor.purgeRecording` (`:1251-1263`).
+    ///
+    /// The one request that takes a recording **out of the catalog**: the row's
+    /// state goes `DELETED` and the index drops it
+    /// ([`Catalog::change_state`]), so a listing afterwards finds nothing while
+    /// the bytes of the row are still in the file.
+    ///
+    /// The state is changed **before** the files are listed, which is the
+    /// reference's order and the safe one: a client that asks about the
+    /// recording while its files are going is told it is not there rather than
+    /// being handed a row whose files are half gone.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn purge_recording(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) = self.invalid_purge(counters, catalog, recording_id) {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let _ = catalog.change_state(recording_id, RecordingState::DELETED);
+
+        let files = list_segment_files(&self.recording.archive_dir, recording_id);
+
+        // `awaitReplaysStop` is **false** here: `isValidPurge` has already
+        // refused a recording with a replay in flight (`:1256`), so by the time
+        // there is a list to delete, there is nothing reading it.
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`): the start moves, and
+    /// what the **old** start was claiming goes.
+    ///
+    /// The order is the reference's and it is not interchangeable with a detach
+    /// followed by a delete: the files to remove are worked out from the start
+    /// the recording had *before* the move (`:1551-1553`), so moving first and
+    /// asking afterwards would ask about a recording that no longer claims them.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn purge_segments(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) =
+            self.invalid_detach(counters, catalog, recording_id, new_start_position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let old_start_position = recording.start_position;
+
+        if let Err(error) = catalog.start_position(recording_id, new_start_position) {
+            self.warnings
+                .push(format!("could not move a recording's start: {error}"));
+            return;
+        }
+
+        let files = find_detached_segments(
+            &self.recording.archive_dir,
+            recording_id,
+            new_start_position,
+            old_start_position,
+            recording.term_buffer_length,
+            recording.segment_file_length,
+        );
+
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.isValidPurge` (`:2234-2254`): two refusals, and both
+    /// are `ACTIVE_RECORDING`.
+    ///
+    /// The first is about a **replay** rather than about the recording, which is
+    /// why it is not the `hasRecording` gate: a recording with a replay reading
+    /// it is one whose files cannot go yet, whatever state its row is in.
+    fn invalid_purge<Access>(
+        &self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &Catalog,
+        recording_id: i64,
+    ) -> Option<(i64, String)> {
+        if self
+            .replay_sessions
+            .values()
+            .any(|entry| entry.session.recording_id() == recording_id)
+        {
+            return Some((
+                ACTIVE_RECORDING,
+                format!("cannot purge recording with active replay {recording_id}"),
+            ));
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return None;
+        };
+
+        // `NULL_POSITION == stopPosition` is a recording that has not stopped —
+        // the catalog's own answer, and the same one the replay path reads.
+        if recording.stop_position == NULL_VALUE {
+            return Some((
+                ACTIVE_RECORDING,
+                format!("cannot purge active recording {recording_id}"),
+            ));
+        }
+
+        // `counters` is here for the shape the other two validations have; a
+        // purge asks the catalog and the replay map and nothing else.
+        let _ = counters;
+
+        None
     }
 
     /// `ArchiveConductor.isValidDetach` (`:2290-2325`): three refusals, and the
@@ -5587,6 +5807,40 @@ impl ControlPlane for Sessions {
                 session_id,
                 correlation_id,
                 recording_id,
+            },
+        )));
+    }
+
+    fn on_purge_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            },
+        )));
+    }
+
+    fn on_purge_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
             },
         )));
     }

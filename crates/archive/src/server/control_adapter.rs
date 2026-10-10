@@ -102,6 +102,8 @@ use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
+use deepmsg_codec::archive::purge_recording_request_codec::{self, PurgeRecordingRequestDecoder};
+use deepmsg_codec::archive::purge_segments_request_codec::{self, PurgeSegmentsRequestDecoder};
 use deepmsg_codec::archive::recording_position_request_codec::{
     self, RecordingPositionRequestDecoder,
 };
@@ -582,6 +584,35 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onPurgeRecording` (`ControlSession.java:481-488` in the
+    /// reference's own numbering; the method is
+    /// `ArchiveConductor.purgeRecording`, `:1251-1263`).
+    ///
+    /// The one request here that takes the recording **out of the catalog** as
+    /// well as off the disk: the row's state goes `DELETED` and the index drops
+    /// it, so a listing after a purge finds nothing.
+    fn on_purge_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onPurgeSegments`, which is
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`).
+    ///
+    /// A detach and a delete in one request: move the start, then remove what
+    /// the old start was still claiming.
+    fn on_purge_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
         now_ms: i64,
     );
 
@@ -1710,6 +1741,55 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        purge_recording_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = PurgeRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_purge_recording(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
+        purge_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = PurgeSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let new_start_position = decoder.new_start_position();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_purge_segments(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    new_start_position,
+                    now_ms,
+                );
+            }
+        }
+
         // Everything else is a request this slice does not answer yet: the
         // recording, replay, listing and replication families arrive with the
         // slices that can carry them out. The reference's switch has no default
@@ -1825,6 +1905,8 @@ mod tests {
     use deepmsg_codec::archive::delete_detached_segments_request_codec::DeleteDetachedSegmentsRequestEncoder;
     use deepmsg_codec::archive::detach_segments_request_codec::DetachSegmentsRequestEncoder;
     use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestEncoder;
+    use deepmsg_codec::archive::purge_recording_request_codec::PurgeRecordingRequestEncoder;
+    use deepmsg_codec::archive::purge_segments_request_codec::PurgeSegmentsRequestEncoder;
     use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
     use deepmsg_codec::archive::replay_token_request_codec::ReplayTokenRequestEncoder;
     use deepmsg_codec::archive::start_recording_request_codec::{
@@ -1895,6 +1977,17 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
+        },
+        PurgeRecording {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        PurgeSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
         },
         StartReplay {
             request: StartReplayRequest,
@@ -2165,6 +2258,37 @@ mod tests {
             });
         }
 
+        fn on_purge_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_purge_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            });
+        }
+
         fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {
             self.calls.push(Call::StartReplay { request });
         }
@@ -2420,6 +2544,52 @@ mod tests {
                 .control_session_id(control_session_id)
                 .correlation_id(correlation_id)
                 .encoded_credentials(encoded_credentials);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `PurgeRecordingRequest` (template 104).
+    fn purge_recording(control_session_id: i64, correlation_id: i64, recording_id: i64) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                PurgeRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `PurgeSegmentsRequest` (template 55).
+    fn purge_segments(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                PurgeSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .new_start_position(new_start_position);
             BODY + encoder.encoded_length()
         };
 
@@ -2906,6 +3076,41 @@ mod tests {
                     session_id,
                     correlation_id: 100,
                     recording_id: RECORDING_ID,
+                },
+            ],
+            control.calls[1..]
+        );
+    }
+
+    /// The two purge requests reach the conductor too, one with a position and
+    /// one without.
+    #[test]
+    fn the_two_purge_requests_reach_the_session() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = purge_recording(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let payload = purge_segments(session_id, 100, RECORDING_ID, 131_072);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![
+                Call::PurgeRecording {
+                    session_id,
+                    correlation_id: 99,
+                    recording_id: RECORDING_ID,
+                },
+                Call::PurgeSegments {
+                    session_id,
+                    correlation_id: 100,
+                    recording_id: RECORDING_ID,
+                    new_start_position: 131_072,
                 },
             ],
             control.calls[1..]
