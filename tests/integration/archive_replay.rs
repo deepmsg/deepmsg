@@ -157,15 +157,23 @@ fn a_recording(channel: &str) -> Recording {
     )
 }
 
-/// The archive's properties, plus the three this file needs.
+/// The archive's properties, plus the four this file needs.
 ///
-/// `spies.simulate.connection` is the recording's half (`archive_recording.rs`);
-/// the other two are the replay's.
+/// `spies.simulate.connection` is the recording's half (`archive_recording.rs`).
+///
+/// The other three are one setting and a bound. A recording's segment length is
+/// `max(aeron.archive.segment.file.length, termBufferLength)`
+/// (`ArchiveConductor.java:2006`, `conductor::segment_file_length`) — a segment
+/// has to be able to hold one term — so asking for 64 KiB segments while the
+/// driver's term is its 16 MiB default gets a recording of sixteen megabytes
+/// that **fits in one file**, which is every claim this file makes about
+/// crossing a segment. `max(64k, 64k)` is what the pair gives.
 fn properties() -> Vec<String> {
     vec![
         archive::PROPERTIES[0].to_owned(),
         archive::PROPERTIES[1].to_owned(),
         "-Daeron.spies.simulate.connection=true".to_owned(),
+        format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"),
         format!("-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"),
         format!("-Daeron.archive.max.concurrent.replays={MAX_CONCURRENT_REPLAYS}"),
     ]
@@ -186,12 +194,19 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     let recorded = archive.record(&recording);
 
     // The recording has to be long enough that reading it back crosses a
-    // segment, or the assertion at the end is about a replay of one file.
+    // segment, or the assertion at the end is about a replay of one file — and
+    // it is the **files** that say so, not the number of bytes. The two were not
+    // the same thing until the term length came down with the segment length
+    // (see [`properties`]): 168960 bytes over 64 KiB is three segments and was
+    // one file of sixteen megabytes, which is the shape this test is here to
+    // avoid.
+    let segments = archive.segment_files(recorded.recording_id);
+
     assert!(
-        recorded.stop > 2 * SEGMENT_FILE_LENGTH,
-        "the recording is {} bytes, which does not span the three segments of {} it needs to",
+        segments.len() >= 3,
+        "the recording is {} bytes over {} segment files, and this test needs three",
         recorded.stop,
-        SEGMENT_FILE_LENGTH
+        segments.len()
     );
 
     // The replay's own subscription, and the request. A position of `-1` is the
