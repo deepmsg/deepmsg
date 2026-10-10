@@ -88,6 +88,135 @@ pub fn segment_file_name(recording_id: i64, segment_base_position: i64) -> Strin
     format!("{recording_id}-{segment_base_position}{SUFFIX}")
 }
 
+/// Where a segment file's first term begins — the offset of the first frame in
+/// it that has a length (`ArchiveConductor.findTermOffsetForStart`, `:1782-1855`).
+///
+/// # What it is for
+///
+/// `attachSegments` walks a recording's segments **backwards**, and a segment it
+/// meets may begin mid-frame. A segment file starts at a segment boundary, but
+/// where the *frames* in it start is whatever the writer left: a recording that
+/// began mid-term has a first segment whose first frame is not at offset 0, and
+/// a segment that was detached and re-attached has whatever was there when it
+/// was. So the walk asks this for an offset, and acts on the two answers
+/// differently — `0` means the segment starts clean and the walk goes on, and
+/// anything else means the recording's start moves to *that* byte and the walk
+/// stops (`:1600-1612`).
+///
+/// `Ok(Some(offset))` is the answer, and `Ok(None)` is "this file is not one
+/// this recording can start on" — the reference has already answered the client
+/// with its reason and returns its `NULL_VALUE` (`:1816`, `:1827`, `:1837`).
+///
+/// # The divergence
+///
+/// A header that cannot be read is `Err` here. The reference sends the error
+/// and then returns `termOffset`, which is **zero** at that point
+/// (`:1797-1802`) — so its caller carries on as if the segment were clean and
+/// counts it. That is a slip rather than a behaviour: nothing can reach it (the
+/// file has just been found to exist and its length checked), and carrying on
+/// after saying no is not what any of the other three refusals in this method
+/// do.
+///
+/// # Errors
+///
+/// The message to answer the client with.
+pub fn find_term_offset_for_start(
+    path: &Path,
+    term_length: i32,
+    term_id: i32,
+    stream_id: i32,
+) -> Result<Option<usize>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut header = [0_u8; DATA_HEADER_LENGTH];
+
+    if file.read_exact_at(&mut header, 0).is_err() {
+        return Err("failed to read segment file".to_owned());
+    }
+
+    let fragment_length =
+        |bytes: &[u8], offset: usize| read_i32(bytes, offset + FRAME_LENGTH_OFFSET).unwrap_or(0);
+
+    let mut term_offset = 0_usize;
+
+    if fragment_length(&header, 0) <= 0 {
+        let term_length = usize::try_from(term_length).unwrap_or(0);
+        let mut found = false;
+
+        while term_offset < term_length && !found {
+            let want = (term_length - term_offset).min(SCAN_BUFFER_LENGTH);
+            let mut buffer = vec![0_u8; want];
+
+            let read = file
+                .read_at(&mut buffer, term_offset as u64)
+                .map_err(|error| error.to_string())?;
+
+            if 0 == read {
+                return Err(format!("read failed on {}", path.display()));
+            }
+
+            // Only whole frames are looked at: a partial one at the end of what
+            // was read is not a frame to start on.
+            let limit = read - (read & (FRAME_ALIGNMENT as usize - 1));
+            let mut offset = 0_usize;
+
+            while offset < limit {
+                if fragment_length(&buffer, offset) > 0 {
+                    found = true;
+                    break;
+                }
+
+                offset += FRAME_ALIGNMENT as usize;
+            }
+
+            term_offset += offset;
+        }
+    }
+
+    if term_offset >= usize::try_from(term_length).unwrap_or(0) {
+        return Err(format!(
+            "fragment not found in first term of segment {}",
+            path.display()
+        ));
+    }
+
+    // The frame that was found has to belong to **this** recording and to the
+    // term the position implies: a segment file from another recording, or from
+    // another place in this one, is not one to attach.
+    // The frame that was found is at `term_offset` in the file — the accumulator
+    // above is the term offset of the read that found it **plus** where in that
+    // read it was, and it is 0 when the very first frame was already the one.
+    // (The reference keeps the in-buffer offset too, because it indexes a buffer
+    // it reuses; the file offset is this one.)
+    let mut found_header = [0_u8; DATA_HEADER_LENGTH];
+    file.read_exact_at(&mut found_header, term_offset as u64)
+        .map_err(|error| error.to_string())?;
+
+    let actual_term_id = read_i32(&found_header, TERM_ID_FIELD_OFFSET).unwrap_or(0);
+    let actual_stream_id = read_i32(&found_header, STREAM_ID_FIELD_OFFSET).unwrap_or(0);
+
+    if actual_term_id != term_id {
+        return Err(format!(
+            "term id does not match: actual={actual_term_id} expected={term_id}"
+        ));
+    }
+
+    if actual_stream_id != stream_id {
+        return Err(format!(
+            "stream id does not match: actual={actual_stream_id} expected={stream_id}"
+        ));
+    }
+
+    Ok(Some(term_offset))
+}
+
+/// How much of a term one scan of [`find_term_offset_for_start`] reads at a
+/// time.
+///
+/// The reference scans into `ctx.dataBuffer()`, whose capacity is the archive's
+/// `file.io.max.length` — 1 MiB by default, which is larger than any term this
+/// build serves, so its loop runs once. A term is scanned whole here too.
+const SCAN_BUFFER_LENGTH: usize = 1024 * 1024;
+
 /// Whether the frame header at `segment_offset` in `file` is the one a position
 /// implies (`ReplaySession.notHeaderAligned`, `ReplaySession.java:617-634`, and
 /// the `isInvalidHeader` it calls, `:654-661`).
@@ -736,6 +865,59 @@ mod tests {
         assert!(
             bytes[CUT as usize..].iter().all(|byte| 0 == *byte),
             "and zeros from the cut to the end"
+        );
+    }
+
+    /// A segment whose first term starts with something that is not a frame is
+    /// scanned for the first one that is
+    /// (`ArchiveConductor.findTermOffsetForStart`, `:1807-1830`).
+    ///
+    /// **The C suite never reaches this**: its recordings begin at a segment
+    /// boundary, so every segment it attaches starts with a frame at offset 0
+    /// and the scan is skipped. What the scan is for is the segment that does
+    /// not — and an attach that carried on as if it did would move the start to
+    /// a byte in the middle of nothing.
+    #[test]
+    fn a_segment_that_does_not_start_with_a_frame_is_scanned_for_one() {
+        const TERM_LENGTH: i32 = 64 * 1024;
+        const TERM_ID: i32 = 7;
+        const STREAM_ID: i32 = 33;
+        const FRAME_AT: usize = 4096;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("7-0.rec");
+
+        let mut segment = vec![0_u8; TERM_LENGTH as usize];
+        // A frame with a length, at an offset that is not 0 — the shape a
+        // recording that began mid-term leaves behind.
+        segment[FRAME_AT + FRAME_LENGTH_OFFSET..FRAME_AT + FRAME_LENGTH_OFFSET + 4]
+            .copy_from_slice(&32_i32.to_le_bytes());
+        segment[FRAME_AT + TERM_ID_FIELD_OFFSET..FRAME_AT + TERM_ID_FIELD_OFFSET + 4]
+            .copy_from_slice(&TERM_ID.to_le_bytes());
+        segment[FRAME_AT + STREAM_ID_FIELD_OFFSET..FRAME_AT + STREAM_ID_FIELD_OFFSET + 4]
+            .copy_from_slice(&STREAM_ID.to_le_bytes());
+        std::fs::write(&path, &segment).expect("the file");
+
+        assert_eq!(
+            Ok(Some(FRAME_AT)),
+            find_term_offset_for_start(&path, TERM_LENGTH, TERM_ID, STREAM_ID),
+            "the first frame in the term, and where it is"
+        );
+
+        // A frame in that term that belongs to another recording is refused
+        // rather than attached.
+        assert_eq!(
+            Err("stream id does not match: actual=33 expected=34".to_owned()),
+            find_term_offset_for_start(&path, TERM_LENGTH, TERM_ID, STREAM_ID + 1)
+        );
+
+        // A term with no frame in it at all is refused rather than attached.
+        std::fs::write(&path, vec![0_u8; TERM_LENGTH as usize]).expect("the file");
+        assert!(
+            find_term_offset_for_start(&path, TERM_LENGTH, TERM_ID, STREAM_ID)
+                .expect_err("refused")
+                .starts_with("fragment not found in first term of segment"),
+            "a term with nothing in it is not one to start on"
         );
     }
 

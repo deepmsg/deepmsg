@@ -74,6 +74,7 @@ use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{FragmentAssembler, Message};
 use deepmsg_client::image::Fragment;
 use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
+use deepmsg_codec::archive::attach_segments_request_codec::{self, AttachSegmentsRequestDecoder};
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
 use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::bounded_replay_request_codec::{self, BoundedReplayRequestDecoder};
@@ -583,6 +584,19 @@ pub trait ControlPlane {
     /// Deferred for the reason every delete is: what it removes is files, and
     /// the answer to a client is what a session several turns long is for.
     fn on_delete_detached_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onAttachSegments`, which is
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`).
+    ///
+    /// The reverse of a detach: it moves the recording's start **back** over
+    /// the segments that are still there, and answers with how many it took.
+    fn on_attach_segments(
         &mut self,
         session_id: i64,
         correlation_id: i64,
@@ -1758,6 +1772,27 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        attach_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = AttachSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_attach_segments(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
         truncate_recording_request_codec::SBE_TEMPLATE_ID => {
             let decoder = TruncateRecordingRequestDecoder::default().header(header, 0);
 
@@ -1944,6 +1979,7 @@ mod tests {
     use crate::server::auth::{AllowAll, DenyAll};
 
     use deepmsg_codec::archive::WriteBuf;
+    use deepmsg_codec::archive::attach_segments_request_codec::AttachSegmentsRequestEncoder;
     use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestEncoder;
     use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseEncoder;
     use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestEncoder;
@@ -2020,6 +2056,11 @@ mod tests {
             new_start_position: i64,
         },
         DeleteDetachedSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        AttachSegments {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
@@ -2304,6 +2345,20 @@ mod tests {
             _now_ms: i64,
         ) {
             self.calls.push(Call::DeleteDetachedSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        fn on_attach_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::AttachSegments {
                 session_id,
                 correlation_id,
                 recording_id,
@@ -2613,6 +2668,26 @@ mod tests {
                 .control_session_id(control_session_id)
                 .correlation_id(correlation_id)
                 .encoded_credentials(encoded_credentials);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// An `AttachSegmentsRequest` (template 56).
+    fn attach_segments(control_session_id: i64, correlation_id: i64, recording_id: i64) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                AttachSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
             BODY + encoder.encoded_length()
         };
 
@@ -3173,6 +3248,27 @@ mod tests {
                     recording_id: RECORDING_ID,
                 },
             ],
+            control.calls[1..]
+        );
+    }
+
+    /// And an attach, whose whole request is the recording it is about.
+    #[test]
+    fn an_attach_reaches_the_session() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = attach_segments(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::AttachSegments {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+            }],
             control.calls[1..]
         );
     }

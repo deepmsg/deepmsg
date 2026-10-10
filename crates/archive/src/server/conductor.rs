@@ -124,8 +124,8 @@ use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
 use crate::segment::{
-    SegmentSummary, erase_tail, header_matches_position, segment_file_base_position,
-    segment_file_name,
+    SegmentSummary, erase_tail, find_term_offset_for_start, header_matches_position,
+    segment_file_base_position, segment_file_name,
 };
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
@@ -895,6 +895,14 @@ pub enum SegmentRequest {
     },
     /// `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
     DeleteDetached {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`): walk the recording's
+    /// segments **backwards** and move its start back over the ones that are
+    /// there and whole.
+    Attach {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
@@ -3152,6 +3160,11 @@ impl Sessions {
                 recording_id,
                 now_ms,
             ),
+            SegmentRequest::Attach {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.attach_segments(catalog, session_id, correlation_id, recording_id),
             SegmentRequest::Truncate {
                 session_id,
                 correlation_id,
@@ -3435,6 +3448,110 @@ impl Sessions {
             true,
             now_ms,
         );
+    }
+
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`).
+    ///
+    /// The walk is **backwards** from the segment before the recording's start,
+    /// and it stops at the first thing that is not a whole segment of this
+    /// recording — or at the first segment that does not begin at offset 0,
+    /// which is where the recording's start moves to instead
+    /// (`:1600-1612`).
+    ///
+    /// What it answers with is the **count** of segments taken back, which is
+    /// what the C suite asserts (`shouldDetachAndReattachSegments` expects the
+    /// four that a detach of four gave away).
+    ///
+    /// Only `hasRecording` is checked: the reference refuses on nothing else
+    /// before the walk, and every refusal inside it is about a file — one that
+    /// is not the segment length, one that cannot be read, one whose first frame
+    /// is not where it should be.
+    fn attach_segments(
+        &mut self,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let segment_length = recording.segment_file_length;
+        let term_length = recording.term_buffer_length;
+        let bits_to_shift = bits_to_shift(term_length).unwrap_or(0);
+        let initial_term_id = recording.initial_term_id;
+        let stream_id = recording.stream_id;
+
+        let mut position = recording.start_position - i64::from(segment_length);
+        let mut count = 0_i64;
+
+        while position >= 0 {
+            let path = self
+                .recording
+                .archive_dir
+                .join(segment_file_name(recording_id, position));
+
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                // No file here, and no file before it either: the walk is over.
+                break;
+            };
+
+            if metadata.len() != u64::try_from(segment_length).unwrap_or(0) {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!(
+                        "fileLength={} not equal to segmentLength={segment_length}",
+                        metadata.len()
+                    ),
+                );
+                return;
+            }
+
+            let term_id = i32::try_from(position >> bits_to_shift)
+                .unwrap_or(0)
+                .wrapping_add(initial_term_id);
+
+            match find_term_offset_for_start(&path, term_length, term_id, stream_id) {
+                Err(message) => {
+                    self.refuse_request(session_id, correlation_id, 0, message);
+                    return;
+                }
+                // The file said no in its own words and has already been
+                // answered for.
+                Ok(None) => return,
+                Ok(Some(0)) => {
+                    let _ = catalog.start_position(recording_id, position);
+                    count += 1;
+                    position -= i64::from(segment_length);
+                }
+                Ok(Some(term_offset)) => {
+                    let start = position + i64::try_from(term_offset).unwrap_or(0);
+
+                    let _ = catalog.start_position(recording_id, start);
+                    count += 1;
+                    break;
+                }
+            }
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: count,
+        });
     }
 
     /// `ArchiveConductor.isValidTruncate` (`:2209-2232`): two refusals.
@@ -6064,6 +6181,21 @@ impl ControlPlane for Sessions {
                 recording_id,
             },
         )));
+    }
+
+    fn on_attach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::Segment(SegmentRequest::Attach {
+                session_id,
+                correlation_id,
+                recording_id,
+            })));
     }
 
     fn on_truncate_recording(
