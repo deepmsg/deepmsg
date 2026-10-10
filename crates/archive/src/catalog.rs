@@ -61,6 +61,15 @@ pub const HEADER_LENGTH: usize = HEADER_BLOCK_LENGTH as usize;
 /// (`Catalog.java:113`).
 pub const DESCRIPTOR_HEADER_LENGTH: usize = DESCRIPTOR_HEADER_BLOCK_LENGTH as usize;
 
+/// Where the descriptor block holds a recording's **start** position, in bytes
+/// from the block's own beginning (`recording_descriptor_codec`: `startPosition`
+/// is "encodedOffset: 40").
+pub const START_POSITION_OFFSET: usize = 40;
+
+/// Where it holds the **stop** position (`recording_descriptor_codec`:
+/// `stopPosition` is "encodedOffset: 48").
+pub const STOP_POSITION_OFFSET: usize = 48;
+
 /// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:118`).
 pub const DEFAULT_CAPACITY: usize = 1024 * 1024;
 
@@ -651,7 +660,6 @@ impl Catalog {
         now_ms: i64,
     ) -> Result<(), CatalogError> {
         const STOP_TIMESTAMP_OFFSET: usize = 32;
-        const STOP_POSITION_OFFSET: usize = 48;
 
         let region =
             self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, STOP_POSITION_OFFSET + 8)?;
@@ -692,6 +700,65 @@ impl Catalog {
         self.write_stop(offset, stop_position, now_ms)
     }
 
+    /// Move a recording's **start**, which is what a detach is
+    /// (`Catalog.startPosition(id, position)`, `:758-767`).
+    ///
+    /// The whole of "detached" is this field: the segment files below it stay
+    /// where they are, and what makes them *detached* is that the recording no
+    /// longer claims them. [`is_detached`](Self::start_position) is the same
+    /// question asked of a file name.
+    ///
+    /// The reference writes this one with `putLong` where its `stopPosition`
+    /// uses `putLongVolatile` (`:764` against `:643`) — an asymmetry about
+    /// which of the two a reader is allowed to see half-written. Both are a
+    /// release store here, which is the ordering Rust names and the one a
+    /// reader taking the record afterwards needs.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn start_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
+        self.write_position(recording_id, START_POSITION_OFFSET, position)
+    }
+
+    /// Move a recording's **stop**, which is what a truncate is
+    /// (`ArchiveConductor.truncateRecording`, `:1213`).
+    ///
+    /// A truncate writes this field **first** and deletes files afterwards, so
+    /// between the two a recording whose files are still there already claims to
+    /// end earlier. That order is the reference's and it is the safe one: a
+    /// reader that believed the files over the field would replay bytes the
+    /// recording no longer owns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::start_position`].
+    pub fn stop_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
+        self.write_position(recording_id, STOP_POSITION_OFFSET, position)
+    }
+
+    /// One of the two position fields, which differ in where they live and in
+    /// nothing else.
+    fn write_position(
+        &mut self,
+        recording_id: i64,
+        field_offset: usize,
+        position: i64,
+    ) -> Result<(), CatalogError> {
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        let region = self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, field_offset + 8)?;
+        region
+            .store_i64_release(field_offset, position)
+            .ok_or(CatalogError::Malformed {
+                offset,
+                length: i32::try_from(field_offset + 8).unwrap_or(i32::MAX),
+            })
+    }
+
     /// Record that a recording has been **extended**: the row goes back to
     /// being one that has not stopped, and remembers which control session and
     /// request did it (`Catalog.extendRecording`, `:648-662`).
@@ -726,7 +793,6 @@ impl Catalog {
         const CONTROL_SESSION_ID_OFFSET: usize = 0;
         const CORRELATION_ID_OFFSET: usize = 8;
         const STOP_TIMESTAMP_OFFSET: usize = 32;
-        const STOP_POSITION_OFFSET: usize = 48;
         const SESSION_ID_OFFSET: usize = 72;
 
         let offset = self
@@ -1958,6 +2024,63 @@ mod tests {
             reopened.recording(id).expect("read back").stop_position,
             "and it is in the file, not only in this process's view of it"
         );
+    }
+
+    /// A recording's two ends can be moved on their own, which is the whole of
+    /// what a detach and a truncate are
+    /// (`Catalog.startPosition(id, position)`, `Catalog.java:758-767`, and
+    /// `stopPosition(id, position)`, `:637-646`).
+    ///
+    /// Neither write touches anything else in the row — that is the assertion
+    /// worth making here, because both are fields *inside* a variable-length
+    /// record whose neighbours are bytes this cannot afford to disturb.
+    #[test]
+    fn either_end_of_a_recording_can_be_moved() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        catalog
+            .recording_stopped(id, 1_048_576, NOW)
+            .expect("stopped");
+
+        // Read **after** the stop: the two writers are compared against the row
+        // as they found it, and a stop is one of the things that moves a field
+        // they must leave alone.
+        let started = catalog.recording(id).expect("read");
+
+        catalog.start_position(id, 262_144).expect("detached");
+        catalog.stop_position(id, 524_288).expect("truncated");
+
+        let moved = catalog.recording(id).expect("read");
+        assert_eq!(262_144, moved.start_position, "the new start");
+        assert_eq!(524_288, moved.stop_position, "and the new stop");
+
+        // Everything else is where the two writers found it.
+        assert_eq!(started.recording_id, moved.recording_id);
+        assert_eq!(started.start_timestamp, moved.start_timestamp);
+        assert_eq!(started.stop_timestamp, moved.stop_timestamp);
+        assert_eq!(started.initial_term_id, moved.initial_term_id);
+        assert_eq!(started.segment_file_length, moved.segment_file_length);
+        assert_eq!(started.term_buffer_length, moved.term_buffer_length);
+        assert_eq!(started.mtu_length, moved.mtu_length);
+        assert_eq!(started.session_id, moved.session_id);
+        assert_eq!(started.stream_id, moved.stream_id);
+        assert_eq!(started.stripped_channel, moved.stripped_channel);
+        assert_eq!(started.original_channel, moved.original_channel);
+        assert_eq!(started.source_identity, moved.source_identity);
+
+        assert!(matches!(
+            catalog.start_position(id + 1, 0),
+            Err(CatalogError::UnknownRecording { .. })
+        ));
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        let read_back = reopened.recording(id).expect("read back");
+        assert_eq!(262_144, read_back.start_position);
+        assert_eq!(524_288, read_back.stop_position);
     }
 
     /// An extended recording is one that has not stopped again, and its row
