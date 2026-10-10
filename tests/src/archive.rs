@@ -944,11 +944,26 @@ impl Archive {
     /// started, and reading that answer is what read past it
     /// ([`Archive::await_answer`]).
     ///
+    /// **The selector is the recording and the signal, not the request's
+    /// correlation id** (plan §2.3's third step). The product draws a request's
+    /// correlation id from the driver's command ring itself
+    /// (`Archive::next_correlation_id`) and answers the request with the id it
+    /// drew, so a caller that went through `Archive::truncate_recording` has no
+    /// way to know what to wait on — while what a signal *says* is which
+    /// recording it is about and what happened, which is what a reader of one is
+    /// after. **No caller ever asserted the correlation id**; it was how the
+    /// signal was found and nothing more.
+    ///
+    /// A recording's `START` and `STOP` signals share the channel with its
+    /// `DELETE`, so both halves of the selector carry weight: the recording
+    /// alone would take the `STOP` a recording sends when it stops, and the
+    /// signal alone would take another recording's.
+    ///
     /// # Panics
     ///
     /// When it does not arrive inside [`DEADLINE`].
-    pub fn await_signal(&mut self, correlation_id: i64) -> Signal {
-        if let Some(index) = self.signal_index(correlation_id) {
+    pub fn await_signal(&mut self, recording_id: i64, signal: RecordingSignal) -> Signal {
+        if let Some(index) = self.signal_index(recording_id, signal) {
             return self.signals.remove(index);
         }
 
@@ -960,9 +975,9 @@ impl Archive {
             subscription,
             Instant::now() + DEADLINE,
             |payload| {
-                let signal = decode_signal(payload)?;
-                let wanted = signal.correlation_id == correlation_id;
-                seen.push(signal);
+                let arrived = decode_signal(payload)?;
+                let wanted = arrived.recording_id == recording_id && arrived.signal == signal;
+                seen.push(arrived);
 
                 wanted.then_some(())
             },
@@ -970,9 +985,9 @@ impl Archive {
 
         self.signals.append(&mut seen);
 
-        let Some(index) = self.signal_index(correlation_id) else {
+        let Some(index) = self.signal_index(recording_id, signal) else {
             panic!(
-                "no signal for correlation id {correlation_id} arrived;\n{}\n--- archive ---\n{}",
+                "no {signal:?} signal for recording {recording_id} arrived;\n{}\n--- archive ---\n{}",
                 counters(&self.aeron_dir),
                 self.media_driver.log_tail(40)
             );
@@ -981,11 +996,11 @@ impl Archive {
         self.signals.remove(index)
     }
 
-    /// Where a signal for `correlation_id` is in the buffer, if it is there.
-    fn signal_index(&self, correlation_id: i64) -> Option<usize> {
+    /// Where a signal for `recording_id` is in the buffer, if it is there.
+    fn signal_index(&self, recording_id: i64, signal: RecordingSignal) -> Option<usize> {
         self.signals
             .iter()
-            .position(|signal| signal.correlation_id == correlation_id)
+            .position(|arrived| arrived.recording_id == recording_id && arrived.signal == signal)
     }
 
     /// Send one request that is answered with an `OK`, and assert that it was.

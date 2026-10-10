@@ -69,10 +69,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::client::ReplayParams;
 use deepmsg_codec::archive::WriteBuf;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::delete_detached_segments_request_codec::DeleteDetachedSegmentsRequestEncoder;
-use deepmsg_codec::archive::detach_segments_request_codec::DetachSegmentsRequestEncoder;
 use deepmsg_codec::archive::message_header_codec;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
@@ -183,6 +182,10 @@ fn a_recording(channel: &str, messages: usize) -> Recording {
 }
 
 /// A truncate (13) of `recording_id` to `position`.
+///
+/// **The one request in this file still built by hand**, because it is the one
+/// that has to be published without being waited for — see the delete-guard test
+/// below. Every other truncate here is `Archive::truncate_recording`.
 fn truncate_recording_request(
     control_session_id: i64,
     correlation_id: i64,
@@ -203,62 +206,6 @@ fn truncate_recording_request(
             .correlation_id(correlation_id)
             .recording_id(recording_id)
             .position(position);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// A detach (53): the recording gives up everything below `new_start_position`.
-fn detach_segments_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-    new_start_position: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 128];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            DetachSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id)
-            .new_start_position(new_start_position);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// A delete-detached (54): the segments the recording has given up are removed.
-fn delete_detached_segments_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 128];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            DeleteDetachedSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id);
 
         body + encoder.encoded_length()
     };
@@ -324,24 +271,26 @@ fn a_truncate_cuts_the_segment_it_stops_inside_and_leaves_it_a_whole_segment() {
     let removed = files.len() - index - 1;
     assert!(removed >= 1, "the truncate leaves a segment to delete");
 
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = truncate_recording_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        cut,
-    );
-    let answer = archive.ok_answer(correlation_id, &payload);
+    // The request is `Archive::truncate_recording`: the same
+    // `TruncateRecordingRequest` (13) the fixture used to build here byte by
+    // byte, with its correlation id drawn from the driver's command ring and its
+    // `relevantId` — the count the archive reports, `count_p` — handed back
+    // rather than read off a frame.
+    let removed_files = archive
+        .session
+        .archive_mut()
+        .truncate_recording(&mut archive.client, recorded.recording_id, cut)
+        .expect("the archive answers a truncate");
 
     assert_eq!(
         i64::try_from(removed).expect("a count"),
-        answer.relevant_id,
+        removed_files,
         "the OK carries the number of files the delete will take"
     );
 
     // The signal is the end of the delete (`DeleteSegmentsSession.java:76-80`),
     // so the directory is read after it and not before.
-    let signal = archive.await_signal(correlation_id);
+    let signal = archive.await_signal(recorded.recording_id, RecordingSignal::DELETE);
 
     assert_eq!(
         RecordingSignal::DELETE,
@@ -386,18 +335,22 @@ fn a_truncate_cuts_the_segment_it_stops_inside_and_leaves_it_a_whole_segment() {
     // A reader's half of the same claim: the recording replays to the cut, with
     // the messages below it and none of the ones the truncate took away.
     let subscription = archive.subscribe(TRUNCATE_REPLAY_CHANNEL, STREAM_ID);
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = archive::replay_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        -1,
-        -2,
-        FILE_IO_MAX_LENGTH,
-        STREAM_ID,
-        TRUNCATE_REPLAY_CHANNEL,
-    );
-    archive.ok_answer(correlation_id, &payload);
+    archive
+        .session
+        .archive_mut()
+        .start_replay(
+            &mut archive.client,
+            recorded.recording_id,
+            TRUNCATE_REPLAY_CHANNEL,
+            STREAM_ID,
+            &ReplayParams {
+                file_io_max_length: FILE_IO_MAX_LENGTH,
+                position: -1,
+                length: -2,
+                ..ReplayParams::default()
+            },
+        )
+        .expect("the archive starts the replay");
 
     let replay = archive.read_replay(subscription, cut);
 
@@ -450,19 +403,23 @@ fn a_truncate_of_a_recording_a_replay_is_reading_ends() {
     // publication's term fills and the replay waits on it, which is the state a
     // delete has to wait for.
     let subscription = archive.subscribe(WAITING_REPLAY_CHANNEL, STREAM_ID);
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = archive::replay_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        -1,
-        -2,
-        FILE_IO_MAX_LENGTH,
-        STREAM_ID,
-        WAITING_REPLAY_CHANNEL,
-    );
-    let answer = archive.ok_answer(correlation_id, &payload);
-    assert!(answer.relevant_id > 0, "the replay has a session id");
+    let replay_session_id = archive
+        .session
+        .archive_mut()
+        .start_replay(
+            &mut archive.client,
+            recorded.recording_id,
+            WAITING_REPLAY_CHANNEL,
+            STREAM_ID,
+            &ReplayParams {
+                file_io_max_length: FILE_IO_MAX_LENGTH,
+                position: -1,
+                length: -2,
+                ..ReplayParams::default()
+            },
+        )
+        .expect("the archive starts the replay");
+    assert!(replay_session_id > 0, "the replay has a session id");
 
     // It is announced on the CnC broadcast, so it is a poll that makes the
     // image exist — and the image is what says the replay is really running.
@@ -486,23 +443,20 @@ fn a_truncate_of_a_recording_a_replay_is_reading_ends() {
          the delete below would be waiting for nothing"
     );
 
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = truncate_recording_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        cut,
-    );
-    let answer = archive.ok_answer(correlation_id, &payload);
+    let removed_files = archive
+        .session
+        .archive_mut()
+        .truncate_recording(&mut archive.client, recorded.recording_id, cut)
+        .expect("the archive answers a truncate");
     assert!(
-        answer.relevant_id > 0,
+        removed_files > 0,
         "the OK carries the files the delete will take, which is {}",
-        answer.relevant_id
+        removed_files
     );
 
     // It finishes, which is the claim: the replay it waited for was aborted by
     // the truncate, so the wait ended rather than holding the files forever.
-    let signal = archive.await_signal(correlation_id);
+    let signal = archive.await_signal(recorded.recording_id, RecordingSignal::DELETE);
 
     assert_eq!(RecordingSignal::DELETE, signal.signal);
 
@@ -568,6 +522,21 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
     // unbounded replay of a stopped recording never has.
     let counter = archive.limit_counter(LIMIT_COUNTER_TYPE_ID, recorded.stop);
 
+    // **These two requests stay the fixture's, and this is the one place in the
+    // file where that is so** (plan §2.3's step 3, §4b). The criterion below is
+    // a state that exists only *between* two requests — the truncate makes the
+    // delete session and the replay finds it — so both have to be published
+    // before either is answered, and **the product has no door for that**: every
+    // request method on `Archive` offers and then waits (`offer_and_wait`), and
+    // `ArchiveProxy`, where the layer under them lives, is handed out shared
+    // (`Archive::proxy`), not mutably.
+    //
+    // Waiting instead is not an option, and the margin is not a guess: the
+    // delete takes one file a turn and the guard is gone once it finishes, so
+    // the window was measured by sleeping between the two publishes — 500µs
+    // still refuses, 1ms is taken. That is a window a blocking round trip fits
+    // inside on an idle machine and not on a loaded one, where publishing both
+    // and waiting afterwards needs no margin at all.
     let truncate_correlation_id = archive.session.next_correlation_id();
     let payload = truncate_recording_request(
         archive.session.control_session_id(),
@@ -627,24 +596,28 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
 
     // Over, and the same request is taken: a replay that stops at the
     // recording's own stop is reading files no delete is holding.
-    let signal = archive.await_signal(truncate_correlation_id);
+    let signal = archive.await_signal(recorded.recording_id, RecordingSignal::DELETE);
     assert_eq!(RecordingSignal::DELETE, signal.signal);
 
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = archive::replay_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        -1,
-        -2,
-        FILE_IO_MAX_LENGTH,
-        STREAM_ID,
-        GUARD_REPLAY_CHANNEL,
-    );
-    let answer = archive.ok_answer(correlation_id, &payload);
+    let replay_session_id = archive
+        .session
+        .archive_mut()
+        .start_replay(
+            &mut archive.client,
+            recorded.recording_id,
+            GUARD_REPLAY_CHANNEL,
+            STREAM_ID,
+            &ReplayParams {
+                file_io_max_length: FILE_IO_MAX_LENGTH,
+                position: -1,
+                length: -2,
+                ..ReplayParams::default()
+            },
+        )
+        .expect("the archive starts the replay again");
 
     assert!(
-        answer.relevant_id > 0,
+        replay_session_id > 0,
         "the recording is replayable again, with a session id of its own"
     );
 
@@ -679,14 +652,11 @@ fn a_delete_of_detached_segments_finishes_one_that_was_half_rolled() {
 
     // The detach: the recording stops claiming its first segment, which is what
     // *detached* means — the file is still there and nothing has deleted it.
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = detach_segments_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        second_base,
-    );
-    archive.ok_answer(correlation_id, &payload);
+    archive
+        .session
+        .archive_mut()
+        .detach_segments(&mut archive.client, recorded.recording_id, second_base)
+        .expect("the archive answers a detach");
 
     assert_eq!(
         recorded.stop,
@@ -707,20 +677,18 @@ fn a_delete_of_detached_segments_finishes_one_that_was_half_rolled() {
         "the directory is in the state a half-rolled delete leaves"
     );
 
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = delete_detached_segments_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-    );
-    let answer = archive.ok_answer(correlation_id, &payload);
+    let deleted = archive
+        .session
+        .archive_mut()
+        .delete_detached_segments(&mut archive.client, recorded.recording_id)
+        .expect("the archive answers a delete of detached segments");
 
     assert_eq!(
-        1, answer.relevant_id,
+        1, deleted,
         "one file was found to delete: the one below the start, named as a `.rec`"
     );
 
-    let signal = archive.await_signal(correlation_id);
+    let signal = archive.await_signal(recorded.recording_id, RecordingSignal::DELETE);
 
     assert_eq!(
         RecordingSignal::DELETE,
