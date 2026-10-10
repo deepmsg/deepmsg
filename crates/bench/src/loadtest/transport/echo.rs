@@ -332,6 +332,7 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
 
         let mut outbound = PublicationOutbound {
             client,
+            publication: client.exclusive_publication(registration_id),
             registration_id,
             window,
         };
@@ -544,30 +545,32 @@ fn window_limit(client: &Client, publication: i64) -> i64 {
 /// The publication a sender writes into.
 struct PublicationOutbound<'a> {
     client: &'a Client,
+    /// The publication this batch writes into, resolved **once for the batch**.
+    ///
+    /// The reference's sender holds the `ExclusivePublication` object itself
+    /// (`MessageSender.java:52`), so nothing on its per-message path looks one
+    /// up. This could not hold one either until the client let it: the
+    /// registration id was the only handle, and every message paid the linear
+    /// scan of `Client::exclusive_publication` to turn it back into a
+    /// publication. `None` when the client no longer holds it, which is what
+    /// each message answered for itself before — and it cannot appear or vanish
+    /// inside a batch, because the duty cycle that would move it is not run
+    /// while this is sending.
+    publication: Option<&'a ExclusivePublication>,
+    /// What the **offer** path needs and the claim path no longer does: it hands
+    /// the id back to `Client::offer_exclusive`, which resolves the publication
+    /// and reads its limit itself. A run that claims does not come through here
+    /// at all (`use.try.claim`), and a run that offers is measuring the offer.
     registration_id: i64,
     /// The window, held by the transceiver so that it outlives one batch.
     window: &'a mut i64,
 }
 
-/// The exclusive publication a registration id names.
-///
-/// A free function rather than a method: a method's returned borrow would be
-/// tied to the outbound, and the window it is about to write is a field of it.
-fn publication_of(client: &Client, registration_id: i64) -> Option<&ExclusivePublication> {
-    client.exclusive_publication(registration_id)
-}
-
 /// Read a publication's window limit from the driver's counter.
-fn read_window(client: &Client, registration_id: i64) -> i64 {
-    let Some(counter_id) = publication_of(client, registration_id)
-        .map(|publication| publication.position_limit_counter_id())
-    else {
-        return 0;
-    };
-
+fn read_window(client: &Client, publication: &ExclusivePublication) -> i64 {
     client
         .counters_reader()
-        .and_then(|counters| counters.value(counter_id))
+        .and_then(|counters| counters.value(publication.position_limit_counter_id()))
         .unwrap_or(0)
 }
 
@@ -579,7 +582,7 @@ impl Outbound for PublicationOutbound<'_> {
         // the reference's client does inside its own append. Reporting that
         // first answer as back pressure would spend one of the sender's three
         // attempts on a window that had merely moved.
-        let Some(publication) = publication_of(self.client, self.registration_id) else {
+        let Some(publication) = self.publication else {
             // The publication is gone from under the client.
             return Err(Appended::Malformed);
         };
@@ -590,7 +593,7 @@ impl Outbound for PublicationOutbound<'_> {
             outcome,
             Err(Appended::BackPressured | Appended::NotConnected)
         ) {
-            *self.window = read_window(self.client, self.registration_id);
+            *self.window = read_window(self.client, publication);
             outcome = publication.try_claim(*self.window, length);
         }
 

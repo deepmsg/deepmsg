@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::{self, LogType};
+use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
+use deepmsg_core::logbuffer::position;
 use deepmsg_tests::driver::{self, OwnDriver};
 
 /// The stream every test here publishes on.
@@ -46,6 +48,12 @@ const LENGTH: usize = 1024;
 /// How many messages to send: enough to cross three term boundaries, which is
 /// where a producer that holds its own offset has to notice the log move.
 const MESSAGES: i64 = 200;
+
+/// A payload of 992 bytes is **1024** on the wire, so 64 of them fill the 64 KiB
+/// term exactly — which no other length here does, and which the rig's own
+/// 32-byte pair does every 1024 messages. It is the one message length at which
+/// an append ends on a term's boundary without the log having rotated.
+const EXACT_PAYLOAD: usize = 992;
 
 /// How long the whole exchange may take before the test is a failure.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -288,4 +296,218 @@ fn a_concurrent_publication_round_trips_over_ipc() {
         arrived.len(),
         "the concurrent path delivers too"
     );
+}
+
+/// The frame length a payload of `payload` bytes takes on the wire, aligned.
+fn frame_length(payload: usize) -> i32 {
+    position::align_up(
+        i32::try_from(payload + DATA_HEADER_LENGTH).expect("small"),
+        descriptor::FRAME_ALIGNMENT,
+    )
+}
+
+/// A publication's position limit, which is what its window opens to.
+fn position_limit(client: &Client, publication: i64) -> i64 {
+    let Some(counter_id) = client
+        .exclusive_publication(publication)
+        .map(|held| held.position_limit_counter_id())
+    else {
+        return 0;
+    };
+
+    client
+        .counters_reader()
+        .and_then(|counters| counters.value(counter_id))
+        .unwrap_or(0)
+}
+
+/// Publish `count` frames of `payload` bytes, interleaved with reads, and answer
+/// with how many arrived and the publication's cached pair afterwards.
+///
+/// Interleaved for the reason [`publish_and_read`] is: the window is the
+/// **reader's** to move, so a producer that published without reading would fill
+/// it and stop — and stopping one frame short of the term's end is exactly the
+/// frame this is for.
+fn publish_frames(
+    client: &mut Client,
+    publication: i64,
+    subscription: i64,
+    payload: usize,
+    count: i32,
+    claim: bool,
+) -> (i32, i32, usize) {
+    let frame = frame_length(payload);
+    let message = vec![0x5A_u8; payload];
+    let deadline = Instant::now() + DEADLINE;
+    let mut published = 0;
+    let mut arrived = 0;
+
+    while published < count {
+        assert!(
+            Instant::now() < deadline,
+            "published {published} of {count}"
+        );
+
+        client.poll();
+        arrived += client.poll_subscription(subscription, 10, |_| {});
+
+        let outcome = if claim {
+            let limit = position_limit(client, publication);
+
+            match client
+                .exclusive_publication(publication)
+                .expect("the publication")
+                .try_claim(limit, payload)
+            {
+                Ok(claimed) => {
+                    claimed.frame().write_payload(&message).expect("in range");
+                    claimed.frame().publish(frame).expect("in range");
+
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            match client.offer_exclusive(publication, &message) {
+                Some(Appended::Ok { .. }) => Ok(()),
+                Some(error) => Err(error),
+                None => Err(Appended::Malformed),
+            }
+        };
+
+        match outcome {
+            Ok(()) => published += 1,
+            // The log rotated under it and the publication re-read where it
+            // went, so the retry lands in the new term.
+            Err(Appended::EndOfLog | Appended::MidRotation) => {}
+            // The window is the reader's; this pass had not opened it yet.
+            Err(Appended::BackPressured) => std::hint::spin_loop(),
+            Err(other) => panic!("the append answered {other:?}"),
+        }
+    }
+
+    // The last frame went out on the same pass that could have read it, so the
+    // reader is drained before the count is answered.
+    while arrived < usize::try_from(count).expect("positive") {
+        assert!(Instant::now() < deadline, "read {arrived} of {count}");
+        client.poll();
+        arrived += client.poll_subscription(subscription, 10, |_| {});
+    }
+
+    let held = client
+        .exclusive_publication(publication)
+        .expect("the publication");
+
+    (held.term_id(), held.term_offset(), arrived)
+}
+
+/// What an append that fills a term **exactly** leaves behind — both paths.
+///
+/// The append ends on the term's boundary, so a pair rebuilt from the position
+/// alone would name the *next* term while the log is still in this one. The pair
+/// either way is checked here, and then that the very next frame is the one that
+/// rotates: the term was full, it was not gone.
+fn exact_fill(claim: bool) {
+    let name = if claim {
+        "exact-fill-claim"
+    } else {
+        "exact-fill-offer"
+    };
+    let Some(mut own) = OwnDriver::start(name) else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let publication = client
+        .add_exclusive_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("an exclusive publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_images(&mut client, subscription);
+
+    let (opened_at, term_length) = {
+        let held = client
+            .exclusive_publication(publication)
+            .expect("the publication");
+
+        (
+            (held.term_id(), held.term_offset()),
+            held.term_buffer_length(),
+        )
+    };
+    let frame = frame_length(EXACT_PAYLOAD);
+    assert_eq!(
+        0,
+        term_length % frame,
+        "the term has to hold a whole number of these frames, or nothing here is exact"
+    );
+    let frames = term_length / frame;
+
+    // Exactly one term's worth, and not a frame more.
+    let (term_id, term_offset, arrived) = publish_frames(
+        &mut client,
+        publication,
+        subscription,
+        EXACT_PAYLOAD,
+        frames,
+        claim,
+    );
+
+    assert_eq!(
+        (opened_at.0, term_length),
+        (term_id, term_offset),
+        "a term filled exactly is still this term, with its offset at the term's own end"
+    );
+    assert_eq!(
+        usize::try_from(frames).expect("positive"),
+        arrived,
+        "and every frame of it was read"
+    );
+
+    // The next frame is the one that rotates — three terms of them, so every
+    // partition of the log's three has been written through.
+    let (term_id, term_offset, more) = publish_frames(
+        &mut client,
+        publication,
+        subscription,
+        EXACT_PAYLOAD,
+        2 * frames,
+        claim,
+    );
+
+    // Two more terms, each of them filled exactly as well: the frames went
+    // through this term, the next and the one after it — the log's three
+    // partitions, all of them — and the pair is again a term at its end.
+    assert_eq!(
+        2,
+        term_id - opened_at.0,
+        "two rotations, over the other two partitions"
+    );
+    assert_eq!(
+        term_length, term_offset,
+        "and the log is full again, not part-way into a fourth term"
+    );
+    assert_eq!(
+        usize::try_from(2 * frames).expect("positive"),
+        more,
+        "and all of those arrived too"
+    );
+}
+
+/// An **offer** that fills a term exactly leaves the pair in this term.
+#[test]
+fn an_offer_that_fills_a_term_exactly_leaves_the_pair_in_this_term() {
+    exact_fill(false);
+}
+
+/// The same for a **claim**, which is the path a producer that claims takes.
+#[test]
+fn a_claim_that_fills_a_term_exactly_leaves_the_pair_in_this_term() {
+    exact_fill(true);
 }
