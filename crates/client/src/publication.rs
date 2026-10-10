@@ -692,20 +692,30 @@ impl ExclusivePublication {
     /// where this one stopped. A publication that kept the frame's offset would
     /// write every message over the first — which is not a subtle failure, it
     /// is a stream of one message that looks like it is being sent N times.
+    ///
+    /// The two numbers that turn a position into the cached pair — `log2` of
+    /// the term length, and the initial term id — are the log's **shape**, not
+    /// anything an append moves, so they come off the mapping's own geometry
+    /// ([`LogBuffer::geometry`], read once when the file was mapped) rather than
+    /// out of an [`Appender`]. Building one to ask it for them costs a metadata
+    /// region, a load of `active_term_count`, a term view and three further
+    /// metadata fields (`Appender::new`'s `TERM_LENGTH`, `INITIAL_TERM_ID` and
+    /// `MTU_LENGTH`), on the path of **every** successful append. The reference
+    /// keeps both of them on the publication object instead
+    /// (`aeron_exclusive_publication.h:45-47`: `position_bits_to_shift`,
+    /// `initial_term_id`, `term_buffer_length`) and re-reads nothing to move the
+    /// pair after an append.
+    ///
+    /// This is total where the appender was fallible: a geometry that could not
+    /// be read is a log that never mapped ([`LogBuffer::open`]), so a caller
+    /// that has one has the other, and the pair is always moved.
     fn advance_to(&self, position: deepmsg_core::logbuffer::position::Position) {
-        let Some(term_length) = self.appender().map(|appender| appender.term_length()) else {
-            return;
-        };
-        let Some(bits) = position::bits_to_shift(term_length) else {
-            return;
-        };
-        let Some(initial_term_id) = self.appender().map(|appender| appender.initial_term_id())
-        else {
-            return;
-        };
+        let geometry = self.log.geometry();
 
-        self.term_id.set(position.term_id(bits, initial_term_id));
-        self.term_offset.set(position.term_offset(bits));
+        self.term_id
+            .set(position.term_id(geometry.bits_to_shift, geometry.initial_term_id));
+        self.term_offset
+            .set(position.term_offset(geometry.bits_to_shift));
     }
 
     /// Re-read the cached pair from the log's current tail
