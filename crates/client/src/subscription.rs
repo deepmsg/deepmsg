@@ -104,25 +104,6 @@ impl Subscription {
         &self.assembler
     }
 
-    /// Poll every image, delivering whole messages, and hand back the counter
-    /// positions the caller has to publish.
-    ///
-    /// The positions are returned rather than written because the counters live
-    /// in the CnC file and this type does not own it: writing them here would
-    /// need the file borrowed while the subscription is borrowed mutably, which
-    /// is exactly the aliasing the borrow checker exists to refuse. The caller
-    /// — [`crate::Client::poll_subscription`] — writes them after the poll.
-    ///
-    /// Only an image whose read **moved its position** is handed back, which is
-    /// the reference's own gate: `Image.poll` writes the subscriber position
-    /// counter only `if (newPosition > initialPosition)`
-    /// (`Image.java:374-378`; `aeron_image.c:314-322`), and neither
-    /// `Subscription.poll` (`Subscription.java:188-212`) nor
-    /// `aeron_subscription_poll` (`aeron_subscription.c:426-472`) writes one
-    /// itself. A poll that read nothing has no position to publish, so
-    /// reporting the value already in the counter would be a write the
-    /// reference never makes — as well as the `Vec`'s one allocation on the
-    /// path a waiting reader spends most of its turns on (ADR-0003).
     /// Where the next poll begins, and how many images there are to cover.
     ///
     /// One image later each call, wrapping. The reference advances a counter and
@@ -144,17 +125,28 @@ impl Subscription {
         (start, length)
     }
 
+    /// Poll every image, delivering whole messages, and publish each reader's
+    /// position as it moves.
+    ///
+    /// `publish` is called with the counter and the position rather than the
+    /// positions being handed back, because the counters live in the CnC file
+    /// and this type does not own it: a caller outside it writes them, as
+    /// [`crate::Client::poll_subscription`] does. A callback rather than a list
+    /// because the list cost one heap allocation a poll — the thing ADR-0003
+    /// forbids on a path a waiting reader spends most of its turns on — and
+    /// because a caller given the positions as they happen can decide for itself
+    /// whether it needs the counters at all.
     pub(crate) fn poll_messages<F>(
         &mut self,
         fragment_limit: usize,
         handler: &mut F,
-    ) -> (usize, Vec<(i32, i64)>)
+        publish: &mut dyn FnMut(i32, i64),
+    ) -> usize
     where
         F: FnMut(crate::fragment_assembler::Message<'_>),
     {
         let mut messages = 0;
         let mut fragments = 0;
-        let mut counter_writes = Vec::new();
 
         // The images and the assembler are borrowed apart here because both are
         // needed at once: the images are what is read, the assembler is where
@@ -188,18 +180,31 @@ impl Subscription {
 
             messages += usize::try_from(assembler.delivered() - before).unwrap_or(0);
 
-            // Reported only when the read moved the position — the reference's
-            // gate (see the type's own note above). A poll that read nothing
-            // would otherwise push a write of the value already in the counter,
-            // which is both work the reference does not do and the `Vec`'s one
-            // allocation a poll.
+            // Published as the poll goes rather than collected and handed back:
+            // a subscription has one counter per image, so the write belongs to
+            // the image it happened on and the reference makes it there too —
+            // inside `Image.poll`'s own ending (`Image.java:371-378`). Handing a
+            // `Vec` back instead cost one heap allocation a poll, which is the
+            // allocation ADR-0003 forbids on a path a waiting reader spends most
+            // of its turns on.
+            //
+            // And **only a read that moved the position** is published, which is
+            // the reference's own gate: `Image.poll` writes the counter only
+            // `if (newPosition > initialPosition)` (`Image.java:374-378`;
+            // `aeron_image.c:314-322`). Publishing one that did not move
+            // re-sends the value the counter already holds — which the driver's
+            // window computation (`aeron_ipc_publication.c:296-313`) cannot tell
+            // from not writing at all — on the **empty** poll that is most of a
+            // waiting reader's turns. It is also what makes the caller's own
+            // gate real: an empty poll hands it nothing to publish, so it never
+            // reaches for the counters.
             let position = image.position();
             if position > position_before {
-                counter_writes.push((image.subscriber_position_id(), position));
+                publish(image.subscriber_position_id(), position);
             }
         }
 
-        (messages, counter_writes)
+        messages
     }
 
     /// Read up to `fragment_limit` fragments from every image, reassembling
@@ -261,19 +266,20 @@ impl Subscription {
     /// (`aeron_subscription.c:1040-1080`), and what Java's `Subscription.poll`
     /// always does (`Subscription.java:188`).
     ///
-    /// Returns how many fragments were delivered, and the counter writes the
-    /// caller has to make afterwards — the same contract as [`Self::poll_messages`].
+    /// Returns how many fragments were delivered, and publishes each reader's
+    /// position through `publish` as it moves — the same contract as
+    /// [`Self::poll_messages`].
     pub(crate) fn poll_fragments<F>(
         &mut self,
         fragment_limit: usize,
         handler: &mut F,
-    ) -> (usize, Vec<(i32, i64)>)
+        publish: &mut dyn FnMut(i32, i64),
+    ) -> usize
     where
         F: FnMut(&Fragment<'_>),
     {
         let (start, length) = self.take_rotation();
         let mut fragments = 0;
-        let mut counter_writes = Vec::new();
 
         for offset in 0..length {
             let image = &mut self.images[(start + offset) % length];
@@ -285,16 +291,18 @@ impl Subscription {
             let position_before = image.position();
             fragments += image.poll(remaining, &mut *handler);
 
-            // Same gate as [`Self::poll_messages`]: only a read that moved the
-            // position is reported, which is the reference's
-            // (`Image.java:374-378`; `aeron_image.c:314-322`).
+            // Published as the poll goes, and only when the read moved the
+            // position — [`Self::poll_messages`]'s reasons, which are the same
+            // ones here: the gate is on the position rather than on the fragment
+            // count because padding moves the position without delivering a
+            // fragment, and a poll that read only padding is a read.
             let position = image.position();
             if position > position_before {
-                counter_writes.push((image.subscriber_position_id(), position));
+                publish(image.subscriber_position_id(), position);
             }
         }
 
-        (fragments, counter_writes)
+        fragments
     }
 
     /// The subscription's registration id.
@@ -531,6 +539,57 @@ mod tests {
         );
     }
 
+    /// What a poll hands the caller is one pair per image: the **counter that
+    /// image's position belongs to**, and where the read left it.
+    ///
+    /// The pair is the seam a caller writes through, and it is the whole reason
+    /// this is a callback rather than a `Vec`: the caller decides whether it
+    /// needs the counters at all, and a poll that read nothing never asks.
+    #[test]
+    fn a_poll_publishes_each_images_own_counter_and_position() {
+        let (mut subscription, _first, _second) = a_subscription_over_two_images();
+        let mut writes = Vec::new();
+        let mut handler = |_message: Message<'_>| {};
+
+        {
+            let mut publish = |counter_id: i32, position: i64| writes.push((counter_id, position));
+            subscription.poll_messages(10, &mut handler, &mut publish);
+        }
+
+        assert_eq!(2, writes.len(), "one pair per image, in image order");
+
+        for (index, (counter_id, position)) in writes.iter().enumerate() {
+            let image = &subscription.images()[index];
+
+            assert_eq!(
+                image.subscriber_position_id(),
+                *counter_id,
+                "image {index}'s own counter"
+            );
+            assert_eq!(
+                image.position(),
+                *position,
+                "and the position the read left it at"
+            );
+        }
+
+        // And nothing left to read publishes nothing: the reference's gate
+        // (`Image.java:374-378`) is what lets the caller's own gate be real —
+        // an empty poll hands it no position, so it never goes looking for the
+        // counters, which is the region lookups this whole path is avoiding.
+        writes.clear();
+
+        {
+            let mut publish = |counter_id: i32, position: i64| writes.push((counter_id, position));
+            subscription.poll_messages(10, &mut handler, &mut publish);
+        }
+
+        assert!(
+            writes.is_empty(),
+            "an empty poll has no position to publish"
+        );
+    }
+
     /// The same for the plain fragment path, which had the same loop.
     #[test]
     fn the_fragment_path_rotates_too() {
@@ -541,7 +600,10 @@ mod tests {
             let mut handler = |fragment: &crate::image::Fragment<'_>| {
                 seen.push((fragment.session_id(), fragment.position()));
             };
-            assert_eq!(1, subscription.poll_fragments(1, &mut handler).0);
+            assert_eq!(
+                1,
+                subscription.poll_fragments(1, &mut handler, &mut |_, _| {})
+            );
         }
 
         // Two images, both written by session 7, so the positions are what
@@ -556,74 +618,6 @@ mod tests {
             seen[0].1, seen[1].1,
             "the third poll went back to the first image"
         );
-    }
-
-    /// A poll that reads nothing has nothing to publish, and one that reads a
-    /// message publishes the position it moved to.
-    ///
-    /// The reference's gate (`Image.java:374-378`; `aeron_image.c:314-322`):
-    /// the subscriber position counter is written only when the read moved the
-    /// position. An empty poll used to hand back a write of the value already in
-    /// the counter — which is also the caller's one heap allocation a poll on
-    /// the path a waiting reader spends most of its turns on (ADR-0003).
-    #[test]
-    fn an_empty_poll_publishes_nothing_and_a_read_publishes_its_position() {
-        let log = TempLog::new("counter-write-gate");
-        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
-        subscription.add_image(log.image(1));
-
-        let mut handler = |_message: Message<'_>| {};
-
-        let (messages, writes) = subscription.poll_messages(10, &mut handler);
-        assert_eq!(0, messages);
-        assert!(
-            writes.is_empty(),
-            "an empty poll has no position to publish, so it hands back no write"
-        );
-
-        // The term now holds a message: the same poll reads it and reports the
-        // position it moved to, exactly as it did before the gate.
-        log.write(|appender| write_message(appender, b"hello"));
-
-        let (messages, writes) = subscription.poll_messages(10, &mut handler);
-        assert_eq!(1, messages);
-        assert_eq!(
-            1,
-            writes.len(),
-            "a read that moved the position is published"
-        );
-        assert_eq!(
-            subscription.images()[0].subscriber_position_id(),
-            writes[0].0
-        );
-        assert!(writes[0].1 > 0, "the position moved past the join position");
-        assert_eq!(subscription.images()[0].position(), writes[0].1);
-    }
-
-    /// The same gate on the plain fragment path, which had the same push.
-    #[test]
-    fn the_fragment_path_publishes_only_a_read_that_moved_the_position() {
-        let log = TempLog::new("counter-write-gate-fragments");
-        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
-        subscription.add_image(log.image(1));
-
-        let mut handler = |_fragment: &crate::image::Fragment<'_>| {};
-
-        let (fragments, writes) = subscription.poll_fragments(10, &mut handler);
-        assert_eq!(0, fragments);
-        assert!(writes.is_empty(), "an empty poll publishes nothing");
-
-        log.write(|appender| write_message(appender, b"hello"));
-
-        let (fragments, writes) = subscription.poll_fragments(10, &mut handler);
-        assert_eq!(1, fragments);
-        assert_eq!(
-            1,
-            writes.len(),
-            "a read that moved the position is published"
-        );
-        assert!(writes[0].1 > 0);
-        assert_eq!(subscription.images()[0].position(), writes[0].1);
     }
 
     /// A counters region the tests can lay out by hand.

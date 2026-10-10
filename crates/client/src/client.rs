@@ -2722,37 +2722,36 @@ impl Client {
     where
         F: FnMut(Message<'_>),
     {
-        let Some(subscription) = self
-            .subscriptions
+        // The subscription and the counters are borrowed apart because the poll
+        // publishes a reader's position **while** it reads. That is where the
+        // reference publishes it too — inside `Image.poll`'s own ending
+        // (`Image.java:371-378`) — and it is what lets a poll that read nothing
+        // touch neither.
+        let Self {
+            subscriptions, cnc, ..
+        } = self;
+
+        let Some(subscription) = subscriptions
             .iter_mut()
             .find(|s| s.registration_id() == subscription_id)
         else {
             return 0;
         };
 
-        let (messages, counter_writes) = subscription.poll_messages(fragment_limit, &mut handler);
-
-        // A poll that read nothing hands back no writes at all — `poll_messages`
-        // reports one only for an image whose position moved, which is the
-        // reference's own gate — so this is the path a reader spends most of its
-        // turns on, and with an empty list the region lookups below would build
-        // two views and a `CountersReader` in order to write nothing.
-        if counter_writes.is_empty() {
-            return messages;
-        }
-
-        // Published after the poll rather than during it: the counters live in
-        // the CnC file, which the images do not borrow, and the reference
-        // publishes a reader's position for the driver to compute the
-        // publisher's window from — an image that is read but not reported
-        // eventually blocks the publisher (`aeron_ipc_publication.c:296-313`).
-        if let Some(counters) = self.cnc.counters_writable() {
-            for (counter_id, position) in counter_writes {
+        // The counters are resolved by the first position that needs one rather
+        // than before the poll, so the empty poll most of a waiting reader's
+        // turns are does not build a `CountersReader` — two region lookups over
+        // the CnC file — in order to write nothing. What the write is for is the
+        // driver's publisher-window computation: an image that is read but never
+        // reported eventually blocks the publisher
+        // (`aeron_ipc_publication.c:296-313`).
+        let mut publish = |counter_id: i32, position: i64| {
+            if let Some(counters) = cnc.counters_writable() {
                 counters.set_value(counter_id, position);
             }
-        }
+        };
 
-        messages
+        subscription.poll_messages(fragment_limit, &mut handler, &mut publish)
     }
 
     /// Read up to `fragment_limit` fragments from every image of a
@@ -2830,32 +2829,26 @@ impl Client {
     where
         F: FnMut(&Fragment<'_>),
     {
-        let Some(subscription) = self
-            .subscriptions
+        // Borrowed apart, published as it reads, and resolved on demand — the
+        // reasons [`Client::poll_subscription`] gives.
+        let Self {
+            subscriptions, cnc, ..
+        } = self;
+
+        let Some(subscription) = subscriptions
             .iter_mut()
             .find(|s| s.registration_id() == subscription_id)
         else {
             return 0;
         };
 
-        let (fragments, counter_writes) = subscription.poll_fragments(fragment_limit, &mut handler);
-
-        // The same gate as [`Client::poll_subscription`], for the same reason:
-        // an empty list has nothing to publish and would cost the region
-        // lookups anyway.
-        if counter_writes.is_empty() {
-            return fragments;
-        }
-
-        // Published after the poll, never during it — the reason
-        // [`Client::poll_subscription`] gives.
-        if let Some(counters) = self.cnc.counters_writable() {
-            for (counter_id, position) in counter_writes {
+        let mut publish = |counter_id: i32, position: i64| {
+            if let Some(counters) = cnc.counters_writable() {
                 counters.set_value(counter_id, position);
             }
-        }
+        };
 
-        fragments
+        subscription.poll_fragments(fragment_limit, &mut handler, &mut publish)
     }
 
     /// Send a command and register it as pending with a deadline.
