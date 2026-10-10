@@ -203,6 +203,63 @@ impl<'a, Access> Frame<'a, Access> {
 
         self.buffer.copy_out(self.offset + DATA_HEADER_LENGTH, dst)
     }
+
+    /// The `int64` at `offset` bytes into the payload, read **in place**.
+    ///
+    /// The read side of [`Frame::store_i64_in_payload`], and it exists for the
+    /// same reason the store does: a handler handed a message should not have to
+    /// copy the whole payload out to look at one field of it. The reference's own
+    /// handlers read the term where it lies —
+    /// `EchoMessageTransceiver.java`'s `dataHandler` is a `buffer.getLong(offset)`
+    /// against the frame's own buffer.
+    ///
+    /// What comes back is a **value**, never a slice: the producer on the other
+    /// side of the mapping can keep writing the term around the read, which is
+    /// the property `pal` keeps by not handing out an `as_slice`.
+    ///
+    /// `None` when the eight bytes are not all inside this frame's payload — so
+    /// a caller reading the fields a message claims to carry cannot be handed
+    /// bytes from whatever frame follows it.
+    ///
+    /// **Any** offset reads, which is what the reference's `getLong(offset)`
+    /// does: a payload field is written wherever the caller put it
+    /// ([`Frame::store_i64_in_payload`]), so a reader that did not choose the
+    /// layout cannot assume an alignment for it. Three paths, longest-range
+    /// first — an eight-byte load where the address allows one, the two halves
+    /// where it is four-byte aligned, and a byte copy otherwise — and only the
+    /// first is the common case in this build's own messages, whose fields are
+    /// eight-byte aligned by construction.
+    pub fn load_i64_in_payload(&self, offset: usize) -> Option<i64> {
+        if offset.checked_add(8)? > self.payload_length()? {
+            return None;
+        }
+
+        let at = self.payload_offset(offset)?;
+
+        if let Some(value) = self.buffer.load_i64(at) {
+            return Some(value);
+        }
+
+        if let Some(value) = self.buffer.load_i64_unaligned(at) {
+            return Some(value);
+        }
+
+        let mut bytes = [0_u8; 8];
+        self.buffer.copy_out(at, &mut bytes)?;
+
+        Some(i64::from_le_bytes(bytes))
+    }
+
+    /// Where `offset` bytes into the payload lies in the term.
+    ///
+    /// Both sides need it — the write side stores through it and the read side
+    /// loads through it — and neither half is about writability, which is why it
+    /// is here rather than beside the stores.
+    fn payload_offset(&self, offset: usize) -> Option<usize> {
+        self.offset
+            .checked_add(DATA_HEADER_LENGTH)?
+            .checked_add(offset)
+    }
 }
 
 /// The write side, available only on a writable term.
@@ -304,13 +361,6 @@ impl Frame<'_, ReadWrite> {
     pub fn store_i32_in_payload(&self, offset: usize, value: i32) -> Option<()> {
         self.buffer
             .store_i32_relaxed(self.payload_offset(offset)?, value)
-    }
-
-    /// Where `offset` bytes into the payload lies in the term.
-    fn payload_offset(&self, offset: usize) -> Option<usize> {
-        self.offset
-            .checked_add(DATA_HEADER_LENGTH)?
-            .checked_add(offset)
     }
 
     /// Publish the frame: a positive length, release.

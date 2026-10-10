@@ -151,11 +151,8 @@ fn run() -> Result<(), String> {
             let channels =
                 ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
             let client_poll_min_ns = poll_min_ns(std::env::var(CLIENT_POLL_MIN_NS).ok().as_deref());
-            let gate = if client_poll_min_ns > 0 {
-                PollGate::EveryInterval(client_poll_min_ns)
-            } else {
-                PollGate::Every
-            };
+            let named = std::env::var(CLIENT_POLL_MIN_NS).is_ok();
+            let gate = poll_gate(client_poll_min_ns, named);
 
             let transceiver = EchoTransceiver::new(channels, idle, logs_directory, gate)
                 .map_err(|error| error.to_string())?;
@@ -179,6 +176,34 @@ fn poll_min_ns(value: Option<&str>) -> u64 {
             value.parse::<u64>().unwrap_or(0)
         }
         _ => 0,
+    }
+}
+
+/// The interval an unset switch gives, in nanoseconds.
+///
+/// The rig has always run the conductor's duty cycle on **every** `receive()`
+/// ([`PollGate::Every`]), and that is still what naming it asks for: a literal
+/// `0` says so. What changed is only the **default** — an unset switch is the
+/// gate open — and the reason is that the gated shape is the one the reference's
+/// rig has: its conductor is on a thread of its own (`Aeron.java:174`,
+/// `AgentRunner.startOnThread`), so its measured thread never runs a duty cycle
+/// at all, and a run that carries ours on every turn is measuring something the
+/// reference does not do.
+const DEFAULT_GATE_NS: u64 = 1_000_000;
+
+/// The gate the switch names, when it is read.
+///
+/// `named` says whether [`CLIENT_POLL_MIN_NS`] was set at all: a switch that was
+/// set asks for what it says — including one a caller mistyped, which
+/// [`poll_min_ns`] reads as `0`, and which therefore asks for the rig's own
+/// shape. Unset is [`DEFAULT_GATE_NS`].
+fn poll_gate(min_ns: u64, named: bool) -> PollGate {
+    if min_ns > 0 {
+        PollGate::EveryInterval(min_ns)
+    } else if named {
+        PollGate::Every
+    } else {
+        PollGate::EveryInterval(DEFAULT_GATE_NS)
     }
 }
 
@@ -328,6 +353,20 @@ mod tests {
         ] {
             assert_eq!(poll_min_ns(value), expected, "for {value:?}");
         }
+
+        // A switch that was set asks for what it says; naming `0` is the rig's
+        // own shape and naming an interval is the gate at that interval.
+        assert_eq!(PollGate::Every, poll_gate(0, true));
+        assert_eq!(
+            PollGate::EveryInterval(1_000_000),
+            poll_gate(1_000_000, true)
+        );
+
+        // Nothing named is the gate open, at the interval a run gets by default.
+        assert_eq!(
+            PollGate::EveryInterval(DEFAULT_GATE_NS),
+            poll_gate(0, false)
+        );
     }
 
     #[test]

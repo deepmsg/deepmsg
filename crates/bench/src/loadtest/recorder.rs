@@ -12,6 +12,7 @@
 //! port deliberately differs from the reference's shape, and the reason is that
 //! the alternative in Rust is a borrow check per message.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,6 +63,22 @@ pub struct Recorder<C: Clock> {
     received_messages: i64,
     checksum: i64,
     clock: C,
+    /// The last reading this recorder took, kept so that a caller wanting a
+    /// reading **inside the same turn** can have one without a second
+    /// `clock_gettime`.
+    ///
+    /// The caller that wants one is the gate: `EchoTransceiver::receive` asks
+    /// whether an interval has gone by before it decides to run the client's
+    /// duty cycle, and the rig's own waiting loop has just read the same clock
+    /// (`LoadTestRig::send`, `now_ns = self.recorder.nano_time()`). A reading
+    /// taken there is at most one turn old — 127-180 ns against an interval of
+    /// a millisecond — and a clock read is 14-19 ns on the bench machine
+    /// (`doc/deepmsg-rust-rig-delta.md` §2.1), measured once a turn whether or
+    /// not the turn had anything to do.
+    ///
+    /// A `Cell` because [`Recorder::nano_time`] takes `&self`, as the rig's own
+    /// clock reads do.
+    last_nano_time: Cell<i64>,
 }
 
 impl<C: Clock> Recorder<C> {
@@ -73,6 +90,9 @@ impl<C: Clock> Recorder<C> {
             received_messages: 0,
             checksum,
             clock,
+            // Zero, not a real reading: the gate's own `due` starts at zero too,
+            // so the first turn polls whatever this holds.
+            last_nano_time: Cell::new(0),
         }
     }
 
@@ -97,7 +117,10 @@ impl<C: Clock> Recorder<C> {
             self.checksum
         );
 
-        let round_trip = self.clock.nano_time() - timestamp;
+        let now = self.clock.nano_time();
+        self.last_nano_time.set(now);
+
+        let round_trip = now - timestamp;
         self.histogram
             .record(u64::try_from(round_trip).unwrap_or(u64::MAX))
             .expect("the histogram's bounds cover any round trip a run can produce");
@@ -118,9 +141,25 @@ impl<C: Clock> Recorder<C> {
 
     /// A reading from the run's clock, which is the same clock every message is
     /// timed against.
+    ///
+    /// Remembers what it read, so that [`Recorder::last_nano_time`] can answer
+    /// with it rather than with a second read.
     #[must_use]
     pub fn nano_time(&self) -> i64 {
-        self.clock.nano_time()
+        let now = self.clock.nano_time();
+        self.last_nano_time.set(now);
+
+        now
+    }
+
+    /// The most recent reading this recorder took, or zero before it took one.
+    ///
+    /// Zero is before any real reading (a monotonic clock is far past it), which
+    /// is what a caller comparing against its own deadline wants: it polls on the
+    /// first turn rather than waiting for a reading that does not exist yet.
+    #[must_use]
+    pub fn last_nano_time(&self) -> i64 {
+        self.last_nano_time.get()
     }
 
     /// Throw away what warmup produced.
@@ -206,6 +245,22 @@ mod tests {
             refused.is_err(),
             "a foreign checksum is not a message of ours"
         );
+    }
+
+    /// The reading the gate reuses is the one the recorder took, not a second
+    /// look at the clock.
+    #[test]
+    fn the_last_reading_is_the_one_that_was_taken() {
+        let mut recorder = recorder(ScriptedClock::new([1111, 2222]), 7);
+
+        assert_eq!(0, recorder.last_nano_time(), "before anything was read");
+
+        assert_eq!(1111, recorder.nano_time());
+        assert_eq!(1111, recorder.last_nano_time(), "the reading just taken");
+
+        // A message records its own reading, which is the freshest one there is.
+        recorder.on_message_received(1000, 7);
+        assert_eq!(2222, recorder.last_nano_time());
     }
 
     #[test]
