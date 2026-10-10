@@ -35,5 +35,7 @@
 //! other slices and are not here.
 
 pub mod context;
+pub mod proxy;
 
 pub use context::{ArchiveContext, ClientError, ConcludeError, ControlChannels};
+pub use proxy::{ArchiveProxy, ProxyError, ReplayParams, ReplicationParams};

@@ -240,6 +240,13 @@ path = "integration/archive_queries.rs"
 name = "archive_client"
 path = "integration/archive_client.rs"
 
+# P2-C1's request proxy: all thirty-two requests published for real and read
+# back off the wire, which is the check that catches a field mix-up in an
+# encoder that is otherwise one of thirty-two near-identical ones.
+[[test]]
+name = "archive_proxy"
+path = "integration/archive_proxy.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused
