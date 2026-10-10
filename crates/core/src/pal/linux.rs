@@ -14,6 +14,66 @@ use std::path::{Path, PathBuf};
 
 use crate::buffer::{AtomicBuffer, ReadWrite};
 
+/// Nanoseconds from the `CLOCK_MONOTONIC` the kernel keeps, read straight from
+/// the vDSO.
+///
+/// The value counts from an arbitrary origin the kernel fixes at boot, so on its
+/// own it is a date and not a duration: two readings may be *subtracted* only by
+/// code that knows they share that origin — which is every reading on one boot,
+/// and is why nothing here is written to shared memory or compared against
+/// another process's. [`crate::clock::monotonic_nano_time`] re-bases it to this
+/// process's first reading, which is the shape the driver's timing wants.
+///
+/// The seam exists for one reason beyond `mmap`: the safe spelling above this,
+/// `Instant::elapsed().as_nanos()`, builds a `Duration` and multiplies in
+/// `u128`, which is work a caller that only ever subtracts two readings does not
+/// need. A hot loop wants what the kernel's own `clock_gettime` costs, and this
+/// is that and nothing else.
+///
+/// **It is a measured candidate, not what `monotonic_nano_time` reads today.**
+/// On this machine the bare call is ~13.6 ns and `Instant::now` underneath it is
+/// the same order (13.6–14.1 ns), so replacing the `Duration`/`u128` arithmetic
+/// with this saves only ~4 ns a reading — below the bar that would justify
+/// putting the driver's own duty cycles on it, and `monotonic_nano_time` was
+/// left as it is. The primitive is kept as the evidence for that decision, and
+/// it is here so the seam stays the only place the raw call could live.
+///
+/// # Errors and saturation
+///
+/// There are none to report: `CLOCK_MONOTONIC` is always present on Linux, and a
+/// failure would mean the kernel lacks the clock the whole crate assumes. A
+/// failure nonetheless saturates to `i64::MAX` rather than panicking, matching
+/// [`crate::clock::monotonic_nano_time`]'s own contract — a duty cycle must not
+/// die over a clock read.
+pub fn monotonic_nanos() -> i64 {
+    let mut timespec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    // SAFETY: `CLOCK_MONOTONIC` is a valid clock id on Linux and `timespec`
+    // points at a `libc::timespec` this frame owns, which is the one object the
+    // call writes through. There is no precondition beyond that and no aliasing
+    // requirement: the call reads the clock and stores a single value.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timespec) };
+
+    if 0 != rc {
+        return i64::MAX;
+    }
+
+    // `i64::from` rather than a cast: `time_t` and `c_long` are `i64` on a
+    // 64-bit target and `i32` on a 32-bit one, and `From` widens both, so the
+    // seam is right wherever the crate builds. On this target the widening is
+    // the identity, which clippy reads as a useless conversion; it is not one on
+    // a 32-bit target, where a bare cast would instead be a silent truncation.
+    // The multiply saturates, which is unreachable before the year 2262 and is
+    // what makes the "never panics" claim above true rather than hopeful.
+    #[allow(clippy::useless_conversion)]
+    i64::from(timespec.tv_sec)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(timespec.tv_nsec))
+}
+
 /// Map `length` bytes of `fd` read-only and shared.
 ///
 /// Private on purpose: the only thing above it is [`MappedFile`], so this

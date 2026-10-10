@@ -17,7 +17,7 @@ use deepmsg_bench::loadtest::config::{
 };
 use deepmsg_bench::loadtest::recorder::{self, Recorder};
 use deepmsg_bench::loadtest::result;
-use deepmsg_bench::loadtest::transceiver::{MessageTransceiver, SystemClock};
+use deepmsg_bench::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock};
 use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
 use deepmsg_bench::loadtest::transport::node::EchoNode;
 use deepmsg_bench::loadtest::transport::util::{ChannelSettings, MIN_MESSAGE_LENGTH};
@@ -111,8 +111,9 @@ fn a_message_goes_to_the_node_and_comes_back() {
         if sent < MESSAGES {
             // The timestamp is when the message is *meant* to go out — the
             // reference's meaning, and what the round trip below is measured
-            // from. Here it is simply now.
-            let timestamp = deepmsg_core::clock::monotonic_nano_time();
+            // from. Here it is simply now, read off the same clock the recorder
+            // times the reply against, or the two would be an origin apart.
+            let timestamp = SystemClock.nano_time();
             sent += MessageTransceiver::<SystemClock>::send(
                 &mut transceiver,
                 1,
