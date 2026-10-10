@@ -24,7 +24,7 @@ use deepmsg_bench::loadtest::config::{
 };
 use deepmsg_bench::loadtest::result::Status;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
-use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
+use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
 use deepmsg_bench::loadtest::transport::node::EchoNode;
 use deepmsg_bench::loadtest::transport::util::ChannelSettings;
 use deepmsg_tests::driver::{self, OwnDriver};
@@ -127,8 +127,14 @@ fn a_client_two_nodes_and_three_drivers_agree() {
     }
 
     let channels = settings(client_driver.aeron_dir(), 0);
-    let transceiver = EchoTransceiver::new(channels, IdleStrategy::BusySpin, scratch.clone())
-        .expect("the client connects to its driver");
+    // The rig's own conductor, as this test has always run it.
+    let transceiver = EchoTransceiver::new(
+        channels,
+        IdleStrategy::BusySpin,
+        scratch.clone(),
+        PollGate::Every,
+    )
+    .expect("the client connects to its driver");
 
     let mut rig = LoadTestRig::new(
         configuration(&scratch),

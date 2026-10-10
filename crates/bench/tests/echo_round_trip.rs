@@ -18,7 +18,7 @@ use deepmsg_bench::loadtest::config::{
 use deepmsg_bench::loadtest::recorder::{self, Recorder};
 use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock};
-use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
+use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
 use deepmsg_bench::loadtest::transport::node::EchoNode;
 use deepmsg_bench::loadtest::transport::util::{ChannelSettings, MIN_MESSAGE_LENGTH};
 use deepmsg_tests::driver::{self, OwnDriver};
@@ -93,6 +93,9 @@ fn a_message_goes_to_the_node_and_comes_back() {
         settings(own.aeron_dir()),
         IdleStrategy::BusySpin,
         scratch.clone(),
+        // The duty cycle on every `receive()`: this test is about the round trip
+        // and not about the poll gate.
+        PollGate::Every,
     )
     .expect("the client connects to the driver");
     // The clock is named because the trait's `init` says nothing about it and
