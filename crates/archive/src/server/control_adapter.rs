@@ -125,6 +125,9 @@ use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
 use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestDecoder};
+use deepmsg_codec::archive::truncate_recording_request_codec::{
+    self, TruncateRecordingRequestDecoder,
+};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
@@ -584,6 +587,20 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onTruncateRecording`, which is
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`).
+    ///
+    /// The one request here that **writes a segment file** as well as deleting
+    /// some: the file the new stop falls inside is cut and left zero beyond it.
+    fn on_truncate_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
         now_ms: i64,
     );
 
@@ -1741,6 +1758,34 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        truncate_recording_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = TruncateRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let position = decoder.position();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_truncate_recording(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    position,
+                    now_ms,
+                );
+            }
+        }
+
         purge_recording_request_codec::SBE_TEMPLATE_ID => {
             let decoder = PurgeRecordingRequestDecoder::default().header(header, 0);
 
@@ -1912,6 +1957,7 @@ mod tests {
     use deepmsg_codec::archive::start_recording_request_codec::{
         SBE_TEMPLATE_ID as START_RECORDING, StartRecordingRequestEncoder,
     };
+    use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
 
     use deepmsg_client::fragment_assembler::MessageHeader;
 
@@ -1977,6 +2023,12 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
+        },
+        TruncateRecording {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            position: i64,
         },
         PurgeRecording {
             session_id: i64,
@@ -2255,6 +2307,23 @@ mod tests {
                 session_id,
                 correlation_id,
                 recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_truncate_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            position: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::TruncateRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
             });
         }
 
@@ -2544,6 +2613,32 @@ mod tests {
                 .control_session_id(control_session_id)
                 .correlation_id(correlation_id)
                 .encoded_credentials(encoded_credentials);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `TruncateRecordingRequest` (template 13).
+    fn truncate_recording(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                TruncateRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .position(position);
             BODY + encoder.encoded_length()
         };
 
@@ -3078,6 +3173,28 @@ mod tests {
                     recording_id: RECORDING_ID,
                 },
             ],
+            control.calls[1..]
+        );
+    }
+
+    /// A truncate reaches the conductor with the position it stops at.
+    #[test]
+    fn a_truncate_reaches_the_session_with_its_position() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = truncate_recording(session_id, 99, RECORDING_ID, 131_072);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::TruncateRecording {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+                position: 131_072,
+            }],
             control.calls[1..]
         );
     }

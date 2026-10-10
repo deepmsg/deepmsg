@@ -88,6 +88,64 @@ pub fn segment_file_name(recording_id: i64, segment_base_position: i64) -> Strin
     format!("{recording_id}-{segment_base_position}{SUFFIX}")
 }
 
+/// Whether the frame header at `segment_offset` in `file` is the one a position
+/// implies (`ReplaySession.notHeaderAligned`, `ReplaySession.java:617-634`, and
+/// the `isInvalidHeader` it calls, `:654-661`).
+///
+/// **Two callers, and they are the reference's two**: a replay checks that a
+/// late-join position points at a frame before it starts reading there
+/// (`:328-336`), and a truncate checks that the position it is about to cut at
+/// is one before it cuts anything (`ArchiveConductor.java:2550-2554`). Same
+/// question, so the same read.
+///
+/// `Ok(false)` is "not the frame this position implies". The reference's name is
+/// the negation of what both callers want, which is why this one is named for
+/// the answer rather than after it.
+///
+/// # Errors
+///
+/// [`io::Error`] when the header cannot be read — a file too short, or one that
+/// is not there.
+pub fn header_matches_position(
+    file: &File,
+    segment_offset: u64,
+    term_offset: i32,
+    term_id: i32,
+    stream_id: i32,
+) -> io::Result<bool> {
+    let mut header = [0_u8; DATA_HEADER_LENGTH];
+    file.read_exact_at(&mut header, segment_offset)?;
+
+    Ok(
+        read_i32(&header, TERM_OFFSET_FIELD_OFFSET) == Some(term_offset)
+            && read_i32(&header, TERM_ID_FIELD_OFFSET) == Some(term_id)
+            && read_i32(&header, STREAM_ID_FIELD_OFFSET) == Some(stream_id),
+    )
+}
+
+/// Cut a segment file at `segment_offset` and leave the rest of it as zeros
+/// (`ArchiveConductor.eraseRemainingSegment`, `:2535-2575`).
+///
+/// **The file keeps its full length.** The reference truncates it to the cut and
+/// then writes a single zero byte at `segment_length - 1` (`:2560-2568`), which
+/// on a file system extends it back out with zeros in between: the tail reads as
+/// empty — no frames, which is what "erased" has to mean to a reader — while the
+/// segment is still the size everything else expects. Truncating and stopping
+/// there would leave a short file, and `attachSegments` refuses one whose length
+/// is not exactly `segmentLength` (`:1591-1596`).
+///
+/// # Errors
+///
+/// [`io::Error`] when the file cannot be opened, cut, or written.
+pub fn erase_tail(path: &Path, segment_offset: u64, segment_length: i32) -> io::Result<()> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+
+    file.set_len(segment_offset)?;
+
+    let last = u64::try_from(segment_length).unwrap_or(1).saturating_sub(1);
+    file.write_all_at(&[0_u8], last)
+}
+
 /// The base position of the segment a stream position falls in.
 ///
 /// `AeronArchive.segmentFileBasePosition` (`:195-203`), and the two masks are
@@ -645,6 +703,82 @@ fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
 mod tests {
     use super::*;
     use crate::mark::tests::TempDir;
+
+    /// Cut a file at `segment_offset` and the tail reads as zeros while the file
+    /// keeps its length (`ArchiveConductor.eraseRemainingSegment`, `:2555-2568`).
+    ///
+    /// **The length is the assertion that matters.** A truncate that stopped at
+    /// the cut would leave a short file, and `attachSegments` refuses one whose
+    /// length is not exactly the segment length (`:1591-1596`) — so a recording
+    /// truncated that way could never be attached back.
+    #[test]
+    fn erasing_a_tail_leaves_a_full_segment_of_zeros_behind_it() {
+        const SEGMENT_LENGTH: i32 = 16 * 1024;
+        const CUT: u64 = 4096;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("7-0.rec");
+        std::fs::write(&path, vec![0xAB_u8; SEGMENT_LENGTH as usize]).expect("the file");
+
+        erase_tail(&path, CUT, SEGMENT_LENGTH).expect("erased");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            SEGMENT_LENGTH as usize,
+            bytes.len(),
+            "still a whole segment"
+        );
+        assert_eq!(
+            vec![0xAB_u8; CUT as usize],
+            bytes[..CUT as usize],
+            "up to the cut"
+        );
+        assert!(
+            bytes[CUT as usize..].iter().all(|byte| 0 == *byte),
+            "and zeros from the cut to the end"
+        );
+    }
+
+    /// The frame-header comparison both a replay and a truncate ask
+    /// (`ReplaySession.isInvalidHeader`, `ReplaySession.java:654-661`).
+    #[test]
+    fn a_header_is_matched_against_the_position_it_should_be_at() {
+        const TERM_ID: i32 = 7;
+        const TERM_OFFSET: i32 = 64;
+        const STREAM_ID: i32 = 33;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("7-0.rec");
+
+        let mut frame = vec![0_u8; DATA_HEADER_LENGTH];
+        frame[TERM_OFFSET_FIELD_OFFSET..TERM_OFFSET_FIELD_OFFSET + 4]
+            .copy_from_slice(&TERM_OFFSET.to_le_bytes());
+        frame[TERM_ID_FIELD_OFFSET..TERM_ID_FIELD_OFFSET + 4]
+            .copy_from_slice(&TERM_ID.to_le_bytes());
+        frame[STREAM_ID_FIELD_OFFSET..STREAM_ID_FIELD_OFFSET + 4]
+            .copy_from_slice(&STREAM_ID.to_le_bytes());
+        std::fs::write(&path, &frame).expect("the file");
+
+        let file = File::open(&path).expect("open");
+
+        let matches = |term_offset, term_id, stream_id| {
+            header_matches_position(&file, 0, term_offset, term_id, stream_id).expect("a header")
+        };
+
+        assert!(matches(TERM_OFFSET, TERM_ID, STREAM_ID));
+        assert!(
+            !matches(TERM_OFFSET, TERM_ID, STREAM_ID + 1),
+            "a stream this recording is not on is not the frame"
+        );
+        assert!(
+            !matches(TERM_OFFSET, TERM_ID + 1, STREAM_ID),
+            "and neither is a term id from another term"
+        );
+        assert!(
+            !matches(TERM_OFFSET + 1, TERM_ID, STREAM_ID),
+            "nor one from another offset in the same term"
+        );
+    }
 
     /// A term of 64 KiB and a segment of four of them, which is the smallest
     /// arrangement where a segment and a term are both visible in the numbers.

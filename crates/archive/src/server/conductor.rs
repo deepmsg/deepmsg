@@ -123,7 +123,10 @@ use deepmsg_core::version::{format_version, semantic_version_major};
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
-use crate::segment::{SegmentSummary, segment_file_base_position};
+use crate::segment::{
+    SegmentSummary, erase_tail, header_matches_position, segment_file_base_position,
+    segment_file_name,
+};
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
 };
@@ -895,6 +898,14 @@ pub enum SegmentRequest {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+    },
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`): move the stop, cut
+    /// the segment the new stop falls in, and delete what is past it.
+    Truncate {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
     },
     /// `ArchiveConductor.purgeRecording` (`:1251-1263`): every file, and the
     /// recording out of the catalog with them.
@@ -1738,6 +1749,61 @@ pub const REPLAY_ALL_AND_FOLLOW: i64 = -1;
 
 /// `AeronArchive.REPLAY_ALL_AND_STOP` (`client/AeronArchive.java:122`).
 pub const REPLAY_ALL_AND_STOP: i64 = -2;
+
+/// Cut the segment a truncate stops inside, and refuse if the stop is not a
+/// frame boundary (`ArchiveConductor.eraseRemainingSegment`, `:2535-2575`).
+///
+/// The check comes **first** and that is the point: cutting a segment at a byte
+/// that is not the start of a frame leaves a file whose tail begins in the
+/// middle of a frame, and the next reader of that recording has no way to tell.
+/// The reference refuses rather than cutting (`:2550-2554`), and the refusal is
+/// this build's one wording that is not the reference's — its message is the
+/// position and the words "position not aligned to a data header", which is what
+/// this says too.
+///
+/// # Errors
+///
+/// The message to answer the client with.
+#[allow(clippy::too_many_arguments)] // the reference's own parameter list
+fn erase_remaining_segment(
+    path: &std::path::Path,
+    position: i64,
+    segment_offset: i64,
+    term_length: i32,
+    initial_term_id: i32,
+    stream_id: i32,
+    segment_length: i32,
+) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+
+    let bits_to_shift = bits_to_shift(term_length).unwrap_or(0);
+    let term_offset = i32::try_from(position & i64::from(term_length - 1)).unwrap_or(-1);
+    let term_id = i32::try_from(position >> bits_to_shift)
+        .unwrap_or(0)
+        .wrapping_add(initial_term_id);
+
+    let aligned = header_matches_position(
+        &file,
+        u64::try_from(segment_offset).unwrap_or(0),
+        term_offset,
+        term_id,
+        stream_id,
+    )
+    .map_err(|error| error.to_string())?;
+
+    if !aligned {
+        return Err(format!("{position} position not aligned to a data header"));
+    }
+
+    drop(file);
+
+    erase_tail(
+        path,
+        u64::try_from(segment_offset).unwrap_or(0),
+        segment_length,
+    )
+    .map_err(|error| error.to_string())
+}
 
 /// What a turn reads about a replay's limit, per replay in flight.
 ///
@@ -3025,17 +3091,25 @@ impl Sessions {
     /// `ArchiveConductor.stopAllReplays` (`:1056-1064`): every replay, or every
     /// replay **of one recording** — `NULL_VALUE` for the id means all of them.
     fn stop_all_replays(&mut self, recording_id: i64, session_id: i64, correlation_id: i64) {
-        for entry in self.replay_sessions.values_mut() {
-            if recording_id == NULL_VALUE || entry.session.recording_id() == recording_id {
-                entry.session.abort();
-            }
-        }
+        self.abort_replays_of(recording_id);
 
         self.pending.push(Deferred::Ok {
             session_id,
             correlation_id,
             relevant_id: 0,
         });
+    }
+
+    /// The **abort** half of `stopAllReplays`, which a truncate needs on its own:
+    /// it is about to delete the very files a replay is reading, and the
+    /// reference aborts them without answering anybody
+    /// (`ArchiveConductor.java:1240`).
+    fn abort_replays_of(&mut self, recording_id: i64) {
+        for entry in self.replay_sessions.values_mut() {
+            if recording_id == NULL_VALUE || entry.session.recording_id() == recording_id {
+                entry.session.abort();
+            }
+        }
     }
 
     /// One of the six segment requests (`ArchiveConductor.java:1199-1660`).
@@ -3076,6 +3150,20 @@ impl Sessions {
                 session_id,
                 correlation_id,
                 recording_id,
+                now_ms,
+            ),
+            SegmentRequest::Truncate {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
+            } => self.truncate_recording(
+                client,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
                 now_ms,
             ),
             SegmentRequest::PurgeRecording {
@@ -3214,6 +3302,173 @@ impl Sessions {
             false,
             now_ms,
         );
+    }
+
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`).
+    ///
+    /// Four steps, and the third is the one that is easy to get wrong:
+    ///
+    /// 1. the **stop moves first** (`:1213`), so that a reader between the two
+    ///    halves sees a recording that ends earlier rather than files it no
+    ///    longer owns;
+    /// 2. the segment file the new stop falls **inside** is cut at the stop and
+    ///    left zero beyond it ([`segment::erase_tail`]) — unless the stop is on
+    ///    a segment boundary, where there is nothing inside to cut and the file
+    ///    is deleted whole instead;
+    /// 3. every segment after that one is deleted;
+    /// 4. and a replay of this recording is aborted before any of it, because
+    ///    what is about to go is what it is reading.
+    ///
+    /// A truncate to the recording's **own start** is the degenerate case the
+    /// reference spells out (`:1215-1218`): there is no segment to keep, so
+    /// every file goes and the recording is left empty — which is what
+    /// `shouldRecordThenReplayThenTruncate` asserts as `start == stop`.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn truncate_recording(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) = self.invalid_truncate(catalog, recording_id, position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let stop_position = recording.stop_position;
+        let start_position = recording.start_position;
+        let segment_length = recording.segment_file_length;
+        let term_length = recording.term_buffer_length;
+
+        let segment_base_position =
+            segment_file_base_position(start_position, position, term_length, segment_length);
+        let segment_offset = position - segment_base_position;
+
+        let _ = catalog.stop_position(recording_id, position);
+
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+
+        if start_position == position {
+            // A truncate to the start keeps no file at all.
+            files = list_segment_files(&self.recording.archive_dir, recording_id);
+        } else {
+            if segment_offset > 0 {
+                // The stop is inside a segment: the reference cuts that one and
+                // only deletes the ones after it (`:1219-1233`).
+                if stop_position != position {
+                    let path = self
+                        .recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, segment_base_position));
+
+                    if let Err(message) = erase_remaining_segment(
+                        &path,
+                        position,
+                        segment_offset,
+                        term_length,
+                        recording.initial_term_id,
+                        recording.stream_id,
+                        segment_length,
+                    ) {
+                        self.refuse_request(session_id, correlation_id, 0, message);
+                        return;
+                    }
+                }
+            } else {
+                // On a boundary: nothing inside the segment to cut, so it goes
+                // with the rest.
+                files.push(
+                    self.recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, segment_base_position)),
+                );
+            }
+
+            let mut base = segment_base_position + i64::from(segment_length);
+
+            while base <= stop_position {
+                files.push(
+                    self.recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, base)),
+                );
+                base += i64::from(segment_length);
+            }
+        }
+
+        // `stopAllReplays(recordingId)` (`:1240`), without an answer: nobody
+        // asked for the stop.
+        self.abort_replays_of(recording_id);
+
+        // `awaitReplaysStop` is **true** here and false in every other caller:
+        // the replays were just aborted and have not yet noticed
+        // (`:1245`).
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            true,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.isValidTruncate` (`:2209-2232`): two refusals.
+    fn invalid_truncate(
+        &self,
+        catalog: &Catalog,
+        recording_id: i64,
+        position: i64,
+    ) -> Option<(i64, String)> {
+        let recording = catalog.recording(recording_id).ok()?;
+        let start_position = recording.start_position;
+        let stop_position = recording.stop_position;
+
+        if stop_position == NULL_VALUE {
+            return Some((
+                ACTIVE_RECORDING,
+                "cannot truncate active recording".to_owned(),
+            ));
+        }
+
+        if position < start_position
+            || position > stop_position
+            || position % i64::from(FRAME_ALIGNMENT) != 0
+        {
+            return Some((
+                INVALID_POSITION,
+                format!(
+                    "invalid position {position}: start={start_position} stop={stop_position} \
+                     alignment={FRAME_ALIGNMENT}"
+                ),
+            ));
+        }
+
+        None
     }
 
     /// `ArchiveConductor.purgeRecording` (`:1251-1263`).
@@ -5807,6 +6062,24 @@ impl ControlPlane for Sessions {
                 session_id,
                 correlation_id,
                 recording_id,
+            },
+        )));
+    }
+
+    fn on_truncate_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::Truncate {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
             },
         )));
     }

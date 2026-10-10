@@ -50,12 +50,12 @@ use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::{FRAME_ALIGNMENT, TERM_MAX_LENGTH};
 use deepmsg_core::logbuffer::frame::{
     DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, SESSION_ID_FIELD_OFFSET, STREAM_ID_FIELD_OFFSET,
-    TERM_ID_FIELD_OFFSET, TERM_OFFSET_FIELD_OFFSET, TYPE_DATA, TYPE_OFFSET, TYPE_PAD,
+    TYPE_DATA, TYPE_OFFSET, TYPE_PAD,
 };
 use deepmsg_core::logbuffer::position::{align_up, bits_to_shift};
 
 use crate::checksum::Checksum;
-use crate::segment::{Placement, SegmentSummary, segment_file_name};
+use crate::segment::{Placement, SegmentSummary, header_matches_position, segment_file_name};
 
 /// `ArchiveException.GENERIC` (`ArchiveException.java:29`).
 pub(crate) const GENERIC: i32 = 0;
@@ -677,27 +677,29 @@ impl ReplaySession {
 
     /// Whether the frame at the replay position is the one that position implies
     /// (`notHeaderAligned`, `:618-634`).
+    ///
+    /// The read and the comparison are [`segment::header_matches_position`]'s,
+    /// because a truncate asks the same question of the same file
+    /// (`ArchiveConductor.java:2550`). What is this method's is the **words** a
+    /// replay refuses in.
     fn check_aligned_to_fragment(&self, publication: &dyn Publication) -> Result<(), String> {
-        let mut header = [0_u8; DATA_HEADER_LENGTH];
         let file = self.file.as_ref().ok_or("no segment file")?;
-
-        file.read_exact_at(&mut header, self.placement.file_offset() as u64)
-            .map_err(|error| error.to_string())?;
-
-        let term_offset = read_i32(&header, TERM_OFFSET_FIELD_OFFSET).unwrap_or(-1);
-        let term_id = read_i32(&header, TERM_ID_FIELD_OFFSET).unwrap_or(-1);
-        let stream_id = read_i32(&header, STREAM_ID_FIELD_OFFSET).unwrap_or(-1);
-
         let expected_term_offset = i32::try_from(self.placement.term_offset).unwrap_or(-1);
         let expected_term_id =
             i32::try_from(self.replay_position >> publication.position_bits_to_shift())
                 .unwrap_or(0)
                 .wrapping_add(publication.initial_term_id());
 
-        if term_offset != expected_term_offset
-            || term_id != expected_term_id
-            || stream_id != self.summary.stream_id
-        {
+        let matches = header_matches_position(
+            file,
+            self.placement.file_offset() as u64,
+            expected_term_offset,
+            expected_term_id,
+            self.summary.stream_id,
+        )
+        .map_err(|error| error.to_string())?;
+
+        if !matches {
             // `raiseError("replayPosition=" + framePosition(0) + " does not
             // point to a valid frame", …)` (`:332-333`), and `framePosition`
             // spells the four numbers it is made of (`:463-471`). A reference
@@ -948,6 +950,7 @@ mod tests {
     use super::*;
     use crate::mark::tests::TempDir;
     use crate::segment::{SegmentSpec, SegmentWriter};
+    use deepmsg_core::logbuffer::frame::{TERM_ID_FIELD_OFFSET, TERM_OFFSET_FIELD_OFFSET};
     use deepmsg_core::logbuffer::position::Position;
 
     const TERM_LENGTH: i32 = 64 * 1024;
