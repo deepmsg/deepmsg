@@ -237,6 +237,17 @@ impl Session {
         self.archive.control_session_id()
     }
 
+    /// The product's archive, for a caller that wants a request this fixture no
+    /// longer builds itself (plan §2.3's third step).
+    ///
+    /// Mutable because every request method on an [`ArchiveClient`] is: each one
+    /// encodes into the proxy's reused buffer and offers it. A test that takes
+    /// this and hands it `&mut client` is borrowing two disjoint fields, which is
+    /// why [`crate::archive::Archive`] keeps them apart.
+    pub const fn archive_mut(&mut self) -> &mut ArchiveClient {
+        &mut self.archive
+    }
+
     /// The next correlation id to build a request with, one per request.
     pub fn next_correlation_id(&mut self) -> i64 {
         let id = self.next_correlation_id;
