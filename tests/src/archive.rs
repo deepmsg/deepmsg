@@ -37,21 +37,54 @@
 //! Aeron: it makes the parameter before it carry the rest of the string as its
 //! value, so the id the chain is built on silently never appears — and the
 //! connect times out with every channel looking right in the log.
+//!
+//! # Two halves, and why they are one module
+//!
+//! The **client** half — [`Session`], [`Response`], the request builders — is
+//! what a test needs to say anything to the archive. The **archive** half —
+//! [`Archive`], [`Recording`], [`Recorded`], [`Replay`] — is a driver, a client
+//! and a control session, and the four things a test does with them: make a
+//! recording, replay it, read the frames, and ask the catalog where it stopped.
+//!
+//! They are here together because the second was extracted from
+//! `tests/integration/archive_replay.rs`, which had all of it inline, at the
+//! point a second scenario file needed it — and because the two halves are
+//! always used together: what makes the archive half worth sharing *is* that
+//! three files now spell the recording the same way.
+//!
+//! What is deliberately **not** here is anything a single scenario is about.
+//! The segment requests are the segments test's, the listings are the queries
+//! test's, and the properties a driver is started with are the calling test's:
+//! this module knows how to run an archive, not what one is being asked.
 
 #![allow(dead_code)] // one test uses what another does not
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::server::conductor::ARCHIVE_ID_DEFAULT;
+use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_archive::server::response_proxy::PROTOCOL_SEMANTIC_VERSION;
 use deepmsg_client::client::Client;
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestEncoder;
+use deepmsg_codec::archive::boolean_type::BooleanType;
+use deepmsg_codec::archive::bounded_replay_request_codec::BoundedReplayRequestEncoder;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::control_response_codec::{self, ControlResponseDecoder};
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
+use deepmsg_codec::archive::recording_signal::RecordingSignal;
+use deepmsg_codec::archive::recording_signal_event_codec::{self, RecordingSignalEventDecoder};
+use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
+use deepmsg_codec::archive::source_location::SourceLocation;
+use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
+use deepmsg_codec::archive::stop_position_request_codec::StopPositionRequestEncoder;
+use deepmsg_codec::archive::stop_recording_subscription_request_codec::StopRecordingSubscriptionRequestEncoder;
 use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::uri::ChannelUri;
+
+use crate::archiving_driver::{self, OwnArchivingMediaDriver};
+use crate::temp::TempDir;
 
 /// The channel the archive's local control subscription listens on —
 /// `LOCAL_CONTROL_CHANNEL_DEFAULT` (`crates/archive/src/server/config.rs`).
@@ -453,5 +486,826 @@ pub fn connect_request(
     };
 
     buffer.truncate(length);
+    buffer
+}
+
+// ---------------------------------------------------------------------------
+// A running archive, and the client that drives it
+// ---------------------------------------------------------------------------
+//
+// Everything below was `tests/integration/archive_replay.rs`'s, and it is here
+// because a second scenario file needs the same door — which is the reason this
+// module gives for itself above, and the reason [`crate::driver`] gives for the
+// driver harness. A test that spells out how to start an archive, make a
+// recording and read a replay will get it wrong in the same way every time, and
+// the three request builders below are the ones two files now share.
+
+/// `ArchiveConductor.ARCHIVE_ID_DEFAULT`: the id every recording-position
+/// counter this archive allocates is keyed by.
+pub const ARCHIVE_ID: i64 = ARCHIVE_ID_DEFAULT;
+
+/// A running archiving media driver, the client connected to it, and the one
+/// control session a test drives it through.
+pub struct Archive {
+    media_driver: OwnArchivingMediaDriver,
+    /// The client every request is published through and every answer read
+    /// through.
+    pub client: Client,
+    /// The control session those requests are addressed to.
+    pub session: Session,
+    /// The driver's own aeron directory, which is where its CnC file is — the
+    /// one a counter is written through.
+    aeron_dir: PathBuf,
+    /// A writable mapping of the counters region, which is how an application
+    /// that owns a counter writes it: the client hands out a reader, because a
+    /// counter is written by whoever asked for it through the address the
+    /// driver gave them (`aeron_counter_set_release`).
+    cnc: deepmsg_cnc::CncFile,
+    /// The archive's own directory, and held rather than merely made: a
+    /// `TempDir` removes its directory when it is dropped, and this is the one
+    /// the archive asks `statvfs` about before every recording
+    /// (`isLowStorageSpace`, `ArchiveConductor.java:2597-2617`) as well as the
+    /// one its segment files are in. A dropped one is a start refused for want
+    /// of room on a filesystem that is not there.
+    archive_dir: TempDir,
+}
+
+impl Archive {
+    /// Start one, or `None` when our archiving media driver is not built.
+    ///
+    /// `connect_correlation_id` is the id the connect is sent with and answered
+    /// by; it is a parameter because every test file picks its own, and the
+    /// properties are a parameter for the reason they exist: they are the
+    /// question the test is asking (segment length, spies, limits).
+    pub fn start(
+        test_name: &str,
+        connect_correlation_id: i64,
+        properties: &[String],
+    ) -> Option<Self> {
+        let archive_dir = TempDir::new(test_name);
+
+        let properties: Vec<&str> = properties.iter().map(String::as_str).collect();
+
+        let Some(mut media_driver) =
+            OwnArchivingMediaDriver::start(test_name, archive_dir.path(), &properties)
+        else {
+            archiving_driver::announce_skip();
+            return None;
+        };
+
+        media_driver
+            .await_ready(DEADLINE)
+            .expect("the archiving media driver must come up and signal its mark file");
+
+        let aeron_dir = media_driver.aeron_dir().to_path_buf();
+        let mut client = Client::connect(&aeron_dir).expect("connect to the driver");
+
+        let session = Session::connect(
+            &mut client,
+            &aeron_dir,
+            connect_correlation_id,
+            Instant::now() + DEADLINE,
+        )
+        .unwrap_or_else(|reason| panic!("{reason};\n{}", media_driver.log_tail(40)));
+
+        let cnc = deepmsg_cnc::CncFile::try_open_writable(&aeron_dir)
+            .expect("the CnC file this test's driver wrote");
+
+        Some(Self {
+            media_driver,
+            client,
+            session,
+            aeron_dir,
+            cnc,
+            archive_dir,
+        })
+    }
+
+    /// Stop the driver, which is also the end of the archive in it.
+    ///
+    /// # Panics
+    ///
+    /// When the process will not take the signal, which is a driver that has
+    /// already gone.
+    pub fn stop(&mut self) -> std::process::ExitStatus {
+        self.media_driver.stop().expect("the driver stops")
+    }
+
+    /// The archive's own directory: where its segment files and its catalog
+    /// file are, which a test that reads a file rather than a field needs.
+    #[must_use]
+    pub fn archive_dir(&self) -> &Path {
+        self.archive_dir.path()
+    }
+
+    /// The segment files this archive holds for `recording_id`, as
+    /// `(base position, path)` pairs in name order.
+    ///
+    /// Read off the **directory**, not off the catalog: the two disagreeing is
+    /// exactly what a truncate's erase and a delete's file removal are about,
+    /// and a test that asked the catalog would be asking the thing under test.
+    #[must_use]
+    pub fn segment_files(&self, recording_id: i64) -> Vec<(i64, PathBuf)> {
+        deepmsg_archive::segment::segment_files(self.archive_dir(), recording_id)
+    }
+
+    /// A counters slot the archive will read as a limit, holding `value`.
+    ///
+    /// # Panics
+    ///
+    /// When the driver will not allocate one, or the region will not take the
+    /// value.
+    pub fn limit_counter(&mut self, type_id: i32, value: i64) -> deepmsg_client::counter::Counter {
+        let counter = self
+            .client
+            .add_counter(
+                type_id,
+                &value.to_be_bytes(),
+                "the archive acceptance tests' limit counter",
+                COMMAND_TIMEOUT,
+            )
+            .expect("the driver must allocate the counter");
+
+        let counters = self.cnc.counters_writable().expect("a writable region");
+        assert!(counter.set_value(&counters, value), "the limit is set");
+
+        counter
+    }
+
+    /// A subscription on `channel`, which a publication — a replay's, or a
+    /// recording's reader — links to.
+    ///
+    /// # Panics
+    ///
+    /// When the driver will not take the subscription.
+    pub fn subscribe(&mut self, channel: &str, stream_id: i32) -> i64 {
+        self.client
+            .add_subscription(channel, stream_id, COMMAND_TIMEOUT)
+            .expect("the driver must accept the subscription")
+    }
+
+    /// Send one request and answer with the response, whatever it says.
+    ///
+    /// This is the door for a request that is **expected to be refused**: the
+    /// refusals are behaviour too, and several of them are reached in no other
+    /// way.
+    ///
+    /// # Panics
+    ///
+    /// When nothing is answered at all, which is a different failure from a
+    /// refusal and printed as one.
+    pub fn ask(&mut self, correlation_id: i64, payload: &[u8]) -> Response {
+        self.session
+            .send(
+                &mut self.client,
+                correlation_id,
+                payload,
+                Instant::now() + DEADLINE,
+            )
+            .unwrap_or_else(|reason| panic!("{reason};\n{}", counters(&self.aeron_dir)))
+    }
+
+    /// Send one request that is answered with an `OK`, and assert that it was.
+    ///
+    /// # Panics
+    ///
+    /// When the answer is anything but `OK`, printing the archive's reason.
+    pub fn ok_answer(&mut self, correlation_id: i64, payload: &[u8]) -> Response {
+        let answer = self.ask(correlation_id, payload);
+
+        assert_eq!(
+            ControlResponseCode::OK,
+            answer.code,
+            "the archive refused: {}",
+            answer.message()
+        );
+
+        answer
+    }
+
+    /// Read a replay until its reader reaches `position`.
+    ///
+    /// # Panics
+    ///
+    /// When it does not get there inside [`DEADLINE`].
+    pub fn read_replay(&mut self, subscription: i64, position: i64) -> Replay {
+        read_replay(&mut self.client, subscription, position)
+    }
+
+    /// Read every data frame the subscription has, appending them to `frames`.
+    pub fn read_frames(&mut self, subscription: i64, frames: &mut Vec<Frame>) {
+        read_frames(&mut self.client, subscription, frames);
+    }
+
+    /// The one recording a test makes: `recording.messages` messages on its
+    /// channel, with a mark at `recording.mark`, stopped.
+    ///
+    /// **Stopped** is what makes it the recording every segment operation needs:
+    /// a truncate and a purge both refuse a recording that is still being
+    /// written (`invalid_truncate`, `invalid_purge`).
+    ///
+    /// # Panics
+    ///
+    /// When the publication will not link, the recording never catches up with
+    /// it, or the archive refuses any of the three requests this makes.
+    pub fn record(&mut self, recording: &Recording) -> Recorded {
+        let publication = self
+            .client
+            .add_exclusive_publication(&recording.channel, recording.stream_id, COMMAND_TIMEOUT)
+            .expect("the driver must accept the publication");
+        let reader = self
+            .client
+            .add_subscription(&recording.channel, recording.stream_id, COMMAND_TIMEOUT)
+            .expect("the driver must accept a reader");
+
+        let publisher_session = self
+            .client
+            .exclusive_publication(publication)
+            .map(|publication| publication.session_id())
+            .expect("the publication has a session");
+
+        // The start (63), whose answer is the **subscription's** registration
+        // id.
+        let correlation_id = self.session.next_correlation_id();
+        let payload = start_recording_request(
+            self.session.control_session_id(),
+            correlation_id,
+            recording.stream_id,
+            &recording.channel,
+        );
+        let subscription_id = self.ok_answer(correlation_id, &payload).relevant_id;
+
+        let (mark, end) = publish(&mut self.client, publication, reader, recording);
+
+        // The recording follows the publication, and this is where the recording
+        // id comes from: nothing else names it until a listing or a stop does.
+        let recording_id = wait_for_the_counter(
+            &mut self.client,
+            publication,
+            reader,
+            publisher_session,
+            &self.aeron_dir,
+        );
+
+        let correlation_id = self.session.next_correlation_id();
+        let payload = stop_recording_request(
+            self.session.control_session_id(),
+            correlation_id,
+            subscription_id,
+        );
+        self.ok_answer(correlation_id, &payload);
+
+        let stop = recorded_stop(&mut self.client, &mut self.session, recording_id);
+
+        assert_eq!(
+            end, stop,
+            "a recording stops where its publication did, which is what makes a mark read off the \
+             publication a position the recording is bounded at"
+        );
+
+        Recorded {
+            recording_id,
+            stop,
+            first: mark,
+        }
+    }
+}
+
+/// What a test asks the archive to record.
+///
+/// The four numbers are per-test because they are what the test is about: a
+/// recording has to span more than one segment before a replay can cross one, a
+/// truncate can cut inside one, or an attach has one to walk back to — and the
+/// mark is the position a bounded replay is stopped at and a truncate cuts.
+pub struct Recording {
+    channel: String,
+    stream_id: i32,
+    messages: usize,
+    message_size: usize,
+    mark: usize,
+}
+
+impl Recording {
+    /// `messages` messages of `message_size` bytes on `channel`, with a mark
+    /// read after the `mark`th.
+    #[must_use]
+    pub fn new(
+        channel: &str,
+        stream_id: i32,
+        messages: usize,
+        message_size: usize,
+        mark: usize,
+    ) -> Self {
+        Self {
+            channel: channel.to_owned(),
+            stream_id,
+            messages,
+            message_size,
+            mark,
+        }
+    }
+
+    /// The message at `index`, as the publication writes it.
+    #[must_use]
+    pub fn message(&self, index: usize) -> Vec<u8> {
+        message(index, self.message_size)
+    }
+}
+
+/// What a recorded run leaves behind.
+pub struct Recorded {
+    /// The recording, as the catalog allocated it.
+    pub recording_id: i64,
+    /// Where the publication stood when the recording was stopped, which is
+    /// where the recording stopped.
+    pub stop: i64,
+    /// Where the recording stood at the mark.
+    ///
+    /// It is read off the **publication**, whose position and the recording's
+    /// are the same number: the archive's spy subscription joins before anything
+    /// is written, so both count from the same place — which [`Archive::record`]
+    /// asserts rather than assumes.
+    pub first: i64,
+}
+
+/// One replayed frame, kept for the assertions.
+pub struct Frame {
+    /// The **frame's** session id, read off its own header.
+    pub session_id: i32,
+    /// The frame's stream id.
+    pub stream_id: i32,
+    /// Its payload.
+    pub payload: Vec<u8>,
+}
+
+/// What a replay left: where it stopped, whose frames it wrote, and the frames.
+pub struct Replay {
+    /// The replay publication's session id, which every frame must carry.
+    pub publication_session_id: i32,
+    /// Where the reader got to.
+    pub position: i64,
+    /// The frames it read.
+    pub frames: Vec<Frame>,
+}
+
+/// Publish every message, answering with the publication's position at the mark
+/// and at the end.
+fn publish(
+    client: &mut Client,
+    publication: i64,
+    reader: i64,
+    recording: &Recording,
+) -> (i64, i64) {
+    let deadline = Instant::now() + DEADLINE;
+    let mut offered = 0;
+    let mut mark = 0;
+
+    while offered < recording.messages {
+        match client.offer_exclusive(publication, &recording.message(offered)) {
+            Some(Appended::Ok { .. }) => {
+                offered += 1;
+                read_whatever_there_is(client, reader);
+
+                // The mark is where the publication stood **after** the message
+                // before it: a frame boundary, with whatever padding the term
+                // before it needed already counted in.
+                if offered == recording.mark {
+                    mark = publication_position(client, publication);
+                }
+            }
+            Some(Appended::NotConnected) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the publication never linked after {offered} messages"
+                );
+            }
+            other => panic!("the message could not be published ({other:?})"),
+        }
+
+        client.poll();
+    }
+
+    (mark, publication_position(client, publication))
+}
+
+/// The `message {index}` bytes, padded to `size`.
+///
+/// A fixed length on purpose: a frame is its payload plus a 32-byte header, so a
+/// fixed payload makes every frame the same size and the marks above land where
+/// the arithmetic says they will.
+#[must_use]
+pub fn message(index: usize, size: usize) -> Vec<u8> {
+    let mut payload = format!("message {index:06}").into_bytes();
+    payload.resize(size, b'.');
+
+    payload
+}
+
+/// Read whatever the reader has, which is what keeps the publisher going: a UDP
+/// publication nobody reads is one the driver stops sending on.
+fn read_whatever_there_is(client: &mut Client, reader: i64) {
+    let Some(image) = image(client, reader) else {
+        return;
+    };
+
+    client.poll_image(reader, image.registration_id, 10, |_| {});
+}
+
+/// Where a publication has got to.
+fn publication_position(client: &Client, publication: i64) -> i64 {
+    client
+        .exclusive_publication(publication)
+        .and_then(|publication| publication.position())
+        .expect("the publication is still held")
+}
+
+/// Wait for the recording's position counter to catch up with the publication,
+/// answering with the recording id it names
+/// (`aeron_archive_test.cpp:267-286`).
+fn wait_for_the_counter(
+    client: &mut Client,
+    publication: i64,
+    reader: i64,
+    session_id: i32,
+    aeron_dir: &Path,
+) -> i64 {
+    let deadline = Instant::now() + DEADLINE;
+    let position = publication_position(client, publication);
+
+    while Instant::now() < deadline {
+        if let Some((recording_id, value)) = recording_counter(client, session_id) {
+            if value >= position {
+                return recording_id;
+            }
+        }
+
+        client.poll();
+        read_whatever_there_is(client, reader);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    panic!(
+        "the recording never caught up to {position};\n{}",
+        counters(aeron_dir)
+    );
+}
+
+/// The recording's position counter — its recording id and value — if the driver
+/// has one for this session.
+fn recording_counter(client: &Client, session_id: i32) -> Option<(i64, i64)> {
+    let counters = client.counters_reader()?;
+    let counter_id = find_counter_id_by_session(&counters, session_id, ARCHIVE_ID)?;
+    let recording_id = parse_key(&counters.key(counter_id)?)?.recording_id;
+
+    Some((recording_id, counters.value(counter_id)?))
+}
+
+/// Where a recording stopped (15), waiting for the catalog to say it did.
+///
+/// # Panics
+///
+/// When the archive refuses the request, or the row never gets a stop position.
+fn recorded_stop(client: &mut Client, session: &mut Session, recording_id: i64) -> i64 {
+    let deadline = Instant::now() + DEADLINE;
+
+    while Instant::now() < deadline {
+        let correlation_id = session.next_correlation_id();
+        let control_session_id = session.control_session_id();
+
+        let mut buffer = vec![0u8; 64];
+        let length = {
+            let body = message_header_codec::ENCODED_LENGTH;
+            let encoder =
+                StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+
+            body + encoder.encoded_length()
+        };
+        buffer.truncate(length);
+
+        let answer = session
+            .send(client, correlation_id, &buffer, Instant::now() + DEADLINE)
+            .expect("the archive answers a stop position");
+        assert_eq!(
+            ControlResponseCode::OK,
+            answer.code,
+            "the archive refused: {}",
+            answer.message()
+        );
+
+        if answer.relevant_id >= 0 {
+            return answer.relevant_id;
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    panic!("the recording's catalog row never got a stop position");
+}
+
+/// What an image says about itself, copied out of the client so it can be polled
+/// again.
+pub struct Image {
+    /// The client's handle for it.
+    pub registration_id: i64,
+    /// The publication behind it.
+    pub session_id: i32,
+    /// Where the reader has got to, padding included.
+    pub position: i64,
+}
+
+/// The image a subscription holds, if there is one yet.
+#[must_use]
+pub fn image(client: &Client, subscription: i64) -> Option<Image> {
+    let image = client.subscription(subscription)?.images().first()?;
+
+    Some(Image {
+        registration_id: image.registration_id(),
+        session_id: image.session_id(),
+        position: image.position(),
+    })
+}
+
+/// Read a replay until its reader reaches `position`, answering with every data
+/// frame it carried on the way.
+///
+/// The position is the image's own, which is where the *reader* has got to —
+/// padding included, since the reader steps over it. That is what makes "it
+/// reached the recording's stop position" a claim about the padding too.
+fn read_replay(client: &mut Client, subscription: i64, position: i64) -> Replay {
+    let deadline = Instant::now() + DEADLINE;
+    let mut frames = Vec::new();
+    let mut publication_session_id = None;
+    let mut reached_from = None;
+
+    loop {
+        // The image is announced on the CnC broadcast, so it is a poll that
+        // makes it exist — and the publication behind it is made several turns
+        // after the OK, because the OK does not wait for it
+        // (`ReplaySession.java:338`).
+        client.poll();
+
+        if let Some(current) = image(client, subscription) {
+            publication_session_id.get_or_insert(current.session_id);
+            read_frames(client, subscription, &mut frames);
+
+            // Read again: the poll above may have taken the image away as well
+            // as moved it, and what the reader got to is the last thing it was
+            // seen at.
+            if let Some(current) = image(client, subscription) {
+                reached_from = Some(current.position);
+
+                if current.position >= position {
+                    return Replay {
+                        publication_session_id: publication_session_id
+                            .expect("an image was seen before this could be returned"),
+                        position: current.position,
+                        frames,
+                    };
+                }
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the replay never reached {position}; it is at {reached_from:?} with {} frames",
+            frames.len()
+        );
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Read every data frame the subscription has, appending them to `frames`.
+fn read_frames(client: &mut Client, subscription: i64, frames: &mut Vec<Frame>) {
+    let Some(current) = image(client, subscription) else {
+        return;
+    };
+
+    client.poll_image(subscription, current.registration_id, 10, |fragment| {
+        // A replay hands over whole frames — it writes blocks of them, not
+        // messages split across frames — so a fragment that is not whole is a
+        // different claim about how the frames were written, and not this one.
+        assert!(
+            fragment.is_unfragmented(),
+            "a replayed frame is a whole frame"
+        );
+
+        let mut payload = vec![0u8; fragment.payload_length()];
+        assert!(
+            fragment.copy_payload(&mut payload).is_some(),
+            "the frame fits"
+        );
+
+        frames.push(Frame {
+            session_id: fragment.session_id().expect("a frame has a header"),
+            stream_id: fragment.stream_id().expect("a frame has a header"),
+            payload,
+        });
+    });
+}
+
+/// One `RecordingSignalEvent` (24), which is how a client learns that a delete
+/// is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signal {
+    /// The session it was sent on.
+    pub control_session_id: i64,
+    /// The request it answers.
+    pub correlation_id: i64,
+    /// The recording it is about.
+    pub recording_id: i64,
+    /// `START`, `STOP`, `DELETE` and the rest.
+    pub signal: RecordingSignal,
+}
+
+/// Decode one `RecordingSignalEvent`, or `None` if the bytes are not one.
+#[must_use]
+pub fn decode_signal(payload: &[u8]) -> Option<Signal> {
+    let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+
+    if header.template_id() != recording_signal_event_codec::SBE_TEMPLATE_ID {
+        return None;
+    }
+
+    let decoder = RecordingSignalEventDecoder::default().header(header, 0);
+    let control_session_id = decoder.control_session_id();
+
+    Some(Signal {
+        control_session_id,
+        correlation_id: decoder.correlation_id(),
+        recording_id: decoder.recording_id(),
+        signal: decoder.signal(),
+    })
+}
+
+/// Poll the client until the signal for `correlation_id` arrives.
+///
+/// A delete's signal is sent when the work is **over**, several turns after the
+/// OK that answered the request (`DeleteSegmentsSession.java:76-80`), so this is
+/// a wait and not a read. Signals for other requests are read past.
+///
+/// # Errors
+///
+/// See [`await_frame`].
+pub fn await_signal(
+    client: &mut Client,
+    subscription: i64,
+    correlation_id: i64,
+    deadline: Instant,
+) -> Result<Signal, String> {
+    await_frame(client, subscription, deadline, |payload| {
+        decode_signal(payload).filter(|signal| signal.correlation_id == correlation_id)
+    })
+}
+
+/// A `StartRecordingRequest2` (63) for the channel a test records.
+#[must_use]
+pub fn start_recording_request(
+    control_session_id: i64,
+    correlation_id: i64,
+    stream_id: i32,
+    channel: &str,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 256];
+
+    let length = {
+        let body = message_header_codec::ENCODED_LENGTH;
+        let encoder =
+            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
+        let mut header = encoder.header(0);
+        let mut encoder = header.parent().unwrap();
+
+        encoder
+            .control_session_id(control_session_id)
+            .correlation_id(correlation_id)
+            .stream_id(stream_id)
+            .source_location(SourceLocation::LOCAL)
+            .auto_stop(BooleanType::FALSE)
+            .channel(channel.as_bytes());
+
+        body + encoder.encoded_length()
+    };
+
+    buffer.truncate(length);
+    buffer
+}
+
+/// A `StopRecordingSubscriptionRequest` (14) for one subscription.
+#[must_use]
+pub fn stop_recording_request(
+    control_session_id: i64,
+    correlation_id: i64,
+    subscription_id: i64,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 64];
+
+    let length = {
+        let body = message_header_codec::ENCODED_LENGTH;
+        let encoder = StopRecordingSubscriptionRequestEncoder::default()
+            .wrap(WriteBuf::new(&mut buffer), body);
+        let mut header = encoder.header(0);
+        let mut encoder = header.parent().unwrap();
+
+        encoder
+            .control_session_id(control_session_id)
+            .correlation_id(correlation_id)
+            .subscription_id(subscription_id);
+
+        body + encoder.encoded_length()
+    };
+
+    buffer.truncate(length);
+    buffer
+}
+
+/// A `ReplayRequest` (6).
+#[allow(clippy::too_many_arguments)] // one per field the request carries
+#[must_use]
+pub fn replay_request(
+    control_session_id: i64,
+    correlation_id: i64,
+    recording_id: i64,
+    position: i64,
+    length: i64,
+    file_io_max_length: i32,
+    replay_stream_id: i32,
+    replay_channel: &str,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 512];
+
+    let written = {
+        let body = message_header_codec::ENCODED_LENGTH;
+        let encoder = ReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
+        let mut header = encoder.header(0);
+        let mut encoder = header.parent().unwrap();
+
+        encoder
+            .control_session_id(control_session_id)
+            .correlation_id(correlation_id)
+            .recording_id(recording_id)
+            .position(position)
+            .length(length)
+            .replay_stream_id(replay_stream_id)
+            .file_io_max_length(file_io_max_length)
+            // `Aeron.NULL_VALUE`: this replay is asked for on the session's own
+            // image, so it carries no token — and the two are told apart by
+            // exactly this comparison, which is why the guard on the field
+            // matters.
+            .replay_token(-1)
+            .replay_channel(replay_channel.as_bytes());
+
+        body + encoder.encoded_length()
+    };
+
+    buffer.truncate(written);
+    buffer
+}
+
+/// A `BoundedReplayRequest` (18): the same request with the counter that bounds
+/// it.
+#[allow(clippy::too_many_arguments)] // one per field the request carries
+#[must_use]
+pub fn bounded_replay_request(
+    control_session_id: i64,
+    correlation_id: i64,
+    recording_id: i64,
+    position: i64,
+    length: i64,
+    file_io_max_length: i32,
+    limit_counter_id: i32,
+    replay_stream_id: i32,
+    replay_channel: &str,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 512];
+
+    let written = {
+        let body = message_header_codec::ENCODED_LENGTH;
+        let encoder = BoundedReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
+        let mut header = encoder.header(0);
+        let mut encoder = header.parent().unwrap();
+
+        encoder
+            .control_session_id(control_session_id)
+            .correlation_id(correlation_id)
+            .recording_id(recording_id)
+            .position(position)
+            .length(length)
+            .limit_counter_id(limit_counter_id)
+            .replay_stream_id(replay_stream_id)
+            .file_io_max_length(file_io_max_length)
+            .replay_token(-1)
+            .replay_channel(replay_channel.as_bytes());
+
+        body + encoder.encoded_length()
+    };
+
+    buffer.truncate(written);
     buffer
 }
