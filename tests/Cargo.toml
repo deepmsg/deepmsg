@@ -232,6 +232,15 @@ path = "integration/archive_replay.rs"
 name = "archive_queries"
 path = "integration/archive_queries.rs"
 
+# P2-S5's acceptance, and the same criterion again: the segment operations, on
+# the four things the C suite cannot see — the bytes a truncate leaves in the
+# segment file it cut, a delete that has to wait for a replay, a replay refused
+# while a delete is in flight, and a delete that finishes one something else
+# half-rolled. Needs our own archiving media driver binary, so it runs in CI.
+[[test]]
+name = "archive_segments"
+path = "integration/archive_segments.rs"
+
 # Our client's REJECT_IMAGE against the reference driver: whether the record
 # this build writes is one the reference reads, and whether its
 # ON_PUBLICATION_ERROR is one this build reads. Needs the reference checkout.

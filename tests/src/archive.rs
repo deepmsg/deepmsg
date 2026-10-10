@@ -361,7 +361,7 @@ pub fn await_frame<T>(
             let mut buffer = vec![0u8; 4096];
 
             client.poll_image(subscription, image, 10, |fragment| {
-                if answer.is_some() || !fragment.is_unfragmented() {
+                if !fragment.is_unfragmented() {
                     return;
                 }
 
@@ -372,7 +372,22 @@ pub fn await_frame<T>(
                     "the frame fits"
                 );
                 frames += 1;
-                answer = read(&buffer);
+
+                // **Every** fragment is handed to `read`, including the ones
+                // after the answer — and the answer is kept, not overwritten.
+                //
+                // A fragment arrives in a poll of up to ten, so "the answer and
+                // the frame behind it" is one call and not two, and what is
+                // behind an answer is not always nothing: a recording signal
+                // shares this channel with the answers, and a delete's is sent a
+                // turn or two after the OK that started the delete
+                // (`DeleteSegmentsSession.java:76-80`). A reader that stopped at
+                // the answer would be handed the OK and never the signal.
+                let found = read(&buffer);
+
+                if answer.is_none() {
+                    answer = found;
+                }
             });
         }
 
@@ -428,6 +443,31 @@ pub fn counters(aeron_dir: &Path) -> String {
     });
 
     out
+}
+
+/// The value of the first counter whose label starts with `prefix`, or `None`
+/// when the client holds no such counter.
+///
+/// The labels are the reference's own (`Archive`'s `AeronCounters`), which is
+/// what a reader of the counters region — `AeronStat`, or anybody's dashboard —
+/// finds them by, so a test that reads one is reading what that reader reads.
+///
+/// # Panics
+///
+/// When the client does not hold a counters region at all, which is a driver
+/// that did not come up rather than a counter that is not there.
+#[must_use]
+pub fn counter_by_label(client: &Client, prefix: &str) -> Option<i64> {
+    let counters = client.counters_reader().expect("a counters region");
+    let mut found = None;
+
+    counters.for_each(|descriptor| {
+        if descriptor.label.starts_with(prefix) {
+            found = counters.value(descriptor.counter_id);
+        }
+    });
+
+    found
 }
 
 /// Decode one `ControlResponse`, or `None` if the bytes are not one.
@@ -516,6 +556,23 @@ pub struct Archive {
     /// The driver's own aeron directory, which is where its CnC file is — the
     /// one a counter is written through.
     aeron_dir: PathBuf,
+    /// Every recording signal read on the way to an answer.
+    ///
+    /// A signal arrives on the same channel as the answers and is **not** the
+    /// answer to anything the client is waiting for, so a reader that keeps only
+    /// what it asked for loses it — and it is not sent again. A real client has
+    /// the same problem and the same answer: `AeronArchive` polls this channel on
+    /// a thread of its own and hands signals to a listener as they go past.
+    signals: Vec<Signal>,
+    /// Every answer read on the way to **another** answer.
+    ///
+    /// The same reason as [`Archive::signals`], one level up. This channel
+    /// carries the answers of every request on the session, so two requests in
+    /// flight — which is what a test of a refusal needs, because the state the
+    /// refusal is about is made by the first — would otherwise have the first
+    /// one's wait eat the second one's answer. Both are answered in one turn, so
+    /// both frames are in one poll, and the second is the one behind the first.
+    answers: Vec<Response>,
     /// A writable mapping of the counters region, which is how an application
     /// that owns a counter writes it: the client hands out a reader, because a
     /// counter is written by whoever asked for it through the address the
@@ -576,6 +633,8 @@ impl Archive {
             client,
             session,
             aeron_dir,
+            signals: Vec::new(),
+            answers: Vec::new(),
             cnc,
             archive_dir,
         })
@@ -589,6 +648,15 @@ impl Archive {
     /// already gone.
     pub fn stop(&mut self) -> std::process::ExitStatus {
         self.media_driver.stop().expect("the driver stops")
+    }
+
+    /// The tail of the archiving media driver's output.
+    ///
+    /// What an archive that will not do something says about why is here and
+    /// nowhere else: the requests it refuses are answered, and the ones it does
+    /// not get to are not.
+    pub fn log_tail(&mut self, lines: usize) -> String {
+        self.media_driver.log_tail(lines)
     }
 
     /// The archive's own directory: where its segment files and its catalog
@@ -656,13 +724,123 @@ impl Archive {
     /// refusal and printed as one.
     pub fn ask(&mut self, correlation_id: i64, payload: &[u8]) -> Response {
         self.session
-            .send(
-                &mut self.client,
-                correlation_id,
-                payload,
-                Instant::now() + DEADLINE,
-            )
-            .unwrap_or_else(|reason| panic!("{reason};\n{}", counters(&self.aeron_dir)))
+            .send_only(&mut self.client, payload, Instant::now() + DEADLINE)
+            .unwrap_or_else(|reason| panic!("{reason};\n{}", counters(&self.aeron_dir)));
+
+        self.await_answer(correlation_id)
+    }
+
+    /// Wait for the answer to a request already sent with
+    /// [`Session::send_only`], whatever it says.
+    ///
+    /// This is the other half of [`Archive::ask`], and the reason it is a method
+    /// of its own is a test that wants **two requests in flight before either is
+    /// answered**: the archive handles both in the turn it reads them, in the
+    /// order they were published, and what one of them does is what the other
+    /// then sees.
+    ///
+    /// **Every recording signal read on the way is kept** ([`Archive::signals`]),
+    /// and that is not tidiness. The response channel carries answers and signals
+    /// interleaved, and a signal is a frame the reader *reads past* — so waiting
+    /// for an answer throws away every signal that arrived before it. A delete
+    /// answers its request before it has deleted anything and signals when the
+    /// work is over (`DeleteSegmentsSession.java:76-80`), which puts the two
+    /// frames a turn or two apart: the ordinary case, not a race.
+    ///
+    /// # Panics
+    ///
+    /// When nothing is answered at all — see [`Archive::ask`].
+    pub fn await_answer(&mut self, correlation_id: i64) -> Response {
+        if let Some(index) = self.answer_index(correlation_id) {
+            return self.answers.remove(index);
+        }
+
+        let subscription = self.session.response_subscription();
+        let mut signals = Vec::new();
+        let mut answers = Vec::new();
+
+        let found = await_frame(
+            &mut self.client,
+            subscription,
+            Instant::now() + DEADLINE,
+            |payload| {
+                if let Some(signal) = decode_signal(payload) {
+                    signals.push(signal);
+                }
+
+                let response = decode(payload)?;
+                let wanted = response.correlation_id == correlation_id;
+
+                if !wanted {
+                    answers.push(response.clone());
+                }
+
+                wanted.then_some(response)
+            },
+        );
+
+        self.signals.append(&mut signals);
+        self.answers.append(&mut answers);
+
+        found.unwrap_or_else(|reason| panic!("{reason};\n{}", counters(&self.aeron_dir)))
+    }
+
+    /// Where the answer to `correlation_id` is in the buffer, if it is there.
+    fn answer_index(&self, correlation_id: i64) -> Option<usize> {
+        self.answers
+            .iter()
+            .position(|answer| answer.correlation_id == correlation_id)
+    }
+
+    /// Wait for a recording signal, answering with it.
+    ///
+    /// The buffer is checked first, because the signal is very often already
+    /// there: it is sent turns after the answer that told the client the work had
+    /// started, and reading that answer is what read past it
+    /// ([`Archive::await_answer`]).
+    ///
+    /// # Panics
+    ///
+    /// When it does not arrive inside [`DEADLINE`].
+    pub fn await_signal(&mut self, correlation_id: i64) -> Signal {
+        if let Some(index) = self.signal_index(correlation_id) {
+            return self.signals.remove(index);
+        }
+
+        let subscription = self.session.response_subscription();
+        let mut seen = Vec::new();
+
+        let _ = await_frame(
+            &mut self.client,
+            subscription,
+            Instant::now() + DEADLINE,
+            |payload| {
+                let signal = decode_signal(payload)?;
+                let wanted = signal.correlation_id == correlation_id;
+                seen.push(signal);
+
+                wanted.then_some(())
+            },
+        );
+
+        self.signals.append(&mut seen);
+
+        let Some(index) = self.signal_index(correlation_id) else {
+            panic!(
+                "no signal for correlation id {correlation_id} arrived;\n{}\n--- archive ---\n{}",
+                counters(&self.aeron_dir),
+                self.media_driver.log_tail(40)
+            );
+        };
+
+        self.signals.remove(index)
+    }
+
+    /// Where a signal for `correlation_id` is in the buffer, if it is there.
+    fn signal_index(&self, correlation_id: i64) -> Option<usize> {
+        self.signals
+            .iter()
+            .position(|signal| signal.correlation_id == correlation_id)
     }
 
     /// Send one request that is answered with an `OK`, and assert that it was.
@@ -690,6 +868,41 @@ impl Archive {
     /// When it does not get there inside [`DEADLINE`].
     pub fn read_replay(&mut self, subscription: i64, position: i64) -> Replay {
         read_replay(&mut self.client, subscription, position)
+    }
+
+    /// Where a recording stops `(15)`, waiting for the catalog to say it does.
+    ///
+    /// The **catalog's** answer, which is the half a truncate moves first: a
+    /// test that read the position off the files would be asking what the erase
+    /// did rather than what the archive now says about the recording.
+    ///
+    /// # Panics
+    ///
+    /// When the archive refuses the request, or the row never has a stop.
+    pub fn stop_position(&mut self, recording_id: i64) -> i64 {
+        let deadline = Instant::now() + DEADLINE;
+
+        loop {
+            let correlation_id = self.session.next_correlation_id();
+            let payload = stop_position_request(
+                self.session.control_session_id(),
+                correlation_id,
+                recording_id,
+            );
+            let answer = self.ok_answer(correlation_id, &payload);
+
+            if answer.relevant_id >= 0 {
+                return answer.relevant_id;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "the recording's catalog row never got a stop position;\n{}",
+                counters(&self.aeron_dir)
+            );
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Read every data frame the subscription has, appending them to `frames`.
@@ -755,7 +968,7 @@ impl Archive {
         );
         self.ok_answer(correlation_id, &payload);
 
-        let stop = recorded_stop(&mut self.client, &mut self.session, recording_id);
+        let stop = self.stop_position(recording_id);
 
         assert_eq!(
             end, stop,
@@ -864,7 +1077,6 @@ fn publish(
         match client.offer_exclusive(publication, &recording.message(offered)) {
             Some(Appended::Ok { .. }) => {
                 offered += 1;
-                read_whatever_there_is(client, reader);
 
                 // The mark is where the publication stood **after** the message
                 // before it: a frame boundary, with whatever padding the term
@@ -873,16 +1085,27 @@ fn publish(
                     mark = publication_position(client, publication);
                 }
             }
-            Some(Appended::NotConnected) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the publication never linked after {offered} messages"
-                );
-            }
+            // Three answers mean *not now* rather than a failure, and a term
+            // short enough to hold a few messages makes two of them ordinary: a
+            // frame that did not fit the rest of the term (`EndOfLog`, which is
+            // the rotation the log has already begun), a window used up because
+            // a reader has not caught up (`BackPressured`), and no reader at all
+            // yet (`NotConnected`). A publisher waits on all three.
+            Some(Appended::EndOfLog | Appended::BackPressured | Appended::NotConnected) => {}
             other => panic!("the message could not be published ({other:?})"),
         }
 
+        // Every turn, whether or not the offer landed: the reader is what lets
+        // the publication rotate, so a publisher that only read on success would
+        // wait forever on the frame that filled the term.
         client.poll();
+        read_whatever_there_is(client, reader);
+
+        assert!(
+            Instant::now() < deadline,
+            "the publication never took message {offered} of {}",
+            recording.messages
+        );
     }
 
     (mark, publication_position(client, publication))
@@ -960,53 +1183,30 @@ fn recording_counter(client: &Client, session_id: i32) -> Option<(i64, i64)> {
     Some((recording_id, counters.value(counter_id)?))
 }
 
-/// Where a recording stopped (15), waiting for the catalog to say it did.
-///
-/// # Panics
-///
-/// When the archive refuses the request, or the row never gets a stop position.
-fn recorded_stop(client: &mut Client, session: &mut Session, recording_id: i64) -> i64 {
-    let deadline = Instant::now() + DEADLINE;
+/// A `StopPositionRequest` (15).
+fn stop_position_request(
+    control_session_id: i64,
+    correlation_id: i64,
+    recording_id: i64,
+) -> Vec<u8> {
+    let mut buffer = vec![0u8; 64];
 
-    while Instant::now() < deadline {
-        let correlation_id = session.next_correlation_id();
-        let control_session_id = session.control_session_id();
+    let length = {
+        let body = message_header_codec::ENCODED_LENGTH;
+        let encoder = StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
+        let mut header = encoder.header(0);
+        let mut encoder = header.parent().unwrap();
 
-        let mut buffer = vec![0u8; 64];
-        let length = {
-            let body = message_header_codec::ENCODED_LENGTH;
-            let encoder =
-                StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-            let mut header = encoder.header(0);
-            let mut encoder = header.parent().unwrap();
+        encoder
+            .control_session_id(control_session_id)
+            .correlation_id(correlation_id)
+            .recording_id(recording_id);
 
-            encoder
-                .control_session_id(control_session_id)
-                .correlation_id(correlation_id)
-                .recording_id(recording_id);
+        body + encoder.encoded_length()
+    };
 
-            body + encoder.encoded_length()
-        };
-        buffer.truncate(length);
-
-        let answer = session
-            .send(client, correlation_id, &buffer, Instant::now() + DEADLINE)
-            .expect("the archive answers a stop position");
-        assert_eq!(
-            ControlResponseCode::OK,
-            answer.code,
-            "the archive refused: {}",
-            answer.message()
-        );
-
-        if answer.relevant_id >= 0 {
-            return answer.relevant_id;
-        }
-
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    panic!("the recording's catalog row never got a stop position");
+    buffer.truncate(length);
+    buffer
 }
 
 /// What an image says about itself, copied out of the client so it can be polled
@@ -1142,26 +1342,6 @@ pub fn decode_signal(payload: &[u8]) -> Option<Signal> {
         correlation_id: decoder.correlation_id(),
         recording_id: decoder.recording_id(),
         signal: decoder.signal(),
-    })
-}
-
-/// Poll the client until the signal for `correlation_id` arrives.
-///
-/// A delete's signal is sent when the work is **over**, several turns after the
-/// OK that answered the request (`DeleteSegmentsSession.java:76-80`), so this is
-/// a wait and not a read. Signals for other requests are read past.
-///
-/// # Errors
-///
-/// See [`await_frame`].
-pub fn await_signal(
-    client: &mut Client,
-    subscription: i64,
-    correlation_id: i64,
-    deadline: Instant,
-) -> Result<Signal, String> {
-    await_frame(client, subscription, deadline, |payload| {
-        decode_signal(payload).filter(|signal| signal.correlation_id == correlation_id)
     })
 }
 

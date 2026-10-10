@@ -269,21 +269,9 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     );
 
     // The replayer's counters, which the archive allocates at startup and the
-    // replay has just moved (`AeronCounters`: 108, 109, 110, 112). The labels
-    // are the reference's own, and they are what a reader of the counters
-    // region — `AeronStat`, or anybody's dashboard — finds them by.
-    let counters = archive.client.counters_reader().expect("a counters region");
-    let by_label = |prefix: &str| {
-        let mut found = None;
-
-        counters.for_each(|descriptor| {
-            if descriptor.label.starts_with(prefix) {
-                found = counters.value(descriptor.counter_id);
-            }
-        });
-
-        found
-    };
+    // replay has just moved (`AeronCounters`: 108, 109, 110, 112), read by the
+    // label a reader of the counters region finds them by.
+    let by_label = |prefix: &str| archive::counter_by_label(&archive.client, prefix);
 
     assert_eq!(
         Some(0),
