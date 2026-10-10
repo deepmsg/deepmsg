@@ -348,6 +348,22 @@ pub struct ExclusivePublication {
     /// concession to sharing.
     term_id: std::cell::Cell<i32>,
     term_offset: std::cell::Cell<i32>,
+    /// Which of the log's three terms this producer is in — the reference's
+    /// `active_partition_index` (`aeron_exclusive_publication.h:62`), kept on the
+    /// object and moved only by a rotation.
+    ///
+    /// It is a cache of the log's answer to a question the log is the authority
+    /// on, so the question is still asked — [`ExclusivePublication::seed_from_log`]
+    /// reads the log's `active_term_count`, and that runs when the log rotates
+    /// under this producer. What caching buys is that it is asked once per
+    /// rotation instead of once per append.
+    ///
+    /// A stale partition cannot be written through: every path that appends asks
+    /// [`Appender::try_claim_exclusive`]'s own first question (`term_is_current`)
+    /// before it touches the term, and that is exactly the question "has this
+    /// cache missed a rotation". The one read-only use, `max_payload_length`,
+    /// does not depend on the partition at all.
+    partition: std::cell::Cell<usize>,
     /// As [`Publication::revoke_on_close`], which is the whole of what the two
     /// kinds share about endings: the flag is not a property of having one
     /// producer.
@@ -379,6 +395,9 @@ impl ExclusivePublication {
             log: LogBuffer::open(path, true)?,
             term_id: std::cell::Cell::new(0),
             term_offset: std::cell::Cell::new(0),
+            // Whatever is here is overwritten by the seed below, which is the
+            // read of the log that answers the question properly.
+            partition: std::cell::Cell::new(0),
             revoke_on_close: false,
         };
 
@@ -596,27 +615,11 @@ impl ExclusivePublication {
         // call and the appender's view does not. The reference has two here as
         // well: its claim returns a pointer into a term it has already moved
         // the tail of.
-        let Some(partition) = self.term_partition() else {
-            return Err(Appended::Malformed);
-        };
-
-        let Some(term) = self.log.term_mut(partition) else {
+        let Some(term) = self.log.term_mut(self.partition.get()) else {
             return Err(Appended::Malformed);
         };
 
         Ok(Claim { term, offset })
-    }
-
-    /// The partition `active_term_count` names.
-    fn term_partition(&self) -> Option<usize> {
-        let metadata = self.log.file().region_mut(
-            self.log.geometry().metadata_offset,
-            descriptor::METADATA_LENGTH,
-        )?;
-
-        metadata
-            .load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET)
-            .map(position::index_by_term_count)
     }
 
     /// Append a padding frame of `length` **payload** bytes.
@@ -724,6 +727,16 @@ impl ExclusivePublication {
     /// The raw offset, not the saturating one: a tail that has run to the end
     /// of a term says so, and zero and `term_length` are different answers.
     fn seed_from_log(&self) {
+        // The log's answer, taken before anything reads the partition this
+        // publication has cached: `active_term_count` is what says which term is
+        // the current one, and after a rotation the count and a tail can
+        // disagree for a moment — the count is the one that is right.
+        let Some(partition) = self.log.active_term_partition() else {
+            return;
+        };
+
+        self.partition.set(partition);
+
         let Some(appender) = self.appender() else {
             return;
         };
@@ -739,16 +752,25 @@ impl ExclusivePublication {
     }
 
     /// A fresh appender over the current term, as [`Publication`] builds one
-    /// and for the same reason.
+    /// and for the same reason — **except** for where the partition comes from.
+    ///
+    /// [`Publication`] re-reads the log's `active_term_count` on every call
+    /// because a shared publication is not the log's only writer and cannot
+    /// assume its cache is still current. An exclusive one *is* the only writer,
+    /// which is the whole of what "exclusive" means, so the reference keeps
+    /// `active_partition_index` on the object and hands it to the appender —
+    /// `TermAppender.claim` is given `termBuffers[activePartitionIndex]` and the
+    /// tail offset that goes with it, with nothing left to ask the log. This is
+    /// that, and the log is asked again only in
+    /// [`ExclusivePublication::seed_from_log`], which is where a rotation is
+    /// noticed.
     fn appender(&self) -> Option<Appender<'_>> {
         let metadata = self.log.file().region_mut(
             self.log.geometry().metadata_offset,
             descriptor::METADATA_LENGTH,
         )?;
 
-        let term_count = metadata.load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET)?;
-        let partition = position::index_by_term_count(term_count);
-        let term = self.log.term_mut(partition)?;
+        let term = self.log.term_mut(self.partition.get())?;
 
         Appender::new(metadata, term)
     }
