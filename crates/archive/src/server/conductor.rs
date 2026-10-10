@@ -123,7 +123,7 @@ use deepmsg_core::version::{format_version, semantic_version_major};
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
-use crate::segment::SegmentSummary;
+use crate::segment::{SegmentSummary, segment_file_base_position};
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
 };
@@ -142,6 +142,10 @@ use crate::server::counters::{
 };
 use crate::server::create_replay_publication::{
     CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
+};
+use crate::server::delete_segments::{
+    DeleteSegmentsSession, Progress as DeleteProgress, find_detached_segments, list_segment_files,
+    min_segment_position,
 };
 use crate::server::recorder::Recorder;
 use crate::server::recording_pos::RecordingPos;
@@ -853,6 +857,38 @@ enum Action {
     /// `ArchiveConductor.stopAllReplays` (`:1056-1064`): every replay, or every
     /// replay **of one recording** — `NULL_VALUE` for the id means all of them.
     StopAllReplays {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// One of the requests that move or remove a recording's **segments** — see
+    /// [`SegmentRequest`] for why they are one variant rather than seven.
+    Segment(SegmentRequest),
+}
+
+/// The requests that move a recording's **start** or remove the files below it
+/// (`ArchiveConductor.java` `detachSegments`, `deleteDetachedSegments`,
+/// `purgeSegments`, `attachSegments`, `truncateRecording` and
+/// `purgeRecording`).
+///
+/// Six requests, one variant. The reference has six methods and six decode
+/// arms, and they differ in what they carry and in what they do — but what they
+/// are *to the conductor* is one family: each one is a change to where a
+/// recording begins or ends and to which files it still owns, taken in a turn
+/// of its own. That is the argument [`Query`] was collapsed under, and it
+/// applies here for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentRequest {
+    /// `ArchiveConductor.detachSegments` (`:1495-1507`), which is one write and
+    /// an answer.
+    Detach {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    },
+    /// `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
+    DeleteDetached {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
@@ -1614,6 +1650,15 @@ pub struct Sessions {
     /// `replaySessionByIdMap` (`:146`): the replays in flight, by the id the
     /// client's OK carried.
     replay_sessions: HashMap<i64, ReplayEntry>,
+    /// `deleteSegmentsSessionByIdMap` (`:147`): the deletes in flight, by the
+    /// recording they are removing.
+    ///
+    /// Keyed by the **recording** rather than by a session id the reference
+    /// mints from it: `DeleteSegmentsSession.sessionId()` *is* the recording id
+    /// (`DeleteSegmentsSession.java:103-106`), and the only two questions asked
+    /// of the map are "is there one for this recording" (`:1962-1972`) and "how
+    /// far does its delete reach" (`:880-886`).
+    delete_sessions: Vec<DeleteSegmentsSession>,
     /// Publications being made, before there is a session to put one in. The
     /// reference keeps these in the same session array as everything else
     /// (`addSession`, `:921`); here they are their own list, and a failure in
@@ -2025,6 +2070,7 @@ impl Sessions {
             next_replay_id: 1,
             num_active_replays: 0,
             replay_sessions: HashMap::new(),
+            delete_sessions: Vec::new(),
             creating_replays: Vec::new(),
             replayer: Replayer::new(archive_id),
             replay_tokens: HashMap::new(),
@@ -2106,6 +2152,7 @@ impl Sessions {
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
         self.drive_replays(client, counters, catalog, now_ms);
+        self.drive_delete_segments(client, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
@@ -2650,7 +2697,7 @@ impl Sessions {
             Some(limit_counter_id) => match resolve_limit_counter(counters, limit_counter_id) {
                 Some(limit) => Some(limit),
                 None => {
-                    self.refuse_replay(
+                    self.refuse_request(
                         session_id,
                         correlation_id,
                         0,
@@ -2666,7 +2713,7 @@ impl Sessions {
         };
 
         let Ok(recording) = catalog.recording(request.recording_id) else {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 UNKNOWN_RECORDING,
@@ -2691,7 +2738,7 @@ impl Sessions {
             if let Some((relevant_id, message)) =
                 invalid_replay_position(request.recording_id, request.position, &recording)
             {
-                self.refuse_replay(session_id, correlation_id, relevant_id, message);
+                self.refuse_request(session_id, correlation_id, relevant_id, message);
                 return;
             }
 
@@ -2701,7 +2748,7 @@ impl Sessions {
         // `:816-819`: the block a replay reads at a time has to be able to hold
         // one of this recording's frames.
         if request.file_io_max_length > 0 && request.file_io_max_length < recording.mtu_length {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2722,7 +2769,7 @@ impl Sessions {
         let mtu_length = usize::try_from(recording.mtu_length).unwrap_or(0);
 
         if archive_buffer < mtu_length {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2758,7 +2805,7 @@ impl Sessions {
         let (stop_position, max_length) = match limit_position {
             Some(limit) => {
                 if replay_position > limit {
-                    self.refuse_replay(
+                    self.refuse_request(
                         session_id,
                         correlation_id,
                         INVALID_POSITION,
@@ -2775,6 +2822,33 @@ impl Sessions {
                 (stop, stop - replay_position)
             }
         };
+
+        // `:880-886`: a delete of this recording that has not finished refuses
+        // a replay that would read past where it reaches. The comparison is
+        // between two segment positions and the recording's own stop, and both
+        // halves matter — a replay that stops at or before the stop of a
+        // **stopped** recording is reading files no delete is holding.
+        if let Some(session) = self
+            .delete_sessions
+            .iter()
+            .find(|session| session.recording_id() == request.recording_id)
+        {
+            if session.max_delete_position() > recording.stop_position
+                && stop_position > recording.stop_position
+            {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!(
+                        "cannot start replay of recording {} due to an outstanding delete \
+                         operation",
+                        request.recording_id
+                    ),
+                );
+                return;
+            }
+        }
 
         // The three branches (`:851-869`), and both sentinels are the client's
         // own. A recording that has not stopped has `NULL_VALUE` for its stop,
@@ -2797,7 +2871,7 @@ impl Sessions {
                 // takes the first match, and the error is first — and no C case
                 // asserts the count, so this is a missing `return` upstream
                 // rather than a behaviour. This build refuses and stops.
-                self.refuse_replay(
+                self.refuse_request(
                     session_id,
                     correlation_id,
                     EMPTY_RECORDING,
@@ -2816,7 +2890,7 @@ impl Sessions {
         };
 
         if replay_length < 0 {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2840,7 +2914,7 @@ impl Sessions {
         ) {
             Ok(channel) => channel,
             Err(error) => {
-                self.refuse_replay(
+                self.refuse_request(
                     session_id,
                     correlation_id,
                     0,
@@ -2944,6 +3018,408 @@ impl Sessions {
             correlation_id,
             relevant_id: 0,
         });
+    }
+
+    /// One of the six segment requests (`ArchiveConductor.java:1199-1660`).
+    ///
+    /// The reference has six methods reached from six decode arms; this is the
+    /// one place they are told apart, and each of them is then the same shape:
+    /// refuse, or build a file list and hand it to the delete session.
+    fn run_segment_request(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        request: SegmentRequest,
+        now_ms: i64,
+    ) {
+        match request {
+            SegmentRequest::Detach {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            } => self.detach_segments(
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            ),
+            SegmentRequest::DeleteDetached {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.delete_detached_segments(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                now_ms,
+            ),
+        }
+    }
+
+    /// `ArchiveConductor.detachSegments` (`:1495-1507`).
+    ///
+    /// **One write and an answer.** The files below the new start are not
+    /// touched: what makes them *detached* is that the recording no longer
+    /// claims them, and they go when something asks for them to go
+    /// ([`SegmentRequest::DeleteDetached`]) or when a purge takes them with the
+    /// start move.
+    fn detach_segments<Access>(
+        &mut self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) =
+            self.invalid_detach(counters, catalog, recording_id, new_start_position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if let Err(error) = catalog.start_position(recording_id, new_start_position) {
+            self.warnings
+                .push(format!("could not move a recording's start: {error}"));
+            return;
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: 0,
+        });
+    }
+
+    /// `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
+    ///
+    /// The files it removes are the ones **below** the recording's start, and
+    /// the walk down stops at the lowest segment base position in the
+    /// directory — which is why the directory is listed first, for a number
+    /// rather than for the files.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn delete_detached_segments(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let files = list_segment_files(&self.recording.archive_dir, recording_id);
+        let detached = match (
+            min_segment_position(&files),
+            catalog.recording(recording_id),
+        ) {
+            (Some(oldest), Ok(recording)) => find_detached_segments(
+                &self.recording.archive_dir,
+                recording_id,
+                recording.start_position,
+                oldest,
+                recording.term_buffer_length,
+                recording.segment_file_length,
+            ),
+            _ => Vec::new(),
+        };
+
+        // `awaitReplaysStop` is **false**: a detach moved nothing, so no replay
+        // is reading anything that is about to go (`:1532`).
+        let _ = (counters, now_ms);
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            detached,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.isValidDetach` (`:2290-2325`): three refusals, and the
+    /// third one is a bound that moves — a recording still being written is
+    /// bounded by where it has got to, and a replay in flight bounds it too.
+    ///
+    /// Returns the code and the message, or `None` when the position is one
+    /// this recording can be detached at. All three carry `GENERIC`: the
+    /// reference's `sendErrorResponse(correlationId, msg)` there is the overload
+    /// that names no code (`:2304`, `:2311`, `:2318`).
+    fn invalid_detach<Access>(
+        &self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &Catalog,
+        recording_id: i64,
+        position: i64,
+    ) -> Option<(i64, String)> {
+        let recording = catalog.recording(recording_id).ok()?;
+        let term_length = recording.term_buffer_length;
+        let segment_length = recording.segment_file_length;
+        let start_position = recording.start_position;
+
+        let lower_bound =
+            segment_file_base_position(start_position, start_position, term_length, segment_length)
+                + i64::from(segment_length);
+
+        if position
+            != segment_file_base_position(start_position, position, term_length, segment_length)
+        {
+            return Some((
+                0,
+                format!("invalid segment start: newStartPosition={position}"),
+            ));
+        }
+
+        if position < lower_bound {
+            return Some((
+                0,
+                format!("invalid detach: newStartPosition={position} lowerBound={lower_bound}"),
+            ));
+        }
+
+        // The upper bound: where a recording that is still being written has got
+        // to, or the stop position of one that is not.
+        let end_position = self
+            .live_recording_position(counters, recording_id, start_position)
+            .unwrap_or(recording.stop_position);
+        let end_position =
+            segment_file_base_position(start_position, end_position, term_length, segment_length);
+
+        if position > end_position {
+            return Some((
+                0,
+                format!(
+                    "invalid detach: in use, newStartPosition={position} upperBound={end_position}"
+                ),
+            ));
+        }
+
+        // And a replay that is reading the very files the detach would give
+        // away (`:2322-2332`).
+        let replay_base = self
+            .replay_sessions
+            .values()
+            .filter(|entry| entry.session.recording_id() == recording_id)
+            .map(|entry| {
+                segment_file_base_position(
+                    start_position,
+                    entry.session.replay_position(),
+                    term_length,
+                    segment_length,
+                )
+            })
+            .min();
+
+        if let Some(replay_base) = replay_base {
+            if replay_base < position {
+                return Some((
+                    0,
+                    format!(
+                        "invalid detach: replay in progress, newStartPosition={position}                          replayPosition={replay_base}"
+                    ),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// `isDeleteAllowed` (`:1962-1972`): one delete per recording at a time.
+    fn is_delete_allowed(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> bool {
+        if self
+            .delete_sessions
+            .iter()
+            .any(|session| session.recording_id() == recording_id)
+        {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                0,
+                format!("another delete operation in progress for recording id: {recording_id}"),
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// `ArchiveConductor.deleteSegments` (`:2619-2634`): the answer, and the
+    /// session that does the work.
+    ///
+    /// The `Ok` goes out **before** anything is deleted and carries the number
+    /// of files as its relevant id — that is the count the C suite asserts. And
+    /// an **empty** list sends the DELETE signal itself, because then there is
+    /// no session whose `close` would send it.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn delete_segments(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        files: Vec<std::path::PathBuf>,
+        await_replays_stop: bool,
+        now_ms: i64,
+    ) {
+        let count = i64::try_from(files.len()).unwrap_or(i64::MAX);
+
+        if !files.is_empty() {
+            self.delete_sessions.push(DeleteSegmentsSession::new(
+                recording_id,
+                session_id,
+                correlation_id,
+                files,
+                await_replays_stop,
+            ));
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: count,
+        });
+
+        if 0 == count {
+            self.send_signal(
+                client,
+                session_id,
+                correlation_id,
+                recording_id,
+                RecordingSignal::DELETE,
+                now_ms,
+            );
+        }
+    }
+
+    /// `ControlSession.sendSignal` (`ControlSession.java:735-750`), with the two
+    /// fields a delete has no values for.
+    ///
+    /// Not deferred: the two callers are the conductor's own turn
+    /// ([`Sessions::drive_delete_segments`]) and an action, and both hold the
+    /// client.
+    fn send_signal(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        signal: RecordingSignal,
+        now_ms: i64,
+    ) {
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry.control.send_signal(
+                correlation_id,
+                recording_id,
+                NULL_VALUE,
+                NULL_VALUE,
+                signal,
+                now_ms,
+                client,
+            );
+        }
+    }
+
+    /// One turn of every delete in flight (`SessionWorker.doWork`,
+    /// `SessionWorker.java:56-81`).
+    ///
+    /// A session that is **done** is closed here, and its `close` is what sends
+    /// the DELETE recording signal (`DeleteSegmentsSession.java:76-80`) — which
+    /// is why the signal arrives turns after the OK that answered the request,
+    /// and why the C suite polls for it rather than reading it.
+    fn drive_delete_segments(&mut self, client: &mut Client, now_ms: i64) {
+        if self.delete_sessions.is_empty() {
+            return;
+        }
+
+        // Which recordings still have a replay reading them. Read out before the
+        // sessions are walked for the same reason `drive_replay_sessions` reads
+        // its limits first: the answer is the conductor's, and a session is
+        // borrowed for the walk.
+        let busy: Vec<i64> = self
+            .replay_sessions
+            .values()
+            .map(|entry| entry.session.recording_id())
+            .collect();
+
+        let mut finished: Vec<i64> = Vec::new();
+
+        for session in &mut self.delete_sessions {
+            let in_progress = busy.contains(&session.recording_id());
+
+            match session.do_work(in_progress) {
+                DeleteProgress::Failed(message) => {
+                    self.pending.push(Deferred::Error {
+                        session_id: session.session_id(),
+                        correlation_id: session.correlation_id(),
+                        relevant_id: 0,
+                        message,
+                    });
+                }
+                DeleteProgress::Finished => finished.push(session.recording_id()),
+                DeleteProgress::AwaitingReplays
+                | DeleteProgress::StoppedWaiting
+                | DeleteProgress::Deleted => {}
+            }
+        }
+
+        for recording_id in finished {
+            let Some(index) = self
+                .delete_sessions
+                .iter()
+                .position(|session| session.recording_id() == recording_id)
+            else {
+                continue;
+            };
+
+            let session = self.delete_sessions.remove(index);
+
+            self.send_signal(
+                client,
+                session.session_id(),
+                session.correlation_id(),
+                recording_id,
+                RecordingSignal::DELETE,
+                now_ms,
+            );
+        }
     }
 
     /// `ArchiveConductor.onReplayEnd` (`:936-939`).
@@ -3086,7 +3562,7 @@ impl Sessions {
                             // publication: give it back to the driver and say so.
                             creating.close(client);
                             self.on_replay_end();
-                            self.refuse_replay(
+                            self.refuse_request(
                                 control_session_id,
                                 replay.correlation_id,
                                 UNKNOWN_RECORDING,
@@ -3101,7 +3577,7 @@ impl Sessions {
                     // existed, so nothing else will count it down.
                     creating.close(client);
                     self.on_replay_end();
-                    self.refuse_replay(
+                    self.refuse_request(
                         creating.replay().control_session_id,
                         creating.replay().correlation_id,
                         i64::from(code),
@@ -3331,7 +3807,7 @@ impl Sessions {
 
     /// One `ERROR` a replay owes, pushed rather than sent for the reason every
     /// other callback answer is.
-    fn refuse_replay(
+    fn refuse_request(
         &mut self,
         session_id: i64,
         correlation_id: i64,
@@ -3351,7 +3827,7 @@ impl Sessions {
         &mut self,
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
-        catalog: &Catalog,
+        catalog: &mut Catalog,
         action: Action,
         recorder: &mut Recorder,
         now_ms: i64,
@@ -3411,6 +3887,9 @@ impl Sessions {
                 recording_id,
                 now_ms,
             ),
+            Action::Segment(request) => {
+                self.run_segment_request(client, counters, catalog, request, now_ms);
+            }
         }
     }
 
@@ -4667,7 +5146,7 @@ impl Sessions {
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
-        catalog: &Catalog,
+        catalog: &mut Catalog,
         recorder: &mut Recorder,
         now_ms: i64,
     ) {
@@ -5077,6 +5556,39 @@ impl ControlPlane for Sessions {
             correlation_id,
             relevant_id: replay_token,
         });
+    }
+
+    fn on_detach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::Segment(SegmentRequest::Detach {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            })));
+    }
+
+    fn on_delete_detached_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::DeleteDetached {
+                session_id,
+                correlation_id,
+                recording_id,
+            },
+        )));
     }
 
     fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {

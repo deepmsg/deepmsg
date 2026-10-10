@@ -64,6 +64,16 @@ pub enum Progress {
 pub struct DeleteSegmentsSession {
     /// The recording whose files these are.
     recording_id: i64,
+    /// The control session that asked, which is what the DELETE signal is sent
+    /// on.
+    ///
+    /// The reference's session holds the `ControlSession` **object** and calls
+    /// `sendSignal` on it (`DeleteSegmentsSession.java:76-80`). Here the sessions
+    /// live with the conductor, so what this keeps is the id — the same
+    /// "conversation" half [`ReplayEntry`] keeps and for the same reason.
+    ///
+    /// [`ReplayEntry`]: crate::server::conductor
+    session_id: i64,
     /// The request being answered, which the signal echoes.
     correlation_id: i64,
     /// The highest segment base position the files name
@@ -86,12 +96,14 @@ impl DeleteSegmentsSession {
     #[must_use]
     pub fn new(
         recording_id: i64,
+        session_id: i64,
         correlation_id: i64,
         files: Vec<PathBuf>,
         await_replays_stop: bool,
     ) -> Self {
         Self {
             recording_id,
+            session_id,
             correlation_id,
             max_delete_position: max_segment_position(&files, recording_id).unwrap_or(i64::MIN),
             files: files.into(),
@@ -103,6 +115,12 @@ impl DeleteSegmentsSession {
     #[must_use]
     pub const fn recording_id(&self) -> i64 {
         self.recording_id
+    }
+
+    /// The control session the DELETE signal is sent on.
+    #[must_use]
+    pub const fn session_id(&self) -> i64 {
+        self.session_id
     }
 
     /// The request the DELETE signal will echo.
@@ -303,6 +321,21 @@ fn segment_position_of(path: &Path) -> Option<i64> {
     name[dash + 1..dot].parse().ok()
 }
 
+/// The **lowest** base position in a list of file names, or `None` for an empty
+/// one.
+///
+/// `deleteDetachedSegments` reads it off the directory before it works out what
+/// is detached (`ArchiveConductor.java:1515-1527`): the walk downwards has to
+/// stop somewhere, and where it stops is the oldest file this recording still
+/// has.
+#[must_use]
+pub fn min_segment_position(files: &[PathBuf]) -> Option<i64> {
+    files
+        .iter()
+        .filter_map(|path| segment_position_of(path))
+        .min()
+}
+
 /// The highest base position in a list of file names, or `None` for an empty
 /// one.
 fn max_segment_position(files: &[PathBuf], recording_id: i64) -> Option<i64> {
@@ -351,6 +384,7 @@ mod tests {
         let dir = with_files(&["7-0.rec", "7-131072.rec", "7-262144.rec.del"]);
         let session = DeleteSegmentsSession::new(
             RECORDING_ID,
+            5,
             99,
             files(&dir, &["7-0.rec", "7-131072.rec", "7-262144.rec.del"]),
             false,
@@ -359,6 +393,7 @@ mod tests {
         assert_eq!(262_144, session.max_delete_position());
         assert_eq!(RECORDING_ID, session.recording_id());
         assert_eq!(99, session.correlation_id());
+        assert_eq!(5, session.session_id());
     }
 
     /// One file a turn, and the session is over when the list is.
@@ -367,6 +402,7 @@ mod tests {
         let dir = with_files(&["7-0.rec", "7-131072.rec"]);
         let mut session = DeleteSegmentsSession::new(
             RECORDING_ID,
+            5,
             99,
             files(&dir, &["7-0.rec", "7-131072.rec"]),
             false,
@@ -390,7 +426,7 @@ mod tests {
     fn waiting_for_replays_comes_first() {
         let dir = with_files(&["7-0.rec"]);
         let mut session =
-            DeleteSegmentsSession::new(RECORDING_ID, 99, files(&dir, &["7-0.rec"]), true);
+            DeleteSegmentsSession::new(RECORDING_ID, 5, 99, files(&dir, &["7-0.rec"]), true);
 
         assert_eq!(Progress::AwaitingReplays, session.do_work(true));
         assert!(dir.path().join("7-0.rec").exists(), "nothing went");
