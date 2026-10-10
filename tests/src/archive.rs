@@ -264,20 +264,34 @@ impl Session {
         payload: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        // A publication that has not linked yet answers `NotConnected`, and the
-        // archive's control subscription is a link like any other. The reference
-        // client retries here for the same reason.
+        // **Three answers mean *not now*, and they are the same three the
+        // fixture's own publisher waits on** (see `offer_recorded_message`) and
+        // the same ones the reference client retries: a publication that has not
+        // linked yet answers `NotConnected`, one whose window the driver has not
+        // advertised yet answers `BackPressured`, and one whose term just ran out
+        // answers `EndOfLog`.
+        //
+        // **`BackPressured` used to be fatal here, and it cost a red CI run.**
+        // The connect request is offered the moment the publication is made, and
+        // a cold runner has not had the window advertised by then — so the very
+        // first offer answered `BackPressured` and a fixture that treated it as
+        // final failed instantly rather than waiting a millisecond. It is the
+        // same shape of race the proxy fixture met in P2-C1's third commit, where
+        // the rule was recorded as "a publication must be `is_connected` before
+        // it is used"; waiting is the other way to keep it.
         let mut attempts = 0;
 
         loop {
             match client.offer_exclusive(self.request_publication, payload) {
                 Some(Appended::Ok { .. }) => return Ok(()),
-                Some(Appended::NotConnected) => {
+                Some(
+                    retry @ (Appended::NotConnected | Appended::BackPressured | Appended::EndOfLog),
+                ) => {
                     attempts += 1;
                     if Instant::now() >= deadline {
                         return Err(format!(
-                            "the request publication never linked to the archive's control \
-                             subscription after {attempts} attempts"
+                            "the request would not go out in {attempts} attempts, the last \
+                             answer {retry:?}"
                         ));
                     }
                     client.poll();
