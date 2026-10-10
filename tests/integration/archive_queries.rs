@@ -465,16 +465,11 @@ fn record(session: &mut Session, client: &mut Client, channel: &str, expected: u
     let correlation_id = session.next_correlation_id();
     let payload = start_recording_request(control_session_id, correlation_id, channel);
 
-    let answer = session
+    // A refusal is the error now, and it carries the archive's own text — the
+    // `expect` message says the same thing the assertion below it used to.
+    session
         .send(client, correlation_id, &payload, Instant::now() + DEADLINE)
         .expect("the archive answers a start");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the recording of {channel}: {}",
-        answer.message()
-    );
 
     publish_and_read(client, publication, reader);
 

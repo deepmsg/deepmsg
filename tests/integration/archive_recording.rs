@@ -46,7 +46,6 @@ use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, NULL_POSITION};
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_client::client::Client;
 use deepmsg_codec::archive::boolean_type::BooleanType;
-use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::list_recording_request_codec::ListRecordingRequestEncoder;
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_descriptor_codec::{self, RecordingDescriptorDecoder};
@@ -142,7 +141,11 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
     let correlation_id = session.next_correlation_id();
     let payload = start_recording_request(session.control_session_id(), correlation_id);
 
-    let answer = session
+    // The answer *is* the `relevantId` now, and a refusal is an error carrying
+    // the archive's own text — so the assertion that it was an `OK` and the
+    // assertion that the id is a registration id are one statement and one
+    // `expect`.
+    let subscription_id = session
         .send(
             &mut client,
             correlation_id,
@@ -151,19 +154,10 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
         )
         .expect("the archive answers a start");
 
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the recording: {}",
-        answer.message()
-    );
     assert!(
-        answer.relevant_id > 0,
-        "the answer carries the subscription's registration id, which is {}",
-        answer.relevant_id
+        subscription_id > 0,
+        "the answer carries the subscription's registration id, which is {subscription_id}"
     );
-
-    let subscription_id = answer.relevant_id;
 
     // Publish, and read it back so the driver's window keeps moving.
     let position = publish_and_read(&mut client, publication, reader);
@@ -194,7 +188,7 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
         subscription_id,
     );
 
-    let answer = session
+    session
         .send(
             &mut client,
             correlation_id,
@@ -202,13 +196,6 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
             Instant::now() + DEADLINE,
         )
         .expect("the archive answers a stop");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the stop: {}",
-        answer.message()
-    );
 
     let stopped = wait_for_stop_position(&mut session, &mut client, recording_id);
     assert_eq!(
@@ -368,7 +355,7 @@ fn recording_position(session: &mut Session, client: &mut Client, recording_id: 
     };
     buffer.truncate(length);
 
-    ok_answer(session, client, correlation_id, &buffer).relevant_id
+    ok_answer(session, client, correlation_id, &buffer)
 }
 
 /// Ask where a recording stopped (15), which is `-1` while it has not.
@@ -392,7 +379,7 @@ fn stop_position(session: &mut Session, client: &mut Client, recording_id: i64) 
     };
     buffer.truncate(length);
 
-    ok_answer(session, client, correlation_id, &buffer).relevant_id
+    ok_answer(session, client, correlation_id, &buffer)
 }
 
 /// Wait until the catalog says the recording stopped, answering with where.
@@ -412,25 +399,20 @@ fn wait_for_stop_position(session: &mut Session, client: &mut Client, recording_
     panic!("the recording's catalog row never got a stop position");
 }
 
-/// Send one request that is answered with an `OK`, and assert that it was.
+/// Send one request that is answered with an `OK`, and answer its `relevantId`.
+///
+/// A refusal is the error now rather than a `code` on a returned value, so
+/// "answered with an `OK`" and "the call came back" are the same statement — the
+/// `expect` is the assertion.
 fn ok_answer(
     session: &mut Session,
     client: &mut Client,
     correlation_id: i64,
     payload: &[u8],
-) -> archive::Response {
-    let answer = session
+) -> i64 {
+    session
         .send(client, correlation_id, payload, Instant::now() + DEADLINE)
-        .expect("the archive answers");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused: {}",
-        answer.message()
-    );
-
-    answer
+        .expect("the archive answers")
 }
 
 /// One recording descriptor, as a listing session sends it.

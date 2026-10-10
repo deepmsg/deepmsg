@@ -42,7 +42,7 @@ pub mod poller;
 pub mod proxy;
 pub mod subscription_descriptor_poller;
 
-pub use archive::{Archive, ArchiveError, archive_to_client_error_code};
+pub use archive::{Archive, ArchiveError, Handlers, archive_to_client_error_code};
 pub use async_connect::{
     AsyncConnect, ConnectError, ConnectState, Connected, Credentials, NoCredentials, Polled,
 };
