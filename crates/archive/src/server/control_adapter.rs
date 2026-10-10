@@ -74,11 +74,16 @@ use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{FragmentAssembler, Message};
 use deepmsg_client::image::Fragment;
 use deepmsg_codec::archive::archive_id_request_codec::ArchiveIdRequestDecoder;
+use deepmsg_codec::archive::attach_segments_request_codec::{self, AttachSegmentsRequestDecoder};
 use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestDecoder;
 use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::bounded_replay_request_codec::{self, BoundedReplayRequestDecoder};
 use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseDecoder;
 use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestDecoder;
+use deepmsg_codec::archive::delete_detached_segments_request_codec::{
+    self, DeleteDetachedSegmentsRequestDecoder,
+};
+use deepmsg_codec::archive::detach_segments_request_codec::{self, DetachSegmentsRequestDecoder};
 use deepmsg_codec::archive::extend_recording_request_2_codec::{
     self, ExtendRecordingRequest2Decoder,
 };
@@ -98,6 +103,8 @@ use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
+use deepmsg_codec::archive::purge_recording_request_codec::{self, PurgeRecordingRequestDecoder};
+use deepmsg_codec::archive::purge_segments_request_codec::{self, PurgeSegmentsRequestDecoder};
 use deepmsg_codec::archive::recording_position_request_codec::{
     self, RecordingPositionRequestDecoder,
 };
@@ -119,6 +126,10 @@ use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
 use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestDecoder};
+use deepmsg_codec::archive::truncate_recording_request_codec::{
+    self, TruncateRecordingRequestDecoder,
+};
+use deepmsg_codec::archive::update_channel_request_codec::{self, UpdateChannelRequestDecoder};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
@@ -549,6 +560,105 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onDetachSegments` (`ControlSession.java:437-444`), which is
+    /// `ArchiveConductor.detachSegments` (`:1495-1507`).
+    ///
+    /// The only one of this family that is **not** deferred behind a session:
+    /// it moves the recording's start and answers, and the files it left behind
+    /// stay where they are until something deletes them.
+    #[allow(clippy::too_many_arguments)] // the gate's, plus what the request carried
+    fn on_detach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onDeleteDetachedSegments` (`ControlSession.java:446-453`),
+    /// which is `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
+    ///
+    /// Deferred for the reason every delete is: what it removes is files, and
+    /// the answer to a client is what a session several turns long is for.
+    fn on_delete_detached_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onUpdateChannel` (`ControlSession.java:531-539`), which
+    /// is `ArchiveConductor.updateChannel` (`:708-735`).
+    ///
+    /// The channel travels as a `varAscii`, so this is one of the two requests
+    /// whose payload is more than its fields.
+    fn on_update_channel(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onAttachSegments`, which is
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`).
+    ///
+    /// The reverse of a detach: it moves the recording's start **back** over
+    /// the segments that are still there, and answers with how many it took.
+    fn on_attach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onTruncateRecording`, which is
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`).
+    ///
+    /// The one request here that **writes a segment file** as well as deleting
+    /// some: the file the new stop falls inside is cut and left zero beyond it.
+    fn on_truncate_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onPurgeRecording` (`ControlSession.java:481-488` in the
+    /// reference's own numbering; the method is
+    /// `ArchiveConductor.purgeRecording`, `:1251-1263`).
+    ///
+    /// The one request here that takes the recording **out of the catalog** as
+    /// well as off the disk: the row's state goes `DELETED` and the index drops
+    /// it, so a listing after a purge finds nothing.
+    fn on_purge_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onPurgeSegments`, which is
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`).
+    ///
+    /// A detach and a delete in one request: move the start, then remove what
+    /// the old start was still claiming.
+    fn on_purge_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
         now_ms: i64,
     );
 
@@ -1619,6 +1729,191 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // The two that move a recording's **start** (`ControlSessionAdapter.java`
+        // `DetachSegmentsRequestDecoder` / `DeleteDetachedSegmentsRequestDecoder`,
+        // `:1408-1446`). A detach is one catalog write and answers immediately;
+        // deleting what it detached is files, and files are a session.
+        detach_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = DetachSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let new_start_position = decoder.new_start_position();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_detach_segments(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    new_start_position,
+                    now_ms,
+                );
+            }
+        }
+
+        delete_detached_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = DeleteDetachedSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_delete_detached_segments(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    now_ms,
+                );
+            }
+        }
+
+        update_channel_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = UpdateChannelRequestDecoder::default().header(header, 0);
+            let coordinates = decoder.channel_decoder();
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let channel = String::from_utf8_lossy(decoder.channel_slice(coordinates)).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_update_channel(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    &channel,
+                    now_ms,
+                );
+            }
+        }
+
+        attach_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = AttachSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_attach_segments(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
+        truncate_recording_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = TruncateRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let position = decoder.position();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_truncate_recording(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    position,
+                    now_ms,
+                );
+            }
+        }
+
+        purge_recording_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = PurgeRecordingRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_purge_recording(session_id, correlation_id, recording_id, now_ms);
+            }
+        }
+
+        purge_segments_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = PurgeSegmentsRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let new_start_position = decoder.new_start_position();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_purge_segments(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    new_start_position,
+                    now_ms,
+                );
+            }
+        }
+
         // Everything else is a request this slice does not answer yet: the
         // recording, replay, listing and replication families arrive with the
         // slices that can carry them out. The reference's switch has no default
@@ -1728,15 +2023,22 @@ mod tests {
     use crate::server::auth::{AllowAll, DenyAll};
 
     use deepmsg_codec::archive::WriteBuf;
+    use deepmsg_codec::archive::attach_segments_request_codec::AttachSegmentsRequestEncoder;
     use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestEncoder;
     use deepmsg_codec::archive::challenge_response_codec::ChallengeResponseEncoder;
     use deepmsg_codec::archive::close_session_request_codec::CloseSessionRequestEncoder;
+    use deepmsg_codec::archive::delete_detached_segments_request_codec::DeleteDetachedSegmentsRequestEncoder;
+    use deepmsg_codec::archive::detach_segments_request_codec::DetachSegmentsRequestEncoder;
     use deepmsg_codec::archive::keep_alive_request_codec::KeepAliveRequestEncoder;
+    use deepmsg_codec::archive::purge_recording_request_codec::PurgeRecordingRequestEncoder;
+    use deepmsg_codec::archive::purge_segments_request_codec::PurgeSegmentsRequestEncoder;
     use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
     use deepmsg_codec::archive::replay_token_request_codec::ReplayTokenRequestEncoder;
     use deepmsg_codec::archive::start_recording_request_codec::{
         SBE_TEMPLATE_ID as START_RECORDING, StartRecordingRequestEncoder,
     };
+    use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
+    use deepmsg_codec::archive::update_channel_request_codec::UpdateChannelRequestEncoder;
 
     use deepmsg_client::fragment_assembler::MessageHeader;
 
@@ -1791,6 +2093,45 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
+        },
+        DetachSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
+        },
+        DeleteDetachedSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        AttachSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        UpdateChannel {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            channel: String,
+        },
+        TruncateRecording {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            position: i64,
+        },
+        PurgeRecording {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+        },
+        PurgeSegments {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
         },
         StartReplay {
             request: StartReplayRequest,
@@ -2027,6 +2368,116 @@ mod tests {
                 session_id,
                 correlation_id,
                 recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_detach_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::DetachSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            });
+        }
+
+        fn on_delete_detached_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::DeleteDetachedSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_update_channel(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            channel: &str,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::UpdateChannel {
+                session_id,
+                correlation_id,
+                recording_id,
+                channel: channel.to_owned(),
+            });
+        }
+
+        fn on_attach_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::AttachSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_truncate_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            position: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::TruncateRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
+            });
+        }
+
+        fn on_purge_recording(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_purge_segments(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            new_start_position: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
             });
         }
 
@@ -2285,6 +2736,174 @@ mod tests {
                 .control_session_id(control_session_id)
                 .correlation_id(correlation_id)
                 .encoded_credentials(encoded_credentials);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// An `UpdateChannelRequest` (template 107).
+    fn update_channel(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 512];
+
+        let length = {
+            let encoder =
+                UpdateChannelRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .channel(channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// An `AttachSegmentsRequest` (template 56).
+    fn attach_segments(control_session_id: i64, correlation_id: i64, recording_id: i64) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                AttachSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `TruncateRecordingRequest` (template 13).
+    fn truncate_recording(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                TruncateRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .position(position);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `PurgeRecordingRequest` (template 104).
+    fn purge_recording(control_session_id: i64, correlation_id: i64, recording_id: i64) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                PurgeRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `PurgeSegmentsRequest` (template 55).
+    fn purge_segments(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                PurgeSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .new_start_position(new_start_position);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `DetachSegmentsRequest` (template 53).
+    fn detach_segments(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder =
+                DetachSegmentsRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .new_start_position(new_start_position);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// A `DeleteDetachedSegmentsRequest` (template 54).
+    fn delete_detached_segments(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 128];
+
+        let length = {
+            let encoder = DeleteDetachedSegmentsRequestEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id);
             BODY + encoder.encoded_length()
         };
 
@@ -2687,6 +3306,166 @@ mod tests {
         assert_eq!(
             None, request.response_correlation_id,
             "and no response-correlation-id, because there was no token"
+        );
+    }
+
+    /// The two requests that move a recording's start reach the conductor with
+    /// what they carried — a detach with its new position, and the delete that
+    /// takes what the detach gave away with no position at all
+    /// (`ControlSessionAdapter.java:1408-1446`).
+    #[test]
+    fn the_two_segment_requests_reach_the_session_with_their_own_fields() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = detach_segments(session_id, 99, RECORDING_ID, 262_144);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let payload = delete_detached_segments(session_id, 100, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![
+                Call::DetachSegments {
+                    session_id,
+                    correlation_id: 99,
+                    recording_id: RECORDING_ID,
+                    new_start_position: 262_144,
+                },
+                Call::DeleteDetachedSegments {
+                    session_id,
+                    correlation_id: 100,
+                    recording_id: RECORDING_ID,
+                },
+            ],
+            control.calls[1..]
+        );
+    }
+
+    /// An update-channel carries its channel as var data, which is the one
+    /// thing about it that is not a field.
+    #[test]
+    fn an_update_channel_reaches_the_session_with_its_channel() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = update_channel(session_id, 99, RECORDING_ID, "aeron:ipc?alias=test42");
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::UpdateChannel {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+                channel: "aeron:ipc?alias=test42".to_owned(),
+            }],
+            control.calls[1..]
+        );
+    }
+
+    /// And an attach, whose whole request is the recording it is about.
+    #[test]
+    fn an_attach_reaches_the_session() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = attach_segments(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::AttachSegments {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+            }],
+            control.calls[1..]
+        );
+    }
+
+    /// A truncate reaches the conductor with the position it stops at.
+    #[test]
+    fn a_truncate_reaches_the_session_with_its_position() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = truncate_recording(session_id, 99, RECORDING_ID, 131_072);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::TruncateRecording {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+                position: 131_072,
+            }],
+            control.calls[1..]
+        );
+    }
+
+    /// The two purge requests reach the conductor too, one with a position and
+    /// one without.
+    #[test]
+    fn the_two_purge_requests_reach_the_session() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = purge_recording(session_id, 99, RECORDING_ID);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let payload = purge_segments(session_id, 100, RECORDING_ID, 131_072);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![
+                Call::PurgeRecording {
+                    session_id,
+                    correlation_id: 99,
+                    recording_id: RECORDING_ID,
+                },
+                Call::PurgeSegments {
+                    session_id,
+                    correlation_id: 100,
+                    recording_id: RECORDING_ID,
+                    new_start_position: 131_072,
+                },
+            ],
+            control.calls[1..]
+        );
+    }
+
+    /// And both are gated like anything else.
+    #[test]
+    fn the_segment_requests_are_gated() {
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = detach_segments(session_id, 99, RECORDING_ID, 0);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::ErrorResponse {
+                session_id,
+                correlation_id: 99,
+                relevant_id: i64::from(UNAUTHORISED_ACTION),
+                message: UNAUTHORISED_ACTION_MSG.to_owned(),
+            }],
+            control.calls[1..]
         );
     }
 

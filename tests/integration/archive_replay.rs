@@ -51,33 +51,20 @@
 //! What this file adds for the second is the positive half of the statement: the
 //! ids the frames that do arrive are carrying, asserted at the frame rather than
 //! left as a consequence of a read that completed.
+//!
+//! The **replayer's counters** are asserted in the first test and nowhere else,
+//! which is the same division of labour: `AeronStat` can read them, but only a
+//! test that made the replay knows what they should have counted.
+//!
+//! Everything this file drives the archive with is in [`archive`], shared with
+//! the segments file — including the recording, which both make the same way.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use deepmsg_archive::server::conductor::ARCHIVE_ID_DEFAULT;
-use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
-use deepmsg_client::client::Client;
-use deepmsg_codec::archive::WriteBuf;
-use deepmsg_codec::archive::boolean_type::BooleanType;
-use deepmsg_codec::archive::bounded_replay_request_codec::BoundedReplayRequestEncoder;
-use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::message_header_codec;
-use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
-use deepmsg_codec::archive::source_location::SourceLocation;
-use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
-use deepmsg_codec::archive::stop_position_request_codec::StopPositionRequestEncoder;
-use deepmsg_codec::archive::stop_recording_subscription_request_codec::StopRecordingSubscriptionRequestEncoder;
-use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_tests::archive::{self, DEADLINE, Session};
-use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
-use deepmsg_tests::temp::TempDir;
+use deepmsg_tests::archive::{self, Archive, Recording};
 
 /// The connect's correlation id, which its answer echoes.
 const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0004;
-
-/// The archive's id, which its rec-pos counters are keyed by.
-const ARCHIVE_ID: i64 = ARCHIVE_ID_DEFAULT;
 
 /// The channel the first test records, and the stream.
 ///
@@ -152,24 +139,41 @@ const FILE_IO_MAX_LENGTH: i32 = 4096;
 /// is a counter nothing but these tests reads.
 const BOUNDED_COUNTER_TYPE_ID: i32 = 10001;
 
-/// How long a command to the driver may take.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How long the archive is given to notice that a limit counter has gone.
 ///
 /// It reads one every turn, so this is a hundred turns of slack rather than a
 /// race.
 const SETTLED: Duration = Duration::from_millis(250);
 
-/// The archive's properties, plus the three this file needs.
+/// The recording both tests make: [`MESSAGE_COUNT`] messages on `channel`, with
+/// a mark at [`FIRST_MARK`].
+fn a_recording(channel: &str) -> Recording {
+    Recording::new(
+        channel,
+        RECORDING_STREAM_ID,
+        MESSAGE_COUNT,
+        MESSAGE_SIZE,
+        FIRST_MARK,
+    )
+}
+
+/// The archive's properties, plus the four this file needs.
 ///
-/// `spies.simulate.connection` is the recording's half (`archive_recording.rs`);
-/// the other two are the replay's.
+/// `spies.simulate.connection` is the recording's half (`archive_recording.rs`).
+///
+/// The other three are one setting and a bound. A recording's segment length is
+/// `max(aeron.archive.segment.file.length, termBufferLength)`
+/// (`ArchiveConductor.java:2006`, `conductor::segment_file_length`) — a segment
+/// has to be able to hold one term — so asking for 64 KiB segments while the
+/// driver's term is its 16 MiB default gets a recording of sixteen megabytes
+/// that **fits in one file**, which is every claim this file makes about
+/// crossing a segment. `max(64k, 64k)` is what the pair gives.
 fn properties() -> Vec<String> {
     vec![
         archive::PROPERTIES[0].to_owned(),
         archive::PROPERTIES[1].to_owned(),
         "-Daeron.spies.simulate.connection=true".to_owned(),
+        format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"),
         format!("-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"),
         format!("-Daeron.archive.max.concurrent.replays={MAX_CONCURRENT_REPLAYS}"),
     ]
@@ -178,34 +182,47 @@ fn properties() -> Vec<String> {
 /// A recording replayed back, frame for frame, carrying the replay's own ids.
 #[test]
 fn a_recording_replays_its_own_frames_across_its_segments() {
-    let Some(mut archive) = Archive::start("archive-replay-frames") else {
+    let Some(mut archive) = Archive::start(
+        "archive-replay-frames",
+        CONNECT_CORRELATION_ID,
+        &properties(),
+    ) else {
         return;
     };
 
-    let recorded = archive.record(RECORDING_CHANNEL);
+    let recording = a_recording(RECORDING_CHANNEL);
+    let recorded = archive.record(&recording);
 
     // The recording has to be long enough that reading it back crosses a
-    // segment, or the assertion at the end is about a replay of one file.
+    // segment, or the assertion at the end is about a replay of one file — and
+    // it is the **files** that say so, not the number of bytes. The two were not
+    // the same thing until the term length came down with the segment length
+    // (see [`properties`]): 168960 bytes over 64 KiB is three segments and was
+    // one file of sixteen megabytes, which is the shape this test is here to
+    // avoid.
+    let segments = archive.segment_files(recorded.recording_id);
+
     assert!(
-        recorded.stop > 2 * SEGMENT_FILE_LENGTH,
-        "the recording is {} bytes, which does not span the three segments of {} it needs to",
+        segments.len() >= 3,
+        "the recording is {} bytes over {} segment files, and this test needs three",
         recorded.stop,
-        SEGMENT_FILE_LENGTH
+        segments.len()
     );
 
     // The replay's own subscription, and the request. A position of `-1` is the
     // recording's beginning and a length of `-2` is "to the stop"
     // (`AeronArchive.NULL_POSITION`, `REPLAY_ALL_AND_STOP`), so neither number
     // here depends on where the recording happens to start.
-    let subscription = archive.subscribe(REPLAY_CHANNEL);
+    let subscription = archive.subscribe(REPLAY_CHANNEL, REPLAY_STREAM_ID);
     let correlation_id = archive.session.next_correlation_id();
-    let payload = replay_request(
+    let payload = archive::replay_request(
         archive.session.control_session_id(),
         correlation_id,
         recorded.recording_id,
         -1,
         -2,
         FILE_IO_MAX_LENGTH,
+        REPLAY_STREAM_ID,
         REPLAY_CHANNEL,
     );
 
@@ -234,7 +251,7 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
 
     for (index, frame) in replay.frames.iter().enumerate() {
         assert_eq!(
-            message(index),
+            recording.message(index),
             frame.payload,
             "message {index} is the bytes the publication wrote"
         );
@@ -267,21 +284,9 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     );
 
     // The replayer's counters, which the archive allocates at startup and the
-    // replay has just moved (`AeronCounters`: 108, 109, 110, 112). The labels
-    // are the reference's own, and they are what a reader of the counters
-    // region — `AeronStat`, or anybody's dashboard — finds them by.
-    let counters = archive.client.counters_reader().expect("a counters region");
-    let by_label = |prefix: &str| {
-        let mut found = None;
-
-        counters.for_each(|descriptor| {
-            if descriptor.label.starts_with(prefix) {
-                found = counters.value(descriptor.counter_id);
-            }
-        });
-
-        found
-    };
+    // replay has just moved (`AeronCounters`: 108, 109, 110, 112), read by the
+    // label a reader of the counters region finds them by.
+    let by_label = |prefix: &str| archive::counter_by_label(&archive.client, prefix);
 
     assert_eq!(
         Some(0),
@@ -312,18 +317,23 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
 /// one that did not refuses it with `MAX_REPLAYS`.
 #[test]
 fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
-    let Some(mut archive) = Archive::start("archive-replay-limit-gone") else {
+    let Some(mut archive) = Archive::start(
+        "archive-replay-limit-gone",
+        CONNECT_CORRELATION_ID,
+        &properties(),
+    ) else {
         return;
     };
 
-    let recorded = archive.record(BOUNDED_RECORDING_CHANNEL);
+    let recording = a_recording(BOUNDED_RECORDING_CHANNEL);
+    let recorded = archive.record(&recording);
 
     for (index, channel) in BOUNDED_REPLAY_CHANNELS.iter().enumerate() {
         let counter = archive.limit_counter(BOUNDED_COUNTER_TYPE_ID, recorded.first);
 
-        let subscription = archive.subscribe(channel);
+        let subscription = archive.subscribe(channel, REPLAY_STREAM_ID);
         let correlation_id = archive.session.next_correlation_id();
-        let payload = bounded_replay_request(
+        let payload = archive::bounded_replay_request(
             archive.session.control_session_id(),
             correlation_id,
             recorded.recording_id,
@@ -331,6 +341,7 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
             -1,
             FILE_IO_MAX_LENGTH,
             counter.counter_id(),
+            REPLAY_STREAM_ID,
             channel,
         );
 
@@ -351,7 +362,7 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
         // half, `ReplaySession.java:568-574`).
         archive
             .client
-            .remove_counter(&counter, COMMAND_TIMEOUT)
+            .remove_counter(&counter, archive::COMMAND_TIMEOUT)
             .expect("the driver gives the counter back");
 
         std::thread::sleep(SETTLED);
@@ -366,7 +377,7 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
     // response channel whether or not anything is listening to the replay.
     let counter = archive.limit_counter(BOUNDED_COUNTER_TYPE_ID, recorded.first);
     let correlation_id = archive.session.next_correlation_id();
-    let payload = bounded_replay_request(
+    let payload = archive::bounded_replay_request(
         archive.session.control_session_id(),
         correlation_id,
         recorded.recording_id,
@@ -374,6 +385,7 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
         -1,
         FILE_IO_MAX_LENGTH,
         counter.counter_id(),
+        REPLAY_STREAM_ID,
         REPLAY_CHANNEL,
     );
 
@@ -381,603 +393,4 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
     assert!(answer.relevant_id > 0, "the third replay was taken");
 
     let _ = archive.stop();
-}
-
-/// A running archiving media driver, the client connected to it, and the one
-/// control session these tests use.
-struct Archive {
-    media_driver: OwnArchivingMediaDriver,
-    client: Client,
-    session: Session,
-    aeron_dir: PathBuf,
-    cnc: deepmsg_cnc::CncFile,
-    /// Held, not merely made: a `TempDir` removes its directory when it is
-    /// dropped, and the archive's own directory is one it asks `statvfs` about
-    /// before every recording (`isLowStorageSpace`, `ArchiveConductor.java:2597-2617`).
-    /// A dropped one is a start refused for want of room on a filesystem that is
-    /// not there.
-    _archive_dir: TempDir,
-}
-
-impl Archive {
-    /// Start one, or `None` when our archiving media driver is not built.
-    fn start(test_name: &str) -> Option<Self> {
-        let archive_dir = TempDir::new(test_name);
-
-        let properties = properties();
-        let properties: Vec<&str> = properties.iter().map(String::as_str).collect();
-
-        let Some(mut media_driver) =
-            OwnArchivingMediaDriver::start(test_name, archive_dir.path(), &properties)
-        else {
-            archiving_driver::announce_skip();
-            return None;
-        };
-
-        media_driver
-            .await_ready(DEADLINE)
-            .expect("the archiving media driver must come up and signal its mark file");
-
-        let aeron_dir = media_driver.aeron_dir().to_path_buf();
-        let mut client = Client::connect(&aeron_dir).expect("connect to the driver");
-
-        let session = Session::connect(
-            &mut client,
-            &aeron_dir,
-            CONNECT_CORRELATION_ID,
-            Instant::now() + DEADLINE,
-        )
-        .unwrap_or_else(|reason| panic!("{reason};\n{}", media_driver.log_tail(40)));
-
-        // A writable mapping of the counters region, which is how an application
-        // that owns a counter writes it: the client hands out a reader, because
-        // a counter is written by whoever asked for it through the address the
-        // driver gave them (`aeron_counter_set_release`).
-        let cnc = deepmsg_cnc::CncFile::try_open_writable(&aeron_dir)
-            .expect("the CnC file this test's driver wrote");
-
-        Some(Self {
-            media_driver,
-            client,
-            session,
-            aeron_dir,
-            cnc,
-            _archive_dir: archive_dir,
-        })
-    }
-
-    fn stop(&mut self) -> std::process::ExitStatus {
-        self.media_driver.stop().expect("the driver stops")
-    }
-
-    /// A counters slot the archive will read as a limit, holding `value`.
-    fn limit_counter(&mut self, type_id: i32, value: i64) -> deepmsg_client::counter::Counter {
-        let counter = self
-            .client
-            .add_counter(
-                type_id,
-                &value.to_be_bytes(),
-                "the replay acceptance tests' limit counter",
-                COMMAND_TIMEOUT,
-            )
-            .expect("the driver must allocate the counter");
-
-        let counters = self.cnc.counters_writable().expect("a writable region");
-        assert!(counter.set_value(&counters, value), "the limit is set");
-
-        counter
-    }
-
-    /// A subscription on `channel`, which a replay's publication links to.
-    fn subscribe(&mut self, channel: &str) -> i64 {
-        self.client
-            .add_subscription(channel, REPLAY_STREAM_ID, COMMAND_TIMEOUT)
-            .expect("the driver must accept the replay's subscription")
-    }
-
-    /// Send one request that is answered with an `OK`, and assert that it was.
-    fn ok_answer(&mut self, correlation_id: i64, payload: &[u8]) -> archive::Response {
-        let answer = self
-            .session
-            .send(
-                &mut self.client,
-                correlation_id,
-                payload,
-                Instant::now() + DEADLINE,
-            )
-            .expect("the archive answers");
-
-        assert_eq!(
-            ControlResponseCode::OK,
-            answer.code,
-            "the archive refused: {}",
-            answer.message()
-        );
-
-        answer
-    }
-
-    /// Read a replay until its reader reaches `position`.
-    fn read_replay(&mut self, subscription: i64, position: i64) -> Replay {
-        read_replay(&mut self.client, subscription, position)
-    }
-
-    /// The one recording a test makes: [`MESSAGE_COUNT`] messages on `channel`,
-    /// with a mark at [`FIRST_MARK`], stopped.
-    fn record(&mut self, channel: &str) -> Recorded {
-        let publication = self
-            .client
-            .add_exclusive_publication(channel, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
-            .expect("the driver must accept the publication");
-        let reader = self
-            .client
-            .add_subscription(channel, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
-            .expect("the driver must accept a reader");
-
-        let publisher_session = self
-            .client
-            .exclusive_publication(publication)
-            .map(|publication| publication.session_id())
-            .expect("the publication has a session");
-
-        // The start (63), whose answer is the **subscription's** registration
-        // id.
-        let correlation_id = self.session.next_correlation_id();
-        let payload =
-            start_recording_request(self.session.control_session_id(), correlation_id, channel);
-        let subscription_id = self.ok_answer(correlation_id, &payload).relevant_id;
-
-        let (mark, end) = publish(&mut self.client, publication, reader);
-
-        // The recording follows the publication, and this is where the recording
-        // id comes from: nothing else names it until a listing or a stop does.
-        let recording_id = wait_for_the_counter(
-            &mut self.client,
-            publication,
-            reader,
-            publisher_session,
-            &self.aeron_dir,
-        );
-
-        let correlation_id = self.session.next_correlation_id();
-        let payload = stop_recording_request(
-            self.session.control_session_id(),
-            correlation_id,
-            subscription_id,
-        );
-        self.ok_answer(correlation_id, &payload);
-
-        let stop = recorded_stop(&mut self.client, &mut self.session, recording_id);
-
-        assert_eq!(
-            end, stop,
-            "a recording stops where its publication did, which is what makes a mark read off the \
-             publication a position the recording is bounded at"
-        );
-
-        Recorded {
-            recording_id,
-            stop,
-            first: mark,
-        }
-    }
-}
-
-/// What a recorded run leaves behind.
-struct Recorded {
-    /// The recording, as the catalog allocated it.
-    recording_id: i64,
-    /// Where the publication stood when the recording was stopped, which is
-    /// where the recording stopped.
-    stop: i64,
-    /// Where the recording stood at [`FIRST_MARK`] messages.
-    ///
-    /// It is read off the **publication**, whose position and the recording's
-    /// are the same number: the archive's spy subscription joins before anything
-    /// is written, so both count from the same place — which [`Archive::record`]
-    /// asserts rather than assumes.
-    first: i64,
-}
-
-/// One replayed frame, kept for the assertions.
-struct Frame {
-    /// The **frame's** session id, read off its own header.
-    session_id: i32,
-    /// The frame's stream id.
-    stream_id: i32,
-    /// Its payload.
-    payload: Vec<u8>,
-}
-
-/// What a replay left: where it stopped, whose frames it wrote, and the frames.
-struct Replay {
-    /// The replay publication's session id, which every frame must carry.
-    publication_session_id: i32,
-    /// Where the reader got to.
-    position: i64,
-    /// The frames it read.
-    frames: Vec<Frame>,
-}
-
-/// Publish every message, answering with the publication's position at
-/// [`FIRST_MARK`] and at the end.
-fn publish(client: &mut Client, publication: i64, reader: i64) -> (i64, i64) {
-    let deadline = Instant::now() + DEADLINE;
-    let mut offered = 0;
-    let mut mark = 0;
-
-    while offered < MESSAGE_COUNT {
-        match client.offer_exclusive(publication, &message(offered)) {
-            Some(Appended::Ok { .. }) => {
-                offered += 1;
-                read_whatever_there_is(client, reader);
-
-                // The mark is where the publication stood **after** the message
-                // before it: a frame boundary, with whatever padding the term
-                // before it needed already counted in.
-                if offered == FIRST_MARK {
-                    mark = publication_position(client, publication);
-                }
-            }
-            Some(Appended::NotConnected) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the publication never linked after {offered} messages"
-                );
-            }
-            other => panic!("the message could not be published ({other:?})"),
-        }
-
-        client.poll();
-    }
-
-    (mark, publication_position(client, publication))
-}
-
-/// The `message {index}` bytes, padded to [`MESSAGE_SIZE`].
-///
-/// A fixed length on purpose: a frame is its payload plus a 32-byte header, so a
-/// fixed payload makes every frame the same size and the marks above land where
-/// the arithmetic says they will.
-fn message(index: usize) -> Vec<u8> {
-    let mut payload = format!("message {index:06}").into_bytes();
-    payload.resize(MESSAGE_SIZE, b'.');
-
-    payload
-}
-
-/// Read whatever the reader has, which is what keeps the publisher going: a UDP
-/// publication nobody reads is one the driver stops sending on.
-fn read_whatever_there_is(client: &mut Client, reader: i64) {
-    let Some(image) = image(client, reader) else {
-        return;
-    };
-
-    client.poll_image(reader, image.registration_id, 10, |_| {});
-}
-
-/// Where a publication has got to.
-fn publication_position(client: &Client, publication: i64) -> i64 {
-    client
-        .exclusive_publication(publication)
-        .and_then(|publication| publication.position())
-        .expect("the publication is still held")
-}
-
-/// Wait for the recording's position counter to catch up with the publication,
-/// answering with the recording id it names
-/// (`aeron_archive_test.cpp:267-286`).
-fn wait_for_the_counter(
-    client: &mut Client,
-    publication: i64,
-    reader: i64,
-    session_id: i32,
-    aeron_dir: &Path,
-) -> i64 {
-    let deadline = Instant::now() + DEADLINE;
-    let position = publication_position(client, publication);
-
-    while Instant::now() < deadline {
-        if let Some((recording_id, value)) = recording_counter(client, session_id) {
-            if value >= position {
-                return recording_id;
-            }
-        }
-
-        client.poll();
-        read_whatever_there_is(client, reader);
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    panic!(
-        "the recording never caught up to {position};\n{}",
-        archive::counters(aeron_dir)
-    );
-}
-
-/// The recording's position counter — its recording id and value — if the driver
-/// has one for this session.
-fn recording_counter(client: &Client, session_id: i32) -> Option<(i64, i64)> {
-    let counters = client.counters_reader()?;
-    let counter_id = find_counter_id_by_session(&counters, session_id, ARCHIVE_ID)?;
-    let recording_id = parse_key(&counters.key(counter_id)?)?.recording_id;
-
-    Some((recording_id, counters.value(counter_id)?))
-}
-
-/// Where a recording stopped (15), waiting for the catalog to say it did.
-fn recorded_stop(client: &mut Client, session: &mut Session, recording_id: i64) -> i64 {
-    let deadline = Instant::now() + DEADLINE;
-
-    while Instant::now() < deadline {
-        let correlation_id = session.next_correlation_id();
-        let control_session_id = session.control_session_id();
-
-        let mut buffer = vec![0u8; 64];
-        let length = {
-            let body = message_header_codec::ENCODED_LENGTH;
-            let encoder =
-                StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-            let mut header = encoder.header(0);
-            let mut encoder = header.parent().unwrap();
-
-            encoder
-                .control_session_id(control_session_id)
-                .correlation_id(correlation_id)
-                .recording_id(recording_id);
-
-            body + encoder.encoded_length()
-        };
-        buffer.truncate(length);
-
-        let answer = session
-            .send(client, correlation_id, &buffer, Instant::now() + DEADLINE)
-            .expect("the archive answers a stop position");
-        assert_eq!(
-            ControlResponseCode::OK,
-            answer.code,
-            "the archive refused: {}",
-            answer.message()
-        );
-
-        if answer.relevant_id >= 0 {
-            return answer.relevant_id;
-        }
-
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    panic!("the recording's catalog row never got a stop position");
-}
-
-/// What an image says about itself, copied out of the client so it can be polled
-/// again.
-struct Image {
-    registration_id: i64,
-    session_id: i32,
-    position: i64,
-}
-
-/// The image a subscription holds, if there is one yet.
-fn image(client: &Client, subscription: i64) -> Option<Image> {
-    let image = client.subscription(subscription)?.images().first()?;
-
-    Some(Image {
-        registration_id: image.registration_id(),
-        session_id: image.session_id(),
-        position: image.position(),
-    })
-}
-
-/// Read a replay until its reader reaches `position`, answering with every data
-/// frame it carried on the way.
-///
-/// The position is the image's own, which is where the *reader* has got to —
-/// padding included, since the reader steps over it. That is what makes "it
-/// reached the recording's stop position" a claim about the padding too.
-fn read_replay(client: &mut Client, subscription: i64, position: i64) -> Replay {
-    let deadline = Instant::now() + DEADLINE;
-    let mut frames = Vec::new();
-    let mut publication_session_id = None;
-    let mut reached_from = None;
-
-    loop {
-        // The image is announced on the CnC broadcast, so it is a poll that
-        // makes it exist — and the publication behind it is made several turns
-        // after the OK, because the OK does not wait for it
-        // (`ReplaySession.java:338`).
-        client.poll();
-
-        if let Some(current) = image(client, subscription) {
-            publication_session_id.get_or_insert(current.session_id);
-            read_frames(client, subscription, &mut frames);
-
-            // Read again: the poll above may have taken the image away as well
-            // as moved it, and what the reader got to is the last thing it was
-            // seen at.
-            if let Some(current) = image(client, subscription) {
-                reached_from = Some(current.position);
-
-                if current.position >= position {
-                    return Replay {
-                        publication_session_id: publication_session_id
-                            .expect("an image was seen before this could be returned"),
-                        position: current.position,
-                        frames,
-                    };
-                }
-            }
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "the replay never reached {position}; it is at {reached_from:?} with {} frames",
-            frames.len()
-        );
-
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// Read every data frame the subscription has, appending them to `frames`.
-fn read_frames(client: &mut Client, subscription: i64, frames: &mut Vec<Frame>) {
-    let Some(current) = image(client, subscription) else {
-        return;
-    };
-
-    client.poll_image(subscription, current.registration_id, 10, |fragment| {
-        // A replay hands over whole frames — it writes blocks of them, not
-        // messages split across frames — so a fragment that is not whole is a
-        // different claim about how the frames were written, and not this one.
-        assert!(
-            fragment.is_unfragmented(),
-            "a replayed frame is a whole frame"
-        );
-
-        let mut payload = vec![0u8; fragment.payload_length()];
-        assert!(
-            fragment.copy_payload(&mut payload).is_some(),
-            "the frame fits"
-        );
-
-        frames.push(Frame {
-            session_id: fragment.session_id().expect("a frame has a header"),
-            stream_id: fragment.stream_id().expect("a frame has a header"),
-            payload,
-        });
-    });
-}
-
-/// A `ReplayRequest` (6).
-#[allow(clippy::too_many_arguments)] // one per field the request carries
-fn replay_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-    position: i64,
-    length: i64,
-    file_io_max_length: i32,
-    replay_channel: &str,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 512];
-
-    let written = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = ReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id)
-            .position(position)
-            .length(length)
-            .replay_stream_id(REPLAY_STREAM_ID)
-            .file_io_max_length(file_io_max_length)
-            // `Aeron.NULL_VALUE`: this replay is asked for on the session's own
-            // image, so it carries no token — and the two are told apart by
-            // exactly this comparison, which is why the guard on the field
-            // matters.
-            .replay_token(-1)
-            .replay_channel(replay_channel.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(written);
-    buffer
-}
-
-/// A `BoundedReplayRequest` (18): the same request with the counter that bounds
-/// it.
-#[allow(clippy::too_many_arguments)] // one per field the request carries
-fn bounded_replay_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-    position: i64,
-    length: i64,
-    file_io_max_length: i32,
-    limit_counter_id: i32,
-    replay_channel: &str,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 512];
-
-    let written = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = BoundedReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id)
-            .position(position)
-            .length(length)
-            .limit_counter_id(limit_counter_id)
-            .replay_stream_id(REPLAY_STREAM_ID)
-            .file_io_max_length(file_io_max_length)
-            .replay_token(-1)
-            .replay_channel(replay_channel.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(written);
-    buffer
-}
-
-/// The `StartRecordingRequest2` (63) for the channel a test records.
-fn start_recording_request(control_session_id: i64, correlation_id: i64, channel: &str) -> Vec<u8> {
-    let mut buffer = vec![0u8; 256];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .stream_id(RECORDING_STREAM_ID)
-            .source_location(SourceLocation::LOCAL)
-            .auto_stop(BooleanType::FALSE)
-            .channel(channel.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// The `StopRecordingSubscriptionRequest` (14) for one subscription.
-fn stop_recording_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    subscription_id: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 64];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = StopRecordingSubscriptionRequestEncoder::default()
-            .wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .subscription_id(subscription_id);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
 }

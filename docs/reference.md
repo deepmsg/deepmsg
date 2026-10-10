@@ -36,7 +36,9 @@ The reference's archive suite is the acceptance instrument for `P2`: it asks
 whether our archive can replace the Java one, and it is worth asking because
 its cases are not ours. It is not this repository's test suite — that is
 `crates/archive/tests/` — and the two do different jobs. `crates/archive/tests/reference-cases.tsv`
-is the join: every case the suite runs, with what this repository owes it.
+is the join: every case the suite runs, named. It is the denominator and nothing
+else — see its own header for why it stopped claiming which of those cases this
+repository owns.
 
 ### Why it takes a second build directory
 

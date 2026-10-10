@@ -61,6 +61,15 @@ pub const HEADER_LENGTH: usize = HEADER_BLOCK_LENGTH as usize;
 /// (`Catalog.java:113`).
 pub const DESCRIPTOR_HEADER_LENGTH: usize = DESCRIPTOR_HEADER_BLOCK_LENGTH as usize;
 
+/// Where the descriptor block holds a recording's **start** position, in bytes
+/// from the block's own beginning (`recording_descriptor_codec`: `startPosition`
+/// is "encodedOffset: 40").
+pub const START_POSITION_OFFSET: usize = 40;
+
+/// Where it holds the **stop** position (`recording_descriptor_codec`:
+/// `stopPosition` is "encodedOffset: 48").
+pub const STOP_POSITION_OFFSET: usize = 48;
+
 /// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:118`).
 pub const DEFAULT_CAPACITY: usize = 1024 * 1024;
 
@@ -291,6 +300,22 @@ impl CatalogIndex {
         {
             Ok(position) => self.entries[position].1 = offset,
             Err(position) => self.entries.insert(position, (recording_id, offset)),
+        }
+    }
+
+    /// Move every record that lives **after** `offset` along by `shift`
+    /// (`Catalog.fixupIndexForShifterRecordings`, `:837-860`).
+    ///
+    /// Substituting one record for a longer one moves everything behind it, and
+    /// the offsets in this index are absolute — so the entries that point past
+    /// the record that grew are the ones that have to move with it. The entry
+    /// for the record itself is at `offset` and is *not* moved: the caller has
+    /// already rewritten it in place.
+    fn shift_after(&mut self, offset: usize, shift: usize) {
+        for entry in &mut self.entries {
+            if entry.1 > offset {
+                entry.1 += shift;
+            }
         }
     }
 
@@ -651,7 +676,6 @@ impl Catalog {
         now_ms: i64,
     ) -> Result<(), CatalogError> {
         const STOP_TIMESTAMP_OFFSET: usize = 32;
-        const STOP_POSITION_OFFSET: usize = 48;
 
         let region =
             self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, STOP_POSITION_OFFSET + 8)?;
@@ -692,6 +716,65 @@ impl Catalog {
         self.write_stop(offset, stop_position, now_ms)
     }
 
+    /// Move a recording's **start**, which is what a detach is
+    /// (`Catalog.startPosition(id, position)`, `:758-767`).
+    ///
+    /// The whole of "detached" is this field: the segment files below it stay
+    /// where they are, and what makes them *detached* is that the recording no
+    /// longer claims them. [`is_detached`](Self::start_position) is the same
+    /// question asked of a file name.
+    ///
+    /// The reference writes this one with `putLong` where its `stopPosition`
+    /// uses `putLongVolatile` (`:764` against `:643`) — an asymmetry about
+    /// which of the two a reader is allowed to see half-written. Both are a
+    /// release store here, which is the ordering Rust names and the one a
+    /// reader taking the record afterwards needs.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id, and
+    /// [`CatalogError::Malformed`] when the record cannot be written.
+    pub fn start_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
+        self.write_position(recording_id, START_POSITION_OFFSET, position)
+    }
+
+    /// Move a recording's **stop**, which is what a truncate is
+    /// (`ArchiveConductor.truncateRecording`, `:1213`).
+    ///
+    /// A truncate writes this field **first** and deletes files afterwards, so
+    /// between the two a recording whose files are still there already claims to
+    /// end earlier. That order is the reference's and it is the safe one: a
+    /// reader that believed the files over the field would replay bytes the
+    /// recording no longer owns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::start_position`].
+    pub fn stop_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
+        self.write_position(recording_id, STOP_POSITION_OFFSET, position)
+    }
+
+    /// One of the two position fields, which differ in where they live and in
+    /// nothing else.
+    fn write_position(
+        &mut self,
+        recording_id: i64,
+        field_offset: usize,
+        position: i64,
+    ) -> Result<(), CatalogError> {
+        let offset = self
+            .recording_offset(recording_id)
+            .ok_or(CatalogError::UnknownRecording { recording_id })?;
+
+        let region = self.region_mut(offset + DESCRIPTOR_HEADER_LENGTH, field_offset + 8)?;
+        region
+            .store_i64_release(field_offset, position)
+            .ok_or(CatalogError::Malformed {
+                offset,
+                length: i32::try_from(field_offset + 8).unwrap_or(i32::MAX),
+            })
+    }
+
     /// Record that a recording has been **extended**: the row goes back to
     /// being one that has not stopped, and remembers which control session and
     /// request did it (`Catalog.extendRecording`, `:648-662`).
@@ -726,7 +809,6 @@ impl Catalog {
         const CONTROL_SESSION_ID_OFFSET: usize = 0;
         const CORRELATION_ID_OFFSET: usize = 8;
         const STOP_TIMESTAMP_OFFSET: usize = 32;
-        const STOP_POSITION_OFFSET: usize = 48;
         const SESSION_ID_OFFSET: usize = 72;
 
         let offset = self
@@ -746,6 +828,125 @@ impl Catalog {
                 offset,
                 length: i32::try_from(block_length).unwrap_or(i32::MAX),
             })
+    }
+
+    /// Write a recording's record again, in place, with a record that may be a
+    /// **different length** (`Catalog.replaceRecording`, `:664-745`).
+    ///
+    /// One caller: `updateChannel`, which reads a descriptor, substitutes one
+    /// field pair, and writes the whole thing back
+    /// (`UpdateChannelSession.java:80-120`). The channels it substitutes are
+    /// strings, so the new record is as likely to be longer as shorter — and a
+    /// longer one moves everything behind it.
+    ///
+    /// # What "different length" costs
+    ///
+    /// A catalog is a **packed** file: records are laid end to end from
+    /// [`HEADER_LENGTH`] to `next_offset`, each one carrying its own length in
+    /// its header. So a record that grows by N bytes needs the whole tail moved
+    /// along by N — and the index, whose offsets are absolute, moved with it
+    /// (`:824-838`). That is three steps and they are in this order for a
+    /// reason: the file is grown first (which may remap it), then the tail is
+    /// moved, then the offsets are told. A record that shrinks instead leaves
+    /// its slack as zeros, which is what the reference does with it
+    /// (`:820-823`): a walk stops at the first unused **slot**, and a record's
+    /// own slack is inside its frame rather than at its beginning.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::UnknownRecording`] when the index has no such id,
+    /// [`CatalogError::Full`] when the grown file would pass the format's
+    /// maximum, and [`CatalogError::Malformed`] when the record cannot be
+    /// written.
+    pub fn replace_recording(&mut self, recording: &Recording) -> Result<(), CatalogError> {
+        let recording_id = recording.recording_id;
+        let Some(offset) = self.recording_offset(recording_id) else {
+            return Err(CatalogError::UnknownRecording { recording_id });
+        };
+
+        let old_frame_length = self.record_frame_length(offset)?;
+        let frame = encode_record(recording, self.alignment)?;
+        let new_frame_length = frame.len();
+
+        if new_frame_length > old_frame_length {
+            let shift = new_frame_length - old_frame_length;
+            let end = self.next_offset;
+
+            if end + shift > self.capacity() {
+                self.grow(shift)?;
+            }
+
+            // The tail, out and back: records are variable-length and this one
+            // just changed length, so there is no copying in place to do.
+            let tail_length = end - (offset + old_frame_length);
+            let mut tail = vec![0_u8; tail_length];
+
+            {
+                let region = self.region_mut(offset + old_frame_length, tail_length)?;
+                region
+                    .copy_out(0, &mut tail)
+                    .ok_or_else(|| CatalogError::Malformed {
+                        offset,
+                        length: i32::try_from(tail_length).unwrap_or(i32::MAX),
+                    })?;
+            }
+
+            {
+                let region = self.region_mut(offset + new_frame_length, tail_length)?;
+                region
+                    .copy_in(0, &tail)
+                    .ok_or_else(|| CatalogError::Malformed {
+                        offset,
+                        length: i32::try_from(tail_length).unwrap_or(i32::MAX),
+                    })?;
+            }
+
+            self.index.shift_after(offset, shift);
+            self.next_offset += shift;
+        } else if new_frame_length < old_frame_length {
+            // The slack a shorter record leaves is zeroed rather than left as
+            // the bytes of the record it replaced.
+            let slack = old_frame_length - new_frame_length;
+            let zeros = vec![0_u8; slack];
+
+            let region = self.region_mut(offset + new_frame_length, slack)?;
+            region
+                .copy_in(0, &zeros)
+                .ok_or_else(|| CatalogError::Malformed {
+                    offset,
+                    length: i32::try_from(slack).unwrap_or(i32::MAX),
+                })?;
+        }
+
+        {
+            let region = self.region_mut(offset, new_frame_length)?;
+            region
+                .copy_in(0, &frame)
+                .ok_or_else(|| CatalogError::Malformed {
+                    offset,
+                    length: i32::try_from(new_frame_length).unwrap_or(i32::MAX),
+                })?;
+        }
+
+        self.write_header()
+    }
+
+    /// How long a record's frame is, from the length in its own header
+    /// (`Catalog.recordingDescriptorOffset` plus the frame arithmetic at
+    /// `:684-687`).
+    fn record_frame_length(&self, offset: usize) -> Result<usize, CatalogError> {
+        let bytes = self.read_at(offset, DESCRIPTOR_HEADER_LENGTH)?;
+        let header = decode_record_header(&bytes)?;
+        let length = header.length();
+
+        if length < 0 {
+            return Err(CatalogError::Malformed { offset, length });
+        }
+
+        Ok(align_up(
+            DESCRIPTOR_HEADER_LENGTH + usize::try_from(length).unwrap_or(0),
+            self.alignment,
+        ))
     }
 
     /// Retire a record, or bring it back: the record's `state` changes and the
@@ -1957,6 +2158,165 @@ mod tests {
             65_536,
             reopened.recording(id).expect("read back").stop_position,
             "and it is in the file, not only in this process's view of it"
+        );
+    }
+
+    /// A recording's two ends can be moved on their own, which is the whole of
+    /// what a detach and a truncate are
+    /// (`Catalog.startPosition(id, position)`, `Catalog.java:758-767`, and
+    /// `stopPosition(id, position)`, `:637-646`).
+    ///
+    /// Neither write touches anything else in the row — that is the assertion
+    /// worth making here, because both are fields *inside* a variable-length
+    /// record whose neighbours are bytes this cannot afford to disturb.
+    #[test]
+    fn either_end_of_a_recording_can_be_moved() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        catalog
+            .recording_stopped(id, 1_048_576, NOW)
+            .expect("stopped");
+
+        // Read **after** the stop: the two writers are compared against the row
+        // as they found it, and a stop is one of the things that moves a field
+        // they must leave alone.
+        let started = catalog.recording(id).expect("read");
+
+        catalog.start_position(id, 262_144).expect("detached");
+        catalog.stop_position(id, 524_288).expect("truncated");
+
+        let moved = catalog.recording(id).expect("read");
+        assert_eq!(262_144, moved.start_position, "the new start");
+        assert_eq!(524_288, moved.stop_position, "and the new stop");
+
+        // Everything else is where the two writers found it.
+        assert_eq!(started.recording_id, moved.recording_id);
+        assert_eq!(started.start_timestamp, moved.start_timestamp);
+        assert_eq!(started.stop_timestamp, moved.stop_timestamp);
+        assert_eq!(started.initial_term_id, moved.initial_term_id);
+        assert_eq!(started.segment_file_length, moved.segment_file_length);
+        assert_eq!(started.term_buffer_length, moved.term_buffer_length);
+        assert_eq!(started.mtu_length, moved.mtu_length);
+        assert_eq!(started.session_id, moved.session_id);
+        assert_eq!(started.stream_id, moved.stream_id);
+        assert_eq!(started.stripped_channel, moved.stripped_channel);
+        assert_eq!(started.original_channel, moved.original_channel);
+        assert_eq!(started.source_identity, moved.source_identity);
+
+        assert!(matches!(
+            catalog.start_position(id + 1, 0),
+            Err(CatalogError::UnknownRecording { .. })
+        ));
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        let read_back = reopened.recording(id).expect("read back");
+        assert_eq!(262_144, read_back.start_position);
+        assert_eq!(524_288, read_back.stop_position);
+    }
+
+    /// Substituting a **longer** record moves everything behind it, and the
+    /// ones that moved are still themselves
+    /// (`Catalog.replaceRecording`, `Catalog.java:664-745`).
+    ///
+    /// One caller substitutes a channel, and a channel is a string — so the
+    /// record it writes is as likely to be longer as shorter. A catalog is
+    /// packed, so a longer record pushes the tail along, and the offsets in the
+    /// index are absolute, so they have to be told (`:824-838`). What could go
+    /// wrong is silent: a tail moved without the index moved with it reads back
+    /// as a **different recording's** bytes.
+    #[test]
+    fn a_record_that_grows_moves_the_ones_behind_it() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let first = catalog.add_recording(&recording(0)).expect("added");
+        let second = catalog.add_recording(&recording(1)).expect("added");
+        let third = catalog.add_recording(&recording(2)).expect("added");
+
+        let before_second = catalog.recording(second).expect("read");
+        let before_third = catalog.recording(third).expect("read");
+
+        let mut changed = catalog.recording(first).expect("read");
+        let longer = format!(
+            "aeron:udp?endpoint=localhost:9000|alias={}",
+            "x".repeat(4096)
+        );
+        changed.original_channel = longer.clone();
+        changed.stripped_channel = longer;
+
+        catalog.replace_recording(&changed).expect("replaced");
+
+        assert_eq!(
+            changed.original_channel,
+            catalog.recording(first).expect("read").original_channel,
+            "the record that changed"
+        );
+        assert_eq!(
+            before_second.original_channel,
+            catalog.recording(second).expect("read").original_channel,
+            "and the two that moved behind it"
+        );
+        assert_eq!(
+            before_third.start_position,
+            catalog.recording(third).expect("read").start_position
+        );
+        assert_eq!(3, catalog.count_entries(), "none of them lost");
+
+        drop(catalog);
+
+        let reopened = Catalog::open(dir.path()).expect("open");
+        assert_eq!(
+            changed.original_channel,
+            reopened
+                .recording(first)
+                .expect("read back")
+                .original_channel
+        );
+        assert_eq!(
+            before_second.original_channel,
+            reopened
+                .recording(second)
+                .expect("read back")
+                .original_channel
+        );
+        assert_eq!(
+            before_third.original_channel,
+            reopened
+                .recording(third)
+                .expect("read back")
+                .original_channel
+        );
+    }
+
+    /// And a **shorter** one leaves its slack as zeros rather than as the bytes
+    /// of the record it replaced (`Catalog.java:820-823`).
+    #[test]
+    fn a_record_that_shrinks_leaves_zeros_behind_it() {
+        let dir = TempDir::new();
+        let mut catalog = created(&dir);
+
+        let first = catalog.add_recording(&recording(0)).expect("added");
+        let second = catalog.add_recording(&recording(1)).expect("added");
+        let before_second = catalog.recording(second).expect("read");
+
+        let mut changed = catalog.recording(first).expect("read");
+        changed.original_channel = "aeron:ipc".to_owned();
+        changed.stripped_channel = "aeron:ipc".to_owned();
+
+        catalog.replace_recording(&changed).expect("replaced");
+
+        assert_eq!(
+            "aeron:ipc",
+            catalog.recording(first).expect("read").original_channel
+        );
+        assert_eq!(
+            before_second.original_channel,
+            catalog.recording(second).expect("read").original_channel,
+            "the record behind it did not move, and did not change either"
         );
     }
 

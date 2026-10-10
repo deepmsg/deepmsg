@@ -123,7 +123,10 @@ use deepmsg_core::version::{format_version, semantic_version_major};
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
-use crate::segment::SegmentSummary;
+use crate::segment::{
+    SegmentSummary, erase_tail, find_term_offset_for_start, header_matches_position,
+    segment_file_base_position, segment_file_name,
+};
 use crate::server::auth::{
     AuthError, Authenticator, AuthorisationService, authenticator, authorisation_service,
 };
@@ -143,6 +146,10 @@ use crate::server::counters::{
 use crate::server::create_replay_publication::{
     CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
 };
+use crate::server::delete_segments::{
+    DeleteSegmentsSession, Progress as DeleteProgress, find_detached_segments, list_segment_files,
+    min_segment_position,
+};
 use crate::server::recorder::Recorder;
 use crate::server::recording_pos::RecordingPos;
 use crate::server::recording_session::RecordingSession;
@@ -151,6 +158,7 @@ use crate::server::replay_session::{
 };
 use crate::server::replayer::Replayer;
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
+use deepmsg_codec::archive::recording_state::RecordingState;
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
 /// client writes when it wants a channel of its own to be answered on
@@ -715,8 +723,10 @@ pub const ACTIVE_LISTING: i64 = 1;
 pub const ACTIVE_LISTING_MSG: &str = "active listing already in progress";
 
 /// `ArchiveException.ACTIVE_RECORDING` (`client/ArchiveException.java:39`), the
-/// refusal an extend gets for a recording that is still in flight
-/// (`ArchiveConductor.java:1093-1098`, `:2066-2072`).
+/// refusal for asking about a recording that is still in flight: an extend
+/// (`ArchiveConductor.java:1093-1098`, `:2066-2072`), a truncate of one
+/// (`:2218-2220`), and a purge of one — or of one a replay is reading
+/// (`:2238-2250`).
 pub const ACTIVE_RECORDING: i64 = 2;
 
 /// `ArchiveException.INVALID_EXTENSION` (`:74`), the refusal an image that does
@@ -856,6 +866,80 @@ enum Action {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+    },
+    /// One of the requests that move or remove a recording's **segments** — see
+    /// [`SegmentRequest`] for why they are one variant rather than seven.
+    Segment(SegmentRequest),
+    /// `ArchiveConductor.updateChannel` (`:708-735`): the channel a recording
+    /// was made on, replaced by another one.
+    ///
+    /// Not a [`SegmentRequest`], because it touches a recording's **row** and no
+    /// file at all — and what it writes is a record of a different length.
+    UpdateChannel {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: String,
+    },
+}
+
+/// The requests that move a recording's **start** or remove the files below it
+/// (`ArchiveConductor.java` `detachSegments`, `deleteDetachedSegments`,
+/// `purgeSegments`, `attachSegments`, `truncateRecording` and
+/// `purgeRecording`).
+///
+/// Six requests, one variant. The reference has six methods and six decode
+/// arms, and they differ in what they carry and in what they do — but what they
+/// are *to the conductor* is one family: each one is a change to where a
+/// recording begins or ends and to which files it still owns, taken in a turn
+/// of its own. That is the argument [`Query`] was collapsed under, and it
+/// applies here for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentRequest {
+    /// `ArchiveConductor.detachSegments` (`:1495-1507`), which is one write and
+    /// an answer.
+    Detach {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    },
+    /// `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
+    DeleteDetached {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`): walk the recording's
+    /// segments **backwards** and move its start back over the ones that are
+    /// there and whole.
+    Attach {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`): move the stop, cut
+    /// the segment the new stop falls in, and delete what is past it.
+    Truncate {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+    },
+    /// `ArchiveConductor.purgeRecording` (`:1251-1263`): every file, and the
+    /// recording out of the catalog with them.
+    PurgeRecording {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    },
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`): a detach and the delete
+    /// of what it detached, in one request.
+    PurgeSegments {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
     },
 }
 
@@ -1614,6 +1698,15 @@ pub struct Sessions {
     /// `replaySessionByIdMap` (`:146`): the replays in flight, by the id the
     /// client's OK carried.
     replay_sessions: HashMap<i64, ReplayEntry>,
+    /// `deleteSegmentsSessionByIdMap` (`:147`): the deletes in flight, by the
+    /// recording they are removing.
+    ///
+    /// Keyed by the **recording** rather than by a session id the reference
+    /// mints from it: `DeleteSegmentsSession.sessionId()` *is* the recording id
+    /// (`DeleteSegmentsSession.java:103-106`), and the only two questions asked
+    /// of the map are "is there one for this recording" (`:1962-1972`) and "how
+    /// far does its delete reach" (`:880-886`).
+    delete_sessions: Vec<DeleteSegmentsSession>,
     /// Publications being made, before there is a session to put one in. The
     /// reference keeps these in the same session array as everything else
     /// (`addSession`, `:921`); here they are their own list, and a failure in
@@ -1675,6 +1768,61 @@ pub const REPLAY_ALL_AND_FOLLOW: i64 = -1;
 
 /// `AeronArchive.REPLAY_ALL_AND_STOP` (`client/AeronArchive.java:122`).
 pub const REPLAY_ALL_AND_STOP: i64 = -2;
+
+/// Cut the segment a truncate stops inside, and refuse if the stop is not a
+/// frame boundary (`ArchiveConductor.eraseRemainingSegment`, `:2535-2575`).
+///
+/// The check comes **first** and that is the point: cutting a segment at a byte
+/// that is not the start of a frame leaves a file whose tail begins in the
+/// middle of a frame, and the next reader of that recording has no way to tell.
+/// The reference refuses rather than cutting (`:2550-2554`), and the refusal is
+/// this build's one wording that is not the reference's — its message is the
+/// position and the words "position not aligned to a data header", which is what
+/// this says too.
+///
+/// # Errors
+///
+/// The message to answer the client with.
+#[allow(clippy::too_many_arguments)] // the reference's own parameter list
+fn erase_remaining_segment(
+    path: &std::path::Path,
+    position: i64,
+    segment_offset: i64,
+    term_length: i32,
+    initial_term_id: i32,
+    stream_id: i32,
+    segment_length: i32,
+) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+
+    let bits_to_shift = bits_to_shift(term_length).unwrap_or(0);
+    let term_offset = i32::try_from(position & i64::from(term_length - 1)).unwrap_or(-1);
+    let term_id = i32::try_from(position >> bits_to_shift)
+        .unwrap_or(0)
+        .wrapping_add(initial_term_id);
+
+    let aligned = header_matches_position(
+        &file,
+        u64::try_from(segment_offset).unwrap_or(0),
+        term_offset,
+        term_id,
+        stream_id,
+    )
+    .map_err(|error| error.to_string())?;
+
+    if !aligned {
+        return Err(format!("{position} position not aligned to a data header"));
+    }
+
+    drop(file);
+
+    erase_tail(
+        path,
+        u64::try_from(segment_offset).unwrap_or(0),
+        segment_length,
+    )
+    .map_err(|error| error.to_string())
+}
 
 /// What a turn reads about a replay's limit, per replay in flight.
 ///
@@ -2025,6 +2173,7 @@ impl Sessions {
             next_replay_id: 1,
             num_active_replays: 0,
             replay_sessions: HashMap::new(),
+            delete_sessions: Vec::new(),
             creating_replays: Vec::new(),
             replayer: Replayer::new(archive_id),
             replay_tokens: HashMap::new(),
@@ -2106,6 +2255,7 @@ impl Sessions {
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
         self.drive_replays(client, counters, catalog, now_ms);
+        self.drive_delete_segments(client, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
     }
@@ -2650,7 +2800,7 @@ impl Sessions {
             Some(limit_counter_id) => match resolve_limit_counter(counters, limit_counter_id) {
                 Some(limit) => Some(limit),
                 None => {
-                    self.refuse_replay(
+                    self.refuse_request(
                         session_id,
                         correlation_id,
                         0,
@@ -2666,7 +2816,7 @@ impl Sessions {
         };
 
         let Ok(recording) = catalog.recording(request.recording_id) else {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 UNKNOWN_RECORDING,
@@ -2691,7 +2841,7 @@ impl Sessions {
             if let Some((relevant_id, message)) =
                 invalid_replay_position(request.recording_id, request.position, &recording)
             {
-                self.refuse_replay(session_id, correlation_id, relevant_id, message);
+                self.refuse_request(session_id, correlation_id, relevant_id, message);
                 return;
             }
 
@@ -2701,7 +2851,7 @@ impl Sessions {
         // `:816-819`: the block a replay reads at a time has to be able to hold
         // one of this recording's frames.
         if request.file_io_max_length > 0 && request.file_io_max_length < recording.mtu_length {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2722,7 +2872,7 @@ impl Sessions {
         let mtu_length = usize::try_from(recording.mtu_length).unwrap_or(0);
 
         if archive_buffer < mtu_length {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2758,7 +2908,7 @@ impl Sessions {
         let (stop_position, max_length) = match limit_position {
             Some(limit) => {
                 if replay_position > limit {
-                    self.refuse_replay(
+                    self.refuse_request(
                         session_id,
                         correlation_id,
                         INVALID_POSITION,
@@ -2775,6 +2925,33 @@ impl Sessions {
                 (stop, stop - replay_position)
             }
         };
+
+        // `:880-886`: a delete of this recording that has not finished refuses
+        // a replay that would read past where it reaches. The comparison is
+        // between two segment positions and the recording's own stop, and both
+        // halves matter — a replay that stops at or before the stop of a
+        // **stopped** recording is reading files no delete is holding.
+        if let Some(session) = self
+            .delete_sessions
+            .iter()
+            .find(|session| session.recording_id() == request.recording_id)
+        {
+            if session.max_delete_position() > recording.stop_position
+                && stop_position > recording.stop_position
+            {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!(
+                        "cannot start replay of recording {} due to an outstanding delete \
+                         operation",
+                        request.recording_id
+                    ),
+                );
+                return;
+            }
+        }
 
         // The three branches (`:851-869`), and both sentinels are the client's
         // own. A recording that has not stopped has `NULL_VALUE` for its stop,
@@ -2797,7 +2974,7 @@ impl Sessions {
                 // takes the first match, and the error is first — and no C case
                 // asserts the count, so this is a missing `return` upstream
                 // rather than a behaviour. This build refuses and stops.
-                self.refuse_replay(
+                self.refuse_request(
                     session_id,
                     correlation_id,
                     EMPTY_RECORDING,
@@ -2816,7 +2993,7 @@ impl Sessions {
         };
 
         if replay_length < 0 {
-            self.refuse_replay(
+            self.refuse_request(
                 session_id,
                 correlation_id,
                 0,
@@ -2840,7 +3017,7 @@ impl Sessions {
         ) {
             Ok(channel) => channel,
             Err(error) => {
-                self.refuse_replay(
+                self.refuse_request(
                     session_id,
                     correlation_id,
                     0,
@@ -2933,10 +3110,154 @@ impl Sessions {
     /// `ArchiveConductor.stopAllReplays` (`:1056-1064`): every replay, or every
     /// replay **of one recording** — `NULL_VALUE` for the id means all of them.
     fn stop_all_replays(&mut self, recording_id: i64, session_id: i64, correlation_id: i64) {
+        self.abort_replays_of(recording_id);
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: 0,
+        });
+    }
+
+    /// The **abort** half of `stopAllReplays`, which a truncate needs on its own:
+    /// it is about to delete the very files a replay is reading, and the
+    /// reference aborts them without answering anybody
+    /// (`ArchiveConductor.java:1240`).
+    fn abort_replays_of(&mut self, recording_id: i64) {
         for entry in self.replay_sessions.values_mut() {
             if recording_id == NULL_VALUE || entry.session.recording_id() == recording_id {
                 entry.session.abort();
             }
+        }
+    }
+
+    /// One of the six segment requests (`ArchiveConductor.java:1199-1660`).
+    ///
+    /// The reference has six methods reached from six decode arms; this is the
+    /// one place they are told apart, and each of them is then the same shape:
+    /// refuse, or build a file list and hand it to the delete session.
+    fn run_segment_request(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        request: SegmentRequest,
+        now_ms: i64,
+    ) {
+        match request {
+            SegmentRequest::Detach {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            } => self.detach_segments(
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            ),
+            SegmentRequest::DeleteDetached {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.delete_detached_segments(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                now_ms,
+            ),
+            SegmentRequest::Attach {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.attach_segments(catalog, session_id, correlation_id, recording_id),
+            SegmentRequest::Truncate {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
+            } => self.truncate_recording(
+                client,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
+                now_ms,
+            ),
+            SegmentRequest::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            } => self.purge_recording(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                now_ms,
+            ),
+            SegmentRequest::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            } => self.purge_segments(
+                client,
+                counters,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+                now_ms,
+            ),
+        }
+    }
+
+    /// `ArchiveConductor.detachSegments` (`:1495-1507`).
+    ///
+    /// **One write and an answer.** The files below the new start are not
+    /// touched: what makes them *detached* is that the recording no longer
+    /// claims them, and they go when something asks for them to go
+    /// ([`SegmentRequest::DeleteDetached`]) or when a purge takes them with the
+    /// start move.
+    fn detach_segments<Access>(
+        &mut self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) =
+            self.invalid_detach(counters, catalog, recording_id, new_start_position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if let Err(error) = catalog.start_position(recording_id, new_start_position) {
+            self.warnings
+                .push(format!("could not move a recording's start: {error}"));
+            return;
         }
 
         self.pending.push(Deferred::Ok {
@@ -2944,6 +3265,854 @@ impl Sessions {
             correlation_id,
             relevant_id: 0,
         });
+    }
+
+    /// `ArchiveConductor.deleteDetachedSegments` (`:1509-1533`).
+    ///
+    /// The files it removes are the ones **below** the recording's start, and
+    /// the walk down stops at the lowest segment base position in the
+    /// directory — which is why the directory is listed first, for a number
+    /// rather than for the files.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn delete_detached_segments(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let files = list_segment_files(&self.recording.archive_dir, recording_id);
+        let detached = match (
+            min_segment_position(&files),
+            catalog.recording(recording_id),
+        ) {
+            (Some(oldest), Ok(recording)) => find_detached_segments(
+                &self.recording.archive_dir,
+                recording_id,
+                recording.start_position,
+                oldest,
+                recording.term_buffer_length,
+                recording.segment_file_length,
+            ),
+            _ => Vec::new(),
+        };
+
+        // `awaitReplaysStop` is **false**: a detach moved nothing, so no replay
+        // is reading anything that is about to go (`:1532`).
+        let _ = (counters, now_ms);
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            detached,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.truncateRecording` (`:1199-1246`).
+    ///
+    /// Four steps, and the third is the one that is easy to get wrong:
+    ///
+    /// 1. the **stop moves first** (`:1213`), so that a reader between the two
+    ///    halves sees a recording that ends earlier rather than files it no
+    ///    longer owns;
+    /// 2. the segment file the new stop falls **inside** is cut at the stop and
+    ///    left zero beyond it ([`segment::erase_tail`]) — unless the stop is on
+    ///    a segment boundary, where there is nothing inside to cut and the file
+    ///    is deleted whole instead;
+    /// 3. every segment after that one is deleted;
+    /// 4. and a replay of this recording is aborted before any of it, because
+    ///    what is about to go is what it is reading.
+    ///
+    /// A truncate to the recording's **own start** is the degenerate case the
+    /// reference spells out (`:1215-1218`): there is no segment to keep, so
+    /// every file goes and the recording is left empty — which is what
+    /// `shouldRecordThenReplayThenTruncate` asserts as `start == stop`.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn truncate_recording(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) = self.invalid_truncate(catalog, recording_id, position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let stop_position = recording.stop_position;
+        let start_position = recording.start_position;
+        let segment_length = recording.segment_file_length;
+        let term_length = recording.term_buffer_length;
+
+        let segment_base_position =
+            segment_file_base_position(start_position, position, term_length, segment_length);
+        let segment_offset = position - segment_base_position;
+
+        let _ = catalog.stop_position(recording_id, position);
+
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+
+        if start_position == position {
+            // A truncate to the start keeps no file at all.
+            files = list_segment_files(&self.recording.archive_dir, recording_id);
+        } else {
+            if segment_offset > 0 {
+                // The stop is inside a segment: the reference cuts that one and
+                // only deletes the ones after it (`:1219-1233`).
+                if stop_position != position {
+                    let path = self
+                        .recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, segment_base_position));
+
+                    if let Err(message) = erase_remaining_segment(
+                        &path,
+                        position,
+                        segment_offset,
+                        term_length,
+                        recording.initial_term_id,
+                        recording.stream_id,
+                        segment_length,
+                    ) {
+                        self.refuse_request(session_id, correlation_id, 0, message);
+                        return;
+                    }
+                }
+            } else {
+                // On a boundary: nothing inside the segment to cut, so it goes
+                // with the rest.
+                files.push(
+                    self.recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, segment_base_position)),
+                );
+            }
+
+            let mut base = segment_base_position + i64::from(segment_length);
+
+            while base <= stop_position {
+                files.push(
+                    self.recording
+                        .archive_dir
+                        .join(segment_file_name(recording_id, base)),
+                );
+                base += i64::from(segment_length);
+            }
+        }
+
+        // `stopAllReplays(recordingId)` (`:1240`), without an answer: nobody
+        // asked for the stop.
+        self.abort_replays_of(recording_id);
+
+        // `awaitReplaysStop` is **true** here and false in every other caller:
+        // the replays were just aborted and have not yet noticed
+        // (`:1245`).
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            true,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.updateChannel` (`:708-735`), which the reference does
+    /// through an `UpdateChannelSession`.
+    ///
+    /// **One turn here, and the reference's session is why it is not one there.**
+    /// Its session reads the recording's descriptor into a buffer, substitutes
+    /// two fields, writes it back and marks the control session as having a
+    /// listing in progress while it does (`:728-733`) — the session exists
+    /// because that read-and-rewrite wants a buffer the conductor owns and a
+    /// window in which the session is "active". Here the read is
+    /// [`Catalog::recording`], the substitution is two field assignments and the
+    /// write is [`Catalog::replace_recording`], all of which the conductor can
+    /// do in the turn it was asked — so the **listing check** is kept (it is a
+    /// refusal a client can see) and the **claim** is not (nothing else runs
+    /// between the check and the answer).
+    ///
+    /// `strippedChannelBuilder` is S2's, and it is the whole of what the C
+    /// suite's `shouldUpdateChannel` asserts about the new channel: the
+    /// parameters the strip list keeps are the ones the descriptor must carry.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn update_channel(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+        now_ms: i64,
+    ) {
+        if self.has_active_listing(session_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                ACTIVE_LISTING,
+                ACTIVE_LISTING_MSG.to_owned(),
+            );
+            return;
+        }
+
+        if !catalog.has_recording(recording_id) {
+            if let Some(entry) = self.sessions.get_mut(&session_id) {
+                entry
+                    .control
+                    .send_recording_unknown(correlation_id, recording_id, now_ms, client);
+            }
+            return;
+        }
+
+        // A channel that will not parse is the one case the reference does not
+        // survive — `ChannelUri.parse` throws and takes the archive with it — so
+        // this refuses the request with this build's words for it, as
+        // `start_recording` does with the same parse.
+        let stripped_channel = match ChannelUri::parse(channel) {
+            Ok(uri) => stripped_channel_builder(&uri).build(),
+            Err(error) => {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!("replay channel could not be read: {error}"),
+                );
+                return;
+            }
+        };
+
+        let Ok(mut recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        // Two fields, and the reference substitutes them into every field it
+        // read out of the descriptor (`UpdateChannelSession.java:96-118`), so
+        // nothing else about the recording is disturbed.
+        recording.original_channel = channel.to_owned();
+        recording.stripped_channel = stripped_channel;
+
+        match catalog.replace_recording(&recording) {
+            Ok(()) => self.pending.push(Deferred::Ok {
+                session_id,
+                correlation_id,
+                relevant_id: 0,
+            }),
+            Err(error) => self.refuse_request(
+                session_id,
+                correlation_id,
+                0,
+                format!("could not write the recording's new channel: {error}"),
+            ),
+        }
+    }
+
+    /// `ArchiveConductor.attachSegments` (`:1556-1617`).
+    ///
+    /// The walk is **backwards** from the segment before the recording's start,
+    /// and it stops at the first thing that is not a whole segment of this
+    /// recording — or at the first segment that does not begin at offset 0,
+    /// which is where the recording's start moves to instead
+    /// (`:1600-1612`).
+    ///
+    /// What it answers with is the **count** of segments taken back, which is
+    /// what the C suite asserts (`shouldDetachAndReattachSegments` expects the
+    /// four that a detach of four gave away).
+    ///
+    /// Only `hasRecording` is checked: the reference refuses on nothing else
+    /// before the walk, and every refusal inside it is about a file — one that
+    /// is not the segment length, one that cannot be read, one whose first frame
+    /// is not where it should be.
+    fn attach_segments(
+        &mut self,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let segment_length = recording.segment_file_length;
+        let term_length = recording.term_buffer_length;
+        let bits_to_shift = bits_to_shift(term_length).unwrap_or(0);
+        let initial_term_id = recording.initial_term_id;
+        let stream_id = recording.stream_id;
+
+        let mut position = recording.start_position - i64::from(segment_length);
+        let mut count = 0_i64;
+
+        while position >= 0 {
+            let path = self
+                .recording
+                .archive_dir
+                .join(segment_file_name(recording_id, position));
+
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                // No file here, and no file before it either: the walk is over.
+                break;
+            };
+
+            if metadata.len() != u64::try_from(segment_length).unwrap_or(0) {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!(
+                        "fileLength={} not equal to segmentLength={segment_length}",
+                        metadata.len()
+                    ),
+                );
+                return;
+            }
+
+            let term_id = i32::try_from(position >> bits_to_shift)
+                .unwrap_or(0)
+                .wrapping_add(initial_term_id);
+
+            match find_term_offset_for_start(&path, term_length, term_id, stream_id) {
+                Err(message) => {
+                    self.refuse_request(session_id, correlation_id, 0, message);
+                    return;
+                }
+                // The file said no in its own words and has already been
+                // answered for.
+                Ok(None) => return,
+                Ok(Some(0)) => {
+                    let _ = catalog.start_position(recording_id, position);
+                    count += 1;
+                    position -= i64::from(segment_length);
+                }
+                Ok(Some(term_offset)) => {
+                    let start = position + i64::try_from(term_offset).unwrap_or(0);
+
+                    let _ = catalog.start_position(recording_id, start);
+                    count += 1;
+                    break;
+                }
+            }
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: count,
+        });
+    }
+
+    /// `ArchiveConductor.isValidTruncate` (`:2209-2232`): two refusals.
+    fn invalid_truncate(
+        &self,
+        catalog: &Catalog,
+        recording_id: i64,
+        position: i64,
+    ) -> Option<(i64, String)> {
+        let recording = catalog.recording(recording_id).ok()?;
+        let start_position = recording.start_position;
+        let stop_position = recording.stop_position;
+
+        if stop_position == NULL_VALUE {
+            return Some((
+                ACTIVE_RECORDING,
+                "cannot truncate active recording".to_owned(),
+            ));
+        }
+
+        if position < start_position
+            || position > stop_position
+            || position % i64::from(FRAME_ALIGNMENT) != 0
+        {
+            return Some((
+                INVALID_POSITION,
+                format!(
+                    "invalid position {position}: start={start_position} stop={stop_position} \
+                     alignment={FRAME_ALIGNMENT}"
+                ),
+            ));
+        }
+
+        None
+    }
+
+    /// `ArchiveConductor.purgeRecording` (`:1251-1263`).
+    ///
+    /// The one request that takes a recording **out of the catalog**: the row's
+    /// state goes `DELETED` and the index drops it
+    /// ([`Catalog::change_state`]), so a listing afterwards finds nothing while
+    /// the bytes of the row are still in the file.
+    ///
+    /// The state is changed **before** the files are listed, which is the
+    /// reference's order and the safe one: a client that asks about the
+    /// recording while its files are going is told it is not there rather than
+    /// being handed a row whose files are half gone.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn purge_recording(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) = self.invalid_purge(counters, catalog, recording_id) {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let _ = catalog.change_state(recording_id, RecordingState::DELETED);
+
+        let files = list_segment_files(&self.recording.archive_dir, recording_id);
+
+        // `awaitReplaysStop` is **false** here: `isValidPurge` has already
+        // refused a recording with a replay in flight (`:1256`), so by the time
+        // there is a list to delete, there is nothing reading it.
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.purgeSegments` (`:1535-1554`): the start moves, and
+    /// what the **old** start was claiming goes.
+    ///
+    /// The order is the reference's and it is not interchangeable with a detach
+    /// followed by a delete: the files to remove are worked out from the start
+    /// the recording had *before* the move (`:1551-1553`), so moving first and
+    /// asking afterwards would ask about a recording that no longer claims them.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn purge_segments(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        now_ms: i64,
+    ) {
+        if !catalog.has_recording(recording_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                unknown_recording_message(recording_id),
+            );
+            return;
+        }
+
+        if let Some((relevant_id, message)) =
+            self.invalid_detach(counters, catalog, recording_id, new_start_position)
+        {
+            self.refuse_request(session_id, correlation_id, relevant_id, message);
+            return;
+        }
+
+        if !self.is_delete_allowed(session_id, correlation_id, recording_id) {
+            return;
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        let old_start_position = recording.start_position;
+
+        if let Err(error) = catalog.start_position(recording_id, new_start_position) {
+            self.warnings
+                .push(format!("could not move a recording's start: {error}"));
+            return;
+        }
+
+        let files = find_detached_segments(
+            &self.recording.archive_dir,
+            recording_id,
+            new_start_position,
+            old_start_position,
+            recording.term_buffer_length,
+            recording.segment_file_length,
+        );
+
+        self.delete_segments(
+            client,
+            session_id,
+            correlation_id,
+            recording_id,
+            files,
+            false,
+            now_ms,
+        );
+    }
+
+    /// `ArchiveConductor.isValidPurge` (`:2234-2254`): two refusals, and both
+    /// are `ACTIVE_RECORDING`.
+    ///
+    /// The first is about a **replay** rather than about the recording, which is
+    /// why it is not the `hasRecording` gate: a recording with a replay reading
+    /// it is one whose files cannot go yet, whatever state its row is in.
+    fn invalid_purge<Access>(
+        &self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &Catalog,
+        recording_id: i64,
+    ) -> Option<(i64, String)> {
+        if self
+            .replay_sessions
+            .values()
+            .any(|entry| entry.session.recording_id() == recording_id)
+        {
+            return Some((
+                ACTIVE_RECORDING,
+                format!("cannot purge recording with active replay {recording_id}"),
+            ));
+        }
+
+        let Ok(recording) = catalog.recording(recording_id) else {
+            return None;
+        };
+
+        // `NULL_POSITION == stopPosition` is a recording that has not stopped —
+        // the catalog's own answer, and the same one the replay path reads.
+        if recording.stop_position == NULL_VALUE {
+            return Some((
+                ACTIVE_RECORDING,
+                format!("cannot purge active recording {recording_id}"),
+            ));
+        }
+
+        // `counters` is here for the shape the other two validations have; a
+        // purge asks the catalog and the replay map and nothing else.
+        let _ = counters;
+
+        None
+    }
+
+    /// `ArchiveConductor.isValidDetach` (`:2290-2325`): three refusals, and the
+    /// third one is a bound that moves — a recording still being written is
+    /// bounded by where it has got to, and a replay in flight bounds it too.
+    ///
+    /// Returns the code and the message, or `None` when the position is one
+    /// this recording can be detached at. All three carry `GENERIC`: the
+    /// reference's `sendErrorResponse(correlationId, msg)` there is the overload
+    /// that names no code (`:2304`, `:2311`, `:2318`).
+    fn invalid_detach<Access>(
+        &self,
+        counters: &CountersReader<'_, Access>,
+        catalog: &Catalog,
+        recording_id: i64,
+        position: i64,
+    ) -> Option<(i64, String)> {
+        let recording = catalog.recording(recording_id).ok()?;
+        let term_length = recording.term_buffer_length;
+        let segment_length = recording.segment_file_length;
+        let start_position = recording.start_position;
+
+        let lower_bound =
+            segment_file_base_position(start_position, start_position, term_length, segment_length)
+                + i64::from(segment_length);
+
+        if position
+            != segment_file_base_position(start_position, position, term_length, segment_length)
+        {
+            return Some((
+                0,
+                format!("invalid segment start: newStartPosition={position}"),
+            ));
+        }
+
+        if position < lower_bound {
+            return Some((
+                0,
+                format!("invalid detach: newStartPosition={position} lowerBound={lower_bound}"),
+            ));
+        }
+
+        // The upper bound: where a recording that is still being written has got
+        // to, or the stop position of one that is not.
+        let end_position = self
+            .live_recording_position(counters, recording_id, start_position)
+            .unwrap_or(recording.stop_position);
+        let end_position =
+            segment_file_base_position(start_position, end_position, term_length, segment_length);
+
+        if position > end_position {
+            return Some((
+                0,
+                format!(
+                    "invalid detach: in use, newStartPosition={position} upperBound={end_position}"
+                ),
+            ));
+        }
+
+        // And a replay that is reading the very files the detach would give
+        // away (`:2322-2332`).
+        let replay_base = self
+            .replay_sessions
+            .values()
+            .filter(|entry| entry.session.recording_id() == recording_id)
+            .map(|entry| {
+                segment_file_base_position(
+                    start_position,
+                    entry.session.replay_position(),
+                    term_length,
+                    segment_length,
+                )
+            })
+            .min();
+
+        if let Some(replay_base) = replay_base {
+            if replay_base < position {
+                return Some((
+                    0,
+                    format!(
+                        "invalid detach: replay in progress, newStartPosition={position}                          replayPosition={replay_base}"
+                    ),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// `isDeleteAllowed` (`:1962-1972`): one delete per recording at a time.
+    fn is_delete_allowed(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+    ) -> bool {
+        if self
+            .delete_sessions
+            .iter()
+            .any(|session| session.recording_id() == recording_id)
+        {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                0,
+                format!("another delete operation in progress for recording id: {recording_id}"),
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// `ArchiveConductor.deleteSegments` (`:2619-2634`): the answer, and the
+    /// session that does the work.
+    ///
+    /// The `Ok` goes out **before** anything is deleted and carries the number
+    /// of files as its relevant id — that is the count the C suite asserts. And
+    /// an **empty** list sends the DELETE signal itself, because then there is
+    /// no session whose `close` would send it.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn delete_segments(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        files: Vec<std::path::PathBuf>,
+        await_replays_stop: bool,
+        now_ms: i64,
+    ) {
+        let count = i64::try_from(files.len()).unwrap_or(i64::MAX);
+
+        if !files.is_empty() {
+            self.delete_sessions.push(DeleteSegmentsSession::new(
+                recording_id,
+                session_id,
+                correlation_id,
+                files,
+                await_replays_stop,
+            ));
+        }
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: count,
+        });
+
+        if 0 == count {
+            self.send_signal(
+                client,
+                session_id,
+                correlation_id,
+                recording_id,
+                RecordingSignal::DELETE,
+                now_ms,
+            );
+        }
+    }
+
+    /// `ControlSession.sendSignal` (`ControlSession.java:735-750`), with the two
+    /// fields a delete has no values for.
+    ///
+    /// Not deferred: the two callers are the conductor's own turn
+    /// ([`Sessions::drive_delete_segments`]) and an action, and both hold the
+    /// client.
+    fn send_signal(
+        &mut self,
+        client: &mut Client,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        signal: RecordingSignal,
+        now_ms: i64,
+    ) {
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry.control.send_signal(
+                correlation_id,
+                recording_id,
+                NULL_VALUE,
+                NULL_VALUE,
+                signal,
+                now_ms,
+                client,
+            );
+        }
+    }
+
+    /// One turn of every delete in flight (`SessionWorker.doWork`,
+    /// `SessionWorker.java:56-81`).
+    ///
+    /// A session that is **done** is closed here, and its `close` is what sends
+    /// the DELETE recording signal (`DeleteSegmentsSession.java:76-80`) — which
+    /// is why the signal arrives turns after the OK that answered the request,
+    /// and why the C suite polls for it rather than reading it.
+    fn drive_delete_segments(&mut self, client: &mut Client, now_ms: i64) {
+        if self.delete_sessions.is_empty() {
+            return;
+        }
+
+        // Which recordings still have a replay reading them. Read out before the
+        // sessions are walked for the same reason `drive_replay_sessions` reads
+        // its limits first: the answer is the conductor's, and a session is
+        // borrowed for the walk.
+        let busy: Vec<i64> = self
+            .replay_sessions
+            .values()
+            .map(|entry| entry.session.recording_id())
+            .collect();
+
+        let mut finished: Vec<i64> = Vec::new();
+
+        for session in &mut self.delete_sessions {
+            let in_progress = busy.contains(&session.recording_id());
+
+            match session.do_work(in_progress) {
+                DeleteProgress::Failed(message) => {
+                    self.pending.push(Deferred::Error {
+                        session_id: session.session_id(),
+                        correlation_id: session.correlation_id(),
+                        relevant_id: 0,
+                        message,
+                    });
+                }
+                DeleteProgress::Finished => finished.push(session.recording_id()),
+                DeleteProgress::AwaitingReplays
+                | DeleteProgress::StoppedWaiting
+                | DeleteProgress::Deleted => {}
+            }
+        }
+
+        for recording_id in finished {
+            let Some(index) = self
+                .delete_sessions
+                .iter()
+                .position(|session| session.recording_id() == recording_id)
+            else {
+                continue;
+            };
+
+            let session = self.delete_sessions.remove(index);
+
+            self.send_signal(
+                client,
+                session.session_id(),
+                session.correlation_id(),
+                recording_id,
+                RecordingSignal::DELETE,
+                now_ms,
+            );
+        }
     }
 
     /// `ArchiveConductor.onReplayEnd` (`:936-939`).
@@ -3086,7 +4255,7 @@ impl Sessions {
                             // publication: give it back to the driver and say so.
                             creating.close(client);
                             self.on_replay_end();
-                            self.refuse_replay(
+                            self.refuse_request(
                                 control_session_id,
                                 replay.correlation_id,
                                 UNKNOWN_RECORDING,
@@ -3101,7 +4270,7 @@ impl Sessions {
                     // existed, so nothing else will count it down.
                     creating.close(client);
                     self.on_replay_end();
-                    self.refuse_replay(
+                    self.refuse_request(
                         creating.replay().control_session_id,
                         creating.replay().correlation_id,
                         i64::from(code),
@@ -3331,7 +4500,7 @@ impl Sessions {
 
     /// One `ERROR` a replay owes, pushed rather than sent for the reason every
     /// other callback answer is.
-    fn refuse_replay(
+    fn refuse_request(
         &mut self,
         session_id: i64,
         correlation_id: i64,
@@ -3351,7 +4520,7 @@ impl Sessions {
         &mut self,
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
-        catalog: &Catalog,
+        catalog: &mut Catalog,
         action: Action,
         recorder: &mut Recorder,
         now_ms: i64,
@@ -3409,6 +4578,23 @@ impl Sessions {
                 session_id,
                 correlation_id,
                 recording_id,
+                now_ms,
+            ),
+            Action::Segment(request) => {
+                self.run_segment_request(client, counters, catalog, request, now_ms);
+            }
+            Action::UpdateChannel {
+                session_id,
+                correlation_id,
+                recording_id,
+                channel,
+            } => self.update_channel(
+                client,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                &channel,
                 now_ms,
             ),
         }
@@ -4667,7 +5853,7 @@ impl Sessions {
         client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
-        catalog: &Catalog,
+        catalog: &mut Catalog,
         recorder: &mut Recorder,
         now_ms: i64,
     ) {
@@ -5077,6 +6263,122 @@ impl ControlPlane for Sessions {
             correlation_id,
             relevant_id: replay_token,
         });
+    }
+
+    fn on_detach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::Segment(SegmentRequest::Detach {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            })));
+    }
+
+    fn on_delete_detached_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::DeleteDetached {
+                session_id,
+                correlation_id,
+                recording_id,
+            },
+        )));
+    }
+
+    fn on_update_channel(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::UpdateChannel {
+            session_id,
+            correlation_id,
+            recording_id,
+            channel: channel.to_owned(),
+        }));
+    }
+
+    fn on_attach_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending
+            .push(Deferred::Action(Action::Segment(SegmentRequest::Attach {
+                session_id,
+                correlation_id,
+                recording_id,
+            })));
+    }
+
+    fn on_truncate_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::Truncate {
+                session_id,
+                correlation_id,
+                recording_id,
+                position,
+            },
+        )));
+    }
+
+    fn on_purge_recording(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::PurgeRecording {
+                session_id,
+                correlation_id,
+                recording_id,
+            },
+        )));
+    }
+
+    fn on_purge_segments(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        new_start_position: i64,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::Segment(
+            SegmentRequest::PurgeSegments {
+                session_id,
+                correlation_id,
+                recording_id,
+                new_start_position,
+            },
+        )));
     }
 
     fn on_start_replay(&mut self, request: StartReplayRequest, _now_ms: i64) {

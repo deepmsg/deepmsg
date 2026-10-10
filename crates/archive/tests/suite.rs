@@ -17,11 +17,19 @@
 //!
 //! `reference-cases.tsv` is the join between the two. It lists every case the
 //! reference runs — 306 of them, from `--gtest_list_tests` on the suite built
-//! at `664f58e705` — and records which of them this suite owns, so that
-//! "covered" is a fact about a name in a file rather than a feeling. Forty of
-//! them are `client-unit`: unit tests of the reference's *client* library
+//! at `664f58e705` — so that the denominator is a set of **names** rather than a
+//! count, which is all the acceptance run can hold this build to. Forty of them
+//! are `client-unit`: unit tests of the reference's *client* library
 //! (`shouldThrowIf…` argument validation, an async-op leak), which the client
 //! track answers to and this crate does not.
+//!
+//! **It does not say which of its cases this crate owns, and that is a decision
+//! rather than an omission.** It carried a `status` column and a growth rule for
+//! four slices and not one row was ever flipped: which of this build's tests
+//! "owns" which reference case is a human judgement, so no gate could check it,
+//! and what records coverage is the acceptance run's own TSV, one row per case
+//! name. The file's own header keeps the longer version. What is left is what
+//! `suite.rs` was always really guarding: the set of names, per binary.
 //!
 //! `reference-java-cases.tsv` is the same idea for a second instrument. The
 //! reference also has a *Java* archive suite, and whether a driver can carry
@@ -91,8 +99,6 @@ struct Row {
     case: String,
     binary: String,
     kind: Kind,
-    status: String,
-    covered_by: String,
 }
 
 fn ledger() -> Vec<Row> {
@@ -103,15 +109,13 @@ fn ledger() -> Vec<Row> {
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .map(|line| {
             let columns: Vec<&str> = line.split('\t').collect();
-            let [case, binary, kind, status, covered_by] = columns[..] else {
-                panic!("a ledger row is not five columns: {line}");
+            let [case, binary, kind] = columns[..] else {
+                panic!("a ledger row is not three columns (case/binary/kind): {line}");
             };
             Row {
                 case: case.to_string(),
                 binary: binary.to_string(),
                 kind: Kind::parse(kind).unwrap_or_else(|| panic!("{case}: unknown kind {kind:?}")),
-                status: status.to_string(),
-                covered_by: covered_by.to_string(),
             }
         })
         .collect()
@@ -174,55 +178,4 @@ fn every_row_agrees_with_its_binary_about_what_kind_of_case_it_is() {
             row.kind
         );
     }
-}
-
-/// Where a case stands, and that the two columns agree about it.
-///
-/// A `ported` row with no test named would be the worst of the three states —
-/// it reads as done and points at nothing — so the columns are held together
-/// here rather than left to a reviewer to notice.
-#[test]
-fn a_case_is_only_claimed_when_something_claims_it() {
-    let rows = ledger();
-    let mut ported = 0;
-    let mut reference_only = 0;
-
-    for row in &rows {
-        match row.status.as_str() {
-            "pending" => assert!(
-                row.covered_by.is_empty(),
-                "{} is pending and names a test",
-                row.case
-            ),
-            "ported" => {
-                ported += 1;
-                assert!(
-                    row.covered_by.starts_with("tests/"),
-                    "{} is ported but does not name a test: {:?}",
-                    row.case,
-                    row.covered_by
-                );
-            }
-            "reference-only" => {
-                reference_only += 1;
-                assert!(
-                    !row.covered_by.is_empty(),
-                    "{} is left to the acceptance instrument without saying why",
-                    row.case
-                );
-            }
-            other => panic!("{}: unknown status {other:?}", row.case),
-        }
-    }
-
-    // Not an assertion about progress — at the time of writing nothing is
-    // ported, and that is the honest number. It is here so that the suite says
-    // how far along it is in a line of `cargo test` output rather than only in
-    // a document nobody re-reads.
-    println!(
-        "archive suite: {ported} of {REFERENCE_CASES} reference cases ported, \
-         {reference_only} left to the acceptance instrument, \
-         {} pending",
-        rows.len() - ported - reference_only
-    );
 }
