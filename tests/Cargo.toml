@@ -232,6 +232,14 @@ path = "integration/archive_replay.rs"
 name = "archive_queries"
 path = "integration/archive_queries.rs"
 
+# P2-C1's acceptance, first half: what an archive client's context is — the
+# reference's own `AeronCArchiveIdTest` cases, ported value for value. No
+# archive and no driver: a context is decided before anything is connected, so
+# this runs in CI.
+[[test]]
+name = "archive_client"
+path = "integration/archive_client.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused
