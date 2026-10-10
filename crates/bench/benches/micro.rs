@@ -28,16 +28,25 @@
 //! it fails.
 
 use std::hint::black_box;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use deepmsg_client::image::Image;
+use deepmsg_client::log_buffer::LogBuffer;
 use deepmsg_core::buffer::AtomicBuffer;
 use deepmsg_core::logbuffer::append::{Appended, Appender};
-use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::scan::{Availability, scan_for_availability};
+use deepmsg_core::logbuffer::{descriptor, position};
 
 /// The smallest legal term length, so a fixture is 64 KiB and not 16 MiB.
 const TERM_LENGTH: i32 = 64 * 1024;
+
+/// The page size a log buffer's layout is aligned to (`descriptor`'s own, and
+/// what the fixture writes its metadata page through). An `i32` because that is
+/// what the layout arithmetic takes.
+const PAGE: i32 = 4096;
 
 /// A term id that is not zero, so a term id that leaked into a frame is visible.
 const INITIAL_TERM_ID: i32 = 17;
@@ -306,5 +315,175 @@ fn buffer(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, logbuffer_append, term_scan, buffer);
+/// A log buffer **on disk**, which is the only way to get an [`Image`].
+///
+/// The other three groups build their fixtures in memory, because an
+/// [`Appender`] will take a pair of buffers. An `Image` will not: the client
+/// maps a file the driver would have made, so a fixture that wants one has to
+/// make the file — the same three steps the driver does, which are also what
+/// `crates/client/src/image.rs`'s own tests do: size it, put the geometry in its
+/// last page, and write the tails through an appender.
+struct TempLog {
+    path: PathBuf,
+}
+
+impl TempLog {
+    /// The file as the driver leaves it: geometry in the last page, and nothing
+    /// else.
+    fn new(name: &str) -> Self {
+        // A serial as well as the pid: `cargo bench` runs the groups in one
+        // process, and two fixtures naming a file the same would have one
+        // truncate what the other has mapped.
+        static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "deepmsg-micro-{name}-{}-{serial}.log",
+            std::process::id()
+        ));
+
+        let terms = 3 * TERM_LENGTH;
+        let length = position::align_up(terms + PAGE, PAGE);
+
+        let mut file = std::fs::File::create(&path).expect("a temp file");
+        file.set_len(u64::try_from(length).expect("positive"))
+            .expect("sized");
+
+        let mut page = Aligned([0_u8; PAGE as usize]);
+        {
+            let view = AtomicBuffer::from_slice_mut(&mut page.0).expect("8-byte aligned");
+            view.store_i32_relaxed(descriptor::TERM_LENGTH_OFFSET, TERM_LENGTH)
+                .expect("in range");
+            view.store_i32_relaxed(descriptor::INITIAL_TERM_ID_OFFSET, INITIAL_TERM_ID)
+                .expect("in range");
+            view.store_i32_relaxed(
+                descriptor::MTU_LENGTH_OFFSET,
+                descriptor::MTU_LENGTH_DEFAULT,
+            )
+            .expect("in range");
+            view.store_i32_relaxed(descriptor::IS_CONNECTED_OFFSET, 1)
+                .expect("in range");
+        }
+
+        file.seek(SeekFrom::Start(u64::try_from(terms).expect("positive")))
+            .expect("seek");
+        file.write_all(&page.0).expect("the metadata page");
+
+        Self { path }
+    }
+
+    /// What a publisher does to the log before a subscriber maps it: write the
+    /// tails, then whatever the caller wants written.
+    fn prime(&self, f: impl FnOnce(&mut Appender<'_>)) {
+        let log = LogBuffer::open(&self.path, true).expect("mappable");
+        let metadata = log
+            .file()
+            .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+            .expect("the metadata page");
+        let term = log.term_mut(0).expect("term 0");
+
+        let mut appender = Appender::new(metadata, term).expect("a usable log");
+        assert!(appender.initialise_tails(INITIAL_TERM_ID));
+        f(&mut appender);
+    }
+
+    /// What a subscriber does: map the file read-only and start at the join
+    /// position, which for a fresh log is zero.
+    fn image(&self) -> Image {
+        Image::open(
+            &self.path,
+            1,
+            SESSION_ID,
+            STREAM_ID,
+            0,
+            0,
+            "aeron:ipc".to_string(),
+        )
+        .expect("an image over the fixture")
+    }
+}
+
+impl Drop for TempLog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// What a **waiting reader's turn** costs when there is nothing to read.
+///
+/// `Image::poll` on an empty image is most of what the rig does: `R * T` is
+/// 0.04-0.06 messages a turn at the pairs it runs, so 94-96% of turns find
+/// nothing — and every one of them still asks the log for its geometry, builds
+/// a term view, builds a scanner and reads one frame length to be told there is
+/// none. The reference asks the same question of a term buffer it already
+/// holds (`Image.poll` takes `termBuffer = activeTermBuffer(position)` and the
+/// buffer comes out of an array built when the image was), which is the whole of
+/// what this group exists to put a number on.
+///
+/// The second bench is for contrast: the same call with one frame to hand over,
+/// which is the other half of a turn.
+///
+/// What this does **not** cover is the subscription above the image — the
+/// rotation and the linear scan for the registration id in
+/// `Client::poll_subscription_fragments` — because those are the client's own
+/// and are not reachable from here. They are smaller and they are somewhere
+/// else's number.
+fn empty_poll(c: &mut Criterion) {
+    const FRAGMENT_LIMIT: usize = 10;
+
+    let mut group = c.benchmark_group("empty_poll");
+
+    let empty = TempLog::new("empty");
+    empty.prime(|_| {});
+    let mut image = empty.image();
+
+    group.bench_function("image/poll", |b| {
+        b.iter(|| {
+            let read = image.poll(FRAGMENT_LIMIT, |_| {});
+            assert_eq!(
+                0, read,
+                "the image is empty; a poll that read a frame would be measuring something else"
+            );
+            black_box(read)
+        });
+    });
+
+    // The two halves of what that poll does before it reads anything: the log's
+    // geometry, and the term view built from it. Measured apart because the
+    // question package D1 asks is how much of the poll is theirs.
+    let log = LogBuffer::open(&empty.path, false).expect("mappable");
+    group.bench_function("log/geometry", |b| {
+        b.iter(|| black_box(log.geometry()));
+    });
+    group.bench_function("log/term", |b| {
+        b.iter(|| {
+            let term = log.term(0).expect("term 0 is in the mapping");
+            black_box(term);
+        });
+    });
+
+    let one = TempLog::new("one");
+    one.prime(|appender| {
+        assert!(matches!(
+            appender.append(SESSION_ID, STREAM_ID, i64::MAX, &[0xA5_u8; 32]),
+            Appended::Ok { .. }
+        ));
+    });
+    let mut one_image = one.image();
+
+    group.bench_function("image/poll_one_frame", |b| {
+        b.iter(|| {
+            // Rewound by hand: the poll advances the reader's position, and a
+            // second read of a frame nobody put back is not a read.
+            one_image.set_position(0);
+            let read = one_image.poll(FRAGMENT_LIMIT, |_| {});
+            assert_eq!(1, read, "the frame is there to be read");
+            black_box(read)
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, logbuffer_append, term_scan, buffer, empty_poll);
 criterion_main!(benches);
