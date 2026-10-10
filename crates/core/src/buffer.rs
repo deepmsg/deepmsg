@@ -265,6 +265,27 @@ impl<'a, Access> AtomicBuffer<'a, Access> {
         self.load_i64_relaxed(offset)
     }
 
+    /// Read an `int64` at a **4-byte-aligned** offset, as two 32-bit loads.
+    ///
+    /// A reader, not a writer: nothing here needs to write, which is why it is
+    /// beside [`AtomicBuffer::load_i64`] rather than beside the stores it
+    /// mirrors. Its callers are the fields the reference writes and reads in
+    /// halves — the metadata block's one four-aligned `int64`
+    /// (`aeron_logbuffer_descriptor.h:78-88` hands it offset 500), and a payload
+    /// field a claim wrote at an offset only four-byte aligned
+    /// ([`Frame::store_i64_in_payload`]).
+    ///
+    /// The halves can disagree for a reader that arrives mid-write, and no
+    /// ordering fixes that; [`AtomicBuffer::load_i64`] is the aligned accessor
+    /// and this is what a caller reaches for only when alignment cannot be
+    /// promised.
+    pub fn load_i64_unaligned(&self, offset: usize) -> Option<i64> {
+        let low = i64::from(self.load_i32(offset)? as u32);
+        let high = i64::from(self.load_i32(offset + 4)? as u32);
+
+        Some((high << 32) | low)
+    }
+
     /// Load a 4-byte field the reference reads under `AERON_GET_ACQUIRE`.
     pub fn load_i32_acquire(&self, offset: usize) -> Option<i32> {
         Some(self.slot_i32(offset)?.load(Ordering::Acquire))
@@ -502,18 +523,6 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
 
         self.store_i32_relaxed(offset, low)?;
         self.store_i32_relaxed(offset + 4, high)
-    }
-
-    /// Read an `int64` at a **4-byte-aligned** offset, as two 32-bit loads.
-    ///
-    /// The reader's half of [`AtomicBuffer::store_i64_relaxed_unaligned`], for
-    /// the one field of the log buffer's metadata block that is four-aligned
-    /// (`aeron_logbuffer_descriptor.h:78-88` hands it offset 500).
-    pub fn load_i64_unaligned(&self, offset: usize) -> Option<i64> {
-        let low = i64::from(self.load_i32(offset)? as u32);
-        let high = i64::from(self.load_i32(offset + 4)? as u32);
-
-        Some((high << 32) | low)
     }
 
     /// Compare and exchange a 4-byte field, returning whether it took.

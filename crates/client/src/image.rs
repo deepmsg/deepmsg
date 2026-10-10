@@ -172,6 +172,30 @@ impl<'a> Fragment<'a> {
     pub fn copy_payload(&self, dst: &mut [u8]) -> Option<()> {
         self.frame.copy_payload(dst)
     }
+
+    /// The `int64` at `offset` bytes into the payload, little-endian, read
+    /// **in place**.
+    ///
+    /// A value rather than a `&[u8]`, because a fragment's payload lies in a
+    /// term the producer on the other side of the mapping is still writing: this
+    /// crate hands out no slice over it (see `deepmsg-core`'s `pal`, where the
+    /// buffer has a `copy_out` and deliberately no `as_slice`). What a handler
+    /// wanting one field of a message needs is the field, and this is how it
+    /// asks for it — a stamp at the front, a checksum at the end — without
+    /// copying the message out to look at it. The reference's own handlers read
+    /// the same way (`EchoMessageTransceiver.java`'s `dataHandler` is a
+    /// `buffer.getLong(offset)` against the frame's buffer).
+    ///
+    /// `None` when the eight bytes are not all inside **this frame's payload**,
+    /// so a caller reading the fields a message claims to carry cannot be handed
+    /// bytes from whatever frame follows it.
+    ///
+    /// This is the in-place read of one **frame**. A message that arrived in
+    /// several frames is not here whole — see [`crate::FragmentAssembler`], whose
+    /// delivered message does have a payload of its own to read.
+    pub fn payload_i64_at(&self, offset: usize) -> Option<i64> {
+        self.frame.load_i64_in_payload(offset)
+    }
 }
 
 impl std::fmt::Debug for Fragment<'_> {
@@ -1064,6 +1088,68 @@ pub(crate) mod tests {
 
         assert_eq!(INITIAL_TERM_ID, image.initial_term_id());
         assert_eq!(TERM_LENGTH, image.term_buffer_length());
+    }
+
+    /// A payload field is read where it lies, and only from inside **this
+    /// frame's** payload.
+    ///
+    /// The in-place read the receive path uses in place of copying a message
+    /// out. The last two reads are the point: the next frame's bytes are sitting
+    /// right there in the term, and a reader that trusted its offset alone would
+    /// hand them back as though they were this message's.
+    #[test]
+    fn a_payload_field_is_read_where_it_lies_and_only_inside_the_payload() {
+        let first = 0x1122_3344_5566_7788_i64;
+        let last = -42_i64;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&first.to_le_bytes()); // 0..8
+        payload.extend_from_slice(&[0_u8; 8]); // 8..16
+        payload.extend_from_slice(&last.to_le_bytes()); // 16..24
+        let length = payload.len();
+
+        let log = TempLog::new("payload-i64-at");
+        log.write(|appender| write_message(appender, &payload));
+
+        let mut seen = Vec::new();
+        let mut image = log.image(1);
+        image.poll(10, |fragment: &Fragment<'_>| {
+            seen.push((
+                fragment.payload_i64_at(0),
+                fragment.payload_i64_at(length - 8),
+                fragment.payload_i64_at(length - 7),
+                fragment.payload_i64_at(length),
+            ));
+        });
+
+        assert_eq!(
+            vec![(Some(first), Some(last), None, None)],
+            seen,
+            "the message's two fields, and nothing past its end"
+        );
+    }
+
+    /// The same read where the eight bytes wanted are not eight-byte aligned,
+    /// which a payload field is allowed to be — the write side puts one wherever
+    /// it is told to.
+    #[test]
+    fn a_payload_field_is_read_unaligned_too() {
+        let straddling = 0x0102_0304_0506_0708_i64;
+
+        let mut payload = vec![0xAA_u8];
+        payload.extend_from_slice(&straddling.to_le_bytes());
+        payload.extend_from_slice(&[0xBB_u8; 7]);
+
+        let log = TempLog::new("payload-i64-at-unaligned");
+        log.write(|appender| write_message(appender, &payload));
+
+        let mut seen = Vec::new();
+        let mut image = log.image(1);
+        image.poll(10, |fragment: &Fragment<'_>| {
+            seen.push(fragment.payload_i64_at(1));
+        });
+
+        assert_eq!(vec![Some(straddling)], seen, "one byte in, read in halves");
     }
 
     #[test]
