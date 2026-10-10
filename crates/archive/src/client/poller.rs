@@ -86,6 +86,7 @@ const RECORDING_SIGNAL_EVENT_TEMPLATE_ID: u16 = 24;
 /// code" (`AERON_…_NULL_VALUE`). Here the field is an
 /// [`Option`] — there is no reader that wants those two told apart, and the
 /// numbers were the C's way of saying `None` twice.
+#[derive(Debug)]
 pub struct ControlResponsePoller {
     /// The subscription the archive's answers arrive on.
     subscription: i64,

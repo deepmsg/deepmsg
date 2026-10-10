@@ -253,6 +253,12 @@ path = "integration/archive_proxy.rs"
 name = "archive_poller"
 path = "integration/archive_poller.rs"
 
+# P2-C1's connect: the state machine driven against a real archive, and the two
+# decisions it makes before anything is sent.
+[[test]]
+name = "archive_async_connect"
+path = "integration/archive_async_connect.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused
