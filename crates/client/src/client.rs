@@ -2590,10 +2590,19 @@ impl Client {
     /// subscription or image.
     ///
     /// The image's reader position is published to its counter **after** the
-    /// handler has returned, never before — and that publication is not
-    /// optional. The driver computes the publisher's window limit from the
-    /// minimum of these counters (`aeron_ipc_publication.c:296-313`), so an
-    /// image that is read but not reported eventually blocks the publisher.
+    /// handler has returned, never before — and, when the read moved it, that
+    /// publication is not optional. The driver computes the publisher's window
+    /// limit from the minimum of these counters
+    /// (`aeron_ipc_publication.c:296-313`), so an image that is read but not
+    /// reported eventually blocks the publisher.
+    ///
+    /// Only a read that **moved** the position is published, which is the
+    /// reference's own gate: `Image.poll` writes the subscriber position counter
+    /// only `if (newPosition > initialPosition)` (`Image.java:374-378`;
+    /// `aeron_image.c:314-322`). A poll that read nothing would re-send the value
+    /// the counter already holds — the driver's window computation cannot see a
+    /// difference between that and not writing at all — and it was building a
+    /// `CountersReader` to do it.
     pub fn poll_image<F>(
         &mut self,
         subscription_id: i64,
@@ -2604,7 +2613,7 @@ impl Client {
     where
         F: FnMut(&Fragment<'_>),
     {
-        let (counter_id, position, read) = {
+        let (counter_id, position_before, position, read) = {
             let subscription = self
                 .subscriptions
                 .iter_mut()
@@ -2614,13 +2623,21 @@ impl Client {
                 .iter_mut()
                 .find(|i| i.registration_id() == image_registration_id)?;
 
+            let position_before = image.position();
             let read = image.poll(fragment_limit, handler);
 
-            (image.subscriber_position_id(), image.position(), read)
+            (
+                image.subscriber_position_id(),
+                position_before,
+                image.position(),
+                read,
+            )
         };
 
-        if let Some(counters) = self.cnc.counters_writable() {
-            counters.set_value(counter_id, position);
+        if position > position_before {
+            if let Some(counters) = self.cnc.counters_writable() {
+                counters.set_value(counter_id, position);
+            }
         }
 
         Some(read)
@@ -2630,9 +2647,10 @@ impl Client {
     /// and hand the whole run to `handler`.
     ///
     /// [`Client::poll_image`]'s counterpart for the block face: the same image,
-    /// the same publishing of the reader's position afterwards, and a count in
-    /// **bytes** rather than fragments. It is here for the reason every poll on
-    /// an image is: this client hands images out borrowed, so a caller outside
+    /// the same publishing of the reader's position afterwards — and the same
+    /// gate on it, a write only for a read that moved the position — and a count
+    /// in **bytes** rather than fragments. It is here for the reason every poll
+    /// on an image is: this client hands images out borrowed, so a caller outside
     /// it cannot reach [`Image::block_poll`] itself — and the position it moves
     /// is the client's to publish.
     ///
@@ -2647,7 +2665,7 @@ impl Client {
     where
         F: FnMut(&Block<'_>),
     {
-        let (counter_id, position, read) = {
+        let (counter_id, position_before, position, read) = {
             let subscription = self
                 .subscriptions
                 .iter_mut()
@@ -2657,13 +2675,21 @@ impl Client {
                 .iter_mut()
                 .find(|i| i.registration_id() == image_registration_id)?;
 
+            let position_before = image.position();
             let read = image.block_poll(block_length_limit, handler);
 
-            (image.subscriber_position_id(), image.position(), read)
+            (
+                image.subscriber_position_id(),
+                position_before,
+                image.position(),
+                read,
+            )
         };
 
-        if let Some(counters) = self.cnc.counters_writable() {
-            counters.set_value(counter_id, position);
+        if position > position_before {
+            if let Some(counters) = self.cnc.counters_writable() {
+                counters.set_value(counter_id, position);
+            }
         }
 
         Some(read)
