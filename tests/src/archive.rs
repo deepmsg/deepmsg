@@ -62,6 +62,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::client::{ArchiveContext, ArchiveProxy, ProxyError};
 use deepmsg_archive::server::conductor::ARCHIVE_ID_DEFAULT;
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_archive::server::response_proxy::PROTOCOL_SEMANTIC_VERSION;
@@ -150,6 +151,16 @@ pub struct Session {
     response_subscription: i64,
     control_session_id: i64,
     next_correlation_id: i64,
+    /// The product client's request encoder — the one [`Session::connect`] opens
+    /// this session through, and the one every request on it will go through
+    /// once the rest of the fixture is turned around (plan §2.3's steps 2–4).
+    ///
+    /// It is carried rather than made per request for the reason the reference
+    /// carries one: the buffer it encodes into is one 8 KiB allocation reused
+    /// across requests, and the control session id every later request is
+    /// addressed to is learned by this object and lives on it
+    /// (`aeron_archive_proxy.h:60-96`).
+    proxy: ArchiveProxy,
 }
 
 impl Session {
@@ -180,16 +191,29 @@ impl Session {
                 format!("the driver would not take the request publication: {error}")
             })?;
 
-        let mut session = Self {
-            request_publication,
-            response_subscription,
-            control_session_id: -1,
-            next_correlation_id: correlation_id,
-        };
+        // **The connect request is the product client's now** (plan §2.3.1's
+        // first step): `ArchiveProxy::try_connect` encodes the same
+        // `AuthConnectRequest` this module used to spell out in
+        // [`connect_request`], from the same table of fields, so the fixture
+        // stops being a second implementation of a request the product already
+        // makes. The answer is still read by this module's own `await_response`
+        // — turning *that* half around is §2.3's second step, not this one.
+        //
+        // One field really does differ, and it is worth knowing before it is
+        // looked for: the proxy writes
+        // `name=<client_name> version=<COMPAT_VERSION_TEXT> commit=<BUILD_IDENTITY>`
+        // (`proxy.rs:254-257`) where [`connect_request`] wrote an **empty**
+        // string. An archive stores what it is handed, so this path now sends
+        // the first non-empty `clientInfo` it ever has. No criterion asserts it
+        // — there is no golden for this request and `archive_connect*.rs` do not
+        // read it back — so nothing changes colour over it.
+        let context = ArchiveContext::resolve(&[]);
+        let mut proxy = ArchiveProxy::new(&context, request_publication);
 
-        let connect = connect_request(correlation_id, RESPONSE_STREAM_ID, RESPONSE_CHANNEL);
-        let response = session
-            .send(client, correlation_id, &connect, deadline)
+        offer_connect(&mut proxy, client, correlation_id, deadline)
+            .map_err(|reason| format!("{reason};\n{}", counters(aeron_dir)))?;
+
+        let response = await_response(client, response_subscription, correlation_id, deadline)
             .map_err(|reason| format!("{reason};\n{}", counters(aeron_dir)))?;
 
         if response.code != ControlResponseCode::OK {
@@ -199,12 +223,24 @@ impl Session {
             ));
         }
 
+        let mut session = Self {
+            request_publication,
+            response_subscription,
+            control_session_id: -1,
+            next_correlation_id: correlation_id,
+            proxy,
+        };
+
         // The connect's `relevantId` is the **control session id**, not the
         // correlation id it echoes (`ControlSession.java:961-971`): the echoed id
         // is already `correlationId`, and the point of `relevantId` here is to
         // name the session every later request on this connection is addressed
         // to.
         session.control_session_id = response.relevant_id;
+        // Both halves are told, because both address requests with it: the
+        // fixture writes it into each request it builds by hand, and the proxy is
+        // where it belongs for every request it makes (`proxy.rs:272-274`).
+        session.proxy.set_control_session_id(response.relevant_id);
 
         Ok(session)
     }
@@ -298,6 +334,73 @@ impl Session {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 other => return Err(format!("the request could not be published ({other:?})")),
+            }
+        }
+    }
+}
+
+/// Offer the connect request until the archive's driver will take it.
+///
+/// **The retry is here rather than in the proxy, and that is the whole point of
+/// this function.** `ArchiveProxy::try_connect` goes through `offer_once` — one
+/// attempt, no retry (`proxy.rs:1291-1306`) — and that is deliberate: the four
+/// handshake requests have no session to be back-pressured behind yet, so
+/// retrying them would hide the reason an offer was refused. The product retries
+/// *above* the proxy instead: `AsyncConnect` reads `Err(ProxyError::Offer(_))`
+/// as "not now" and comes back on its next turn (`async_connect.rs:404-432`).
+///
+/// So a fixture that called `try_connect` once and gave up would put back the
+/// very flake this fixture's `send_only` was just fixed for: the connect request
+/// is offered the moment the publication is made, and a cold runner has not had
+/// the window advertised by then, so the first offer answers `BackPressured` and
+/// a one-shot call fails instantly instead of waiting a millisecond.
+///
+/// The three answers that mean *not now* are the same three, spelled the same
+/// way, as [`Session::send_only`]'s — this function is that loop with the
+/// product's encoder in place of the hand-built payload, and the equivalence is
+/// intended: §2.3.1 (a) chose "wrap a retry around the fixture's call" over
+/// "adopt `AsyncConnect`" precisely so the semantics would not move.
+fn offer_connect(
+    proxy: &mut ArchiveProxy,
+    client: &mut Client,
+    correlation_id: i64,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut attempts = 0;
+
+    loop {
+        match proxy.try_connect(
+            client,
+            correlation_id,
+            RESPONSE_CHANNEL,
+            RESPONSE_STREAM_ID,
+            // No credentials, which the reference spells as a null pointer and a
+            // zero length (`proxy.rs:296-297`).
+            &[],
+        ) {
+            Ok(()) => return Ok(()),
+            Err(ProxyError::Offer(
+                retry @ (Appended::NotConnected | Appended::BackPressured | Appended::EndOfLog),
+            )) => {
+                attempts += 1;
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the connect request would not go out in {attempts} attempts, the last \
+                         answer {retry:?}"
+                    ));
+                }
+                client.poll();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Everything else is final, and `MaxPositionExceeded`, `AdminAction`,
+            // `MessageTooLarge` and `Malformed` are why: a request that cannot
+            // fit the term, or that the log will never take, is not going to fit
+            // it a millisecond from now. Retrying those would turn a refusal
+            // that says what is wrong into a deadline that says nothing.
+            Err(other) => {
+                return Err(format!(
+                    "the connect request could not be published ({other:?})"
+                ));
             }
         }
     }
@@ -510,6 +613,19 @@ pub fn decode(payload: &[u8]) -> Option<Response> {
 /// `version`'s **major** is the whole of what the archive checks
 /// (`ArchiveConductor.java:483-488`), so this sends the archive's own semantic
 /// version rather than a number of its own choosing.
+///
+/// **As of plan §2.3.1's first step this has no caller**: [`Session::connect`]
+/// sends the connect through the product's `ArchiveProxy::try_connect` now, and
+/// this is the hand-written twin that says what that request is supposed to
+/// contain. It is kept rather than deleted for two reasons — it is the readable
+/// statement of the request's field set, and §2.3's last step deletes the
+/// fixture's constructors in one pass once every one of them has stopped being
+/// called. The other five constructors below still have callers.
+///
+/// It is deliberately **not** used as a byte-for-byte cross-check on the proxy,
+/// which is what a reader would expect of a twin: the two differ in exactly one
+/// field, `clientInfo` (empty here, `name=… version=… commit=…` there —
+/// `proxy.rs:254-257`), so such a check would fail by design.
 #[must_use]
 pub fn connect_request(
     correlation_id: i64,
