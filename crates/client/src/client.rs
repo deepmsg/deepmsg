@@ -2706,6 +2706,15 @@ impl Client {
 
         let (messages, counter_writes) = subscription.poll_messages(fragment_limit, &mut handler);
 
+        // A poll that read nothing hands back no writes at all — `poll_messages`
+        // reports one only for an image whose position moved, which is the
+        // reference's own gate — so this is the path a reader spends most of its
+        // turns on, and with an empty list the region lookups below would build
+        // two views and a `CountersReader` in order to write nothing.
+        if counter_writes.is_empty() {
+            return messages;
+        }
+
         // Published after the poll rather than during it: the counters live in
         // the CnC file, which the images do not borrow, and the reference
         // publishes a reader's position for the driver to compute the
@@ -2804,6 +2813,13 @@ impl Client {
         };
 
         let (fragments, counter_writes) = subscription.poll_fragments(fragment_limit, &mut handler);
+
+        // The same gate as [`Client::poll_subscription`], for the same reason:
+        // an empty list has nothing to publish and would cost the region
+        // lookups anyway.
+        if counter_writes.is_empty() {
+            return fragments;
+        }
 
         // Published after the poll, never during it — the reason
         // [`Client::poll_subscription`] gives.
@@ -3364,6 +3380,16 @@ impl Client {
     /// to-clients ring (`crate::Client::laps`). The counts travel with the
     /// error so that a caller who reports a timeout can say which it was.
     fn expire_pending(&mut self) {
+        // Nothing in flight is the ordinary case on a reader's poll path, and it
+        // is the one case where everything below is wasted: a `clock_gettime`
+        // (~14-19 ns on the bench machine, `doc/deepmsg-rust-rig-delta.md` §2.1)
+        // and two counter reads whose only use is inside the loop. A command that
+        // was never submitted cannot time out, so the list being empty is the
+        // whole of the question and the answers below would be discarded.
+        if self.pending.is_empty() {
+            return;
+        }
+
         let now = Instant::now();
         let laps = self.receiver.lapped();
         let discarded = self.receiver.discarded();
