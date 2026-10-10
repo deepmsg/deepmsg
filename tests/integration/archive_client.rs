@@ -7,15 +7,28 @@
 //! caller cannot be written against it.
 //!
 //! Fifteen of the sixteen cases in that fixture need no archive at all, and
-//! neither do these: what a context *is* is decided before anything is
+//! neither do most of these: what a context *is* is decided before anything is
 //! connected, and the reference's own cases reach for a live archive in exactly
 //! one place (`shouldResolveArchiveId`, which is a later commit and needs a Java
 //! archive to talk to).
+//!
+//! The three cases at the end are the exception, and they are the ones about
+//! `conclude`'s *second* half: what a non-response-mode context does is ask a
+//! **driver** for a session id and write the answer into two channel URIs. They
+//! run against our own driver, which is the production path — the reference's
+//! own versions fabricate an `aeron_t` instead, to reach a shortcut that has no
+//! counterpart here.
 //!
 //! The lists below are passed to `resolve` rather than set as a process's
 //! environment: an environment is one per process, and two of these tests set
 //! it — one to a hundred-and-three-character name, one to `9223372036s`. The
 //! reader that turns a process into that list has a smoke test of its own.
+
+use std::time::Duration;
+
+use deepmsg_client::client::Client;
+use deepmsg_core::uri::ChannelUri;
+use deepmsg_tests::driver::{self, OwnDriver};
 
 use deepmsg_archive::client::context::{
     AERON_CLIENT_NAME_ENV, AERON_DIR_ENV, CLIENT_NAME_ENV, CONTROL_CHANNEL_ENV,
@@ -373,4 +386,286 @@ fn this_processs_environment_is_a_context() {
             assert_eq!(dir, context.aeron_dir, "AERON_DIR reaches the context");
         }
     }
+}
+
+/// A driver and a client for the cases below, or `None` when our driver is not
+/// built.
+///
+/// The driver comes back with the client because it has to outlive it: dropping
+/// a driver kills its process (`driver.rs:574-584`), and a client whose driver
+/// has gone is a client that waits for an answer that cannot come.
+fn driver_and_client(test_name: &str) -> Option<(OwnDriver, Client)> {
+    let Some(mut own) = OwnDriver::start(test_name) else {
+        driver::announce_own_skip();
+        return None;
+    };
+
+    own.await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+
+    let client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    Some((own, client))
+}
+
+/// `shouldApplyDefaultParametersToRequestAndResponseChannels` (`:3171-3229`).
+///
+/// A context that names neither a term length, an MTU nor sparse-ness gets all
+/// three written into **both** channels — and then **one session id, in both**.
+/// That one id in two places is the point of the case: the archive has to be
+/// able to tell that the request it reads and the response it is told to send
+/// belong to the same session.
+///
+/// The reference's own version fabricates an `aeron_t` with
+/// `control_protocol_version = 0` rather than starting a driver
+/// (`aeron_archive_test.cpp:3177-3193`), because below 1.0.0
+/// `aeron_async_next_session_id` hands back a randomised int32 with no command
+/// sent at all (`aeron_client_conductor.c:2344-2371`). There is no such
+/// shortcut here, so this asks a real driver — which is what production does.
+#[test]
+fn default_parameters_reach_both_control_channels() {
+    let Some((_own, mut client)) = driver_and_client("archive-client-default-parameters") else {
+        return;
+    };
+
+    let mut context = ArchiveContext::resolve(&environment(&[
+        (CONTROL_CHANNEL_ENV, "aeron:ipc"),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV,
+            "aeron:udp?endpoint=127.0.0.1:0",
+        ),
+    ]));
+    context.control_term_buffer_length = 256 * 1024;
+    context.control_mtu_length = 2048;
+    context.control_term_buffer_sparse = false;
+
+    let channels = context
+        .conclude_with(&mut client)
+        .expect("a context a session can be opened with");
+
+    let request = ChannelUri::parse(&channels.request).expect("a channel");
+    assert_eq!(Some("262144"), request.get("term-length"));
+    assert_eq!(Some("2048"), request.get("mtu"));
+    assert_eq!(Some("false"), request.get("sparse"));
+    assert_eq!("ipc", request.media());
+
+    let response = ChannelUri::parse(&channels.response).expect("a channel");
+    assert_eq!(Some("262144"), response.get("term-length"));
+    assert_eq!(Some("2048"), response.get("mtu"));
+    assert_eq!(Some("false"), response.get("sparse"));
+    assert_eq!(Some("127.0.0.1:0"), response.get("endpoint"));
+    assert_eq!("udp", response.media());
+
+    let session_id = request.get("session-id").expect("a session id");
+    assert_ne!("", session_id, "and it is not the empty one");
+    assert_eq!(
+        Some(session_id),
+        response.get("session-id"),
+        "both channels name the same session"
+    );
+}
+
+/// `shouldNotApplyDefaultParameters…IfTheyAreSetExplicitly` (`:3231-3296`).
+///
+/// Nothing that is already written is overwritten — not the term length
+/// spelled `64k`, not the MTU, not sparse-ness — and the parameters a channel
+/// carries for its own reasons (`ttl`, `interface`, `alias`) survive the trip
+/// through the builder untouched.
+///
+/// **One thing is overwritten**, and it is the case's quiet half: the request
+/// channel above says `session-id=0`, and afterwards it names the minted
+/// session instead. A session id is not a default; it is the session's, and
+/// `put_int32` replaces it (`aeron_archive_context.c:399-400`).
+#[test]
+fn explicit_parameters_are_not_overwritten() {
+    let Some((_own, mut client)) = driver_and_client("archive-client-explicit-parameters") else {
+        return;
+    };
+
+    let mut context = ArchiveContext::resolve(&environment(&[
+        (
+            CONTROL_CHANNEL_ENV,
+            "aeron:udp?endpoint=localhost:8080|term-length=64k|mtu=1408|sparse=true|session-id=0|ttl=3|interface=127.0.0.1",
+        ),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV,
+            "aeron:ipc?term-length=128k|mtu=4096|sparse=true|alias=response",
+        ),
+    ]));
+    context.control_term_buffer_length = 256 * 1024;
+    context.control_mtu_length = 2048;
+    context.control_term_buffer_sparse = false;
+
+    let channels = context
+        .conclude_with(&mut client)
+        .expect("a context a session can be opened with");
+
+    let request = ChannelUri::parse(&channels.request).expect("a channel");
+    assert_eq!(Some("64k"), request.get("term-length"), "not 262144");
+    assert_eq!(Some("1408"), request.get("mtu"), "not 2048");
+    assert_eq!(Some("true"), request.get("sparse"), "not false");
+    assert_eq!(Some("3"), request.get("ttl"));
+    assert_eq!(Some("127.0.0.1"), request.get("interface"));
+    assert_eq!("udp", request.media());
+
+    let response = ChannelUri::parse(&channels.response).expect("a channel");
+    assert_eq!(Some("128k"), response.get("term-length"));
+    assert_eq!(Some("4096"), response.get("mtu"));
+    assert_eq!(Some("true"), response.get("sparse"));
+    assert_eq!(Some("response"), response.get("alias"));
+    assert_eq!("ipc", response.media());
+
+    let session_id = request.get("session-id").expect("a session id");
+    assert_ne!("", session_id);
+    assert_eq!(
+        Some(session_id),
+        response.get("session-id"),
+        "still one session, named on both"
+    );
+
+    // **Added to the reference's assertions**, because without it the case is
+    // nearly vacuous: the channel was written `session-id=0` above, and
+    // `non-empty` is satisfied by the `0` that was already there. What the case
+    // claims is that the id is *replaced*, and this is that claim.
+    //
+    // It is not a hope about what the driver will say. A driver never answers
+    // with an id inside its reserved range — `SessionIds::cursor` *skips* the
+    // whole of it (`crates/driver/src/ipc_publications.rs:343-349`), and the
+    // range is `-1..=1000` by default (`config.rs:414`, `:421`) — so nought is
+    // one of the ids it cannot give, whatever it seeded its cursor with.
+    assert_ne!(
+        Some("0"),
+        request.get("session-id"),
+        "the session id that was written by hand is replaced by the session's"
+    );
+}
+
+/// `shouldNotSetSessionIdOnControlRequestAndReponseChannelsIfControlModeResponseIsUsed`
+/// (`:3298-3336`).
+///
+/// The other direction, and the reason the two cases are worth separate tests:
+/// a response channel whose `control-mode` is `response` is the archive's own,
+/// so the client names no session **anywhere** — and does not ask the driver
+/// for one, which is why this path does not touch the client at all.
+///
+/// Note what is *still* written: term length, MTU and sparse-ness reach both
+/// channels here as well. Only the session id is conditional.
+#[test]
+fn a_response_mode_context_names_no_session() {
+    let Some((mut own, mut client)) = driver_and_client("archive-client-response-mode") else {
+        return;
+    };
+
+    let mut context = ArchiveContext::resolve(&environment(&[
+        (CONTROL_CHANNEL_ENV, "aeron:udp?endpoint=localhost:8080"),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV,
+            "aeron:udp?control=localhost:9090|control-mode=response",
+        ),
+    ]));
+    context.control_term_buffer_length = 256 * 1024;
+    context.control_mtu_length = 2048;
+    context.control_term_buffer_sparse = false;
+
+    // Take the driver away first, because *this* is the claim worth testing and
+    // nothing below needs a driver: the response-mode path never touches the
+    // client, and a context that never asks cannot be told a session id by a
+    // driver that is not there. A conclusion that still succeeds here is one
+    // that did not ask — where `next_session_id` against a dead driver cannot
+    // succeed at all. "Does not set a session id" and "does not ask for one"
+    // are different claims, and only the second says the branch is really
+    // skipped rather than asked-and-discarded. The cursor moves on every ask,
+    // so asking has a cost even when the answer is thrown away.
+    own.stop().expect("stop our driver");
+
+    let channels = context
+        .conclude_with(&mut client)
+        .expect("a context a session can be opened with");
+
+    let request = ChannelUri::parse(&channels.request).expect("a channel");
+    assert_eq!(Some("localhost:8080"), request.get("endpoint"));
+    assert_eq!(None, request.get("session-id"));
+
+    let response = ChannelUri::parse(&channels.response).expect("a channel");
+    assert_eq!(
+        None,
+        response.get("endpoint"),
+        "a response channel has a control address, not an endpoint"
+    );
+    assert_eq!(Some("localhost:9090"), response.get("control"));
+    assert_eq!(Some("response"), response.get("control-mode"));
+    assert_eq!(None, response.get("session-id"));
+}
+
+/// `shouldDuplicateContext` (`:3338-3405`).
+///
+/// A duplicated context is **equal in every field and independent in every
+/// pointer**: the copy's channels say the same thing and are their own
+/// allocations, so writing to one cannot be seen through the other. The
+/// reference needs a function for this because its copy is a `memcpy` with
+/// three re-`strdup`s (`:229-267`); here [`Clone`] does it, and what the case
+/// is really pinning is that it stays a *deep* copy — a field changed from
+/// `String` to `Arc<str>` would satisfy `assert_eq!` and break this.
+///
+/// Four of the reference's assertions have no counterpart and are not ported:
+/// `aeron`, `owns_aeron_client`, `error_handler` and `idle_strategy` are a
+/// driver connection, an ownership flag and two callbacks. This context holds
+/// none of them — the client is an argument to
+/// [`ArchiveContext::conclude_with`], not a field — so there is nothing to
+/// compare.
+#[test]
+fn a_context_is_copied_not_shared() {
+    let mut original = ArchiveContext::resolve(&environment(&[
+        (CONTROL_CHANNEL_ENV, "aeron:udp?endpoint=localhost:8080"),
+        (CONTROL_STREAM_ID_ENV, "42"),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV,
+            "aeron:udp?endpoint=localhost:0",
+        ),
+        (CONTROL_RESPONSE_STREAM_ID_ENV, "-5"),
+        (RECORDING_EVENTS_STREAM_ID_ENV, "777"),
+        (CONTROL_TERM_BUFFER_LENGTH_ENV, "256k"),
+        (CONTROL_MTU_LENGTH_ENV, "2048"),
+        (CONTROL_TERM_BUFFER_SPARSE_ENV, "false"),
+        (MESSAGE_TIMEOUT_ENV, "1s"),
+    ]));
+
+    let copy = original.clone();
+
+    assert_eq!(original, copy, "every field, value for value");
+    assert_eq!(42, copy.control_request_stream_id);
+    assert_eq!(-5, copy.control_response_stream_id);
+    assert_eq!(777, copy.recording_events_stream_id);
+    assert_eq!(1_000_000_000, copy.message_timeout_ns);
+    assert_eq!(256 * 1024, copy.control_term_buffer_length);
+    assert_eq!(2048, copy.control_mtu_length);
+    assert!(!copy.control_term_buffer_sparse);
+    assert_eq!(
+        None, copy.recording_events_channel,
+        "unset, and stays unset"
+    );
+
+    // `EXPECT_NE(m_ctx->control_request_channel, copy_ctx->control_request_channel)`
+    // is a pointer comparison, and this is the same claim: the two strings are
+    // equal in value and are not the same memory.
+    let (original_channel, copy_channel) = (
+        original
+            .control_request_channel
+            .as_ref()
+            .expect("set above"),
+        copy.control_request_channel.as_ref().expect("set above"),
+    );
+    assert_eq!(original_channel, copy_channel);
+    assert_ne!(
+        original_channel.as_ptr(),
+        copy_channel.as_ptr(),
+        "equal in value, not the same allocation"
+    );
+
+    // And independent: changing one leaves the other as it was.
+    original.control_request_channel = Some("aeron:ipc".to_owned());
+    assert_eq!(
+        Some("aeron:udp?endpoint=localhost:8080".to_owned()),
+        copy.control_request_channel
+    );
 }

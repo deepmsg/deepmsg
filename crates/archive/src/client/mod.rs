@@ -36,4 +36,4 @@
 
 pub mod context;
 
-pub use context::{ArchiveContext, ClientError};
+pub use context::{ArchiveContext, ClientError, ConcludeError, ControlChannels};

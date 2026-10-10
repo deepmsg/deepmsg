@@ -33,6 +33,10 @@
 //! is the client name, and it is a **recorded deviation** — see its arm.
 
 use core::fmt;
+use std::time::Duration;
+
+use deepmsg_client::client::{Client, CommandError};
+use deepmsg_core::uri::{ChannelUri, UriError};
 
 /// The aeron directory to look for, when nothing says otherwise
 /// (`AERON_DIR_ENV_VAR`, `aeronc.h:...`). It is the *driver's* variable, not
@@ -122,6 +126,26 @@ const MESSAGE_TIMEOUT_NS_DEFAULT: i64 = 10 * 1_000_000_000;
 /// A control MTU's default when neither variable says otherwise
 /// (`AERON_ARCHIVE_CONTROL_MTU_LENGTH_DEFAULT`, `aeron_archive_context.h:92-97`).
 const MTU_LENGTH_DEFAULT: i32 = 1408;
+
+/// The three parameters a concluded context writes into both channels
+/// (`AERON_URI_TERM_LENGTH_KEY` / `…_MTU_LENGTH_KEY` / `…_SPARSE_TERM_KEY`,
+/// `aeron_uri.h:58-61`).
+const TERM_LENGTH_KEY: &str = "term-length";
+/// See [`TERM_LENGTH_KEY`].
+const MTU_LENGTH_KEY: &str = "mtu";
+/// See [`TERM_LENGTH_KEY`].
+const SPARSE_KEY: &str = "sparse";
+
+/// The parameter that carries the session (`AERON_URI_SESSION_ID_KEY`,
+/// `aeron_uri.h:65`).
+const SESSION_ID_KEY: &str = "session-id";
+
+/// How a response channel says it *is* the archive's response channel
+/// (`AERON_UDP_CHANNEL_CONTROL_MODE_KEY` / `…_RESPONSE_VALUE`,
+/// `aeron_uri.h:48-51`).
+const CONTROL_MODE_KEY: &str = "control-mode";
+/// See [`CONTROL_MODE_KEY`].
+const CONTROL_MODE_RESPONSE: &str = "response";
 
 /// What a client is configured with.
 ///
@@ -405,6 +429,179 @@ impl ArchiveContext {
         }
 
         Ok(())
+    }
+
+    /// The *second* half of `aeron_archive_context_conclude` (`:359-423`): the
+    /// two control channels as they will actually be used.
+    ///
+    /// [`conclude`](Self::conclude) is called first, so a context that is not
+    /// one a session can be opened with is refused here too — the split is the
+    /// reference's own, and it is visible in its error paths: the four refusals
+    /// happen before `ctx->aeron` is so much as looked at, which is why a test
+    /// for one of them needs no driver at all.
+    ///
+    /// What is left is three writes and one decision, and the decision is the
+    /// whole of this function:
+    ///
+    /// * **A response-mode response channel is the archive's own channel**, so
+    ///   the client does not name a session on either URI. The archive stamps
+    ///   `response-correlation-id` onto the *request* channel later, when it has
+    ///   a subscription to correlate with (`aeron_archive_async_connect.c:451-454`,
+    ///   another commit). Asking the driver for a session id here would both be
+    ///   pointless and move its cursor, so this path does not ask — `client` is
+    ///   not touched.
+    /// * **Otherwise one session id is minted and written into both URIs.** One
+    ///   id for two channels is the point: the archive has to be able to tell
+    ///   that the request it received and the response it is told to send are
+    ///   the same session.
+    ///
+    /// The defaults are written only where the URI does not already carry a
+    /// value (`aeron_archive_apply_default_parameters`, `:269-310`), so a
+    /// channel spelled `mtu=1408` keeps the text `1408` rather than being
+    /// normalised — and a channel spelled `session-id=0` has that value
+    /// *overwritten*, because a session id is not a default but the session's.
+    ///
+    /// **A recorded difference**: where the reference *creates* the Aeron client
+    /// it asks (`:338-356`, an `aeron_init`/`aeron_start` under the client name
+    /// `"archive-client"`) if it was not handed one, this takes the client as an
+    /// argument. The reference's own test is the reason the distinction matters
+    /// and the reason it is cheap here: it hands in a fabricated `aeron_t`
+    /// rather than a driver, so "who owns the client" is already the caller's
+    /// question upstream.
+    ///
+    /// # Errors
+    ///
+    /// [`ConcludeError`]: a refusal, a channel that is not a channel, or a
+    /// driver that did not answer.
+    pub fn conclude_with(&self, client: &mut Client) -> Result<ControlChannels, ConcludeError> {
+        self.conclude()?;
+
+        // Both are `Some`: `conclude` has just refused a context without them.
+        let request = self.control_request_channel.as_deref().unwrap_or_default();
+        let response = self.control_response_channel.as_deref().unwrap_or_default();
+
+        let mut request = ChannelUri::parse(request).map_err(ConcludeError::RequestChannel)?;
+        let mut response = ChannelUri::parse(response).map_err(ConcludeError::ResponseChannel)?;
+
+        apply_default_parameters(&mut request, self);
+        apply_default_parameters(&mut response, self);
+
+        let response_mode = Some(CONTROL_MODE_RESPONSE) == response.get(CONTROL_MODE_KEY);
+
+        if !response_mode {
+            let session_id = client
+                .next_session_id(
+                    self.control_request_stream_id,
+                    // Nought rather than "forever" for a nonsense deadline: a
+                    // context built through `resolve`/`from_env` cannot carry
+                    // one (the reader clamps at 1000 ns), but a field is a
+                    // field, and the safe way to fail a deadline is to reach it.
+                    Duration::from_nanos(u64::try_from(self.message_timeout_ns).unwrap_or(0)),
+                )
+                .map_err(ConcludeError::SessionId)?;
+
+            let session_id = session_id.to_string();
+            request.put(SESSION_ID_KEY, session_id.clone());
+            response.put(SESSION_ID_KEY, session_id);
+        }
+
+        Ok(ControlChannels {
+            request: request.build(),
+            response: response.build(),
+        })
+    }
+}
+
+/// The term, MTU and sparse defaults, written into a channel that does not
+/// carry them (`aeron_archive_apply_default_parameters`, `:269-310`).
+///
+/// In this order, because a URI is text and the reference writes them in this
+/// order: two clients that build the same channel from the same context should
+/// not differ by a parameter's position.
+fn apply_default_parameters(uri: &mut ChannelUri, context: &ArchiveContext) {
+    if uri.get(TERM_LENGTH_KEY).is_none() {
+        uri.put(
+            TERM_LENGTH_KEY,
+            context.control_term_buffer_length.to_string(),
+        );
+    }
+
+    if uri.get(MTU_LENGTH_KEY).is_none() {
+        uri.put(MTU_LENGTH_KEY, context.control_mtu_length.to_string());
+    }
+
+    if uri.get(SPARSE_KEY).is_none() {
+        uri.put(
+            SPARSE_KEY,
+            if context.control_term_buffer_sparse {
+                "true"
+            } else {
+                "false"
+            },
+        );
+    }
+}
+
+/// The two channels a concluded context will open a session on.
+///
+/// The reference writes them back into the context
+/// (`aeron_archive_context_set_control_request_channel`, `:408-410`) and every
+/// layer above reads them off it. Here they are a value instead, so that what
+/// `conclude` *did* is an argument to the next layer rather than state a later
+/// caller has to know was mutated — `async_connect` rewrites the request
+/// channel a second time, and this is the shape that makes that rewrite a
+/// value too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlChannels {
+    /// Where requests go, with the defaults and the session id written in.
+    pub request: String,
+    /// Where the answers come back, the same two ways.
+    pub response: String,
+}
+
+/// Why a context could not be turned into the two channels it will use.
+///
+/// Separate from [`ClientError`] because that type is the reference's own four
+/// refusals, text for text; none of these three has a reference text to match
+/// (each is `AERON_APPEND_ERR("%s", "")` there) and two of them carry a cause
+/// that [`ClientError`] could not hold and stay comparable.
+#[derive(Debug)]
+pub enum ConcludeError {
+    /// One of the four refusals, which is [`ArchiveContext::conclude`]'s answer.
+    Refused(ClientError),
+    /// The request channel is not a channel.
+    RequestChannel(UriError),
+    /// The response channel is not a channel.
+    ResponseChannel(UriError),
+    /// The driver was asked what session id to use and did not say.
+    SessionId(CommandError),
+}
+
+impl From<ClientError> for ConcludeError {
+    fn from(error: ClientError) -> Self {
+        Self::Refused(error)
+    }
+}
+
+impl fmt::Display for ConcludeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(error) => write!(f, "{error}"),
+            Self::RequestChannel(error) => write!(f, "control request channel: {error}"),
+            Self::ResponseChannel(error) => write!(f, "control response channel: {error}"),
+            // The reference's text (`:381`, `:394`), and the capital F is its.
+            Self::SessionId(error) => write!(f, "Failed to fetch next session-id: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConcludeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused(error) => Some(error),
+            Self::RequestChannel(error) | Self::ResponseChannel(error) => Some(error),
+            Self::SessionId(error) => Some(error),
+        }
     }
 }
 
