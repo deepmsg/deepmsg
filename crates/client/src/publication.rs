@@ -712,13 +712,32 @@ impl ExclusivePublication {
     /// This is total where the appender was fallible: a geometry that could not
     /// be read is a log that never mapped ([`LogBuffer::open`]), so a caller
     /// that has one has the other, and the pair is always moved.
+    ///
+    /// An append that ends **exactly on a term's end** is the one position that
+    /// cannot say which term it is in: `begin(term) + term_length` and
+    /// `begin(term + 1)` are the same number. It has not rotated — an append that
+    /// rotated answers `Appended::EndOfLog` and is seeded, never advanced to — so
+    /// the term is this one, and the pair the reference keeps here is
+    /// `(term_id, term_length)`: that is what `resulting_offset` is, and what its
+    /// `new_position` stores (`aeron_exclusive_publication.h:99-108`). Naming the
+    /// next term instead leaves a cache that disagrees with the log's own tail
+    /// about which term the producer is in; only the *next* append's
+    /// `MidRotation` puts it back, and that check then carries the whole weight
+    /// of the partition every append is built over.
     fn advance_to(&self, position: deepmsg_core::logbuffer::position::Position) {
         let geometry = self.log.geometry();
+        let offset = position.term_offset(geometry.bits_to_shift);
+
+        if 0 == offset {
+            // Exactly at a boundary: this term is full, and it is still this one.
+            self.term_offset.set(geometry.term_length);
+
+            return;
+        }
 
         self.term_id
             .set(position.term_id(geometry.bits_to_shift, geometry.initial_term_id));
-        self.term_offset
-            .set(position.term_offset(geometry.bits_to_shift));
+        self.term_offset.set(offset);
     }
 
     /// Re-read the cached pair from the log's current tail
