@@ -106,23 +106,38 @@ impl Subscription {
 
     /// Where the next poll begins, and how many images there are to cover.
     ///
-    /// One image later each call, wrapping. The reference advances a counter and
-    /// resets it to one when it runs past the end (`Subscription.java`); taking
-    /// the remainder does the same thing without the special case, because the
-    /// only thing anyone does with it is index.
+    /// Where the next poll begins, and how many images there are to cover.
+    ///
+    /// A counter that has run past the end reads as zero, which is the wrap the
+    /// reference's own line does when it *takes* the index (`Subscription.java`:
+    /// `startingIndex = roundRobinIndex++`, and a read that came back at or past
+    /// the end is 0 with the counter reset to one). A subscription with no images
+    /// therefore answers zero rather than dividing by it.
     fn rotation(&self) -> (usize, usize) {
         let length = self.images.len();
-        if 0 == length {
-            return (0, 0);
+
+        if self.round_robin >= length {
+            (0, length)
+        } else {
+            (self.round_robin, length)
         }
-        (self.round_robin % length, length)
     }
 
-    /// The next poll's index, after this one has taken it.
-    fn take_rotation(&mut self) -> (usize, usize) {
-        let (start, length) = self.rotation();
-        self.round_robin = if 0 == length { 0 } else { (start + 1) % length };
-        (start, length)
+    /// Where the next poll begins, after this one has taken it.
+    ///
+    /// One image later each call, wrapping — and the counter is **allowed** to
+    /// come back as the image count, because that is the read that wraps it. It
+    /// has to be: a counter wrapped eagerly here would hand the last image back
+    /// for ever (`the_rotation_wraps` is the test that says so). Taking a
+    /// remainder instead does the same thing in one expression, and it is a
+    /// **division** on the path of every turn a waiting reader takes — an image
+    /// count is not a constant, so the compiler cannot turn it into anything
+    /// cheaper.
+    fn take_rotation(&mut self) -> usize {
+        let (start, _) = self.rotation();
+        self.round_robin = start + 1;
+
+        start
     }
 
     /// Poll every image, delivering whole messages, and publish each reader's
@@ -151,14 +166,19 @@ impl Subscription {
         // The images and the assembler are borrowed apart here because both are
         // needed at once: the images are what is read, the assembler is where
         // their fragments go.
-        let (start, length) = self.take_rotation();
+        let start = self.take_rotation();
 
         let Self {
             images, assembler, ..
         } = self;
 
-        for offset in 0..length {
-            let image = &mut images[(start + offset) % length];
+        // The two ranges the reference walks, in its order — `images[start..]`
+        // and then `images[..start]` (`Subscription.java`'s two `for` loops) —
+        // rather than one walk over `(start + offset) % length`, which is a
+        // division an image later.
+        let (before, from_start) = images.split_at_mut(start);
+
+        for image in from_start.iter_mut().chain(before.iter_mut()) {
             let remaining = fragment_limit.saturating_sub(fragments);
             if 0 == remaining {
                 break;
@@ -231,7 +251,7 @@ impl Subscription {
     {
         // Borrowed apart for the same reason `poll_messages` does it: the
         // images are what is read, the assembler is where their fragments go.
-        let (start, length) = self.take_rotation();
+        let start = self.take_rotation();
 
         let Self {
             images, assembler, ..
@@ -239,8 +259,10 @@ impl Subscription {
 
         let mut fragments = 0;
 
-        for offset in 0..length {
-            let image = &mut images[(start + offset) % length];
+        // The reference's two ranges, in its order — see [`Self::poll_messages`].
+        let (before, from_start) = images.split_at_mut(start);
+
+        for image in from_start.iter_mut().chain(before.iter_mut()) {
             let remaining = fragment_limit.saturating_sub(fragments);
             if 0 == remaining {
                 break;
@@ -278,11 +300,13 @@ impl Subscription {
     where
         F: FnMut(&Fragment<'_>),
     {
-        let (start, length) = self.take_rotation();
+        let start = self.take_rotation();
         let mut fragments = 0;
 
-        for offset in 0..length {
-            let image = &mut self.images[(start + offset) % length];
+        // The reference's two ranges, in its order — see [`Self::poll_messages`].
+        let (before, from_start) = self.images.split_at_mut(start);
+
+        for image in from_start.iter_mut().chain(before.iter_mut()) {
             let remaining = fragment_limit.saturating_sub(fragments);
             if 0 == remaining {
                 break;
@@ -772,8 +796,8 @@ mod tests {
         let (mut subscription, _first, _second) = a_subscription_over_two_images();
         assert_eq!((0, 2), subscription.rotation());
 
-        assert_eq!((0, 2), subscription.take_rotation());
-        assert_eq!((1, 2), subscription.take_rotation());
-        assert_eq!((0, 2), subscription.take_rotation());
+        assert_eq!(0, subscription.take_rotation());
+        assert_eq!(1, subscription.take_rotation());
+        assert_eq!(0, subscription.take_rotation(), "and the next one wraps");
     }
 }
