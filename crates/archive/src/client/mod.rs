@@ -37,13 +37,22 @@
 pub mod archive;
 pub mod async_connect;
 pub mod context;
+pub mod descriptor_poller;
 pub mod poller;
 pub mod proxy;
+pub mod subscription_descriptor_poller;
 
 pub use archive::{Archive, ArchiveError, archive_to_client_error_code};
 pub use async_connect::{
     AsyncConnect, ConnectError, ConnectState, Connected, Credentials, NoCredentials, Polled,
 };
 pub use context::{ArchiveContext, ClientError, ConcludeError, ControlChannels};
+pub use descriptor_poller::{
+    RecordingDescriptor, RecordingDescriptorConsumer, RecordingDescriptorPoller,
+};
 pub use poller::{ControlResponseError, ControlResponsePoller, FRAGMENT_LIMIT_DEFAULT};
 pub use proxy::{ArchiveProxy, ProxyError, ReplayParams, ReplicationParams};
+pub use subscription_descriptor_poller::{
+    RecordingSubscriptionDescriptor, RecordingSubscriptionDescriptorConsumer,
+    RecordingSubscriptionDescriptorPoller,
+};

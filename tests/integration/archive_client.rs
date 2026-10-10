@@ -30,6 +30,7 @@ use deepmsg_client::client::Client;
 use deepmsg_core::uri::ChannelUri;
 use deepmsg_tests::driver::{self, OwnDriver};
 
+use deepmsg_archive::client::archive::channel_with_session_id;
 use deepmsg_archive::client::context::{
     AERON_CLIENT_NAME_ENV, AERON_DIR_ENV, CLIENT_NAME_ENV, CONTROL_CHANNEL_ENV,
     CONTROL_MTU_LENGTH_ENV, CONTROL_RESPONSE_CHANNEL_ENV, CONTROL_RESPONSE_STREAM_ID_ENV,
@@ -667,5 +668,48 @@ fn a_context_is_copied_not_shared() {
     assert_eq!(
         Some("aeron:udp?endpoint=localhost:8080".to_owned()),
         copy.control_request_channel
+    );
+}
+
+/// **A channel can be given a session id**
+/// (`aeron_archive_channel_with_session_id`, `:2592-2607`).
+///
+/// There is no reference **case** to port: the C helper has none, and the Java
+/// client has no equivalent at all — its two callers there write the same thing
+/// inline through a builder. So what is asserted is the reference's *code*: the
+/// session is a parameter **put** on the channel, so an existing one is replaced
+/// where it stands and the channel's own parameters are not disturbed.
+///
+/// That last part is the one place this deviates from the reference. It parses
+/// into a `ChannelUriStringBuilder` and prints its fields in a fixed order
+/// (`ChannelUriStringBuilder.java:2451-2512`), so a channel whose parameters
+/// were written in another order comes back normalised; [`ChannelUri`] prints
+/// what it read, which makes this a round trip. Both are asserted below, because
+/// a caller that compares the result against what it passed in needs to know
+/// which one it is getting.
+#[test]
+fn a_channel_can_be_given_a_session_id() {
+    assert_eq!(
+        "aeron:ipc?session-id=7",
+        channel_with_session_id("aeron:ipc", 7).expect("a channel"),
+        "a channel with no parameters gets one"
+    );
+
+    assert_eq!(
+        "aeron:ipc?alias=client-api|session-id=7",
+        channel_with_session_id("aeron:ipc?alias=client-api", 7).expect("a channel"),
+        "and one that had parameters keeps them, in the order they were read"
+    );
+
+    assert_eq!(
+        "aeron:udp?endpoint=localhost:8080|session-id=7",
+        channel_with_session_id("aeron:udp?endpoint=localhost:8080|session-id=5", 7)
+            .expect("a channel"),
+        "a session it already had is replaced where it stands, not appended"
+    );
+
+    assert!(
+        channel_with_session_id("ipc", 7).is_err(),
+        "and something that is not an aeron channel is not one after this either"
     );
 }

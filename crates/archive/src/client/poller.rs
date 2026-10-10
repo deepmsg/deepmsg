@@ -482,7 +482,7 @@ impl ControlledHandler for ControlResponsePoller {
 /// answers `NULL` rather than reading past the end. The generated decoder would
 /// **panic** on a short payload — every field read is an indexed read — so the
 /// check is the port of the reference's bound, not an addition to it.
-fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<'_>>> {
+pub(crate) fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<'_>>> {
     if payload.len() < message_header_codec::ENCODED_LENGTH {
         return None;
     }
@@ -504,7 +504,7 @@ fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<'_>>> {
 /// arithmetic the generated code exists to do; a message like that has to come
 /// from a source that is already lying, and the alternative is a client that
 /// reports rather than a client that misreads.
-fn holds(payload: &[u8], block_length: u16) -> bool {
+pub(crate) fn holds(payload: &[u8], block_length: u16) -> bool {
     payload.len() >= message_header_codec::ENCODED_LENGTH + usize::from(block_length)
 }
 

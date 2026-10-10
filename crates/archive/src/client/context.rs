@@ -138,7 +138,7 @@ const SPARSE_KEY: &str = "sparse";
 
 /// The parameter that carries the session (`AERON_URI_SESSION_ID_KEY`,
 /// `aeron_uri.h:65`).
-const SESSION_ID_KEY: &str = "session-id";
+pub(crate) const SESSION_ID_KEY: &str = "session-id";
 
 /// How a response channel says it *is* the archive's response channel
 /// (`AERON_UDP_CHANNEL_CONTROL_MODE_KEY` / `…_RESPONSE_VALUE`,

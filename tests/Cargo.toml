@@ -37,6 +37,11 @@ name = "loss_report_reference"
 path = "interop/loss_report.rs"
 required-features = ["interop"]
 
+[[test]]
+name = "java_archive_id"
+path = "interop/java_archive_id.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]
