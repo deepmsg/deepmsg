@@ -129,6 +129,7 @@ use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestD
 use deepmsg_codec::archive::truncate_recording_request_codec::{
     self, TruncateRecordingRequestDecoder,
 };
+use deepmsg_codec::archive::update_channel_request_codec::{self, UpdateChannelRequestDecoder};
 use deepmsg_codec::archive::{
     ReadBuf, SBE_SCHEMA_ID, archive_id_request_codec, auth_connect_request_codec,
     challenge_response_codec, close_session_request_codec, keep_alive_request_codec,
@@ -588,6 +589,20 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onUpdateChannel` (`ControlSession.java:531-539`), which
+    /// is `ArchiveConductor.updateChannel` (`:708-735`).
+    ///
+    /// The channel travels as a `varAscii`, so this is one of the two requests
+    /// whose payload is more than its fields.
+    fn on_update_channel(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
         now_ms: i64,
     );
 
@@ -1772,6 +1787,35 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        update_channel_request_codec::SBE_TEMPLATE_ID => {
+            let mut decoder = UpdateChannelRequestDecoder::default().header(header, 0);
+            let coordinates = decoder.channel_decoder();
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let recording_id = decoder.recording_id();
+            let channel = String::from_utf8_lossy(decoder.channel_slice(coordinates)).into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_update_channel(
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    &channel,
+                    now_ms,
+                );
+            }
+        }
+
         attach_segments_request_codec::SBE_TEMPLATE_ID => {
             let decoder = AttachSegmentsRequestDecoder::default().header(header, 0);
 
@@ -1994,6 +2038,7 @@ mod tests {
         SBE_TEMPLATE_ID as START_RECORDING, StartRecordingRequestEncoder,
     };
     use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
+    use deepmsg_codec::archive::update_channel_request_codec::UpdateChannelRequestEncoder;
 
     use deepmsg_client::fragment_assembler::MessageHeader;
 
@@ -2064,6 +2109,12 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
+        },
+        UpdateChannel {
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            channel: String,
         },
         TruncateRecording {
             session_id: i64,
@@ -2348,6 +2399,23 @@ mod tests {
                 session_id,
                 correlation_id,
                 recording_id,
+            });
+        }
+
+        #[allow(clippy::too_many_arguments)] // mirrors the trait
+        fn on_update_channel(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            recording_id: i64,
+            channel: &str,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::UpdateChannel {
+                session_id,
+                correlation_id,
+                recording_id,
+                channel: channel.to_owned(),
             });
         }
 
@@ -2668,6 +2736,32 @@ mod tests {
                 .control_session_id(control_session_id)
                 .correlation_id(correlation_id)
                 .encoded_credentials(encoded_credentials);
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// An `UpdateChannelRequest` (template 107).
+    fn update_channel(
+        control_session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 512];
+
+        let length = {
+            let encoder =
+                UpdateChannelRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .recording_id(recording_id)
+                .channel(channel.as_bytes());
             BODY + encoder.encoded_length()
         };
 
@@ -3248,6 +3342,29 @@ mod tests {
                     recording_id: RECORDING_ID,
                 },
             ],
+            control.calls[1..]
+        );
+    }
+
+    /// An update-channel carries its channel as var data, which is the one
+    /// thing about it that is not a field.
+    #[test]
+    fn an_update_channel_reaches_the_session_with_its_channel() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = update_channel(session_id, 99, RECORDING_ID, "aeron:ipc?alias=test42");
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            vec![Call::UpdateChannel {
+                session_id,
+                correlation_id: 99,
+                recording_id: RECORDING_ID,
+                channel: "aeron:ipc?alias=test42".to_owned(),
+            }],
             control.calls[1..]
         );
     }

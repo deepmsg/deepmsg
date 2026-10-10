@@ -870,6 +870,17 @@ enum Action {
     /// One of the requests that move or remove a recording's **segments** — see
     /// [`SegmentRequest`] for why they are one variant rather than seven.
     Segment(SegmentRequest),
+    /// `ArchiveConductor.updateChannel` (`:708-735`): the channel a recording
+    /// was made on, replaced by another one.
+    ///
+    /// Not a [`SegmentRequest`], because it touches a recording's **row** and no
+    /// file at all — and what it writes is a record of a different length.
+    UpdateChannel {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: String,
+    },
 }
 
 /// The requests that move a recording's **start** or remove the files below it
@@ -3450,6 +3461,96 @@ impl Sessions {
         );
     }
 
+    /// `ArchiveConductor.updateChannel` (`:708-735`), which the reference does
+    /// through an `UpdateChannelSession`.
+    ///
+    /// **One turn here, and the reference's session is why it is not one there.**
+    /// Its session reads the recording's descriptor into a buffer, substitutes
+    /// two fields, writes it back and marks the control session as having a
+    /// listing in progress while it does (`:728-733`) — the session exists
+    /// because that read-and-rewrite wants a buffer the conductor owns and a
+    /// window in which the session is "active". Here the read is
+    /// [`Catalog::recording`], the substitution is two field assignments and the
+    /// write is [`Catalog::replace_recording`], all of which the conductor can
+    /// do in the turn it was asked — so the **listing check** is kept (it is a
+    /// refusal a client can see) and the **claim** is not (nothing else runs
+    /// between the check and the answer).
+    ///
+    /// `strippedChannelBuilder` is S2's, and it is the whole of what the C
+    /// suite's `shouldUpdateChannel` asserts about the new channel: the
+    /// parameters the strip list keeps are the ones the descriptor must carry.
+    #[allow(clippy::too_many_arguments)] // one per collaborator and one per field
+    fn update_channel(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+        now_ms: i64,
+    ) {
+        if self.has_active_listing(session_id) {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                ACTIVE_LISTING,
+                ACTIVE_LISTING_MSG.to_owned(),
+            );
+            return;
+        }
+
+        if !catalog.has_recording(recording_id) {
+            if let Some(entry) = self.sessions.get_mut(&session_id) {
+                entry
+                    .control
+                    .send_recording_unknown(correlation_id, recording_id, now_ms, client);
+            }
+            return;
+        }
+
+        // A channel that will not parse is the one case the reference does not
+        // survive — `ChannelUri.parse` throws and takes the archive with it — so
+        // this refuses the request with this build's words for it, as
+        // `start_recording` does with the same parse.
+        let stripped_channel = match ChannelUri::parse(channel) {
+            Ok(uri) => stripped_channel_builder(&uri).build(),
+            Err(error) => {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    0,
+                    format!("replay channel could not be read: {error}"),
+                );
+                return;
+            }
+        };
+
+        let Ok(mut recording) = catalog.recording(recording_id) else {
+            return;
+        };
+
+        // Two fields, and the reference substitutes them into every field it
+        // read out of the descriptor (`UpdateChannelSession.java:96-118`), so
+        // nothing else about the recording is disturbed.
+        recording.original_channel = channel.to_owned();
+        recording.stripped_channel = stripped_channel;
+
+        match catalog.replace_recording(&recording) {
+            Ok(()) => self.pending.push(Deferred::Ok {
+                session_id,
+                correlation_id,
+                relevant_id: 0,
+            }),
+            Err(error) => self.refuse_request(
+                session_id,
+                correlation_id,
+                0,
+                format!("could not write the recording's new channel: {error}"),
+            ),
+        }
+    }
+
     /// `ArchiveConductor.attachSegments` (`:1556-1617`).
     ///
     /// The walk is **backwards** from the segment before the recording's start,
@@ -4482,6 +4583,20 @@ impl Sessions {
             Action::Segment(request) => {
                 self.run_segment_request(client, counters, catalog, request, now_ms);
             }
+            Action::UpdateChannel {
+                session_id,
+                correlation_id,
+                recording_id,
+                channel,
+            } => self.update_channel(
+                client,
+                catalog,
+                session_id,
+                correlation_id,
+                recording_id,
+                &channel,
+                now_ms,
+            ),
         }
     }
 
@@ -6181,6 +6296,22 @@ impl ControlPlane for Sessions {
                 recording_id,
             },
         )));
+    }
+
+    fn on_update_channel(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        channel: &str,
+        _now_ms: i64,
+    ) {
+        self.pending.push(Deferred::Action(Action::UpdateChannel {
+            session_id,
+            correlation_id,
+            recording_id,
+            channel: channel.to_owned(),
+        }));
     }
 
     fn on_attach_segments(
