@@ -122,7 +122,11 @@ fn a_message_goes_to_the_node_and_comes_back() {
 #[test]
 fn a_message_wider_than_one_frame_comes_back_whole() {
     // Offered and not claimed: a claim is one frame and this message is three.
-    let scratch = round_trip("echo-round-trip-fragmented", FRAGMENTED_MESSAGE_LENGTH, false);
+    let scratch = round_trip(
+        "echo-round-trip-fragmented",
+        FRAGMENTED_MESSAGE_LENGTH,
+        false,
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
 }

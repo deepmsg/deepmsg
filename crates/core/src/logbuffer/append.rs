@@ -186,12 +186,96 @@ impl PayloadSource<'_, '_> {
     }
 }
 
+/// What a log's own metadata says about its shape, read once.
+///
+/// Every one of these is written by the driver when it creates the log and never
+/// again, so a publication that keeps them pays for them once instead of once an
+/// append. That matters more than the five instructions it saves: the metadata
+/// block is **the line the producer writes its tail into every append**, and a
+/// block that is read before it is written comes into the producer's cache
+/// shared and then has to be upgraded when the tail is stored — a second
+/// coherence round trip per append, on the one line the driver is also reading.
+/// The reference keeps all of this on its publication object and touches the
+/// block once an append, to write the tail.
+#[derive(Clone, Copy, Debug)]
+pub struct AppendShape {
+    term_length: i32,
+    initial_term_id: i32,
+    bits_to_shift: u32,
+    max_payload_length: usize,
+    max_message_length: usize,
+}
+
+impl AppendShape {
+    /// The shape a metadata block describes, which is the whole of what
+    /// [`Appender::new`] reads it for.
+    ///
+    /// # Errors
+    ///
+    /// [`None`] for a block that does not describe a usable log: a term length
+    /// that is not one of the reference's legal values, or an MTU with no room
+    /// in it for a frame's header.
+    pub fn read(metadata: &AtomicBuffer<'_, ReadWrite>) -> Option<Self> {
+        let term_length = metadata.load_i32(descriptor::TERM_LENGTH_OFFSET)?;
+        let bits_to_shift = position::bits_to_shift(term_length)?;
+        let initial_term_id = metadata.load_i32(descriptor::INITIAL_TERM_ID_OFFSET)?;
+
+        // The MTU is what decides whether a payload fits one frame. A log with
+        // no MTU is not one the driver would have created — every publication
+        // gets one — so treat zero as refusing everything rather than as "no
+        // bound", which would silently write frames the reference fragments.
+        let mtu_length = metadata.load_i32(descriptor::MTU_LENGTH_OFFSET)?;
+        let max_payload_length = mtu_length.saturating_sub(DATA_HEADER_LENGTH as i32);
+        if max_payload_length <= 0 {
+            return None;
+        }
+
+        Some(Self {
+            term_length,
+            initial_term_id,
+            bits_to_shift,
+            #[allow(clippy::cast_sign_loss)]
+            max_payload_length: max_payload_length as usize,
+            #[allow(clippy::cast_sign_loss)]
+            max_message_length: position::max_message_length(term_length) as usize,
+        })
+    }
+}
+
 impl<'a> Appender<'a> {
     /// Wrap a metadata block and the term buffer it describes.
     ///
     /// Returns `None` if the term length is not one of the reference's legal
     /// values, or if the term buffer is not as long as the metadata says — a
     /// reader that trusted a shorter term buffer would write past it.
+    /// The same, over a term whose shape the caller already holds — **no reads
+    /// of the metadata block at all**.
+    ///
+    /// What a producer that keeps its own [`AppendShape`] uses: the block is
+    /// then touched once an append, to write the tail, which is what the
+    /// reference does.
+    pub fn with_shape(
+        metadata: AtomicBuffer<'a, ReadWrite>,
+        term: AtomicBuffer<'a, ReadWrite>,
+        shape: AppendShape,
+    ) -> Option<Self> {
+        if term.len() < shape.term_length as usize {
+            return None;
+        }
+
+        Some(Self {
+            metadata,
+            term,
+            term_length: shape.term_length,
+            initial_term_id: shape.initial_term_id,
+            bits_to_shift: shape.bits_to_shift,
+            max_payload_length: shape.max_payload_length,
+            max_message_length: shape.max_message_length,
+            #[cfg(test)]
+            produce_race: None,
+        })
+    }
+
     pub fn new(
         metadata: AtomicBuffer<'a, ReadWrite>,
         term: AtomicBuffer<'a, ReadWrite>,

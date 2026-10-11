@@ -27,7 +27,7 @@ use std::path::Path;
 
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::logbuffer::append::PayloadRegion;
-use deepmsg_core::logbuffer::append::{Appended, Appender};
+use deepmsg_core::logbuffer::append::{AppendShape, Appended, Appender};
 use deepmsg_core::logbuffer::frame::Frame;
 use deepmsg_core::logbuffer::position::Position;
 use deepmsg_core::logbuffer::{descriptor, position};
@@ -365,6 +365,19 @@ pub struct ExclusivePublication {
     /// cache missed a rotation". The one read-only use, `max_payload_length`,
     /// does not depend on the partition at all.
     partition: std::cell::Cell<usize>,
+    /// What the log's metadata says about the log's shape, read **once**, when
+    /// this publication mapped it.
+    ///
+    /// Every field of it is written by the driver when it creates the log and
+    /// never again, so an append that reads them reads the same numbers every
+    /// time — and pays for them in the one currency that matters here: the
+    /// metadata block is the line this producer writes its tail into on every
+    /// append, so reading it first brings it in **shared** and the store then
+    /// has to upgrade it, which is a second coherence round trip per append on a
+    /// line the driver is reading too. The reference keeps exactly this on its
+    /// publication object (`aeron_exclusive_publication.h:45-47`), and this is
+    /// the same thing.
+    shape: AppendShape,
     /// As [`Publication::revoke_on_close`], which is the whole of what the two
     /// kinds share about endings: the flag is not a property of having one
     /// producer.
@@ -387,18 +400,29 @@ impl ExclusivePublication {
         position_limit_counter_id: i32,
         channel_status_indicator_id: i32,
     ) -> io::Result<Self> {
+        let log = LogBuffer::open(path, true)?;
+
+        // The one read of the metadata block that is about the log's shape
+        // rather than about where this producer is in it.
+        let shape = log
+            .file()
+            .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+            .and_then(|metadata| AppendShape::read(&metadata))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no usable log metadata"))?;
+
         let publication = Self {
             registration_id,
             session_id,
             stream_id,
             position_limit_counter_id,
             channel_status_indicator_id,
-            log: LogBuffer::open(path, true)?,
+            log,
             term_id: std::cell::Cell::new(0),
             term_offset: std::cell::Cell::new(0),
             // Whatever is here is overwritten by the seed below, which is the
             // read of the log that answers the question properly.
             partition: std::cell::Cell::new(0),
+            shape,
             revoke_on_close: false,
         };
 
@@ -842,7 +866,10 @@ impl ExclusivePublication {
 
         let term = self.log.term_mut(self.partition.get())?;
 
-        Appender::new(metadata, term)
+        // And nothing is read out of the block above it: this publication
+        // already holds everything an appender derives from it, so the only
+        // touch this append has of that line is the tail it writes.
+        Appender::with_shape(metadata, term, self.shape)
     }
 }
 
