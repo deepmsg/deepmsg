@@ -523,18 +523,53 @@ fn a_refusal_carries_the_archives_code_and_the_clients() {
     media_driver.stop().expect("the driver stops");
 }
 
-/// The two domains, and the one code that is in neither.
+/// `shouldMapErrorCodes` (`:4849-4867`) and `shouldNotMapActualErrorCodes`
+/// (`:4870-4888`) — **both domains whole, not a sample of them**.
+///
+/// The reference sweeps all seventeen archive codes and then all seventeen
+/// client codes, and the sweep *is* the claim: the two ranges have to meet
+/// exactly, one code onto one, with nothing in between remapped twice. A sample
+/// cannot catch a wrong constant in a code it never visits, which is why the
+/// reference visits every one of them. (Falsified: send code `7` to `208` and
+/// this goes red naming `archive code 7` — a sample of `0`, `5` and `16` never
+/// looks at it.)
+///
+/// **The third case of that class — `shouldHaveErrorMessagesForArchiveErrorCodes`
+/// (`:4891-4910`) — has no counterpart here, and its absence is on purpose.** It
+/// asserts that `aeron_error_code_str` answers with something other than
+/// `"unknown error code"` for each of the seventeen client codes, and that table
+/// lives in Aeron's *client* (`aeron_archive_client_error.h:8+` defines the
+/// codes, `util/aeron_error.c:252+` is the switch) because in C an error **is**
+/// an `int`. This build's errors are typed: `ArchiveError::Refused` carries the
+/// wire code, the client code and the archive's own text, and printing one says
+/// what happened without a lookup (`crates/archive/src/client/archive.rs:259-270`).
+/// There is no `error_code_str` anywhere in this workspace for that table to be
+/// extended from, so porting the archive half alone would be an API with no
+/// caller — if the client's error surface is built, these codes go in with it.
 #[test]
 fn the_error_code_domains_map_the_way_the_reference_says() {
-    // `ARCHIVE_ERROR_CODE_GENERIC` and the first of the sixteen.
-    assert_eq!(200, archive_to_client_error_code(0));
-    // `ARCHIVE_ERROR_CODE_UNKNOWN_RECORDING`.
-    assert_eq!(205, archive_to_client_error_code(5));
-    // `ARCHIVE_ERROR_CODE_INVALID_POSITION`, the last of them.
-    assert_eq!(216, archive_to_client_error_code(16));
+    // `ARCHIVE_ERROR_CODE_GENERIC` (0) through `ARCHIVE_ERROR_CODE_INVALID_POSITION`
+    // (16), onto `AERON_ARCHIVE_ERROR_CODE_GENERIC` (200) through
+    // `AERON_ARCHIVE_ERROR_CODE_INVALID_POSITION` (216).
+    for archive_code in 0..=16 {
+        assert_eq!(
+            archive_code + 200,
+            archive_to_client_error_code(archive_code),
+            "archive code {archive_code}"
+        );
+    }
 
-    // One past the last is already a client code, and remapping it would make
-    // it mean something else.
+    // A client code is left alone — remapping one would make it mean something
+    // else. `217` is one past the last of them and `-1` is outside both
+    // domains; neither is moved either.
+    for client_code in 200..=216 {
+        assert_eq!(
+            client_code,
+            archive_to_client_error_code(client_code),
+            "client code {client_code}"
+        );
+    }
+
     assert_eq!(217, archive_to_client_error_code(217));
     assert_eq!(-1, archive_to_client_error_code(-1));
 }
