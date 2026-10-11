@@ -40,18 +40,39 @@
 //! session's response channel — the same one a descriptor and a control
 //! response come back on, which is why the reads here filter by correlation id
 //! rather than by message type.
+//!
+//! # Why the listing is still read off the channel by hand
+//!
+//! Plan §2.3's third step is where this file's request sites were to become the
+//! product's named methods, and the listing half of it cannot: what the criteria
+//! here are about is the **answer that ends a page**, and the product keeps no
+//! door onto it. `Archive::list_recordings` hands each descriptor to a consumer
+//! and answers the count (`archive.rs:911-931`); the `RECORDING_UNKNOWN` that
+//! ends the listing is read by the poller, which takes only its existence
+//! (`is_dispatch_complete`, `descriptor_poller.rs:264-268`) — **the reference's
+//! own poller does the same thing** (`aeron_archive_recording_descriptor_poller.c
+//! :194-200`), so this is the product being faithful rather than a gap in it.
+//! The `relevantId` and the code asserted below are on the wire and only there.
+//!
+//! The one call that could not be made either way is ⑤: a listing asked for
+//! **zero** recordings is one the archive ends without answering at all
+//! (`conductor.rs:1489-1493`), and the product's wait is for an answer — so
+//! `Archive::list_recordings(from, 0, …)` would sit out its whole timeout. One
+//! ruler (the fixture reads what the archive sends) covers all the calls here.
+//!
+//! What the product's listing methods are is a criterion of their own, and they
+//! have one: `archive_client_api.rs` and `archive_proxy.rs` drive
+//! `list_recordings` and `list_recordings_for_uri` against this same archive.
+//! Nothing goes uncovered by this file staying on the channel.
 
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
-use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::list_recordings_for_uri_request_codec::ListRecordingsForUriRequestEncoder;
 use deepmsg_codec::archive::list_recordings_request_codec::ListRecordingsRequestEncoder;
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_descriptor_codec::{self, RecordingDescriptorDecoder};
-use deepmsg_codec::archive::source_location::SourceLocation;
-use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
 use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
@@ -462,13 +483,18 @@ fn record(session: &mut Session, client: &mut Client, channel: &str, expected: u
         .expect("the publication has a session");
 
     let control_session_id = session.control_session_id();
-    let correlation_id = session.next_correlation_id();
-    let payload = start_recording_request(control_session_id, correlation_id, channel);
 
-    // A refusal is the error now, and it carries the archive's own text — the
-    // `expect` message says the same thing the assertion below it used to.
+    // `StartRecordingRequest2` (63), which is `Archive::start_recording` now —
+    // the same request this file used to build byte by byte, with its
+    // correlation id drawn from the driver's command ring and a refusal turned
+    // into an error carrying the archive's own text. `LOCAL` is the source
+    // location and `false` the auto-stop, which is what the constructor wrote.
+    //
+    // It is the only request site in this file that moves: see the module doc
+    // on why the listings stay on the channel.
     session
-        .send(client, correlation_id, &payload, Instant::now() + DEADLINE)
+        .archive_mut()
+        .start_recording(client, channel, STREAM_ID, true, false)
         .expect("the archive answers a start");
 
     publish_and_read(client, publication, reader);
@@ -603,32 +629,6 @@ fn list_recordings_for_uri_request(
             .record_count(count)
             .stream_id(stream_id)
             .channel(channel_fragment.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// The `StartRecordingRequest2` (63) for one channel.
-fn start_recording_request(control_session_id: i64, correlation_id: i64, channel: &str) -> Vec<u8> {
-    let mut buffer = vec![0u8; 256];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .stream_id(STREAM_ID)
-            .source_location(SourceLocation::LOCAL)
-            .auto_stop(BooleanType::FALSE)
-            .channel(channel.as_bytes());
 
         body + encoder.encoded_length()
     };
