@@ -523,6 +523,78 @@ fn a_refusal_carries_the_archives_code_and_the_clients() {
     media_driver.stop().expect("the driver stops");
 }
 
+/// **A caller can send a request itself, and read the answer by the id it drew.**
+///
+/// Every named method on `Archive` offers and then waits (`offer_and_wait`),
+/// which is the shape a caller that wants one answer needs — and the wrong shape
+/// for a caller that has to stay non-blocking. `Archive::proxy_mut` is the door
+/// for that caller: the proxy's encoders write into its reused buffer, the
+/// correlation id comes from `Archive::next_correlation_id`, and the answer is
+/// read later, keyed on the id the caller drew.
+///
+/// **The reference's replication session is that caller** — it reaches for
+/// `archiveProxy().listRecording`, `getRecordingPosition`, `replay` and
+/// `stopReplay` directly rather than the high-level calls
+/// (`ReplicationSession.java`), because it runs inside the archive conductor's
+/// work cycle and may take only one step per turn. The same door is what the
+/// test fixture has always needed: `tests/src/archive.rs`'s `Session::send_only`
+/// touches the publication itself for want of one.
+///
+/// What this asks is that the door is real. The request below is answered with a
+/// refusal — there is no such recording — and *that* is the evidence: the
+/// refusal comes back carrying the correlation id this caller drew, so the
+/// request went out through the proxy and the archive answered **that** id.
+#[test]
+fn a_caller_can_offer_a_request_itself_and_read_its_answer() {
+    let Some((mut media_driver, _archive_dir, mut client)) = rig("archive-client-api-own-request")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    let correlation_id = archive
+        .next_correlation_id(&mut client)
+        .expect("the driver's command ring answers");
+
+    archive
+        .proxy_mut()
+        .get_recording_position(&client, correlation_id, 999_999)
+        .expect("the proxy offers the request");
+
+    let error = archive
+        .wait_for_response(&mut client, "a request the caller built", correlation_id)
+        .expect_err("there is no recording 999999");
+
+    let ArchiveError::Refused {
+        correlation_id: refused,
+        archive_error_code,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        correlation_id, *refused,
+        "the answer is the one to the id this caller drew, not to one the product drew"
+    );
+    assert_eq!(
+        5, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_UNKNOWN_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(Some(205), error.client_error_code());
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
 /// `shouldMapErrorCodes` (`:4849-4867`) and `shouldNotMapActualErrorCodes`
 /// (`:4870-4888`) — **both domains whole, not a sample of them**.
 ///

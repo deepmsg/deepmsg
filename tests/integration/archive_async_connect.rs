@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_archive::client::async_connect::{AsyncConnect, NoCredentials, Polled};
 use deepmsg_archive::client::context::{CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV};
-use deepmsg_archive::client::{ArchiveContext, ControlChannels};
+use deepmsg_archive::client::{Archive, ArchiveContext, ControlChannels, Handlers};
 use deepmsg_client::client::Client;
 use deepmsg_core::uri::ChannelUri;
 use deepmsg_tests::archive;
@@ -152,6 +152,95 @@ fn the_connect_completes_against_an_archive() {
 
     media_driver.stop().expect("the driver stops");
 }
+
+/// **A connect that was polled by hand is finished into a working archive.**
+///
+/// [`Archive::connect`] is the blocking face of the state machine: it owns the
+/// loop and does not come back until the connect is over. A caller that has to
+/// keep its own clock cannot use it — it polls the connect a turn at a time and
+/// builds the archive out of what `Done` hands back. **The reference's
+/// replication session is that caller** (`ReplicationSession.java:407` polls an
+/// `asyncConnect` from the archive conductor's work cycle), which is why
+/// `Archive::from_connected` is public.
+///
+/// Two things have to survive the hand-off and one has to work afterwards: the
+/// ids the connect named, and the archive itself. The listing below is what
+/// separates "an `Archive` was built" from "an `Archive` was built and it is
+/// talking to the archive" — against a catalog with nothing in it, the answer is
+/// nought descriptors rather than a failure.
+#[test]
+fn a_polled_connect_is_finished_into_an_archive() {
+    let archive_dir = TempDir::new("archive-polled-connect");
+    let archive_id_property = format!("-Daeron.archive.id={ARCHIVE_ID}");
+    let properties: Vec<&str> = archive::PROPERTIES
+        .iter()
+        .copied()
+        .chain(std::iter::once(archive_id_property.as_str()))
+        .collect();
+
+    let Some(mut media_driver) =
+        OwnArchivingMediaDriver::start("archive-polled-connect", archive_dir.path(), &properties)
+    else {
+        archiving_driver::announce_skip();
+        return;
+    };
+
+    media_driver
+        .await_ready(archive::DEADLINE)
+        .expect("the archiving media driver comes up");
+
+    let mut client = Client::connect(media_driver.aeron_dir()).expect("connect to our driver");
+    let context = ArchiveContext::resolve(&[
+        (
+            CONTROL_CHANNEL_ENV.to_owned(),
+            archive::CONTROL_CHANNEL.to_owned(),
+        ),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV.to_owned(),
+            archive::RESPONSE_CHANNEL.to_owned(),
+        ),
+    ]);
+
+    let mut connect = AsyncConnect::new(&context, &mut client, &mut NoCredentials)
+        .expect("the context concludes");
+    let connected = drive(&mut connect, &mut client)
+        .unwrap_or_else(|error| panic!("{error};\n{}", media_driver.log_tail(40)));
+
+    let session_id = connected.control_session_id;
+    let mut archive = Archive::from_connected(context, *connected, Handlers::default());
+
+    assert_eq!(
+        session_id,
+        archive.control_session_id(),
+        "the session the archive names is the one the connect was given"
+    );
+    assert_eq!(
+        ARCHIVE_ID,
+        archive.archive_id(),
+        "and the archive it was talking to is the one that answered the connect"
+    );
+
+    // A listing is asked for and answered, which is the round trip that makes
+    // this an archive rather than a struct full of ids.
+    let listed = archive
+        .list_recordings(&mut client, i64::MIN, 10, count_nothing)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the archive answers a listing: {error};\n{}",
+                media_driver.log_tail(40)
+            )
+        });
+
+    assert_eq!(
+        0, listed,
+        "a catalog with nothing in it is nought descriptors — an answer, not a failure"
+    );
+
+    media_driver.stop().expect("the driver stops");
+}
+
+/// A listing consumer that keeps nothing, for a listing that expects nothing.
+fn count_nothing(_descriptor: &deepmsg_archive::client::RecordingDescriptor) {}
 
 /// **A response-mode response channel makes the request name the subscription.**
 ///

@@ -145,10 +145,12 @@ impl Credentials for NoCredentials {
 /// Everything a completed connect assembled, for whoever builds an `Archive`.
 ///
 /// The reference hands these to `aeron_archive_create` inside
-/// `transition_to_done`; here they are the answer, and [`Archive::connect`] —
-/// which holds the handlers a recording-descriptor poller is built with — is
-/// what consumes them. **This type is that seam and stays one**: see the module
-/// note for why the split is forced rather than provisional.
+/// `transition_to_done`; here they are the answer, and the layer that holds the
+/// handlers a recording-descriptor poller is built with — [`Archive::connect`]
+/// for a caller that can afford to block, [`Archive::from_connected`] for one
+/// that cannot — is what consumes them. **This type is that seam and stays
+/// one**: see the module note for why the split is forced rather than
+/// provisional.
 #[derive(Debug)]
 pub struct Connected {
     /// The response channel's subscription, which the poller reads.

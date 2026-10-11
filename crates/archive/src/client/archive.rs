@@ -374,8 +374,27 @@ impl Archive {
         }
     }
 
-    /// What a finished connect assembled.
-    fn from_connected(context: ArchiveContext, connected: Connected, handlers: Handlers) -> Self {
+    /// What a finished connect assembled — the **non-blocking** way to an
+    /// `Archive`.
+    ///
+    /// [`Self::connect`] is the blocking face of [`AsyncConnect`]: it owns the
+    /// loop, drives the client and does not come back until the connect is over.
+    /// A caller that must keep its own clock cannot use it — it has to poll the
+    /// connect itself, one turn at a time, and build the archive from what
+    /// [`Polled::Done`] hands back. **That caller is the reference's replication
+    /// session** (`ReplicationSession.java:407`, an `asyncConnect` polled from
+    /// the conductor's work cycle), and this is the door it comes through.
+    ///
+    /// It is public for the same reason [`AsyncConnect`] and [`Connected`] are:
+    /// they are the polling face of this client, and a public `Connected` with
+    /// no public way to become an `Archive` would be a type nobody could finish
+    /// using.
+    #[must_use]
+    pub fn from_connected(
+        context: ArchiveContext,
+        connected: Connected,
+        handlers: Handlers,
+    ) -> Self {
         let recording_descriptor_poller = RecordingDescriptorPoller::new(
             connected.subscription,
             connected.control_session_id,
@@ -430,10 +449,35 @@ impl Archive {
         self.subscription
     }
 
-    /// The proxy, for a caller that needs to send something itself.
+    /// The proxy, to read what the session was opened with.
     #[must_use]
     pub const fn proxy(&self) -> &ArchiveProxy {
         &self.proxy
+    }
+
+    /// The proxy, **mutably** — for a caller that sends something itself.
+    ///
+    /// Every method on this type is a *named* request and every one of them
+    /// offers and then waits (`offer_and_wait`), which is the shape a caller
+    /// that wants one answer needs and the wrong shape for one that must keep
+    /// its own clock: [`crate::client::proxy`]'s encoders write into a reused
+    /// buffer and need `&mut`, and what a poll-driven caller does with them is
+    /// offer now and read the answer in a later turn.
+    ///
+    /// **The reference's replication session is exactly that caller**
+    /// (`ReplicationSession.java`: it reaches for `archiveProxy().listRecording`,
+    /// `getRecordingPosition`, `replay` and `stopReplay` directly rather than
+    /// the high-level calls), and it is why this door exists: without it a
+    /// session that runs inside a conductor's turn has no way to send a request
+    /// and stay non-blocking. The fixture has needed the same thing since it
+    /// existed — see `tests/src/archive.rs`'s `Session::send_only`, which
+    /// touches the publication because there was nowhere to hand it a payload.
+    ///
+    /// Correlation ids come from [`Self::next_correlation_id`], which is what
+    /// the proxy's encoders take as an argument.
+    #[must_use]
+    pub const fn proxy_mut(&mut self) -> &mut ArchiveProxy {
+        &mut self.proxy
     }
 
     /// Leave, and tell the archive so (`aeron_archive_close`, `:347-386`).
