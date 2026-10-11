@@ -39,10 +39,6 @@ pub struct EchoNode {
     client: Client,
     publication: i64,
     subscription: i64,
-    /// The messages one poll took, kept between polls so that echoing them does
-    /// not allocate. See [`EchoNode::run`] for why they are taken out of the
-    /// poll rather than answered inside it.
-    echoed: Vec<Vec<u8>>,
     /// Where a message that arrived in several frames is put back together.
     ///
     /// The node reads fragments (see [`EchoNode::run`]), so the reassembly the
@@ -82,7 +78,6 @@ impl EchoNode {
             receiver_index,
             running: Arc::new(AtomicBool::new(true)),
             client,
-            echoed: Vec::new(),
             assembler: FragmentAssembler::new(),
         };
 
@@ -161,10 +156,14 @@ impl EchoNode {
         })?;
 
         // Taken out of `self` for the loop: the poll borrows the client
-        // mutably, and the echoes after it borrow the client again, so the
-        // messages have to be somewhere that is neither.
-        let mut echoed = std::mem::take(&mut self.echoed);
+        // mutably, and the echo inside it borrows the client again. The
+        // assembler goes with them for the same reason.
         let mut assembler = std::mem::take(&mut self.assembler);
+        // Copied out rather than borrowed: the closures below hold it for the
+        // whole poll, and the loop still has to reach `self` for the idle.
+        // `IdleStrategy` is a `Copy` pair of numbers, so this is the same value
+        // the field holds and it goes back at the end.
+        let mut idle = self.idle;
 
         loop {
             self.client.poll();
@@ -175,75 +174,74 @@ impl EchoNode {
 
                 // The **fragment** door and not the message door: a message that
                 // arrived in one frame is a window onto the term, and the only
-                // copy the node needs is the one into its own buffer. The
-                // message door would copy it into the assembler's `passthrough`
-                // first — one copy for a caller that only wanted the bytes, and
-                // a second for this node, which is holding a copy of a copy.
+                // copy the node needs is the one the offer makes on its way into
+                // the outgoing log. The message door would copy it into the
+                // assembler's `passthrough` first — one copy for a caller that
+                // only wanted the bytes, and a second for this node, which would
+                // be holding a copy of a copy.
                 //
                 // The reference's node is on this door too: `Image.poll` hands
-                // its handler the term buffer and the assembler passes an
+                // its handler the term buffer, the assembler passes an
                 // unfragmented fragment through without touching it
-                // (`ImageFragmentAssembler.java:107-110`).
-                client.poll_subscription_fragments(subscription, fragment_limit, |fragment| {
-                    if fragment.is_unfragmented() {
-                        // Read where the message lies, and copy it out once.
-                        // The two checks are the message door's, in its order.
-                        let length = fragment.payload_length();
-                        if length < MIN_MESSAGE_LENGTH {
-                            return;
-                        }
+                // (`ImageFragmentAssembler.java:107-110`), and the handler
+                // offers it straight back out of that window
+                // (`EchoNode.java:179-184`) — which is what the lent writer
+                // below is for.
+                client.poll_subscription_fragments_with_publication(
+                    subscription,
+                    fragment_limit,
+                    publication,
+                    |fragment, writer| {
+                        if fragment.is_unfragmented() {
+                            // Read where the message lies. The two checks are
+                            // the message door's, in its order.
+                            let length = fragment.payload_length();
+                            if length < MIN_MESSAGE_LENGTH {
+                                return;
+                            }
 
-                        // Only the messages addressed to this node. One message
-                        // of a client's batch names one receiver, so a node that
-                        // answered everything would answer for its neighbours
-                        // too.
-                        if fragment.payload_i32_at(RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
-                            return;
-                        }
+                            // Only the messages addressed to this node. One message
+                            // of a client's batch names one receiver, so a node that
+                            // answered everything would answer for its neighbours
+                            // too.
+                            if fragment.payload_i32_at(RECEIVER_INDEX_OFFSET)
+                                != Some(receiver_index)
+                            {
+                                return;
+                            }
 
-                        if arrived == echoed.len() {
-                            echoed.push(Vec::new());
-                        }
-
-                        let slot = &mut echoed[arrived];
-                        // Grown rather than cleared and grown: a run sends one
-                        // length, so this is the first message of a cell and
-                        // nothing after it, and `clear` would have every message
-                        // pay for zeroing bytes the copy is about to overwrite.
-                        if slot.len() != length {
-                            slot.resize(length, 0);
-                        }
-
-                        if fragment.copy_payload(slot).is_some() {
+                            // Straight back out, out of the window it came in on:
+                            // one copy, from the received term into the outgoing
+                            // log, and the reply does not wait for the rest of the
+                            // batch the way it did when this node collected a poll
+                            // and answered it afterwards.
+                            echo(&mut idle, || writer.offer(fragment));
                             arrived += 1;
-                        }
 
-                        return;
-                    }
-
-                    // A message that arrived in several frames is put back
-                    // together here and echoed as one — which is what the
-                    // reference's node does with its own assembler
-                    // (`ImageFragmentAssembler.java:113-133`), and the reason
-                    // the fragment door is not simply "forward each fragment".
-                    assembler.push(fragment, &mut |message| {
-                        let payload = message.payload;
-
-                        if payload.len() < MIN_MESSAGE_LENGTH {
                             return;
                         }
 
-                        if i32_at(payload, RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
-                            return;
-                        }
+                        // A message that arrived in several frames is put back
+                        // together here and echoed as one — which is what the
+                        // reference's node does with its own assembler
+                        // (`ImageFragmentAssembler.java:113-133`), and the reason
+                        // the fragment door is not simply "forward each fragment".
+                        assembler.push(fragment, &mut |message| {
+                            let payload = message.payload;
 
-                        keep(&mut echoed, &mut arrived, payload);
-                    });
-                });
-            }
+                            if payload.len() < MIN_MESSAGE_LENGTH {
+                                return;
+                            }
 
-            for payload in &echoed[..arrived] {
-                echo(&self.client, publication, payload, &mut self.idle);
+                            if i32_at(payload, RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
+                                return;
+                            }
+
+                            echo(&mut idle, || writer.offer_bytes(payload));
+                            arrived += 1;
+                        });
+                    },
+                );
             }
 
             if arrived == 0
@@ -262,8 +260,8 @@ impl EchoNode {
             }
         }
 
-        self.echoed = echoed;
         self.assembler = assembler;
+        self.idle = idle;
 
         Ok(())
     }
@@ -274,36 +272,21 @@ impl EchoNode {
     }
 }
 
-/// Keep one message for the echo pass, growing the list of them as needed.
-///
-/// The list is kept between turns so that echoing a batch does not allocate, and
-/// this is the one place both doors put a message into it.
-fn keep(echoed: &mut Vec<Vec<u8>>, arrived: &mut usize, payload: &[u8]) {
-    if *arrived == echoed.len() {
-        echoed.push(Vec::new());
-    }
-
-    echoed[*arrived].clear();
-    echoed[*arrived].extend_from_slice(payload);
-    *arrived += 1;
-}
-
 /// Send one message back, waiting as long as it takes.
 ///
 /// The reference's node loops on a negative offer without a bound — it is the
 /// only thing this process has to do, and giving up would drop a message the
 /// client is timing.
-fn echo(client: &Client, publication: i64, payload: &[u8], idle: &mut IdleStrategy) {
+fn echo(idle: &mut IdleStrategy, offer: impl Fn() -> Appended) {
     idle.reset();
 
     loop {
-        match client.offer_exclusive(publication, payload) {
-            Some(Appended::Ok { .. }) => return,
-            Some(other) => match check_publication_result(other, idle) {
+        match offer() {
+            Appended::Ok { .. } => return,
+            other => match check_publication_result(other, idle) {
                 Ok(_) => {}
                 Err(error) => panic!("{error}"),
             },
-            None => panic!("the node's publication is gone"),
         }
     }
 }
