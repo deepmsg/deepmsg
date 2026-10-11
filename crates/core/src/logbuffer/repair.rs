@@ -49,9 +49,17 @@ pub fn rebuild(
         return None;
     }
 
-    let mut payload = vec![0u8; source_length as usize - DATA_HEADER_LENGTH];
-    source_frame.copy_payload(&mut payload)?;
-    dest_frame.write_payload(&payload)?;
+    // Straight from the source's payload to the destination's, with no buffer
+    // in between: both are mapped memory, and the intermediate `Vec` was only
+    // ever there because nothing could copy one to the other. The two frames
+    // are disjoint by this function's own contract — the destination is empty,
+    // which is what the guard above checked — so the region copy accepts them.
+    dest.copy_in_from(
+        dest_offset + DATA_HEADER_LENGTH,
+        source,
+        source_offset + DATA_HEADER_LENGTH,
+        source_length as usize - DATA_HEADER_LENGTH,
+    )?;
 
     // Words 3, 2 and 1 — reserved value, stream and term id, session and term
     // offset — then word 0, which publishes the lot.
@@ -434,9 +442,16 @@ fn reset_as_padding(
     let declared = metadata.load_i32(descriptor::DEFAULT_FRAME_HEADER_LENGTH_OFFSET)?;
     let template_length = declared.clamp(0, descriptor::DEFAULT_FRAME_HEADER_MAX_LENGTH as i32);
 
-    let mut template = vec![0u8; template_length as usize];
-    metadata.copy_out(descriptor::DEFAULT_FRAME_HEADER_OFFSET, &mut template)?;
-    term.copy_in(offset, &template)?;
+    // The metadata block and the term this is padding are regions of one file
+    // and are disjoint — the terms come first, the metadata block is what
+    // follows them — so the region copy takes them, and the heap template this
+    // used to go through is gone.
+    term.copy_in_from(
+        offset,
+        metadata,
+        descriptor::DEFAULT_FRAME_HEADER_OFFSET,
+        template_length as usize,
+    )?;
 
     // The template carries the *initial* term's identity and offset zero; both
     // have to be corrected for wherever this frame actually is.

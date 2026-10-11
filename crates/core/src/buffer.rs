@@ -504,6 +504,78 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         Some(())
     }
 
+    /// Copy bytes into the window **out of another window**, or `None` if either
+    /// range is out of bounds or the two overlap.
+    ///
+    /// The counterpart of [`AtomicBuffer::copy_in`] for a source that is itself
+    /// mapped memory: a shared-memory stack hands bytes from one term to another
+    /// without an application buffer in between — a node echoing a message, a
+    /// proxy forwarding one — and the reference does exactly that in one
+    /// `putBytes(srcBuffer, srcOffset, length)` from the received term into the
+    /// outgoing one (`ExclusivePublication.java:645`).
+    ///
+    /// There is no `&[u8]` in between, and there cannot be: a slice over a
+    /// mapped region would promise the bytes will not change, which is false for
+    /// every region a driver is still writing (see this module's header, and
+    /// `pal`'s deliberate absence of `as_slice`). A window is the only spelling
+    /// the source can have.
+    ///
+    /// **Overlapping windows are refused rather than handled.** Two windows into
+    /// one mapping can be made to overlap — the repair path builds a read-only
+    /// one over the metadata block and a writable one over a term of the same
+    /// file — and a copy whose source and destination overlap is not what
+    /// `memmove` does for free: which bytes are read is a question about the
+    /// direction of the copy. Refusing is the answer that cannot be got wrong,
+    /// and no caller wants it: every one of them copies between regions that are
+    /// disjoint by construction.
+    pub fn copy_in_from(
+        &self,
+        dst_offset: usize,
+        src: &AtomicBuffer<'_, ReadOnly>,
+        src_offset: usize,
+        len: usize,
+    ) -> Option<()> {
+        let dst_end = dst_offset.checked_add(len)?;
+        let src_end = src_offset.checked_add(len)?;
+
+        if dst_end > self.len || src_end > src.len {
+            return None;
+        }
+
+        let dst_address = self.base.addr().checked_add(dst_offset)?;
+        let src_address = src.base.addr().checked_add(src_offset)?;
+
+        // The two ranges meet exactly when each begins before the other ends.
+        // (`checked_add` again: the ends are addresses, and an address that
+        // wrapped would be a range that appears to end before it begins.)
+        if dst_address < src_address.checked_add(len)?
+            && src_address < dst_address.checked_add(len)?
+        {
+            return None;
+        }
+
+        // SAFETY: both ranges were just proven to be inside their own windows
+        // (the two bounds checks above, which also rule out the wrapping that
+        // `checked_add` is there to catch), and the two ranges were just proven
+        // not to overlap — which is the whole of what `copy_nonoverlapping`
+        // needs beyond validity. The destination window is writable by
+        // construction: this method exists only on a window built from a
+        // writable mapping, and the source is a *read-only* window, so no
+        // writable alias is minted through it. Both windows are borrowed for the
+        // call and a mapping is unmapped only in `Drop`, which takes
+        // `&mut self`. Nothing is published here: as with `copy_in`, the
+        // caller's release of the length is what publishes these bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.base.cast::<u8>().add(src_offset),
+                self.base.add(dst_offset).cast_mut(),
+                len,
+            );
+        }
+
+        Some(())
+    }
+
     /// Write an `int64` at a **4-byte-aligned** offset, as two 32-bit stores.
     ///
     /// The reference's log-buffer metadata block is `#pragma pack(4)`
@@ -827,5 +899,100 @@ mod tests {
         let mut out = [0u8; 5];
         assert_eq!(Some(()), reader.copy_out(3, &mut out));
         assert_eq!(b"hello", &out);
+    }
+
+    /// The region copy moves the same bytes the slice one does — which is the
+    /// whole claim this method makes, and the reason a caller can hand a term to
+    /// it instead of copying the term into a `Vec` first.
+    #[test]
+    fn copies_bytes_from_another_window_where_a_read_view_finds_them() {
+        let mut bytes = Aligned([0u8; 64]);
+        let mut source = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut source.0).expect("aligned slice");
+            assert_eq!(Some(()), writer.copy_in(2, b"hello"));
+        }
+
+        {
+            let reader = AtomicBuffer::from_slice(&source.0).expect("aligned slice");
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+
+            assert_eq!(Some(()), writer.copy_in_from(5, &reader, 2, 5));
+            assert_eq!(
+                None,
+                writer.copy_in_from(60, &reader, 2, 8),
+                "a copy that runs past the destination must not be attempted"
+            );
+            assert_eq!(
+                None,
+                writer.copy_in_from(0, &reader, 60, 8),
+                "and one that runs past the source is not a copy either"
+            );
+            assert_eq!(
+                None,
+                writer.copy_in_from(usize::MAX, &reader, 0, 1),
+                "an offset that wraps is out of bounds, not a copy near the end"
+            );
+            assert_eq!(
+                Some(()),
+                writer.copy_in_from(0, &reader, 0, 0),
+                "nothing to copy is nothing to refuse"
+            );
+        }
+
+        let reader = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
+        let mut out = [0u8; 5];
+        assert_eq!(Some(()), reader.copy_out(5, &mut out));
+        assert_eq!(b"hello", &out);
+    }
+
+    /// Two windows that meet are refused, and the two below are the two ways a
+    /// caller can make that happen without meaning to: the same window twice,
+    /// and one window inside another.
+    ///
+    /// It is a refusal and not a `memmove` because which bytes a forward copy
+    /// sees when its ranges overlap is a question about direction — and because
+    /// no caller wants it: every one of them copies between regions that are
+    /// disjoint by construction.
+    #[test]
+    fn overlapping_windows_are_refused() {
+        let mut bytes = Aligned([0u8; 64]);
+
+        {
+            let writer = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+
+            // The same bytes on both sides: a read-only view of the window this
+            // is copying into. (`as_read_only` is how a test can build one at
+            // all — a `&[u8]` over the same bytes could not coexist with the
+            // `&mut [u8]` the writer holds.)
+            let itself = writer.as_read_only();
+            assert_eq!(None, writer.copy_in_from(0, &itself, 0, 8));
+            assert_eq!(
+                None,
+                writer.copy_in_from(4, &itself, 0, 8),
+                "a partial meeting is a meeting"
+            );
+            assert_eq!(
+                Some(()),
+                writer.copy_in_from(16, &itself, 0, 8),
+                "and one byte of daylight is not"
+            );
+        }
+
+        // Disjoint windows over **one** buffer, which is the shape every real
+        // caller has: two regions of a log, or two logs.
+        let mut halves = Aligned([0u8; 64]);
+        let (head, tail) = halves.0.split_at_mut(32);
+        {
+            let source = AtomicBuffer::from_slice(head).expect("aligned slice");
+            let destination = AtomicBuffer::from_slice_mut(tail).expect("aligned slice");
+            assert_eq!(Some(()), destination.copy_in_from(0, &source, 0, 32));
+        }
+        assert_eq!(
+            &halves.0[..32],
+            &halves.0[32..],
+            "the head was copied into the tail"
+        );
     }
 }
