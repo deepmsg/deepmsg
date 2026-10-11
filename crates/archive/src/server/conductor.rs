@@ -121,6 +121,7 @@ use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_siz
 use deepmsg_core::version::{format_version, semantic_version_major};
 
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
+use crate::client::context::ArchiveContext;
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{ArchiveMarkFile, MARK_FILE_UPDATE_INTERVAL_MS};
 use crate::segment::{
@@ -764,6 +765,17 @@ pub const STORAGE_SPACE: i64 = 11;
 /// `tryStopReplication` that always said it had stopped something.
 pub const UNKNOWN_REPLICATION: i64 = 12;
 
+/// `ArchiveException.REPLICATION_CONNECTION_FAILURE`
+/// (`client/ArchiveException.java:99`), the failure a replication answers with
+/// when it cannot open a session on the source archive at all
+/// (`ReplicationSession.java:437-442`).
+///
+/// It is an `ERROR` like any other, and it arrives **unsolicited**: the
+/// correlation id it carries is the replication's id, which no client ever sent
+/// a request under, so a client that is waiting for something else meets it as
+/// the error drain does.
+pub const REPLICATION_CONNECTION_FAILURE: i64 = 14;
+
 /// `CommonContext.SPY_PREFIX` (`CommonContext.java:246`): the channel prefix a
 /// **local** UDP publication is recorded through, because a driver's own
 /// publication is not a network one and a spy link is what carries it to a
@@ -840,6 +852,94 @@ pub struct ReplicationSettings {
     /// `ctx.replicationChannel()`, or `None` when the archive was started
     /// without one.
     pub channel: Option<String>,
+    /// `ctx.archiveClientContext()` (`ArchiveConductor.java:1441`): what the
+    /// archive reaches another archive with, before the request's own control
+    /// channel and stream are written over it.
+    ///
+    /// A whole [`ArchiveContext`] rather than the two fields of it that matter,
+    /// because the reference clones one and a session reads more of it than
+    /// that — the term buffer length, the MTU, the message timeout and the
+    /// client name all reach the source archive's driver, and a settings struct
+    /// carrying only the two would be this build inventing a second set of
+    /// defaults beside the client's own.
+    pub client_context: ArchiveContext,
+}
+
+/// `CommonContext.ENDPOINT_PARAM_NAME` (`CommonContext.java:239`), the one
+/// parameter the reference's derivation reads.
+const ENDPOINT_PARAM: &str = "endpoint";
+
+/// What a response channel falls back to when the archive's own control channel
+/// has no endpoint to derive one from — see
+/// [`replication_client_context`] for why there is a fallback at all.
+const REPLICATION_RESPONSE_CHANNEL_FALLBACK: &str =
+    "aeron:udp?endpoint=localhost:0|control-mode=response";
+
+/// `ChannelUri.hasControlModeResponse`'s value (`ChannelUri.java:653-656`).
+const CONTROL_MODE_RESPONSE_PARAM: &str = "control-mode=response";
+
+/// `Archive.Context.archiveClientContext` (`Archive.java:1514-1552`): the
+/// context a replication reaches its source with.
+///
+/// Two things are derived and neither is a guess:
+///
+/// * the **response channel**, which the reference derives from the archive's
+///   own control channel by replacing the port with nought
+///   (`Archive.java:1519-1541`) — `aeron:udp?endpoint=localhost:8010` gives a
+///   dynamic port on the same host, which is the only way the source can answer
+///   an archive that never advertised one;
+/// * everything else the client's own defaults, which is what
+///   `archiveClientContext = new AeronArchive.Context()` (`:1516`) is.
+///
+/// # ★ The one deviation, and it is forced by this build's shape
+///
+/// **The derived channel carries `control-mode=response`; the reference's does
+/// not.** That is not a preference — a plain response channel cannot be used
+/// from where this context is used at all.
+///
+/// `ArchiveContext::conclude_with` draws a session id for a non-response
+/// channel (`client/context.rs:489-506`), and that draw is
+/// [`Client::next_session_id`], a **driver round trip**. The reference makes it
+/// happily because its archive agent and its driver agent are different
+/// threads. This build's archiving media driver runs both halves in **one
+/// loop** (`deepmsg-archiving-media-driver.rs:363-375`: `driver.do_work()`, then
+/// `conductor.do_work(&mut client, …)`), so a client command issued inside the
+/// conductor's turn waits for a driver nobody is driving: the call sits for its
+/// whole `messageTimeoutNs` and the turn — and with it the answer the replicate
+/// is owed — never finishes. **Measured**: with the reference's plain channel
+/// the four replication criteria time out on the first replicate; with
+/// `control-mode=response` they pass in 0.08 s.
+///
+/// This is the same hazard [`Sessions::allocate_session_counter`] names for
+/// `ArchiveIdCounter::allocate`, and the same answer: the command is not sent.
+/// A response channel is asked for nothing here, and the source archive answers
+/// on the channel the request came in on — which is the shape `control-mode=
+/// response` means, and the one P2-1c built the response proxy for.
+///
+/// **One more deviation.** A control channel whose endpoint is absent or not
+/// `<host>:<port>` makes the reference throw `ConfigurationException` and
+/// refuse to **start** (`Archive.java:1526-1529`). There is no place in this
+/// build's startup to throw that from — `ArchiveConductor::new` returns an auth
+/// error, and the property has been accepted without this check since S2 — so
+/// an endpoint that cannot be derived falls back to `localhost:0`, which is what
+/// the derivation produces for every endpoint these archives are started with
+/// anyway.
+fn replication_client_context(config: &ArchiveConfig) -> ArchiveContext {
+    let mut context = ArchiveContext::new();
+    context.aeron_dir = config.aeron_dir.display().to_string();
+    context.control_response_channel = Some(
+        config
+            .control_channel
+            .as_deref()
+            .and_then(|channel| ChannelUri::parse(channel).ok())
+            .and_then(|uri| uri.get(ENDPOINT_PARAM).map(str::to_owned))
+            .and_then(|endpoint| endpoint.rsplit_once(':').map(|(host, _)| host.to_owned()))
+            .map_or_else(
+                || REPLICATION_RESPONSE_CHANNEL_FALLBACK.to_owned(),
+                |host| format!("aeron:udp?endpoint={host}:0|{CONTROL_MODE_RESPONSE_PARAM}"),
+            ),
+    );
+    context
 }
 
 /// A request that **moves a resource** rather than answering about one.
@@ -2315,7 +2415,7 @@ impl Sessions {
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
         self.drive_replays(client, counters, catalog, now_ms);
-        self.drive_replication_sessions(now_ms);
+        self.drive_replication_sessions(client, now_ms);
         self.drive_delete_segments(client, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
@@ -4574,13 +4674,40 @@ impl Sessions {
     /// the next commit's, and until it exists a replication that finishes is
     /// dropped rather than closed — which is a hole this comment names and does
     /// not paper over.
-    fn drive_replication_sessions(&mut self, now_ms: i64) {
+    fn drive_replication_sessions(&mut self, client: &mut Client, now_ms: i64) {
         if self.replication_sessions.is_empty() {
             return;
         }
 
-        self.replication_sessions
-            .retain_mut(|session| !matches!(session.do_work(now_ms), ReplicationProgress::Done));
+        // Taken out for the walk, so that the answers a session owes can be
+        // pushed onto `pending` while the sessions are borrowed — the same
+        // shape [`Sessions::claim_creating_replays`] uses for `creating_replays`.
+        let mut sessions = std::mem::take(&mut self.replication_sessions);
+
+        sessions.retain_mut(|session| {
+            let control_session_id = session.control_session_id();
+
+            match session.do_work(client, now_ms) {
+                ReplicationProgress::Idle => true,
+                ReplicationProgress::Done => false,
+                ReplicationProgress::Failed {
+                    correlation_id,
+                    code,
+                    message,
+                } => {
+                    self.pending.push(Deferred::Error {
+                        session_id: control_session_id,
+                        correlation_id,
+                        relevant_id: code,
+                        message,
+                    });
+
+                    false
+                }
+            }
+        });
+
+        self.replication_sessions = sessions;
     }
 
     /// `ArchiveConductor.replicate` (`ArchiveConductor.java:1385-1478`), its
@@ -4717,6 +4844,28 @@ impl Sessions {
         let replication_id = self.next_session_id;
         self.next_session_id += 1;
 
+        // ③ `:1441-1456`: the source's context — the archive's own client
+        // context, with the request's control channel and stream written over
+        // it, the response channel when the request named one, and the client
+        // name marked with which replication it is.
+        //
+        // **No credentials supplier yet**: the reference installs a
+        // `ReplicationCredentialsSupplier` when `encodedCredentials` is not
+        // empty (`:1445-1448`), and this build's authenticator has no
+        // challenge-response path for a *client* to answer with. Every path the
+        // four criteria drive carries empty credentials, so what is unbuilt is
+        // also unreachable — and it is recorded rather than half-done.
+        let mut context = self.replication.client_context.clone();
+        context.control_request_channel = Some(request.src_control_channel.clone());
+        context.control_request_stream_id = request.src_control_stream_id;
+        if !request.src_response_channel.is_empty() {
+            context.control_response_channel = Some(request.src_response_channel.clone());
+        }
+        context.client_name = format!(
+            "{} replicationSessionId={replication_id}",
+            context.client_name
+        );
+
         // ⑤ `:1472-1478`: registered, added to the worker's list, and answered.
         //
         // The answer goes out **before** the session has done anything at all,
@@ -4728,6 +4877,7 @@ impl Sessions {
             replication_id,
             request,
             replication_channel,
+            context,
         ));
 
         self.pending.push(Deferred::Ok {
@@ -6941,6 +7091,7 @@ impl ArchiveConductor {
             },
             ReplicationSettings {
                 channel: config.replication_channel.clone(),
+                client_context: replication_client_context(config),
             },
             subscription_ids,
         );
@@ -8706,6 +8857,7 @@ mod tests {
             },
             ReplicationSettings {
                 channel: Some("aeron:ipc?alias=replicated".to_owned()),
+                client_context: ArchiveContext::new(),
             },
             Vec::new(),
         )
@@ -9088,6 +9240,7 @@ mod tests {
             replication_id,
             replication_request(),
             "aeron:ipc?alias=replicated".to_owned(),
+            ArchiveContext::new(),
         ));
 
         sessions.stop_replication(1, 99, replication_id);

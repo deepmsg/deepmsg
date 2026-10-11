@@ -1675,3 +1675,109 @@ fn the_four_replication_round_trips() {
     archive.close(&client);
     media_driver.stop().expect("the driver stops");
 }
+
+/// **A replication that cannot reach its source says so — under its own id.**
+///
+/// The first of the replication's twelve states is the only one that walks, and
+/// it is the only one that can fail outright: `CONNECT` builds a session on the
+/// source archive, and a source that will not take one ends the replication
+/// before it has copied anything.
+///
+/// Three claims, and the third is the one that would be missed by a plausible
+/// implementation:
+///
+/// * the client is told, which needs the failure to travel from inside the
+///   session's own turn out to the control subscription
+///   (`ReplicationProgress::Failed` → `Deferred::Error`);
+/// * it is told the archive's code, `REPLICATION_CONNECTION_FAILURE`
+///   (`ArchiveException.java:99`), which is the `relevantId` on the wire;
+/// * and the **correlation id is the replication's**, not the request's —
+///   `sendErrorResponse(replicationId, …)` (`ReplicationSession.java:925`). So
+///   this arrives as an error about a request the client made earlier, under an
+///   id it was *answered* with, and no wait of its own will ever match it.
+///
+/// The source here is a channel the client will not open a session with. That is
+/// the reference's own failure path and not a stand-in for one: its
+/// `ConfigurationException` from `AeronArchive.asyncConnect` is an
+/// `AeronException` (`ConfigurationException.java:21`), so it lands in the same
+/// `catch` as a connect that timed out (`ReplicationSession.java:437-442`).
+#[test]
+fn a_replication_that_cannot_reach_its_source_says_so() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replicate-src")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    // Accepted: the answer to a replicate is the session being registered, and
+    // nothing about the copy is known yet — which is why this call succeeds and
+    // the failure below arrives on its own, later.
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            SRC_RECORDING_ID,
+            SRC_CONTROL_STREAM_ID,
+            "",
+            &params,
+        )
+        .expect("the archive takes the replication, whatever the source turns out to be");
+
+    let mut failures = Vec::new();
+
+    until(
+        &mut client,
+        "the replication's connection failure",
+        |client| match archive.check_for_error_response(client) {
+            Ok(()) => false,
+            Err(error) => {
+                failures.push(error);
+
+                true
+            }
+        },
+    );
+
+    let ArchiveError::Refused {
+        correlation_id,
+        archive_error_code,
+        message,
+    } = &failures[0]
+    else {
+        panic!(
+            "the archive refused, so this is a refusal: {:?}",
+            failures[0]
+        );
+    };
+
+    assert_eq!(
+        &replication_id, correlation_id,
+        "the error is about the replication, under the id its OK carried"
+    );
+    assert_eq!(
+        14, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_REPLICATION_CONNECTION_FAILURE, in the archive's own domain"
+    );
+    assert_eq!(
+        Some(214),
+        failures[0].client_error_code(),
+        "and the same code where a caller matches on it"
+    );
+    assert!(
+        message.starts_with("Replication connection failed="),
+        "with the reference's own words in front of the reason: {message}"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
