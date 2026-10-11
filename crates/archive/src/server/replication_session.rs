@@ -168,6 +168,15 @@ pub enum ReplicationNotice {
         /// Which signal.
         signal: RecordingSignal,
     },
+    /// **Ask the conductor to stop the destination's recording**, quietly
+    /// (`ArchiveConductor.stopRecordingSubscription(subscriptionId)`, `:626-636`
+    /// — the overload that answers nobody; the client-facing one answers).
+    ///
+    /// The reference's session calls it directly from its `close()` (`:950`).
+    StopRecording {
+        /// The subscription the extend made.
+        registration_id: i64,
+    },
     /// **Ask the conductor to run one of the archive's own operations.**
     ///
     /// The reference's session calls the conductor **directly** and reads what
@@ -274,7 +283,7 @@ pub struct ReplicationSession {
     replay_token: i64,
     /// `srcReplaySessionId` (`:78`): the session the **source's replay** runs
     /// under, which is what `AWAIT_IMAGE` looks for at the destination.
-    src_replay_session_id: i32,
+    src_replay_session_id: i64,
     /// The clock this turn is running on, which [`Self::go_to`] reads — the
     /// reference's `epochClock`, which its own `state` asks for the time
     /// (`:975-983`).
@@ -394,7 +403,7 @@ impl ReplicationSession {
             recording_subscription: None,
             file_io_max_length,
             replay_token: NULL_VALUE,
-            src_replay_session_id: 0,
+            src_replay_session_id: NULL_VALUE,
             now_ms: 0,
             extend_asked: false,
             extend_answer: None,
@@ -488,10 +497,13 @@ impl ReplicationSession {
             State::ReplayToken => self.replay_token(),
             State::GetArchiveProxy => self.get_archive_proxy(),
             State::Replay => self.replay(client, now_ms),
-            // The live-merge pair and `AWAIT_IMAGE` are the next commits'. A
-            // state that returned a plausible-looking step here would be worse
-            // than one that does nothing: the next reader could not tell them
-            // apart.
+            State::AwaitImage => self.await_image(client, now_ms),
+            State::Replicate => self.replicate(client, now_ms),
+            // The live-merge pair is out of reach for every criterion this
+            // slice is held to (`live_destination` is empty in all of them, and
+            // `onRecordingDescriptor` never sends a live request here). A state
+            // that returned a plausible-looking step would be worse than one
+            // that does nothing: the next reader could not tell them apart.
             _ => Ok(()),
         };
 
@@ -1176,7 +1188,7 @@ impl ReplicationSession {
             );
         };
 
-        self.src_replay_session_id = i32::try_from(session_id).unwrap_or(0);
+        self.src_replay_session_id = session_id;
         self.go_to(State::AwaitImage);
 
         Ok(())
@@ -1219,6 +1231,182 @@ impl ReplicationSession {
     fn replication_channel_is_response(&self) -> bool {
         ChannelUri::parse(&self.replication_channel)
             .is_ok_and(|uri| uri.get(CONTROL_MODE_KEY) == Some(CONTROL_MODE_RESPONSE))
+    }
+
+    /// `(int)srcReplaySessionId` (`:760`), which is what the image is looked up
+    /// by — and the cast is not a formality.
+    ///
+    /// The id the source answers with is the archive's own replay counter in
+    /// the **high** half and the replay publication's Aeron session in the low
+    /// one (`ArchiveConductor.java:954`:
+    /// `((long)(replayId++) << 32) | (replayPublication.sessionId() & 0xFFFF_FFFFL)`),
+    /// and an image carries only the second. **Measured**: without the cast the
+    /// session sat in `AWAIT_IMAGE` for its whole deadline while the copy itself
+    /// ran — the bytes arrived and the session never noticed.
+    fn replay_image_session_id(&self) -> i32 {
+        self.src_replay_session_id as i32
+    }
+
+    /// `ReplicationSession.awaitImage` (`:753-776`): wait for the destination's
+    /// subscription to be given the image the **source's replay** is.
+    ///
+    /// The image is looked for by session id — `srcReplaySessionId`, which the
+    /// source named in its answer to `REPLAY` — and that is the whole of the
+    /// test. Nothing here is the session's own doing: the image appears when the
+    /// source's replay publication and the destination's subscription meet, and
+    /// what the session does about it is notice.
+    ///
+    /// **A live destination goes to `CATCHUP` instead** (`:762-766`), which no
+    /// criterion reaches — the same branch `onRecordingDescriptor` records.
+    fn await_image(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
+        let Some(registration_id) = self.recording_subscription else {
+            return Err("no destination subscription: EXTEND did not finish".to_owned());
+        };
+
+        let image = client
+            .subscription(registration_id)
+            .and_then(|subscription| {
+                subscription.image_by_session_id(self.replay_image_session_id())
+            });
+
+        if image.is_some() {
+            self.go_to(State::Replicate);
+
+            return Ok(());
+        }
+
+        let channel = client
+            .subscription(registration_id)
+            .map_or_else(String::new, |subscription| {
+                subscription.channel().to_owned()
+            });
+
+        self.expire_or_hold(
+            now_ms,
+            &format!(
+                "failed get replay image for sessionId={} on channel={channel}",
+                self.src_replay_session_id
+            ),
+        )
+    }
+
+    /// `ReplicationSession.replicate` (`:777-815`): follow the image until the
+    /// copy is done, and say so.
+    ///
+    /// **Done** is any of four things (`:784-785`): the destination's reader has
+    /// caught up with where the source's recording stopped, it has reached the
+    /// stop the request asked for, the image is at end-of-stream, or it is
+    /// closed. The first is the one a client is told about — a `SYNC` at the
+    /// position reached (`:797-800`) — and it is the one every bounded copy this
+    /// build serves ends on.
+    ///
+    /// The reference holds the image and asks *it* whether it is closed; this
+    /// looks the image up each turn, so **an image that is no longer there is
+    /// the closed one**. Both readings agree on what the session does about it:
+    /// nothing is copied any more, so the session is over.
+    ///
+    /// The reference logs the ending through its `ArchiveLog`
+    /// (`logReplicationSessionDone`, `:1017-1041`), which this build does not
+    /// have (the same gap `recording_session.rs` records).
+    fn replicate(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
+        let _ = now_ms;
+
+        let Some(registration_id) = self.recording_subscription else {
+            return Err("no destination subscription: EXTEND did not finish".to_owned());
+        };
+
+        let image = client
+            .subscription(registration_id)
+            .and_then(|subscription| {
+                subscription.image_by_session_id(self.replay_image_session_id())
+            });
+
+        let (position, is_end_of_stream) = match image {
+            Some(image) => (image.position(), image.is_end_of_stream().unwrap_or(false)),
+            None => (NULL_POSITION, true),
+        };
+
+        let is_synced =
+            self.src_stop_position != NULL_POSITION && position >= self.src_stop_position;
+
+        let done = is_synced
+            || (self.dst_stop_position != NULL_POSITION && position >= self.dst_stop_position)
+            || is_end_of_stream;
+
+        if !done {
+            return Ok(());
+        }
+
+        if is_synced {
+            self.notices.push(ReplicationNotice::Signal {
+                recording_id: self.dst_recording_id,
+                subscription_id: registration_id,
+                position,
+                signal: RecordingSignal::SYNC,
+            });
+        }
+
+        self.src_replay_session_id = NULL_VALUE;
+        self.go_to(State::Done);
+
+        Ok(())
+    }
+
+    /// `ReplicationSession.close` (`:196-211`): the teardown, and the **one**
+    /// `REPLICATE_END` — the signal the reference's own fixture waits for, and
+    /// the only one of them that is sent exactly once.
+    ///
+    /// Four things, in the reference's order: the destination's recording is
+    /// stopped, the source is told to stop the replay it was asked for, the
+    /// source archive's client is closed, and the client is told the session is
+    /// over. The reference also removes the session from the conductor's map
+    /// here (`:209`); in this build that is the same act as the session leaving
+    /// [`Sessions::drive_replication_sessions`]'s list, which is where `close`
+    /// is called from.
+    ///
+    /// **The order is what the signal says.** `stopRecording` drops the
+    /// recording subscription *first*, so the `REPLICATE_END` that follows
+    /// carries no subscription id (`signal`, `:925`) — which is what a client
+    /// that saw the `REPLICATE` signal, with one, will notice.
+    pub fn close(&mut self, client: &mut Client) {
+        if let Some(registration_id) = self.recording_subscription.take() {
+            self.notices
+                .push(ReplicationNotice::StopRecording { registration_id });
+        }
+
+        self.stop_replay_session(client);
+
+        if let Some(mut archive) = self.src_archive.take() {
+            archive.close(client);
+        }
+
+        self.notices.push(ReplicationNotice::Signal {
+            recording_id: self.dst_recording_id,
+            subscription_id: NULL_VALUE,
+            position: NULL_POSITION,
+            signal: RecordingSignal::REPLICATE_END,
+        });
+    }
+
+    /// `stopReplaySession` (`:929-944`): tell the source to stop the replay, and
+    /// do not wait for the answer — the reference catches and counts whatever
+    /// goes wrong here, because the session is over either way.
+    fn stop_replay_session(&mut self, client: &mut Client) {
+        if self.src_replay_session_id == NULL_VALUE {
+            return;
+        }
+
+        if let Some(archive) = self.src_archive.as_mut() {
+            if let Ok(correlation_id) = archive.next_correlation_id(client) {
+                let _ = archive.proxy_mut().stop_replay(
+                    client,
+                    correlation_id,
+                    self.src_replay_session_id,
+                );
+            }
+        }
+
+        self.src_replay_session_id = NULL_VALUE;
     }
 
     /// `ReplicationSession.connect` (`:401-443`): make the connect, then poll it

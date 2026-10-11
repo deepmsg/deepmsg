@@ -1014,6 +1014,15 @@ enum Action {
     },
     /// `ArchiveConductor.extendRecording` (`:1067-1157`): a client asking to
     /// go on recording a channel whose first session ended.
+    /// `ArchiveConductor.stopRecordingSubscription(subscriptionId)`
+    /// (`:626-636`), the **internal** overload — the one that answers nobody.
+    ///
+    /// A replication session's `close()` is what asks (`ReplicationSession.java:950`);
+    /// the client-facing overload next door is `Action::StopRecordingSubscription`.
+    StopRecordingQuietly {
+        /// The recording subscription to take off.
+        subscription_id: i64,
+    },
     /// `ArchiveConductor.extendRecording` (`:1067-1145`) — asked for by a
     /// **client**, and by a replication session.
     ///
@@ -4750,6 +4759,16 @@ impl Sessions {
         sessions.retain_mut(|session| {
             let control_session_id = session.control_session_id();
             let progress = session.do_work(client, catalog, now_ms);
+            let is_done = matches!(progress, ReplicationProgress::Done);
+
+            // **The teardown, and the one signal that says the session is over**
+            // (`ReplicationSession.close`, `:196-211`). The reference closes a
+            // session where the worker takes a done one out, and so does this —
+            // here, before the session leaves, so that what it owes on the way
+            // out goes onto the same queue as everything else it said.
+            if is_done {
+                session.close(client);
+            }
 
             // **Whatever the turn owed goes out, finished or not.** A session
             // that ends on the same turn as it raises a `SYNC` owes both, and
@@ -4769,6 +4788,11 @@ impl Sessions {
                         position,
                         signal,
                     },
+                    ReplicationNotice::StopRecording { registration_id } => {
+                        Deferred::Action(Action::StopRecordingQuietly {
+                            subscription_id: registration_id,
+                        })
+                    }
                     // An ask of the archive rather than a message to its
                     // client: the reference's session calls the conductor
                     // itself here, and what comes back is written onto the
@@ -4792,7 +4816,7 @@ impl Sessions {
                 });
             }
 
-            !matches!(progress, ReplicationProgress::Done)
+            !is_done
         });
 
         self.replication_sessions = sessions;
@@ -5072,6 +5096,22 @@ impl Sessions {
 
                 if let Some(replication_id) = replication_id {
                     self.record_extend_outcome(replication_id, outcome);
+                }
+            }
+            Action::StopRecordingQuietly { subscription_id } => {
+                // The reference's two lines (`:628-633`): take the subscription
+                // off the registry, and end what it was recording. Nothing is
+                // answered — a session's own teardown owes the client a signal,
+                // not a response.
+                if self
+                    .remove_recording_subscription(subscription_id)
+                    .is_some()
+                {
+                    self.abort_recording_session_and_close_subscription(
+                        client,
+                        recorder,
+                        subscription_id,
+                    );
                 }
             }
             Action::StopRecording {

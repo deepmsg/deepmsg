@@ -2090,31 +2090,118 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
         extension.stripped_channel
     );
 
-    // **And the copy happens.** `REPLAY` (`:666-752`) asks the source to replay
-    // the recording onto the destination's subscription, and the whole of that
-    // request is unobservable on its own — what proves it is that bytes arrive:
-    // the source's replay publication joins the destination's recording
-    // subscription, the recorder writes what it reads, and the destination
-    // recording's position moves off the start the descriptor gave it.
+    // **And the session ends by saying so.** `REPLICATE` sends `SYNC` when the
+    // copy has caught up with where the source's recording stopped (`:784-800`),
+    // and `close()` sends `REPLICATE_END` **once** — the signal the reference's
+    // own fixture waits on (`aeron_archive_test.cpp:3001-3006`).
     //
-    // Nothing between here and there is the session's doing — `AWAIT_IMAGE` and
-    // `REPLICATE` are about the session *noticing*, and they are the next
-    // commits' — so this is the replay request and the archive's own machinery
-    // behind it.
-    let copy_start = copied.start_position;
-    let mut copy_position = NULL_POSITION;
+    // The wait goes through a wait that **dispatches**. A bare `client.poll()`
+    // reads the driver's replies and nothing else; archive signals are handed to
+    // the handler by the archive's own waits (this file's module note says the
+    // same thing about the listing), so what this polls is the signal method.
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
 
-    until(&mut client, "the copy's first bytes", |client| {
-        copy_position = archive
-            .get_recording_position(client, copied.recording_id)
-            .unwrap_or(NULL_POSITION);
-
-        copy_position > copy_start
+        REPLICATION_SIGNALS
+            .lock()
+            .expect("no other test is holding the replication signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
     });
 
+    let signals = REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .clone();
+
+    let synced = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::SYNC)
+        .copied()
+        .expect("a SYNC signal");
+
+    assert_eq!(
+        copied.recording_id, synced.recording_id,
+        "the sync is about the copy the descriptor made"
+    );
     assert!(
-        copy_position > copy_start,
-        "the copy has data in it: position {copy_position} against a start of {copy_start}"
+        synced.position >= source.stop_position,
+        "at or past where the source's recording stopped: {} against {}",
+        synced.position,
+        source.stop_position
+    );
+    assert_eq!(
+        extension.subscription_id, synced.subscription_id,
+        "and it names the destination's recording subscription, which is still \
+         there — `stopRecording` has not run yet"
+    );
+
+    let ended = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE_END)
+        .copied()
+        .expect("a REPLICATE_END signal");
+
+    assert_eq!(
+        copied.recording_id, ended.recording_id,
+        "the end is about the same recording"
+    );
+    assert_eq!(
+        NULL_POSITION, ended.position,
+        "and carries no position: there is nothing left to be at"
+    );
+    assert_eq!(
+        -1, ended.subscription_id,
+        "nor a subscription — `close` stops the recording **before** it says so \
+         (`ReplicationSession.java:197`, `:925`)"
+    );
+
+    // **And the copy is what the destination is left holding.** The row the
+    // descriptor made now stops where the **source's** row stops, which is the
+    // archive's own record of what was recorded — read after the session is over,
+    // so it is not racing the teardown `close()` does.
+    //
+    // This is also the assertion that says the bytes are the **replay's**: the
+    // source's publisher is given back before the copy is asked for, so nothing
+    // else can have fed the destination's recording.
+    let mut rows: Vec<RecordingDescriptor> = Vec::new();
+
+    let after = archive
+        .list_recordings(&mut client, 0, 10, &mut |d: &RecordingDescriptor| {
+            rows.push(d.clone())
+        })
+        .expect("the listing completes");
+
+    assert!(after >= 2, "the source's row and the copy's: {after}");
+
+    let copied_after = rows
+        .iter()
+        .find(|row| row.recording_id == copied.recording_id)
+        .expect("the copy is still there");
+
+    let source_after = rows
+        .iter()
+        .find(|row| row.recording_id == source.recording_id)
+        .expect("and so is what it was copied from");
+
+    assert!(
+        copied_after.stop_position > copied_after.start_position,
+        "the copy has data in it: {} against a start of {}",
+        copied_after.stop_position,
+        copied_after.start_position
+    );
+    assert_eq!(
+        source_after.stop_position, copied_after.stop_position,
+        "and it stops exactly where the source's recording stopped"
+    );
+
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "exactly one REPLICATE_END, which is the whole point of it being in close()"
     );
 
     archive.close(&client);
