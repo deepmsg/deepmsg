@@ -287,11 +287,15 @@ impl core::fmt::Display for ArchiveError {
 
 impl std::error::Error for ArchiveError {}
 
-/// A connected archive: a session, the publication requests go out on, and the
-/// subscription the answers come back on.
+/// A connected archive: a session, the publication requests go out on, the
+/// subscription the answers come back on, and the two pollers a listing reads
+/// through.
 ///
-/// `aeron_archive_t`, less the two descriptor pollers — those arrive with the
-/// listings that need them, and `Connected` is the seam they will come through.
+/// `aeron_archive_t`. The reference builds this object **inside** the connect's
+/// last state (`transition_to_done`, `:462-519`); here the connect answers with
+/// what it assembled — [`Connected`] — and this type is built from that. The
+/// split, and why this build's handler placement makes it forced rather than
+/// provisional, is in `async_connect`'s module note.
 #[derive(Debug)]
 pub struct Archive {
     /// The context this archive was opened with. The reference owns a
