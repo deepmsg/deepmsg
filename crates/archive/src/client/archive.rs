@@ -635,6 +635,86 @@ impl Archive {
         }
     }
 
+    /// Poll the control channel **once** and answer the `relevantId` of the
+    /// response to `correlation_id`, or `None` while none has arrived
+    /// (`ReplicationSession.hasResponse`, `:902-914`).
+    ///
+    /// The non-blocking half of [`Self::wait_for_response`], and the reason it
+    /// exists: a replication session runs inside the archive's own turn and
+    /// cannot wait for anything — the turn it waits in is the turn that would
+    /// drive the client. What it can do is look once per turn, which is what the
+    /// reference's session does: `hasResponse` is a test on the poller, not a
+    /// loop.
+    ///
+    /// Two differences from the blocking face, and both are the reference's:
+    ///
+    /// * an answer for another session, or for another correlation id, is
+    ///   walked past and reads as `None` — it is somebody else's traffic on a
+    ///   shared subscription, not this caller's failure;
+    /// * an `ERROR` for **this** correlation id is the source refusing, and it
+    ///   is an error here: the reference throws the archive exception straight
+    ///   out of `hasResponse` (`:907-910`) and the caller's `catch` turns it
+    ///   into the state's failure.
+    ///
+    /// A recording signal on the same subscription is dispatched as it is
+    /// everywhere else this poller is read, and reads as `None`: a signal is not
+    /// an answer to a request.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchiveError::Refused`] when the source answered `ERROR` for this
+    /// correlation id, [`ArchiveError::UnexpectedCode`] when it answered
+    /// something that is neither, and [`ArchiveError::Malformed`] when what
+    /// arrived was not an archive message.
+    pub fn poll_for_response(
+        &mut self,
+        client: &mut Client,
+        correlation_id: i64,
+    ) -> Result<Option<i64>, ArchiveError> {
+        self.control_response_poller
+            .poll(client)
+            .map_err(map_poller_error)?;
+
+        if self.control_response_poller.is_poll_complete()
+            && self.control_response_poller.is_recording_signal()
+            && self.control_response_poller.control_session_id() == self.control_session_id
+        {
+            self.dispatch_recording_signal();
+
+            return Ok(None);
+        }
+
+        if !self.control_response_poller.is_poll_complete()
+            || self.control_response_poller.control_session_id() != self.control_session_id
+        {
+            return Ok(None);
+        }
+
+        let poller_correlation = self.control_response_poller.correlation_id();
+
+        if self.control_response_poller.is_code_error() {
+            if poller_correlation == correlation_id {
+                return Err(self.refused(correlation_id));
+            }
+
+            self.handle_error_with_handler(client);
+
+            return Ok(None);
+        }
+
+        if poller_correlation != correlation_id {
+            return Ok(None);
+        }
+
+        if !self.control_response_poller.is_code_ok() {
+            return Err(ArchiveError::UnexpectedCode(code_value(
+                self.control_response_poller.code(),
+            )));
+        }
+
+        Ok(Some(self.control_response_poller.relevant_id()))
+    }
+
     /// The same, for a caller that **expects** one error (`:147-215`).
     ///
     /// Answers `true` when the archive said `OK`, and `false` when it refused

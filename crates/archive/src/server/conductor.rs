@@ -1014,7 +1014,22 @@ enum Action {
     },
     /// `ArchiveConductor.extendRecording` (`:1067-1157`): a client asking to
     /// go on recording a channel whose first session ended.
-    ExtendRecording(ExtendRecordingRequest),
+    /// `ArchiveConductor.extendRecording` (`:1067-1145`) — asked for by a
+    /// **client**, and by a replication session.
+    ///
+    /// The two differ in exactly one thing: what becomes of the outcome. A
+    /// client's is answered on the wire and nothing here needs to read it; a
+    /// session's is a **return value** in the reference
+    /// (`ReplicationSession.java:549`, `conductor.extendRecording(...)` handed
+    /// straight to an `instanceof` test), and this build's sessions are driven
+    /// by the conductor rather than calling it — so `replication_id` is what
+    /// carries the answer back ([`Sessions::record_extend_outcome`]).
+    ExtendRecording {
+        /// The request, field for field.
+        request: ExtendRecordingRequest,
+        /// The replication session that asked, when one did.
+        replication_id: Option<i64>,
+    },
     /// `ArchiveConductor.stopRecordingByIdentity` (`:1301-1327`), which names
     /// the *recording* — and answers with whether there was one to stop, not
     /// with a position.
@@ -4754,6 +4769,16 @@ impl Sessions {
                         position,
                         signal,
                     },
+                    // An ask of the archive rather than a message to its
+                    // client: the reference's session calls the conductor
+                    // itself here, and what comes back is written onto the
+                    // session by `record_extend_outcome` a turn later.
+                    ReplicationNotice::Extend { request } => {
+                        Deferred::Action(Action::ExtendRecording {
+                            request,
+                            replication_id: session.replication_id(),
+                        })
+                    }
                     ReplicationNotice::Error {
                         correlation_id,
                         code,
@@ -5039,8 +5064,15 @@ impl Sessions {
                 subscription_id,
                 now_ms,
             ),
-            Action::ExtendRecording(request) => {
-                self.extend_recording(client, catalog, &request, now_ms);
+            Action::ExtendRecording {
+                request,
+                replication_id,
+            } => {
+                let outcome = self.extend_recording(client, catalog, &request, now_ms);
+
+                if let Some(replication_id) = replication_id {
+                    self.record_extend_outcome(replication_id, outcome);
+                }
             }
             Action::StopRecording {
                 session_id,
@@ -5449,13 +5481,23 @@ impl Sessions {
     /// The gate this build has nothing for is the outstanding-delete one
     /// (`:1100-1108`): delete-segments sessions are a later slice, and
     /// `deleteSegmentsSessionByIdMap` has no counterpart here.
+    ///
+    /// # Returns
+    ///
+    /// What the reference's `extendRecording` **returns**: `Ok` once the
+    /// subscription that does the recording has been asked for, `Err` with the
+    /// refusal's code and message when a gate turned it away. A client's answer
+    /// has already gone out either way — the subscription's registration id
+    /// travels from [`Self::claim_pending_starts`] when the driver gives it —
+    /// so this is only ever read by a **replication session**, which in the
+    /// reference read the same thing off a return value.
     fn extend_recording(
         &mut self,
         client: &mut Client,
         catalog: &Catalog,
         request: &ExtendRecordingRequest,
         now_ms: i64,
-    ) {
+    ) -> Result<(), (i64, String)> {
         let ExtendRecordingRequest {
             session_id,
             correlation_id,
@@ -5490,34 +5532,57 @@ impl Sessions {
                     &message,
                     now_ms,
                 );
-                return;
+
+                return Err((relevant_id, message));
             }
         };
 
         match client.async_add_subscription(&channel, *stream_id, self.command_timeout) {
-            Ok(add) => self.pending_starts.push(PendingStartRecording {
-                session_id: *session_id,
-                correlation_id: *correlation_id,
-                key,
-                registration_id: add.registration_id(),
-                stripped_channel,
-                channel,
-                stream_id: *stream_id,
-                original_channel: original_channel.clone(),
-                is_auto_stop: *auto_stop,
-                request: RecordingRequest::Extend {
-                    recording_id: *recording_id,
-                },
-            }),
-            Err(error) => self.send_error(
-                client,
-                *session_id,
-                *correlation_id,
-                0,
-                &format!("subscription could not be added: {error}"),
-                now_ms,
-            ),
+            Ok(add) => {
+                self.pending_starts.push(PendingStartRecording {
+                    session_id: *session_id,
+                    correlation_id: *correlation_id,
+                    key,
+                    registration_id: add.registration_id(),
+                    stripped_channel,
+                    channel,
+                    stream_id: *stream_id,
+                    original_channel: original_channel.clone(),
+                    is_auto_stop: *auto_stop,
+                    request: RecordingRequest::Extend {
+                        recording_id: *recording_id,
+                    },
+                });
+
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("subscription could not be added: {error}");
+
+                self.send_error(client, *session_id, *correlation_id, 0, &message, now_ms);
+
+                Err((0, message))
+            }
         }
+    }
+
+    /// Hand a replication session the answer to the extend it asked for
+    /// (`ReplicationSession.java:549-568`, where the answer is a return value).
+    ///
+    /// A session that has already ended is silently not there: the reference
+    /// answers a `Subscription` to a session that is still in flight, and a
+    /// session that stopped between asking and being answered has nobody left
+    /// to tell.
+    fn record_extend_outcome(&mut self, replication_id: i64, outcome: Result<(), (i64, String)>) {
+        let Some(session) = self
+            .replication_sessions
+            .iter_mut()
+            .find(|session| session.replication_id() == Some(replication_id))
+        else {
+            return;
+        };
+
+        session.on_extend_answered(outcome);
     }
 
     /// The gates in front of an extend (`ArchiveConductor.java:1076-1118`).
@@ -6970,8 +7035,10 @@ impl ControlPlane for Sessions {
     }
 
     fn on_extend_recording(&mut self, request: ExtendRecordingRequest, _now_ms: i64) {
-        self.pending
-            .push(Deferred::Action(Action::ExtendRecording(request)));
+        self.pending.push(Deferred::Action(Action::ExtendRecording {
+            request,
+            replication_id: None,
+        }));
     }
 
     #[allow(clippy::too_many_arguments)] // one per field the request carries

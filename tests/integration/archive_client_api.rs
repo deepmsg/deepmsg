@@ -1469,6 +1469,10 @@ fn a_publication_can_be_added_recorded_and_replayed() {
 /// the archive's own `aeron.archive.replication.channel` is **not** set by
 /// [`archive::PROPERTIES`], and a request that names none is refused for it.
 const REPLICATION_CHANNEL: &str = "aeron:ipc?alias=client-api-replicated";
+/// The one parameter of [`REPLICATION_CHANNEL`] a **stripped** channel keeps,
+/// which is what makes it findable in a listing (`stripped_channel_builder`
+/// drops `term-length`, `mtu` and `sparse` and keeps the rest).
+const REPLICATION_ALIAS: &str = "alias=client-api-replicated";
 
 /// **The four replication round trips.**
 ///
@@ -1836,7 +1840,7 @@ fn the_only_recording(archive: &mut Archive, client: &mut Client) -> Option<Reco
 ///   `:337-349`). A row that agreed on one field would prove nothing; this
 ///   agrees on ten.
 #[test]
-fn a_replicate_fetches_its_source_descriptor_and_makes_the_row() {
+fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     let Some((mut media_driver, _archive_dir, mut client)) =
         rig("archive-client-api-replicate-descriptor")
     else {
@@ -1988,7 +1992,72 @@ fn a_replicate_fetches_its_source_descriptor_and_makes_the_row() {
     );
     assert_eq!(
         -1, replicated.subscription_id,
-        "and with no subscription: EXTEND has not made one yet"
+        "and with no subscription: the signal goes out before EXTEND makes one"
+    );
+
+    // **And EXTEND makes one.** `SRC_RECORDING_POSITION` asks the source where
+    // its recording got to (`:484-524`), and `EXTEND` (`:525-568`) turns the
+    // destination's row into a recording: a subscription on the **replication**
+    // channel, carrying the two parameters that make it *this* copy.
+    //
+    // What is asserted is the subscription as the archive recorded it, which is
+    // the only half of the two that is observable from here: the other is the
+    // `OK` answer the archive sends the client under the **replication's**
+    // correlation id, and that is what a later state's criterion reads.
+
+    // **The wait is for the replication's own subscription**, not for "a
+    // subscription": the source recording's is on the same stream and may still
+    // be listed for a turn or two after the test stopped it, and a loop that
+    // broke on *any* of them would go on to fail on a real subscription that had
+    // not arrived yet. Measured: that is what this criterion did before it was
+    // written this way — one run in three.
+    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(
+        &mut client,
+        "the destination's recording subscription",
+        |client| {
+            extended.clear();
+
+            let _ = archive.list_recording_subscriptions(
+                client,
+                0,
+                10,
+                "",
+                Some(RECORDING_STREAM_ID),
+                &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                    extended.push(descriptor.clone());
+                },
+            );
+
+            extended
+                .iter()
+                .any(|subscription| subscription.stripped_channel.contains(REPLICATION_ALIAS))
+        },
+    );
+
+    let extension = extended
+        .iter()
+        .find(|subscription| subscription.stripped_channel.contains(REPLICATION_ALIAS))
+        .expect("the destination holds a subscription on the replication channel");
+
+    assert_eq!(
+        RECORDING_STREAM_ID, extension.stream_id,
+        "on the stream the source's descriptor named, which is the one the \
+         extend had to agree with"
+    );
+    assert!(
+        extension.stripped_channel.contains("rejoin=false"),
+        "and not rejoining: an image that goes away is not fought for: {}",
+        extension.stripped_channel
+    );
+    assert!(
+        extension
+            .stripped_channel
+            .contains(&format!("session-id={}", source.session_id)),
+        "and under the session the **source's replay** will arrive as — the \
+         descriptor's session, not this session's own: {}",
+        extension.stripped_channel
     );
 
     archive.close(&client);

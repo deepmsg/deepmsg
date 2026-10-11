@@ -46,6 +46,7 @@
 
 use deepmsg_client::client::{AsyncNextSessionId, AsyncNextSessionIdPoll, Client};
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
+use deepmsg_codec::archive::source_location::SourceLocation;
 
 use crate::catalog::{Catalog, Recording};
 use crate::client::archive::{Archive, Handlers};
@@ -56,7 +57,17 @@ use crate::mark::NULL_VALUE;
 use crate::server::conductor::{
     GENERIC, NULL_POSITION, REPLICATION_CONNECTION_FAILURE, UNKNOWN_RECORDING,
 };
-use crate::server::control_adapter::ReplicationRequest;
+use crate::server::control_adapter::{ExtendRecordingRequest, ReplicationRequest};
+use deepmsg_core::uri::ChannelUri;
+
+/// `CommonContext.REJOIN_PARAM_NAME` (`CommonContext.java:229`).
+const REJOIN_KEY: &str = "rejoin";
+/// `CommonContext.SESSION_ID_PARAM_NAME` (`CommonContext.java:135`).
+const SESSION_ID_KEY: &str = "session-id";
+/// `CommonContext.MDC_CONTROL_MODE_PARAM_NAME`'s key.
+const CONTROL_MODE_KEY: &str = "control-mode";
+/// `ChannelUri.hasControlModeResponse`'s value (`ChannelUri.java:653-656`).
+const CONTROL_MODE_RESPONSE: &str = "response";
 
 /// The state a session is in (`ReplicationSession.java:61-75`), in the order it
 /// walks them.
@@ -116,7 +127,10 @@ pub enum ReplicationProgress {
     Done,
 }
 
-/// Something a session owes the destination's client and **cannot send itself**.
+/// Something a session **cannot do itself**, and what it does instead.
+///
+/// Most of these are owed to the destination's client; the last is an ask of the
+/// archive the session runs inside.
 ///
 /// The reference's session holds the asking `ControlSession` and calls it
 /// directly — `sendSignal` and `sendErrorResponse` are methods on it
@@ -141,6 +155,22 @@ pub enum ReplicationNotice {
         position: i64,
         /// Which signal.
         signal: RecordingSignal,
+    },
+    /// **Ask the conductor to run one of the archive's own operations.**
+    ///
+    /// The reference's session calls the conductor **directly** and reads what
+    /// it returns — `conductor.extendRecording(...)` (`:549`) is the one this
+    /// build needs. Here the conductor owns its sessions in a map and drives
+    /// them, so the request travels out and the answer is written back onto the
+    /// session ([`Sessions::record_extend_outcome`]).
+    ///
+    /// Unlike its two siblings this is not a message to the client: what the
+    /// client hears about an extend is the archive's own answer, sent under the
+    /// **replication's** correlation id, exactly as it is for a client that
+    /// asked for the extend itself.
+    Extend {
+        /// The request, with the replication's own ids in it.
+        request: ExtendRecordingRequest,
     },
     /// `ControlSession.sendErrorResponse`.
     ///
@@ -218,6 +248,13 @@ pub struct ReplicationSession {
     /// Messages the destination's client is owed — see [`ReplicationNotice`].
     notices: Vec<ReplicationNotice>,
 
+    /// Whether the extend has been handed to the conductor already.
+    extend_asked: bool,
+    /// What the conductor answered it with, once it has run — the reference's
+    /// return value from `conductor.extendRecording`, delivered a turn late
+    /// because that is where this build's conductor is.
+    extend_answer: Option<Result<(), (i64, String)>>,
+
     /// `activeCorrelationId` (`:77`): the request whose answer a state is
     /// waiting for, or `NULL_VALUE` when nothing is in flight.
     ///
@@ -245,6 +282,12 @@ pub struct ReplicationSession {
     /// `liveDestination` (`:97`), which is `None` unless the request named one
     /// (`:133`: an empty string is no destination, not an empty one).
     live_destination: Option<String>,
+    /// `srcRecordingPosition` (`:81`): where the **source** says its recording
+    /// has got to, asked for by [`State::SrcRecordingPosition`]. A different
+    /// number from `src_stop_position` and asked a different way — that one
+    /// comes off the descriptor, this one off a `getRecordingPosition` — and
+    /// the reference keeps them apart.
+    src_recording_position: i64,
     /// `srcStopPosition` (`:80`): where the source's recording stopped, which
     /// `onRecordingDescriptor` reads off the descriptor and `REPLICATE` compares
     /// the image against.
@@ -312,10 +355,13 @@ impl ReplicationSession {
             async_connect: None,
             src_archive: None,
             notices: Vec::new(),
+            extend_asked: false,
+            extend_answer: None,
             active_correlation_id: NULL_VALUE,
             time_of_last_action_ms: 0,
             action_timeout_ms,
             src_stop_position: NULL_POSITION,
+            src_recording_position: NULL_POSITION,
             replay_position,
             replay_stream_id,
             replay_session_id: 0,
@@ -394,6 +440,8 @@ impl ReplicationSession {
         let outcome = match self.state {
             State::Connect => self.connect(client),
             State::ReplicateDescriptor => self.replicate_descriptor(client, catalog, now_ms),
+            State::SrcRecordingPosition => self.src_recording_position(client, now_ms),
+            State::Extend => self.extend(),
             // The other ten, one commit at a time. A state that returns a
             // plausible-looking step here would be worse than one that does
             // nothing, because the next reader could not tell them apart.
@@ -507,6 +555,180 @@ impl ReplicationSession {
         if descriptors.is_empty() {
             return self.expire_or_hold(now_ms, "failed to fetch remote recording descriptor");
         }
+
+        Ok(())
+    }
+
+    /// `ReplicationSession.extend` (`:525-568`): make the **destination**
+    /// recording — the subscription that will receive the replay.
+    ///
+    /// What the reference does in one call is two things here, because the call
+    /// it makes cannot be made from where this runs:
+    ///
+    /// * it builds the channel (`:534-546`) — the replication channel with
+    ///   `rejoin=false`, and with `session-id=<replaySessionId>` unless that
+    ///   channel is a response one, which is what ties the incoming replay to
+    ///   this copy;
+    /// * and it calls `conductor.extendRecording(...)` (`:549`), which is
+    ///   **synchronous** for the reference and returns either the subscription
+    ///   or the reason there is none.
+    ///
+    /// So the second half goes out as a [`ReplicationNotice::Extend`] and the
+    /// answer comes back on a later turn, written onto this session by
+    /// [`Sessions::record_extend_outcome`]. A refusal is **already answered to
+    /// the client** by the conductor — `extendRecording` sends that response
+    /// itself (`ArchiveConductor.java:1085-1111`) — so ending the session here
+    /// says nothing more, which is what the reference's `state(DONE, msg)`
+    /// (`:566`) does too.
+    ///
+    /// **No deadline**, and that is not an oversight: `expire_or_hold` bounds
+    /// the states the reference bounds, and this one it does not — there is no
+    /// `TimeoutException` in `extend`, because there is nothing here to wait
+    /// for once the call has been made. The conductor answers every request it
+    /// is handed, this turn or the next.
+    ///
+    /// **The `isMds` half is not built.** `isTagged || null != liveDestination`
+    /// (`:527`) rewrites the channel again — endpoint off, tags on,
+    /// `control-mode=manual` — and then adds a destination. No criterion in this
+    /// build's list reaches a tagged or live replication (plan §3.2), so that
+    /// branch is recorded rather than written.
+    fn extend(&mut self) -> Result<(), String> {
+        if let Some(answer) = self.extend_answer.take() {
+            match answer {
+                Ok(()) => self.state = State::ReplayToken,
+                Err(_) => self.state = State::Done,
+            }
+
+            return Ok(());
+        }
+
+        if self.extend_asked {
+            return Ok(());
+        }
+
+        let channel = self.extend_channel()?;
+
+        self.extend_asked = true;
+        self.notices.push(ReplicationNotice::Extend {
+            request: ExtendRecordingRequest {
+                session_id: self.control_session_id,
+                correlation_id: self.replication_id.unwrap_or(NULL_VALUE),
+                recording_id: self.dst_recording_id,
+                stream_id: self.replay_stream_id,
+                source_location: SourceLocation::REMOTE,
+                auto_stop: true,
+                original_channel: channel,
+            },
+        });
+
+        Ok(())
+    }
+
+    /// The channel the destination records on (`:534-546`).
+    ///
+    /// Two parameters, and both are the copy's rather than the channel's:
+    /// `rejoin=false`, so an image that goes away is not fought for, and the
+    /// session id the replay will arrive under — which is the **source's**
+    /// replay session, settled off the descriptor, not this session's own.
+    fn extend_channel(&self) -> Result<String, String> {
+        let mut uri = ChannelUri::parse(&self.replication_channel)
+            .map_err(|error| format!("{} is not a channel: {error}", self.replication_channel))?;
+
+        uri.put(REJOIN_KEY, "false");
+
+        if uri.get(CONTROL_MODE_KEY) != Some(CONTROL_MODE_RESPONSE) {
+            uri.put(SESSION_ID_KEY, self.replay_session_id.to_string());
+        }
+
+        Ok(uri.build())
+    }
+
+    /// The conductor's answer to the extend, delivered a turn late
+    /// (`ReplicationSession.extend`'s return value, `:549-568`).
+    pub fn on_extend_answered(&mut self, outcome: Result<(), (i64, String)>) {
+        self.extend_answer = Some(outcome);
+    }
+
+    /// `ReplicationSession.srcRecordingPosition` (`:484-524`): ask the source
+    /// where its recording has got to.
+    ///
+    /// **A live-source state, and it runs anyway.** What it produces is
+    /// `srcRecordingPosition`, which the live pair reads — and the one thing
+    /// this build's criteria ever do with it is the refusal below: a source
+    /// recording that is *not* live answers `NULL_POSITION`, which a replication
+    /// with no live destination is perfectly happy with. The reference walks the
+    /// state for every replication and branches on the value, and so does this.
+    ///
+    /// Two halves, like every state: send the request and park on its
+    /// correlation id, then read the answer. What is different is **how** the
+    /// answer is read — a single non-blocking poll of the source's control
+    /// channel ([`Archive::poll_for_response`]) rather than a wait, because a
+    /// turn that waits here is a turn the client never gets driven in.
+    fn src_recording_position(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
+        if self.src_archive.is_none() {
+            return Err("no source archive: the connect did not finish".to_owned());
+        }
+
+        if self.active_correlation_id == NULL_VALUE {
+            let correlation_id = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Ok(());
+                };
+
+                archive
+                    .next_correlation_id(client)
+                    .map_err(|error| error.to_string())?
+            };
+
+            let offered = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Ok(());
+                };
+
+                archive
+                    .proxy_mut()
+                    .get_recording_position(client, correlation_id, self.request.src_recording_id)
+                    .is_ok()
+            };
+
+            // `else if (time >= …) throw` (`:498-501`): a request that could
+            // not be published is retried until the action deadline, not
+            // failed on the spot — the publication it goes out on is one the
+            // source may not have connected yet.
+            if !offered {
+                return self.expire_or_hold(now_ms, "failed to send recording position request");
+            }
+
+            self.track_action(correlation_id, now_ms);
+
+            return Ok(());
+        }
+
+        let answer = {
+            let Some(archive) = self.src_archive.as_mut() else {
+                return Ok(());
+            };
+
+            archive
+                .poll_for_response(client, self.active_correlation_id)
+                .map_err(|error| error.to_string())?
+        };
+
+        let Some(position) = answer else {
+            return self.expire_or_hold(now_ms, "failed to get recording position");
+        };
+
+        self.src_recording_position = position;
+
+        // `:509-512` — a live destination is the only caller that needs the
+        // source to still be recording, and it is the one case where finding
+        // out it is not is fatal. The message is the reference's, and it
+        // travels as the state's failure, so it is answered `GENERIC`.
+        if NULL_POSITION == position && self.live_destination.is_some() {
+            return Err("cannot live merge without active source recording".to_owned());
+        }
+
+        self.state = State::Extend;
 
         Ok(())
     }
