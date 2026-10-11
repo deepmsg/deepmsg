@@ -44,12 +44,20 @@
 //! The reference's last act — `aeron_archive_async_connect_transition_to_done`
 //! (`:462-519`) — builds the recording-descriptor pollers, constructs an
 //! `aeron_archive_t` out of everything the connect assembled, and hands it back.
-//! Neither exists here yet: [`crate::client`] has no `Archive`, and the two
-//! descriptor pollers are a later commit. So a connect that reaches
-//! [`ConnectState::Done`] **answers with what it assembled** —
-//! [`Connected`] — and the layer that builds an `Archive` is the one that
-//! consumes it. That is a recorded difference, not an omission: it is also what
-//! keeps those two pollers out of this file's dependency list.
+//! **This build splits that act one layer up.** A connect that reaches
+//! [`ConnectState::Done`] answers with what it assembled — [`Connected`] — and
+//! [`Archive::connect`] is what builds the `Archive` out of it.
+//!
+//! That is a deviation, and it is one this build's own earlier record forces
+//! rather than a convenience. The two pollers are built with the **recording
+//! signal handler**, and that handler lives on the `Archive` here rather than on
+//! the context (see `crate::client::archive`: the reference puts both handlers
+//! on the context and asserts that a `duplicate` copy of it compares equal to
+//! the original, which rustc will not do for function pointers). The archive
+//! cannot be built where the handlers are not, so `transition_to_done`'s work
+//! happens where they are — and the state machine stays a machine about the wire
+//! rather than about the caller's callbacks. What it costs is one type
+//! ([`Connected`]) that exists only as that seam.
 //!
 //! # Self-destruction, in Rust
 //!
@@ -137,8 +145,10 @@ impl Credentials for NoCredentials {
 /// Everything a completed connect assembled, for whoever builds an `Archive`.
 ///
 /// The reference hands these to `aeron_archive_create` inside
-/// `transition_to_done`; here they are the answer, and this type is the seam
-/// that a later commit closes (see the module note).
+/// `transition_to_done`; here they are the answer, and [`Archive::connect`] —
+/// which holds the handlers a recording-descriptor poller is built with — is
+/// what consumes them. **This type is that seam and stays one**: see the module
+/// note for why the split is forced rather than provisional.
 #[derive(Debug)]
 pub struct Connected {
     /// The response channel's subscription, which the poller reads.

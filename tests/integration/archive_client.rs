@@ -200,11 +200,20 @@ fn a_context_that_never_retries_is_refused() {
     );
 }
 
-/// `shouldFailWithErrorIfAeronClientFailsToConnect` (`:3155-3169`).
+/// `shouldFailWithErrorIfAeronClientFailsToConnect` (`:3155-3169`), and the same
+/// refusal reached from the other side in `shouldFailIfClientNameIsTooLong`
+/// (`:4838-4846`).
 ///
 /// The name is 127 characters — `"super very long client name"` and a hundred
 /// `x`s — and the limit is the width of a counter's client-name field
 /// (`aeronc.h:885`).
+///
+/// **The two reference cases are two layers of one rule**, which is why one
+/// criterion here answers both: the first is a *driver* refusing a name that
+/// wide at connect, the second is `aeron_archive_context_set_client_name`
+/// refusing a 103-character one with `EINVAL`. This build gives the rule at
+/// `conclude` instead (a recorded deviation), and the boundary either way is
+/// what [`a_client_name_of_exactly_the_limit_is_taken`] pins down.
 #[test]
 fn a_context_whose_client_name_is_too_wide_is_refused() {
     let too_long = format!("super very long client name{}", "x".repeat(100));
@@ -220,6 +229,37 @@ fn a_context_whose_client_name_is_too_wide_is_refused() {
         error.to_string().contains("client_name length must <= 100"),
         "the reason a caller matches on: {error}"
     );
+}
+
+/// `shouldSetClientName` (`:4819-4836`), at the instance that is **exactly** the
+/// limit — and `shouldFailIfClientNameIsTooLong` (`:4838-4846`) one over it.
+///
+/// The reference's two instances of the name are `"abc"` and ninety-nine `x`s
+/// and a `$`: **100 characters**, the width of a counter's client-name field
+/// (`aeronc.h:885`), which the case sets and reads back unharmed.
+///
+/// **What is asserted is the boundary, not a setter.** That case has a
+/// setter/getter pair to round-trip through, and this build has a public field —
+/// setting it *is* getting it, so there is nothing there to fail. The line the
+/// two cases sit either side of is what a test can still be wrong about, and it
+/// is pinned here: 100 is taken, 101 is not.
+#[test]
+fn a_client_name_of_exactly_the_limit_is_taken() {
+    let at_the_limit = format!("{}$", "x".repeat(99));
+    assert_eq!(100, at_the_limit.len());
+
+    let mut context = conclude_able();
+    context.aeron_client_name = at_the_limit.clone();
+
+    context
+        .conclude()
+        .expect("a counter has room for exactly this much name");
+
+    context.aeron_client_name = format!("{at_the_limit}x");
+
+    let error = context.conclude().expect_err("one more is one too many");
+
+    assert_eq!(ClientError::ClientNameTooLong { length: 101 }, error);
 }
 
 /// A value that will not parse is the default **and a warning**.

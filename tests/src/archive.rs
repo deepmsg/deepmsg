@@ -1,10 +1,19 @@
-//! A client for our archive, written by hand.
+//! An archive a test can drive, and the two doors the product's client has not
+//! got.
 //!
-//! `crates/archive/src/client.rs` is a stub: the reference's `AeronArchive` —
-//! the type a *user* of an archive holds — is a slice of its own and this
-//! workspace has not built it. So a test that drives the archive writes its
-//! requests with the generated codecs and reads the answers with them too, which
-//! is what this module is.
+//! This module began as a hand-written client: `crates/archive/src/client.rs`
+//! was a stub, and a test that drove the archive wrote its requests with the
+//! generated codecs and read the answers with them too. **The product has that
+//! client now** (P2-C1), so what is left here wraps it: [`Session`] is the
+//! product's `Archive` plus the fixture's own correlation counter, and the
+//! requests a test makes go through the product's named methods.
+//!
+//! **What is still built by hand is what the product has no door for.** Here:
+//! [`Session::send_only`] and [`bounded_replay_request`] — the delete guard's
+//! pair, which has to publish two requests before either is answered. In
+//! `archive_queries.rs` rather than here: the listing whose *terminal* answer
+//! the product consumes and drops. Each is written up where it is used, and in
+//! the plan's §4b.
 //!
 //! It was extracted from `tests/integration/archive_connect.rs`, which had all
 //! of it inline. Two tests now need the same door, and the reason to share it is
@@ -40,11 +49,12 @@
 //!
 //! # Two halves, and why they are one module
 //!
-//! The **client** half — [`Session`], [`Response`], the request builders — is
-//! what a test needs to say anything to the archive. The **archive** half —
-//! [`Archive`], [`Recording`], [`Recorded`], [`Replay`] — is a driver, a client
-//! and a control session, and the four things a test does with them: make a
-//! recording, replay it, read the frames, and ask the catalog where it stopped.
+//! The **client** half — [`Session`], and the [`Response`] a test that reads the
+//! channel itself still decodes — is what a test needs to say anything to the
+//! archive. The **archive** half — [`Archive`], [`Recording`], [`Recorded`],
+//! [`Replay`] — is a driver, a client and a control session, and the four things
+//! a test does with them: make a recording, replay it, read the frames, and ask
+//! the catalog where it stopped.
 //!
 //! They are here together because the second was extracted from
 //! `tests/integration/archive_replay.rs`, which had all of it inline, at the
@@ -57,8 +67,6 @@
 //! test's, and the properties a driver is started with are the calling test's:
 //! this module knows how to run an archive, not what one is being asked.
 
-#![allow(dead_code)] // one test uses what another does not
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -68,24 +76,15 @@ use std::time::{Duration, Instant};
 use deepmsg_archive::client::{Archive as ArchiveClient, ArchiveContext, Handlers, NoCredentials};
 use deepmsg_archive::server::conductor::ARCHIVE_ID_DEFAULT;
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
-use deepmsg_archive::server::response_proxy::PROTOCOL_SEMANTIC_VERSION;
 use deepmsg_client::client::Client;
-use deepmsg_codec::archive::auth_connect_request_codec::AuthConnectRequestEncoder;
-use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::bounded_replay_request_codec::BoundedReplayRequestEncoder;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::control_response_codec::{self, ControlResponseDecoder};
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::recording_signal_event_codec::{self, RecordingSignalEventDecoder};
-use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
-use deepmsg_codec::archive::source_location::SourceLocation;
-use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
-use deepmsg_codec::archive::stop_position_request_codec::StopPositionRequestEncoder;
-use deepmsg_codec::archive::stop_recording_subscription_request_codec::StopRecordingSubscriptionRequestEncoder;
 use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_core::uri::ChannelUri;
 
 use crate::archiving_driver::{self, OwnArchivingMediaDriver};
 use crate::temp::TempDir;
@@ -255,69 +254,36 @@ impl Session {
         id
     }
 
-    /// The publication requests go out on, for a caller whose answer is not a
-    /// `ControlResponse` — a listing's descriptor is one such
-    /// (`ControlResponseProxy.java:54-89`).
-    #[must_use]
-    pub const fn request_publication(&self) -> i64 {
-        self.archive.proxy().request_publication()
-    }
-
     /// The subscription the answers come back on.
     #[must_use]
     pub const fn response_subscription(&self) -> i64 {
         self.archive.subscription()
     }
 
-    /// Publish one request and wait for the answer that echoes its id.
-    ///
-    /// **The wait is the product's now**: `Archive::wait_for_response`, which is
-    /// the reference's `aeron_archive_poll_for_response` — so the answer is read
-    /// by the product's `ControlResponsePoller`, the `relevantId` is what comes
-    /// back, and a refusal is an [`ArchiveError::Refused`] carrying the archive's
-    /// own text rather than a `Response` this module decoded.
-    ///
-    /// **`deadline` no longer governs the wait**, and that is the reference's
-    /// arrangement rather than a loss: every wait in `aeron_archive_client.c`
-    /// starts from `ctx->message_timeout_ns` and no entry point takes a caller's
-    /// (`:156` and its siblings). The budget is set once, in
-    /// [`connect_context`]. The parameter survives because the *offer* still
-    /// needs it — see [`Session::send_only`].
-    ///
-    /// # Errors
-    ///
-    /// The reason nothing was answered — see [`Session::connect`].
-    pub fn send(
-        &mut self,
-        client: &mut Client,
-        correlation_id: i64,
-        payload: &[u8],
-        deadline: Instant,
-    ) -> Result<i64, String> {
-        self.send_only(client, payload, deadline)?;
-
-        self.archive
-            .wait_for_response(client, "a request the fixture built", correlation_id)
-            .map_err(|error| error.to_string())
-    }
-
     /// Publish one request and do not wait for anything.
     ///
-    /// **The one door the product has no equivalent of, and it is why this
-    /// method still touches the publication directly.** Every request the
-    /// product's proxy can send is a *named* one — `start_recording`,
-    /// `list_recordings`, `get_stop_position` and the rest — so there is nowhere
-    /// to hand it a payload this module built. The reference has the same gap and
-    /// the same answer: its test reaches past the client to the proxy itself
+    /// **The one door the product has no equivalent of, and the two callers it
+    /// has left are the two that need it.** Every request the product's proxy
+    /// can send is a *named* one — `start_recording`, `list_recordings`,
+    /// `get_stop_position` and the rest — so there is nowhere to hand it a
+    /// payload this module built. The reference has the same gap and the same
+    /// answer: its test reaches past the client to the proxy itself
     /// (`aeron_archive_proxy_get_start_position(archive->archive_proxy, …)`,
     /// `aeron_archive_test.cpp:1117`), and the proxy is where a named request
-    /// gets its bytes. The calls that need this are the ones driving the server
-    /// with a request the product has no method for yet — plan §2.3's third step
-    /// is where they move, and this is what disappears when they have.
+    /// gets its bytes.
     ///
-    /// It offers through the **product's** publication, read off
-    /// [`Session::request_publication`], so the id is the one `Archive::connect`
-    /// made rather than one this module made.
+    /// What is left is not "the requests the product has no method for yet" —
+    /// plan §2.3's third step moved every call site it could. These two are the
+    /// ones the product has no **shape** for: the delete guard asks for two
+    /// requests to be published before either is answered
+    /// (`archive_segments.rs`), and the listing criterion reads the answer that
+    /// *ends* a page, which the product's listing consumes and drops
+    /// (`archive_queries.rs`). Both are written up where they are used, and in
+    /// the plan's §4b.
+    ///
+    /// It offers through the **product's** publication, read off the proxy, so
+    /// the id is the one `Archive::connect` made rather than one this module
+    /// made.
     ///
     /// # Errors
     ///
@@ -406,27 +372,6 @@ fn connect_context(deadline: Instant) -> ArchiveContext {
         .unwrap_or(i64::MAX);
 
     context
-}
-
-/// The request channel: the archive's control channel with the id of the
-/// subscription the answer has to reach written into it.
-///
-/// `AeronArchive.java:4043-4048`, which is a `ChannelUri.put` for the reason the
-/// module note gives.
-///
-/// **As of plan §2.3's second step this has no caller**: the derivation is the
-/// product's — `check_and_setup_response_channel` in `async_connect`, reached
-/// from `conclude_with` — and [`Session::connect`] no longer opens its own
-/// channels. It is kept because it is the readable statement of a chain that is
-/// otherwise three registration ids deep, and it goes with the other dead
-/// constructors when §2.3's fourth step deletes them in one pass.
-#[must_use]
-pub fn request_channel(response_subscription: i64) -> String {
-    let mut uri = ChannelUri::parse(CONTROL_CHANNEL).expect("a channel this module wrote");
-
-    uri.put("response-correlation-id", response_subscription.to_string());
-
-    uri.build()
 }
 
 /// Read frames off `subscription` until `read` answers with something.
@@ -523,32 +468,6 @@ pub fn await_frame<T>(
     Ok(answer.expect("the loop only leaves with an answer"))
 }
 
-/// Poll the client until the control response for `correlation_id` arrives.
-///
-/// A response for **another** correlation id — a listing's descriptors and a
-/// recording's signals share this channel — is read past rather than answered
-/// with: what this waits for is one answer to one request.
-///
-/// **As of plan §2.3's second step this has no caller**: [`Session::send`] waits
-/// through the product's `Archive::wait_for_response`, whose poller is what
-/// recognises a response and whose loop is what skips the rest. This was the
-/// fixture's version of it. It goes with the other dead members when §2.3's
-/// fourth step deletes them.
-///
-/// # Errors
-///
-/// See [`await_frame`].
-pub fn await_response(
-    client: &mut Client,
-    subscription: i64,
-    correlation_id: i64,
-    deadline: Instant,
-) -> Result<Response, String> {
-    await_frame(client, subscription, deadline, |payload| {
-        decode(payload).filter(|response| response.correlation_id == correlation_id)
-    })
-}
-
 /// Every counter the driver publishes.
 ///
 /// What an archive that has taken a connect has that one which has not is here
@@ -623,57 +542,6 @@ pub fn decode(payload: &[u8]) -> Option<Response> {
     })
 }
 
-/// The `AuthConnectRequest` a client opens a control session with.
-///
-/// `version`'s **major** is the whole of what the archive checks
-/// (`ArchiveConductor.java:483-488`), so this sends the archive's own semantic
-/// version rather than a number of its own choosing.
-///
-/// **As of plan §2.3.1's first step this has no caller**: [`Session::connect`]
-/// sends the connect through the product's `ArchiveProxy::try_connect` now, and
-/// this is the hand-written twin that says what that request is supposed to
-/// contain. It is kept rather than deleted for two reasons — it is the readable
-/// statement of the request's field set, and §2.3's last step deletes the
-/// fixture's constructors in one pass once every one of them has stopped being
-/// called. The other five constructors below still have callers.
-///
-/// It is deliberately **not** used as a byte-for-byte cross-check on the proxy,
-/// which is what a reader would expect of a twin: the two differ in exactly one
-/// field, `clientInfo` (empty here, `name=… version=… commit=…` there —
-/// `proxy.rs:254-257`), so such a check would fail by design.
-#[must_use]
-pub fn connect_request(
-    correlation_id: i64,
-    response_stream_id: i32,
-    response_channel: &str,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 1024];
-
-    let length = {
-        let encoder = AuthConnectRequestEncoder::default().wrap(
-            WriteBuf::new(&mut buffer),
-            message_header_codec::ENCODED_LENGTH,
-        );
-        let mut header = encoder.header(0);
-        let mut encoder = header
-            .parent()
-            .expect("the encoder the header was wrapped on");
-
-        encoder
-            .correlation_id(correlation_id)
-            .response_stream_id(response_stream_id)
-            .version(PROTOCOL_SEMANTIC_VERSION)
-            .response_channel(response_channel.as_bytes())
-            .encoded_credentials(&[])
-            .client_info(&[]);
-
-        message_header_codec::ENCODED_LENGTH + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
 // ---------------------------------------------------------------------------
 // A running archive, and the client that drives it
 // ---------------------------------------------------------------------------
@@ -683,7 +551,7 @@ pub fn connect_request(
 // module gives for itself above, and the reason [`crate::driver`] gives for the
 // driver harness. A test that spells out how to start an archive, make a
 // recording and read a replay will get it wrong in the same way every time, and
-// the three request builders below are the ones two files now share.
+// making a recording is the thing two files now spell the same way.
 
 /// `ArchiveConductor.ARCHIVE_ID_DEFAULT`: the id every recording-position
 /// counter this archive allocates is keyed by.
@@ -857,32 +725,13 @@ impl Archive {
             .expect("the driver must accept the subscription")
     }
 
-    /// Send one request and answer with the response, whatever it says.
-    ///
-    /// This is the door for a request that is **expected to be refused**: the
-    /// refusals are behaviour too, and several of them are reached in no other
-    /// way.
-    ///
-    /// # Panics
-    ///
-    /// When nothing is answered at all, which is a different failure from a
-    /// refusal and printed as one.
-    pub fn ask(&mut self, correlation_id: i64, payload: &[u8]) -> Response {
-        self.session
-            .send_only(&mut self.client, payload, Instant::now() + DEADLINE)
-            .unwrap_or_else(|reason| panic!("{reason};\n{}", counters(&self.aeron_dir)));
-
-        self.await_answer(correlation_id)
-    }
-
     /// Wait for the answer to a request already sent with
     /// [`Session::send_only`], whatever it says.
     ///
-    /// This is the other half of [`Archive::ask`], and the reason it is a method
-    /// of its own is a test that wants **two requests in flight before either is
-    /// answered**: the archive handles both in the turn it reads them, in the
-    /// order they were published, and what one of them does is what the other
-    /// then sees.
+    /// The reason it is a method of its own is a test that wants **two requests
+    /// in flight before either is answered**: the archive handles both in the
+    /// turn it reads them, in the order they were published, and what one of
+    /// them does is what the other then sees.
     ///
     /// **Every recording signal read on the way is kept** ([`Archive::signals`]),
     /// and that is not tidiness. The response channel carries answers and signals
@@ -894,7 +743,8 @@ impl Archive {
     ///
     /// # Panics
     ///
-    /// When nothing is answered at all — see [`Archive::ask`].
+    /// When nothing is answered at all, which the panic prints along with the
+    /// driver's counters.
     pub fn await_answer(&mut self, correlation_id: i64) -> Response {
         if let Some(index) = self.answer_index(correlation_id) {
             return self.answers.remove(index);
@@ -1003,24 +853,6 @@ impl Archive {
             .position(|arrived| arrived.recording_id == recording_id && arrived.signal == signal)
     }
 
-    /// Send one request that is answered with an `OK`, and assert that it was.
-    ///
-    /// # Panics
-    ///
-    /// When the answer is anything but `OK`, printing the archive's reason.
-    pub fn ok_answer(&mut self, correlation_id: i64, payload: &[u8]) -> Response {
-        let answer = self.ask(correlation_id, payload);
-
-        assert_eq!(
-            ControlResponseCode::OK,
-            answer.code,
-            "the archive refused: {}",
-            answer.message()
-        );
-
-        answer
-    }
-
     /// Read a replay until its reader reaches `position`.
     ///
     /// # Panics
@@ -1043,16 +875,26 @@ impl Archive {
         let deadline = Instant::now() + DEADLINE;
 
         loop {
-            let correlation_id = self.session.next_correlation_id();
-            let payload = stop_position_request(
-                self.session.control_session_id(),
-                correlation_id,
-                recording_id,
-            );
-            let answer = self.ok_answer(correlation_id, &payload);
+            // The request is `Archive::get_stop_position` now — the same
+            // `StopPositionRequest` (15) this helper used to build byte by byte.
+            // **Two readings of the answer survive the move**, and both are the
+            // reference's: a recording whose row has no stop yet is answered
+            // `-1` rather than refused (`ArchiveConductor.java:1169-1175`), which
+            // is what the loop waits out; and a *refusal* is a hard failure,
+            // which is what the old `ok_answer` asserted.
+            let position = self
+                .session
+                .archive_mut()
+                .get_stop_position(&mut self.client, recording_id)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "the archive refused a stop position: {error};\n{}",
+                        counters(&self.aeron_dir)
+                    )
+                });
 
-            if answer.relevant_id >= 0 {
-                return answer.relevant_id;
+            if position >= 0 {
+                return position;
             }
 
             assert!(
@@ -1098,15 +940,20 @@ impl Archive {
             .expect("the publication has a session");
 
         // The start (63), whose answer is the **subscription's** registration
-        // id.
-        let correlation_id = self.session.next_correlation_id();
-        let payload = start_recording_request(
-            self.session.control_session_id(),
-            correlation_id,
-            recording.stream_id,
-            &recording.channel,
-        );
-        let subscription_id = self.ok_answer(correlation_id, &payload).relevant_id;
+        // id — `Archive::start_recording` now, with `LOCAL` the source location
+        // and `false` the auto-stop, which is what the constructor it replaced
+        // wrote.
+        let subscription_id = self
+            .session
+            .archive_mut()
+            .start_recording(
+                &mut self.client,
+                &recording.channel,
+                recording.stream_id,
+                true,
+                false,
+            )
+            .unwrap_or_else(|error| panic!("the archive refused a start: {error}"));
 
         let (mark, end) = publish(&mut self.client, publication, reader, recording);
 
@@ -1120,13 +967,10 @@ impl Archive {
             &self.aeron_dir,
         );
 
-        let correlation_id = self.session.next_correlation_id();
-        let payload = stop_recording_request(
-            self.session.control_session_id(),
-            correlation_id,
-            subscription_id,
-        );
-        self.ok_answer(correlation_id, &payload);
+        self.session
+            .archive_mut()
+            .stop_recording_subscription(&mut self.client, subscription_id)
+            .expect("the archive answers a stop");
 
         let stop = self.stop_position(recording_id);
 
@@ -1343,32 +1187,6 @@ fn recording_counter(client: &Client, session_id: i32) -> Option<(i64, i64)> {
     Some((recording_id, counters.value(counter_id)?))
 }
 
-/// A `StopPositionRequest` (15).
-fn stop_position_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 64];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
 /// What an image says about itself, copied out of the client so it can be polled
 /// again.
 pub struct Image {
@@ -1503,109 +1321,6 @@ pub fn decode_signal(payload: &[u8]) -> Option<Signal> {
         recording_id: decoder.recording_id(),
         signal: decoder.signal(),
     })
-}
-
-/// A `StartRecordingRequest2` (63) for the channel a test records.
-#[must_use]
-pub fn start_recording_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    stream_id: i32,
-    channel: &str,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 256];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .stream_id(stream_id)
-            .source_location(SourceLocation::LOCAL)
-            .auto_stop(BooleanType::FALSE)
-            .channel(channel.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// A `StopRecordingSubscriptionRequest` (14) for one subscription.
-#[must_use]
-pub fn stop_recording_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    subscription_id: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 64];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = StopRecordingSubscriptionRequestEncoder::default()
-            .wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .subscription_id(subscription_id);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// A `ReplayRequest` (6).
-#[allow(clippy::too_many_arguments)] // one per field the request carries
-#[must_use]
-pub fn replay_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    recording_id: i64,
-    position: i64,
-    length: i64,
-    file_io_max_length: i32,
-    replay_stream_id: i32,
-    replay_channel: &str,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 512];
-
-    let written = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = ReplayRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id)
-            .position(position)
-            .length(length)
-            .replay_stream_id(replay_stream_id)
-            .file_io_max_length(file_io_max_length)
-            // `Aeron.NULL_VALUE`: this replay is asked for on the session's own
-            // image, so it carries no token — and the two are told apart by
-            // exactly this comparison, which is why the guard on the field
-            // matters.
-            .replay_token(-1)
-            .replay_channel(replay_channel.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(written);
-    buffer
 }
 
 /// A `BoundedReplayRequest` (18): the same request with the counter that bounds
