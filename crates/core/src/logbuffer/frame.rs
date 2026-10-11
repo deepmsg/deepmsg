@@ -250,6 +250,30 @@ impl<'a, Access> Frame<'a, Access> {
         Some(i64::from_le_bytes(bytes))
     }
 
+    /// The same for a four-byte field, which the reference's messages carry one
+    /// of (`AeronUtil.RECEIVER_INDEX_OFFSET` is an `int32`).
+    ///
+    /// The read is deliberately *not* the head of the eight-byte one: a message
+    /// whose receiver index sits where an eight-byte load would run past the
+    /// payload has four bytes of it inside, and the reference reads those four
+    /// (`EchoNode.java:157`'s `getInt(offset + RECEIVER_INDEX_OFFSET)`).
+    pub fn load_i32_in_payload(&self, offset: usize) -> Option<i32> {
+        if offset.checked_add(4)? > self.payload_length()? {
+            return None;
+        }
+
+        let at = self.payload_offset(offset)?;
+
+        if let Some(value) = self.buffer.load_i32(at) {
+            return Some(value);
+        }
+
+        let mut bytes = [0_u8; 4];
+        self.buffer.copy_out(at, &mut bytes)?;
+
+        Some(i32::from_le_bytes(bytes))
+    }
+
     /// Where `offset` bytes into the payload lies in the term.
     ///
     /// Both sides need it — the write side stores through it and the read side

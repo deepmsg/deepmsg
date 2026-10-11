@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
+use deepmsg_client::fragment_assembler::FragmentAssembler;
 use deepmsg_core::logbuffer::append::Appended;
 
 use crate::loadtest::config::IdleStrategy;
@@ -42,6 +43,14 @@ pub struct EchoNode {
     /// not allocate. See [`EchoNode::run`] for why they are taken out of the
     /// poll rather than answered inside it.
     echoed: Vec<Vec<u8>>,
+    /// Where a message that arrived in several frames is put back together.
+    ///
+    /// The node reads fragments (see [`EchoNode::run`]), so the reassembly the
+    /// message door would have done for it is the node's to do — and only for
+    /// the messages that need it. One per node, which is the arrangement the
+    /// reference's node has for one subscription (`ImageFragmentAssembler`,
+    /// constructed once at `EchoNode.java:155`).
+    assembler: FragmentAssembler,
 }
 
 impl EchoNode {
@@ -74,6 +83,7 @@ impl EchoNode {
             running: Arc::new(AtomicBool::new(true)),
             client,
             echoed: Vec::new(),
+            assembler: FragmentAssembler::new(),
         };
 
         node.attach()?;
@@ -154,6 +164,7 @@ impl EchoNode {
         // mutably, and the echoes after it borrow the client again, so the
         // messages have to be somewhere that is neither.
         let mut echoed = std::mem::take(&mut self.echoed);
+        let mut assembler = std::mem::take(&mut self.assembler);
 
         loop {
             self.client.poll();
@@ -162,26 +173,72 @@ impl EchoNode {
             {
                 let client = &mut self.client;
 
-                client.poll_subscription(subscription, fragment_limit, |message| {
-                    let payload = message.payload;
+                // The **fragment** door and not the message door: a message that
+                // arrived in one frame is a window onto the term, and the only
+                // copy the node needs is the one into its own buffer. The
+                // message door would copy it into the assembler's `passthrough`
+                // first — one copy for a caller that only wanted the bytes, and
+                // a second for this node, which is holding a copy of a copy.
+                //
+                // The reference's node is on this door too: `Image.poll` hands
+                // its handler the term buffer and the assembler passes an
+                // unfragmented fragment through without touching it
+                // (`ImageFragmentAssembler.java:107-110`).
+                client.poll_subscription_fragments(subscription, fragment_limit, |fragment| {
+                    if fragment.is_unfragmented() {
+                        // Read where the message lies, and copy it out once.
+                        // The two checks are the message door's, in its order.
+                        let length = fragment.payload_length();
+                        if length < MIN_MESSAGE_LENGTH {
+                            return;
+                        }
 
-                    if payload.len() < MIN_MESSAGE_LENGTH {
+                        // Only the messages addressed to this node. One message
+                        // of a client's batch names one receiver, so a node that
+                        // answered everything would answer for its neighbours
+                        // too.
+                        if fragment.payload_i32_at(RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
+                            return;
+                        }
+
+                        if arrived == echoed.len() {
+                            echoed.push(Vec::new());
+                        }
+
+                        let slot = &mut echoed[arrived];
+                        // Grown rather than cleared and grown: a run sends one
+                        // length, so this is the first message of a cell and
+                        // nothing after it, and `clear` would have every message
+                        // pay for zeroing bytes the copy is about to overwrite.
+                        if slot.len() != length {
+                            slot.resize(length, 0);
+                        }
+
+                        if fragment.copy_payload(slot).is_some() {
+                            arrived += 1;
+                        }
+
                         return;
                     }
 
-                    // Only the messages addressed to this node. One message of a
-                    // client's batch names one receiver, so a node that answered
-                    // everything would answer for its neighbours too.
-                    if i32_at(payload, RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
-                        return;
-                    }
+                    // A message that arrived in several frames is put back
+                    // together here and echoed as one — which is what the
+                    // reference's node does with its own assembler
+                    // (`ImageFragmentAssembler.java:113-133`), and the reason
+                    // the fragment door is not simply "forward each fragment".
+                    assembler.push(fragment, &mut |message| {
+                        let payload = message.payload;
 
-                    if arrived == echoed.len() {
-                        echoed.push(Vec::new());
-                    }
-                    echoed[arrived].clear();
-                    echoed[arrived].extend_from_slice(payload);
-                    arrived += 1;
+                        if payload.len() < MIN_MESSAGE_LENGTH {
+                            return;
+                        }
+
+                        if i32_at(payload, RECEIVER_INDEX_OFFSET) != Some(receiver_index) {
+                            return;
+                        }
+
+                        keep(&mut echoed, &mut arrived, payload);
+                    });
                 });
             }
 
@@ -206,6 +263,7 @@ impl EchoNode {
         }
 
         self.echoed = echoed;
+        self.assembler = assembler;
 
         Ok(())
     }
@@ -214,6 +272,20 @@ impl EchoNode {
     pub fn close(&mut self) {
         self.client.close();
     }
+}
+
+/// Keep one message for the echo pass, growing the list of them as needed.
+///
+/// The list is kept between turns so that echoing a batch does not allocate, and
+/// this is the one place both doors put a message into it.
+fn keep(echoed: &mut Vec<Vec<u8>>, arrived: &mut usize, payload: &[u8]) {
+    if *arrived == echoed.len() {
+        echoed.push(Vec::new());
+    }
+
+    echoed[*arrived].clear();
+    echoed[*arrived].extend_from_slice(payload);
+    *arrived += 1;
 }
 
 /// Send one message back, waiting as long as it takes.

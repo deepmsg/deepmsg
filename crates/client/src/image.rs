@@ -112,6 +112,16 @@ impl<'a> Fragment<'a> {
         self.frame.payload_length().unwrap_or(0)
     }
 
+    /// A four-byte field of the payload, read where it lies.
+    ///
+    /// [`Fragment::payload_i64_at`]'s reasons and its bounds, for the field a
+    /// message carries as an `int32` — the receiver index a node filters on
+    /// (`AeronUtil.RECEIVER_INDEX_OFFSET`), which the reference reads straight
+    /// out of the received term (`EchoNode.java:157`).
+    pub fn payload_i32_at(&self, offset: usize) -> Option<i32> {
+        self.frame.load_i32_in_payload(offset)
+    }
+
     /// The `BEGIN`/`END`/`EOS`/`REVOKED` bits.
     pub fn flags(&self) -> Option<u8> {
         self.frame.flags()
