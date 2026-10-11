@@ -443,6 +443,54 @@ pub enum AsyncAddPoll {
     Unknown,
 }
 
+/// A handle on a `GET_NEXT_AVAILABLE_SESSION_ID` that has been sent and not yet
+/// answered.
+///
+/// Returned by [`Client::async_next_session_id`], consumed by
+/// [`Client::async_next_session_id_poll`]. It carries the correlation id and
+/// nothing else: unlike an [`AsyncAdd`] there is no resource to find later — the
+/// answer *is* the value — so the client's pending list is the whole of where it
+/// lives.
+///
+/// **Why there is an async twin at all.** The answer is a driver round trip,
+/// and a caller that is itself inside the driver's turn cannot wait for one:
+/// the loop that would answer it is the loop that is waiting
+/// (`deepmsg-archiving-media-driver.rs`: `driver.do_work()` then
+/// `conductor.do_work`, one thread). The reference's clients block here and can
+/// afford to — its archive agent and its driver agent are different threads —
+/// so this is where a caller that cannot block gets to say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncNextSessionId {
+    correlation_id: i64,
+}
+
+impl AsyncNextSessionId {
+    /// The correlation id the command went out under, which is also what a
+    /// caller keeping ids rather than handles has to put back together.
+    #[must_use]
+    pub const fn correlation_id(&self) -> i64 {
+        self.correlation_id
+    }
+}
+
+/// What [`Client::async_next_session_id_poll`] found.
+///
+/// Not `Clone` or `PartialEq`, for the reason [`AsyncAddPoll`] is neither.
+#[derive(Debug)]
+pub enum AsyncNextSessionIdPoll {
+    /// The driver has not answered yet. Poll again later.
+    Awaiting,
+    /// It answered, with the id to publish under.
+    Ready(i32),
+    /// The driver refused it, or the deadline passed before it answered. A
+    /// deadline that passed is [`CommandError::TimedOut`], recorded where the
+    /// pending entry was dropped.
+    Failed(CommandError),
+    /// This handle is not one this client is waiting on: it was already polled,
+    /// or never came from this client.
+    Unknown,
+}
+
 /// A removal that has been sent and not yet answered.
 ///
 /// Carries both ids for the same reason [`AsyncAdd`] carries one: the
@@ -2406,6 +2454,84 @@ impl Client {
         stream_id: i32,
         timeout: Duration,
     ) -> Result<i32, CommandError> {
+        let correlation_id = self.submit_next_session_id(stream_id, timeout)?;
+
+        let Ready::NextSessionId { next_session_id } = self.wait(correlation_id)? else {
+            return Err(CommandError::Encoding);
+        };
+
+        Ok(next_session_id)
+    }
+
+    /// Ask the driver what session id to publish under on `stream_id`, and come
+    /// back **without waiting for the answer**.
+    ///
+    /// The same command [`Client::next_session_id`] sends, and the same answer;
+    /// what differs is who drives the wait. A caller that is inside the driver's
+    /// own turn cannot ([`AsyncNextSessionId`] says why), so it sends here and
+    /// reads the answer with [`Client::async_next_session_id_poll`] on a later
+    /// turn — which is the shape the archive's counter allocations already use.
+    ///
+    /// `timeout` is the deadline the pending entry carries; the client's own
+    /// [`Client::poll`] is what drops it when it passes, and the drop is what a
+    /// later poll reports as [`AsyncNextSessionIdPoll::Unknown`].
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent, or if the client has
+    /// no correlation ids left to draw.
+    pub fn async_next_session_id(
+        &mut self,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<AsyncNextSessionId, CommandError> {
+        let correlation_id = self.submit_next_session_id(stream_id, timeout)?;
+
+        Ok(AsyncNextSessionId { correlation_id })
+    }
+
+    /// What has become of an [`AsyncNextSessionId`]. Does **not** drive the
+    /// client: [`Client::poll`] has to have run for a driver response to have
+    /// been read, as it does for every other reply.
+    ///
+    /// Polling consumes the answer: a completed request leaves the pending list,
+    /// so a second poll of the same handle answers
+    /// [`AsyncNextSessionIdPoll::Unknown`] — the same choice
+    /// [`Client::async_add_poll`] makes and for the same reason.
+    pub fn async_next_session_id_poll(
+        &mut self,
+        request: AsyncNextSessionId,
+    ) -> AsyncNextSessionIdPoll {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == request.correlation_id)
+        else {
+            return AsyncNextSessionIdPoll::Unknown;
+        };
+
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return AsyncNextSessionIdPoll::Awaiting;
+        };
+
+        self.pending.swap_remove(index);
+
+        match outcome {
+            Ok(Ready::NextSessionId { next_session_id }) => {
+                AsyncNextSessionIdPoll::Ready(next_session_id)
+            }
+            Ok(_) => AsyncNextSessionIdPoll::Failed(CommandError::Encoding),
+            Err(error) => AsyncNextSessionIdPoll::Failed(error),
+        }
+    }
+
+    /// The send both of the faces above share: the command into the ring, and
+    /// the pending entry that its answer will complete.
+    fn submit_next_session_id(
+        &mut self,
+        stream_id: i32,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
         let command = GetNextAvailableSessionId {
@@ -2428,11 +2554,7 @@ impl Client {
             timeout,
         )?;
 
-        let Ready::NextSessionId { next_session_id } = self.wait(correlation_id)? else {
-            return Err(CommandError::Encoding);
-        };
-
-        Ok(next_session_id)
+        Ok(correlation_id)
     }
 
     /// Reject an image this client is reading, and wait for the driver to

@@ -191,6 +191,29 @@ pub struct ArchiveContext {
     pub control_mtu_length: i32,
     /// Whether the control channel's term buffer is sparse.
     pub control_term_buffer_sparse: bool,
+    /// The session id the two control channels are to be stamped with, when the
+    /// caller has **already** asked the driver for one.
+    ///
+    /// `None` — the default, and what every caller outside the archive sets —
+    /// means [`ArchiveContext::conclude_with`] asks, which blocks until the
+    /// driver answers. **A caller inside the driver's own turn cannot do that**
+    /// and must hand the id in: the archiving media driver runs the driver and
+    /// the archive in one thread (`deepmsg-archiving-media-driver.rs`:
+    /// `driver.do_work()`, then `conductor.do_work`), so a command sent from the
+    /// archive's turn waits for a driver nobody is driving. Which is what makes
+    /// this a deviation at all — the reference blocks here and can afford to,
+    /// its archive agent and driver agent being different threads
+    /// (`AeronArchive.Context.conclude`, `AeronArchive.java:3138-3151`, which
+    /// is where the token is asked for).
+    ///
+    /// What the id is *for* does not change: one session for the request channel
+    /// and the response channel together, so that the archive's response
+    /// publication and this client's response subscription are the same session
+    /// and meet. The value is a hint and not a reservation — the driver's cursor
+    /// moves past whatever it answered — so a caller that acquired it
+    /// asynchronously is holding exactly what the blocking call would have
+    /// returned.
+    pub prepared_session_id: Option<i32>,
     /// Every value that would not parse, as `name=value`.
     ///
     /// The reference prints these to stderr as it reads them
@@ -229,6 +252,7 @@ impl ArchiveContext {
             control_term_buffer_length: 64 * 1024,
             control_mtu_length: MTU_LENGTH_DEFAULT,
             control_term_buffer_sparse: true,
+            prepared_session_id: None,
             warnings: Vec::new(),
         }
     }
@@ -431,6 +455,34 @@ impl ArchiveContext {
         Ok(())
     }
 
+    /// Whether [`Self::conclude_with`] will need a session id — the question a
+    /// caller that **cannot block** has to ask before it calls it.
+    ///
+    /// The rule is `conclude_with`'s own: a response-mode response channel is
+    /// the archive's own channel and neither URI names a session, while every
+    /// other pair gets one id written into both. A caller that would have to
+    /// wait for [`Client::next_session_id`] to get one — because it is inside
+    /// the driver's own turn — asks this first and fills
+    /// [`Self::prepared_session_id`] with an id it acquired without waiting
+    /// ([`Client::async_next_session_id`]).
+    ///
+    /// A context with no response channel at all answers `false`:
+    /// `conclude_with` refuses such a context before it reaches the question.
+    ///
+    /// # Errors
+    ///
+    /// [`ConcludeError::ResponseChannel`] when there is a channel and it will
+    /// not parse — the same refusal, word for word, that `conclude_with` makes.
+    pub fn needs_session_id(&self) -> Result<bool, ConcludeError> {
+        let Some(response) = self.control_response_channel.as_deref() else {
+            return Ok(false);
+        };
+
+        let response = ChannelUri::parse(response).map_err(ConcludeError::ResponseChannel)?;
+
+        Ok(Some(CONTROL_MODE_RESPONSE) != response.get(CONTROL_MODE_KEY))
+    }
+
     /// The *second* half of `aeron_archive_context_conclude` (`:359-423`): the
     /// two control channels as they will actually be used.
     ///
@@ -489,16 +541,23 @@ impl ArchiveContext {
         let response_mode = Some(CONTROL_MODE_RESPONSE) == response.get(CONTROL_MODE_KEY);
 
         if !response_mode {
-            let session_id = client
-                .next_session_id(
-                    self.control_request_stream_id,
-                    // Nought rather than "forever" for a nonsense deadline: a
-                    // context built through `resolve`/`from_env` cannot carry
-                    // one (the reader clamps at 1000 ns), but a field is a
-                    // field, and the safe way to fail a deadline is to reach it.
-                    Duration::from_nanos(u64::try_from(self.message_timeout_ns).unwrap_or(0)),
-                )
-                .map_err(ConcludeError::SessionId)?;
+            // A caller that is inside the driver's own turn never reaches the
+            // blocking call below: it hands the id in, having asked for it some
+            // turns earlier (`ArchiveContext::prepared_session_id`).
+            let prepared = self.prepared_session_id;
+            let session_id = match prepared {
+                Some(session_id) => Ok(session_id),
+                None => client
+                    .next_session_id(
+                        self.control_request_stream_id,
+                        // Nought rather than "forever" for a nonsense deadline: a
+                        // context built through `resolve`/`from_env` cannot carry
+                        // one (the reader clamps at 1000 ns), but a field is a
+                        // field, and the safe way to fail a deadline is to reach it.
+                        Duration::from_nanos(u64::try_from(self.message_timeout_ns).unwrap_or(0)),
+                    )
+                    .map_err(ConcludeError::SessionId),
+            }?;
 
             let session_id = session_id.to_string();
             request.put(SESSION_ID_KEY, session_id.clone());

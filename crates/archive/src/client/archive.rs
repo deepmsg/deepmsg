@@ -480,6 +480,20 @@ impl Archive {
         &mut self.proxy
     }
 
+    /// The descriptor poller, for a caller that drives a listing itself.
+    ///
+    /// [`Self::proxy_mut`]'s twin, and needed for the same caller: every
+    /// listing on this type is the **blocking** wrapper
+    /// ([`Self::poll_for_descriptors`]), which resets the poller, polls it and
+    /// loops to a deadline. The reference's replication session does neither —
+    /// it resets the poller with its own correlation id and polls it a turn at
+    /// a time (`ReplicationSession.java:454`, `:471`) — and this is the door it
+    /// comes through. The poller's own API is the rest of it.
+    #[must_use]
+    pub const fn descriptor_poller_mut(&mut self) -> &mut RecordingDescriptorPoller {
+        &mut self.recording_descriptor_poller
+    }
+
     /// Leave, and tell the archive so (`aeron_archive_close`, `:347-386`).
     ///
     /// The session is closed **only if the request publication is connected** —

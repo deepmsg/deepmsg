@@ -158,7 +158,9 @@ use crate::server::replay_session::{
     Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
 };
 use crate::server::replayer::Replayer;
-use crate::server::replication_session::{ReplicationProgress, ReplicationSession};
+use crate::server::replication_session::{
+    ReplicationNotice, ReplicationProgress, ReplicationSession,
+};
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 use deepmsg_codec::archive::recording_state::RecordingState;
 
@@ -548,6 +550,25 @@ enum Deferred {
         session_id: i64,
         correlation_id: i64,
     },
+    /// A recording signal a **session** owes the client
+    /// (`ControlSession.sendSignal`, `ControlSession.java:735-750`).
+    ///
+    /// The other signals in this file are sent by the conductor itself, from the
+    /// turn that earned them ([`Sessions::send_signal`]); this one is deferred
+    /// because its sender is a replication session, which holds the control
+    /// session's **id** and not the session. Every field the reference's
+    /// `sendSignal` takes travels, including the correlation id: a replication's
+    /// signals carry the **replication's** id (`ReplicationSession.java:932`),
+    /// which is what lets a client tell one replication's signals from
+    /// another's.
+    Signal {
+        session_id: i64,
+        correlation_id: i64,
+        recording_id: i64,
+        subscription_id: i64,
+        position: i64,
+        signal: RecordingSignal,
+    },
     /// A request that has to move something (`ArchiveConductor.java:562`,
     /// `:1766-1780`) — see [`Action`].
     Action(Action),
@@ -776,6 +797,14 @@ pub const UNKNOWN_REPLICATION: i64 = 12;
 /// the error drain does.
 pub const REPLICATION_CONNECTION_FAILURE: i64 = 14;
 
+/// `ArchiveException.GENERIC` (`client/ArchiveException.java:29`), the code a
+/// request gets when the archive could not say anything more specific about it
+/// — and the code
+/// [`ReplicationSession`](crate::server::replication_session::ReplicationSession)
+/// answers with for **every** state failure that is not one of its own
+/// (`ReplicationSession.java:275-277`, the `catch` around the whole machine).
+pub const GENERIC: i64 = 0;
+
 /// `CommonContext.SPY_PREFIX` (`CommonContext.java:246`): the channel prefix a
 /// **local** UDP publication is recorded through, because a driver's own
 /// publication is not a network one and a spy link is what carries it to a
@@ -872,11 +901,7 @@ const ENDPOINT_PARAM: &str = "endpoint";
 /// What a response channel falls back to when the archive's own control channel
 /// has no endpoint to derive one from — see
 /// [`replication_client_context`] for why there is a fallback at all.
-const REPLICATION_RESPONSE_CHANNEL_FALLBACK: &str =
-    "aeron:udp?endpoint=localhost:0|control-mode=response";
-
-/// `ChannelUri.hasControlModeResponse`'s value (`ChannelUri.java:653-656`).
-const CONTROL_MODE_RESPONSE_PARAM: &str = "control-mode=response";
+const REPLICATION_RESPONSE_CHANNEL_FALLBACK: &str = "aeron:udp?endpoint=localhost:0";
 
 /// `Archive.Context.archiveClientContext` (`Archive.java:1514-1552`): the
 /// context a replication reaches its source with.
@@ -891,31 +916,49 @@ const CONTROL_MODE_RESPONSE_PARAM: &str = "control-mode=response";
 /// * everything else the client's own defaults, which is what
 ///   `archiveClientContext = new AeronArchive.Context()` (`:1516`) is.
 ///
-/// # ★ The one deviation, and it is forced by this build's shape
+/// # ★★ The one hazard, and how it is answered
 ///
-/// **The derived channel carries `control-mode=response`; the reference's does
-/// not.** That is not a preference — a plain response channel cannot be used
-/// from where this context is used at all.
-///
-/// `ArchiveContext::conclude_with` draws a session id for a non-response
-/// channel (`client/context.rs:489-506`), and that draw is
-/// [`Client::next_session_id`], a **driver round trip**. The reference makes it
-/// happily because its archive agent and its driver agent are different
-/// threads. This build's archiving media driver runs both halves in **one
-/// loop** (`deepmsg-archiving-media-driver.rs:363-375`: `driver.do_work()`, then
+/// `ArchiveContext::conclude_with` stamps a session id on both control channels
+/// for a channel that is not a response channel (`client/context.rs:489-506`),
+/// and what it draws that id with is [`Client::next_session_id`] — a **driver
+/// round trip**. The reference makes it happily because its archive agent and
+/// its driver agent are different threads; this build's archiving media driver
+/// runs both halves in **one loop**
+/// (`deepmsg-archiving-media-driver.rs:363-375`: `driver.do_work()`, then
 /// `conductor.do_work(&mut client, …)`), so a client command issued inside the
-/// conductor's turn waits for a driver nobody is driving: the call sits for its
-/// whole `messageTimeoutNs` and the turn — and with it the answer the replicate
-/// is owed — never finishes. **Measured**: with the reference's plain channel
-/// the four replication criteria time out on the first replicate; with
-/// `control-mode=response` they pass in 0.08 s.
+/// conductor's turn waits for a driver nobody is driving.
 ///
-/// This is the same hazard [`Sessions::allocate_session_counter`] names for
-/// `ArchiveIdCounter::allocate`, and the same answer: the command is not sent.
-/// A response channel is asked for nothing here, and the source archive answers
-/// on the channel the request came in on — which is the shape `control-mode=
-/// response` means, and the one P2-1c built the response proxy for.
+/// This is the hazard [`Sessions::allocate_session_counter`] names for
+/// `ArchiveIdCounter::allocate`, and it is **measured**: with the derived
+/// channel as the reference derives it, `replicate` itself times out at 10 s,
+/// the turn being stuck in that round trip before the answer it owes goes out.
 ///
+/// **What was done about it, and what was tried first.** The first answer was
+/// to derive the channel as `…|control-mode=response`, on the reading that a
+/// response channel "is asked for nothing" — `conclude_with` mints no id for
+/// one, so the round trip disappears. That reading is right about the round trip
+/// and wrong about the channel: **a response channel over UDP is not a channel
+/// a peer can answer on unless it names a `control=` address to be elicited to**
+/// (`crates/driver/src/network_publication.rs`'s `do_send`,
+/// `aeron_network_publication.c:355-378`, sends only to an address it was
+/// elicited from; `media/aeron_receive_channel_endpoint.c:1127-1152` is what
+/// asks). Measured 2026-10-11: a plain `Archive::connect` over
+/// `aeron:udp?endpoint=localhost:0|control-mode=response` times out, with the
+/// response publication dropping every frame it is handed — the shape is
+/// unsatisfiable for the reference too, whose `do_send` is the same. The
+/// reference's own two working shapes are `aeron:udp?control=<addr>` with
+/// `control-mode=response` (its response samples, `samples_configuration.h:34`)
+/// and a plain `aeron:udp?endpoint=<host>:0` (its archive tests,
+/// `TestContexts.LOCALHOST_CONTROL_RESPONSE_CHANNEL`).
+///
+/// So the derivation below is the reference's, **unchanged**, and the round trip
+/// is answered where it is asked: the replication session asks the driver for
+/// the id **without waiting** ([`Client::async_next_session_id`]) and hands it
+/// in through [`ArchiveContext::prepared_session_id`], which is the one field
+/// this build adds to the client's context. Both halves of the deviation are
+/// recorded in `analysis/archive/deepmsg-p2-s6-plan-replication.md` §8.
+///
+/// **One more deviation.** A control channel whose endpoint is absent or not
 /// **One more deviation.** A control channel whose endpoint is absent or not
 /// `<host>:<port>` makes the reference throw `ConfigurationException` and
 /// refuse to **start** (`Archive.java:1526-1529`). There is no place in this
@@ -936,7 +979,7 @@ fn replication_client_context(config: &ArchiveConfig) -> ArchiveContext {
             .and_then(|endpoint| endpoint.rsplit_once(':').map(|(host, _)| host.to_owned()))
             .map_or_else(
                 || REPLICATION_RESPONSE_CHANNEL_FALLBACK.to_owned(),
-                |host| format!("aeron:udp?endpoint={host}:0|{CONTROL_MODE_RESPONSE_PARAM}"),
+                |host| format!("aeron:udp?endpoint={host}:0"),
             ),
     );
     context
@@ -2415,7 +2458,7 @@ impl Sessions {
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
         self.drive_replays(client, counters, catalog, now_ms);
-        self.drive_replication_sessions(client, now_ms);
+        self.drive_replication_sessions(client, catalog, now_ms);
         self.drive_delete_segments(client, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
@@ -4674,7 +4717,12 @@ impl Sessions {
     /// the next commit's, and until it exists a replication that finishes is
     /// dropped rather than closed — which is a hole this comment names and does
     /// not paper over.
-    fn drive_replication_sessions(&mut self, client: &mut Client, now_ms: i64) {
+    fn drive_replication_sessions(
+        &mut self,
+        client: &mut Client,
+        catalog: &mut Catalog,
+        now_ms: i64,
+    ) {
         if self.replication_sessions.is_empty() {
             return;
         }
@@ -4686,25 +4734,40 @@ impl Sessions {
 
         sessions.retain_mut(|session| {
             let control_session_id = session.control_session_id();
+            let progress = session.do_work(client, catalog, now_ms);
 
-            match session.do_work(client, now_ms) {
-                ReplicationProgress::Idle => true,
-                ReplicationProgress::Done => false,
-                ReplicationProgress::Failed {
-                    correlation_id,
-                    code,
-                    message,
-                } => {
-                    self.pending.push(Deferred::Error {
+            // **Whatever the turn owed goes out, finished or not.** A session
+            // that ends on the same turn as it raises a `SYNC` owes both, and
+            // the signal is not a parting gift to be dropped with the session.
+            for notice in session.take_notices() {
+                self.pending.push(match notice {
+                    ReplicationNotice::Signal {
+                        recording_id,
+                        subscription_id,
+                        position,
+                        signal,
+                    } => Deferred::Signal {
+                        session_id: control_session_id,
+                        correlation_id: session.replication_id().unwrap_or(NULL_VALUE),
+                        recording_id,
+                        subscription_id,
+                        position,
+                        signal,
+                    },
+                    ReplicationNotice::Error {
+                        correlation_id,
+                        code,
+                        message,
+                    } => Deferred::Error {
                         session_id: control_session_id,
                         correlation_id,
                         relevant_id: code,
                         message,
-                    });
-
-                    false
-                }
+                    },
+                });
             }
+
+            !matches!(progress, ReplicationProgress::Done)
         });
 
         self.replication_sessions = sessions;
@@ -4807,8 +4870,10 @@ impl Sessions {
             return;
         }
 
+        let mut destination = None;
+
         if has_recording {
-            let Ok(destination) = catalog.recording(request.dst_recording_id) else {
+            let Ok(recording) = catalog.recording(request.dst_recording_id) else {
                 self.warnings.push(format!(
                     "catalog could not read recording {}: the replicate is dropped",
                     request.dst_recording_id
@@ -4820,7 +4885,7 @@ impl Sessions {
             // recording session still holds it (`:1419-1420`) — the two are
             // different questions, and a recording whose stop position is
             // written but whose session is still open is the second one.
-            if destination.stop_position == NULL_POSITION
+            if recording.stop_position == NULL_POSITION
                 || self
                     .recording_session_by_id
                     .contains_key(&request.dst_recording_id)
@@ -4836,6 +4901,10 @@ impl Sessions {
                 );
                 return;
             }
+
+            // `hasRecording ? recordingSummary : null` (`:1465`), which the
+            // session reads two facts off and nothing else.
+            destination = Some(recording);
         }
 
         // ④ `:1455`: the id comes from the **session** counter and not from one
@@ -4878,6 +4947,7 @@ impl Sessions {
             request,
             replication_channel,
             context,
+            destination,
         ));
 
         self.pending.push(Deferred::Ok {
@@ -6406,6 +6476,26 @@ impl Sessions {
                         entry
                             .control
                             .send_subscription_unknown(correlation_id, now_ms, client);
+                    }
+                }
+                Deferred::Signal {
+                    session_id,
+                    correlation_id,
+                    recording_id,
+                    subscription_id,
+                    position,
+                    signal,
+                } => {
+                    if let Some(entry) = self.sessions.get_mut(&session_id) {
+                        entry.control.send_signal(
+                            correlation_id,
+                            recording_id,
+                            subscription_id,
+                            position,
+                            signal,
+                            now_ms,
+                            client,
+                        );
                     }
                 }
                 Deferred::Action(action) => {
@@ -8616,6 +8706,42 @@ mod tests {
         response_channel(requested, IMAGE_CORRELATION_ID, &DEFAULTS).expect("a readable channel")
     }
 
+    /// **A replication's response channel is the one the reference derives.**
+    ///
+    /// `Archive.java:1519-1541`: the archive's own control channel with the port
+    /// replaced by nought. Nothing else — in particular **no
+    /// `control-mode=response`**, which this build derived for one day and which
+    /// cannot work over UDP (`replication_client_context` says why, measured).
+    ///
+    /// The second claim is what makes the first one cost something: a channel
+    /// derived this way is **not** a response channel, so `conclude_with` will
+    /// want a session id for it — the driver round trip that a session, running
+    /// inside the archive's own turn, must not make. A test that only read the
+    /// string back would pass for a derivation that had been made cheap again.
+    #[test]
+    fn a_replication_is_answered_on_the_channel_the_reference_derives() {
+        let config = ArchiveConfig::resolve(&[
+            ("aeron.dir".to_owned(), "/dev/shm/a".to_owned()),
+            (
+                "aeron.archive.control.channel".to_owned(),
+                "aeron:udp?endpoint=localhost:8011".to_owned(),
+            ),
+        ])
+        .expect("resolves");
+
+        let context = replication_client_context(&config);
+
+        assert_eq!(
+            Some("aeron:udp?endpoint=localhost:0".to_owned()),
+            context.control_response_channel
+        );
+        assert!(
+            context.needs_session_id().expect("a readable channel"),
+            "so the session has to acquire one, without blocking"
+        );
+        assert_eq!(None, context.prepared_session_id);
+    }
+
     /// The strip list, read off the reference's own `strippedChannelBuilder` by
     /// reflection rather than reasoned about — every expected value below is
     /// what `aeron-archive-1.53.2.jar` printed.
@@ -9241,6 +9367,7 @@ mod tests {
             replication_request(),
             "aeron:ipc?alias=replicated".to_owned(),
             ArchiveContext::new(),
+            None,
         ));
 
         sessions.stop_replication(1, 99, replication_id);

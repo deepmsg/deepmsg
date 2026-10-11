@@ -1781,3 +1781,216 @@ fn a_replication_that_cannot_reach_its_source_says_so() {
     archive.close(&client);
     media_driver.stop().expect("the driver stops");
 }
+
+/// What the **descriptor** test's signal handler saw.
+///
+/// A sink of its own, for the reason written at [`SIGNALS`].
+static REPLICATION_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+/// Its handler.
+fn collect_replication_signal(signal: &RecordingSignal) {
+    REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .push(*signal);
+}
+
+/// The one row a listing of this archive holds, or `None` while there is not
+/// exactly one.
+fn the_only_recording(archive: &mut Archive, client: &mut Client) -> Option<RecordingDescriptor> {
+    let mut rows = Vec::new();
+
+    let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+        rows.push(descriptor.clone());
+    });
+
+    match rows.len() {
+        1 => rows.pop(),
+        _ => None,
+    }
+}
+
+/// **A replicate fetches its source's descriptor, and makes the destination
+/// row.**
+///
+/// `REPLICATE_DESCRIPTOR` (`ReplicationSession.java:444-483`) is the state where
+/// the copy first touches anything: it asks the source archive — through the
+/// client the `CONNECT` state built — for one recording's descriptor, and
+/// `onRecordingDescriptor` (`:295-399`) turns what comes back into a row in
+/// **this** archive's catalog.
+///
+/// **The source is this archive.** deepmsg serves both ends, and the shortest
+/// path through the state is a replication of one of its recordings onto
+/// itself: the control channel is the one this archive already listens on, and
+/// the request goes out over it and comes back. What is exercised is the whole
+/// state — the listing, the poller, the descriptor, and the row — with no
+/// second archive to keep in step.
+///
+/// Two claims, and the second is the one a stub could not fake:
+///
+/// * the destination's client is told, with a `REPLICATE` signal
+///   (`:351`) whose position is the source's **start**;
+/// * and the row that appears is the source's descriptor — every field of it,
+///   under an id of this archive's own, with the two positions collapsed to the
+///   start (`catalog.addNewRecording(startPosition, startPosition, …)`,
+///   `:337-349`). A row that agreed on one field would prove nothing; this
+///   agrees on ten.
+#[test]
+fn a_replicate_fetches_its_source_descriptor_and_makes_the_row() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replicate-descriptor")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_replication_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the archive is connected");
+
+    // The recording to copy. Made, written to, and **stopped**: a stopped
+    // recording has a stop position, which is what keeps the descriptor from
+    // taking the "already in sync" shortcut (`:393-398`) and lets this test
+    // assert on a row the source actually filled in.
+    let subscription_id = archive
+        .start_recording(
+            &mut client,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            false,
+            false,
+        )
+        .expect("the archive starts recording");
+
+    let publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("the driver takes a publication on the recording channel");
+
+    until(&mut client, "the recording publication linking", |client| {
+        client
+            .exclusive_publication(publication)
+            .and_then(deepmsg_client::publication::ExclusivePublication::is_connected)
+            .unwrap_or(false)
+    });
+
+    let mut source = None;
+
+    until(&mut client, "the source's catalog row", |client| {
+        let _ = client.offer_exclusive(publication, b"a message to copy");
+        source = the_only_recording(&mut archive, client);
+
+        source.is_some()
+    });
+
+    let source = source.expect("the loop ends with a row");
+
+    archive
+        .stop_recording_subscription(&mut client, subscription_id)
+        .expect("the archive stops the subscription it opened");
+
+    until(&mut client, "the source's stop position", |client| {
+        archive
+            .get_stop_position(client, source.recording_id)
+            .is_ok_and(|stop| stop >= 0)
+    });
+
+    let source = the_only_recording(&mut archive, &mut client).expect("still one row");
+
+    // **The replicate.** Its source is this archive's own control channel, on
+    // the stream both control subscriptions are on.
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            archive::CONTROL_CHANNEL,
+            &params,
+        )
+        .expect("the archive takes the replication");
+
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        let mut rows = Vec::new();
+        let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+            rows.push(descriptor.clone());
+        });
+
+        copied = rows
+            .iter()
+            .find(|row| row.recording_id != source.recording_id)
+            .cloned();
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // The descriptor, field for field, under an id of this archive's own.
+    assert!(
+        copied.recording_id > source.recording_id,
+        "the copy is a new row, not the source's: {} against {}",
+        copied.recording_id,
+        source.recording_id
+    );
+    assert_eq!(
+        source.start_position, copied.start_position,
+        "the start is the source's"
+    );
+    assert_eq!(
+        copied.start_position, copied.stop_position,
+        "and the row begins empty — `addNewRecording(startPosition, startPosition, …)`"
+    );
+    assert_eq!(source.initial_term_id, copied.initial_term_id);
+    assert_eq!(source.segment_file_length, copied.segment_file_length);
+    assert_eq!(source.term_buffer_length, copied.term_buffer_length);
+    assert_eq!(source.mtu_length, copied.mtu_length);
+    assert_eq!(
+        source.session_id, copied.session_id,
+        "the source publication's session, which the replay will arrive under"
+    );
+    assert_eq!(source.stream_id, copied.stream_id);
+    assert_eq!(source.stripped_channel, copied.stripped_channel);
+    assert_eq!(source.original_channel, copied.original_channel);
+    assert_eq!(source.source_identity, copied.source_identity);
+
+    // And the signal, under the replication's own id rather than a request's.
+    let replicated = REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE)
+        .copied()
+        .expect("a REPLICATE signal");
+
+    let _ = replication_id;
+
+    assert_eq!(
+        copied.recording_id, replicated.recording_id,
+        "it is about the row that was just made"
+    );
+    assert_eq!(
+        source.start_position, replicated.position,
+        "at the position the copy starts from, which is the source's start"
+    );
+    assert_eq!(
+        -1, replicated.subscription_id,
+        "and with no subscription: EXTEND has not made one yet"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
