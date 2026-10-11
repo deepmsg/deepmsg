@@ -50,7 +50,9 @@ use deepmsg_codec::archive::source_location::SourceLocation;
 
 use crate::catalog::{Catalog, Recording};
 use crate::client::archive::{Archive, Handlers};
-use crate::client::async_connect::{AsyncConnect, NoCredentials, Polled};
+use crate::client::async_connect::{
+    AsyncConnect, Credentials, NoCredentials, Polled, ReplicationCredentials,
+};
 use crate::client::context::ArchiveContext;
 use crate::client::descriptor_poller::RecordingDescriptor;
 use crate::client::proxy::ReplayParams;
@@ -80,6 +82,55 @@ const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
 /// `AeronArchive.NULL_LENGTH` (`AeronArchive.java:106`), which is `NULL_VALUE`:
 /// a replay with no length follows the source (`:115-117`).
 const NULL_LENGTH: i64 = NULL_VALUE;
+
+/// What a session offers the **source** when it connects.
+///
+/// Two cases, and the reference has both (`ArchiveConductor.java:1443-1446`):
+/// a request that carried credentials gets
+/// [`ReplicationCredentials`] — offered as they are, and **no challenge
+/// answered** — and a request that carried none leaves the context's own
+/// supplier alone, which is the null one: it offers nothing and answers a
+/// challenge with nothing.
+///
+/// The difference is only visible when the far end challenges a request that
+/// brought no credentials, and then it is the difference between the server
+/// refusing an empty answer and this build refusing to answer at all. Both end
+/// the connect; the words differ, and the words are the reference's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum SessionCredentials {
+    /// The request carried none.
+    #[default]
+    Nothing,
+    /// The request carried these.
+    Request(ReplicationCredentials),
+}
+
+impl SessionCredentials {
+    /// What a request with these `encoded_credentials` connects with.
+    fn for_request(encoded_credentials: &[u8]) -> Self {
+        if encoded_credentials.is_empty() {
+            Self::Nothing
+        } else {
+            Self::Request(ReplicationCredentials::new(encoded_credentials.to_vec()))
+        }
+    }
+}
+
+impl Credentials for SessionCredentials {
+    fn encoded(&mut self) -> Vec<u8> {
+        match self {
+            Self::Nothing => NoCredentials.encoded(),
+            Self::Request(credentials) => credentials.encoded(),
+        }
+    }
+
+    fn on_challenge(&mut self, challenge: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Nothing => NoCredentials.on_challenge(challenge),
+            Self::Request(credentials) => credentials.on_challenge(challenge),
+        }
+    }
+}
 
 /// The state a session is in (`ReplicationSession.java:61-75`), in the order it
 /// walks them.
@@ -284,6 +335,21 @@ pub struct ReplicationSession {
     /// `srcReplaySessionId` (`:78`): the session the **source's replay** runs
     /// under, which is what `AWAIT_IMAGE` looks for at the destination.
     src_replay_session_id: i64,
+    /// What this session offers the **source** when it connects, which is what
+    /// the replication request carried (`ArchiveConductor.java:1443-1446`).
+    ///
+    /// **The reference keeps this on the context** the session connects with
+    /// (`remoteArchiveContext.credentialsSupplier(new ReplicationCredentialsSupplier(...))`)
+    /// and only when the request carried something; here it is a field of the
+    /// session, which reaches the same place — `AsyncConnect::new` takes the
+    /// supplier as an argument — without putting a trait object on a context
+    /// that is `Clone`, `Debug` and `PartialEq`.
+    ///
+    /// **Measured**: without it every replication against the C suite's archives
+    /// died at `CONNECT` with `authentication rejected` — the suite configures
+    /// the sample authenticator (`TestArchive.h:50`) and sends `admin:admin`
+    /// with every replication request (`aeron_archive_test.cpp:78`).
+    credentials: SessionCredentials,
     /// The clock this turn is running on, which [`Self::go_to`] reads — the
     /// reference's `epochClock`, which its own `state` asks for the time
     /// (`:975-983`).
@@ -376,6 +442,7 @@ impl ReplicationSession {
         // Read out before the request moves into the session: `REPLAY` passes
         // it on to the source (`:712`).
         let file_io_max_length = request.file_io_max_length;
+        let credentials = SessionCredentials::for_request(&request.encoded_credentials);
         let (replay_position, replay_stream_id, is_destination_recording_empty) = match destination
         {
             Some(recording) => (
@@ -404,6 +471,7 @@ impl ReplicationSession {
             file_io_max_length,
             replay_token: NULL_VALUE,
             src_replay_session_id: NULL_VALUE,
+            credentials,
             now_ms: 0,
             extend_asked: false,
             extend_answer: None,
@@ -1450,7 +1518,15 @@ impl ReplicationSession {
             // `connect` answers `REPLICATION_CONNECTION_FAILURE` and returns
             // (`:437-442`), where every other state's failure is the outer
             // `catch`'s and gets `GENERIC`.
-            return match AsyncConnect::new(&self.context, client, &mut NoCredentials) {
+            // The two fields are taken apart because one is read and the other
+            // written for the length of the call.
+            let Self {
+                context,
+                credentials,
+                ..
+            } = self;
+
+            return match AsyncConnect::new(context, client, credentials) {
                 Ok(connect) => {
                     self.async_connect = Some(connect);
 
@@ -1467,11 +1543,19 @@ impl ReplicationSession {
             };
         }
 
-        let Some(connect) = self.async_connect.as_mut() else {
+        // The same supplier the connect was built with, for the reason every
+        // poll takes one: the challenge can arrive on any turn.
+        let Self {
+            async_connect,
+            credentials,
+            ..
+        } = self;
+
+        let Some(connect) = async_connect.as_mut() else {
             return Ok(());
         };
 
-        match connect.poll(client, &mut NoCredentials) {
+        match connect.poll(client, credentials) {
             Ok(Polled::Awaiting) => Ok(()),
             Ok(Polled::Done(connected)) => {
                 // `srcArchive = archive` (`:433`), built from what the connect
