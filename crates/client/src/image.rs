@@ -112,6 +112,35 @@ impl<'a> Fragment<'a> {
         self.frame.payload_length().unwrap_or(0)
     }
 
+    /// The frame's payload as a **window** and its bounds — the read that does
+    /// not copy, for a caller that has somewhere else to put the bytes.
+    ///
+    /// The window and not a slice, for the reason every read here is a value
+    /// and not a slice: the producer on the other side of the mapping is still
+    /// writing (see [`Fragment::payload_i64_at`]). A caller that wants the
+    /// bytes *moved* — an echo node publishing what it read, a proxy forwarding
+    /// it — hands this window to
+    /// [`ExclusivePublication::offer_region`](crate::publication::ExclusivePublication::offer_region),
+    /// which copies out of it in one go, and never needs the bytes to look like
+    /// a slice at all.
+    pub fn payload_region(&self) -> Option<(&'a AtomicBuffer<'a, ReadOnly>, usize, usize)> {
+        Some((
+            self.frame.buffer(),
+            self.frame.payload_start()?,
+            self.payload_length(),
+        ))
+    }
+
+    /// A four-byte field of the payload, read where it lies.
+    ///
+    /// [`Fragment::payload_i64_at`]'s reasons and its bounds, for the field a
+    /// message carries as an `int32` — the receiver index a node filters on
+    /// (`AeronUtil.RECEIVER_INDEX_OFFSET`), which the reference reads straight
+    /// out of the received term (`EchoNode.java:157`).
+    pub fn payload_i32_at(&self, offset: usize) -> Option<i32> {
+        self.frame.load_i32_in_payload(offset)
+    }
+
     /// The `BEGIN`/`END`/`EOS`/`REVOKED` bits.
     pub fn flags(&self) -> Option<u8> {
         self.frame.flags()

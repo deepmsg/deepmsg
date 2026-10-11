@@ -250,11 +250,51 @@ impl<'a, Access> Frame<'a, Access> {
         Some(i64::from_le_bytes(bytes))
     }
 
+    /// The window this frame lies in, which is where its payload bytes are.
+    ///
+    /// Handed out as the window rather than as bytes: a slice over it would
+    /// promise the producer on the other side of the mapping has stopped, which
+    /// is what [`Frame::load_i64_in_payload`] refuses to promise too.
+    pub fn buffer(&self) -> &'a AtomicBuffer<'a, Access> {
+        self.buffer
+    }
+
+    /// Where the payload begins in [`Frame::buffer`].
+    pub fn payload_start(&self) -> Option<usize> {
+        self.payload_offset(0)
+    }
+
+    /// The same for a four-byte field, which the reference's messages carry one
+    /// of (`AeronUtil.RECEIVER_INDEX_OFFSET` is an `int32`).
+    ///
+    /// The read is deliberately *not* the head of the eight-byte one: a message
+    /// whose receiver index sits where an eight-byte load would run past the
+    /// payload has four bytes of it inside, and the reference reads those four
+    /// (`EchoNode.java:157`'s `getInt(offset + RECEIVER_INDEX_OFFSET)`).
+    pub fn load_i32_in_payload(&self, offset: usize) -> Option<i32> {
+        if offset.checked_add(4)? > self.payload_length()? {
+            return None;
+        }
+
+        let at = self.payload_offset(offset)?;
+
+        if let Some(value) = self.buffer.load_i32(at) {
+            return Some(value);
+        }
+
+        let mut bytes = [0_u8; 4];
+        self.buffer.copy_out(at, &mut bytes)?;
+
+        Some(i32::from_le_bytes(bytes))
+    }
+
     /// Where `offset` bytes into the payload lies in the term.
     ///
     /// Both sides need it — the write side stores through it and the read side
     /// loads through it — and neither half is about writability, which is why it
-    /// is here rather than beside the stores.
+    /// is here rather than beside the stores. So is the window it lies in
+    /// ([`Frame::buffer`]), which is what a caller handing this frame's bytes to
+    /// something that does not take slices needs.
     fn payload_offset(&self, offset: usize) -> Option<usize> {
         self.offset
             .checked_add(DATA_HEADER_LENGTH)?
@@ -322,6 +362,26 @@ impl Frame<'_, ReadWrite> {
     }
 
     /// Copy payload bytes in.
+    /// Copy bytes into this frame's payload **out of another window**.
+    ///
+    /// [`Frame::write_payload`]'s counterpart for a source that is itself
+    /// mapped memory, and the same reasoning: the copy publishes nothing, and
+    /// the caller's [`Frame::publish`] is what makes these bytes visible.
+    ///
+    /// `offset` is into the payload on **both** sides, which is what a caller
+    /// writing a message in pieces wants: the fragment writer copies the same
+    /// span it is writing.
+    pub fn write_payload_from(
+        &self,
+        offset: usize,
+        src: &AtomicBuffer<'_, ReadOnly>,
+        src_offset: usize,
+        len: usize,
+    ) -> Option<()> {
+        self.buffer
+            .copy_in_from(self.payload_offset(offset)?, src, src_offset, len)
+    }
+
     pub fn write_payload(&self, payload: &[u8]) -> Option<()> {
         self.buffer
             .copy_in(self.offset + DATA_HEADER_LENGTH, payload)

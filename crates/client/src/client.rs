@@ -69,6 +69,9 @@ use deepmsg_cnc::command::{
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
     encode_add_static_counter, encode_client_close, encode_reject_image,
 };
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
+use deepmsg_core::logbuffer::append::Appended;
+
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver};
@@ -499,6 +502,112 @@ struct Pending {
     correlation_id: i64,
     deadline: Instant,
     outcome: Option<Result<Ready, CommandError>>,
+}
+
+/// A publication this client owns, lent to a poll handler for one call.
+///
+/// The reference's `ExclusivePublication` is self-sufficient: it holds a
+/// `ReadablePosition` counter into the CnC values region and reads its own
+/// window limit (`ExclusivePublication.java:244`). This build's
+/// [`ExclusivePublication`] holds only the counter's **id**, because the
+/// counter lives in the CnC file the [`Client`] owns — so an offer from
+/// anywhere but the client has no window to offer against. This is the adapter
+/// that puts the two back together for the duration of one poll, and it is
+/// deliberately a borrow and not a handle the caller can keep: the client still
+/// owns the publication, which is what its removal and revocation bookkeeping
+/// assumes (see [`Client::forget_exclusive_publication`]).
+///
+/// It does not retry. A caller with a message to send decides what a
+/// back-pressured offer means for it — a node echoing a message loops, a
+/// forwarder may drop — and every call reads the limit fresh, so a retry
+/// against a window the driver has since opened makes progress rather than
+/// spinning on a stale answer.
+pub struct PublicationWriter<'a> {
+    publication: &'a ExclusivePublication,
+    cnc: &'a CncFile,
+}
+
+impl PublicationWriter<'_> {
+    /// The publication's registration id.
+    #[must_use]
+    pub fn registration_id(&self) -> i64 {
+        self.publication.registration_id()
+    }
+
+    /// Whether the driver says a subscriber is attached.
+    #[must_use]
+    pub fn is_connected(&self) -> Option<bool> {
+        self.publication.is_connected()
+    }
+
+    /// How much room the window has left, in bytes, read fresh from the
+    /// driver's counter.
+    #[must_use]
+    pub fn available_window(&self) -> i64 {
+        self.publication
+            .available_window(self.position_limit())
+            .unwrap_or(0)
+    }
+
+    /// The window's limit, read fresh from the driver's counter — the number
+    /// every offer is judged against.
+    #[must_use]
+    pub fn position_limit(&self) -> i64 {
+        self.cnc
+            .counters()
+            .and_then(|counters| counters.value(self.publication.position_limit_counter_id()))
+            .unwrap_or(0)
+    }
+
+    /// Offer the message a fragment carries, **without copying it out first**.
+    ///
+    /// A message that arrived in several frames is not one fragment, so this is
+    /// for the unfragmented case: the fragment\'s payload is the whole message
+    /// and it goes straight from the term it was read out of into the outgoing
+    /// log, which is the reference\'s one `putBytes`
+    /// (`ExclusivePublication.java:645`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. A fragment that is not a whole message is refused
+    /// rather than forwarded as a piece of one.
+    pub fn offer(&self, fragment: &Fragment<'_>) -> Appended {
+        if !fragment.is_unfragmented() {
+            return Appended::Malformed;
+        }
+
+        let Some((source, offset, length)) = fragment.payload_region() else {
+            return Appended::Malformed;
+        };
+
+        self.publication
+            .offer_region(self.position_limit(), source, offset, length)
+    }
+
+    /// Offer bytes the caller holds, for a message that had to be put back
+    /// together before it could be sent on.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`].
+    pub fn offer_bytes(&self, payload: &[u8]) -> Appended {
+        self.publication.offer(self.position_limit(), payload)
+    }
+
+    /// Offer `length` bytes lying in a window the caller has.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`].
+    pub fn offer_region(
+        &self,
+        source: &AtomicBuffer<'_, ReadOnly>,
+        source_offset: usize,
+        length: usize,
+    ) -> Appended {
+        self.publication
+            .offer_region(self.position_limit(), source, source_offset, length)
+    }
 }
 
 /// A client connected to a running driver.
@@ -2849,6 +2958,76 @@ impl Client {
         };
 
         subscription.poll_fragments(fragment_limit, &mut handler, &mut publish)
+    }
+
+    /// Poll fragments from a subscription, lending the handler the publication
+    /// it must be able to offer into.
+    ///
+    /// The one thing [`Client::offer_exclusive`] cannot do. That takes `&self`
+    /// and this poll takes `&mut self`, so a handler reached through
+    /// [`Client::poll_subscription_fragments`] holds the subscriptions and
+    /// nothing else — and a caller that has to **answer** what it reads, a node
+    /// echoing a message or a proxy forwarding one, would otherwise have to
+    /// copy every message out, wait for the poll to return, and publish it
+    /// afterwards. The reference has no such problem because its
+    /// `Publication` and `Subscription` are objects that borrow no client
+    /// (`EchoNode.java:98-99`); [`PublicationWriter`] is what recovers that for
+    /// the length of one call.
+    ///
+    /// The two resources are disjoint fields of this client and every borrow
+    /// either needs is a **shared** one — an exclusive publication appends
+    /// through `&self` and the counters are read through `&self` — so one
+    /// destructure is the whole of what makes this possible. It is the
+    /// destructure [`Client::poll_subscription_fragments`] already does, with
+    /// the publications named as well.
+    ///
+    /// The reader's position is published **after** the handler returns, which
+    /// is the order a forwarding caller depends on: the offer completes before
+    /// the driver may reuse the term the fragment points into.
+    pub fn poll_subscription_fragments_with_publication<H>(
+        &mut self,
+        subscription_id: i64,
+        fragment_limit: usize,
+        publication_id: i64,
+        mut handler: H,
+    ) -> usize
+    where
+        H: FnMut(&Fragment<'_>, &PublicationWriter<'_>),
+    {
+        let Self {
+            subscriptions,
+            cnc,
+            exclusive_publications,
+            ..
+        } = self;
+
+        let Some(subscription) = subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)
+        else {
+            return 0;
+        };
+
+        let Some(publication) = exclusive_publications
+            .iter()
+            .find(|p| p.registration_id() == publication_id)
+        else {
+            return 0;
+        };
+
+        let writer = PublicationWriter { publication, cnc };
+
+        let mut publish = |counter_id: i32, position: i64| {
+            if let Some(counters) = cnc.counters_writable() {
+                counters.set_value(counter_id, position);
+            }
+        };
+
+        subscription.poll_fragments(
+            fragment_limit,
+            &mut |fragment| handler(fragment, &writer),
+            &mut publish,
+        )
     }
 
     /// Send a command and register it as pending with a deadline.
