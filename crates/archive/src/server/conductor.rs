@@ -5484,9 +5484,9 @@ impl Sessions {
     ///
     /// # Returns
     ///
-    /// What the reference's `extendRecording` **returns**: `Ok` once the
-    /// subscription that does the recording has been asked for, `Err` with the
-    /// refusal's code and message when a gate turned it away. A client's answer
+    /// What the reference's `extendRecording` **returns**: the `Subscription`
+    /// it made — here its registration id — or `Err` with the refusal's code
+    /// and message when a gate turned it away. A client's answer
     /// has already gone out either way — the subscription's registration id
     /// travels from [`Self::claim_pending_starts`] when the driver gives it —
     /// so this is only ever read by a **replication session**, which in the
@@ -5497,7 +5497,7 @@ impl Sessions {
         catalog: &Catalog,
         request: &ExtendRecordingRequest,
         now_ms: i64,
-    ) -> Result<(), (i64, String)> {
+    ) -> Result<i64, (i64, String)> {
         let ExtendRecordingRequest {
             session_id,
             correlation_id,
@@ -5554,7 +5554,7 @@ impl Sessions {
                     },
                 });
 
-                Ok(())
+                Ok(add.registration_id())
             }
             Err(error) => {
                 let message = format!("subscription could not be added: {error}");
@@ -5573,7 +5573,7 @@ impl Sessions {
     /// answers a `Subscription` to a session that is still in flight, and a
     /// session that stopped between asking and being answered has nobody left
     /// to tell.
-    fn record_extend_outcome(&mut self, replication_id: i64, outcome: Result<(), (i64, String)>) {
+    fn record_extend_outcome(&mut self, replication_id: i64, outcome: Result<i64, (i64, String)>) {
         let Some(session) = self
             .replication_sessions
             .iter_mut()

@@ -53,6 +53,7 @@ use crate::client::archive::{Archive, Handlers};
 use crate::client::async_connect::{AsyncConnect, NoCredentials, Polled};
 use crate::client::context::ArchiveContext;
 use crate::client::descriptor_poller::RecordingDescriptor;
+use crate::client::proxy::ReplayParams;
 use crate::mark::NULL_VALUE;
 use crate::server::conductor::{
     GENERIC, NULL_POSITION, REPLICATION_CONNECTION_FAILURE, UNKNOWN_RECORDING,
@@ -68,6 +69,17 @@ const SESSION_ID_KEY: &str = "session-id";
 const CONTROL_MODE_KEY: &str = "control-mode";
 /// `ChannelUri.hasControlModeResponse`'s value (`ChannelUri.java:653-656`).
 const CONTROL_MODE_RESPONSE: &str = "response";
+/// `CommonContext.ENDPOINT_PARAM_NAME` (`CommonContext.java:239`).
+const ENDPOINT_KEY: &str = "endpoint";
+/// `CommonContext.LINGER_PARAM_NAME` (`CommonContext.java:243`).
+const LINGER_KEY: &str = "linger";
+/// `CommonContext.EOS_PARAM_NAME` (`CommonContext.java:231`).
+const EOS_KEY: &str = "eos";
+/// `CommonContext.RESPONSE_CORRELATION_ID_PARAM_NAME`.
+const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
+/// `AeronArchive.NULL_LENGTH` (`AeronArchive.java:106`), which is `NULL_VALUE`:
+/// a replay with no length follows the source (`:115-117`).
+const NULL_LENGTH: i64 = NULL_VALUE;
 
 /// The state a session is in (`ReplicationSession.java:61-75`), in the order it
 /// walks them.
@@ -248,12 +260,33 @@ pub struct ReplicationSession {
     /// Messages the destination's client is owed — see [`ReplicationNotice`].
     notices: Vec<ReplicationNotice>,
 
-    /// Whether the extend has been handed to the conductor already.
+    /// The registration id of the destination's recording subscription, once
+    /// [`State::Extend`] has made one — the reference's `recordingSubscription`,
+    /// of which `REPLAY` reads the **resolved endpoint** and
+    /// `GET_ARCHIVE_PROXY` the registration id.
+    recording_subscription: Option<i64>,
+    /// `fileIoMaxLength` (`:103`): how big a block one turn may read, which the
+    /// request carries and `REPLAY` passes on to the source.
+    file_io_max_length: i32,
+    /// `replayToken` (`:111`): the token a replay over a **response channel**
+    /// needs, or `NULL_VALUE`. Nothing in this build asks for one — see
+    /// [`State::ReplayToken`].
+    replay_token: i64,
+    /// `srcReplaySessionId` (`:78`): the session the **source's replay** runs
+    /// under, which is what `AWAIT_IMAGE` looks for at the destination.
+    src_replay_session_id: i32,
+    /// The clock this turn is running on, which [`Self::go_to`] reads — the
+    /// reference's `epochClock`, which its own `state` asks for the time
+    /// (`:975-983`).
+    now_ms: i64,
+    /// Whether the extend has been handed to the conductor already, which is
+    /// what keeps [`State::Extend`] from asking again every turn.
     extend_asked: bool,
+
     /// What the conductor answered it with, once it has run — the reference's
     /// return value from `conductor.extendRecording`, delivered a turn late
     /// because that is where this build's conductor is.
-    extend_answer: Option<Result<(), (i64, String)>>,
+    extend_answer: Option<Result<i64, (i64, String)>>,
 
     /// `activeCorrelationId` (`:77`): the request whose answer a state is
     /// waiting for, or `NULL_VALUE` when nothing is in flight.
@@ -331,6 +364,9 @@ impl ReplicationSession {
         destination: Option<Recording>,
     ) -> Self {
         let action_timeout_ms = context.message_timeout_ns / 1_000_000;
+        // Read out before the request moves into the session: `REPLAY` passes
+        // it on to the source (`:712`).
+        let file_io_max_length = request.file_io_max_length;
         let (replay_position, replay_stream_id, is_destination_recording_empty) = match destination
         {
             Some(recording) => (
@@ -355,6 +391,11 @@ impl ReplicationSession {
             async_connect: None,
             src_archive: None,
             notices: Vec::new(),
+            recording_subscription: None,
+            file_io_max_length,
+            replay_token: NULL_VALUE,
+            src_replay_session_id: 0,
+            now_ms: 0,
             extend_asked: false,
             extend_answer: None,
             active_correlation_id: NULL_VALUE,
@@ -405,7 +446,7 @@ impl ReplicationSession {
     /// [`Sessions::drive_replication_sessions`](super::conductor::Sessions) is
     /// where it is paid.
     pub fn abort(&mut self, _reason: &str) {
-        self.state = State::Done;
+        self.go_to(State::Done);
     }
 
     /// The session that asked for this, which every answer goes to
@@ -429,6 +470,8 @@ impl ReplicationSession {
         catalog: &mut Catalog,
         now_ms: i64,
     ) -> ReplicationProgress {
+        self.now_ms = now_ms;
+
         if self.state == State::Done {
             return ReplicationProgress::Done;
         }
@@ -442,9 +485,13 @@ impl ReplicationSession {
             State::ReplicateDescriptor => self.replicate_descriptor(client, catalog, now_ms),
             State::SrcRecordingPosition => self.src_recording_position(client, now_ms),
             State::Extend => self.extend(),
-            // The other ten, one commit at a time. A state that returns a
-            // plausible-looking step here would be worse than one that does
-            // nothing, because the next reader could not tell them apart.
+            State::ReplayToken => self.replay_token(),
+            State::GetArchiveProxy => self.get_archive_proxy(),
+            State::Replay => self.replay(client, now_ms),
+            // The live-merge pair and `AWAIT_IMAGE` are the next commits'. A
+            // state that returned a plausible-looking step here would be worse
+            // than one that does nothing: the next reader could not tell them
+            // apart.
             _ => Ok(()),
         };
 
@@ -595,7 +642,10 @@ impl ReplicationSession {
     fn extend(&mut self) -> Result<(), String> {
         if let Some(answer) = self.extend_answer.take() {
             match answer {
-                Ok(()) => self.state = State::ReplayToken,
+                Ok(registration_id) => {
+                    self.recording_subscription = Some(registration_id);
+                    self.go_to(State::ReplayToken);
+                }
                 Err(_) => self.state = State::Done,
             }
 
@@ -645,7 +695,7 @@ impl ReplicationSession {
 
     /// The conductor's answer to the extend, delivered a turn late
     /// (`ReplicationSession.extend`'s return value, `:549-568`).
-    pub fn on_extend_answered(&mut self, outcome: Result<(), (i64, String)>) {
+    pub fn on_extend_answered(&mut self, outcome: Result<i64, (i64, String)>) {
         self.extend_answer = Some(outcome);
     }
 
@@ -728,7 +778,7 @@ impl ReplicationSession {
             return Err("cannot live merge without active source recording".to_owned());
         }
 
-        self.state = State::Extend;
+        self.go_to(State::Extend);
 
         Ok(())
     }
@@ -756,8 +806,29 @@ impl ReplicationSession {
             _ => descriptor.session_id,
         };
 
+        // `:324-330`. A source that reads less per turn than the recording's
+        // MTU could not keep up with it, and the reference refuses the
+        // replication rather than replaying it badly — "than than" and all.
+        if self.file_io_max_length != NULL_VALUE as i32
+            && self.file_io_max_length < descriptor.mtu_length
+        {
+            self.fail(
+                GENERIC,
+                format!(
+                    "Replication fileIoMaxLength ({}) is less than than the recording mtuLength ({})",
+                    self.file_io_max_length, descriptor.mtu_length
+                ),
+            );
+
+            return;
+        }
+
         if let Some(destination) = self.destination_row(descriptor, catalog) {
             if self.request.dst_recording_id == NULL_VALUE {
+                // `:336`: a copy into a **new** row starts where the source's
+                // recording does.
+                self.replay_position = descriptor.start_position;
+
                 match catalog.add_recording(&destination) {
                     Ok(recording_id) => {
                         self.dst_recording_id = recording_id;
@@ -780,6 +851,9 @@ impl ReplicationSession {
                     }
                 }
             } else if self.is_destination_recording_empty {
+                // `:360`: and so does one into a row that exists but is empty.
+                self.replay_position = descriptor.start_position;
+
                 if let Err(error) = catalog.replace_recording(&destination) {
                     self.fail(
                         GENERIC,
@@ -808,7 +882,7 @@ impl ReplicationSession {
                 return;
             }
 
-            self.state = State::SrcRecordingPosition;
+            self.go_to(State::SrcRecordingPosition);
             return;
         }
 
@@ -829,12 +903,12 @@ impl ReplicationSession {
                 position: descriptor.stop_position,
                 signal: RecordingSignal::SYNC,
             });
-            self.state = State::Done;
+            self.go_to(State::Done);
 
             return;
         }
 
-        self.state = State::Extend;
+        self.go_to(State::Extend);
     }
 
     /// The row [`Self::on_recording_descriptor`] writes: the source's facts
@@ -889,6 +963,31 @@ impl ReplicationSession {
         self.active_correlation_id = correlation_id;
     }
 
+    /// `ReplicationSession.state` (`:975-983`): the state, **and the two writes
+    /// that go with it**.
+    ///
+    /// Not a plain assignment, and both of the others are load-bearing:
+    ///
+    /// * `activeCorrelationId` is cleared, because the correlation id belonged
+    ///   to the state that just ended. A state entered still holding one reads
+    ///   **an answer that is not its own** — `hasResponse` compares against it
+    ///   (`:912`), and so does every `NULL_VALUE == activeCorrelationId` guard
+    ///   that decides whether to send a request at all;
+    /// * `timeOfLastActionMs` is set to now, so that the state's deadline is
+    ///   measured from its own start rather than from the previous state's
+    ///   last action.
+    ///
+    /// **Measured, and this is what it cost**: with the two missing, `REPLAY`
+    /// entered holding `SRC_RECORDING_POSITION`'s correlation id, took the
+    /// "an answer is already in flight" branch, and waited out its deadline for
+    /// a reply to a request it had never sent. Nothing upstream showed it —
+    /// `EXTEND`, `REPLAY_TOKEN` and `GET_ARCHIVE_PROXY` do not read the field.
+    fn go_to(&mut self, state: State) {
+        self.state = state;
+        self.active_correlation_id = NULL_VALUE;
+        self.time_of_last_action_ms = self.now_ms;
+    }
+
     /// A state that has not heard back and whose deadline has passed answers its
     /// own `TimeoutException` — or keeps waiting (`:478-481`).
     fn expire_or_hold(&self, now_ms: i64, reason: &str) -> Result<(), String> {
@@ -901,6 +1000,225 @@ impl ReplicationSession {
         } else {
             Ok(())
         }
+    }
+
+    /// `ReplicationSession.replayToken` (`:569-605`).
+    ///
+    /// **A pass-through for every channel this build serves.** The state exists
+    /// to ask the source for a token when the copy runs over a **response
+    /// channel** (`:573-575` is the whole of its guard), and the token is what
+    /// `GET_ARCHIVE_PROXY` turns into a second publication for an image that is
+    /// not this session's.
+    ///
+    /// No criterion in this slice reaches a response-channel replication (plan
+    /// §3.2) and the request behind it — `requestReplayToken`, template 105 — is
+    /// not built, so a session that did take that branch **ends loudly** rather
+    /// than walking on to build a publication out of a token it never asked
+    /// for. A silent pass-through there would be a session that looks like it
+    /// works and copies nothing.
+    fn replay_token(&mut self) -> Result<(), String> {
+        if self.replay_token != NULL_VALUE || !self.replication_channel_is_response() {
+            self.go_to(State::GetArchiveProxy);
+
+            return Ok(());
+        }
+
+        Err(
+            "a replication over a response channel needs a replay token, which \
+             this build does not ask for"
+                .to_owned(),
+        )
+    }
+
+    /// `ReplicationSession.getArchiveProxy` (`:606-665`).
+    ///
+    /// The reference's **first branch is this whole state** for a session that
+    /// has no token (`:610-614`), and that is every session this build drives:
+    /// [`State::ReplayToken`] is the only thing that sets one and it refuses to
+    /// ask. The rest — a second publication on the source's control channel,
+    /// waited for until it is connected and has a window — is therefore not
+    /// built, and a session that somehow reached it says so rather than
+    /// producing a proxy that is not there.
+    fn get_archive_proxy(&mut self) -> Result<(), String> {
+        if self.replay_token != NULL_VALUE {
+            return Err("a replay token needs a second publication, which this \
+                        build does not make"
+                .to_owned());
+        }
+
+        self.go_to(State::Replay);
+
+        Ok(())
+    }
+
+    /// `ReplicationSession.replay` (`:666-752`): ask the **source** to replay
+    /// the recording onto the destination.
+    ///
+    /// Three things are the copy's rather than the replay's, and all three go
+    /// onto the channel the source is asked for:
+    ///
+    /// * the destination subscription's **resolved endpoint**, when the copy's
+    ///   channel named a wildcard port — the source cannot send to `:0`;
+    /// * `linger=0` and `eos=false` for a live destination, so the replay
+    ///   publication does not go away when this session does;
+    /// * and either the destination subscription's registration id, for a
+    ///   response channel, or `session-id=<replaySessionId>` — which is what
+    ///   makes the destination's subscription and the source's replay
+    ///   publication the same stream.
+    ///
+    /// The request carries where to start and how much: `replayPosition`, and
+    /// `dstStopPosition - replayPosition` when the request named a stop —
+    /// otherwise `NULL_LENGTH`, which follows the source (`AeronArchive.java:106-117`).
+    ///
+    /// The answer is the **source's** replay session id, which is what
+    /// `AWAIT_IMAGE` looks for at the destination. It is read a turn at a time,
+    /// like every other answer this session waits for.
+    fn replay(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
+        if self.src_archive.is_none() {
+            return Err("no source archive: the connect did not finish".to_owned());
+        }
+
+        if self.active_correlation_id == NULL_VALUE {
+            let Some(registration_id) = self.recording_subscription else {
+                return Err("no destination subscription: EXTEND did not finish".to_owned());
+            };
+
+            // The reference's `recordingSubscription.resolvedEndpoint()`
+            // (`:668-681`): "not yet" is a wait, not a failure — a subscription
+            // that has just been added has no port until the driver says so.
+            let resolved = client.counters_reader().and_then(|counters| {
+                client
+                    .subscription(registration_id)?
+                    .resolved_endpoint(&counters)
+            });
+
+            let Some(resolved) = resolved else {
+                let channel = client
+                    .subscription(registration_id)
+                    .map_or_else(String::new, |subscription| {
+                        subscription.channel().to_owned()
+                    });
+
+                return self.expire_or_hold(
+                    now_ms,
+                    &format!("failed to resolve subscription endpoint: channel={channel}"),
+                );
+            };
+
+            let channel = self.replay_channel(registration_id, &resolved)?;
+
+            let params = ReplayParams {
+                position: self.replay_position,
+                length: if self.dst_stop_position == NULL_POSITION {
+                    NULL_LENGTH
+                } else {
+                    self.dst_stop_position.saturating_sub(self.replay_position)
+                },
+                file_io_max_length: self.file_io_max_length,
+                replay_token: self.replay_token,
+                ..ReplayParams::default()
+            };
+
+            let correlation_id = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Ok(());
+                };
+
+                archive
+                    .next_correlation_id(client)
+                    .map_err(|error| error.to_string())?
+            };
+
+            let offered = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Ok(());
+                };
+
+                archive
+                    .proxy_mut()
+                    .replay(
+                        client,
+                        correlation_id,
+                        self.request.src_recording_id,
+                        &channel,
+                        self.replay_stream_id,
+                        &params,
+                    )
+                    .is_ok()
+            };
+
+            if !offered {
+                return self.expire_or_hold(now_ms, "failed to send replay request");
+            }
+
+            self.track_action(correlation_id, now_ms);
+
+            return Ok(());
+        }
+
+        let answer = {
+            let Some(archive) = self.src_archive.as_mut() else {
+                return Ok(());
+            };
+
+            archive
+                .poll_for_response(client, self.active_correlation_id)
+                .map_err(|error| error.to_string())?
+        };
+
+        let Some(session_id) = answer else {
+            return self.expire_or_hold(
+                now_ms,
+                &format!(
+                    "failed get acknowledgement of replay request to: {}",
+                    self.replication_channel
+                ),
+            );
+        };
+
+        self.src_replay_session_id = i32::try_from(session_id).unwrap_or(0);
+        self.go_to(State::AwaitImage);
+
+        Ok(())
+    }
+
+    /// What `REPLAY` asks the source for (`:683-703`).
+    fn replay_channel(&self, registration_id: i64, resolved: &str) -> Result<String, String> {
+        let mut uri = ChannelUri::parse(&self.replication_channel)
+            .map_err(|error| format!("{} is not a channel: {error}", self.replication_channel))?;
+
+        // `replaceEndpointWildcardPort` (`ChannelUri.java:613-637`). Its two
+        // refusals are out of reach from here — the caller has already checked
+        // there is an endpoint, and a resolved one is bound — and the branch
+        // that matters is the wildcard port, which a source cannot send to.
+        if let Some(endpoint) = uri.get(ENDPOINT_KEY) {
+            if let (true, Some((_, port))) = (endpoint.ends_with(":0"), resolved.rsplit_once(':')) {
+                uri.put(
+                    ENDPOINT_KEY,
+                    format!("{}:{port}", &endpoint[..endpoint.len() - 2]),
+                );
+            }
+        }
+
+        if self.live_destination.is_some() {
+            uri.put(LINGER_KEY, "0");
+            uri.put(EOS_KEY, "false");
+        }
+
+        if self.replication_channel_is_response() {
+            uri.put(RESPONSE_CORRELATION_ID_KEY, registration_id.to_string());
+        } else {
+            uri.put(SESSION_ID_KEY, self.replay_session_id.to_string());
+        }
+
+        Ok(uri.build())
+    }
+
+    /// `ChannelUri.hasControlModeResponse()` for the copy's own channel, which
+    /// is the question `REPLAY_TOKEN`, `EXTEND` and `REPLAY` each ask it.
+    fn replication_channel_is_response(&self) -> bool {
+        ChannelUri::parse(&self.replication_channel)
+            .is_ok_and(|uri| uri.get(CONTROL_MODE_KEY) == Some(CONTROL_MODE_RESPONSE))
     }
 
     /// `ReplicationSession.connect` (`:401-443`): make the connect, then poll it
@@ -979,7 +1297,7 @@ impl ReplicationSession {
                     Handlers::default(),
                 ));
                 self.async_connect = None;
-                self.state = State::ReplicateDescriptor;
+                self.go_to(State::ReplicateDescriptor);
 
                 Ok(())
             }
@@ -1056,7 +1374,7 @@ impl ReplicationSession {
     /// `doWork`'s outer `catch` passes the exception's own words (`:275-277`)
     /// and `connect`'s prefixes `"Replication connection failed="` (`:441`).
     fn fail(&mut self, code: i64, message: String) {
-        self.state = State::Done;
+        self.go_to(State::Done);
         self.notices.push(ReplicationNotice::Error {
             correlation_id: self.replication_id.unwrap_or(NULL_VALUE),
             code,

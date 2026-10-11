@@ -1468,11 +1468,20 @@ fn a_publication_can_be_added_recorded_and_replayed() {
 /// The channel a replication's copy runs over, which the request has to name:
 /// the archive's own `aeron.archive.replication.channel` is **not** set by
 /// [`archive::PROPERTIES`], and a request that names none is refused for it.
-const REPLICATION_CHANNEL: &str = "aeron:ipc?alias=client-api-replicated";
-/// The one parameter of [`REPLICATION_CHANNEL`] a **stripped** channel keeps,
-/// which is what makes it findable in a listing (`stripped_channel_builder`
-/// drops `term-length`, `mtu` and `sparse` and keeps the rest).
-const REPLICATION_ALIAS: &str = "alias=client-api-replicated";
+/// The channel the copy itself runs over, and it is **UDP** for the reason the
+/// reference's own fixture is (`aeron_archive_test.cpp:449`:
+/// `aeron:udp?endpoint=localhost:8012`): `REPLAY` puts the destination
+/// subscription's **resolved endpoint** on the channel it asks the source to
+/// replay onto (`ReplicationSession.java:668-690`), and an IPC subscription has
+/// no endpoint to resolve — `resolvedEndpoint()` answers `null` for one
+/// (`Subscription.java:582-590` is a counter lookup, and `aeron:ipc` has no
+/// address counter). A copy over IPC therefore stalls at `REPLAY` in the
+/// reference too, which is why no reference test does it.
+///
+/// A wildcard port rather than a fixed one: the destination binds an ephemeral
+/// port, exactly as its own replication channel does
+/// (`TestContexts.LOCALHOST_REPLICATION_CHANNEL`).
+const REPLICATION_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
 
 /// **The four replication round trips.**
 ///
@@ -1908,6 +1917,19 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
             .is_ok_and(|stop| stop >= 0)
     });
 
+    // **The publisher goes before the copy is asked for, and it is not
+    // tidiness.** The destination's subscription will name the **source's
+    // session** on the source's stream — that is what `EXTEND` writes onto its
+    // channel — and an IPC subscription matches on the stream and the session
+    // alone. A publisher still open on that stream therefore feeds the
+    // destination recording by itself, and the bytes the last assertion of this
+    // test waits for would not be the replay's. **Measured**: with it open, that
+    // assertion passed with `REPLAY` disabled — the same shape of mistake as the
+    // wait that §9.5 records, and found the same way.
+    client
+        .remove_publication(publication, archive::COMMAND_TIMEOUT)
+        .expect("the source publication is given back");
+
     let source = the_only_recording(&mut archive, &mut client).expect("still one row");
 
     // **The replicate.** Its source is this archive's own control channel, on
@@ -2010,7 +2032,9 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     // be listed for a turn or two after the test stopped it, and a loop that
     // broke on *any* of them would go on to fail on a real subscription that had
     // not arrived yet. Measured: that is what this criterion did before it was
-    // written this way — one run in three.
+    // written this way — one run in three. What names it is the **session** the
+    // source's replay will arrive under, which no other subscription on this
+    // archive carries.
     let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
 
     until(
@@ -2030,15 +2054,21 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
                 },
             );
 
-            extended
-                .iter()
-                .any(|subscription| subscription.stripped_channel.contains(REPLICATION_ALIAS))
+            extended.iter().any(|subscription| {
+                subscription
+                    .stripped_channel
+                    .contains(&format!("session-id={}", source.session_id))
+            })
         },
     );
 
     let extension = extended
         .iter()
-        .find(|subscription| subscription.stripped_channel.contains(REPLICATION_ALIAS))
+        .find(|subscription| {
+            subscription
+                .stripped_channel
+                .contains(&format!("session-id={}", source.session_id))
+        })
         .expect("the destination holds a subscription on the replication channel");
 
     assert_eq!(
@@ -2058,6 +2088,33 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
         "and under the session the **source's replay** will arrive as — the \
          descriptor's session, not this session's own: {}",
         extension.stripped_channel
+    );
+
+    // **And the copy happens.** `REPLAY` (`:666-752`) asks the source to replay
+    // the recording onto the destination's subscription, and the whole of that
+    // request is unobservable on its own — what proves it is that bytes arrive:
+    // the source's replay publication joins the destination's recording
+    // subscription, the recorder writes what it reads, and the destination
+    // recording's position moves off the start the descriptor gave it.
+    //
+    // Nothing between here and there is the session's doing — `AWAIT_IMAGE` and
+    // `REPLICATE` are about the session *noticing*, and they are the next
+    // commits' — so this is the replay request and the archive's own machinery
+    // behind it.
+    let copy_start = copied.start_position;
+    let mut copy_position = NULL_POSITION;
+
+    until(&mut client, "the copy's first bytes", |client| {
+        copy_position = archive
+            .get_recording_position(client, copied.recording_id)
+            .unwrap_or(NULL_POSITION);
+
+        copy_position > copy_start
+    });
+
+    assert!(
+        copy_position > copy_start,
+        "the copy has data in it: position {copy_position} against a start of {copy_start}"
     );
 
     archive.close(&client);
