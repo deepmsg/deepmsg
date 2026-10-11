@@ -42,6 +42,14 @@ name = "java_archive_id"
 path = "interop/java_archive_id.rs"
 required-features = ["interop"]
 
+# A replication whose **source** is the reference's own archive: the pairing
+# every other criterion in this slice leaves out, since they are our build on
+# both ends.
+[[test]]
+name = "replication_reference_archive"
+path = "interop/replication_reference_archive.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]
