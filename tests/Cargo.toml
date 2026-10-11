@@ -25,6 +25,10 @@ name = "basic_roundtrip"
 path = "integration/basic_roundtrip.rs"
 
 [[test]]
+name = "forwarding_poll"
+path = "integration/forwarding_poll.rs"
+
+[[test]]
 name = "termination_handshake"
 path = "integration/termination_handshake.rs"
 

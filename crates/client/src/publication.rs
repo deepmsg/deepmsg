@@ -25,7 +25,8 @@
 use std::io;
 use std::path::Path;
 
-use deepmsg_core::buffer::{AtomicBuffer, ReadWrite};
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
+use deepmsg_core::logbuffer::append::PayloadRegion;
 use deepmsg_core::logbuffer::append::{Appended, Appender};
 use deepmsg_core::logbuffer::frame::Frame;
 use deepmsg_core::logbuffer::position::Position;
@@ -554,6 +555,56 @@ impl ExclusivePublication {
             // As in `try_claim`: both "try again" answers say this publication's
             // cached term is not the log's current one, and re-seeding is how the
             // cache hears the log's answer.
+            Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
+            Appended::Ok { position, .. } => self.advance_to(position),
+            _ => {}
+        }
+
+        outcome
+    }
+
+    /// The same offer, with the message lying in another window rather than in
+    /// a slice this caller holds.
+    ///
+    /// For a producer whose bytes are already somewhere in shared memory — a
+    /// node echoing what it read off a subscription, a proxy forwarding it —
+    /// which is what the reference's `offer(buffer, offset, length)` is for:
+    /// one `putBytes` from the received term into the outgoing one, with no
+    /// application buffer in between (`ExclusivePublication.java:645`).
+    ///
+    /// The window's own lifetime is not this publication's business: it is
+    /// borrowed for the call and the bytes are copied out of it before it ends,
+    /// which is why a caller may hand over a window onto a term that another
+    /// process is still writing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`], and [`ExclusivePublication::offer`] for what each one
+    /// means — this is the same append.
+    pub fn offer_region(
+        &self,
+        position_limit: i64,
+        source: &AtomicBuffer<'_, ReadOnly>,
+        source_offset: usize,
+        length: usize,
+    ) -> Appended {
+        let Some(appender) = self.appender() else {
+            return Appended::Malformed;
+        };
+
+        let outcome = appender.append_exclusive_region(
+            self.session_id,
+            self.stream_id,
+            position_limit,
+            self.term_id.get(),
+            self.term_offset.get(),
+            PayloadRegion::new(source, source_offset, length),
+        );
+
+        match outcome {
+            // As in `offer`: both "try again" answers say this publication's
+            // cached term is not the log's current one, and re-seeding is how
+            // the cache hears the log's answer.
             Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
             Appended::Ok { position, .. } => self.advance_to(position),
             _ => {}

@@ -24,7 +24,7 @@
 //! the driver's business (P1), and the counter is not part of the log buffer.
 //! The limit is a parameter, so this module stays drivable from a test.
 
-use crate::buffer::{AtomicBuffer, ReadWrite};
+use crate::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 
 use super::descriptor;
 use super::frame::{
@@ -102,6 +102,88 @@ pub struct Appender<'a> {
     /// build has the field.
     #[cfg(test)]
     produce_race: Option<(i64, bool)>,
+}
+
+/// Where the bytes an append writes come from.
+///
+/// Two doors, one body: a caller with the bytes in hand passes a slice, and a
+/// caller whose bytes are already in another mapped window — a term being
+/// echoed, a frame being repaired — passes that. Everything between the two is
+/// the same, deliberately: the entry's decisions (is this producer's term still
+/// the log's? has the window opened? does the message fit?) are the
+/// reference's, and two copies of them would be two answers to the same
+/// question.
+///
+/// A slice and a window are not interchangeable, and that is the point: a
+/// `&[u8]` over a mapped region would promise that the driver has stopped
+/// writing it.
+enum PayloadSource<'a, 'b> {
+    Slice(&'a [u8]),
+    Region(PayloadRegion<'a, 'b>),
+}
+
+/// A message that lies in a window rather than in a slice: the window, and where
+/// in it the message starts and ends.
+///
+/// The parameter of the append that copies out of shared memory, and a type of
+/// its own because the three numbers belong together — a window and an offset
+/// into it are one source, and passing them as three arguments invites a caller
+/// to pair one window with another's offset.
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadRegion<'a, 'b> {
+    buffer: &'a AtomicBuffer<'b, ReadOnly>,
+    offset: usize,
+    length: usize,
+}
+
+impl<'a, 'b> PayloadRegion<'a, 'b> {
+    /// A region of `length` bytes starting `offset` into `buffer`.
+    #[must_use]
+    pub const fn new(buffer: &'a AtomicBuffer<'b, ReadOnly>, offset: usize, length: usize) -> Self {
+        Self {
+            buffer,
+            offset,
+            length,
+        }
+    }
+
+    /// How many bytes the message is.
+    #[must_use]
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+}
+
+impl PayloadSource<'_, '_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Slice(bytes) => bytes.len(),
+            Self::Region(region) => region.length,
+        }
+    }
+
+    /// Copy `len` bytes, `offset` into the source, to the **front of the
+    /// frame's payload**.
+    ///
+    /// The two offsets are different numbers and this is the one place that
+    /// matters: `offset` is how far into the *message* the piece starts, which
+    /// a fragmented write advances frame by frame, while every frame carries
+    /// its piece from its own payload start. Copying the second frame at the
+    /// message's offset rather than at zero writes it past its own end, which
+    /// is how this was written first — and what the test beside it caught.
+    ///
+    /// `None` when the source has no such bytes, or when the frame's payload
+    /// has no room for them.
+    fn copy_into(&self, frame: &Frame<'_, ReadWrite>, offset: usize, len: usize) -> Option<()> {
+        let end = offset.checked_add(len)?;
+
+        match self {
+            Self::Slice(bytes) => frame.write_payload(bytes.get(offset..end)?),
+            Self::Region(region) => {
+                frame.write_payload_from(0, region.buffer, region.offset.checked_add(offset)?, len)
+            }
+        }
+    }
 }
 
 impl<'a> Appender<'a> {
@@ -388,7 +470,7 @@ impl<'a> Appender<'a> {
                 stream_id,
                 claimed_offset,
                 claimed_term_id,
-                payload,
+                &PayloadSource::Slice(payload),
             )
         } else {
             let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
@@ -401,7 +483,7 @@ impl<'a> Appender<'a> {
                 claimed_offset,
                 claimed_term_id,
                 frame_length,
-                payload,
+                &PayloadSource::Slice(payload),
             )
         };
 
@@ -429,14 +511,14 @@ impl<'a> Appender<'a> {
         stream_id: i32,
         term_offset: i32,
         term_id: i32,
-        payload: &[u8],
+        source: &PayloadSource<'_, '_>,
     ) -> Option<()> {
         let mut flags = FLAG_BEGIN;
         let mut offset = term_offset;
         let mut written = 0;
 
-        while written < payload.len() {
-            let remaining = payload.len() - written;
+        while written < source.len() {
+            let remaining = source.len() - written;
             let bytes = remaining.min(self.max_payload_length);
             let frame_length = i32::try_from(bytes + DATA_HEADER_LENGTH).ok()?;
 
@@ -456,7 +538,7 @@ impl<'a> Appender<'a> {
                 stream_id,
                 term_id,
             )?;
-            frame.write_payload(&payload[written..written + bytes])?;
+            source.copy_into(&frame, written, bytes)?;
             frame.publish(frame_length)?;
 
             flags = 0;
@@ -476,7 +558,7 @@ impl<'a> Appender<'a> {
         term_offset: i32,
         term_id: i32,
         frame_length: i32,
-        payload: &[u8],
+        source: &PayloadSource<'_, '_>,
     ) -> Option<()> {
         let frame = Frame::new(&self.term, term_offset as usize);
 
@@ -489,7 +571,7 @@ impl<'a> Appender<'a> {
             stream_id,
             term_id,
         )?;
-        frame.write_payload(payload)?;
+        source.copy_into(&frame, 0, source.len())?;
         frame.publish(frame_length)?;
 
         Some(())
@@ -586,6 +668,59 @@ impl<'a> Appender<'a> {
         term_offset: i32,
         payload: &[u8],
     ) -> Appended {
+        self.append_exclusive_source(
+            session_id,
+            stream_id,
+            position_limit,
+            term_id,
+            term_offset,
+            &PayloadSource::Slice(payload),
+        )
+    }
+
+    /// The same append, with the message lying in another window rather than in
+    /// a slice this caller holds.
+    ///
+    /// For a caller whose bytes are already in a term — a node echoing what it
+    /// read, a proxy forwarding it — which is the case the reference's
+    /// `offer(DirectBuffer, offset, length)` is for: one `putBytes` from the
+    /// received term into the outgoing one, with no application buffer in
+    /// between (`ExclusivePublication.java:645`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`]. Every one of them, and in the same order, as
+    /// [`Appender::append_exclusive`] — this is the same body.
+    pub fn append_exclusive_region(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        region: PayloadRegion<'_, '_>,
+    ) -> Appended {
+        self.append_exclusive_source(
+            session_id,
+            stream_id,
+            position_limit,
+            term_id,
+            term_offset,
+            &PayloadSource::Region(region),
+        )
+    }
+
+    /// The one body both doors go through.
+    #[allow(clippy::too_many_arguments)]
+    fn append_exclusive_source(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        source: &PayloadSource<'_, '_>,
+    ) -> Appended {
         if !self.term_is_current(term_id) {
             return Appended::MidRotation;
         }
@@ -601,7 +736,7 @@ impl<'a> Appender<'a> {
         );
 
         if position.raw() >= position_limit {
-            return self.back_pressure(position, payload.len());
+            return self.back_pressure(position, source.len());
         }
 
         // The bound, then the one-frame-or-several choice (`:565-604`). The
@@ -609,18 +744,18 @@ impl<'a> Appender<'a> {
         // payload small enough for one frame cannot exceed a message maximum
         // that is never below one frame; checking it for both is the same
         // answer with one line fewer, and is what [`Appender::append`] does.
-        if payload.len() > self.max_message_length {
+        if source.len() > self.max_message_length {
             return Appended::MessageTooLarge;
         }
 
-        let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+        let Some(frame_length) = i32::try_from(source.len() + DATA_HEADER_LENGTH).ok() else {
             return Appended::Malformed;
         };
-        let fragmented = payload.len() > self.max_payload_length;
+        let fragmented = source.len() > self.max_payload_length;
 
         #[allow(clippy::cast_possible_wrap)] // bounded by the message maximum
         let framed_length = if fragmented {
-            descriptor::compute_fragmented_length(payload.len(), self.max_payload_length) as i32
+            descriptor::compute_fragmented_length(source.len(), self.max_payload_length) as i32
         } else {
             position::align_up(frame_length, descriptor::FRAME_ALIGNMENT)
         };
@@ -654,7 +789,7 @@ impl<'a> Appender<'a> {
         }
 
         let written = if fragmented {
-            self.write_fragmented(session_id, stream_id, term_offset, term_id, payload)
+            self.write_fragmented(session_id, stream_id, term_offset, term_id, source)
         } else {
             self.write_frame(
                 session_id,
@@ -662,7 +797,7 @@ impl<'a> Appender<'a> {
                 term_offset,
                 term_id,
                 frame_length,
-                payload,
+                source,
             )
         };
 
@@ -1888,6 +2023,72 @@ mod tests {
         assert_eq!(payload.len() + DATA_HEADER_LENGTH, length as usize);
         assert_eq!(TYPE_DATA, type_id);
         assert_eq!(payload.to_vec(), read_back);
+    }
+
+    /// The region door is the slice door: same bytes in the term, same answer,
+    /// and the same for a message the append has to split into frames.
+    ///
+    /// This is the claim a caller echoing a message leans on — that handing the
+    /// append a window over a term it just read is the same as having copied
+    /// those bytes into a buffer first, minus the copy.
+    #[test]
+    fn an_exclusive_append_from_a_region_writes_the_same_bytes_as_one_from_a_slice() {
+        let (session_id, stream_id) = (11, 22);
+
+        // One frame, and then a message long enough to be split — the two arms
+        // of the append, because the fragment writer copies in pieces and the
+        // single-frame writer copies the lot.
+        for payload in [vec![0x5au8; 64], vec![0xa5u8; 3 * 1024]] {
+            let mut source = Box::new(Buffer([0u8; TERM_LENGTH as usize]));
+            AtomicBuffer::from_slice_mut(&mut source.0)
+                .expect("aligned")
+                .copy_in(0, &payload)
+                .expect("room");
+
+            let mut from_slice = Log::new();
+            from_slice.set_tail(initial_term_id(), 0, 0);
+            let slice_outcome = from_slice.appender().append_exclusive(
+                session_id,
+                stream_id,
+                i64::MAX,
+                initial_term_id(),
+                0,
+                &payload,
+            );
+
+            let mut from_region = Log::new();
+            from_region.set_tail(initial_term_id(), 0, 0);
+            let source_window = AtomicBuffer::from_slice(&source.0).expect("aligned");
+            let region_outcome = from_region.appender().append_exclusive_region(
+                session_id,
+                stream_id,
+                i64::MAX,
+                initial_term_id(),
+                0,
+                PayloadRegion::new(&source_window, 0, payload.len()),
+            );
+
+            assert_eq!(slice_outcome, region_outcome, "same answer");
+            // The first byte they disagree on, named: a term is 64 KiB and
+            // `assert_eq!` on the whole of it prints all of them.
+            let differing = from_slice
+                .term
+                .0
+                .iter()
+                .zip(from_region.term.0.iter())
+                .position(|(a, b)| a != b);
+            assert_eq!(
+                None,
+                differing,
+                "and byte for byte the same term, for {} bytes",
+                payload.len()
+            );
+            assert_eq!(
+                from_slice.metadata.0[..],
+                from_region.metadata.0[..],
+                "and the same metadata, tail included"
+            );
+        }
     }
 
     #[test]

@@ -472,8 +472,21 @@ and nothing more. The reference's own reassembling path hands its delegate
 `builder.buffer()`, the assembler's buffer rather than the term
 (`ControlledFragmentAssembler.java:113-167`), which is the same arrangement this
 build uses everywhere; and seven of those eight pollers reassemble. Zero-copy
-forwarding is a real thing the reference can do and this build cannot, and it is
-left to whoever needs it rather than opened here for a face whose callers do not.
+forwarding is a real thing the reference can do, and it is not opened here — for
+a face whose callers do not forward, the copy is the price of the rule above and
+nothing more.
+
+It **is** open on the fragment face, which is where a forwarder is:
+`Client::poll_subscription_fragments` hands its handler a window onto the term,
+`Fragment::payload_region` hands that window on, and
+`Client::poll_subscription_fragments_with_publication` lends the same handler a
+publication to offer into — so a message that arrived in one frame goes from the
+received term into the outgoing log in one copy, as the reference's does
+(`ExclusivePublication.java:645`), and a message that arrived in several is
+reassembled first, which is what the reference's own node does with its
+assembler. Held by `tests/integration/forwarding_poll.rs`, which forwards one
+message of each shape and compares the bytes that come out against the ones that
+went in.
 
 The four actions are the reference's, and the numbers are not a contract: Java
 numbers `ABORT, BREAK, COMMIT, CONTINUE` from zero
@@ -709,6 +722,11 @@ only field that differed was this one.
   no such slice for that reason. The copy is into a reused buffer, so a
   session's messages allocate nothing after the first. Covered by the same
   tests.
+  This is the **message** face. A caller on the fragment face is not handed a
+  slice and does not need one: `Fragment::payload_region` is the window and
+  `PublicationWriter::offer` copies out of it once, into the outgoing log — the
+  same single copy the reference pays, and the reason the copy above is paid for
+  a face rather than for the build.
 
 ## Configuration names
 
