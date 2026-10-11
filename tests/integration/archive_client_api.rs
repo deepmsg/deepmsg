@@ -55,7 +55,7 @@ use deepmsg_archive::client::archive::{
 };
 use deepmsg_archive::client::context::{CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV};
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
-use deepmsg_archive::client::proxy::ReplayParams;
+use deepmsg_archive::client::proxy::{ReplayParams, ReplicationParams};
 use deepmsg_archive::client::subscription_descriptor_poller::RecordingSubscriptionDescriptor;
 use deepmsg_archive::client::{ArchiveContext, NoCredentials, archive_to_client_error_code};
 use deepmsg_client::client::Client;
@@ -68,6 +68,22 @@ use deepmsg_tests::temp::TempDir;
 /// world is on it.
 const RECORDING_CHANNEL: &str = "aeron:ipc?alias=client-api";
 const RECORDING_STREAM_ID: i32 = 4213;
+
+/// `Aeron.NULL_POSITION`, which a **live** recording's stop position is — so
+/// this is the test that tells a recording still in flight from one that has
+/// stopped.
+const NULL_POSITION: i64 = -1;
+
+/// The source a replication is asked to copy **from**. Nothing reads these
+/// until the session walks, so they are a shape rather than a subject: what the
+/// four criteria below are about is the answer, not the copy.
+const SRC_RECORDING_ID: i64 = 7;
+const SRC_CONTROL_STREAM_ID: i32 = 10;
+const SRC_CONTROL_CHANNEL: &str = "aeron:udp?endpoint=localhost:8999";
+
+/// A destination recording id this archive certainly does not hold, for the
+/// refusal that asks the **catalog**.
+const DST_RECORDING_ID_NOT_HELD: i64 = 123_456;
 
 /// What the **recording** test's signal handler saw.
 ///
@@ -1443,6 +1459,217 @@ fn a_publication_can_be_added_recorded_and_replayed() {
         replayed.len() >= written.len(),
         "the archive replayed what was written: {} bytes back",
         replayed.len()
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
+/// The channel a replication's copy runs over, which the request has to name:
+/// the archive's own `aeron.archive.replication.channel` is **not** set by
+/// [`archive::PROPERTIES`], and a request that names none is refused for it.
+const REPLICATION_CHANNEL: &str = "aeron:ipc?alias=client-api-replicated";
+
+/// **The four replication round trips.**
+///
+/// [`Archive::replicate`], [`Archive::stop_replication`] and
+/// [`Archive::try_stop_replication`] have been able to *offer* their requests
+/// since C1 and had no arm to answer them — the gap
+/// [`the_requests_that_stop_and_reshape_a_recording`] writes down. This is the
+/// arm, and these are the answers that say it is wired to the conductor rather
+/// than to the adapter's `catch-all`.
+///
+/// **What is not tested here is a copy.** Nothing below moves a byte between
+/// two archives: a successful replicate leaves a session that has not taken its
+/// first step, and what is asserted is the *answer*. That is the reference's own
+/// shape rather than a shortcut — `ArchiveConductor.replicate` answers
+/// `sendOkResponse(correlationId, replicationId)` the moment the session is
+/// registered (`:1472-1478`), long before anything is copied.
+///
+/// The four, in the order they are asked:
+///
+/// 1. **A replicate nothing refuses is answered with its id**, which is minted
+///    from the conductor's **session** counter (`:1455`) and so is a positive
+///    number rather than a constant.
+/// 2. **A destination this archive does not hold is refused with `5`**, its own
+///    `UNKNOWN_RECORDING` (`:1411-1417`) — the code the archive sends, not the
+///    `205` the client reports.
+/// 3. **A destination that is recording right now is refused with `2`**, its
+///    `ACTIVE_RECORDING` (`:1419-1428`). The one of the four that needs a
+///    recording to exist, and the only one that says anything about the copy
+///    rather than about the request.
+/// 4. **A stop for an id no session is registered under is a `false`** — the
+///    whole point of the `try_` form (`aeron_archive_client.c:1816-1844`), and
+///    the C fixture's own assertion (`aeron_archive_test.cpp:2861-2871`). It is
+///    also the one that can be got wrong by being *helpful*: a stop that
+///    answered `OK` for an unknown id would make every `tryStopReplication`
+///    claim it had stopped something.
+///
+/// The last two assertions are the same claim from the other side: an id that
+/// **is** registered stops, and then does not, because a stop gives the id up
+/// (`ArchiveConductor.java:1482`) while the session goes on being driven until
+/// its own close (`ReplicationSession.java:196-211`).
+#[test]
+fn the_four_replication_round_trips() {
+    let Some((mut media_driver, _archive_dir, mut client)) = rig("archive-client-api-replicate")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    // A request with a source in it, so the fields that are not read yet are at
+    // least the fields a real one carries. Nothing validates the source until
+    // the session walks, which is the next commit's.
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+    params.file_io_max_length = 4096;
+
+    let replicate = |archive: &mut Archive, client: &mut Client, params: &ReplicationParams| {
+        archive.replicate(
+            client,
+            SRC_RECORDING_ID,
+            SRC_CONTROL_STREAM_ID,
+            SRC_CONTROL_CHANNEL,
+            params,
+        )
+    };
+
+    // ① Nothing in its way.
+    let replication_id = replicate(&mut archive, &mut client, &params)
+        .expect("the archive takes a replication it has no reason to refuse");
+
+    assert!(
+        replication_id > 0,
+        "the id is minted from the session counter, which starts at {}: {replication_id}",
+        deepmsg_archive::server::conductor::FIRST_SESSION_ID
+    );
+
+    // ② A destination that does not exist.
+    params.dst_recording_id = DST_RECORDING_ID_NOT_HELD;
+    let error = replicate(&mut archive, &mut client, &params)
+        .expect_err("a destination the archive does not hold is refused");
+
+    let ArchiveError::Refused {
+        archive_error_code,
+        message,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        5, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_UNKNOWN_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(
+        Some(205),
+        error.client_error_code(),
+        "and the same code where a caller matches on it"
+    );
+    assert!(
+        message.contains(&format!(
+            "unknown destination recording id {DST_RECORDING_ID_NOT_HELD}"
+        )),
+        "the archive's own words, which name the recording and not this client's summary: {message}"
+    );
+
+    // ③ A destination that is being recorded right now.
+    //
+    // The id comes from a **listing** rather than from a signal: the client's
+    // descriptor consumer is an object since C1's last commit, so the closure
+    // below carries this test's own `Vec` and no `static` slot is needed for it.
+    // That is the same door the replication's own session needs, used here for
+    // the first time by a criterion.
+    let _subscription_id = archive
+        .start_recording(
+            &mut client,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            false,
+            false,
+        )
+        .expect("the archive starts recording");
+
+    let _publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("the driver takes a publication on the recording channel");
+
+    let mut active = Vec::new();
+
+    until(
+        &mut client,
+        "the recording to reach the catalog",
+        |client| {
+            active.clear();
+            let _ =
+                archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+                    if descriptor.stop_position == NULL_POSITION {
+                        active.push(descriptor.recording_id);
+                    }
+                });
+
+            !active.is_empty()
+        },
+    );
+
+    params.dst_recording_id = active[0];
+    let error = replicate(&mut archive, &mut client, &params)
+        .expect_err("a recording still in flight is not a place to copy into");
+
+    let ArchiveError::Refused {
+        archive_error_code,
+        message,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        2, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_ACTIVE_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(Some(202), error.client_error_code());
+    assert!(
+        message.contains(&format!(
+            "cannot replicate to active recording {}",
+            active[0]
+        )),
+        "and its reason names the recording that is in the way: {message}"
+    );
+
+    // ④ The three stops. An id nothing is under, an id that is, and that id
+    // again — the C fixture's `/0` arm's `replication_id + 40000`, and then the
+    // pair that shows the id really was given up rather than merely aborted.
+    assert!(
+        !archive
+            .try_stop_replication(&mut client, replication_id + 40_000)
+            .expect("an id no session is registered under is an answer, not an error"),
+        "nothing was stopped, so the try form says so"
+    );
+    assert!(
+        archive
+            .try_stop_replication(&mut client, replication_id)
+            .expect("the id the OK carried is one a stop finds"),
+        "and the replication the first replicate made is one there was to stop"
+    );
+    assert!(
+        !archive
+            .try_stop_replication(&mut client, replication_id)
+            .expect("the same id again is the same kind of answer"),
+        "a stop takes the session out by its id, so a second one has nothing to find"
     );
 
     archive.close(&client);

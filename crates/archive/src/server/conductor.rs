@@ -133,7 +133,7 @@ use crate::server::auth::{
 use crate::server::config::ArchiveConfig;
 use crate::server::control_adapter::{
     ConnectRequest, ControlAdapter, ControlError, ControlPlane, ExtendRecordingRequest, ImageId,
-    StartRecordingRequest, StartReplayRequest,
+    ReplicationRequest, StartRecordingRequest, StartReplayRequest,
 };
 use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
@@ -157,6 +157,7 @@ use crate::server::replay_session::{
     Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
 };
 use crate::server::replayer::Replayer;
+use crate::server::replication_session::{ReplicationProgress, ReplicationSession};
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 use deepmsg_codec::archive::recording_state::RecordingState;
 
@@ -752,6 +753,17 @@ pub const UNKNOWN_SUBSCRIPTION: i64 = 4;
 /// (`ArchiveConductor.java:2597-2617`).
 pub const STORAGE_SPACE: i64 = 11;
 
+/// `ArchiveException.UNKNOWN_REPLICATION` (`client/ArchiveException.java:89`),
+/// the refusal a replication stop gets for an id no session is registered under
+/// (`ArchiveConductor.java:1483-1487`).
+///
+/// **The code the `tryStopReplication` form is built on**: the C client's
+/// `aeron_archive_try_stop_replication` turns this one refusal into a `false`
+/// rather than an error (`aeron_archive_client.c:1816-1844`), which is why a
+/// stop that quietly answered `OK` for an id it did not know would be a
+/// `tryStopReplication` that always said it had stopped something.
+pub const UNKNOWN_REPLICATION: i64 = 12;
+
 /// `CommonContext.SPY_PREFIX` (`CommonContext.java:246`): the channel prefix a
 /// **local** UDP publication is recorded through, because a driver's own
 /// publication is not a network one and a spy link is what carries it to a
@@ -812,6 +824,24 @@ pub struct ReplaySettings {
     pub max_concurrent_replays: usize,
 }
 
+/// The setting a replication is answered from
+/// (`aeron.archive.replication.channel`, `Archive.java:584`).
+///
+/// One field, and it is an `Option` on purpose: the reference treats the
+/// property's **absence** as a configuration error and refuses to start the
+/// archive at all (`Archive.java:1235-1238`), which is a check this build does
+/// not make — the property has been accepted and unused since S2
+/// (`config.rs:575`). So the fallback a replicate request takes when it names
+/// no channel (`ArchiveConductor.java:1394-1395`) can land on `None` here where
+/// it could not in the reference, and `Sessions::replicate` is where that has
+/// to be answered rather than crashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationSettings {
+    /// `ctx.replicationChannel()`, or `None` when the archive was started
+    /// without one.
+    pub channel: Option<String>,
+}
+
 /// A request that **moves a resource** rather than answering about one.
 ///
 /// The second kind of thing a callback defers, after the messages and the
@@ -867,6 +897,19 @@ enum Action {
         correlation_id: i64,
         recording_id: i64,
     },
+    /// `ArchiveConductor.replicate` (`:1385-1478`): copy a recording in from
+    /// another archive, which this archive reaches over a client of its own.
+    ///
+    /// Deferred for the reason [`Action::StartReplay`] is, and with more on
+    /// top: two of the four refusals in front of it are **catalog** questions
+    /// (`:1410-1428`), and the id the answer carries is minted from the
+    /// conductor's own session counter (`:1455`).
+    ///
+    /// **Not in the same family as the stop below**, which the reference pairs
+    /// it with in the adapter and which is here a [`Deferred`] arm and not an
+    /// `Action` at all: this one builds a resource, and that one takes one out
+    /// of a map the conductor already holds.
+    Replicate(ReplicationRequest),
     /// One of the requests that move or remove a recording's **segments** — see
     /// [`SegmentRequest`] for why they are one variant rather than seven.
     Segment(SegmentRequest),
@@ -1714,6 +1757,20 @@ pub struct Sessions {
     creating_replays: Vec<CreateReplayPublicationSession>,
     /// The settings a replay is answered from.
     replay: ReplaySettings,
+    /// The setting a replication is answered from — see [`ReplicationSettings`].
+    replication: ReplicationSettings,
+    /// The replications **in flight**, which is the reference's session array
+    /// and its `replicationSessionByIdMap` (`ArchiveConductor.java:148`) in one
+    /// container.
+    ///
+    /// One rather than two because the two differ by exactly one fact — whether
+    /// a stop can still find the session by its id — and that fact is
+    /// [`ReplicationSession::replication_id`] being `None`
+    /// (`:1482` removes the map's entry, and the array's entry outlives it).
+    /// The reference holds the session **objects**, and so does this: each is
+    /// its own state machine, which is why a replication is not a set of facts
+    /// the way [`RecordingHandle`] is.
+    replication_sessions: Vec<ReplicationSession>,
     /// `ArchiveConductor.Replayer`'s counters (`ArchiveConductor.java:2745-2791`):
     /// how many replays are open (112) and what the reads have cost (108-110).
     ///
@@ -2140,6 +2197,7 @@ impl Sessions {
         response_channel_defaults: ResponseChannelDefaults,
         recording: RecordingSettings,
         replay: ReplaySettings,
+        replication: ReplicationSettings,
         subscription_ids: Vec<i64>,
     ) -> Self {
         Self {
@@ -2151,6 +2209,8 @@ impl Sessions {
             response_channel_defaults,
             recording,
             replay,
+            replication,
+            replication_sessions: Vec::new(),
             subscription_ids,
             sessions: HashMap::new(),
             pending_connects: Vec::new(),
@@ -2255,6 +2315,7 @@ impl Sessions {
         // leaves them: everything a turn *does* happens before the sessions that
         // asked for it are looked at again.
         self.drive_replays(client, counters, catalog, now_ms);
+        self.drive_replication_sessions(now_ms);
         self.drive_delete_segments(client, now_ms);
         self.drive_sessions(client, counters, authenticator, now_ms);
         self.apply_session_count_delta(counters);
@@ -4498,6 +4559,225 @@ impl Sessions {
         self.pending.extend(owed);
     }
 
+    /// One turn of every replication in flight
+    /// (`replicationSessionByIdMap`, `ArchiveConductor.java:148`).
+    ///
+    /// The reference's sessions are `Session`s in the conductor's session array
+    /// and are walked by the same worker as the control sessions
+    /// (`addSession`, `:1474`); here they are their own list and their own
+    /// turn, for the reason [`Sessions::drive_replay_sessions`] gives — the
+    /// sessions are owned values and the worker's array is the client's.
+    ///
+    /// A session that reaches `DONE` leaves the list here. **What it leaves
+    /// behind is its `close()`** (`ReplicationSession.java:196-211`): the
+    /// teardown, and the one `REPLICATE_END` a replication ever sends. That is
+    /// the next commit's, and until it exists a replication that finishes is
+    /// dropped rather than closed — which is a hole this comment names and does
+    /// not paper over.
+    fn drive_replication_sessions(&mut self, now_ms: i64) {
+        if self.replication_sessions.is_empty() {
+            return;
+        }
+
+        self.replication_sessions
+            .retain_mut(|session| !matches!(session.do_work(now_ms), ReplicationProgress::Done));
+    }
+
+    /// `ArchiveConductor.replicate` (`ArchiveConductor.java:1385-1478`), its
+    /// five steps in its order, and all four of its refusals.
+    ///
+    /// Steps ③ and ④ — build the source's context and hand it to a session that
+    /// will connect with it — are the session's own: what is built here is the
+    /// session, and what it is built from is the request.
+    fn replicate(&mut self, catalog: &Catalog, request: ReplicationRequest) {
+        let session_id = request.session_id;
+        let correlation_id = request.correlation_id;
+
+        // ① `:1394-1395`: the request's channel, or the archive's own.
+        //
+        // **The one place this build can be somewhere the reference cannot
+        // be.** The reference checks at *startup* that the property is set and
+        // refuses to run without it (`Archive.java:1235-1238`); this archive
+        // has accepted and ignored the property since S2, so an empty request
+        // meeting an unset property is reachable here and is answered rather
+        // than crashed. See [`ReplicationSettings`].
+        let replication_channel = if request.replication_channel.is_empty() {
+            match self.replication.channel.as_ref() {
+                Some(configured) => configured.clone(),
+                None => {
+                    self.refuse_request(
+                        session_id,
+                        correlation_id,
+                        0, // `ArchiveException.GENERIC`
+                        "no replication channel: the request named none and \
+                         aeron.archive.replication.channel is not set"
+                            .to_owned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            request.replication_channel.clone()
+        };
+
+        // The reference parses the channel **outside** a guard (`:1397`), so a
+        // channel that will not parse throws out of the request and reaches
+        // the archive's error handler without the client being answered. That
+        // is the outcome here, named one frame earlier.
+        let Ok(replication_channel_uri) = ChannelUri::parse(&replication_channel) else {
+            self.warnings.push(format!(
+                "replicationChannel={replication_channel} is not a channel"
+            ));
+            return;
+        };
+
+        // ② `:1399-1410`: the two refusals a response channel earns, in the
+        // reference's order and its words.
+        let is_response_channel =
+            replication_channel_uri.get("control-mode") == Some(CONTROL_MODE_RESPONSE);
+
+        if is_response_channel && !request.live_destination.is_empty() {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                0, // `ArchiveException.GENERIC`
+                "response channels can't be used with live destinations".to_owned(),
+            );
+            return;
+        }
+
+        if is_response_channel
+            && (request.channel_tag_id != NULL_VALUE || request.subscription_tag_id != NULL_VALUE)
+        {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                0, // `ArchiveException.GENERIC`
+                "response channels can't be used with tagged replication".to_owned(),
+            );
+            return;
+        }
+
+        // ② continued, `:1411-1428`: the destination, which is a catalog
+        // question and therefore the reason this whole request is deferred.
+        //
+        // `hasRecording` is read **before** the `NULL_VALUE` test and used
+        // after it, which matters: a request that names no destination
+        // (`NULL_VALUE`) asks for a new recording and is never refused for one,
+        // and the two `hasRecording` reads below are the same read.
+        let has_recording = catalog.has_recording(request.dst_recording_id);
+
+        if request.dst_recording_id != NULL_VALUE && !has_recording {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_RECORDING,
+                format!(
+                    "unknown destination recording id {}",
+                    request.dst_recording_id
+                ),
+            );
+            return;
+        }
+
+        if has_recording {
+            let Ok(destination) = catalog.recording(request.dst_recording_id) else {
+                self.warnings.push(format!(
+                    "catalog could not read recording {}: the replicate is dropped",
+                    request.dst_recording_id
+                ));
+                return;
+            };
+
+            // A destination is active if it has not stopped **or** if a
+            // recording session still holds it (`:1419-1420`) — the two are
+            // different questions, and a recording whose stop position is
+            // written but whose session is still open is the second one.
+            if destination.stop_position == NULL_POSITION
+                || self
+                    .recording_session_by_id
+                    .contains_key(&request.dst_recording_id)
+            {
+                self.refuse_request(
+                    session_id,
+                    correlation_id,
+                    ACTIVE_RECORDING,
+                    format!(
+                        "cannot replicate to active recording {}",
+                        request.dst_recording_id
+                    ),
+                );
+                return;
+            }
+        }
+
+        // ④ `:1455`: the id comes from the **session** counter and not from one
+        // of its own, which is what makes a replication id unusable as a
+        // control session id and the two sequences unsplittable.
+        let replication_id = self.next_session_id;
+        self.next_session_id += 1;
+
+        // ⑤ `:1472-1478`: registered, added to the worker's list, and answered.
+        //
+        // The answer goes out **before** the session has done anything at all,
+        // which is the reference's own shape and the reason the four criteria
+        // this commit is held to can be met while the machine is still a
+        // skeleton: what the client is told is that the replication exists, not
+        // that it has finished.
+        self.replication_sessions.push(ReplicationSession::new(
+            replication_id,
+            request,
+            replication_channel,
+        ));
+
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: replication_id,
+        });
+    }
+
+    /// `ArchiveConductor.stopReplication` (`ArchiveConductor.java:1480-1493`):
+    /// take the session out by its id, or refuse **loudly**.
+    ///
+    /// The refusal is the whole point of the method. `aeron_archive_try_stop_
+    /// replication` in the C client is this request with
+    /// [`UNKNOWN_REPLICATION`] turned into a `false`
+    /// (`aeron_archive_client.c:1816-1844`), and the C fixture's `tryStop` arm
+    /// asserts that `false` for an id it has just invented
+    /// (`aeron_archive_test.cpp:2861-2871`) — so an implementation that
+    /// answered `OK` for an id it did not know would report a stop that never
+    /// happened.
+    fn stop_replication(&mut self, session_id: i64, correlation_id: i64, replication_id: i64) {
+        let Some(session) = self
+            .replication_sessions
+            .iter_mut()
+            .find(|session| session.replication_id() == Some(replication_id))
+        else {
+            self.refuse_request(
+                session_id,
+                correlation_id,
+                UNKNOWN_REPLICATION,
+                format!("unknown replication id {replication_id}"),
+            );
+            return;
+        };
+
+        // `:1482`, then `:1490`: the map lets go **first**, and the abort only
+        // sets the state. The session is still in flight behind the answer, and
+        // its close is what ends it.
+        session.unregister();
+        session.abort("stop replication");
+
+        // `sendOkResponse(correlationId)` — the reference's two-argument form,
+        // so the relevant id is nought rather than the replication's.
+        self.pending.push(Deferred::Ok {
+            session_id,
+            correlation_id,
+            relevant_id: 0,
+        });
+    }
+
     /// One `ERROR` a replay owes, pushed rather than sent for the reason every
     /// other callback answer is.
     fn refuse_request(
@@ -4597,6 +4877,7 @@ impl Sessions {
                 &channel,
                 now_ms,
             ),
+            Action::Replicate(request) => self.replicate(catalog, request),
         }
     }
 
@@ -6386,6 +6667,25 @@ impl ControlPlane for Sessions {
             .push(Deferred::Action(Action::StartReplay(request)));
     }
 
+    fn on_replicate(&mut self, request: ReplicationRequest, _now_ms: i64) {
+        self.pending
+            .push(Deferred::Action(Action::Replicate(request)));
+    }
+
+    fn on_stop_replication(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        replication_id: i64,
+        _now_ms: i64,
+    ) {
+        // **Sent, not deferred.** Everything this needs is in this struct —
+        // the sessions and the answer — and one of the two outcomes is the
+        // refusal a `tryStopReplication` is built on, which has to be right in
+        // the same turn the stop arrived.
+        self.stop_replication(session_id, correlation_id, replication_id);
+    }
+
     fn on_stop_replay(
         &mut self,
         session_id: i64,
@@ -6639,6 +6939,9 @@ impl ArchiveConductor {
             ReplaySettings {
                 max_concurrent_replays: usize::try_from(config.max_concurrent_replays).unwrap_or(0),
             },
+            ReplicationSettings {
+                channel: config.replication_channel.clone(),
+            },
             subscription_ids,
         );
 
@@ -6784,6 +7087,7 @@ mod tests {
 
     use crate::catalog::Recording;
     use crate::mark::tests::TempDir;
+    use crate::server::replication_session::State;
 
     use deepmsg_cnc::layout;
     use deepmsg_core::buffer::AtomicBuffer;
@@ -8368,6 +8672,27 @@ mod tests {
         }
     }
 
+    /// A replication request with nothing in it a test has to think about.
+    fn replication_request() -> ReplicationRequest {
+        ReplicationRequest {
+            session_id: 1,
+            correlation_id: 7,
+            src_recording_id: 11,
+            dst_recording_id: NULL_VALUE,
+            stop_position: NULL_POSITION,
+            channel_tag_id: NULL_VALUE,
+            subscription_tag_id: NULL_VALUE,
+            src_control_stream_id: 10,
+            file_io_max_length: NULL_VALUE as i32,
+            replication_session_id: NULL_VALUE as i32,
+            src_control_channel: "aeron:udp?endpoint=localhost:8010".to_owned(),
+            live_destination: String::new(),
+            replication_channel: String::new(),
+            encoded_credentials: Vec::new(),
+            src_response_channel: String::new(),
+        }
+    }
+
     fn sessions() -> Sessions {
         Sessions::new(
             ARCHIVE_ID,
@@ -8378,6 +8703,9 @@ mod tests {
             recording_settings(),
             ReplaySettings {
                 max_concurrent_replays: 20,
+            },
+            ReplicationSettings {
+                channel: Some("aeron:ipc?alias=replicated".to_owned()),
             },
             Vec::new(),
         )
@@ -8731,6 +9059,82 @@ mod tests {
         assert_eq!(
             None,
             sessions.replay_session_by_token(first, recording_id, 6_000)
+        );
+    }
+
+    /// **A stop that has been answered is not found again**, and it is found
+    /// again by *the drive loop* rather than by this — which is exactly why the
+    /// two have to be told apart.
+    ///
+    /// `stopReplication` takes the session out of `replicationSessionByIdMap`
+    /// **itself** (`ArchiveConductor.java:1482`) and only then aborts it
+    /// (`:1490`), and the abort is one line: `state(DONE)`. The session is still
+    /// in the worker's array, still in flight, and it is its own `close()`
+    /// (`ReplicationSession.java:196-211`) that ends it.
+    ///
+    /// **The window is one turn wide and no criterion can see it**: two stops
+    /// that arrive a turn apart are told apart by
+    /// [`Sessions::drive_replication_sessions`] dropping the aborted session in
+    /// between, so a build that never gave the id up would answer the wire's
+    /// second stop correctly by accident. Two stops read from **one** poll —
+    /// which the adapter's fragment limit allows — is the case that tells them
+    /// apart, and it is this test.
+    #[test]
+    fn a_stop_gives_the_id_up_before_the_session_leaves() {
+        let mut sessions = sessions();
+        let replication_id = 4;
+
+        sessions.replication_sessions.push(ReplicationSession::new(
+            replication_id,
+            replication_request(),
+            "aeron:ipc?alias=replicated".to_owned(),
+        ));
+
+        sessions.stop_replication(1, 99, replication_id);
+        sessions.stop_replication(1, 100, replication_id);
+
+        assert_eq!(
+            vec![
+                Deferred::Ok {
+                    session_id: 1,
+                    correlation_id: 99,
+                    relevant_id: 0,
+                },
+                Deferred::Error {
+                    session_id: 1,
+                    correlation_id: 100,
+                    relevant_id: UNKNOWN_REPLICATION,
+                    message: format!("unknown replication id {replication_id}"),
+                },
+            ],
+            sessions.pending,
+            "the second stop is refused, and `UNKNOWN_REPLICATION` is what a \
+             `tryStopReplication` reads its `false` out of"
+        );
+        assert_eq!(
+            1,
+            sessions.replication_sessions.len(),
+            "and the session it stopped is still in flight: what ends it is its own close"
+        );
+        assert_eq!(State::Done, sessions.replication_sessions[0].state());
+    }
+
+    /// The same claim from the other side: an id the archive never handed out
+    /// is refused, not quietly accepted.
+    #[test]
+    fn a_stop_for_an_unknown_replication_is_refused() {
+        let mut sessions = sessions();
+
+        sessions.stop_replication(1, 99, 4_242);
+
+        assert_eq!(
+            vec![Deferred::Error {
+                session_id: 1,
+                correlation_id: 99,
+                relevant_id: UNKNOWN_REPLICATION,
+                message: "unknown replication id 4242".to_owned(),
+            }],
+            sessions.pending
         );
     }
 
