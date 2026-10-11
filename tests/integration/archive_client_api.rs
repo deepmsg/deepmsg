@@ -739,7 +739,7 @@ fn a_listing_reads_while_a_signal_lands_in_it() {
         let signals_before = listing_signals_seen();
 
         let listed = archive
-            .list_recordings(&mut client, 0, 10, collect_descriptor)
+            .list_recordings(&mut client, 0, 10, &mut collect_descriptor)
             .expect("the listing completes");
 
         if descriptors_seen() > descriptors_before && listing_signals_seen() > signals_before {
@@ -781,6 +781,35 @@ fn a_listing_reads_while_a_signal_lands_in_it() {
         Some(recording_id),
         listing_signal_for(subscription_id, SignalCode::START).map(|signal| signal.recording_id),
         "the listing and the signal name the same recording"
+    );
+
+    // **And a consumer can be an object.** The same page, asked for again with a
+    // closure that keeps its own list, answers into *that* list — the shape the
+    // reference's replication session is built on (`ReplicationSession.java:53`
+    // **is** its consumer, with its state on `this`) and the one a `fn` pointer
+    // could not have. Every listing read in this file used to go through a
+    // `static` slot like `DESCRIPTORS` — one slot per criterion, which is a rule
+    // nothing enforces and two listings in one process can break.
+    let mut mine = Vec::new();
+    let listed_again = archive
+        .list_recordings(
+            &mut client,
+            0,
+            10,
+            &mut |descriptor: &RecordingDescriptor| {
+                mine.push(descriptor.recording_id);
+            },
+        )
+        .expect("the listing completes");
+
+    assert_eq!(
+        listed, listed_again,
+        "the same catalog answers the same page twice"
+    );
+    assert_eq!(
+        vec![recording_id],
+        mine,
+        "the closure's own list, which the shared slot knows nothing about"
     );
 
     // And the same claim one layer over: a **response** wait, which is a
@@ -874,7 +903,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
         forget_narrowed();
 
         let listed = archive
-            .list_recordings(&mut client, 0, 10, collect_narrowed)
+            .list_recordings(&mut client, 0, 10, &mut collect_narrowed)
             .expect("the listing completes");
 
         if listed >= 1 {
@@ -901,7 +930,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "aeron:ipc",
             RECORDING_STREAM_ID,
-            collect_narrowed,
+            &mut collect_narrowed,
         )
         .expect("the listing completes");
 
@@ -926,7 +955,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "aeron:udp",
             RECORDING_STREAM_ID,
-            collect_narrowed,
+            &mut collect_narrowed,
         )
         .expect("the archive answers a listing that holds nothing");
 
@@ -936,7 +965,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
     // page through and the count it asked in for is not the caller's to choose.
     forget_narrowed();
     let by_id = archive
-        .list_recording(&mut client, recording.recording_id, collect_narrowed)
+        .list_recording(&mut client, recording.recording_id, &mut collect_narrowed)
         .expect("the listing completes");
 
     assert_eq!(1, by_id, "the recording the id names");
@@ -954,7 +983,11 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
     // error: the listing is over and there was nothing in it.
     forget_narrowed();
     let missing = archive
-        .list_recording(&mut client, recording.recording_id + 999, collect_narrowed)
+        .list_recording(
+            &mut client,
+            recording.recording_id + 999,
+            &mut collect_narrowed,
+        )
         .expect("the archive answers about a recording it does not hold");
 
     assert_eq!(
@@ -973,7 +1006,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "",
             Some(RECORDING_STREAM_ID),
-            collect_subscription,
+            &mut collect_subscription,
         )
         .expect("the listing completes");
 
@@ -1006,7 +1039,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             by_subscription,
             "",
             Some(RECORDING_STREAM_ID),
-            collect_subscription,
+            &mut collect_subscription,
         )
         .expect("the listing completes");
 
@@ -1249,7 +1282,7 @@ fn the_requests_that_stop_and_reshape_a_recording() {
     assert_eq!(
         0,
         archive
-            .list_recording(&mut client, recording_id, collect_narrowed)
+            .list_recording(&mut client, recording_id, &mut collect_narrowed)
             .expect("listing a recording that is not there is an empty listing"),
         "the recording is not there any more"
     );

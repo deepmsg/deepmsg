@@ -68,10 +68,13 @@ pub struct RecordingSubscriptionDescriptor {
 
 /// What a listing does with each descriptor it reads.
 ///
-/// A plain function pointer, for the reason
+/// Borrowed and mutable, for the reason
 /// [`RecordingDescriptorConsumer`](crate::client::descriptor_poller::RecordingDescriptorConsumer)
-/// is one.
-pub type RecordingSubscriptionDescriptorConsumer = fn(&RecordingSubscriptionDescriptor);
+/// is: the reference's consumer carries a `clientd`, and the Rust for that half
+/// is a `&mut dyn FnMut`, so that a consumer can be an object rather than an
+/// item reaching for a `static`.
+pub type RecordingSubscriptionDescriptorConsumer<'a> =
+    &'a mut dyn FnMut(&RecordingSubscriptionDescriptor);
 
 /// Reads a listing of the archive's subscriptions, one descriptor at a time.
 #[derive(Debug)]
@@ -87,7 +90,9 @@ pub struct RecordingSubscriptionDescriptorPoller {
     /// How many more descriptors the caller is waiting for.
     remaining_subscription_count: i32,
     /// Where each one goes.
-    consumer: Option<RecordingSubscriptionDescriptorConsumer>,
+    /// What this turn read, handed to the caller's consumer when the turn is
+    /// over — see [`RecordingDescriptorPoller`](crate::client::descriptor_poller::RecordingDescriptorPoller).
+    pending: Vec<RecordingSubscriptionDescriptor>,
     /// Where recording signals go while a listing is running.
     signal_handler: crate::client::archive::RecordingSignalHandler,
     /// The listing is over — either the count ran out or the archive said there
@@ -114,7 +119,7 @@ impl RecordingSubscriptionDescriptorPoller {
             fragment_limit,
             correlation_id: -1,
             remaining_subscription_count: 0,
-            consumer: None,
+            pending: Vec::new(),
             signal_handler,
             is_dispatch_complete: false,
             error_on_message: false,
@@ -128,16 +133,11 @@ impl RecordingSubscriptionDescriptorPoller {
     /// does. It is not observable: [`Self::poll`] clears it before it reads
     /// anything, and the reference's own caller polls before it looks
     /// (`aeron_archive_poll_for_subscription_descriptors`, `:2236-2244`).
-    pub fn reset(
-        &mut self,
-        correlation_id: i64,
-        subscription_count: i32,
-        consumer: RecordingSubscriptionDescriptorConsumer,
-    ) {
+    pub fn reset(&mut self, correlation_id: i64, subscription_count: i32) {
         self.error_on_message = false;
         self.correlation_id = correlation_id;
         self.remaining_subscription_count = subscription_count;
-        self.consumer = Some(consumer);
+        self.pending.clear();
         self.is_dispatch_complete = false;
     }
 
@@ -174,15 +174,26 @@ impl RecordingSubscriptionDescriptorPoller {
     ///
     /// [`ControlResponseError`] when a message on the subscription was
     /// malformed.
-    pub fn poll(&mut self, client: &mut Client) -> Result<usize, ControlResponseError> {
+    pub fn poll(
+        &mut self,
+        client: &mut Client,
+        consumer: RecordingSubscriptionDescriptorConsumer<'_>,
+    ) -> Result<usize, ControlResponseError> {
         if self.is_dispatch_complete {
             self.is_dispatch_complete = false;
         }
+
+        self.pending.clear();
 
         let subscription = self.subscription;
         let fragment_limit = self.fragment_limit;
 
         let fragments = client.poll_subscription_controlled(subscription, fragment_limit, self);
+
+        // Before the error, for the reason the recordings poller gives.
+        for descriptor in &self.pending {
+            consumer(descriptor);
+        }
 
         if self.error_on_message {
             return Err(ControlResponseError::MalformedMessage);
@@ -274,9 +285,7 @@ impl ControlledHandler for RecordingSubscriptionDescriptorPoller {
                     .into_owned(),
                 };
 
-                if let Some(consumer) = self.consumer {
-                    consumer(&subscription);
-                }
+                self.pending.push(subscription);
 
                 self.remaining_subscription_count -= 1;
                 if 0 == self.remaining_subscription_count {

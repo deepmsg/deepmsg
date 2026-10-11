@@ -795,10 +795,10 @@ impl Archive {
         operation_name: &str,
         correlation_id: i64,
         record_count: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         self.recording_descriptor_poller
-            .reset(correlation_id, record_count, consumer);
+            .reset(correlation_id, record_count);
 
         let mut deadline = Instant::now() + self.operation_timeout();
         let mut previous_remaining = record_count;
@@ -806,7 +806,7 @@ impl Archive {
         loop {
             let fragments = self
                 .recording_descriptor_poller
-                .poll(client)
+                .poll(client, &mut *consumer)
                 .map_err(map_poller_error)?;
 
             let remaining = self.recording_descriptor_poller.remaining_record_count();
@@ -861,13 +861,10 @@ impl Archive {
         operation_name: &str,
         correlation_id: i64,
         subscription_count: i32,
-        consumer: RecordingSubscriptionDescriptorConsumer,
+        consumer: RecordingSubscriptionDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
-        self.recording_subscription_descriptor_poller.reset(
-            correlation_id,
-            subscription_count,
-            consumer,
-        );
+        self.recording_subscription_descriptor_poller
+            .reset(correlation_id, subscription_count);
 
         let mut deadline = Instant::now() + self.operation_timeout();
         let mut previous_remaining = subscription_count;
@@ -875,7 +872,7 @@ impl Archive {
         loop {
             let fragments = self
                 .recording_subscription_descriptor_poller
-                .poll(client)
+                .poll(client, &mut *consumer)
                 .map_err(map_poller_error)?;
 
             let remaining = self
@@ -961,7 +958,7 @@ impl Archive {
         client: &mut Client,
         from_recording_id: i64,
         record_count: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -993,7 +990,7 @@ impl Archive {
         &mut self,
         client: &mut Client,
         recording_id: i64,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -1023,7 +1020,7 @@ impl Archive {
         record_count: i32,
         channel_fragment: &str,
         stream_id: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -1067,7 +1064,7 @@ impl Archive {
         subscription_count: i32,
         channel_fragment: &str,
         stream_id: Option<i32>,
-        consumer: RecordingSubscriptionDescriptorConsumer,
+        consumer: RecordingSubscriptionDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 

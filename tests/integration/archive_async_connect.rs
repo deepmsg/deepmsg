@@ -223,7 +223,7 @@ fn a_polled_connect_is_finished_into_an_archive() {
     // A listing is asked for and answered, which is the round trip that makes
     // this an archive rather than a struct full of ids.
     let listed = archive
-        .list_recordings(&mut client, i64::MIN, 10, count_nothing)
+        .list_recordings(&mut client, i64::MIN, 10, &mut count_nothing)
         .unwrap_or_else(|error| {
             panic!(
                 "the archive answers a listing: {error};\n{}",
