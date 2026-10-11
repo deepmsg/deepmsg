@@ -61,6 +61,7 @@
 
 use std::time::Duration;
 
+use deepmsg_archive::client::ReplayParams;
 use deepmsg_tests::archive::{self, Archive, Recording};
 
 /// The connect's correlation id, which its answer echoes.
@@ -213,31 +214,41 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     // recording's beginning and a length of `-2` is "to the stop"
     // (`AeronArchive.NULL_POSITION`, `REPLAY_ALL_AND_STOP`), so neither number
     // here depends on where the recording happens to start.
+    //
+    // The request is `Archive::start_replay` and **not** `Archive::replay`: the
+    // latter follows it with a subscription of its own and answers that
+    // subscription's registration id (`archive.rs:1652-1687`). The subscription
+    // this replay is read through is the one made just above, and an id the
+    // product picked for a subscription is not the id asserted below.
     let subscription = archive.subscribe(REPLAY_CHANNEL, REPLAY_STREAM_ID);
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = archive::replay_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        -1,
-        -2,
-        FILE_IO_MAX_LENGTH,
-        REPLAY_STREAM_ID,
-        REPLAY_CHANNEL,
-    );
+    let replay_session_id = archive
+        .session
+        .archive_mut()
+        .start_replay(
+            &mut archive.client,
+            recorded.recording_id,
+            REPLAY_CHANNEL,
+            REPLAY_STREAM_ID,
+            &ReplayParams {
+                file_io_max_length: FILE_IO_MAX_LENGTH,
+                position: -1,
+                length: -2,
+                ..ReplayParams::default()
+            },
+        )
+        .expect("the archive starts the replay");
 
-    let answer = archive.ok_answer(correlation_id, &payload);
-
-    // The OK's `relevantId` is the `replaySessionId` (`ReplaySession.java:338`),
-    // which is what a client stops the replay by.
+    // The OK's `relevantId` — what `start_replay` answers — is the
+    // `replaySessionId` (`ReplaySession.java:338`), which is what a client stops
+    // the replay by.
     assert!(
-        answer.relevant_id > 0,
+        replay_session_id > 0,
         "the OK carries the replay session id, which is {}",
-        answer.relevant_id
+        replay_session_id
     );
     assert_eq!(
         1,
-        answer.relevant_id >> 32,
+        replay_session_id >> 32,
         "and its high half is the first replay id, which starts at 1"
     );
 
@@ -331,22 +342,31 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
     for (index, channel) in BOUNDED_REPLAY_CHANNELS.iter().enumerate() {
         let counter = archive.limit_counter(BOUNDED_COUNTER_TYPE_ID, recorded.first);
 
+        // Naming a limit counter that is not the null one is the whole of what
+        // makes this the **bounded** form of the request
+        // (`aeron_archive_replay_params_is_bounded`,
+        // `aeron_archive_replay_params.c:43-46`); everything else about the two
+        // is identical.
         let subscription = archive.subscribe(channel, REPLAY_STREAM_ID);
-        let correlation_id = archive.session.next_correlation_id();
-        let payload = archive::bounded_replay_request(
-            archive.session.control_session_id(),
-            correlation_id,
-            recorded.recording_id,
-            -1,
-            -1,
-            FILE_IO_MAX_LENGTH,
-            counter.counter_id(),
-            REPLAY_STREAM_ID,
-            channel,
-        );
+        let replay_session_id = archive
+            .session
+            .archive_mut()
+            .start_replay(
+                &mut archive.client,
+                recorded.recording_id,
+                channel,
+                REPLAY_STREAM_ID,
+                &ReplayParams {
+                    bounding_limit_counter_id: counter.counter_id(),
+                    file_io_max_length: FILE_IO_MAX_LENGTH,
+                    position: -1,
+                    length: -1,
+                    ..ReplayParams::default()
+                },
+            )
+            .expect("the archive starts the bounded replay");
 
-        let answer = archive.ok_answer(correlation_id, &payload);
-        assert!(answer.relevant_id > 0, "replay {index} has a session id");
+        assert!(replay_session_id > 0, "replay {index} has a session id");
 
         // It runs up to the limit and waits there, because `-1` is
         // `REPLAY_ALL_AND_FOLLOW` and a following replay has nothing telling it
@@ -376,21 +396,25 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
     // will take the replay, and the OK to this request goes out on the control
     // response channel whether or not anything is listening to the replay.
     let counter = archive.limit_counter(BOUNDED_COUNTER_TYPE_ID, recorded.first);
-    let correlation_id = archive.session.next_correlation_id();
-    let payload = archive::bounded_replay_request(
-        archive.session.control_session_id(),
-        correlation_id,
-        recorded.recording_id,
-        -1,
-        -1,
-        FILE_IO_MAX_LENGTH,
-        counter.counter_id(),
-        REPLAY_STREAM_ID,
-        REPLAY_CHANNEL,
-    );
+    let replay_session_id = archive
+        .session
+        .archive_mut()
+        .start_replay(
+            &mut archive.client,
+            recorded.recording_id,
+            REPLAY_CHANNEL,
+            REPLAY_STREAM_ID,
+            &ReplayParams {
+                bounding_limit_counter_id: counter.counter_id(),
+                file_io_max_length: FILE_IO_MAX_LENGTH,
+                position: -1,
+                length: -1,
+                ..ReplayParams::default()
+            },
+        )
+        .expect("the archive starts the third replay");
 
-    let answer = archive.ok_answer(correlation_id, &payload);
-    assert!(answer.relevant_id > 0, "the third replay was taken");
+    assert!(replay_session_id > 0, "the third replay was taken");
 
     let _ = archive.stop();
 }

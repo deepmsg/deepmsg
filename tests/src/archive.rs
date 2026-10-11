@@ -62,6 +62,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// The product's connected client is named `Archive` where it lives and the
+// fixture's own running-archive harness is named `Archive` here, so the import
+// is the one that moves aside.
+use deepmsg_archive::client::{Archive as ArchiveClient, ArchiveContext, Handlers, NoCredentials};
 use deepmsg_archive::server::conductor::ARCHIVE_ID_DEFAULT;
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_archive::server::response_proxy::PROTOCOL_SEMANTIC_VERSION;
@@ -145,15 +149,63 @@ impl Response {
 }
 
 /// One control session, and the two ends of the channel it answers on.
+///
+/// **A thin wrapper over the product's [`ArchiveClient`] now** (plan §2.3's
+/// second step). The session, the publication requests go out on, the
+/// subscription the answers come back on, and the encoding of both directions
+/// are the product's; what is left here is the fixture's own correlation counter
+/// and the one door the product has no equivalent of (see [`Session::send_only`]).
+///
+/// This is the shape the reference's own test base has: it holds an
+/// `aeron_archive_t` and the `aeron_t` it came from, and it reaches for the raw
+/// client only to make the **data-plane** channels a scenario records
+/// (`AeronCArchiveTestBase::connect`, `aeron_archive_test.cpp`, ends in
+/// `aeron_archive_connect`). It does not hand-build a control request anywhere.
 pub struct Session {
-    request_publication: i64,
-    response_subscription: i64,
-    control_session_id: i64,
+    /// The product's archive: the control session, the two ends of the channel,
+    /// and the waits.
+    archive: ArchiveClient,
+    /// The next correlation id this fixture hands out.
+    ///
+    /// **The fixture's own, and deliberately not the product's yet** (plan §2.3's
+    /// step 3). The product draws correlation ids from the driver's command ring
+    /// (`Archive::next_correlation_id` → `Client::next_correlation_id`, a
+    /// `fetch_add` on the CnC's MPSC counter) and its `next_correlation_id` needs
+    /// the client — so adopting it is a signature change at twenty call sites,
+    /// and mixing that with a change of *ownership* would make a failure
+    /// impossible to attribute to one or the other.
+    ///
+    /// The two counters coexist safely because they live in different ranges and
+    /// the ring's is the low one: the ring starts at nought and is at single
+    /// digits on a driver this young, while every caller seeds this one with a
+    /// `0x5ed1_000X`-shaped constant. Nothing else draws from the ring on this
+    /// path either — the connect takes one, and the product's own request methods
+    /// take one each, and neither is called here.
     next_correlation_id: i64,
 }
 
 impl Session {
     /// Open one control session, or say why not.
+    ///
+    /// **This is the product's connect now** (plan §2.3's second step):
+    /// `Archive::connect` builds the response subscription and the request
+    /// publication, runs the ten-state `AsyncConnect` over them, and hands back
+    /// an [`ArchiveClient`]. The two channels the fixture used to open by hand —
+    /// and the `response-correlation-id` derivation it used to do — are the
+    /// product's, from the context below.
+    ///
+    /// `correlation_id` **no longer names the connect**. `AsyncConnect` takes the
+    /// connect's own correlation id from the driver's command ring, which is what
+    /// the reference does (`aeron_archive_client.c:408-411` for the counter, and
+    /// no entry point lets a caller choose one), so the parameter survives only
+    /// as the seed for [`Session::next_correlation_id`]. The callers' constants
+    /// are unchanged and still name a request; they just no longer also name the
+    /// connect.
+    ///
+    /// `deadline` is still the caller's budget, but **it is handed to the context
+    /// rather than to the connect** — because that is where the reference keeps
+    /// it, and because it is what every *later* wait on this session will read
+    /// too. See [`connect_context`].
     ///
     /// # Errors
     ///
@@ -167,52 +219,33 @@ impl Session {
         correlation_id: i64,
         deadline: Instant,
     ) -> Result<Self, String> {
-        let response_subscription = client
-            .add_subscription(RESPONSE_CHANNEL, RESPONSE_STREAM_ID, COMMAND_TIMEOUT)
-            .map_err(|error| {
-                format!("the driver would not take a response subscription: {error}")
-            })?;
+        let context = connect_context(deadline);
 
-        let request_channel = request_channel(response_subscription);
-        let request_publication = client
-            .add_exclusive_publication(&request_channel, CONTROL_STREAM_ID, COMMAND_TIMEOUT)
-            .map_err(|error| {
-                format!("the driver would not take the request publication: {error}")
-            })?;
+        let archive =
+            ArchiveClient::connect(&context, client, &mut NoCredentials, Handlers::default())
+                .map_err(|error| format!("{error};\n{}", counters(aeron_dir)))?;
 
-        let mut session = Self {
-            request_publication,
-            response_subscription,
-            control_session_id: -1,
+        Ok(Self {
+            archive,
             next_correlation_id: correlation_id,
-        };
-
-        let connect = connect_request(correlation_id, RESPONSE_STREAM_ID, RESPONSE_CHANNEL);
-        let response = session
-            .send(client, correlation_id, &connect, deadline)
-            .map_err(|reason| format!("{reason};\n{}", counters(aeron_dir)))?;
-
-        if response.code != ControlResponseCode::OK {
-            return Err(format!(
-                "the archive refused the connect: {}",
-                response.message()
-            ));
-        }
-
-        // The connect's `relevantId` is the **control session id**, not the
-        // correlation id it echoes (`ControlSession.java:961-971`): the echoed id
-        // is already `correlationId`, and the point of `relevantId` here is to
-        // name the session every later request on this connection is addressed
-        // to.
-        session.control_session_id = response.relevant_id;
-
-        Ok(session)
+        })
     }
 
     /// The session every request on this connection is addressed to.
     #[must_use]
     pub const fn control_session_id(&self) -> i64 {
-        self.control_session_id
+        self.archive.control_session_id()
+    }
+
+    /// The product's archive, for a caller that wants a request this fixture no
+    /// longer builds itself (plan §2.3's third step).
+    ///
+    /// Mutable because every request method on an [`ArchiveClient`] is: each one
+    /// encodes into the proxy's reused buffer and offers it. A test that takes
+    /// this and hands it `&mut client` is borrowing two disjoint fields, which is
+    /// why [`crate::archive::Archive`] keeps them apart.
+    pub const fn archive_mut(&mut self) -> &mut ArchiveClient {
+        &mut self.archive
     }
 
     /// The next correlation id to build a request with, one per request.
@@ -227,16 +260,29 @@ impl Session {
     /// (`ControlResponseProxy.java:54-89`).
     #[must_use]
     pub const fn request_publication(&self) -> i64 {
-        self.request_publication
+        self.archive.proxy().request_publication()
     }
 
     /// The subscription the answers come back on.
     #[must_use]
     pub const fn response_subscription(&self) -> i64 {
-        self.response_subscription
+        self.archive.subscription()
     }
 
     /// Publish one request and wait for the answer that echoes its id.
+    ///
+    /// **The wait is the product's now**: `Archive::wait_for_response`, which is
+    /// the reference's `aeron_archive_poll_for_response` — so the answer is read
+    /// by the product's `ControlResponsePoller`, the `relevantId` is what comes
+    /// back, and a refusal is an [`ArchiveError::Refused`] carrying the archive's
+    /// own text rather than a `Response` this module decoded.
+    ///
+    /// **`deadline` no longer governs the wait**, and that is the reference's
+    /// arrangement rather than a loss: every wait in `aeron_archive_client.c`
+    /// starts from `ctx->message_timeout_ns` and no entry point takes a caller's
+    /// (`:156` and its siblings). The budget is set once, in
+    /// [`connect_context`]. The parameter survives because the *offer* still
+    /// needs it — see [`Session::send_only`].
     ///
     /// # Errors
     ///
@@ -247,13 +293,31 @@ impl Session {
         correlation_id: i64,
         payload: &[u8],
         deadline: Instant,
-    ) -> Result<Response, String> {
+    ) -> Result<i64, String> {
         self.send_only(client, payload, deadline)?;
 
-        await_response(client, self.response_subscription, correlation_id, deadline)
+        self.archive
+            .wait_for_response(client, "a request the fixture built", correlation_id)
+            .map_err(|error| error.to_string())
     }
 
     /// Publish one request and do not wait for anything.
+    ///
+    /// **The one door the product has no equivalent of, and it is why this
+    /// method still touches the publication directly.** Every request the
+    /// product's proxy can send is a *named* one — `start_recording`,
+    /// `list_recordings`, `get_stop_position` and the rest — so there is nowhere
+    /// to hand it a payload this module built. The reference has the same gap and
+    /// the same answer: its test reaches past the client to the proxy itself
+    /// (`aeron_archive_proxy_get_start_position(archive->archive_proxy, …)`,
+    /// `aeron_archive_test.cpp:1117`), and the proxy is where a named request
+    /// gets its bytes. The calls that need this are the ones driving the server
+    /// with a request the product has no method for yet — plan §2.3's third step
+    /// is where they move, and this is what disappears when they have.
+    ///
+    /// It offers through the **product's** publication, read off
+    /// [`Session::request_publication`], so the id is the one `Archive::connect`
+    /// made rather than one this module made.
     ///
     /// # Errors
     ///
@@ -264,20 +328,34 @@ impl Session {
         payload: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        // A publication that has not linked yet answers `NotConnected`, and the
-        // archive's control subscription is a link like any other. The reference
-        // client retries here for the same reason.
+        // **Three answers mean *not now*, and they are the same three the
+        // fixture's own publisher waits on** (see `offer_recorded_message`) and
+        // the same ones the reference client retries: a publication that has not
+        // linked yet answers `NotConnected`, one whose window the driver has not
+        // advertised yet answers `BackPressured`, and one whose term just ran out
+        // answers `EndOfLog`.
+        //
+        // **`BackPressured` used to be fatal here, and it cost a red CI run.**
+        // The connect request is offered the moment the publication is made, and
+        // a cold runner has not had the window advertised by then — so the very
+        // first offer answered `BackPressured` and a fixture that treated it as
+        // final failed instantly rather than waiting a millisecond. It is the
+        // same shape of race the proxy fixture met in P2-C1's third commit, where
+        // the rule was recorded as "a publication must be `is_connected` before
+        // it is used"; waiting is the other way to keep it.
         let mut attempts = 0;
 
         loop {
-            match client.offer_exclusive(self.request_publication, payload) {
+            match client.offer_exclusive(self.archive.proxy().request_publication(), payload) {
                 Some(Appended::Ok { .. }) => return Ok(()),
-                Some(Appended::NotConnected) => {
+                Some(
+                    retry @ (Appended::NotConnected | Appended::BackPressured | Appended::EndOfLog),
+                ) => {
                     attempts += 1;
                     if Instant::now() >= deadline {
                         return Err(format!(
-                            "the request publication never linked to the archive's control \
-                             subscription after {attempts} attempts"
+                            "the request would not go out in {attempts} attempts, the last \
+                             answer {retry:?}"
                         ));
                     }
                     client.poll();
@@ -289,11 +367,59 @@ impl Session {
     }
 }
 
+/// The context the fixture connects with.
+///
+/// Three of these are the settings the fixture's own connect used to spell out
+/// when it opened its two channels by hand — the archive's control channel and
+/// its stream, and the channel it asks to be answered on and its stream. The
+/// reference's own test base does the same thing with the same four values
+/// (`AeronCArchiveTestBase::connect`: `set_control_request_channel` and
+/// `set_control_response_channel`), which is why they live in the context now
+/// rather than in the connect.
+///
+/// The fourth is the budget, and **it is the one setting here that is not merely
+/// moved**. In the reference there is exactly one owner of a deadline —
+/// `ctx->message_timeout_ns`, which every wait in `aeron_archive_client.c` starts
+/// from (`:156` and its siblings) and which no entry point lets a caller
+/// override; a test that wants another one sets it on the context
+/// (`aeron_archive_test.cpp:1114` sets 500 ms for exactly that reason). The
+/// fixture used to pass `DEADLINE` per call, on both the connect and every wait
+/// after it. So the caller's deadline is handed over here, once, as whatever is
+/// left of it — which for the callers that pass `Instant::now() + DEADLINE` is
+/// the same 30 s they always had, and for any future caller that wants less is
+/// the one place to say so.
+///
+/// It is the budget for the *adds* as well as the waits, since those take their
+/// timeout from the same field: 30 s where `COMMAND_TIMEOUT` used to give 10.
+/// More generous, and the direction the reference's own test base sits in.
+fn connect_context(deadline: Instant) -> ArchiveContext {
+    let mut context = ArchiveContext::resolve(&[]);
+
+    context.control_request_channel = Some(CONTROL_CHANNEL.to_owned());
+    context.control_request_stream_id = CONTROL_STREAM_ID;
+    context.control_response_channel = Some(RESPONSE_CHANNEL.to_owned());
+    context.control_response_stream_id = RESPONSE_STREAM_ID;
+    context.message_timeout_ns = deadline
+        .saturating_duration_since(Instant::now())
+        .as_nanos()
+        .try_into()
+        .unwrap_or(i64::MAX);
+
+    context
+}
+
 /// The request channel: the archive's control channel with the id of the
 /// subscription the answer has to reach written into it.
 ///
 /// `AeronArchive.java:4043-4048`, which is a `ChannelUri.put` for the reason the
 /// module note gives.
+///
+/// **As of plan §2.3's second step this has no caller**: the derivation is the
+/// product's — `check_and_setup_response_channel` in `async_connect`, reached
+/// from `conclude_with` — and [`Session::connect`] no longer opens its own
+/// channels. It is kept because it is the readable statement of a chain that is
+/// otherwise three registration ids deep, and it goes with the other dead
+/// constructors when §2.3's fourth step deletes them in one pass.
 #[must_use]
 pub fn request_channel(response_subscription: i64) -> String {
     let mut uri = ChannelUri::parse(CONTROL_CHANNEL).expect("a channel this module wrote");
@@ -403,6 +529,12 @@ pub fn await_frame<T>(
 /// recording's signals share this channel — is read past rather than answered
 /// with: what this waits for is one answer to one request.
 ///
+/// **As of plan §2.3's second step this has no caller**: [`Session::send`] waits
+/// through the product's `Archive::wait_for_response`, whose poller is what
+/// recognises a response and whose loop is what skips the rest. This was the
+/// fixture's version of it. It goes with the other dead members when §2.3's
+/// fourth step deletes them.
+///
 /// # Errors
 ///
 /// See [`await_frame`].
@@ -496,6 +628,19 @@ pub fn decode(payload: &[u8]) -> Option<Response> {
 /// `version`'s **major** is the whole of what the archive checks
 /// (`ArchiveConductor.java:483-488`), so this sends the archive's own semantic
 /// version rather than a number of its own choosing.
+///
+/// **As of plan §2.3.1's first step this has no caller**: [`Session::connect`]
+/// sends the connect through the product's `ArchiveProxy::try_connect` now, and
+/// this is the hand-written twin that says what that request is supposed to
+/// contain. It is kept rather than deleted for two reasons — it is the readable
+/// statement of the request's field set, and §2.3's last step deletes the
+/// fixture's constructors in one pass once every one of them has stopped being
+/// called. The other five constructors below still have callers.
+///
+/// It is deliberately **not** used as a byte-for-byte cross-check on the proxy,
+/// which is what a reader would expect of a twin: the two differ in exactly one
+/// field, `clientInfo` (empty here, `name=… version=… commit=…` there —
+/// `proxy.rs:254-257`), so such a check would fail by design.
 #[must_use]
 pub fn connect_request(
     correlation_id: i64,
@@ -799,11 +944,26 @@ impl Archive {
     /// started, and reading that answer is what read past it
     /// ([`Archive::await_answer`]).
     ///
+    /// **The selector is the recording and the signal, not the request's
+    /// correlation id** (plan §2.3's third step). The product draws a request's
+    /// correlation id from the driver's command ring itself
+    /// (`Archive::next_correlation_id`) and answers the request with the id it
+    /// drew, so a caller that went through `Archive::truncate_recording` has no
+    /// way to know what to wait on — while what a signal *says* is which
+    /// recording it is about and what happened, which is what a reader of one is
+    /// after. **No caller ever asserted the correlation id**; it was how the
+    /// signal was found and nothing more.
+    ///
+    /// A recording's `START` and `STOP` signals share the channel with its
+    /// `DELETE`, so both halves of the selector carry weight: the recording
+    /// alone would take the `STOP` a recording sends when it stops, and the
+    /// signal alone would take another recording's.
+    ///
     /// # Panics
     ///
     /// When it does not arrive inside [`DEADLINE`].
-    pub fn await_signal(&mut self, correlation_id: i64) -> Signal {
-        if let Some(index) = self.signal_index(correlation_id) {
+    pub fn await_signal(&mut self, recording_id: i64, signal: RecordingSignal) -> Signal {
+        if let Some(index) = self.signal_index(recording_id, signal) {
             return self.signals.remove(index);
         }
 
@@ -815,9 +975,9 @@ impl Archive {
             subscription,
             Instant::now() + DEADLINE,
             |payload| {
-                let signal = decode_signal(payload)?;
-                let wanted = signal.correlation_id == correlation_id;
-                seen.push(signal);
+                let arrived = decode_signal(payload)?;
+                let wanted = arrived.recording_id == recording_id && arrived.signal == signal;
+                seen.push(arrived);
 
                 wanted.then_some(())
             },
@@ -825,9 +985,9 @@ impl Archive {
 
         self.signals.append(&mut seen);
 
-        let Some(index) = self.signal_index(correlation_id) else {
+        let Some(index) = self.signal_index(recording_id, signal) else {
             panic!(
-                "no signal for correlation id {correlation_id} arrived;\n{}\n--- archive ---\n{}",
+                "no {signal:?} signal for recording {recording_id} arrived;\n{}\n--- archive ---\n{}",
                 counters(&self.aeron_dir),
                 self.media_driver.log_tail(40)
             );
@@ -836,11 +996,11 @@ impl Archive {
         self.signals.remove(index)
     }
 
-    /// Where a signal for `correlation_id` is in the buffer, if it is there.
-    fn signal_index(&self, correlation_id: i64) -> Option<usize> {
+    /// Where a signal for `recording_id` is in the buffer, if it is there.
+    fn signal_index(&self, recording_id: i64, signal: RecordingSignal) -> Option<usize> {
         self.signals
             .iter()
-            .position(|signal| signal.correlation_id == correlation_id)
+            .position(|arrived| arrived.recording_id == recording_id && arrived.signal == signal)
     }
 
     /// Send one request that is answered with an `OK`, and assert that it was.

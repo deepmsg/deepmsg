@@ -40,22 +40,13 @@
 //! and the C suite's tests add one for the same reason.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::client::RecordingDescriptor;
 use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, NULL_POSITION};
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_client::client::Client;
-use deepmsg_codec::archive::boolean_type::BooleanType;
-use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::list_recording_request_codec::ListRecordingRequestEncoder;
-use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
-use deepmsg_codec::archive::recording_descriptor_codec::{self, RecordingDescriptorDecoder};
-use deepmsg_codec::archive::recording_position_request_codec::RecordingPositionRequestEncoder;
-use deepmsg_codec::archive::source_location::SourceLocation;
-use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
-use deepmsg_codec::archive::stop_position_request_codec::StopPositionRequestEncoder;
-use deepmsg_codec::archive::stop_recording_subscription_request_codec::StopRecordingSubscriptionRequestEncoder;
-use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
@@ -136,34 +127,32 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
         .map(|publication| publication.session_id())
         .expect("the publication has a session");
 
-    // `StartRecordingRequest2` (63). Its answer is the **subscription's**
-    // registration id, and it comes before any image exists: the two are
-    // different moments (`ArchiveConductor.java:570` against `:2046-2051`).
-    let correlation_id = session.next_correlation_id();
-    let payload = start_recording_request(session.control_session_id(), correlation_id);
-
-    let answer = session
-        .send(
+    // `StartRecordingRequest2` (63), which the product sends. Its answer is the
+    // **subscription's** registration id, and it comes before any image exists:
+    // the two are different moments (`ArchiveConductor.java:570` against
+    // `:2046-2051`).
+    //
+    // The request used to be built here byte by byte and posted through
+    // `Session::send`. It is now `Archive::start_recording` — the same request,
+    // with its correlation id drawn from the driver and its refusal turned into
+    // an error rather than a `code` to assert on. **What the criterion is about
+    // is unchanged**: it is still the subscription's registration id coming
+    // back before any image does.
+    let subscription_id = session
+        .archive_mut()
+        .start_recording(
             &mut client,
-            correlation_id,
-            &payload,
-            Instant::now() + DEADLINE,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            true,
+            false,
         )
         .expect("the archive answers a start");
 
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the recording: {}",
-        answer.message()
-    );
     assert!(
-        answer.relevant_id > 0,
-        "the answer carries the subscription's registration id, which is {}",
-        answer.relevant_id
+        subscription_id > 0,
+        "the answer carries the subscription's registration id, which is {subscription_id}"
     );
-
-    let subscription_id = answer.relevant_id;
 
     // Publish, and read it back so the driver's window keeps moving.
     let position = publish_and_read(&mut client, publication, reader);
@@ -187,28 +176,10 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
     // Stop it (14), and wait for the stop to reach the catalog: the session
     // reading the image ends, and what it got to is written down
     // (`ArchiveConductor.java:1329-1363`).
-    let correlation_id = session.next_correlation_id();
-    let payload = stop_recording_request(
-        session.control_session_id(),
-        correlation_id,
-        subscription_id,
-    );
-
-    let answer = session
-        .send(
-            &mut client,
-            correlation_id,
-            &payload,
-            Instant::now() + DEADLINE,
-        )
+    session
+        .archive_mut()
+        .stop_recording_subscription(&mut client, subscription_id)
         .expect("the archive answers a stop");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the stop: {}",
-        answer.message()
-    );
 
     let stopped = wait_for_stop_position(&mut session, &mut client, recording_id);
     assert_eq!(
@@ -347,52 +318,24 @@ fn recording_counter(client: &Client, session_id: i32) -> Option<(i64, i64)> {
 }
 
 /// Ask one recording where it has got to (12).
+///
+/// `Archive::get_recording_position`. A recording that is **not** being recorded
+/// answers `NULL_POSITION` rather than refusing (`ArchiveConductor.java:1169-1175`),
+/// so that is an `Ok` and not an `Err` — the criterion that reads this one wants
+/// the live position and the one below wants the `NULL_POSITION`.
 fn recording_position(session: &mut Session, client: &mut Client, recording_id: i64) -> i64 {
-    let correlation_id = session.next_correlation_id();
-    let control_session_id = session.control_session_id();
-
-    let mut buffer = vec![0u8; 64];
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            RecordingPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id);
-
-        body + encoder.encoded_length()
-    };
-    buffer.truncate(length);
-
-    ok_answer(session, client, correlation_id, &buffer).relevant_id
+    session
+        .archive_mut()
+        .get_recording_position(client, recording_id)
+        .expect("the archive answers a position")
 }
 
 /// Ask where a recording stopped (15), which is `-1` while it has not.
 fn stop_position(session: &mut Session, client: &mut Client, recording_id: i64) -> i64 {
-    let correlation_id = session.next_correlation_id();
-    let control_session_id = session.control_session_id();
-
-    let mut buffer = vec![0u8; 64];
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = StopPositionRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id);
-
-        body + encoder.encoded_length()
-    };
-    buffer.truncate(length);
-
-    ok_answer(session, client, correlation_id, &buffer).relevant_id
+    session
+        .archive_mut()
+        .get_stop_position(client, recording_id)
+        .expect("the archive answers a stop position")
 }
 
 /// Wait until the catalog says the recording stopped, answering with where.
@@ -412,26 +355,14 @@ fn wait_for_stop_position(session: &mut Session, client: &mut Client, recording_
     panic!("the recording's catalog row never got a stop position");
 }
 
-/// Send one request that is answered with an `OK`, and assert that it was.
-fn ok_answer(
-    session: &mut Session,
-    client: &mut Client,
-    correlation_id: i64,
-    payload: &[u8],
-) -> archive::Response {
-    let answer = session
-        .send(client, correlation_id, payload, Instant::now() + DEADLINE)
-        .expect("the archive answers");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused: {}",
-        answer.message()
-    );
-
-    answer
-}
+/// The descriptor the listing consumer last handed back.
+///
+/// A `RecordingDescriptorConsumer` is a plain `fn` pointer — the reference's
+/// consumer is handed a `clientd` and this one cannot be — so a consumer with
+/// somewhere to put things uses a `static`. One listing runs in this file, so one
+/// slot is enough. It is the same shape as the fixture's `SIGNALS` and carries
+/// the same hazard: **a slot belongs to one criterion and is never shared.**
+static LISTED: Mutex<Option<Descriptor>> = Mutex::new(None);
 
 /// One recording descriptor, as a listing session sends it.
 struct Descriptor {
@@ -441,117 +372,35 @@ struct Descriptor {
     stop_position: i64,
 }
 
-/// Ask for one recording's descriptor (10) and decode the answer.
+/// What the listing hands each descriptor to.
+fn take_descriptor(descriptor: &RecordingDescriptor) {
+    *LISTED.lock().expect("the slot is not poisoned") = Some(Descriptor {
+        recording_id: descriptor.recording_id,
+        stream_id: descriptor.stream_id,
+        session_id: descriptor.session_id,
+        stop_position: descriptor.stop_position,
+    });
+}
+
+/// Ask for one recording's descriptor (10).
 ///
-/// The answer is a `RecordingDescriptor` **message** rather than a
-/// `ControlResponse` (`ControlResponseProxy.java:54-89`), which is why this does
-/// not go through `Session::send`: what comes back for that correlation id is
-/// the descriptor itself, and it is read here.
+/// `Archive::list_recording` now. The answer is a `RecordingDescriptor`
+/// **message** rather than a `ControlResponse` (`ControlResponseProxy.java:54-89`),
+/// which is why this never went through `Session::send` — and it is why the
+/// product *hands it to a consumer* instead of returning it, which is the one
+/// shape difference this conversion has to carry: the four fields the criterion
+/// reads are copied out of the borrow the consumer is given.
 fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64) -> Descriptor {
-    let correlation_id = session.next_correlation_id();
-    let control_session_id = session.control_session_id();
-
-    let mut buffer = vec![0u8; 64];
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = ListRecordingRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .recording_id(recording_id);
-
-        body + encoder.encoded_length()
-    };
-    buffer.truncate(length);
+    *LISTED.lock().expect("the slot is not poisoned") = None;
 
     session
-        .send_only(client, &buffer, Instant::now() + DEADLINE)
-        .expect("the archive takes the request");
+        .archive_mut()
+        .list_recording(client, recording_id, take_descriptor)
+        .expect("the archive offers the descriptor");
 
-    archive::await_frame(
-        client,
-        session.response_subscription(),
-        Instant::now() + DEADLINE,
-        |payload| decode_descriptor(payload, correlation_id),
-    )
-    .expect("the archive offers the descriptor")
-}
-
-/// Decode a `RecordingDescriptor` for `correlation_id`, or `None` for anything
-/// else on that channel.
-fn decode_descriptor(payload: &[u8], correlation_id: i64) -> Option<Descriptor> {
-    let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
-
-    if header.template_id() != recording_descriptor_codec::SBE_TEMPLATE_ID {
-        return None;
-    }
-
-    let decoder = RecordingDescriptorDecoder::default().header(header, 0);
-
-    if decoder.correlation_id() != correlation_id {
-        return None;
-    }
-
-    Some(Descriptor {
-        recording_id: decoder.recording_id(),
-        stream_id: decoder.stream_id(),
-        session_id: decoder.session_id(),
-        stop_position: decoder.stop_position(),
-    })
-}
-
-/// The `StartRecordingRequest2` (63) for the channel this test records.
-fn start_recording_request(control_session_id: i64, correlation_id: i64) -> Vec<u8> {
-    let mut buffer = vec![0u8; 256];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .stream_id(RECORDING_STREAM_ID)
-            .source_location(SourceLocation::LOCAL)
-            .auto_stop(BooleanType::FALSE)
-            .channel(RECORDING_CHANNEL.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// The `StopRecordingSubscriptionRequest` (14) for one subscription.
-fn stop_recording_request(
-    control_session_id: i64,
-    correlation_id: i64,
-    subscription_id: i64,
-) -> Vec<u8> {
-    let mut buffer = vec![0u8; 64];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder = StopRecordingSubscriptionRequestEncoder::default()
-            .wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .subscription_id(subscription_id);
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
+    LISTED
+        .lock()
+        .expect("the slot is not poisoned")
+        .take()
+        .expect("the archive offered a descriptor")
 }

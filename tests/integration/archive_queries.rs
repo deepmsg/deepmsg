@@ -40,18 +40,39 @@
 //! session's response channel — the same one a descriptor and a control
 //! response come back on, which is why the reads here filter by correlation id
 //! rather than by message type.
+//!
+//! # Why the listing is still read off the channel by hand
+//!
+//! Plan §2.3's third step is where this file's request sites were to become the
+//! product's named methods, and the listing half of it cannot: what the criteria
+//! here are about is the **answer that ends a page**, and the product keeps no
+//! door onto it. `Archive::list_recordings` hands each descriptor to a consumer
+//! and answers the count (`archive.rs:911-931`); the `RECORDING_UNKNOWN` that
+//! ends the listing is read by the poller, which takes only its existence
+//! (`is_dispatch_complete`, `descriptor_poller.rs:264-268`) — **the reference's
+//! own poller does the same thing** (`aeron_archive_recording_descriptor_poller.c
+//! :194-200`), so this is the product being faithful rather than a gap in it.
+//! The `relevantId` and the code asserted below are on the wire and only there.
+//!
+//! The one call that could not be made either way is ⑤: a listing asked for
+//! **zero** recordings is one the archive ends without answering at all
+//! (`conductor.rs:1489-1493`), and the product's wait is for an answer — so
+//! `Archive::list_recordings(from, 0, …)` would sit out its whole timeout. One
+//! ruler (the fixture reads what the archive sends) covers all the calls here.
+//!
+//! What the product's listing methods are is a criterion of their own, and they
+//! have one: `archive_client_api.rs` and `archive_proxy.rs` drive
+//! `list_recordings` and `list_recordings_for_uri` against this same archive.
+//! Nothing goes uncovered by this file staying on the channel.
 
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
-use deepmsg_codec::archive::boolean_type::BooleanType;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_codec::archive::list_recordings_for_uri_request_codec::ListRecordingsForUriRequestEncoder;
 use deepmsg_codec::archive::list_recordings_request_codec::ListRecordingsRequestEncoder;
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_descriptor_codec::{self, RecordingDescriptorDecoder};
-use deepmsg_codec::archive::source_location::SourceLocation;
-use deepmsg_codec::archive::start_recording_request_2_codec::StartRecordingRequest2Encoder;
 use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
@@ -294,6 +315,29 @@ struct Descriptor {
 /// reference refuses it, and asking again is what a client does with that
 /// answer. What the retry is **not** is a way past a listing that never ended:
 /// one of those is refused every time, and the deadline says so.
+///
+/// # What the retry is keyed on, and why it is not the answer's code
+///
+/// It is keyed on **how many descriptors came back**: a page that answered with
+/// fewer than were asked for is a page to ask again for, and a full one is the
+/// answer. That is deliberately not `code == ERROR`: the `ACTIVE_LISTING`
+/// refusal this loop was written for arrives as an `ERROR`, but so does every
+/// other refusal, and **a `RECORDING_UNKNOWN` does not arrive as one at all**
+/// (`control_response_code.rs`: `ERROR = 1`, `RECORDING_UNKNOWN = 2`).
+///
+/// The difference matters because the archive answers a listing out of the
+/// catalog **as it stands**, and the catalog is written by the archive's own
+/// recording session — a turn or two behind the request that started the
+/// recording. A listing that arrives in that window is answered with the
+/// honest `RECORDING_UNKNOWN` of an empty catalog, and the criterion that is
+/// waiting for its recording has to ask again rather than take that for the
+/// end of the story. Keyed on the count, it does; keyed on the code, it took
+/// the empty answer as final and the caller waited out its whole deadline.
+///
+/// **The count keys it correctly for the three callers that want an empty
+/// page.** ⑤, ⑥ and ⑦ ask for **zero** descriptors and expect the
+/// `RECORDING_UNKNOWN` that comes back — and `0 < 0` is false, so none of them
+/// ever retries. One ruler separates the two cases; no second flag is needed.
 fn ask(
     session: &mut Session,
     client: &mut Client,
@@ -302,7 +346,7 @@ fn ask(
     request: impl Fn(i64) -> Vec<u8>,
 ) -> (Vec<Descriptor>, Option<archive::Response>) {
     let deadline = Instant::now() + DEADLINE;
-    let mut refusals = 0;
+    let mut attempts = 0;
 
     loop {
         let correlation_id = session.next_correlation_id();
@@ -314,17 +358,21 @@ fn ask(
 
         let (page, end) = read_page(session, client, correlation_id, descriptors, terminal);
 
-        match end {
-            Some(refusal) if refusal.code == ControlResponseCode::ERROR => {
-                refusals += 1;
-                assert!(
-                    Instant::now() < deadline,
-                    "the archive refused {refusals} pages running, the last one saying: {}",
-                    refusal.message()
-                );
-            }
-            end => return (page, end),
+        if page.len() >= descriptors {
+            return (page, end);
         }
+
+        attempts += 1;
+        assert!(
+            Instant::now() < deadline,
+            "the archive answered {attempts} pages short, the last one with {} of \
+             {descriptors} descriptors{}",
+            page.len(),
+            match &end {
+                Some(end) => format!(" and {} saying: {}", end.code, end.message()),
+                None => " and no answer at all".to_owned(),
+            }
+        );
     }
 }
 
@@ -394,12 +442,18 @@ fn read_page(
             }
         });
 
-        // A refusal is the end of the request, so there is nothing left to wait
-        // for — the deadline would only make a wrong answer slow.
-        if end
-            .as_ref()
-            .is_some_and(|end| end.code == ControlResponseCode::ERROR)
-        {
+        // **A terminal answer ends the request, whatever its code.** A listing's
+        // descriptors are sent before the answer that ends it, so an answer in
+        // hand means nothing more is coming: waiting for the rest of a page that
+        // was answered short would only make a wrong answer slow.
+        //
+        // **The code used to be tested here** (`== ControlResponseCode::ERROR`)
+        // and that was a hole. A listing the archive answers out of an empty
+        // catalog ends with `RECORDING_UNKNOWN`, which is not `ERROR`
+        // (`control_response_code.rs`: `1` against `2`), so the wait went on to
+        // its deadline with the answer already in hand — and `ask`, which is the
+        // caller that knows to ask again, never got control back to do it.
+        if end.is_some() {
             break;
         }
 
@@ -429,19 +483,19 @@ fn record(session: &mut Session, client: &mut Client, channel: &str, expected: u
         .expect("the publication has a session");
 
     let control_session_id = session.control_session_id();
-    let correlation_id = session.next_correlation_id();
-    let payload = start_recording_request(control_session_id, correlation_id, channel);
 
-    let answer = session
-        .send(client, correlation_id, &payload, Instant::now() + DEADLINE)
+    // `StartRecordingRequest2` (63), which is `Archive::start_recording` now —
+    // the same request this file used to build byte by byte, with its
+    // correlation id drawn from the driver's command ring and a refusal turned
+    // into an error carrying the archive's own text. `LOCAL` is the source
+    // location and `false` the auto-stop, which is what the constructor wrote.
+    //
+    // It is the only request site in this file that moves: see the module doc
+    // on why the listings stay on the channel.
+    session
+        .archive_mut()
+        .start_recording(client, channel, STREAM_ID, true, false)
         .expect("the archive answers a start");
-
-    assert_eq!(
-        ControlResponseCode::OK,
-        answer.code,
-        "the archive refused the recording of {channel}: {}",
-        answer.message()
-    );
 
     publish_and_read(client, publication, reader);
 
@@ -575,32 +629,6 @@ fn list_recordings_for_uri_request(
             .record_count(count)
             .stream_id(stream_id)
             .channel(channel_fragment.as_bytes());
-
-        body + encoder.encoded_length()
-    };
-
-    buffer.truncate(length);
-    buffer
-}
-
-/// The `StartRecordingRequest2` (63) for one channel.
-fn start_recording_request(control_session_id: i64, correlation_id: i64, channel: &str) -> Vec<u8> {
-    let mut buffer = vec![0u8; 256];
-
-    let length = {
-        let body = message_header_codec::ENCODED_LENGTH;
-        let encoder =
-            StartRecordingRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), body);
-        let mut header = encoder.header(0);
-        let mut encoder = header.parent().unwrap();
-
-        encoder
-            .control_session_id(control_session_id)
-            .correlation_id(correlation_id)
-            .stream_id(STREAM_ID)
-            .source_location(SourceLocation::LOCAL)
-            .auto_stop(BooleanType::FALSE)
-            .channel(channel.as_bytes());
 
         body + encoder.encoded_length()
     };
