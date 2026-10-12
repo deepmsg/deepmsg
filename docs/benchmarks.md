@@ -172,7 +172,7 @@ and both sides write the same interval-log files.
 
 | batch | what changes between the rows | what a reading can say |
 |---|---|---|
-| `bench/upstream-c-drivers` | the media driver, three ways: Java, a C control built here, a C build of the changes this tree is asking upstream for | which layer, because exactly one layer moves |
+| `bench/upstream-c-drivers` | the media driver, three ways: Java, a C control built here, a C build of the changes sent upstream in [aeron-io/aeron#2188](https://github.com/aeron-io/aeron/pull/2188) | which layer, because exactly one layer moves |
 | `bench/rust-vs-java` | nothing inside either side — this build's whole stack against the reference's | only how far apart the two systems are, never which layer |
 
     bench/build.sh

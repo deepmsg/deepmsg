@@ -50,8 +50,10 @@ harness revision, the digest of every binary, the core placement — is in
 `docs/benchmarks.md`, which is the file to quote from; the numbers here are the
 headline and nothing else.
 
-The media driver, one layer swapped (this is also the evidence for three C
-driver changes this work is sending upstream):
+The media driver, one layer swapped. This batch is also the evidence behind the
+three C driver changes sent upstream —
+[aeron-io/aeron#2188](https://github.com/aeron-io/aeron/pull/2188), with the
+discussion in [issue #2187](https://github.com/aeron-io/aeron/issues/2187):
 
 | ratio | 101K:1344 | 301K:288 | 501K:32 |
 |---|---|---|---|
