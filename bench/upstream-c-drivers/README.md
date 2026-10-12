@@ -1,7 +1,11 @@
 # The C driver arms
 
 One batch, one question: **what are this tree's three C driver changes worth,
-measured on the reference's own benchmark?**
+measured on the reference's own benchmark?** Those three changes are the
+`c-patched` arm and are sent upstream as
+[aeron-io/aeron#2188](https://github.com/aeron-io/aeron/pull/2188), which refers
+to [issue #2187](https://github.com/aeron-io/aeron/issues/2187) for the
+mechanisms; this batch is the evidence both of them cite.
 
 ```
 bench/build.sh                                   # this build's binaries (only the `c` arm needs nothing)
