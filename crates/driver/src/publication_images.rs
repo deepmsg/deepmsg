@@ -863,4 +863,69 @@ mod tests {
             "`group=false` even where the channel and the setup both say otherwise"
         );
     }
+
+    /// A record for the tests that ask only what the collection's own rules
+    /// make of one.
+    fn record(state: ImageState) -> PublicationImageRecord {
+        PublicationImageRecord {
+            registration_id: 42,
+            session_id: -7,
+            stream_id: 1000,
+            endpoint_id: 3,
+            channel: b"aeron:udp?control=localhost:2000".to_vec(),
+            source_identity: "aeron:udp?control=localhost:2000".to_owned(),
+            path: PathBuf::from("/dev/shm/aeron-gavin/42.logbuffer"),
+            counters: ImageCounters {
+                rcv_hwm: 0,
+                rcv_pos: 0,
+                rcv_naks_sent: 0,
+            },
+            congestion_control_counters: Vec::new(),
+            state,
+            time_of_last_state_change_ns: 0,
+            refcount: 1,
+            setup_flags: 0,
+        }
+    }
+
+    /// Only an image that is still taking packets is handed to a subscription
+    /// that arrives.
+    ///
+    /// The case that made this worth its own question: a subscription that
+    /// **re-joins** after a drop finds the image it was reading still in hand —
+    /// a lingering one, which stays until it reaches `DONE` — and a client
+    /// handed that image reads it as its live image and loses it when the image
+    /// finally goes, which drops it back to replay under a subscription that
+    /// had already recovered.
+    ///
+    /// `Draining` is accepted, which is the one place this is not the
+    /// reference's three clauses: it also asks that the image still has a
+    /// working position and is not yet drained
+    /// (`aeron_publication_image_is_accepting_subscriptions`,
+    /// `aeron-driver/src/main/c/aeron_publication_image.h:318-324`), and the
+    /// positions live with the image in the receiver's thread. A drained image
+    /// leaves `Draining` for `Linger` as it is drained
+    /// (`aeron_publication_image.c:1338-1358`), so the two agree everywhere
+    /// except a drained image still in `Draining` inside the
+    /// `IMAGE_SM_EOS_MULTIPLE` window, where the reference refuses and this
+    /// build accepts.
+    #[test]
+    fn only_an_image_still_taking_packets_is_offered_to_a_subscription() {
+        assert!(
+            record(ImageState::Active).is_accepting_subscriptions(),
+            "an image taking packets is what a subscription is for"
+        );
+        assert!(
+            record(ImageState::Draining).is_accepting_subscriptions(),
+            "one that is draining still has the term the subscription wants"
+        );
+        assert!(
+            !record(ImageState::Linger).is_accepting_subscriptions(),
+            "a lingering image's readers have already been told it is gone"
+        );
+        assert!(
+            !record(ImageState::Done).is_accepting_subscriptions(),
+            "and a done one is on its way out of the collection"
+        );
+    }
 }
