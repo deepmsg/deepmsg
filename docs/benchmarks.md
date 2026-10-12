@@ -192,8 +192,9 @@ sign survived the reversal.
 
 Every rule the tables above are read by applies here too, and two more: a ratio
 is read only when both rounds agree in sign, and a difference inside the floor
-(each row against itself across the two rounds) is not a difference. The second
-batch has not been run yet; the first one has.
+(each row against itself across the two rounds) is not a difference. Both
+batches have been run, and the second one's table is at the end of this
+section.
 
 ### The C driver's receive path, against the unpatched driver and the Java one
 
@@ -269,3 +270,70 @@ would compare against a compiler and an era as well.
 
 The histograms, the fingerprint file and the run's own record are in
 `bench/out/upstream-c-drivers/<date>-<host>/` (ignored by git).
+
+### This build's whole stack, against the reference's
+
+    bench/build.sh
+    bench/rust-vs-java/run-batch.sh
+
+Two arms, neither of them a swap inside itself. The Java arm is the harness's
+own `media-driver`, its `echo-client` (the `LoadTestRig` over
+`EchoMessageTransceiver`) and its `echo-server` (the reference's `EchoNode`).
+The Rust arm is this tree's `deepmsg-driver`, its `loadtest-rig` and its
+`echo-node`, built by `bench/build.sh` at the profile they are measured under.
+
+`E[X | X < p99]`, nanoseconds, `round 1 / round 2`; one run of 60 s per cell
+(30 s warmup at 25K), the second round with the two stacks in reversed order:
+
+| tier | `java` | `rust` | `rust / java` | verdict |
+|---|---|---|---|---|
+| 25K:32 | 5999 / 5982 | 5895 / 5794 | 0.983 / 0.969 | same sign |
+| 101K:1344 | 6738 / 6835 | 6812 / 6747 | 1.011 / 0.987 | **sign flips** |
+| 301K:288 | 8186 / 8167 | 8032 / 8021 | 0.981 / 0.982 | same sign |
+| 501K:32 | 8398 / 8418 | 8364 / 8371 | 0.996 / 0.995 | same sign |
+
+The floor — each stack against itself between the two rounds — is 1.7% for the
+Rust arm at 25K, 1.4% and 0.95% for the Java and Rust arms at 101K, and under
+0.3% in the five other cells. Read each cell against its own floor, and then
+against the worst floor in the table, which is 1.7%:
+
+- **301K:288** is 1.8% faster in both rounds, against a cell floor of 0.23% or
+  less. This is the one tier where the difference is larger than any floor in
+  the table.
+- **501K:32** is 0.4% and 0.6%, the same sign, against a cell floor of 0.23%:
+  outside its own cell's floor, inside the table's worst.
+- **25K:32** agrees in sign (1.7% and 3.2%) against the Rust arm's own 1.7% drift
+  at that tier — one to two times its own floor.
+- **101K:1344** flips sign between the two rounds, so nothing is read there at
+  all.
+
+So this batch reads a difference of about 1.8% at one tier, two tiers small
+enough to be argued either way, and nothing at the fourth — which is what a
+whole-stack comparison at this resolution is able to say, and no more.
+
+**The two sides are not the same Aeron version, and this batch does not separate
+that from the implementations.** This build targets byte-level compatibility
+with Aeron 1.53.2 (`docs/adr/0001`); the Java arm is the harness's own
+dependency, Aeron 1.53.3. Nothing breaks — the two arms never talk to each
+other, each being a driver, a client and a node from one side — but the ratio
+carries a version difference that was not measured on its own, and it should be
+read as the one known unknown in the table.
+
+**The fingerprint.** The machine, toolchain, core placement and driver settings
+are the ones in the section above, with one difference: this batch is the one
+that has to pin the three throughput knobs, because it compares whole stacks
+rather than one layer, so both sides are handed
+`bench/lib/conf/benchmark.properties` (the aligned values) on top of the
+harness's own. The harness is the same checkout at `1b11bfc` with the same four
+paths changed. This build's three binaries, by digest:
+
+| binary | digest |
+|---|---|
+| `deepmsg-driver` | `d0cfdb4a…` |
+| `loadtest-rig` | `adc4b5e9…` |
+| `echo-node` | `577ff8fc…` |
+
+They are this tree at `b7d8d1f`, which is `main` plus this section's own commits
+— a different node and rig from any earlier session's, so this table may not be
+read against one of those even by direction alone. The histograms and the
+record are in `bench/out/rust-vs-java/<date>-<host>/` (ignored by git).
