@@ -55,14 +55,10 @@ use crate::udp_channel::UdpChannel;
 /// `recv_buffers.vector_capacity`, set from `receiver_io_vector_capacity` at
 /// `:47`); in the **Java** driver it is read nowhere at all and the poll takes
 /// one datagram per transport (`media/DataTransportPoller.java:222-225`). This
-/// build keeps the pool the size the setting asks for and reads one, which is
-/// Java's cadence over C's allocation.
+/// build keeps the pool the size the setting asks for **and reads it**, which
+/// is the C driver's cadence — the one the reference's authority rule picks
+/// where the two disagree.
 pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT;
-
-/// How many datagrams one receive poll takes from one destination, which is
-/// one — the Java driver's shape. See the call site for why a burst is not
-/// paced by it.
-const DATAGRAMS_PER_POLL: usize = 1;
 
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
@@ -1333,19 +1329,20 @@ impl ReceiverThread {
         let mut work = Self::receive_datagrams(
             &mut self.endpoints,
             &mut self.images,
-            // One datagram per destination per pass, which is the reference's
-            // **Java** shape: its poller reads each transport once into a
-            // preallocated buffer (`media/DataTransportPoller.java:222-225`),
-            // where the C driver reads `recv_buffers.vector_capacity` at a
-            // time (`aeron_driver_receiver.c:127`). The pool below is still
-            // sized by `aeron.receiver.io.vector.capacity`, as both references
-            // size theirs; only the first entry is ever filled.
+            // `aeron.receiver.io.vector.capacity` datagrams per destination per
+            // pass — the whole pool, because that is the `vlen` the **C**
+            // driver's poll reads with (`aeron_driver_receiver.c:127` reads
+            // `recv_buffers.vector_capacity`).
             //
-            // What keeps a burst from being paced by this is that a pass reads
-            // *every* ready destination, so the drain rate is the pass rate
-            // times the destination count — 676,000 a second at 501K against
-            // the 500,000 arriving.
-            &mut self.buffers[..DATAGRAMS_PER_POLL],
+            // One datagram per pass is the **Java** driver's shape
+            // (`media/DataTransportPoller.java:222-225`) and it is *not* what
+            // this build does, deliberately: a burst delivered by the sender as
+            // one datagram per frame was then drained one frame per pass, which
+            // paces the arrival of a flood to the receiver's pass rate and
+            // starves the flow control of the over-run it is supposed to
+            // detect. Four datagrams a pass is the C driver's cadence, and only
+            // this pool's length is what decides it.
+            &mut self.buffers,
             &mut self.datagrams,
             &mut self.poller,
             &mut self.readable,
