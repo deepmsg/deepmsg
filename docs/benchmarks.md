@@ -192,6 +192,78 @@ sign survived the reversal.
 
 Every rule the tables above are read by applies here too, and two more: a ratio
 is read only when both rounds agree in sign, and a difference inside the floor
-(each arm against itself across the two rounds) is not a difference. No table
-from either batch is in this file yet — they are put here with the command that
-produced them and the fingerprint they ran on, and not before.
+(each arm against itself across the two rounds) is not a difference. The second
+batch has not been run yet; the first one has.
+
+### The C driver's receive path, against the unpatched driver and the Java one
+
+    bench/build.sh
+    bench/upstream-c-drivers/build-c-driver.sh c-control upstream/master
+    bench/upstream-c-drivers/build-c-driver.sh c-patched driver/c-driver-receive-path
+    bench/upstream-c-drivers/patches/install.sh --apply
+    bench/upstream-c-drivers/run-batch.sh
+
+`E[X | X < p99]`, nanoseconds, `round 1 / round 2`; three runs of 60 s per cell
+(30 s warmup at 25K), the second round with the arms reversed:
+
+| arm | 101K:1344 | 301K:288 | 501K:32 |
+|---|---|---|---|
+| `java` — the harness's own Java driver | 6690 / 6739 | 8170 / 8134 | 8369 / 8374 |
+| `c`, unpatched — built here | 7124 / 7216 | 8377 / 8324 | 8774 / 8779 |
+| `c`, patched — the three changes | **6442 / 6440** | **7850 / 7902** | **8112 / 8103** |
+| **patched / unpatched** | 0.904 / 0.892 | 0.937 / 0.949 | 0.925 / 0.923 |
+| **patched / java** | 0.963 / 0.956 | 0.961 / 0.972 | 0.969 / 0.968 |
+| unpatched / java | 1.065 / 1.071 | 1.025 / 1.023 | 1.048 / 1.048 |
+
+All nine ratios agree in sign across the reversal, and the floor — each arm
+against itself between the two rounds — is at most 1.3%, and under 0.7% in seven
+of the nine cells. Every effect below is at least twice the floor it sits on.
+Read on the ratios:
+
+- before these changes, this driver's receive path was **2.3–7.1% slower than the
+  Java driver's** at these tiers;
+- with them it is **2.9–4.4% faster than the Java driver's**, in every tier and
+  both rounds;
+- against the unpatched driver built from the same source, by the same script,
+  with the same compiler, the three commits are worth **5.1–10.8%**.
+
+The unpatched arm is a build of the revision the changes apply to (`dd7c56c7`),
+made by the same script with the same cmake and the same compiler as the patched
+one (`da361c17`): the only difference between those two rows is the three
+commits. It is deliberately **not** the C binaries the harness checks in, which
+are a build of some other source at some other time — comparing against those
+would compare against a compiler and an era as well.
+
+**The fingerprint.**
+
+- **Machine** Intel i7-9700K, 8 cores, no SMT, one socket, 31 GiB; Ubuntu 24.04.4;
+  kernel 7.0.0-38-generic; governor `performance`, turbo enabled.
+- **Toolchain** gcc 13.3.0; cmake 4.3.4 (the one the upstream work area's own
+  `cppbuild` installs); OpenJDK 21.0.12.1; the harness built by its own Gradle
+  build.
+- **Harness** `aeron-io/benchmarks` at `1b11bfc` (its `master`), a clean
+  checkout, with exactly four paths changed by this tree and nothing else:
+  `scripts/remote-benchmarks-runner` and
+  `scripts/aeron/remote-echo-single-host-benchmarks`, which carry the two
+  patches, and the two launchers `scripts/aeron/c-media-driver-c-control` and
+  `…-c-patched`. Its Java side is the harness's own dependency, Aeron 1.53.3.
+- **Arms** `c-control` from `dd7c56c7` (`upstream/master`,
+  `libaeron_driver.so` `6059b663…`), `c-patched` from `da361c17`
+  (`driver/c-driver-receive-path`, `a7d70356…`); both were rebuilt from those
+  revisions afterwards and came out bit-identical, which is what says the builds
+  that ran are the builds those revisions produce. The Java arm is the harness's
+  own driver.
+- **Grid and placement** 501K↔32, 301K↔288, 101K↔1344 at mtu 1408; the driver's
+  conductor, sender and receiver on cores 1, 2 and 3, the echo node on 4, the
+  client on 5, cores 6 and 7 for the JVMs' own threads, core 0 left to the kernel
+  and the network softirq; UDP on 127.0.0.1:13000 and :13100.
+- **Driver settings** the harness writes these per run, and all three arms are
+  handed the same file: `max.messages.per.send=2`,
+  `receiver.io.vector.capacity=2`, `sender.io.vector.capacity=2`. Those are the
+  harness's own single-host defaults, and being identical across the arms is the
+  only thing that matters here — this batch compares drivers, not
+  configurations. The other batch, the two whole stacks, is the one that has to
+  pin those three knobs to what this build hard-codes.
+
+The histograms, the fingerprint file and the run's own record are in
+`bench/out/upstream-c-drivers/<date>-<host>/` (ignored by git).
