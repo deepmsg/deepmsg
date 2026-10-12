@@ -103,7 +103,13 @@ pub struct MarkFile {
 }
 
 impl MarkFile {
-    /// Create a file of `length` bytes and map it, replacing one that is there.
+    /// Create a file of `length` bytes and map it, **refusing to replace one
+    /// that is there** — `O_EXCL`, so [`MarkFileError::Io`] with
+    /// [`io::ErrorKind::AlreadyExists`] is what a second start over the same
+    /// directory meets.
+    ///
+    /// A caller starting up wants [`MarkFile::open_or_create`] instead; this one
+    /// is for a caller that must know whether it is the first.
     ///
     /// The bytes are zero, and a zero version means "created but not
     /// initialised" to every reader — including [`MarkFile::is_active`]'s
