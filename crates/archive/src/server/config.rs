@@ -453,13 +453,18 @@ impl ArchiveConfig {
         };
 
         let archive_id = match get(settings::ARCHIVE_ID) {
-            // -1 is the reference's "not told", and it resolves to the Aeron
-            // client's id — which is not known until there is a client, so it
-            // stays unresolved here.
+            // Absent is "not told", which the archive runs as
+            // [`ARCHIVE_ID_DEFAULT`]. **A configured id is an id whatever its
+            // sign**: the reference parses this property as a long and tests
+            // nothing about it (`Archive.Configuration.archiveId`,
+            // `Archive.java:1051-1058`), and its own suite runs a *destination*
+            // archive as `-7777` (`aeron_archive_test.cpp:452`) and asserts the
+            // id it reports back (`:2659`). Dropping negatives here made that
+            // archive answer `-1` instead — a whole family of criteria red
+            // before their first request, which is how it was found.
             None => None,
             Some(value) => match value.parse::<i64>() {
-                Ok(id) if id >= 0 => Some(id),
-                Ok(_) => None,
+                Ok(id) => Some(id),
                 Err(_) => {
                     return Err(ConfigError::InvalidValue {
                         name: settings::ARCHIVE_ID.to_owned(),
@@ -744,6 +749,34 @@ mod tests {
             ("aeron.archive.segment.file.length", "131072"),
             ("aeron.archive.recording.events.enabled", "false"),
         ])
+    }
+
+    /// **A negative archive id is an id.**
+    ///
+    /// The reference parses `aeron.archive.id` as a long and asks nothing about
+    /// its sign (`Archive.Configuration.archiveId`, `Archive.java:1051-1058`),
+    /// and its own suite relies on that: the *destination* archive of the
+    /// replication criteria is started as `-7777` (`aeron_archive_test.cpp:452`)
+    /// and the criteria assert that the id comes back (`:2659`, `:2793`,
+    /// `:2910`). Dropping negatives — which this resolver used to do, reading
+    /// "`-1` is not told" as "no negative is told" — made that archive answer
+    /// `-1`, and all four criteria failed in their setup before sending a single
+    /// request.
+    #[test]
+    fn a_negative_archive_id_is_taken_as_given() {
+        for id in ["-7777", "-1"] {
+            let mut properties = archive_defaults();
+            properties.retain(|(property, _)| property != settings::ARCHIVE_ID);
+            properties.push((settings::ARCHIVE_ID.to_owned(), id.to_owned()));
+
+            let config = ArchiveConfig::resolve(&properties).expect("resolves");
+
+            assert_eq!(
+                Some(id.parse::<i64>().expect("a number")),
+                config.archive_id,
+                "the id `{id}` is what the archive was told it is"
+            );
+        }
     }
 
     #[test]

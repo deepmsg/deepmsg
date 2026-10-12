@@ -374,8 +374,27 @@ impl Archive {
         }
     }
 
-    /// What a finished connect assembled.
-    fn from_connected(context: ArchiveContext, connected: Connected, handlers: Handlers) -> Self {
+    /// What a finished connect assembled — the **non-blocking** way to an
+    /// `Archive`.
+    ///
+    /// [`Self::connect`] is the blocking face of [`AsyncConnect`]: it owns the
+    /// loop, drives the client and does not come back until the connect is over.
+    /// A caller that must keep its own clock cannot use it — it has to poll the
+    /// connect itself, one turn at a time, and build the archive from what
+    /// [`Polled::Done`] hands back. **That caller is the reference's replication
+    /// session** (`ReplicationSession.java:407`, an `asyncConnect` polled from
+    /// the conductor's work cycle), and this is the door it comes through.
+    ///
+    /// It is public for the same reason [`AsyncConnect`] and [`Connected`] are:
+    /// they are the polling face of this client, and a public `Connected` with
+    /// no public way to become an `Archive` would be a type nobody could finish
+    /// using.
+    #[must_use]
+    pub fn from_connected(
+        context: ArchiveContext,
+        connected: Connected,
+        handlers: Handlers,
+    ) -> Self {
         let recording_descriptor_poller = RecordingDescriptorPoller::new(
             connected.subscription,
             connected.control_session_id,
@@ -430,10 +449,49 @@ impl Archive {
         self.subscription
     }
 
-    /// The proxy, for a caller that needs to send something itself.
+    /// The proxy, to read what the session was opened with.
     #[must_use]
     pub const fn proxy(&self) -> &ArchiveProxy {
         &self.proxy
+    }
+
+    /// The proxy, **mutably** — for a caller that sends something itself.
+    ///
+    /// Every method on this type is a *named* request and every one of them
+    /// offers and then waits (`offer_and_wait`), which is the shape a caller
+    /// that wants one answer needs and the wrong shape for one that must keep
+    /// its own clock: [`crate::client::proxy`]'s encoders write into a reused
+    /// buffer and need `&mut`, and what a poll-driven caller does with them is
+    /// offer now and read the answer in a later turn.
+    ///
+    /// **The reference's replication session is exactly that caller**
+    /// (`ReplicationSession.java`: it reaches for `archiveProxy().listRecording`,
+    /// `getRecordingPosition`, `replay` and `stopReplay` directly rather than
+    /// the high-level calls), and it is why this door exists: without it a
+    /// session that runs inside a conductor's turn has no way to send a request
+    /// and stay non-blocking. The fixture has needed the same thing since it
+    /// existed — see `tests/src/archive.rs`'s `Session::send_only`, which
+    /// touches the publication because there was nowhere to hand it a payload.
+    ///
+    /// Correlation ids come from [`Self::next_correlation_id`], which is what
+    /// the proxy's encoders take as an argument.
+    #[must_use]
+    pub const fn proxy_mut(&mut self) -> &mut ArchiveProxy {
+        &mut self.proxy
+    }
+
+    /// The descriptor poller, for a caller that drives a listing itself.
+    ///
+    /// [`Self::proxy_mut`]'s twin, and needed for the same caller: every
+    /// listing on this type is the **blocking** wrapper
+    /// ([`Self::poll_for_descriptors`]), which resets the poller, polls it and
+    /// loops to a deadline. The reference's replication session does neither —
+    /// it resets the poller with its own correlation id and polls it a turn at
+    /// a time (`ReplicationSession.java:454`, `:471`) — and this is the door it
+    /// comes through. The poller's own API is the rest of it.
+    #[must_use]
+    pub const fn descriptor_poller_mut(&mut self) -> &mut RecordingDescriptorPoller {
+        &mut self.recording_descriptor_poller
     }
 
     /// Leave, and tell the archive so (`aeron_archive_close`, `:347-386`).
@@ -575,6 +633,86 @@ impl Archive {
                 return Ok(self.control_response_poller.relevant_id());
             }
         }
+    }
+
+    /// Poll the control channel **once** and answer the `relevantId` of the
+    /// response to `correlation_id`, or `None` while none has arrived
+    /// (`ReplicationSession.hasResponse`, `:902-914`).
+    ///
+    /// The non-blocking half of [`Self::wait_for_response`], and the reason it
+    /// exists: a replication session runs inside the archive's own turn and
+    /// cannot wait for anything — the turn it waits in is the turn that would
+    /// drive the client. What it can do is look once per turn, which is what the
+    /// reference's session does: `hasResponse` is a test on the poller, not a
+    /// loop.
+    ///
+    /// Two differences from the blocking face, and both are the reference's:
+    ///
+    /// * an answer for another session, or for another correlation id, is
+    ///   walked past and reads as `None` — it is somebody else's traffic on a
+    ///   shared subscription, not this caller's failure;
+    /// * an `ERROR` for **this** correlation id is the source refusing, and it
+    ///   is an error here: the reference throws the archive exception straight
+    ///   out of `hasResponse` (`:907-910`) and the caller's `catch` turns it
+    ///   into the state's failure.
+    ///
+    /// A recording signal on the same subscription is dispatched as it is
+    /// everywhere else this poller is read, and reads as `None`: a signal is not
+    /// an answer to a request.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchiveError::Refused`] when the source answered `ERROR` for this
+    /// correlation id, [`ArchiveError::UnexpectedCode`] when it answered
+    /// something that is neither, and [`ArchiveError::Malformed`] when what
+    /// arrived was not an archive message.
+    pub fn poll_for_response(
+        &mut self,
+        client: &mut Client,
+        correlation_id: i64,
+    ) -> Result<Option<i64>, ArchiveError> {
+        self.control_response_poller
+            .poll(client)
+            .map_err(map_poller_error)?;
+
+        if self.control_response_poller.is_poll_complete()
+            && self.control_response_poller.is_recording_signal()
+            && self.control_response_poller.control_session_id() == self.control_session_id
+        {
+            self.dispatch_recording_signal();
+
+            return Ok(None);
+        }
+
+        if !self.control_response_poller.is_poll_complete()
+            || self.control_response_poller.control_session_id() != self.control_session_id
+        {
+            return Ok(None);
+        }
+
+        let poller_correlation = self.control_response_poller.correlation_id();
+
+        if self.control_response_poller.is_code_error() {
+            if poller_correlation == correlation_id {
+                return Err(self.refused(correlation_id));
+            }
+
+            self.handle_error_with_handler(client);
+
+            return Ok(None);
+        }
+
+        if poller_correlation != correlation_id {
+            return Ok(None);
+        }
+
+        if !self.control_response_poller.is_code_ok() {
+            return Err(ArchiveError::UnexpectedCode(code_value(
+                self.control_response_poller.code(),
+            )));
+        }
+
+        Ok(Some(self.control_response_poller.relevant_id()))
     }
 
     /// The same, for a caller that **expects** one error (`:147-215`).
@@ -751,10 +889,10 @@ impl Archive {
         operation_name: &str,
         correlation_id: i64,
         record_count: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         self.recording_descriptor_poller
-            .reset(correlation_id, record_count, consumer);
+            .reset(correlation_id, record_count);
 
         let mut deadline = Instant::now() + self.operation_timeout();
         let mut previous_remaining = record_count;
@@ -762,7 +900,7 @@ impl Archive {
         loop {
             let fragments = self
                 .recording_descriptor_poller
-                .poll(client)
+                .poll(client, &mut *consumer)
                 .map_err(map_poller_error)?;
 
             let remaining = self.recording_descriptor_poller.remaining_record_count();
@@ -817,13 +955,10 @@ impl Archive {
         operation_name: &str,
         correlation_id: i64,
         subscription_count: i32,
-        consumer: RecordingSubscriptionDescriptorConsumer,
+        consumer: RecordingSubscriptionDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
-        self.recording_subscription_descriptor_poller.reset(
-            correlation_id,
-            subscription_count,
-            consumer,
-        );
+        self.recording_subscription_descriptor_poller
+            .reset(correlation_id, subscription_count);
 
         let mut deadline = Instant::now() + self.operation_timeout();
         let mut previous_remaining = subscription_count;
@@ -831,7 +966,7 @@ impl Archive {
         loop {
             let fragments = self
                 .recording_subscription_descriptor_poller
-                .poll(client)
+                .poll(client, &mut *consumer)
                 .map_err(map_poller_error)?;
 
             let remaining = self
@@ -917,7 +1052,7 @@ impl Archive {
         client: &mut Client,
         from_recording_id: i64,
         record_count: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -949,7 +1084,7 @@ impl Archive {
         &mut self,
         client: &mut Client,
         recording_id: i64,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -979,7 +1114,7 @@ impl Archive {
         record_count: i32,
         channel_fragment: &str,
         stream_id: i32,
-        consumer: RecordingDescriptorConsumer,
+        consumer: RecordingDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 
@@ -1023,7 +1158,7 @@ impl Archive {
         subscription_count: i32,
         channel_fragment: &str,
         stream_id: Option<i32>,
-        consumer: RecordingSubscriptionDescriptorConsumer,
+        consumer: RecordingSubscriptionDescriptorConsumer<'_>,
     ) -> Result<i32, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
 

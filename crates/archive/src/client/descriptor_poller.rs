@@ -105,12 +105,22 @@ pub struct RecordingDescriptor {
 
 /// What a listing does with each descriptor it reads.
 ///
-/// A plain function pointer, like [`crate::client::archive::ErrorHandler`]: the
-/// reference's consumer gets a `clientd` and this one cannot, so a consumer with
-/// state uses a `static`. The descriptor is borrowed — a consumer must copy what
-/// it wants to keep, which is what the reference's `aeron_free` after the call
-/// says in C.
-pub type RecordingDescriptorConsumer = fn(&RecordingDescriptor);
+/// **Borrowed and mutable, so that a consumer can be an object.** The reference's
+/// consumer is a function pointer plus a `void *clientd`
+/// (`aeron_archive_recording_descriptor_poller_create`), and the `clientd` half
+/// is the whole of what makes its `ReplicationSession` possible: that class
+/// **implements** `RecordingDescriptorConsumer` and carries the state on `this`
+/// (`ReplicationSession.java:53`, its `onRecordingDescriptor` at `:295`). A plain
+/// `fn` here meant every stateful consumer smuggled its state through a `static`
+/// — which is what the criteria did, one slot each, and what made a slot shared
+/// between two of them a real defect. `&mut dyn FnMut` is the `clientd` half in
+/// Rust, and `&mut` rather than a box keeps it borrowable from the caller's own
+/// stack.
+///
+/// The descriptor is handed over **for the length of the call**: a consumer must
+/// copy what it wants to keep, which is what the reference's `aeron_free` after
+/// the call says in C.
+pub type RecordingDescriptorConsumer<'a> = &'a mut dyn FnMut(&RecordingDescriptor);
 
 /// Reads a listing, one descriptor at a time.
 #[derive(Debug)]
@@ -125,8 +135,10 @@ pub struct RecordingDescriptorPoller {
     correlation_id: i64,
     /// How many more descriptors the caller is waiting for (`:61`).
     remaining_record_count: i32,
-    /// Where each one goes.
-    consumer: Option<RecordingDescriptorConsumer>,
+    /// What this turn read, handed to the caller's consumer when the turn is
+    /// over. Reused between polls, so a listing does not allocate one per
+    /// descriptor.
+    pending: Vec<RecordingDescriptor>,
     /// Where recording signals go while a listing is running.
     signal_handler: crate::client::archive::RecordingSignalHandler,
     /// The listing is over (`:62`) — either the count ran out or the archive
@@ -152,7 +164,7 @@ impl RecordingDescriptorPoller {
             fragment_limit,
             correlation_id: -1,
             remaining_record_count: 0,
-            consumer: None,
+            pending: Vec::new(),
             signal_handler,
             is_dispatch_complete: false,
             error_on_message: false,
@@ -161,16 +173,11 @@ impl RecordingDescriptorPoller {
 
     /// Arm it for one listing (`aeron_archive_recording_descriptor_poller_reset`,
     /// `:86-100`).
-    pub fn reset(
-        &mut self,
-        correlation_id: i64,
-        record_count: i32,
-        consumer: RecordingDescriptorConsumer,
-    ) {
+    pub fn reset(&mut self, correlation_id: i64, record_count: i32) {
         self.error_on_message = false;
         self.correlation_id = correlation_id;
         self.remaining_record_count = record_count;
-        self.consumer = Some(consumer);
+        self.pending.clear();
         self.is_dispatch_complete = false;
     }
 
@@ -207,15 +214,29 @@ impl RecordingDescriptorPoller {
     ///
     /// [`ControlResponseError`] when a message on the subscription was
     /// malformed.
-    pub fn poll(&mut self, client: &mut Client) -> Result<usize, ControlResponseError> {
+    pub fn poll(
+        &mut self,
+        client: &mut Client,
+        consumer: RecordingDescriptorConsumer<'_>,
+    ) -> Result<usize, ControlResponseError> {
         if self.is_dispatch_complete {
             self.is_dispatch_complete = false;
         }
+
+        self.pending.clear();
 
         let subscription = self.subscription;
         let fragment_limit = self.fragment_limit;
 
         let fragments = client.poll_subscription_controlled(subscription, fragment_limit, self);
+
+        // **Hand over what the turn read before answering an error it found.**
+        // A descriptor that arrived ahead of a malformed message was delivered
+        // by the reference too — its consumer is called inside the scan — so
+        // holding these back would lose a descriptor the caller is owed.
+        for descriptor in &self.pending {
+            consumer(descriptor);
+        }
 
         if self.error_on_message {
             return Err(ControlResponseError::MalformedMessage);
@@ -334,9 +355,7 @@ impl ControlledHandler for RecordingDescriptorPoller {
                     .into_owned(),
                 };
 
-                if let Some(consumer) = self.consumer {
-                    consumer(&recording);
-                }
+                self.pending.push(recording);
 
                 self.remaining_record_count -= 1;
                 if 0 == self.remaining_record_count {

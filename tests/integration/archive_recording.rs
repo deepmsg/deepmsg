@@ -395,7 +395,7 @@ fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64)
 
     session
         .archive_mut()
-        .list_recording(client, recording_id, take_descriptor)
+        .list_recording(client, recording_id, &mut take_descriptor)
         .expect("the archive offers the descriptor");
 
     LISTED

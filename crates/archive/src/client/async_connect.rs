@@ -124,8 +124,20 @@ pub trait Credentials {
     /// What to send with the connect request.
     fn encoded(&mut self) -> Vec<u8>;
 
-    /// What to send in answer to `challenge`.
-    fn on_challenge(&mut self, challenge: &[u8]) -> Vec<u8>;
+    /// What to send in answer to `challenge` — or the reason it cannot be
+    /// answered.
+    ///
+    /// The reference's suppliers **throw** here, and for one of them that is the
+    /// whole of its answer: a replication's
+    /// (`ReplicationCredentialsSupplier.onChallenge`, `:35-38`) says
+    /// "Replication does not support challenge/response authentication" and the
+    /// connect ends there. A `Vec` cannot say that, so the refusal is the error
+    /// arm.
+    ///
+    /// # Errors
+    ///
+    /// The supplier's own words, which [`ConnectError::Refused`] carries on.
+    fn on_challenge(&mut self, challenge: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 /// A caller with nothing to prove, which is the common case.
@@ -137,18 +149,53 @@ impl Credentials for NoCredentials {
         Vec::new()
     }
 
-    fn on_challenge(&mut self, _challenge: &[u8]) -> Vec<u8> {
-        Vec::new()
+    fn on_challenge(&mut self, _challenge: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// The credentials a **replication** carries to its source
+/// (`ReplicationCredentialsSupplier.java:21-39`): the bytes the replication
+/// request named, offered as they are, and **no challenge answered at all**.
+///
+/// The reference builds one on the context its session connects with, and only
+/// when the request carried something (`ArchiveConductor.java:1443-1446`: an
+/// empty `encodedCredentials` leaves the context's own supplier alone). The
+/// second half is not an oversight on its part and is copied rather than
+/// improved: a replication's credentials are the caller's, and a session that
+/// answered a challenge would be inventing an answer the caller never gave.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationCredentials {
+    encoded: Vec<u8>,
+}
+
+impl ReplicationCredentials {
+    /// The credentials a replication request carried.
+    #[must_use]
+    pub fn new(encoded: Vec<u8>) -> Self {
+        Self { encoded }
+    }
+}
+
+impl Credentials for ReplicationCredentials {
+    fn encoded(&mut self) -> Vec<u8> {
+        self.encoded.clone()
+    }
+
+    fn on_challenge(&mut self, _challenge: &[u8]) -> Result<Vec<u8>, String> {
+        Err("Replication does not support challenge/response authentication".to_owned())
     }
 }
 
 /// Everything a completed connect assembled, for whoever builds an `Archive`.
 ///
 /// The reference hands these to `aeron_archive_create` inside
-/// `transition_to_done`; here they are the answer, and [`Archive::connect`] —
-/// which holds the handlers a recording-descriptor poller is built with — is
-/// what consumes them. **This type is that seam and stays one**: see the module
-/// note for why the split is forced rather than provisional.
+/// `transition_to_done`; here they are the answer, and the layer that holds the
+/// handlers a recording-descriptor poller is built with — [`Archive::connect`]
+/// for a caller that can afford to block, [`Archive::from_connected`] for one
+/// that cannot — is what consumes them. **This type is that seam and stays
+/// one**: see the module note for why the split is forced rather than
+/// provisional.
 #[derive(Debug)]
 pub struct Connected {
     /// The response channel's subscription, which the poller reads.
@@ -481,10 +528,21 @@ impl AsyncConnect {
                             .set_control_session_id(self.control_session_id);
 
                         if poller.was_challenged() {
-                            self.challenge_credentials =
-                                credentials.on_challenge(poller.encoded_challenge());
-                            self.state = ConnectState::SendChallengeResponse;
-                            Step::Awaiting
+                            // A supplier that will not answer ends the connect
+                            // here — the reference's `onChallenge` throws, and
+                            // what the caller sees is the exception's own words
+                            // (`ReplicationCredentialsSupplier.java:35-38`).
+                            match credentials.on_challenge(poller.encoded_challenge()) {
+                                Ok(answer) => {
+                                    self.challenge_credentials = answer;
+                                    self.state = ConnectState::SendChallengeResponse;
+
+                                    Step::Awaiting
+                                }
+                                Err(refusal) => {
+                                    Step::Failed(ConnectError::Refused { message: refusal })
+                                }
+                            }
                         } else if !poller.is_code_ok() {
                             let close = self
                                 .proxy
@@ -756,4 +814,41 @@ fn should_replace_wildcard_port(uri: &ChannelUri) -> bool {
 
     uri.get(ENDPOINT_KEY)
         .is_some_and(|endpoint| endpoint.ends_with(":0"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A replication's credentials are offered, and a challenge is refused.**
+    ///
+    /// The two halves of `ReplicationCredentialsSupplier` (`:30-38`), which is
+    /// the whole of what a replication carries to its source. The refusal's
+    /// **wording** is the reference's and is asserted as it is: it is what a
+    /// caller sees when the far end asks a question the reference will not
+    /// answer, and the exception's text is the message
+    /// (`ReplicationCredentialsSupplier.java:37`).
+    #[test]
+    fn a_replication_offers_its_credentials_and_refuses_a_challenge() {
+        let mut credentials = ReplicationCredentials::new(b"admin:admin".to_vec());
+
+        assert_eq!(
+            b"admin:admin".to_vec(),
+            credentials.encoded(),
+            "the bytes the request named, offered as they are"
+        );
+
+        assert_eq!(
+            Err("Replication does not support challenge/response authentication".to_owned()),
+            credentials.on_challenge(b"challenge!"),
+            "and no challenge answered at all — not an empty answer, a refusal"
+        );
+
+        // A caller with nothing to prove is the other side of the same coin:
+        // it offers nothing and answers with nothing, which is not a refusal.
+        let mut nothing = NoCredentials;
+
+        assert!(nothing.encoded().is_empty());
+        assert_eq!(Ok(Vec::new()), nothing.on_challenge(b"challenge!"));
+    }
 }

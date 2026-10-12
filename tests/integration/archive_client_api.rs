@@ -55,7 +55,7 @@ use deepmsg_archive::client::archive::{
 };
 use deepmsg_archive::client::context::{CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV};
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
-use deepmsg_archive::client::proxy::ReplayParams;
+use deepmsg_archive::client::proxy::{ReplayParams, ReplicationParams};
 use deepmsg_archive::client::subscription_descriptor_poller::RecordingSubscriptionDescriptor;
 use deepmsg_archive::client::{ArchiveContext, NoCredentials, archive_to_client_error_code};
 use deepmsg_client::client::Client;
@@ -68,6 +68,22 @@ use deepmsg_tests::temp::TempDir;
 /// world is on it.
 const RECORDING_CHANNEL: &str = "aeron:ipc?alias=client-api";
 const RECORDING_STREAM_ID: i32 = 4213;
+
+/// `Aeron.NULL_POSITION`, which a **live** recording's stop position is — so
+/// this is the test that tells a recording still in flight from one that has
+/// stopped.
+const NULL_POSITION: i64 = -1;
+
+/// The source a replication is asked to copy **from**. Nothing reads these
+/// until the session walks, so they are a shape rather than a subject: what the
+/// four criteria below are about is the answer, not the copy.
+const SRC_RECORDING_ID: i64 = 7;
+const SRC_CONTROL_STREAM_ID: i32 = 10;
+const SRC_CONTROL_CHANNEL: &str = "aeron:udp?endpoint=localhost:8999";
+
+/// A destination recording id this archive certainly does not hold, for the
+/// refusal that asks the **catalog**.
+const DST_RECORDING_ID_NOT_HELD: i64 = 123_456;
 
 /// What the **recording** test's signal handler saw.
 ///
@@ -523,6 +539,78 @@ fn a_refusal_carries_the_archives_code_and_the_clients() {
     media_driver.stop().expect("the driver stops");
 }
 
+/// **A caller can send a request itself, and read the answer by the id it drew.**
+///
+/// Every named method on `Archive` offers and then waits (`offer_and_wait`),
+/// which is the shape a caller that wants one answer needs — and the wrong shape
+/// for a caller that has to stay non-blocking. `Archive::proxy_mut` is the door
+/// for that caller: the proxy's encoders write into its reused buffer, the
+/// correlation id comes from `Archive::next_correlation_id`, and the answer is
+/// read later, keyed on the id the caller drew.
+///
+/// **The reference's replication session is that caller** — it reaches for
+/// `archiveProxy().listRecording`, `getRecordingPosition`, `replay` and
+/// `stopReplay` directly rather than the high-level calls
+/// (`ReplicationSession.java`), because it runs inside the archive conductor's
+/// work cycle and may take only one step per turn. The same door is what the
+/// test fixture has always needed: `tests/src/archive.rs`'s `Session::send_only`
+/// touches the publication itself for want of one.
+///
+/// What this asks is that the door is real. The request below is answered with a
+/// refusal — there is no such recording — and *that* is the evidence: the
+/// refusal comes back carrying the correlation id this caller drew, so the
+/// request went out through the proxy and the archive answered **that** id.
+#[test]
+fn a_caller_can_offer_a_request_itself_and_read_its_answer() {
+    let Some((mut media_driver, _archive_dir, mut client)) = rig("archive-client-api-own-request")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    let correlation_id = archive
+        .next_correlation_id(&mut client)
+        .expect("the driver's command ring answers");
+
+    archive
+        .proxy_mut()
+        .get_recording_position(&client, correlation_id, 999_999)
+        .expect("the proxy offers the request");
+
+    let error = archive
+        .wait_for_response(&mut client, "a request the caller built", correlation_id)
+        .expect_err("there is no recording 999999");
+
+    let ArchiveError::Refused {
+        correlation_id: refused,
+        archive_error_code,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        correlation_id, *refused,
+        "the answer is the one to the id this caller drew, not to one the product drew"
+    );
+    assert_eq!(
+        5, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_UNKNOWN_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(Some(205), error.client_error_code());
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
 /// `shouldMapErrorCodes` (`:4849-4867`) and `shouldNotMapActualErrorCodes`
 /// (`:4870-4888`) — **both domains whole, not a sample of them**.
 ///
@@ -667,7 +755,7 @@ fn a_listing_reads_while_a_signal_lands_in_it() {
         let signals_before = listing_signals_seen();
 
         let listed = archive
-            .list_recordings(&mut client, 0, 10, collect_descriptor)
+            .list_recordings(&mut client, 0, 10, &mut collect_descriptor)
             .expect("the listing completes");
 
         if descriptors_seen() > descriptors_before && listing_signals_seen() > signals_before {
@@ -709,6 +797,35 @@ fn a_listing_reads_while_a_signal_lands_in_it() {
         Some(recording_id),
         listing_signal_for(subscription_id, SignalCode::START).map(|signal| signal.recording_id),
         "the listing and the signal name the same recording"
+    );
+
+    // **And a consumer can be an object.** The same page, asked for again with a
+    // closure that keeps its own list, answers into *that* list — the shape the
+    // reference's replication session is built on (`ReplicationSession.java:53`
+    // **is** its consumer, with its state on `this`) and the one a `fn` pointer
+    // could not have. Every listing read in this file used to go through a
+    // `static` slot like `DESCRIPTORS` — one slot per criterion, which is a rule
+    // nothing enforces and two listings in one process can break.
+    let mut mine = Vec::new();
+    let listed_again = archive
+        .list_recordings(
+            &mut client,
+            0,
+            10,
+            &mut |descriptor: &RecordingDescriptor| {
+                mine.push(descriptor.recording_id);
+            },
+        )
+        .expect("the listing completes");
+
+    assert_eq!(
+        listed, listed_again,
+        "the same catalog answers the same page twice"
+    );
+    assert_eq!(
+        vec![recording_id],
+        mine,
+        "the closure's own list, which the shared slot knows nothing about"
     );
 
     // And the same claim one layer over: a **response** wait, which is a
@@ -802,7 +919,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
         forget_narrowed();
 
         let listed = archive
-            .list_recordings(&mut client, 0, 10, collect_narrowed)
+            .list_recordings(&mut client, 0, 10, &mut collect_narrowed)
             .expect("the listing completes");
 
         if listed >= 1 {
@@ -829,7 +946,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "aeron:ipc",
             RECORDING_STREAM_ID,
-            collect_narrowed,
+            &mut collect_narrowed,
         )
         .expect("the listing completes");
 
@@ -854,7 +971,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "aeron:udp",
             RECORDING_STREAM_ID,
-            collect_narrowed,
+            &mut collect_narrowed,
         )
         .expect("the archive answers a listing that holds nothing");
 
@@ -864,7 +981,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
     // page through and the count it asked in for is not the caller's to choose.
     forget_narrowed();
     let by_id = archive
-        .list_recording(&mut client, recording.recording_id, collect_narrowed)
+        .list_recording(&mut client, recording.recording_id, &mut collect_narrowed)
         .expect("the listing completes");
 
     assert_eq!(1, by_id, "the recording the id names");
@@ -882,7 +999,11 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
     // error: the listing is over and there was nothing in it.
     forget_narrowed();
     let missing = archive
-        .list_recording(&mut client, recording.recording_id + 999, collect_narrowed)
+        .list_recording(
+            &mut client,
+            recording.recording_id + 999,
+            &mut collect_narrowed,
+        )
         .expect("the archive answers about a recording it does not hold");
 
     assert_eq!(
@@ -901,7 +1022,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             10,
             "",
             Some(RECORDING_STREAM_ID),
-            collect_subscription,
+            &mut collect_subscription,
         )
         .expect("the listing completes");
 
@@ -934,7 +1055,7 @@ fn the_listings_narrow_by_uri_by_id_and_to_subscriptions() {
             by_subscription,
             "",
             Some(RECORDING_STREAM_ID),
-            collect_subscription,
+            &mut collect_subscription,
         )
         .expect("the listing completes");
 
@@ -1177,7 +1298,7 @@ fn the_requests_that_stop_and_reshape_a_recording() {
     assert_eq!(
         0,
         archive
-            .list_recording(&mut client, recording_id, collect_narrowed)
+            .list_recording(&mut client, recording_id, &mut collect_narrowed)
             .expect("listing a recording that is not there is an empty listing"),
         "the recording is not there any more"
     );
@@ -1342,4 +1463,1051 @@ fn a_publication_can_be_added_recorded_and_replayed() {
 
     archive.close(&client);
     media_driver.stop().expect("the driver stops");
+}
+
+/// The channel a replication's copy runs over, which the request has to name:
+/// the archive's own `aeron.archive.replication.channel` is **not** set by
+/// [`archive::PROPERTIES`], and a request that names none is refused for it.
+/// The channel the copy itself runs over, and it is **UDP** for the reason the
+/// reference's own fixture is (`aeron_archive_test.cpp:449`:
+/// `aeron:udp?endpoint=localhost:8012`): `REPLAY` puts the destination
+/// subscription's **resolved endpoint** on the channel it asks the source to
+/// replay onto (`ReplicationSession.java:668-690`), and an IPC subscription has
+/// no endpoint to resolve — `resolvedEndpoint()` answers `null` for one
+/// (`Subscription.java:582-590` is a counter lookup, and `aeron:ipc` has no
+/// address counter). A copy over IPC therefore stalls at `REPLAY` in the
+/// reference too, which is why no reference test does it.
+///
+/// A wildcard port rather than a fixed one: the destination binds an ephemeral
+/// port, exactly as its own replication channel does
+/// (`TestContexts.LOCALHOST_REPLICATION_CHANNEL`).
+const REPLICATION_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
+
+/// **The four replication round trips.**
+///
+/// [`Archive::replicate`], [`Archive::stop_replication`] and
+/// [`Archive::try_stop_replication`] have been able to *offer* their requests
+/// since C1 and had no arm to answer them — the gap
+/// [`the_requests_that_stop_and_reshape_a_recording`] writes down. This is the
+/// arm, and these are the answers that say it is wired to the conductor rather
+/// than to the adapter's `catch-all`.
+///
+/// **What is not tested here is a copy.** Nothing below moves a byte between
+/// two archives: a successful replicate leaves a session that has not taken its
+/// first step, and what is asserted is the *answer*. That is the reference's own
+/// shape rather than a shortcut — `ArchiveConductor.replicate` answers
+/// `sendOkResponse(correlationId, replicationId)` the moment the session is
+/// registered (`:1472-1478`), long before anything is copied.
+///
+/// The four, in the order they are asked:
+///
+/// 1. **A replicate nothing refuses is answered with its id**, which is minted
+///    from the conductor's **session** counter (`:1455`) and so is a positive
+///    number rather than a constant.
+/// 2. **A destination this archive does not hold is refused with `5`**, its own
+///    `UNKNOWN_RECORDING` (`:1411-1417`) — the code the archive sends, not the
+///    `205` the client reports.
+/// 3. **A destination that is recording right now is refused with `2`**, its
+///    `ACTIVE_RECORDING` (`:1419-1428`). The one of the four that needs a
+///    recording to exist, and the only one that says anything about the copy
+///    rather than about the request.
+/// 4. **A stop for an id no session is registered under is a `false`** — the
+///    whole point of the `try_` form (`aeron_archive_client.c:1816-1844`), and
+///    the C fixture's own assertion (`aeron_archive_test.cpp:2861-2871`). It is
+///    also the one that can be got wrong by being *helpful*: a stop that
+///    answered `OK` for an unknown id would make every `tryStopReplication`
+///    claim it had stopped something.
+///
+/// The last two assertions are the same claim from the other side: an id that
+/// **is** registered stops, and then does not, because a stop gives the id up
+/// (`ArchiveConductor.java:1482`) while the session goes on being driven until
+/// its own close (`ReplicationSession.java:196-211`).
+#[test]
+fn the_four_replication_round_trips() {
+    let Some((mut media_driver, _archive_dir, mut client)) = rig("archive-client-api-replicate")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    // A request with a source in it, so the fields that are not read yet are at
+    // least the fields a real one carries. Nothing validates the source until
+    // the session walks, which is the next commit's.
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+    params.file_io_max_length = 4096;
+
+    let replicate = |archive: &mut Archive, client: &mut Client, params: &ReplicationParams| {
+        archive.replicate(
+            client,
+            SRC_RECORDING_ID,
+            SRC_CONTROL_STREAM_ID,
+            SRC_CONTROL_CHANNEL,
+            params,
+        )
+    };
+
+    // ① Nothing in its way.
+    let replication_id = replicate(&mut archive, &mut client, &params)
+        .expect("the archive takes a replication it has no reason to refuse");
+
+    assert!(
+        replication_id > 0,
+        "the id is minted from the session counter, which starts at {}: {replication_id}",
+        deepmsg_archive::server::conductor::FIRST_SESSION_ID
+    );
+
+    // ② A destination that does not exist.
+    params.dst_recording_id = DST_RECORDING_ID_NOT_HELD;
+    let error = replicate(&mut archive, &mut client, &params)
+        .expect_err("a destination the archive does not hold is refused");
+
+    let ArchiveError::Refused {
+        archive_error_code,
+        message,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        5, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_UNKNOWN_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(
+        Some(205),
+        error.client_error_code(),
+        "and the same code where a caller matches on it"
+    );
+    assert!(
+        message.contains(&format!(
+            "unknown destination recording id {DST_RECORDING_ID_NOT_HELD}"
+        )),
+        "the archive's own words, which name the recording and not this client's summary: {message}"
+    );
+
+    // ③ A destination that is being recorded right now.
+    //
+    // The id comes from a **listing** rather than from a signal: the client's
+    // descriptor consumer is an object since C1's last commit, so the closure
+    // below carries this test's own `Vec` and no `static` slot is needed for it.
+    // That is the same door the replication's own session needs, used here for
+    // the first time by a criterion.
+    let _subscription_id = archive
+        .start_recording(
+            &mut client,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            false,
+            false,
+        )
+        .expect("the archive starts recording");
+
+    let _publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("the driver takes a publication on the recording channel");
+
+    let mut active = Vec::new();
+
+    until(
+        &mut client,
+        "the recording to reach the catalog",
+        |client| {
+            active.clear();
+            let _ =
+                archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+                    if descriptor.stop_position == NULL_POSITION {
+                        active.push(descriptor.recording_id);
+                    }
+                });
+
+            !active.is_empty()
+        },
+    );
+
+    params.dst_recording_id = active[0];
+    let error = replicate(&mut archive, &mut client, &params)
+        .expect_err("a recording still in flight is not a place to copy into");
+
+    let ArchiveError::Refused {
+        archive_error_code,
+        message,
+        ..
+    } = &error
+    else {
+        panic!("the archive refused, so this is a refusal: {error}");
+    };
+
+    assert_eq!(
+        2, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_ACTIVE_RECORDING, in the archive's own domain"
+    );
+    assert_eq!(Some(202), error.client_error_code());
+    assert!(
+        message.contains(&format!(
+            "cannot replicate to active recording {}",
+            active[0]
+        )),
+        "and its reason names the recording that is in the way: {message}"
+    );
+
+    // ④ The three stops. An id nothing is under, an id that is, and that id
+    // again — the C fixture's `/0` arm's `replication_id + 40000`, and then the
+    // pair that shows the id really was given up rather than merely aborted.
+    assert!(
+        !archive
+            .try_stop_replication(&mut client, replication_id + 40_000)
+            .expect("an id no session is registered under is an answer, not an error"),
+        "nothing was stopped, so the try form says so"
+    );
+    assert!(
+        archive
+            .try_stop_replication(&mut client, replication_id)
+            .expect("the id the OK carried is one a stop finds"),
+        "and the replication the first replicate made is one there was to stop"
+    );
+    assert!(
+        !archive
+            .try_stop_replication(&mut client, replication_id)
+            .expect("the same id again is the same kind of answer"),
+        "a stop takes the session out by its id, so a second one has nothing to find"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
+/// **A replication that cannot reach its source says so — under its own id.**
+///
+/// The first of the replication's twelve states is the only one that walks, and
+/// it is the only one that can fail outright: `CONNECT` builds a session on the
+/// source archive, and a source that will not take one ends the replication
+/// before it has copied anything.
+///
+/// Three claims, and the third is the one that would be missed by a plausible
+/// implementation:
+///
+/// * the client is told, which needs the failure to travel from inside the
+///   session's own turn out to the control subscription
+///   (`ReplicationProgress::Failed` → `Deferred::Error`);
+/// * it is told the archive's code, `REPLICATION_CONNECTION_FAILURE`
+///   (`ArchiveException.java:99`), which is the `relevantId` on the wire;
+/// * and the **correlation id is the replication's**, not the request's —
+///   `sendErrorResponse(replicationId, …)` (`ReplicationSession.java:925`). So
+///   this arrives as an error about a request the client made earlier, under an
+///   id it was *answered* with, and no wait of its own will ever match it.
+///
+/// The source here is a channel the client will not open a session with. That is
+/// the reference's own failure path and not a stand-in for one: its
+/// `ConfigurationException` from `AeronArchive.asyncConnect` is an
+/// `AeronException` (`ConfigurationException.java:21`), so it lands in the same
+/// `catch` as a connect that timed out (`ReplicationSession.java:437-442`).
+#[test]
+fn a_replication_that_cannot_reach_its_source_says_so() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replicate-src")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    // Accepted: the answer to a replicate is the session being registered, and
+    // nothing about the copy is known yet — which is why this call succeeds and
+    // the failure below arrives on its own, later.
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            SRC_RECORDING_ID,
+            SRC_CONTROL_STREAM_ID,
+            "",
+            &params,
+        )
+        .expect("the archive takes the replication, whatever the source turns out to be");
+
+    let mut failures = Vec::new();
+
+    until(
+        &mut client,
+        "the replication's connection failure",
+        |client| match archive.check_for_error_response(client) {
+            Ok(()) => false,
+            Err(error) => {
+                failures.push(error);
+
+                true
+            }
+        },
+    );
+
+    let ArchiveError::Refused {
+        correlation_id,
+        archive_error_code,
+        message,
+    } = &failures[0]
+    else {
+        panic!(
+            "the archive refused, so this is a refusal: {:?}",
+            failures[0]
+        );
+    };
+
+    assert_eq!(
+        &replication_id, correlation_id,
+        "the error is about the replication, under the id its OK carried"
+    );
+    assert_eq!(
+        14, *archive_error_code,
+        "ARCHIVE_ERROR_CODE_REPLICATION_CONNECTION_FAILURE, in the archive's own domain"
+    );
+    assert_eq!(
+        Some(214),
+        failures[0].client_error_code(),
+        "and the same code where a caller matches on it"
+    );
+    assert!(
+        message.starts_with("Replication connection failed="),
+        "with the reference's own words in front of the reason: {message}"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
+/// What the **descriptor** test's signal handler saw.
+///
+/// A sink of its own, for the reason written at [`SIGNALS`].
+static REPLICATION_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+/// Its handler.
+fn collect_replication_signal(signal: &RecordingSignal) {
+    REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .push(*signal);
+}
+
+/// The one row a listing of this archive holds, or `None` while there is not
+/// exactly one.
+fn the_only_recording(archive: &mut Archive, client: &mut Client) -> Option<RecordingDescriptor> {
+    let mut rows = Vec::new();
+
+    let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+        rows.push(descriptor.clone());
+    });
+
+    match rows.len() {
+        1 => rows.pop(),
+        _ => None,
+    }
+}
+
+/// **A recording on `archive`, with data in it and stopped**, and the row it
+/// leaves.
+///
+/// The three things a replication's criteria need of a **source**, in the order
+/// they need them: a catalog row (a recording, and a publication on the
+/// recording channel), a **stop position** on that row — which is what keeps the
+/// descriptor from taking the already-in-sync shortcut
+/// (`ReplicationSession.java:393-398`) — and the publisher **given back**.
+///
+/// The last is not tidiness. The destination's subscription names the
+/// **source's session** on the source's stream, and an IPC subscription matches
+/// on stream and session alone: a publisher still open on that stream feeds the
+/// destination's recording by itself, and a criterion that then says "the copy
+/// has data in it" is measuring that publisher rather than the replay.
+/// **Measured**: with it open, that assertion passed with `REPLAY` disabled.
+fn a_stopped_recording(archive: &mut Archive, client: &mut Client) -> RecordingDescriptor {
+    // The recording to copy. Made, written to, and **stopped**: a stopped
+    // recording has a stop position, which is what keeps the descriptor from
+    // taking the "already in sync" shortcut (`:393-398`) and lets a caller
+    // assert on a row the source actually filled in.
+    let subscription_id = archive
+        .start_recording(client, RECORDING_CHANNEL, RECORDING_STREAM_ID, false, false)
+        .expect("the archive starts recording");
+
+    let publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("the driver takes a publication on the recording channel");
+
+    until(client, "the recording publication linking", |client| {
+        client
+            .exclusive_publication(publication)
+            .and_then(deepmsg_client::publication::ExclusivePublication::is_connected)
+            .unwrap_or(false)
+    });
+
+    let mut source = None;
+
+    until(client, "the source's catalog row", |client| {
+        let _ = client.offer_exclusive(publication, b"a message to copy");
+        source = the_only_recording(archive, client);
+
+        source.is_some()
+    });
+
+    let source = source.expect("the loop ends with a row");
+
+    archive
+        .stop_recording_subscription(client, subscription_id)
+        .expect("the archive stops the subscription it opened");
+
+    until(client, "the source's stop position", |client| {
+        archive
+            .get_stop_position(client, source.recording_id)
+            .is_ok_and(|stop| stop >= 0)
+    });
+
+    // **The publisher goes before the copy is asked for, and it is not
+    // tidiness.** The destination's subscription will name the **source's
+    // session** on the source's stream — that is what `EXTEND` writes onto its
+    // channel — and an IPC subscription matches on the stream and the session
+    // alone. A publisher still open on that stream therefore feeds the
+    // destination recording by itself, and the bytes a caller waits for would
+    // not be the replay's. **Measured**: with it open, the assertion that the
+    // copy has data in it passed with `REPLAY` disabled — the same shape of
+    // mistake as the wait the plan's §9.5 records, and found the same way.
+    client
+        .remove_publication(publication, archive::COMMAND_TIMEOUT)
+        .expect("the source publication is given back");
+
+    the_only_recording(archive, client).expect("still one row")
+}
+
+/// What the **cross-process** replication test's signal handler saw.
+///
+/// A sink of its own, for the reason [`SIGNALS`] gives: two rigs started in one
+/// process are two archives in one signal space, and a shared sink answers one
+/// test with the other's signal.
+static CROSS_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+/// Its handler.
+fn collect_cross_signal(signal: &RecordingSignal) {
+    CROSS_SIGNALS
+        .lock()
+        .expect("no other test is holding the cross-process signals")
+        .push(*signal);
+}
+
+/// A UDP port this process may use, off a base that keeps two test binaries
+/// running at once apart.
+///
+/// The source archive of [`a_replication_reaches_an_archive_in_another_process`]
+/// has to **bind** the port its control channel names, so it cannot be the
+/// hard-coded kind the rest of this file uses for addresses nobody binds: two
+/// binaries in one `cargo test` run would fight over it.
+fn free_udp_port(offset: u16) -> u16 {
+    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
+    let base = 20_000 + (std::process::id() as u16 % 20_000);
+
+    base.saturating_add(offset)
+}
+
+/// **A replicate fetches its source's descriptor, and makes the destination
+/// row.**
+///
+/// `REPLICATE_DESCRIPTOR` (`ReplicationSession.java:444-483`) is the state where
+/// the copy first touches anything: it asks the source archive — through the
+/// client the `CONNECT` state built — for one recording's descriptor, and
+/// `onRecordingDescriptor` (`:295-399`) turns what comes back into a row in
+/// **this** archive's catalog.
+///
+/// **The source is this archive.** deepmsg serves both ends, and the shortest
+/// path through the state is a replication of one of its recordings onto
+/// itself: the control channel is the one this archive already listens on, and
+/// the request goes out over it and comes back. What is exercised is the whole
+/// state — the listing, the poller, the descriptor, and the row — with no
+/// second archive to keep in step.
+///
+/// Two claims, and the second is the one a stub could not fake:
+///
+/// * the destination's client is told, with a `REPLICATE` signal
+///   (`:351`) whose position is the source's **start**;
+/// * and the row that appears is the source's descriptor — every field of it,
+///   under an id of this archive's own, with the two positions collapsed to the
+///   start (`catalog.addNewRecording(startPosition, startPosition, …)`,
+///   `:337-349`). A row that agreed on one field would prove nothing; this
+///   agrees on ten.
+#[test]
+fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replicate-descriptor")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_replication_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the archive is connected");
+
+    let source = a_stopped_recording(&mut archive, &mut client);
+
+    // **The replicate.** Its source is this archive's own control channel, on
+    // the stream both control subscriptions are on.
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            archive::CONTROL_CHANNEL,
+            &params,
+        )
+        .expect("the archive takes the replication");
+
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        let mut rows = Vec::new();
+        let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+            rows.push(descriptor.clone());
+        });
+
+        copied = rows
+            .iter()
+            .find(|row| row.recording_id != source.recording_id)
+            .cloned();
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // The descriptor, field for field, under an id of this archive's own.
+    assert!(
+        copied.recording_id > source.recording_id,
+        "the copy is a new row, not the source's: {} against {}",
+        copied.recording_id,
+        source.recording_id
+    );
+    assert_eq!(
+        source.start_position, copied.start_position,
+        "the start is the source's"
+    );
+    assert_eq!(
+        copied.start_position, copied.stop_position,
+        "and the row begins empty — `addNewRecording(startPosition, startPosition, …)`"
+    );
+    assert_eq!(source.initial_term_id, copied.initial_term_id);
+    assert_eq!(source.segment_file_length, copied.segment_file_length);
+    assert_eq!(source.term_buffer_length, copied.term_buffer_length);
+    assert_eq!(source.mtu_length, copied.mtu_length);
+    assert_eq!(
+        source.session_id, copied.session_id,
+        "the source publication's session, which the replay will arrive under"
+    );
+    assert_eq!(source.stream_id, copied.stream_id);
+    assert_eq!(source.stripped_channel, copied.stripped_channel);
+    assert_eq!(source.original_channel, copied.original_channel);
+    assert_eq!(source.source_identity, copied.source_identity);
+
+    // And the signal, under the replication's own id rather than a request's.
+    let replicated = REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE)
+        .copied()
+        .expect("a REPLICATE signal");
+
+    let _ = replication_id;
+
+    assert_eq!(
+        copied.recording_id, replicated.recording_id,
+        "it is about the row that was just made"
+    );
+    assert_eq!(
+        source.start_position, replicated.position,
+        "at the position the copy starts from, which is the source's start"
+    );
+    assert_eq!(
+        -1, replicated.subscription_id,
+        "and with no subscription: the signal goes out before EXTEND makes one"
+    );
+
+    // **And EXTEND makes one.** `SRC_RECORDING_POSITION` asks the source where
+    // its recording got to (`:484-524`), and `EXTEND` (`:525-568`) turns the
+    // destination's row into a recording: a subscription on the **replication**
+    // channel, carrying the two parameters that make it *this* copy.
+    //
+    // What is asserted is the subscription as the archive recorded it, which is
+    // the only half of the two that is observable from here: the other is the
+    // `OK` answer the archive sends the client under the **replication's**
+    // correlation id, and that is what a later state's criterion reads.
+
+    // **The wait is for the replication's own subscription**, not for "a
+    // subscription": the source recording's is on the same stream and may still
+    // be listed for a turn or two after the test stopped it, and a loop that
+    // broke on *any* of them would go on to fail on a real subscription that had
+    // not arrived yet. Measured: that is what this criterion did before it was
+    // written this way — one run in three. What names it is the **session** the
+    // source's replay will arrive under, which no other subscription on this
+    // archive carries.
+    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(
+        &mut client,
+        "the destination's recording subscription",
+        |client| {
+            extended.clear();
+
+            let _ = archive.list_recording_subscriptions(
+                client,
+                0,
+                10,
+                "",
+                Some(RECORDING_STREAM_ID),
+                &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                    extended.push(descriptor.clone());
+                },
+            );
+
+            extended.iter().any(|subscription| {
+                subscription
+                    .stripped_channel
+                    .contains(&format!("session-id={}", source.session_id))
+            })
+        },
+    );
+
+    let extension = extended
+        .iter()
+        .find(|subscription| {
+            subscription
+                .stripped_channel
+                .contains(&format!("session-id={}", source.session_id))
+        })
+        .expect("the destination holds a subscription on the replication channel");
+
+    assert_eq!(
+        RECORDING_STREAM_ID, extension.stream_id,
+        "on the stream the source's descriptor named, which is the one the \
+         extend had to agree with"
+    );
+    assert!(
+        extension.stripped_channel.contains("rejoin=false"),
+        "and not rejoining: an image that goes away is not fought for: {}",
+        extension.stripped_channel
+    );
+    assert!(
+        extension
+            .stripped_channel
+            .contains(&format!("session-id={}", source.session_id)),
+        "and under the session the **source's replay** will arrive as — the \
+         descriptor's session, not this session's own: {}",
+        extension.stripped_channel
+    );
+
+    // **And the session ends by saying so.** `REPLICATE` sends `SYNC` when the
+    // copy has caught up with where the source's recording stopped (`:784-800`),
+    // and `close()` sends `REPLICATE_END` **once** — the signal the reference's
+    // own fixture waits on (`aeron_archive_test.cpp:3001-3006`).
+    //
+    // The wait goes through a wait that **dispatches**. A bare `client.poll()`
+    // reads the driver's replies and nothing else; archive signals are handed to
+    // the handler by the archive's own waits (this file's module note says the
+    // same thing about the listing), so what this polls is the signal method.
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        REPLICATION_SIGNALS
+            .lock()
+            .expect("no other test is holding the replication signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
+    });
+
+    let signals = REPLICATION_SIGNALS
+        .lock()
+        .expect("no other test is holding the replication signals")
+        .clone();
+
+    let synced = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::SYNC)
+        .copied()
+        .expect("a SYNC signal");
+
+    assert_eq!(
+        copied.recording_id, synced.recording_id,
+        "the sync is about the copy the descriptor made"
+    );
+    assert!(
+        synced.position >= source.stop_position,
+        "at or past where the source's recording stopped: {} against {}",
+        synced.position,
+        source.stop_position
+    );
+    assert_eq!(
+        extension.subscription_id, synced.subscription_id,
+        "and it names the destination's recording subscription, which is still \
+         there — `stopRecording` has not run yet"
+    );
+
+    let ended = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE_END)
+        .copied()
+        .expect("a REPLICATE_END signal");
+
+    assert_eq!(
+        copied.recording_id, ended.recording_id,
+        "the end is about the same recording"
+    );
+    assert_eq!(
+        NULL_POSITION, ended.position,
+        "and carries no position: there is nothing left to be at"
+    );
+    assert_eq!(
+        -1, ended.subscription_id,
+        "nor a subscription — `close` stops the recording **before** it says so \
+         (`ReplicationSession.java:197`, `:925`)"
+    );
+
+    // **And the copy is what the destination is left holding.** The row the
+    // descriptor made now stops where the **source's** row stops, which is the
+    // archive's own record of what was recorded — read after the session is over,
+    // so it is not racing the teardown `close()` does.
+    //
+    // This is also the assertion that says the bytes are the **replay's**: the
+    // source's publisher is given back before the copy is asked for, so nothing
+    // else can have fed the destination's recording.
+    let mut rows: Vec<RecordingDescriptor> = Vec::new();
+
+    let after = archive
+        .list_recordings(&mut client, 0, 10, &mut |d: &RecordingDescriptor| {
+            rows.push(d.clone())
+        })
+        .expect("the listing completes");
+
+    assert!(after >= 2, "the source's row and the copy's: {after}");
+
+    let copied_after = rows
+        .iter()
+        .find(|row| row.recording_id == copied.recording_id)
+        .expect("the copy is still there");
+
+    let source_after = rows
+        .iter()
+        .find(|row| row.recording_id == source.recording_id)
+        .expect("and so is what it was copied from");
+
+    assert!(
+        copied_after.stop_position > copied_after.start_position,
+        "the copy has data in it: {} against a start of {}",
+        copied_after.stop_position,
+        copied_after.start_position
+    );
+    assert_eq!(
+        source_after.stop_position, copied_after.stop_position,
+        "and it stops exactly where the source's recording stopped"
+    );
+
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "exactly one REPLICATE_END, which is the whole point of it being in close()"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
+/// **A replication reaches an archive in another process.**
+///
+/// The criterion above copies an archive **onto itself**: one process, one
+/// driver, one catalog, and — the part that matters — one aeron directory, so
+/// the response channel, the copy's channel and the source's control channel
+/// all belong to the same driver.
+///
+/// What this slice was blocked on for a day is the other arrangement, and it is
+/// the one the reference's own suite puts in front of it (`TestArchive.h` starts
+/// one archive, `startDestArchive` the other): two archives, **two processes,
+/// two directories**. A replication session derives its response channel from
+/// the **destination's** control channel (`Archive.java:1519-1541`), so that
+/// channel cannot be IPC — the source is another process, and the answers have
+/// to cross a socket. That is the shape the plan's §8 settled on, and the shape
+/// nothing had measured until there was an archive to measure it against.
+///
+/// So this is the same walk with the source moved out: its own driver, its own
+/// aeron directory, its own archive directory, its own catalog, reached over the
+/// wire on a port of its own.
+#[test]
+fn a_replication_reaches_an_archive_in_another_process() {
+    // The destination first, because its rig is what says whether this build has
+    // a driver to run at all.
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replication-cross-process")
+    else {
+        return;
+    };
+
+    // **The source archive**, on a control channel the destination can dial.
+    let source_control = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(1));
+    let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
+    let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
+    let source_archive_dir = TempDir::new("archive-client-api-replication-source");
+
+    let Some(mut source_driver) = OwnArchivingMediaDriver::start(
+        "archive-client-api-replication-source",
+        source_archive_dir.path(),
+        &source_properties,
+    ) else {
+        archiving_driver::announce_skip();
+        return;
+    };
+
+    source_driver
+        .await_ready(archive::DEADLINE)
+        .expect("the source archive comes up");
+
+    let mut source_client =
+        Client::connect(source_driver.aeron_dir()).expect("connect to the source driver");
+
+    // **The source's own client reaches it over its local control channel**,
+    // which is [`context()`] and the same string the destination's client uses —
+    // the same channel name in two different drivers. It is not the UDP channel
+    // the replication will dial: a *network* publication that names a
+    // response-correlation-id has to name a **network** response subscription,
+    // and the driver refuses it otherwise
+    // (`aeron_driver_conductor_validate_response_subscription`, `:631-651`) —
+    // which is a rule about the driver, not about this test.
+    let mut source_archive = Archive::connect(
+        &context(),
+        &mut source_client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the source archive is connected");
+
+    // What is to be copied, made on the **source**: its row lives in the
+    // source's catalog and in no other.
+    let source = a_stopped_recording(&mut source_archive, &mut source_client);
+
+    // **The destination**, which is this archive and its own driver.
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_cross_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the destination archive is connected");
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            &source_control,
+            &params,
+        )
+        .expect("the destination archive takes the replication");
+
+    // **The row the descriptor made.** The source's catalog is another
+    // process's, so everything in this row crossed a socket.
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        copied = the_only_recording(&mut archive, client);
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // **Two catalogs, and the same id in each names a different recording** —
+    // the destination's first row and the source's are both `0` here, which is
+    // the one thing about this arrangement that a self-replication hides. What
+    // says the row is the copy is what it *holds*, and what says it is alone is
+    // the count.
+    let mut rows = 0;
+
+    let listed = archive
+        .list_recordings(
+            &mut client,
+            0,
+            10,
+            &mut |_descriptor: &RecordingDescriptor| {
+                rows += 1;
+            },
+        )
+        .expect("the listing completes");
+
+    assert_eq!(1, listed, "the destination holds the copy and nothing else");
+    assert_eq!(1, rows, "and it listed exactly that one");
+    assert_eq!(
+        source.start_position, copied.start_position,
+        "the descriptor's start crossed the wire"
+    );
+    assert_eq!(source.stream_id, copied.stream_id);
+    assert_eq!(
+        source.stripped_channel, copied.stripped_channel,
+        "and so did the channel the source recorded on"
+    );
+    assert_eq!(
+        source.session_id, copied.session_id,
+        "and the source's own session, which is what the replay will arrive under"
+    );
+
+    // **The destination's recording subscription**, on the copy's channel and
+    // under the source's session — the two things `EXTEND` writes onto it.
+    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(
+        &mut client,
+        "the destination's recording subscription",
+        |client| {
+            extended.clear();
+
+            let _ = archive.list_recording_subscriptions(
+                client,
+                0,
+                10,
+                "",
+                Some(RECORDING_STREAM_ID),
+                &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                    extended.push(descriptor.clone());
+                },
+            );
+
+            extended.iter().any(|subscription| {
+                subscription
+                    .stripped_channel
+                    .contains(&format!("session-id={}", source.session_id))
+            })
+        },
+    );
+
+    // **And the session ends by saying so**, once — the same signals the
+    // self-replication criterion reads, through this test's own sink. The wait
+    // has to go through a wait that **dispatches**: `client.poll()` reads the
+    // driver's replies, not the archive's signals.
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        CROSS_SIGNALS
+            .lock()
+            .expect("no other test is holding the cross-process signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
+    });
+
+    let signals = CROSS_SIGNALS
+        .lock()
+        .expect("no other test is holding the cross-process signals")
+        .clone();
+
+    let replicated = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE)
+        .copied()
+        .expect("a REPLICATE signal");
+
+    assert_eq!(
+        copied.recording_id, replicated.recording_id,
+        "told about the row the descriptor made, under the replication's own id"
+    );
+    assert_eq!(-1, replicated.subscription_id, "before EXTEND has made one");
+
+    let synced = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::SYNC)
+        .copied()
+        .expect("a SYNC signal");
+
+    assert!(
+        synced.position >= source.stop_position,
+        "the copy caught up with the source's stop: {} against {}",
+        synced.position,
+        source.stop_position
+    );
+
+    let ended = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::REPLICATE_END)
+        .copied()
+        .expect("a REPLICATE_END signal");
+
+    assert_eq!(copied.recording_id, ended.recording_id);
+    assert_eq!(NULL_POSITION, ended.position);
+    assert_eq!(-1, ended.subscription_id);
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "exactly one REPLICATE_END"
+    );
+
+    // **And the bytes crossed the process boundary.** The destination's row now
+    // stops where the **source's** row stops — read on both archives after the
+    // session is over, so it is not racing the teardown `close()` does, and read
+    // on the source to say that the two catalogs agree.
+    let copied_after = the_only_recording(&mut archive, &mut client).expect("still one row");
+
+    let source_after =
+        the_only_recording(&mut source_archive, &mut source_client).expect("still one row");
+
+    assert!(
+        copied_after.stop_position > copied_after.start_position,
+        "the copy has data in it: {} against a start of {}",
+        copied_after.stop_position,
+        copied_after.start_position
+    );
+    assert_eq!(
+        source_after.stop_position, copied_after.stop_position,
+        "and it stops exactly where the source's recording stopped — in another process"
+    );
+
+    let _ = replication_id;
+
+    archive.close(&client);
+    source_archive.close(&source_client);
+
+    media_driver.stop().expect("the destination driver stops");
+    source_driver.stop().expect("the source driver stops");
 }

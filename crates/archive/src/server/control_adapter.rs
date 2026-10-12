@@ -110,6 +110,7 @@ use deepmsg_codec::archive::recording_position_request_codec::{
 };
 use deepmsg_codec::archive::replay_request_codec::{self, ReplayRequestDecoder};
 use deepmsg_codec::archive::replay_token_request_codec::{self, ReplayTokenRequestDecoder};
+use deepmsg_codec::archive::replicate_request_2_codec::{self, ReplicateRequest2Decoder};
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_codec::archive::start_position_request_codec::{self, StartPositionRequestDecoder};
 use deepmsg_codec::archive::start_recording_request_2_codec::{
@@ -126,6 +127,7 @@ use deepmsg_codec::archive::stop_recording_subscription_request_codec::{
     self, StopRecordingSubscriptionRequestDecoder,
 };
 use deepmsg_codec::archive::stop_replay_request_codec::{self, StopReplayRequestDecoder};
+use deepmsg_codec::archive::stop_replication_request_codec::{self, StopReplicationRequestDecoder};
 use deepmsg_codec::archive::truncate_recording_request_codec::{
     self, TruncateRecordingRequestDecoder,
 };
@@ -154,6 +156,26 @@ use crate::server::control_session::SESSION_CLOSED_MSG;
 /// `file_io_max_length`, the other version-gated field, only has to be
 /// **not positive**, which both values are.
 pub const REPLAY_TOKEN_VERSION: u16 = 10;
+
+/// The version a replicate request's `fileIoMaxLength` arrived in
+/// (`ControlSessionAdapter.java:80`).
+///
+/// The reference substitutes `Aeron.NULL_VALUE` for a request older than the
+/// field (`:979-981`), where the generated reader answers `i32::MIN`
+/// (`replicate_request_2_codec.rs:418-424`). Unlike a replay token the two are
+/// interchangeable here — the field is only ever put to the "not positive means
+/// the archive's own" test — but the substitution is made anyway, because the
+/// value travels on into the session, and a session carrying `i32::MIN` would
+/// be one holding a number no client ever wrote.
+pub const REPLICATE_FILE_IO_MAX_LENGTH_VERSION: u16 = 7;
+
+/// The version a replicate request's `replicationSessionId` and
+/// `encodedCredentials` arrived in (`ControlSessionAdapter.java:81-82`).
+///
+/// One constant for two fields that share it: the reference declares two names
+/// with the same value and gates them on it separately, which is a distinction
+/// without a difference — a request has both fields or neither.
+pub const REPLICATE_SESSION_ID_VERSION: u16 = 8;
 
 /// How many fragments one subscription is read for in a turn
 /// (`ControlSessionAdapter.java:79`).
@@ -329,6 +351,68 @@ pub struct StartReplayRequest {
     /// carried as the client wrote it: the adapter hands on a fact and the
     /// conductor decides what to do with it.
     pub response_correlation_id: Option<i64>,
+}
+
+/// One `ReplicateRequest2` (template **66**), as the adapter decoded it
+/// (`ControlSessionAdapter.java:965-1019`, which is `ControlSession.onReplicate`
+/// `:581-610`'s fourteen arguments).
+///
+/// The widest request in the protocol, and the only one whose **version** is
+/// read twice over: four of these fields arrived after the template's first
+/// version, and a client that predates one of them sends a block that stops
+/// short of it. Three are already handled by the generated decoder — the two
+/// `i32`s and the one `varData` answer a substitutable value, and the last
+/// `varData` answers empty — so what travels here is the reference's own
+/// substitution rather than the decoder's, which is what
+/// [`REPLICATE_FILE_IO_MAX_LENGTH_VERSION`] and
+/// [`REPLICATE_SESSION_ID_VERSION`] are for.
+///
+/// **Nothing here is resolved.** Which channel a replication really runs on —
+/// this request's, or the archive's configured one — is the conductor's
+/// question (`ArchiveConductor.java:1394-1395`), and so is every refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationRequest {
+    /// The session that asked.
+    pub session_id: i64,
+    /// The request's correlation id, which its answer echoes.
+    pub correlation_id: i64,
+    /// The recording at the **source** archive to copy.
+    pub src_recording_id: i64,
+    /// The recording at this archive to copy into, or `NULL_VALUE` to make one.
+    pub dst_recording_id: i64,
+    /// Where the copy stops; `NULL_POSITION` copies a source that has not
+    /// stopped yet, and follows it.
+    pub stop_position: i64,
+    /// A tag for the source channel, for tagged replication — always
+    /// `NULL_VALUE` on the paths this build serves (`:1404-1410` refuses a
+    /// response channel that names one).
+    pub channel_tag_id: i64,
+    /// The same for the source subscription.
+    pub subscription_tag_id: i64,
+    /// The source archive's control **stream**.
+    pub src_control_stream_id: i32,
+    /// How big a block one turn may read; not positive means the archive's own.
+    /// Absent before version 7 (see [`REPLICATE_FILE_IO_MAX_LENGTH_VERSION`]).
+    pub file_io_max_length: i32,
+    /// The session id the copy should use at the source, for replicating one
+    /// recording through several stages. Absent before version 8 (see
+    /// [`REPLICATE_SESSION_ID_VERSION`]).
+    pub replication_session_id: i32,
+    /// The source archive's control **channel**, which is what this archive
+    /// connects to it on.
+    pub src_control_channel: String,
+    /// Where a live stream should be merged to, if one is. Empty on every path
+    /// this build serves.
+    pub live_destination: String,
+    /// The channel the copy itself runs over. Empty means the archive's
+    /// configured one (`ArchiveConductor.java:1394-1395`).
+    pub replication_channel: String,
+    /// Credentials for the source archive. Empty before version 8, and empty
+    /// whenever the source wants none.
+    pub encoded_credentials: Vec<u8>,
+    /// The channel this archive should be answered on by the **source**, for a
+    /// replication driven over response channels. Empty before version 10.
+    pub src_response_channel: String,
 }
 
 /// One `ExtendRecordingRequest2`, as the adapter decoded it
@@ -742,6 +826,29 @@ pub trait ControlPlane {
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
+        now_ms: i64,
+    );
+
+    /// `ControlSession.onReplicate` (`ControlSession.java:581-617`), which is
+    /// `ArchiveConductor.replicate` (`:1385-1478`).
+    ///
+    /// Deferred for the reason [`ControlPlane::on_start_replay`] is: two of the
+    /// refusals in front of it are **catalog** questions, and the answer — the
+    /// replication's id — is minted from the conductor's own session counter
+    /// (`:1455`).
+    fn on_replicate(&mut self, request: ReplicationRequest, now_ms: i64);
+
+    /// `ControlSession.onStopReplication`, which is
+    /// `ArchiveConductor.stopReplication` (`:1480-1493`).
+    ///
+    /// **Not deferred**: the map it takes the session out of is the
+    /// conductor's own, and nothing about the answer needs the client or the
+    /// catalog. It is answered here and sent with everything else that turn.
+    fn on_stop_replication(
+        &mut self,
+        session_id: i64,
+        correlation_id: i64,
+        replication_id: i64,
         now_ms: i64,
     );
 }
@@ -1914,6 +2021,117 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
+        // Asking this archive to copy a recording **from another archive**
+        // (`ControlSessionAdapter.java:965-1019`). The widest request in the
+        // protocol, and the one whose decoder alone is not enough: four of its
+        // fields arrived after the template's first version, and the reference
+        // substitutes for two of them where the generated reader has its own
+        // answer (see [`ReplicationRequest`]).
+        //
+        // Three of the substitutions need nothing done here — the two `varData`
+        // the generated decoder blanks, and `encodedCredentials`, which it
+        // answers empty for exactly the versions the reference hands
+        // `NullCredentialsSupplier.NULL_CREDENTIAL` for.
+        replicate_request_2_codec::SBE_TEMPLATE_ID => {
+            // Read before the decoder, which takes the header by value.
+            let acting_version = header.version();
+
+            let mut decoder = ReplicateRequest2Decoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let src_recording_id = decoder.src_recording_id();
+            let dst_recording_id = decoder.dst_recording_id();
+            let stop_position = decoder.stop_position();
+            let channel_tag_id = decoder.channel_tag_id();
+            let subscription_tag_id = decoder.subscription_tag_id();
+            let src_control_stream_id = decoder.src_control_stream_id();
+            let file_io_max_length = when_present(
+                decoder.file_io_max_length(),
+                acting_version,
+                REPLICATE_FILE_IO_MAX_LENGTH_VERSION,
+            );
+            let replication_session_id = when_present(
+                decoder.replication_session_id(),
+                acting_version,
+                REPLICATE_SESSION_ID_VERSION,
+            );
+
+            // The five `varData` are read **in schema order**: each one starts
+            // where the one before it ended, so a decoder called out of turn
+            // reads the wrong field's length.
+            let coordinates = decoder.src_control_channel_decoder();
+            let src_control_channel =
+                String::from_utf8_lossy(decoder.src_control_channel_slice(coordinates))
+                    .into_owned();
+            let coordinates = decoder.live_destination_decoder();
+            let live_destination =
+                String::from_utf8_lossy(decoder.live_destination_slice(coordinates)).into_owned();
+            let coordinates = decoder.replication_channel_decoder();
+            let replication_channel =
+                String::from_utf8_lossy(decoder.replication_channel_slice(coordinates))
+                    .into_owned();
+            let coordinates = decoder.encoded_credentials_decoder();
+            let encoded_credentials = decoder.encoded_credentials_slice(coordinates).to_vec();
+            let coordinates = decoder.src_response_channel_decoder();
+            let src_response_channel =
+                String::from_utf8_lossy(decoder.src_response_channel_slice(coordinates))
+                    .into_owned();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_replicate(
+                    ReplicationRequest {
+                        session_id,
+                        correlation_id,
+                        src_recording_id,
+                        dst_recording_id,
+                        stop_position,
+                        channel_tag_id,
+                        subscription_tag_id,
+                        src_control_stream_id,
+                        file_io_max_length,
+                        replication_session_id,
+                        src_control_channel,
+                        live_destination,
+                        replication_channel,
+                        encoded_credentials,
+                        src_response_channel,
+                    },
+                    now_ms,
+                );
+            }
+        }
+
+        stop_replication_request_codec::SBE_TEMPLATE_ID => {
+            let decoder = StopReplicationRequestDecoder::default().header(header, 0);
+
+            let control_session_id = decoder.control_session_id();
+            let correlation_id = decoder.correlation_id();
+            let replication_id = decoder.replication_id();
+
+            if let Some(session_id) = gate(
+                sessions,
+                control,
+                authorisation,
+                image,
+                control_session_id,
+                template_id,
+                correlation_id,
+                now_ms,
+            ) {
+                control.on_stop_replication(session_id, correlation_id, replication_id, now_ms);
+            }
+        }
+
         // Everything else is a request this slice does not answer yet: the
         // recording, replay, listing and replication families arrive with the
         // slices that can carry them out. The reference's switch has no default
@@ -1944,6 +2162,22 @@ fn token(decoded: i64, acting_version: u16) -> i64 {
         decoded
     } else {
         NULL_VALUE
+    }
+}
+
+/// An `i32` field the reference substitutes `Aeron.NULL_VALUE` for when the
+/// request predates it (`ControlSessionAdapter.java:979-985`).
+///
+/// [`token`]'s twin, and it is a separate function because the reference's two
+/// substitutions differ in **type** as well as in which field they belong to:
+/// the token is an `i64` and these are `int`s. The generated reader answers
+/// `i32::MIN` for both (`replicate_request_2_codec.rs:418-434`), which is not
+/// `NULL_VALUE` and would travel on as a number no client wrote.
+fn when_present(decoded: i32, acting_version: u16, version: u16) -> i32 {
+    if acting_version >= version {
+        decoded
+    } else {
+        NULL_VALUE as i32
     }
 }
 
@@ -2034,9 +2268,11 @@ mod tests {
     use deepmsg_codec::archive::purge_segments_request_codec::PurgeSegmentsRequestEncoder;
     use deepmsg_codec::archive::replay_request_codec::ReplayRequestEncoder;
     use deepmsg_codec::archive::replay_token_request_codec::ReplayTokenRequestEncoder;
+    use deepmsg_codec::archive::replicate_request_2_codec::ReplicateRequest2Encoder;
     use deepmsg_codec::archive::start_recording_request_codec::{
         SBE_TEMPLATE_ID as START_RECORDING, StartRecordingRequestEncoder,
     };
+    use deepmsg_codec::archive::stop_replication_request_codec::StopReplicationRequestEncoder;
     use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
     use deepmsg_codec::archive::update_channel_request_codec::UpdateChannelRequestEncoder;
 
@@ -2145,6 +2381,14 @@ mod tests {
             session_id: i64,
             correlation_id: i64,
             recording_id: i64,
+        },
+        Replicate {
+            request: ReplicationRequest,
+        },
+        StopReplication {
+            session_id: i64,
+            correlation_id: i64,
+            replication_id: i64,
         },
         ListRecording {
             session_id: i64,
@@ -2478,6 +2722,24 @@ mod tests {
                 correlation_id,
                 recording_id,
                 new_start_position,
+            });
+        }
+
+        fn on_replicate(&mut self, request: ReplicationRequest, _now_ms: i64) {
+            self.calls.push(Call::Replicate { request });
+        }
+
+        fn on_stop_replication(
+            &mut self,
+            session_id: i64,
+            correlation_id: i64,
+            replication_id: i64,
+            _now_ms: i64,
+        ) {
+            self.calls.push(Call::StopReplication {
+                session_id,
+                correlation_id,
+                replication_id,
             });
         }
 
@@ -2960,6 +3222,87 @@ mod tests {
                 .file_io_max_length(4096)
                 .replay_token(replay_token)
                 .replay_channel(replay_channel.as_bytes());
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        buffer
+    }
+
+    /// One `ReplicateRequest2`, hand-built at whatever version the caller wants
+    /// written into the header.
+    ///
+    /// The encoder answers the schema's **newest** version, so an older one is
+    /// written by hand over it — see
+    /// [`a_replicate_from_before_the_versions_it_needs_has_no_fields_for_them`],
+    /// which is the test that version exists for.
+    fn replicate_request(control_session_id: i64, correlation_id: i64, version: u16) -> Vec<u8> {
+        let mut buffer = vec![0u8; 512];
+
+        let length = {
+            let encoder =
+                ReplicateRequest2Encoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .src_recording_id(11)
+                .dst_recording_id(-1)
+                .stop_position(-1)
+                .channel_tag_id(-1)
+                .subscription_tag_id(-1)
+                .src_control_stream_id(10)
+                .file_io_max_length(4096)
+                .replication_session_id(3)
+                .src_control_channel(b"aeron:udp?endpoint=localhost:8010")
+                .live_destination(b"")
+                .replication_channel(b"aeron:udp?endpoint=localhost:8012")
+                .encoded_credentials(b"")
+                .src_response_channel(b"");
+            BODY + encoder.encoded_length()
+        };
+
+        buffer.truncate(length);
+        // `version` is the header's fourth field (`message_header_codec.rs:185`).
+        buffer[6..8].copy_from_slice(&version.to_le_bytes());
+        buffer
+    }
+
+    /// The same request as an **older** client would have written it: the two
+    /// `varData` that arrived later are not there at all.
+    ///
+    /// Both are empty in this build's request, so each costs exactly its
+    /// four-byte length prefix. The block is left at the length the encoder
+    /// wrote, which is not what a version-6 client would have sent — what is
+    /// under test is the **adapter's** reading of an older version, and every
+    /// field it reads is either fixed-width or positioned off that block.
+    fn replicate_request_before_the_new_fields(
+        control_session_id: i64,
+        correlation_id: i64,
+    ) -> Vec<u8> {
+        let mut buffer = replicate_request(control_session_id, correlation_id, 6);
+        buffer.truncate(buffer.len() - 8);
+        buffer
+    }
+
+    /// One `StopReplicationRequest`.
+    fn stop_replication_request(
+        control_session_id: i64,
+        correlation_id: i64,
+        replication_id: i64,
+    ) -> Vec<u8> {
+        let mut buffer = vec![0u8; 256];
+
+        let length = {
+            let encoder =
+                StopReplicationRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), BODY);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().unwrap();
+            encoder
+                .control_session_id(control_session_id)
+                .correlation_id(correlation_id)
+                .replication_id(replication_id);
             BODY + encoder.encoded_length()
         };
 
@@ -4567,6 +4910,103 @@ mod tests {
             control.warnings[0].starts_with("unauthorised archive action="),
             "{:?}",
             control.warnings
+        );
+    }
+
+    /// A `ReplicateRequest2` reaches the session with what it carried, all
+    /// fourteen fields of it (`ControlSessionAdapter.java:965-1019`).
+    #[test]
+    fn a_replicate_reaches_the_session_with_its_own_fields() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = replicate_request(session_id, 99, u16::MAX);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let [Call::Replicate { request }] = &control.calls[1..] else {
+            panic!("not one replicate: {:?}", control.calls);
+        };
+
+        assert_eq!(session_id, request.session_id, "the gate's session");
+        assert_eq!(11, request.src_recording_id);
+        assert_eq!(-1, request.dst_recording_id);
+        assert_eq!(10, request.src_control_stream_id);
+        assert_eq!(4096, request.file_io_max_length, "a field of version 7");
+        assert_eq!(3, request.replication_session_id, "a field of version 8");
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8010", request.src_control_channel,
+            "the first of the five `varData`, read in schema order"
+        );
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8012", request.replication_channel,
+            "the third, which the two between it did not shift"
+        );
+    }
+
+    /// A request written **before** the versions its later fields arrived in
+    /// has no values for them — and the two `i32`s are the reference's
+    /// `Aeron.NULL_VALUE` rather than the decoder's `i32::MIN`
+    /// (`ControlSessionAdapter.java:979-985` against
+    /// `replicate_request_2_codec.rs:418-434`).
+    ///
+    /// This is a unit test rather than a criterion because **no client in this
+    /// tree sends an old one**: the C client writes version 10's block
+    /// (`aeron_archive_proxy.c:796-848`), and the four criteria drive that one.
+    /// What is checked here is the branch a *different* client would take.
+    #[test]
+    fn a_replicate_from_before_the_versions_it_needs_has_no_fields_for_them() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = replicate_request_before_the_new_fields(session_id, 99);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        let [Call::Replicate { request }] = &control.calls[1..] else {
+            panic!("not one replicate: {:?}", control.calls);
+        };
+
+        assert_eq!(
+            NULL_VALUE as i32, request.file_io_max_length,
+            "not positive, which is all the copy asks of it"
+        );
+        assert_eq!(
+            NULL_VALUE as i32, request.replication_session_id,
+            "and the same for the id the copy would use at the source"
+        );
+        assert!(
+            request.encoded_credentials.is_empty(),
+            "the credentials of a version-8 field: {:?}",
+            request.encoded_credentials
+        );
+        assert_eq!(
+            "", request.src_response_channel,
+            "and the response channel of a version-10 one"
+        );
+    }
+
+    /// A `StopReplicationRequest` reaches the session with the id it names
+    /// (`ControlSessionAdapter.java`'s `StopReplicationRequestDecoder` arm).
+    #[test]
+    fn a_stop_replication_reaches_the_session_with_its_id() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+
+        let payload = stop_replication_request(session_id, 99, 4);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(
+            Some(&Call::StopReplication {
+                session_id,
+                correlation_id: 99,
+                replication_id: 4,
+            }),
+            control.calls.last()
         );
     }
 }
