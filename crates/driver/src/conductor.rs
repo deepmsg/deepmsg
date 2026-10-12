@@ -1497,6 +1497,25 @@ impl Conductor {
                     work += self.release_image(registration_id);
                 }
                 ReceiverEvent::ImageLingering { registration_id } => {
+                    // The image has left `DRAINING` for `LINGER`
+                    // (`aeron_publication_image.c:1351-1358`). The receiver runs
+                    // the state machine; this records the one transition the
+                    // conductor's own match reads, and records it **before** the
+                    // announcement below, because the two are one moment in the
+                    // reference — there the state and the match live on the same
+                    // side of the thread, and
+                    // `aeron_publication_image_is_accepting_subscriptions`
+                    // (`aeron_publication_image.h:318-324`) sees `LINGER` the
+                    // instant the image is announced. A subscription arriving
+                    // after this must not be handed the image
+                    // ([`PublicationImages::matching`]).
+                    self.images.on_time_event(
+                        &[(
+                            registration_id,
+                            crate::publication_image::ImageState::Linger,
+                        )],
+                        now_ns,
+                    );
                     work += self.announce_image_unavailable(registration_id);
                 }
                 ReceiverEvent::ReResolveControl {

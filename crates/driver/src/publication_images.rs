@@ -96,6 +96,29 @@ impl PublicationImageRecord {
     pub const fn has_send_response_setup(&self) -> bool {
         self.setup_flags & crate::protocol::header_flags::SETUP_SEND_RESPONSE != 0
     }
+
+    /// Whether a subscription arriving **now** would be linked to this image
+    /// (`aeron_publication_image_is_accepting_subscriptions`,
+    /// `aeron-driver/src/main/c/aeron_publication_image.h:318-324`).
+    ///
+    /// The reference asks three things of the image: that it still has a
+    /// working position, that it is `ACTIVE`, or that it is `DRAINING` and not
+    /// yet drained. A subscription is linked only if all of that holds, so a
+    /// **lingering** image — one whose readers have already been told it is
+    /// gone (`aeron_driver_conductor_image_transition_to_linger`,
+    /// `aeron_driver_conductor.c:1642-1675`) — is never handed to a
+    /// subscription that arrives after it, even though the record is still in
+    /// hand until the image reaches `DONE`.
+    ///
+    /// The state is what this build can ask of the record: the image's
+    /// subscribers live with the image in the receiver's thread, so the
+    /// "working position" and "drained" clauses are the receiver's to know and
+    /// it says so by moving the state — a drained image leaves `DRAINING` for
+    /// `LINGER` (`aeron_publication_image.c:1338-1358`). What a caller sees is
+    /// the same either way: never a `LINGER` or `DONE` image.
+    pub const fn is_accepting_subscriptions(&self) -> bool {
+        matches!(self.state, ImageState::Active | ImageState::Draining)
+    }
 }
 
 /// An image whose log buffer is being created.
@@ -239,17 +262,27 @@ impl PublicationImages {
     }
 
     /// The images a subscription joins as it is created
-    /// (`aeron_driver_conductor.c:5121-5143`).
+    /// (`aeron_driver_conductor.c:5122-5143`).
     ///
-    /// The rule is [`SubscriptionLink::matches_image`], which the live
-    /// image-to-subscription path asks too — the two have to agree, because an
-    /// image a subscription is linked to at creation is one it reads for as
-    /// long as the image exists.
+    /// The rule is [`SubscriptionLink::matches_image`] **and** the image still
+    /// accepting subscriptions — the two clauses the reference's loop asks, in
+    /// that order (`:5126-5128`).
+    ///
+    /// A subscription may well arrive while the same `(endpoint, stream,
+    /// session)` is still an image in hand but one that has already been
+    /// announced unavailable: a re-join after a drop finds the old image
+    /// lingering, and a **lingering** image must not be handed to it
+    /// ([`PublicationImageRecord::is_accepting_subscriptions`]). The image the
+    /// subscription is really for is the one the `SETUP` is about to create,
+    /// linked from the other side a moment later ([`Self::link_new_image`]) —
+    /// so a lingering image left in this answer would be index 0 of two, the
+    /// one a client reads first and the one that goes away under it.
     pub fn matching(&self, link: &SubscriptionLink) -> Vec<i64> {
         self.images
             .iter()
             .filter(|image| {
                 link.matches_image(image.endpoint_id, image.stream_id, image.session_id)
+                    && image.is_accepting_subscriptions()
             })
             .map(|image| image.registration_id)
             .collect()
