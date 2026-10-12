@@ -359,18 +359,6 @@ pub fn run(
     let archive_id = archive_config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT);
     let error_counter_id = half.error_counter_id(&mut client, archive_id)?;
 
-    // Last of the setup, so that nothing can be waiting on a mark file this
-    // process cannot yet serve. See the module note for why this is later than
-    // the reference's own `signalReady`.
-    let mark_file = create_mark_file(archive_config, control_channel.as_deref(), &aeron_dir)?;
-
-    // The ready byte, which is the mark file's *version* field rather than its
-    // length (`ArchiveMarkFile.java:331-338`). Written here, after everything
-    // that serves is up, rather than where the reference writes it.
-    mark_file
-        .signal_ready(clock::epoch_millis())
-        .map_err(|error| format!("could not signal the archive ready: {error}"))?;
-
     let cnc = CncFile::open_writable(&aeron_dir, COMMAND_TIMEOUT)
         .map_err(|error| format!("could not open the counter region: {error}"))?;
 
@@ -406,9 +394,50 @@ pub fn run(
     // **fresh** catalog starts at recording id 0, because the reference's field
     // starts at 0 and `Archive` constructs its `Catalog` without seeding it
     // (`Catalog.java:148`, `Archive.java:1503-1511`).
-    let catalog =
+    let mut catalog =
         Catalog::open_or_create(&archive_config.archive_dir, MAX_CATALOG_ENTRIES_DEFAULT, 0)
             .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
+
+    // **The repair the caller has to ask for**, and this is that caller: a
+    // recording that was being written when the last archive died has a `VALID`
+    // record and a **null** stop position, because the position is written when
+    // a recording stops and this one never did. The reference repairs every
+    // descriptor as it loads the catalog (`Catalog.java:228-231`); this build's
+    // repair is a method precisely so a *reader* — `ArchiveTool describe` is one
+    // — does not write to somebody's catalog because it looked at it, and the
+    // archive starting up is the caller that means it.
+    //
+    // Without this the recording is still listed and still replayable **up to a
+    // position** — and a reader that replays to the end gets
+    // `replay length must be positive: ... stopPosition=-1`, because "to the
+    // end" of a recording with no stop position is not a length. That is what
+    // the C suite's kill-and-restart cases met.
+    //
+    // `None` is the checksum, which is what the reference passes by default
+    // (`Archive.Configuration.recordChecksum()` is empty unless
+    // `aeron.archive.record.checksum` names a class); the recording's stop
+    // **timestamp** is now, which is the reference's answer too
+    // (`Catalog.java:1093-1095`) — the time it actually stopped is not knowable
+    // from the files.
+    let repaired = catalog
+        .refresh_and_fix(None, clock::epoch_millis())
+        .map_err(|error| format!("could not repair the archive's catalog: {error}"))?;
+
+    if repaired > 0 {
+        println!("{name}: repaired {repaired} recording(s) with no stop position");
+    }
+
+    // Last of the setup, so that nothing can be waiting on a mark file this
+    // process cannot yet serve. See the module note for why this is later than
+    // the reference's own `signalReady`.
+    let mark_file = create_mark_file(archive_config, control_channel.as_deref(), &aeron_dir)?;
+
+    // The ready byte, which is the mark file's *version* field rather than its
+    // length (`ArchiveMarkFile.java:331-338`). Written here, after everything
+    // that serves is up, rather than where the reference writes it.
+    mark_file
+        .signal_ready(clock::epoch_millis())
+        .map_err(|error| format!("could not signal the archive ready: {error}"))?;
 
     let mut conductor = ArchiveConductor::new(
         archive_config,

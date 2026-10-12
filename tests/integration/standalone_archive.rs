@@ -31,6 +31,8 @@
 
 use std::time::Instant;
 
+use deepmsg_archive::catalog::{Catalog, Recording};
+use deepmsg_archive::mark::NULL_VALUE;
 use deepmsg_client::client::Client;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::driver::{self, OwnDriver};
@@ -39,6 +41,10 @@ use deepmsg_tests::temp::TempDir;
 
 /// The connect's correlation id, which its answer echoes.
 const CORRELATION_ID: i64 = 0x5ed1_0002;
+
+/// How big the fabricated catalog's file is. A record is a few hundred bytes and
+/// this holds the one the repair test writes with room to spare.
+const CATALOG_CAPACITY: usize = 8 * 1024;
 
 #[test]
 fn a_standalone_archive_serves_a_connect_over_a_drivers_cnc() {
@@ -86,4 +92,92 @@ fn a_standalone_archive_serves_a_connect_over_a_drivers_cnc() {
     );
 
     let _ = archive.stop();
+}
+
+/// A recording that was being written when its archive died has **no stop
+/// position** on disk, and the archive that starts over that catalog must repair
+/// it before it serves anything.
+///
+/// The stop position is written when a recording stops
+/// (`ArchiveConductor.java:1329-1363`, this build's `Catalog::recording_stopped`),
+/// so a recording whose archive died first leaves a `VALID` record with a null
+/// one. What it would have been is still in the segment files, and
+/// `Catalog.refreshAndFixDescriptor` (`:1066-1097`) reads them — the reference
+/// runs that over **every** descriptor as it loads the catalog
+/// (`Catalog.java:228-231`).
+///
+/// This build's repair is a method on purpose — a reader like `ArchiveTool
+/// describe` has no business writing to somebody's catalog because it looked at
+/// it — and the archive starting up is the caller that means it. Without that
+/// caller the C suite's kill-and-restart cases were handed `stopPosition = -1`
+/// and refused with `replay length must be positive: replayLength=-33793,
+/// length=-1, stopPosition=-1`, because "to the end" of a recording with no stop
+/// position is not a length.
+///
+/// The recording here has **no segment files**, which is the shape this
+/// criterion can fabricate without a recorder: `compute_stop_position`'s answer
+/// to that is the recording's start position, so what is asserted is that the
+/// null is gone and something with a meaning took its place.
+#[test]
+fn an_archive_repairs_a_stop_position_that_was_never_written() {
+    let archive_dir = TempDir::new("standalone-archive-repair");
+
+    let Some(driver) = OwnDriver::start("standalone-archive-repair") else {
+        driver::announce_skip();
+        return;
+    };
+
+    // Deliberately not zero, so that "repaired to the start position" cannot be
+    // an uninitialised field agreeing with itself.
+    let start_position = 64;
+
+    let recording_id = {
+        let mut catalog =
+            Catalog::create(archive_dir.path(), CATALOG_CAPACITY, 0).expect("the catalog is made");
+
+        catalog
+            .add_recording(&Recording {
+                recording_id: 0,
+                start_timestamp: 1,
+                stop_timestamp: NULL_VALUE,
+                start_position,
+                stop_position: NULL_VALUE,
+                initial_term_id: 0,
+                segment_file_length: 128 * 1024,
+                term_buffer_length: 64 * 1024,
+                mtu_length: 1408,
+                session_id: 3,
+                stream_id: 33,
+                stripped_channel: "aeron:ipc".to_owned(),
+                original_channel: "aeron:ipc".to_owned(),
+                source_identity: "aeron:ipc".to_owned(),
+            })
+            .expect("the record fits")
+    };
+
+    let Some(mut archive) =
+        OwnStandaloneArchive::start(driver.aeron_dir(), archive_dir.path(), &archive::PROPERTIES)
+    else {
+        standalone_archive::announce_skip();
+        return;
+    };
+
+    archive
+        .await_ready(DEADLINE)
+        .expect("the standalone archive must come up over the catalog it was handed");
+
+    let _ = archive.stop();
+    drop(archive);
+
+    // Read it back out of the file, not out of the archive: what the repair
+    // wrote is what the next start will load.
+    let catalog = Catalog::open(archive_dir.path()).expect("the catalog opens again");
+    let recording = catalog
+        .recording(recording_id)
+        .expect("the recording is still there");
+
+    assert_eq!(
+        start_position, recording.stop_position,
+        "the null stop position is repaired before the archive serves"
+    );
 }
