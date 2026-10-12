@@ -160,3 +160,38 @@ Removing it took the round trip from 8.8 µs to 0.9 µs and throughput from
 116,544/s to 2,758,084/s — with `attempts/msg` at 1.00 before *and* after, which
 is what says the publisher was never the limit: the consumer's poll loop was,
 and the poll loop was mostly this.
+
+## Against the reference's own benchmark harness
+
+The tables above come from this tree's own harness and from the reference's
+`Ping`/`Pong` samples: a process pair, one message in flight, no rate control.
+`bench/` measures something else — two batches that drive the reference's
+benchmark repository (`aeron-io/benchmarks`) instead, where the load is a stated
+rate for a stated number of iterations, the far end is the harness's echo node,
+and both sides write the same interval-log files.
+
+| batch | what moves between arms | what a reading can say |
+|---|---|---|
+| `bench/upstream-c-drivers` | the media driver, three ways: Java, a C control built here, a C build of the changes this tree is asking upstream for | which layer, because exactly one layer moves |
+| `bench/rust-vs-java` | nothing inside either arm — this build's whole stack against the reference's | only how far apart the two systems are, never which layer |
+
+    bench/build.sh
+    bench/upstream-c-drivers/build-c-driver.sh c-control upstream/master
+    bench/upstream-c-drivers/build-c-driver.sh c-patched driver/c-driver-receive-path
+    bench/upstream-c-drivers/patches/install.sh --apply
+    bench/upstream-c-drivers/run-batch.sh                  # about 80 minutes
+    bench/rust-vs-java/run-batch.sh                        # about 40 minutes
+
+Both write one directory of histograms per cell under `bench/out/` (ignored by
+git) with a `fingerprint.txt` and a `RUN-INFO.txt` beside them, and both read
+them with `bench/tools/quantiles.sh` — the harness's own HdrHistogram decoder,
+which reads this build's files because `crates/bench/src/loadtest/result.rs`
+writes the format the harness's `PersistedHistogram` writes. Each batch's
+`read.py` prints the pair round by round, with the floor and with whether the
+sign survived the reversal.
+
+Every rule the tables above are read by applies here too, and two more: a ratio
+is read only when both rounds agree in sign, and a difference inside the floor
+(each arm against itself across the two rounds) is not a difference. No table
+from either batch is in this file yet — they are put here with the command that
+produced them and the fingerprint they ran on, and not before.
