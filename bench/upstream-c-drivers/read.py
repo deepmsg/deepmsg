@@ -153,7 +153,7 @@ def main():
 
     if comparisons:
         print(f"=== ratios, {args.stat} ===")
-        print(f"{'pair':>12} " + "".join(f"{n:>24}" for n, _, _ in comparisons))
+        print(f"{'pair':>12} " + "".join(f"{n:>30}" for n, _, _ in comparisons))
         verdicts = defaultdict(dict)
         for pair in pairs:
             name = f"{pair[0]}:{pair[1]}"
@@ -165,7 +165,7 @@ def main():
                     (vals[0] < 1.0) == (vals[1] < 1.0)
                 )
                 verdicts[label][pair] = agree
-                line += f"{shown + ('  same sign' if agree else '  SIGN FLIPS'):>24}"
+                line += f"{shown + ('  same sign' if agree else '  SIGN FLIPS'):>30}"
             print(line)
         print()
 
