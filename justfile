@@ -40,6 +40,20 @@ bench:
 bench-latency *args:
     cargo bench -p deepmsg-bench --bench latency -- {{args}}
 
+# Build the three binaries a run batch measures, at the profile they are
+# measured under. See bench/README.md.
+bench-build:
+    ./bench/build.sh
+
+# The C driver arms against each other and the Java one. Long; `--list` first.
+bench-drivers *args:
+    ./bench/upstream-c-drivers/run-batch.sh {{args}}
+
+# Two whole stacks, this build and the reference's. See bench/README.md for why
+# this one cannot say which layer a difference came from.
+bench-stacks *args:
+    ./bench/rust-vs-java/run-batch.sh {{args}}
+
 # Regenerate the SBE codecs from schemas/ (ADR-0004). Needs a JDK and the
 # pinned sbe-tool/agrona jars; see `gen-sbe-codecs --help`.
 gen *args:

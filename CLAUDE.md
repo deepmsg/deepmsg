@@ -76,6 +76,7 @@ the authority only where no C exists — the archive server and the cluster.
 | Why 1.53.2, and what "compatible" means | `docs/adr/0001` |
 | Numbers, versions, byte contracts | `docs/compat.md` |
 | What this build measures, and on what | `docs/benchmarks.md` |
+| How this build is compared against the reference's own benchmark harness, and how to run either batch | `bench/README.md` |
 | Scope, phases, gates that apply from day one | `docs/roadmap.md` |
 | Vocabulary | `GLOSSARY.md` |
 | Reference checkout layout | `docs/reference.md` |

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# A driver shim: the harness hands a media driver *properties files* as
+# positional arguments, and this build's driver takes `-Dname=value`. This turns
+# one into the other and execs the driver.
+#
+# That is what `AERON_MD` is documented to be for
+# (`scripts/aeron/README.md:99-106`) — except that `c-media-driver` hard-codes
+# `exec "${DIR}/aeronmd"` and never reads the variable, so the way in is to be
+# named `aeronmd` and sit where that script looks, beside the properties it
+# passes.
+#
+#   DEEPMSG_DRIVER   the driver binary to run (default: this tree's release build)
+#
+# Two details that are not decoration:
+#
+# - The harness's `start_media_driver` waits for the driver with
+#   `pgrep -x '^aeronmd$'` (`scripts/aeron/remote-benchmarks-helper:41`), which
+#   matches the *process name*. A shell script that execs a binary called
+#   `deepmsg-driver` is a process called `deepmsg-driver`, so this execs a
+#   symlink named `aeronmd` instead and the name survives.
+# - This build's driver has no `aeron.print.configuration`: the reference's dump
+#   is a whole feature, not a setting, and nothing here depends on it.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+BENCH_DIR=$(dirname "$(dirname "$here")")
+REPO_ROOT=$(dirname "$BENCH_DIR")
+driver=${DEEPMSG_DRIVER:-$REPO_ROOT/target/release/deepmsg-driver}
+
+defines=()
+passthrough=()
+
+for argument in "$@"; do
+    if [ -f "$argument" ]; then
+        # `key=value` a line, `#` or nothing to a line. The reference's files are
+        # written that way; `java.util.Properties`' escapes are not implemented
+        # here because none of them appear in the files this reads.
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=${line%$'\r'}
+            [ -z "${line// }" ] && continue
+            case "$line" in \#*) continue ;; esac
+            defines+=("-D$line")
+        done <"$argument"
+    else
+        # Anything that is not a file — a `-D` the caller added, say — is handed
+        # to the driver as it came.
+        passthrough+=("$argument")
+    fi
+done
+
+# The name has to survive the exec — see the header. The symlink lands under the
+# batch's output tree, not in this one: nothing a run creates belongs in the
+# checkout.
+link_dir=${BENCH_OUT_DIR:-$BENCH_DIR/out}/shims
+mkdir -p "$link_dir"
+ln -sf "$driver" "$link_dir/aeronmd"
+
+exec "$link_dir/aeronmd" ${defines[@]+"${defines[@]}"} ${passthrough[@]+"${passthrough[@]}"}

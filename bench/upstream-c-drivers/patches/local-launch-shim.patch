@@ -1,0 +1,63 @@
+diff --git a/scripts/aeron/remote-echo-single-host-benchmarks b/scripts/aeron/remote-echo-single-host-benchmarks
+index 7b42497..b104738 100755
+--- a/scripts/aeron/remote-echo-single-host-benchmarks
++++ b/scripts/aeron/remote-echo-single-host-benchmarks
+@@ -59,6 +59,11 @@ so_sndbuf="${AERON_SOCKET_SO_SNDBUF:-2m}"
+ so_rcvbuf="${AERON_SOCKET_SO_RCVBUF:-2m}"
+ rcv_initial_window="${AERON_RCV_INITIAL_WINDOW_LENGTH:-2m}"
+ max_messages_per_send="${AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND:-2}"
++# deepmsg bench harness: allow the three throughput knobs to be set independently, which
++# the reference's own default (all three equal) cannot express. Both default to
++# max_messages_per_send, so upstream behaviour is unchanged when they are unset.
++receiver_io_vector_capacity="${AERON_RECEIVER_IO_VECTOR_CAPACITY:-${max_messages_per_send}}"
++sender_io_vector_capacity="${AERON_SENDER_IO_VECTOR_CAPACITY:-${max_messages_per_send}}"
+ dpdk_config_overrides=""
+ if [[ -v AERON_DPDK_MTU && -n ${AERON_DPDK_MTU} ]];
+ then
+@@ -216,8 +221,8 @@ aeron.socket.so_sndbuf=${so_sndbuf}\n\
+ aeron.socket.so_rcvbuf=${so_rcvbuf}\n\
+ aeron.rcv.initial.window.length=${rcv_initial_window}\n\
+ aeron.network.publication.max.messages.per.send=${max_messages_per_send}\n\
+-aeron.receiver.io.vector.capacity=${max_messages_per_send}\n\
+-aeron.sender.io.vector.capacity=${max_messages_per_send}\n\
++aeron.receiver.io.vector.capacity=${receiver_io_vector_capacity}\n\
++aeron.sender.io.vector.capacity=${sender_io_vector_capacity}\n\
+ \" > ${scripts_path}/benchmark.properties"
+ 
+ supported_drivers['java']="${driver_properties}; \
+diff --git a/scripts/remote-benchmarks-runner b/scripts/remote-benchmarks-runner
+index c34d6de..97e7a0f 100755
+--- a/scripts/remote-benchmarks-runner
++++ b/scripts/remote-benchmarks-runner
+@@ -157,6 +157,14 @@ function download_results()
+ 
+   mkdir -p "${dest_dir}"
+ 
++  # Local launch shim: an empty node means "this host", so the archive is already local
++  # and the scp hop is skipped. Unchanged when a node is given.
++  if [[ -z "${server}" ]]
++  then
++    cp "${archive}" "${dest_dir}"
++    return
++  fi
++
+   scp -i "${sshKeyFile}" \
+    -o ConnectionAttempts="${sshConnectionAttempts}" \
+    -o ConnectTimeout="${sshConnectTimeout}" \
+@@ -245,6 +253,16 @@ function execute_remote_command()
+   local sshKeyFile=${2}
+   local server=${3}
+   local command=${4}
++
++  # Local launch shim (deepmsg bench harness): the benchmarks are driven on the same
++  # machine that runs them, so an empty node means "this host" and the ssh hop is
++  # skipped. Unchanged when a node is given.
++  if [[ -z "${server}" ]]
++  then
++    bash -c "${command}"
++    return $?
++  fi
++
+   ssh -i "${sshKeyFile}" \
+    -o StrictHostKeyChecking=no \
+    -o ConnectionAttempts="${sshConnectionAttempts}" \

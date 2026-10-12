@@ -1,0 +1,13 @@
+--- a/scripts/aeron/remote-echo-single-host-benchmarks
++++ b/scripts/aeron/remote-echo-single-host-benchmarks
+@@ -234,6 +234,10 @@
+ 
+ supported_drivers['c']="${driver_properties}; \
+       $(start_media_driver "${scripts_path}/c-media-driver" "" "driver_cpu_node_var" "driver_non_isolated_cpu_cores_var" "driver_conductor_cpu_core_var" "driver_sender_cpu_core_var" "driver_receiver_cpu_core_var")"
++supported_drivers['c-control']="${driver_properties}; \
++      $(start_media_driver "${scripts_path}/c-media-driver-c-control" "" "driver_cpu_node_var" "driver_non_isolated_cpu_cores_var" "driver_conductor_cpu_core_var" "driver_sender_cpu_core_var" "driver_receiver_cpu_core_var")"
++supported_drivers['c-patched']="${driver_properties}; \
++      $(start_media_driver "${scripts_path}/c-media-driver-c-patched" "" "driver_cpu_node_var" "driver_non_isolated_cpu_cores_var" "driver_conductor_cpu_core_var" "driver_sender_cpu_core_var" "driver_receiver_cpu_core_var")"
+ 
+ supported_drivers['c-onload']="${driver_properties}; \
+       export EF_NO_FAIL=0 EF_RXQ_SIZE=${ef_vi_rxq_size} EF_TXQ_SIZE=${ef_vi_txq_size} \
