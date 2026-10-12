@@ -208,14 +208,30 @@ pub struct ArchiveMarkFile {
 }
 
 impl ArchiveMarkFile {
-    /// Create the mark file for an archive in `directory`, replacing one that is
-    /// there.
+    /// Create the mark file for an archive in `directory`, **over one that is
+    /// already there**.
+    ///
+    /// The reference's `ArchiveMarkFile` opens as readily as it creates —
+    /// `new ArchiveMarkFile(ctx)` (`Archive.java:1323`) reaches Agrona's
+    /// `MarkFile`, which maps the file it finds and makes one only when there is
+    /// none — and that is what lets an archive be restarted over its own
+    /// directory: the C suite's kill-and-restart cases start one with
+    /// `delete.on.start=false` and expect it to serve the recordings already in
+    /// the archive directory. Insisting on `O_EXCL` here refused exactly that,
+    /// with `File exists`, to a case that then waited for an archive that had
+    /// already died.
+    ///
+    /// What is written over it is this process's own header, which is the same
+    /// thing the reference does with the file it mapped.
     ///
     /// The length is the reference's `alignedTotalFileLength` (`:450-471`): the
     /// header and the error buffer together, rounded up to the page size —
     /// because a mapping is whole pages whatever the file asks for, and the
     /// error buffer has to be what the reader expects to find behind the
-    /// header.
+    /// header. It is honoured when the file is made, and an existing file is
+    /// mapped at whatever length it has: a reader behind this one reads the
+    /// length the file carries, not the one a later process would have asked
+    /// for.
     ///
     /// The pid is this process's, stamped once, here: `ArchiveMarkFile`'s
     /// creating constructor does the same (`:196`) and its opening one does
@@ -252,7 +268,8 @@ impl ArchiveMarkFile {
         let mut bytes = vec![0_u8; needed];
         let encoded = encode(&mut bytes, header, error_buffer_length, pid)?;
 
-        let mark = MarkFile::create(&path, length, VERSION_OFFSET, ACTIVITY_TIMESTAMP_OFFSET)?;
+        let mark =
+            MarkFile::open_or_create(&path, length, VERSION_OFFSET, ACTIVITY_TIMESTAMP_OFFSET)?;
         write(&mark, &bytes[..encoded])?;
 
         mark::ensure_mark_file_link(directory, &path, LINK_FILENAME).map_err(MarkFileError::Io)?;
@@ -807,6 +824,63 @@ mod tests {
         // And once it is published, it opens.
         mark.signal_ready(NOW).expect("signalled");
         assert!(ArchiveMarkFile::open(dir.path()).is_ok());
+    }
+
+    /// A second archive start over the same directory writes its own header over
+    /// the file it finds rather than refusing to start.
+    ///
+    /// This is the reference's shape — `ArchiveMarkFile` reaches Agrona's
+    /// `MarkFile`, which maps what is there — and it is what the C suite's
+    /// kill-and-restart cases do: an archive is stopped, its directory kept
+    /// (`delete.on.start=false`), and another started in its place to serve the
+    /// recordings already in it.
+    ///
+    /// The header is **not** what the first start wrote: a restart names its own
+    /// control channel and its own pid, and a reader that got the first one's
+    /// would be reading an archive that is gone.
+    #[test]
+    fn a_second_start_writes_its_own_header_over_the_one_it_finds() {
+        let dir = TempDir::new();
+
+        let first = ArchiveMarkFile::create(
+            dir.path(),
+            &header(),
+            ERROR_BUFFER_LENGTH_DEFAULT,
+            PAGE,
+            PID,
+        )
+        .expect("the first start creates it");
+        first.signal_ready(NOW).expect("signalled");
+        drop(first);
+
+        // The second start: same directory, a later clock, a different id and a
+        // different pid — three fields a reader of the first one's header would
+        // get wrong.
+        let mut restarted_header = header();
+        restarted_header.start_timestamp = NOW;
+        restarted_header.archive_id = ARCHIVE_ID + 1;
+
+        let second = ArchiveMarkFile::create(
+            dir.path(),
+            &restarted_header,
+            ERROR_BUFFER_LENGTH_DEFAULT,
+            PAGE,
+            PID + 1,
+        )
+        .expect("the second start writes over it");
+
+        assert_eq!(Some(NOW), second.start_timestamp(), "the new header");
+        assert_eq!(Some(ARCHIVE_ID + 1), second.archive_id());
+        assert_eq!(Some(PID + 1), second.pid());
+
+        // And it is the file, not just the mapping: opened by a third process,
+        // which is a reader that waits for the ready byte like every other.
+        second.signal_ready(NOW).expect("signalled");
+
+        let opened = ArchiveMarkFile::open(dir.path()).expect("open");
+        assert_eq!(Some(NOW), opened.start_timestamp());
+        assert_eq!(Some(ARCHIVE_ID + 1), opened.archive_id());
+        assert_eq!(Some(PID + 1), opened.pid());
     }
 
     /// The error buffer's length is a **field**, not a constant: what the

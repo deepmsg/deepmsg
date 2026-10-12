@@ -10,6 +10,7 @@
 pub mod catalog;
 pub mod checksum;
 pub mod client;
+pub mod launch;
 pub mod mark;
 pub mod mark_file;
 pub mod recording_log;

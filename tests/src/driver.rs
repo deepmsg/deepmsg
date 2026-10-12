@@ -468,8 +468,33 @@ impl ReferenceDriver {
         args: &[String],
         extra_env: &[(&str, &str)],
     ) -> Result<Self, DriverError> {
-        let log_path = aeron_dir.with_extension("driver.log");
-        let log = std::fs::File::create(&log_path).map_err(DriverError::Spawn)?;
+        Self::spawn_with_args_and_log(
+            program,
+            aeron_dir,
+            &aeron_dir.with_extension("driver.log"),
+            args,
+            extra_env,
+        )
+    }
+
+    /// The same, with the log somewhere other than `<aeron_dir>.driver.log`.
+    ///
+    /// Two processes in **one** aeron directory need this: the standalone
+    /// archive attaches to a driver somebody else started, and the second of the
+    /// two to start would truncate the first one's startup lines away if they
+    /// shared a log. Who is talking is the whole of whose log it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReferenceDriver::spawn_with_args`].
+    pub fn spawn_with_args_and_log(
+        program: &Path,
+        aeron_dir: &Path,
+        log_path: &Path,
+        args: &[String],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, DriverError> {
+        let log = std::fs::File::create(log_path).map_err(DriverError::Spawn)?;
         let log_err = log.try_clone().map_err(DriverError::Spawn)?;
 
         let mut command = Command::new(program);
@@ -494,7 +519,7 @@ impl ReferenceDriver {
         Ok(Self {
             child,
             aeron_dir: aeron_dir.to_path_buf(),
-            log_path,
+            log_path: log_path.to_path_buf(),
             stopped: false,
         })
     }
