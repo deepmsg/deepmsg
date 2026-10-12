@@ -6009,12 +6009,26 @@ impl Sessions {
     /// threshold — so a filesystem that cannot be asked about refuses starts
     /// rather than accepting them blind.
     fn is_low_storage_space(&self) -> Option<String> {
-        let threshold = self.recording.low_storage_space_threshold;
-        let usable = usable_space(&self.recording.archive_dir);
+        self.storage_space_refusal(usable_space(&self.recording.archive_dir))
+    }
 
-        if usable <= threshold {
+    /// The comparison `isLowStorageSpace` makes and the line it makes it with
+    /// (`ArchiveConductor.java:2604-2606`), over a reading of the space **handed
+    /// in** rather than taken.
+    ///
+    /// The reading is the caller's so that the one thing here that can be wrong
+    /// — `<=` and not `<` — is askable at the boundary, which is the only place
+    /// the two disagree. A criterion that read the filesystem itself would be
+    /// asking it of a number another test can move between the threshold that
+    /// criterion sets and the check this one runs: `std::env::temp_dir()` is one
+    /// filesystem for the whole workspace, and a full round has every other
+    /// criterion writing to it.
+    fn storage_space_refusal(&self, usable_space: u64) -> Option<String> {
+        let threshold = self.recording.low_storage_space_threshold;
+
+        if usable_space <= threshold {
             return Some(format!(
-                "low storage threshold={threshold} <= usableSpace={usable}"
+                "low storage threshold={threshold} <= usableSpace={usable_space}"
             ));
         }
 
@@ -8235,20 +8249,41 @@ mod tests {
 
         assert_eq!(None, sessions.is_low_storage_space(), "the temp directory");
 
-        let usable = usable_space(&sessions.recording.archive_dir);
-        sessions.recording.low_storage_space_threshold = usable;
+        // The boundary is `<=` and not `<` (`ArchiveConductor.java:2604`), and
+        // this is the one criterion that can stand on it: in the field the
+        // threshold is a configured number that lands on the reading only by
+        // accident. The reading is handed to the comparison rather than read by
+        // it, because a criterion that read the filesystem twice would be
+        // asserting on two readings of one shared temp directory — a parallel
+        // criterion writing to it is what made this red in a full round.
+        sessions.recording.low_storage_space_threshold = 770_196_246_528;
 
         assert_eq!(
-            Some(format!(
-                "low storage threshold={usable} <= usableSpace={usable}"
-            )),
-            sessions.is_low_storage_space(),
+            Some("low storage threshold=770196246528 <= usableSpace=770196246528".to_owned()),
+            sessions.storage_space_refusal(770_196_246_528),
             "the reference refuses at `<=`, not at `<`"
         );
+        assert_eq!(
+            None,
+            sessions.storage_space_refusal(770_196_247_529),
+            "one byte of room is room"
+        );
 
+        // And what the refusal is built on is that directory's own filesystem:
+        // a reading no filesystem can be above refuses...
+        sessions.recording.low_storage_space_threshold = u64::MAX;
+        assert!(
+            sessions.is_low_storage_space().is_some(),
+            "the temp directory's filesystem is below every threshold"
+        );
+
+        // ...and a directory that cannot be asked about answers zero.
         sessions.recording.archive_dir = PathBuf::from("/no/such/archive/directory");
         assert_eq!(
-            Some(format!("low storage threshold={usable} <= usableSpace=0")),
+            Some(format!(
+                "low storage threshold={} <= usableSpace=0",
+                u64::MAX
+            )),
             sessions.is_low_storage_space(),
             "a filesystem that cannot be asked about answers zero, which is below any threshold"
         );
