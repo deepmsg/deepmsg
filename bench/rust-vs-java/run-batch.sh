@@ -224,8 +224,15 @@ _run_round() {
 }
 
 _run_round round1-forward "${arm_list[@]}"
-reversed=$(IFS=,; for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do printf '%s' "${arm_list[i]}"; [ "$i" -gt 0 ] && printf ','; done)
-IFS=',' read -ra rev_list <<<"$reversed"
+
+# The second round is the first one walked backwards. An array, not a CSV built
+# inside a command substitution: a `[ … ] && printf` there returns non-zero on
+# the last iteration, and under `set -e` that ends the script before the round
+# it was building ever starts.
+rev_list=()
+for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do
+    rev_list+=("${arm_list[i]}")
+done
 _run_round round2-reverse "${rev_list[@]}"
 
 echo

@@ -85,7 +85,7 @@ await_cnc() {
 driver_start_java() {
     local log=$1; shift
     "$BENCHMARKS_DRIVER_JAVA" "$@" >"$log" 2>&1 &
-    echo $!
+    _bench_driver_started $!
 }
 
 # One of the C arms: a directory holding `aeronmd` and the shared libraries it
@@ -96,7 +96,7 @@ driver_start_c() {
     local log=$1 arm=$2; shift 2
     LD_LIBRARY_PATH="$arm${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$arm/c-media-driver" "$@" >"$log" 2>&1 &
-    echo $!
+    _bench_driver_started $!
 }
 
 # This build's driver, through the shim that turns the reference's positional
@@ -107,7 +107,17 @@ driver_start_deepmsg() {
         "$BENCH_LIB/shims/aeronmd" \
         "$BENCHMARKS_SCRIPTS_DIR/low-latency-driver.properties" \
         "$BENCH_DIR/lib/conf/benchmark.properties" "$@" >"$log" 2>&1 &
-    echo $!
+    _bench_driver_started $!
+}
+
+# A driver is started to be killed at the end of the cell, and bash announces a
+# killed job on stderr — one `Killed` line per cell, in the middle of the
+# table's progress lines. Disowning it takes it out of the job table, so the
+# kill is silent. Nothing waits on these pids: the cell kills by name.
+_bench_driver_started() {
+    local pid=$1
+    disown "$pid" 2>/dev/null || true
+    echo "$pid"
 }
 
 # --- far ends ----------------------------------------------------------------
@@ -178,6 +188,17 @@ run_client_rust() {
 
 # --- the check ---------------------------------------------------------------
 
+# A rate as the harness writes it — `25K`, `501K`, `1M` — as a count. The suffix
+# is part of the property's syntax on both sides, and arithmetic on the string
+# itself is a shell error, not a slow failure.
+_rate_as_number() {
+    case "$1" in
+        *[Kk]) echo $(( ${1%[Kk]} * 1000 )) ;;
+        *[Mm]) echo $(( ${1%[Mm]} * 1000000 )) ;;
+        *) echo "$1" ;;
+    esac
+}
+
 # `cell_validate <cell-dir> <run> <rate> <iterations>` — 0 when the cell counts,
 # 1 with a reason on stderr when it does not.
 #
@@ -187,7 +208,7 @@ run_client_rust() {
 cell_validate() {
     local cell=$1 run=$2 rate=$3 iterations=$4
     local dir="$cell/run-$run" log="$cell/run-$run/client.log"
-    local expected=$((rate * iterations))
+    local expected=$(( $(_rate_as_number "$rate") * iterations ))
 
     if [ ! -f "$log" ]; then
         echo "no client log at $log" >&2
