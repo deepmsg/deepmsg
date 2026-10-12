@@ -56,6 +56,10 @@ BENCH_NODE="${BENCH_NODE:-$DEEPMSG_DIR/target/rig/release/echo-node}"
 
 BENCH_AERON_DIR="${BENCH_AERON_DIR:-/dev/shm/aeron}"
 
+# Where the built C driver arms are collected, one directory each. Defined here
+# because three scripts use it and it must be the same three times.
+AERON_C_ARM_DIR="${AERON_C_ARM_DIR:-$BENCH_OUT_DIR/arms}"
+
 # The cores. The driver pins its own three out of the properties file it is
 # given; these two are the ones a batch has to place itself.
 BENCH_NODE_CPU="${BENCH_NODE_CPU:-4}"

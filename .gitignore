@@ -10,3 +10,6 @@
 # The tables that matter are copied into docs/benchmarks.md with the command that
 # produced them; the files themselves are large and machine-specific.
 /bench/out/
+
+# The readers under bench/ are Python; their bytecode is not source.
+__pycache__/

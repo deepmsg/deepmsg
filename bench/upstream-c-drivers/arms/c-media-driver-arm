@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# The harness's C-driver launcher, for one *arm* — a build of the C driver that
+# a batch is comparing.
+#
+# Installed as `c-media-driver-<arm>` into the harness's `scripts/aeron`, beside
+# the reference's own `c-media-driver`. That script is 18 lines and ends with
+# `exec "${DIR}/aeronmd" low-latency-driver.properties benchmark.properties
+# "$@"`; this is the same shape with the binary and its libraries taken from the
+# arm's directory instead of from `scripts/aeron` itself — which is what lets
+# two C drivers be two arms of one run rather than two runs.
+#
+#   AERON_C_ARM_DIR   where the arms live (default: `arms` beside this script,
+#                     which is where `patches/install.sh` would put a copy;
+#                     `run-batch.sh` exports it instead, pointing at the
+#                     batch's own output tree, so the harness keeps only a
+#                     launcher)
+#
+# The arm is named by the file this is installed as, so one file serves every
+# arm: `c-media-driver-c-patched` runs the arm `c-patched`.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+arm=$(basename "${BASH_SOURCE[0]}")
+arm=${arm#c-media-driver-}
+
+arm_dir="${AERON_C_ARM_DIR:-$here/arms}/$arm"
+
+if [ ! -x "$arm_dir/aeronmd" ]; then
+    echo "no C driver for arm '$arm': $arm_dir/aeronmd does not exist" >&2
+    echo "  build it with bench/upstream-c-drivers/build-c-driver.sh $arm <git-ref>" >&2
+    exit 1
+fi
+
+export LD_LIBRARY_PATH="$arm_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+exec "$arm_dir/aeronmd" \
+    "$here/low-latency-driver.properties" \
+    "$here/benchmark.properties" \
+    "$@"
