@@ -177,7 +177,23 @@ mkdir -p "$out"
 # 0 is left to the kernel and the network softirq, 6 and 7 to the JVMs' own
 # threads. They are frozen here and published with every result.
 export BENCHMARKS_PATH="$BENCHMARKS_DIR"
-export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
+
+# The harness needs a JAVA_HOME, not just a `java`. The bench machine's is named
+# first and the one behind `java` on the path is the fallback, so this does not
+# have to be edited on a machine that keeps its JDK somewhere else.
+if [ -z "${JAVA_HOME:-}" ]; then
+    for candidate in /usr/lib/jvm/java-21-openjdk-amd64 \
+        "$(dirname "$(dirname "$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)")")"; do
+        if [ -x "$candidate/bin/java" ]; then
+            export JAVA_HOME="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "${JAVA_HOME:-}" ]; then
+    echo "no JAVA_HOME: set it, or put a java on the path" >&2
+    exit 1
+fi
 
 export DRIVER_CPU_NODE=0
 export CLIENT_CPU_NODE=0
