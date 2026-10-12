@@ -11,6 +11,12 @@ bench/upstream-c-drivers/patches/install.sh --apply
 bench/upstream-c-drivers/run-batch.sh            # ~40 minutes a round, two rounds
 ```
 
+`BENCHMARKS_DIR` must be a **clean** checkout of the harness
+(`../benchmarks-deepmsg` by default), it must have been built once
+(`./gradlew :benchmarks-all:shadowJar`), and the arms are built out of
+`AERON_FORK_DIR` (`../aeron-deepmsg`). `bench/README.md` says why the other
+checkout on the machine — the one with the probes in it — is not the default.
+
 `run-batch.sh --list` prints the plan and the digests without running anything,
 and exits non-zero if a prerequisite is missing. `--quick` is the same shape in
 about a minute, for checking the plumbing.

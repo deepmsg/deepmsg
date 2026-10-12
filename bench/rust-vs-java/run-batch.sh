@@ -89,6 +89,7 @@ export BENCH_WARMUP_RATE="$warmup_rate"
 
 _check() {
     need_dir "harness checkout" "$BENCHMARKS_DIR" || return 1
+    need_harness_built || return 1
     need_file "harness echo client" "$BENCHMARKS_ECHO_CLIENT" || return 1
     need_file "harness echo server" "$BENCHMARKS_ECHO_SERVER" || return 1
     need_file "the driver" "$BENCH_DRIVER" "run bench/build.sh" || return 1

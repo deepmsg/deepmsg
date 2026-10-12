@@ -12,10 +12,24 @@
 # Sourced, never executed. It sets `BENCH_*` paths and defines `need_*`.
 #
 #   DEEPMSG_DIR       this repository's checkout (default: two levels up)
-#   BENCHMARKS_DIR    the reference harness (default: ../benchmarks)
-#   AERON_REF_DIR     the 1.53.2 reference checkout, the frozen one
-#                     (default: ../aeron). Read by the fingerprint and by the
-#                     build of the *stock* C driver; never written to.
+#   BENCHMARKS_DIR    the harness a batch measures with — **a clean checkout of
+#                     `aeron-io/benchmarks`**, with nothing applied to it but
+#                     this tree's two patches (default: ../benchmarks-deepmsg).
+#                     It must be buildable, which means its own Gradle build has
+#                     been run once (`./gradlew :benchmarks-all:shadowJar`);
+#                     without the jar there is no client and no Java driver.
+#
+#                     `../benchmarks` is a **different** checkout and is not the
+#                     default on purpose: it carries the probes and the local
+#                     commits this tree's earlier sessions were measured with
+#                     (leg1, the answer curve, the send-delta histogram, the pin
+#                     to 1.53.2). A number taken on it is a number taken on a
+#                     modified harness, which is fine for the sessions it
+#                     belongs to and not fine for evidence.
+#   AERON_REF_DIR     the 1.53.2 reference checkout (default: ../aeron). Kept in
+#                     the fingerprint because it is part of what the machine
+#                     was; **neither batch reads anything out of it**, so an
+#                     evidence run leaves it untouched.
 #   AERON_FORK_DIR    the upstream work area — a clone of our fork of aeron,
 #                     where the commits a batch is evidence for live
 #                     (default: ../aeron-deepmsg). Only `upstream-c-drivers`
@@ -36,7 +50,7 @@ BENCH_DIR="$(dirname "$BENCH_LIB")"
 REPO_ROOT="$(dirname "$BENCH_DIR")"
 
 DEEPMSG_DIR="${DEEPMSG_DIR:-$REPO_ROOT}"
-BENCHMARKS_DIR="${BENCHMARKS_DIR:-$(dirname "$REPO_ROOT")/benchmarks}"
+BENCHMARKS_DIR="${BENCHMARKS_DIR:-$(dirname "$REPO_ROOT")/benchmarks-deepmsg}"
 AERON_REF_DIR="${AERON_REF_DIR:-$(dirname "$REPO_ROOT")/aeron}"
 AERON_FORK_DIR="${AERON_FORK_DIR:-$(dirname "$REPO_ROOT")/aeron-deepmsg}"
 BENCH_OUT_DIR="${BENCH_OUT_DIR:-$BENCH_DIR/out}"
@@ -81,6 +95,19 @@ need_file() {
         [ -n "$hint" ] && echo "  $hint" >&2
         return 1
     fi
+}
+
+# The harness's own build. Both batches run its Java client, its Java node — and,
+# for the plain `java` arm, its Java driver — out of one shadow jar, so a clean
+# checkout is a checkout that can only produce C numbers until Gradle has run.
+need_harness_built() {
+    local jar="$BENCHMARKS_DIR/benchmarks-all/build/libs/benchmarks.jar"
+    if [ -f "$jar" ]; then
+        return 0
+    fi
+    echo "the harness has not been built: no $jar" >&2
+    echo "  cd \"$BENCHMARKS_DIR\" && ./gradlew :benchmarks-all:shadowJar" >&2
+    return 1
 }
 
 # Says what a batch is about to use, before it uses it. Every batch prints this

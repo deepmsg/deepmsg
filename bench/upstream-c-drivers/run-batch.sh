@@ -114,6 +114,7 @@ _arm_problem() {
 _check() {
     need_dir "harness checkout" "$BENCHMARKS_DIR" || return 1
     need_file "harness single-host script" "$BENCHMARKS_SCRIPTS_DIR/remote-echo-single-host-benchmarks" || return 1
+    need_harness_built || return 1
     local problem=0
     for arm in "${arm_list[@]}"; do
         local why

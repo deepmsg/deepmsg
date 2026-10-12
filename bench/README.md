@@ -51,6 +51,30 @@ None of them is vendored, so each is an environment variable with a sibling
 directory as its default — `BENCHMARKS_DIR`, `AERON_REF_DIR`, `AERON_FORK_DIR`,
 `DEEPMSG_DIR` — and `lib/checkouts.sh` is where those are named and checked.
 
+Two of those defaults are worth saying out loud:
+
+- **`BENCHMARKS_DIR` is `../benchmarks-deepmsg`, and it has to be a clean
+  checkout.** That one carries nothing but this tree's two patches. The other
+  checkout on this machine, `../benchmarks`, is the one the earlier sessions were
+  measured with: it has the `leg1` and answer-curve probes in its Java sources,
+  a send-delta histogram, and a local pin of the harness to Aeron 1.53.2. Those
+  are instruments, not settings, and a number taken with them is a number about a
+  modified harness. Point `BENCHMARKS_DIR` at it and the batch will run, and the
+  result will not be evidence. `lib/checkouts.sh` says the same thing again where
+  someone setting the variable will see it.
+- **The harness has to have been built once**, because its Java client, its Java
+  node and the Java driver all come out of one shadow jar:
+
+      cd "$BENCHMARKS_DIR" && ./gradlew :benchmarks-all:shadowJar
+
+  A clean checkout does not have it. Both batches check for it and stop with that
+  command rather than failing later on a missing class.
+
+`AERON_REF_DIR` (`../aeron`) is the frozen 1.53.2 reference. It is in the
+fingerprint because it is part of what the machine was, and neither batch reads
+anything out of it: a batch touches the harness (two patches) and the fork, and
+leaves the reference alone.
+
 ## The rules every cell keeps
 
 Four, all of them paid for once already (`lib/cell.sh`):
