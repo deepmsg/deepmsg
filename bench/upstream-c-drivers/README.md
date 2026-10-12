@@ -23,6 +23,11 @@ about a minute, for checking the plumbing.
 
 ## The arms
 
+Each one is a driver the run swaps in, and *arm* is the word the scripts use for
+it (`--arms`, `AERON_C_ARM_DIR`, one launcher per arm). `docs/benchmarks.md`
+calls the same things drivers, so that a table of them is not read as if a ratio
+were a fourth one.
+
 | arm | what it is | why it is there |
 |---|---|---|
 | `java` | the harness's own `media-driver` — the Java driver | the scoreboard: whether the result is interesting to anyone who is not us |
