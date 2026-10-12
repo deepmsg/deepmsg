@@ -143,12 +143,26 @@ if [ "$list_only" = 1 ]; then
     echo "rounds          forward, reverse"
     echo "results         $out"
     echo
+    # The same shape the run's own record uses, so that what `--list` promises and
+    # what a finished batch writes down are the same four lines.
     echo "=== arms, by digest ==="
     for arm in "${arm_list[@]}"; do
         case "$arm" in
-            java) printf '%-12s %s\n' "$arm" "the harness's Java driver" ;;
-            c)    printf '%-12s %s %s\n' "$arm" "$(sha256sum "$BENCHMARKS_SCRIPTS_DIR/aeronmd" 2>/dev/null | cut -c1-16)" "$BENCHMARKS_SCRIPTS_DIR/aeronmd" ;;
-            *)    printf '%-12s %s %s\n' "$arm" "$(sha256sum "$AERON_C_ARM_DIR/$arm/aeronmd" 2>/dev/null | cut -c1-16)" "$AERON_C_ARM_DIR/$arm/libaeron_driver.so" ;;
+            java)
+                echo "  java        the harness's Java driver"
+                ;;
+            c)
+                echo "  c           $(sha256sum "$BENCHMARKS_SCRIPTS_DIR/aeronmd" | cut -d' ' -f1)  aeronmd"
+                echo "              $(sha256sum "$BENCHMARKS_SCRIPTS_DIR/libaeron_driver.so" | cut -d' ' -f1)  libaeron_driver.so"
+                echo "              the harness's own checked-in binaries"
+                ;;
+            *)
+                echo "  $arm  $(sha256sum "$AERON_C_ARM_DIR/$arm/aeronmd" | cut -d' ' -f1)  aeronmd"
+                echo "              $(sha256sum "$AERON_C_ARM_DIR/$arm/libaeron_driver.so" | cut -d' ' -f1)  libaeron_driver.so"
+                rev=$(awk '/^revision /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
+                named=$(awk '/^revision-name /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
+                echo "              built from ${rev:-unknown} ${named:+($named)}"
+                ;;
         esac
     done
     echo
@@ -254,7 +268,13 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
             c)    echo "  c           $(sha256sum "$BENCHMARKS_SCRIPTS_DIR/aeronmd" 2>/dev/null | cut -d' ' -f1)  (the harness's checked-in binary)" ;;
             *)    echo "  $arm  $(sha256sum "$AERON_C_ARM_DIR/$arm/aeronmd" | cut -d' ' -f1)  aeronmd"
                   echo "              $(sha256sum "$AERON_C_ARM_DIR/$arm/libaeron_driver.so" | cut -d' ' -f1)  libaeron_driver.so"
-                  echo "              built from $(git -C "$AERON_FORK_DIR" rev-parse HEAD 2>/dev/null)" ;;
+                  # The arm's own revision, out of the file `build-c-driver.sh`
+                  # leaves beside it. The work area's HEAD is a different thing
+                  # and would name the same revision for every arm.
+                  local rev named
+                  rev=$(awk '/^revision /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
+                  named=$(awk '/^revision-name /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
+                  echo "              built from ${rev:-unknown} ${named:+($named)}" ;;
         esac
     done
 } >"$out/RUN-INFO.txt"

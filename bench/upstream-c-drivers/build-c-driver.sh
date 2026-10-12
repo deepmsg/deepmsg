@@ -112,8 +112,22 @@ done
 
 git -C "$AERON_FORK_DIR" worktree remove --force "$src" >/dev/null 2>&1 || true
 
+# The arm carries what it was built from, so that a batch does not have to guess
+# it from the work area's current HEAD — which is a different thing, and says the
+# wrong revision for every arm but the one that happens to be checked out.
+{
+    echo "arm             $arm"
+    echo "revision        $revision"
+    echo "revision-name   $ref"
+    echo "repository      $AERON_FORK_DIR"
+    echo "cmake           $cmake ($("$cmake" --version | head -1))"
+    echo "compiler        $(cc --version | head -1)"
+    echo "built           $(date --rfc-3339=seconds)"
+    echo
+    sha256sum "$dest/aeronmd" "$dest/libaeron_driver.so" "$dest/libaeron.so"
+} >"$dest/BUILD-INFO.txt"
+
 echo "== $dest =="
 ls -l "$dest"
 echo
-echo "== digests (these go in the record) =="
-sha256sum "$dest/aeronmd" "$dest/libaeron_driver.so"
+cat "$dest/BUILD-INFO.txt"

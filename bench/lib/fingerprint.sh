@@ -48,10 +48,14 @@ bench_fingerprint() {
         _rev "$BENCHMARKS_DIR" "harness"
         _rev "$AERON_REF_DIR" "reference"
         _rev "$AERON_FORK_DIR" "upstream"
-        # A checkout with uncommitted work in it is not the revision it names.
+        # A checkout with uncommitted work in it is not the revision it names,
+        # so the paths are named rather than counted: what a batch applies to the
+        # harness should be the two patches and the two launchers and nothing
+        # else, and a reader can check that at a glance.
         local dirty
         dirty=$(git -C "$BENCHMARKS_DIR" status --porcelain 2>/dev/null | wc -l)
-        echo "harness dirty   $dirty path(s) modified"
+        echo "harness dirty   $dirty path(s)"
+        git -C "$BENCHMARKS_DIR" status --porcelain 2>/dev/null | sed 's/^/                  /'
         echo "harness aeron   $(grep -E '^aeron *=' "$BENCHMARKS_DIR/gradle/libs.versions.toml" 2>/dev/null)"
 
         echo
