@@ -140,9 +140,10 @@ use crate::server::control_session::{
     ControlSession, REQUEST_IMAGE_NOT_AVAILABLE_MSG, RESPONSE_NOT_CONNECTED_MSG, SESSION_CLOSED_MSG,
 };
 use crate::server::counters::{
-    ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID, ArchiveIdCounter, ControlSessionCounter,
-    ControlSessionsCounter, ErrorCounter, RECORDING_SESSIONS_NAME, claim_archive_id_counter,
-    claim_control_sessions_counter, request_archive_id_counter, request_control_sessions_counter,
+    ARCHIVE_RECORDING_POSITION_TYPE_ID, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID, ArchiveIdCounter,
+    ControlSessionCounter, ControlSessionsCounter, ErrorCounter, RECORDING_SESSIONS_NAME,
+    claim_archive_id_counter, claim_control_sessions_counter, request_archive_id_counter,
+    request_control_sessions_counter,
 };
 use crate::server::create_replay_publication::{
     CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
@@ -2105,6 +2106,34 @@ fn read_limit_counter<Access>(
         .then_some(descriptor.value)
 }
 
+/// Which counter bounds a replay (`ArchiveConductor.startReplay`, `:789-797`).
+///
+/// The client's own request may name one (`BoundedReplayRequest`, template 18).
+/// When it names none, the reference looks the recording up among its **live**
+/// sessions and takes that session's position counter as the limit, so a plain
+/// `REPLAY_ALL_AND_FOLLOW` is followed through the counter every turn — and is
+/// **ended by it**: when the publisher stops the counter is given back,
+/// `notExtended` freezes the limit at the stop position and the reader reaches
+/// it (`ReplaySession.java:544-578`). Borrowing only the counter's *value*, as
+/// this build did, follows nothing and never ends.
+///
+/// A recording that has stopped has no session, so nothing is adopted and the
+/// catalog's own stop position is what bounds the replay.
+fn replay_limit_counter(
+    requested: Option<LimitCounter>,
+    live: Option<&RecordingHandle>,
+) -> Option<LimitCounter> {
+    requested.or_else(|| {
+        live.and_then(|handle| {
+            handle.position.counter_id().map(|counter_id| LimitCounter {
+                counter_id,
+                type_id: ARCHIVE_RECORDING_POSITION_TYPE_ID,
+                registration_id: handle.position.registration_id(),
+            })
+        })
+    })
+}
+
 /// `ArchiveConductor.isInvalidReplayPosition` (`:2256-2288`).
 ///
 /// Three refusals, and the codes are **not** all the same: a position that is
@@ -3051,6 +3080,13 @@ impl Sessions {
             },
             None => None,
         };
+
+        // `:789-797`: a request that named no counter takes the **live
+        // recording's own**, which is what a following replay rides on.
+        let limit = replay_limit_counter(
+            limit,
+            self.recording_session_by_id.get(&request.recording_id),
+        );
 
         let Ok(recording) = catalog.recording(request.recording_id) else {
             self.refuse_request(
@@ -9412,6 +9448,45 @@ mod tests {
         );
 
         assert_eq!(None, invalid_replay_position(0, 4096, &recording));
+    }
+
+    /// A replay's limit counter is the client's when its request named one, and
+    /// the **live recording's own** when it did not
+    /// (`ArchiveConductor.java:789-797`). The second half is what a plain
+    /// `REPLAY_ALL_AND_FOLLOW` rides on: a replay of a recording that is still
+    /// being written follows that counter, and is ended when the publisher
+    /// stops and the counter goes away.
+    #[test]
+    fn a_replay_is_bounded_by_the_live_recordings_own_counter() {
+        let named = LimitCounter {
+            counter_id: 7,
+            type_id: 42,
+            registration_id: 21,
+        };
+        let live = RecordingHandle {
+            position: RecordingPos::with_counter_for_test(31, 5),
+            subscription_id: 11,
+        };
+
+        assert_eq!(
+            Some(named),
+            replay_limit_counter(Some(named), Some(&live)),
+            "the client's own counter wins"
+        );
+        assert_eq!(
+            Some(LimitCounter {
+                counter_id: 5,
+                type_id: ARCHIVE_RECORDING_POSITION_TYPE_ID,
+                registration_id: 31,
+            }),
+            replay_limit_counter(None, Some(&live)),
+            "the recording that is still being written"
+        );
+        assert_eq!(
+            None,
+            replay_limit_counter(None, None),
+            "a recording that has stopped is bounded by the catalog's stop"
+        );
     }
 
     /// The protocol major is derived from the version stamped on every

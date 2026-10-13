@@ -372,6 +372,16 @@ impl RecordingPos {
     /// `pub(crate)` and test-only: a caller outside this crate builds one by
     /// asking for it, and the only other thing that wants a handle with no slot
     /// is a test that is not about the counter.
+    /// The same handle once the driver has answered: a slot in the counters
+    /// region, which is the state a replay's limit counter is read from.
+    #[cfg(test)]
+    pub(crate) const fn with_counter_for_test(registration_id: i64, counter_id: i32) -> Self {
+        Self {
+            registration_id,
+            counter_id: Some(counter_id),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(registration_id: i64) -> Self {
         Self {
