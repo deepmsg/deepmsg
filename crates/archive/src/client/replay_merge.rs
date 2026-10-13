@@ -374,6 +374,23 @@ pub trait MergePeer {
 ///   merge's turn for as long as the driver took.
 /// * **A command the driver refuses is a merge that fails**, with the driver's
 ///   words (`:490-501`).
+///
+/// # One contract difference that decides how this is used
+///
+/// [`MergePeer::resolved_endpoint`] is
+/// [`Subscription::resolved_endpoint`], which reads the address out of the
+/// **counters** — and a subscription that named no endpoint at all, which is
+/// what `control-mode=manual` on its own is, has no address there to read and
+/// answers `None`. A replay destination with a **wildcard** port
+/// (`aeron:udp?endpoint=localhost:0`, the reference's own test's shape) is
+/// exactly the case that needs it, because the port only the subscription can
+/// fill in is the one that has to be resolved.
+///
+/// So the wildcard path is not reachable in this build, and the reference's
+/// other one is: a replay destination that named a port is a port the caller
+/// meant, the merge starts at [`State::GetRecordingPosition`], and no resolution
+/// is needed. That is the shape the end-to-end test takes, and the difference
+/// belongs in documentation rather than in a silently different merge.
 pub struct ClientMergePeer<'a> {
     client: &'a mut Client,
     archive: &'a mut Archive,
