@@ -31,12 +31,21 @@
 //!
 //! # What this build had to change
 //!
-//! The reference holds an `Image` handle and reads its position every turn. A
-//! handle here would borrow the subscription for the life of the merge, so the
-//! merge holds an [`ImageFacts`] **snapshot per turn** instead, taken through
-//! [`MergePeer::image`] — same reads, no borrow. An image that can no longer be
-//! read at all is an image the client has closed ([`ImageFacts::is_closed`] is
-//! what the reference asks), and is reported as one.
+//! Two things the reference has and this build does not, both of them about an
+//! image being a **handle** there and a **snapshot** here:
+//!
+//! * The reference holds an `Image` handle and reads its position every turn.
+//!   A handle here would borrow the subscription for the life of the merge, so
+//!   the merge takes an [`ImageFacts`] snapshot per turn through
+//!   [`MergePeer::image`] instead — the same reads, no borrow.
+//! * The reference asks that handle `isClosed` (`:457`) and means a closed
+//!   image the client still holds, whose last position can still be read. This
+//!   client removes an image when the driver says it is unavailable and holds
+//!   nothing closed, so the image **going** is that same event: [`MergePeer::image`]
+//!   answers `None`, and after the replay has been found once that is the
+//!   closed image. A merge here fails a turn earlier than the reference's would
+//!   in the corner where an image closes having already reached the target —
+//!   there are no facts left to decide on.
 
 use crate::client::archive::ArchiveError;
 use deepmsg_client::image::Fragment;
@@ -109,6 +118,13 @@ impl State {
 
 /// What a merge needs to know about the image carrying its replay, read fresh
 /// every turn.
+///
+/// A snapshot and not a handle, because a handle would borrow the subscription
+/// for the life of the merge — see the module note. The one thing a handle
+/// carries that a snapshot cannot is the reference's `Image.isClosed`
+/// (`:457`), a closed image the client still holds and whose last position can
+/// still be read; there is no such image here, and the absence is said where it
+/// arrives instead: [`MergePeer::image`] answers `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageFacts {
     /// How far the image has been read (`Image.position`).
@@ -120,8 +136,6 @@ pub struct ImageFacts {
     /// replay with one transport is the archive's and one with two is the
     /// archive's plus the live stream's.
     pub active_transport_count: i32,
-    /// Whether the client has closed the image (`Image.isClosed`).
-    pub is_closed: bool,
 }
 
 /// Why a merge failed, which is the reference's two exceptions
@@ -188,6 +202,14 @@ pub trait MergePeer {
     fn subscription_connected(&self) -> bool;
 
     /// The replay's image, if the subscription has one for that session.
+    ///
+    /// **`None` is two things and the merge tells them apart by having found
+    /// one already** (`image_found`): before the replay's image has appeared it
+    /// is "not yet", and after it has, `None` is the reference's closed image.
+    /// The reference holds an `Image` handle and asks `isClosed` on it
+    /// (`:457`); this build's client removes an image when the driver says it
+    /// is unavailable and holds nothing closed, so an image that cannot be
+    /// asked about any more is exactly the one the reference would call closed.
     fn image(&mut self, session_id: i32) -> Option<ImageFacts>;
 
     /// `AeronArchive.getMaxRecordedPosition`.
@@ -578,8 +600,6 @@ impl ReplayMerge {
             self.position_of_last_progress = facts.position;
 
             Ok(0)
-        } else if facts.is_closed {
-            Err(MergeFailure::ImageClosed)
         } else {
             Ok(0)
         }
@@ -930,7 +950,6 @@ mod tests {
             position,
             term_buffer_length: 64 * 1024,
             active_transport_count: transports,
-            is_closed: false,
         }
     }
 
@@ -1075,6 +1094,11 @@ mod tests {
     /// An image that closes while the merge is catching up is the reference's
     /// `IllegalStateException` (`:457`), and it is what a merge whose replay was
     /// stopped underneath it sees.
+    ///
+    /// The image **going** is how this peer says closed, which is what the
+    /// client behind the real one does — see [`MergePeer::image`]. Nothing
+    /// catches this before the replay has been found, which is the other half
+    /// of the same rule and is why the merge walks to CATCHUP first.
     #[test]
     fn an_image_that_closes_while_catching_up_fails_the_merge() {
         let mut merge = merge(MERGE_PROGRESS_TIMEOUT_DEFAULT_MS);
@@ -1086,15 +1110,52 @@ mod tests {
         turn_until_state(&mut merge, &mut peer, &mut now, State::Replay);
         turn_until_state(&mut merge, &mut peer, &mut now, State::Catchup);
 
-        peer.image = Some(ImageFacts {
-            is_closed: true,
-            ..catchup_facts(0, 1)
-        });
+        // One turn with the image there, which is the turn that finds it —
+        // arriving in CATCHUP and being *in* it are two turns, so the image has
+        // to be found before it can go.
         merge.do_work(&mut peer, now);
+        assert_eq!(
+            State::Catchup,
+            merge.state(),
+            "the merge is still catching up"
+        );
+
+        peer.image = None;
         merge.do_work(&mut peer, now + 1);
 
         assert!(merge.has_failed());
         assert_eq!(Some(&MergeFailure::ImageClosed), merge.failure_reason());
+    }
+
+    /// And the other half of "no image": one that has not **appeared** yet is
+    /// not a closed one.
+    ///
+    /// The merge goes on waiting rather than failing — and on waiting without a
+    /// deadline, because that is the reference's own gate: the turn that looks
+    /// for the image also records progress (`:591-596`), so as long as the
+    /// subscription is connected the progress timeout is pushed back every
+    /// turn. A merge waiting for an image that never comes waits forever, there
+    /// and here, and what would end it is the caller's `close`.
+    #[test]
+    fn an_image_that_has_not_appeared_yet_is_not_a_closed_one() {
+        let mut merge = merge(MERGE_PROGRESS_TIMEOUT_DEFAULT_MS);
+        let mut peer = FakePeer::new(1024);
+        let mut now = 0;
+        assert_eq!(None, peer.image, "this peer never has an image");
+
+        turn_until_state(&mut merge, &mut peer, &mut now, State::Catchup);
+
+        // Well past the progress timeout, in both directions of the clock a
+        // merge could be reading: neither is a closed image.
+        merge.do_work(&mut peer, now);
+        merge.do_work(&mut peer, now + MERGE_PROGRESS_TIMEOUT_DEFAULT_MS + 1);
+
+        assert_eq!(State::Catchup, merge.state());
+        assert_eq!(
+            None,
+            merge.failure_reason(),
+            "a replay whose image has not arrived is not a failure"
+        );
     }
 
     /// The backoff between `getMaxRecordedPosition` attempts doubles to a
