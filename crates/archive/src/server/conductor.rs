@@ -2227,9 +2227,23 @@ pub fn replay_channel(
         .initial_term_id(initial_term_id)
         .term_id(term_id)
         .term_offset(term_offset)
-        .sparse(flag(&uri, "sparse"))
-        .eos(flag(&uri, "eos"))
         .mtu(mtu_length);
+
+    // `sparse` and `eos` are the reference's two **tri-state** copies
+    // (`ChannelUriStringBuilder.sparse/eos(ChannelUri)`,
+    // `aeron-client/.../ChannelUriStringBuilder.java:1049-1061`, `:1094-1106`): a
+    // value the client's channel carried is copied, and one it did not is left
+    // **off** the built channel rather than written out as `false`. The
+    // difference is not cosmetic: the driver's own default for `sparse` is
+    // `aeron.term.buffer.sparse.file`, and every C-suite driver here starts with
+    // that **true** — so a replay channel that says `sparse=false` is not the
+    // channel that says nothing, and the publication built from it did not link.
+    if let Some(value) = uri.get("sparse") {
+        builder.sparse(value.eq_ignore_ascii_case("true"));
+    }
+    if let Some(value) = uri.get("eos") {
+        builder.eos(value.eq_ignore_ascii_case("true"));
+    }
 
     // `linger` is the client's when it named one, and the driver's own default
     // when it did not. The reference falls back to
@@ -2245,11 +2259,6 @@ pub fn replay_channel(
     }
 
     Ok(builder.build())
-}
-
-/// A URI flag, as the reference's `ChannelUri.getBoolean` reads one.
-fn flag(uri: &ChannelUri, name: &str) -> bool {
-    uri.get(name).is_some_and(|value| value == "true")
 }
 
 /// A random `i64` for a replay token.
@@ -6794,6 +6803,10 @@ impl ControlPlane for Sessions {
     }
 
     fn on_keep_alive(&mut self, session_id: i64) {
+        self.activate_session(session_id);
+    }
+
+    fn activate_session(&mut self, session_id: i64) {
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             entry.control.attempt_to_activate();
         }
@@ -9437,6 +9450,35 @@ mod tests {
             !channel.contains("response-correlation-id"),
             "no image to answer: {channel}"
         );
+    }
+
+    /// `sparse` and `eos` are copied **only when the client's channel carried
+    /// them** (`ChannelUriStringBuilder.sparse/eos(ChannelUri)`,
+    /// `aeron-client/src/main/java/io/aeron/ChannelUriStringBuilder.java:1049-1061`,
+    /// `:1094-1106`). A channel that named neither leaves both off, and the
+    /// driver's own defaults stand — which is not the same as writing `false`:
+    /// `eos` defaults **true** (`publication_params.rs:625`, `:691`), and a
+    /// replay whose channel said `eos=false` is a replay whose publication never
+    /// signalled the end of its stream.
+    #[test]
+    fn a_replay_channel_copies_sparse_and_eos_only_when_the_client_named_them() {
+        const BARE: &str = "aeron:udp?endpoint=localhost:10002";
+
+        let channel = replay_channel(BARE, 4096, 3, 64 * 1024, 1408, None).expect("a channel");
+        assert!(!channel.contains("sparse"), "{channel}");
+        assert!(!channel.contains("eos"), "{channel}");
+
+        let named = replay_channel(
+            &format!("{BARE}|sparse=true|eos=true"),
+            4096,
+            3,
+            64 * 1024,
+            1408,
+            None,
+        )
+        .expect("a channel");
+        assert!(named.contains("sparse=true"), "{named}");
+        assert!(named.contains("eos=true"), "{named}");
     }
 
     /// A token names a session and a recording for as long as a connect
