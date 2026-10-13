@@ -518,6 +518,19 @@ pub trait ControlPlane {
     /// whole body is `attemptToActivate()`.
     fn on_keep_alive(&mut self, session_id: i64);
 
+    /// `ControlSession.attemptToActivate()` (`ControlSession.java:1070-1076`),
+    /// which the reference writes as the **first statement of 29 of its 30
+    /// request handlers** (`:324-657`). The one that does not is
+    /// `onChallengeResponse` (`:308-315`) — which is also the one the adapter
+    /// does not gate (`ControlSessionAdapter.java:804-833`).
+    ///
+    /// It is what moves a session out of `AUTHENTICATED`, and with it what stops
+    /// the connect answer that state keeps resending every `RESEND_INTERVAL_MS`
+    /// (`:960-977`). The reference reaches `ControlSession` — and so this — only
+    /// once the adapter has found the session, matched the image and asked the
+    /// authorisation service (`ControlSessionAdapter.java:1191-1223`).
+    fn activate_session(&mut self, session_id: i64);
+
     /// `ControlSession.onArchiveId` (`ControlSession.java:541-548`), which the
     /// conductor answers with `ctx.archiveId()`
     /// (`ArchiveConductor.java:525-528`).
@@ -2245,6 +2258,15 @@ fn gate<C: ControlPlane, A: AuthorisationService>(
         return None;
     }
 
+    // The request has a session to be served on, and in the reference that is
+    // what every handler acts on first: `attemptToActivate()` is the opening
+    // statement of all of them but the challenge answer
+    // (`ControlSession.java:1070-1076`, `:324-657`). Doing it here rather than
+    // in each handler is this side's one deliberate difference — the reference
+    // writes it 29 times; here every request that reaches a session passes
+    // through this function, so a new request arm cannot forget it.
+    control.activate_session(control_session_id);
+
     Some(control_session_id)
 }
 
@@ -2443,6 +2465,11 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         calls: Vec<Call>,
+        /// The sessions a request was taken to activate, in the order they were
+        /// activated. Its own field rather than a `Call`, because the reference
+        /// activates once per handler *before* serving and every test here would
+        /// otherwise carry a line it is not about.
+        activations: Vec<i64>,
         warnings: Vec<String>,
         /// What the sessions' authenticator is taken to have vouched for.
         principal: Option<Vec<u8>>,
@@ -2502,6 +2529,10 @@ mod tests {
 
         fn on_keep_alive(&mut self, session_id: i64) {
             self.calls.push(Call::KeepAlive { session_id });
+        }
+
+        fn activate_session(&mut self, session_id: i64) {
+            self.activations.push(session_id);
         }
 
         fn on_archive_id(&mut self, session_id: i64, correlation_id: i64, _now_ms: i64) {
@@ -3850,6 +3881,68 @@ mod tests {
             }],
             control.calls[1..]
         );
+    }
+
+    /// A request that passes the gate activates the session it reached. The
+    /// reference writes `attemptToActivate()` as the first statement of every
+    /// handler it dispatches to (`ControlSession.java:1070-1076` over
+    /// `:324-657`), and the adapter is what decides whether a request gets that
+    /// far (`ControlSessionAdapter.java:1191-1223`).
+    #[test]
+    fn a_request_that_passes_the_gate_activates_its_session() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        assert!(
+            control.activations.is_empty(),
+            "the connect makes a session; it is not a request to one"
+        );
+
+        let payload = archive_id_request(session_id, 7);
+        adapter
+            .on_message(&mut control, IMAGE, message(&payload), 2_000)
+            .expect("read");
+
+        assert_eq!(vec![session_id], control.activations);
+    }
+
+    /// The three ways out of the gate activate nothing: the reference reaches
+    /// `ControlSession` — and so `attemptToActivate` — only for a session it
+    /// knows, on the image that session was made on, allowed by the
+    /// authorisation service (`ControlSessionAdapter.java:1191-1223`).
+    #[test]
+    fn a_request_the_gate_turns_away_activates_nothing() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        adapter
+            .on_message(&mut control, IMAGE, message(&keep_alive(4_242, 99)), 2_000)
+            .expect("read");
+        assert!(control.activations.is_empty(), "an unknown session");
+
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        adapter
+            .on_message(
+                &mut control,
+                OTHER_IMAGE,
+                message(&keep_alive(session_id, 99)),
+                2_000,
+            )
+            .expect("read");
+        assert!(
+            control.activations.is_empty(),
+            "a session that was made on another image"
+        );
+
+        let (mut adapter, mut control) = adapter_with(DenyAll);
+        let session_id = an_open_session(&mut adapter, &mut control);
+        adapter
+            .on_message(
+                &mut control,
+                IMAGE,
+                message(&keep_alive(session_id, 99)),
+                2_000,
+            )
+            .expect("read");
+        assert!(control.activations.is_empty(), "a denied request");
     }
 
     /// A close names a session and ends it, with the reference's reason

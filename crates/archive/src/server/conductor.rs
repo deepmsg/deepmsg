@@ -6794,6 +6794,10 @@ impl ControlPlane for Sessions {
     }
 
     fn on_keep_alive(&mut self, session_id: i64) {
+        self.activate_session(session_id);
+    }
+
+    fn activate_session(&mut self, session_id: i64) {
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             entry.control.attempt_to_activate();
         }
