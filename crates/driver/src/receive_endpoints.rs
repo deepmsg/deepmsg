@@ -382,6 +382,7 @@ impl ReceiveChannelEndpoints {
             channel,
             group_tag,
             &mut self.receiver_port_manager,
+            &config.transport_bindings,
             params,
             receiver_id,
             config.stream_session_limit,

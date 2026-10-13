@@ -2,7 +2,7 @@
 //!
 //! Mirrors `aeron-driver/src/main/c/media/` (M12), in the reference's own
 //! two-part shape: a set of **bindings** — a vtable there
-//! (`aeron_udp_channel_transport_bindings.h:110-126`), a trait here — and an
+//! (`aeron_udp_channel_transport_bindings.h:113-134`), a trait here — and an
 //! implementation of them over the kernel's own calls
 //! (`aeron_udp_channel_transport.c`).
 //!
@@ -37,6 +37,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+pub mod bindings;
 pub mod destination_tracker;
 pub mod dispatcher;
 pub mod interceptor;
@@ -47,6 +48,7 @@ pub mod send_endpoint;
 pub mod udp_transport;
 
 pub use crate::sys::socket::Datagrams;
+pub use bindings::{Affinity, TransportBindings};
 pub use loss_generator::{EveryNthDatagram, LossGenerator};
 pub use send_endpoint::SendChannelEndpoint;
 pub use udp_transport::UdpTransport;
@@ -73,7 +75,7 @@ pub struct TransportParams {
 
 /// What the endpoints, the publications and the images are allowed to ask of
 /// whatever is underneath them
-/// (`aeron_udp_channel_transport_bindings_t`, `aeron_udp_channel_transport_bindings.h:110-126`).
+/// (`aeron_udp_channel_transport_bindings_t`, `aeron_udp_channel_transport_bindings.h:113-134`).
 ///
 /// The methods are the ones this slice calls; `reconnect` and the poller's
 /// add/remove arrive with the features that need them (a re-resolving address,

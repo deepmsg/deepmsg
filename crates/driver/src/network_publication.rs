@@ -2188,6 +2188,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             fixture.channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
@@ -2268,6 +2269,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             fixture.channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
@@ -2334,6 +2336,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             fixture.channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut CounterManager::new(64 * 1024, 1_000).expect("room"),
             &CounterRegions::new(
@@ -2403,6 +2406,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             fixture.channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
@@ -2700,6 +2704,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             fixture.channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,
@@ -2827,6 +2832,7 @@ mod tests {
         SendChannelEndpoint::create(
             channel.clone(),
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &crate::media::TransportParams::default(),
             &mut manager,
             &regions,

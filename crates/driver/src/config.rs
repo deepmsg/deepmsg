@@ -880,6 +880,12 @@ pub struct DriverConfig {
     /// whether a send endpoint connects its socket to the endpoint its channel
     /// names (`media/aeron_send_channel_endpoint.c:89`).
     pub connect_enabled: bool,
+    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`): what the
+    /// UDP data paths run on (`aeron_driver_context.c:1258-1263`). The
+    /// conductor's twin is checked and not kept: its one servable value is the
+    /// one its only user, the name resolver, always runs on
+    /// ([`crate::media::bindings`]).
+    pub transport_bindings: crate::media::TransportBindings,
     /// `aeron.driver.cpuset.affinity` (`AERON_DRIVER_CPUSET_AFFINITY`,
     /// `aeronmd.h:969`): whether the driver pins its agents to the CPUs its
     /// cgroup allows (`aeron_driver.c:1138-1209`). **Off by default**, which is
@@ -1011,6 +1017,7 @@ impl Default for DriverConfig {
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
             loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
             connect_enabled: DRIVER_CONNECT_DEFAULT,
+            transport_bindings: crate::media::TransportBindings::Default,
             cpuset_affinity: false,
             cpuset_warnings_as_errors: false,
             conductor_cpu_affinity: CPU_AFFINITY_DEFAULT,
@@ -1309,13 +1316,15 @@ impl DriverConfig {
             }
         }
 
-        for setting in [
-            Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
-            Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
-        ] {
-            if let Some(value) = get(&setting) {
-                check_transport_bindings(&setting, &value)?;
-            }
+        if let Some(value) = get(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
+            config.transport_bindings =
+                parse_transport_bindings(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA, &value)?;
+        }
+        if let Some(value) = get(&Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
+            parse_transport_bindings(
+                &Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
+                &value,
+            )?;
         }
 
         if let Some(value) = get(&Setting::LOSS_REPORT_BUFFER_LENGTH) {
@@ -2281,7 +2290,7 @@ impl Setting {
     /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`): which
     /// implementation of the transport bindings the driver's UDP data paths
     /// run on (`aeron_driver_context.c:1258-1263`). See
-    /// [`check_transport_bindings`].
+    /// [`parse_transport_bindings`].
     const UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA: Self = Self {
         property: "udp.channel.transport.bindings.media",
         env: "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
@@ -2968,15 +2977,20 @@ fn parse_supplier(setting: &Setting, value: &str) -> Result<Supplier, ConfigErro
 /// entry and refuses everything else, because the `dlsym` step is loading code
 /// (ADR-0002).
 ///
-/// Both settings are checked the same way: the conductor's has no other value
+/// Both settings are parsed the same way: the conductor's has no other value
 /// in the reference's table either.
 ///
 /// # Errors
 ///
 /// [`ConfigError::UnknownTransportBindings`] for any other name.
-fn check_transport_bindings(setting: &Setting, value: &str) -> Result<(), ConfigError> {
+fn parse_transport_bindings(
+    setting: &Setting,
+    value: &str,
+) -> Result<crate::media::TransportBindings, ConfigError> {
     match value {
-        "default" | "aeron_udp_channel_transport_bindings_default" => Ok(()),
+        "default" | "aeron_udp_channel_transport_bindings_default" => {
+            Ok(crate::media::TransportBindings::Default)
+        }
         other => Err(ConfigError::UnknownTransportBindings {
             name: setting.property,
             value: other.to_owned(),
@@ -4265,8 +4279,12 @@ mod tests {
             // The table's one entry, under both of the names its scan takes
             // (`aeron_symbol_table.c:48-49`).
             for name in ["default", "aeron_udp_channel_transport_bindings_default"] {
-                resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, name)])
+                let config = resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, name)])
                     .unwrap_or_else(|error| panic!("{property}={name} is served: {error}"));
+                assert_eq!(
+                    crate::media::TransportBindings::Default,
+                    config.transport_bindings
+                );
             }
 
             // Anything else is what the reference would `dlsym`, and this

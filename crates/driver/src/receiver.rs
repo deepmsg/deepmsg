@@ -694,6 +694,7 @@ impl Receiver {
             cycle_threshold_ns,
             re_resolution_interval_ns,
             timer_interval_ns,
+            &crate::media::TransportBindings::Default,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -729,6 +730,7 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
         timer_interval_ns: i64,
+        bindings: &crate::media::TransportBindings,
     ) -> io::Result<ReceiverParts> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
         let (event_tx, event_rx) = mpsc::channel::<ReceiverEvent>();
@@ -755,6 +757,7 @@ impl Receiver {
                 cycle_threshold_ns,
                 re_resolution_interval_ns,
                 timer_interval_ns,
+                bindings.poller(crate::media::Affinity::Receiver),
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -858,7 +861,7 @@ pub(crate) struct ReceiverThread {
     /// Which destinations have something to read (G4-3): the reference's
     /// transport poller, per receiver (`aeron_driver_receiver.c:130-260` polls
     /// through it).
-    poller: crate::media::poller::TransportPoller,
+    poller: crate::media::poller::MediaPoller,
     /// The indices `poller` answered with, reused across passes.
     readable: Vec<usize>,
     /// The (endpoint, destination) each index refers to, rebuilt each pass
@@ -888,6 +891,7 @@ impl ReceiverThread {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
         timer_interval_ns: i64,
+        poller: crate::media::poller::MediaPoller,
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
         commands: Inbox<ReceiverCommand>,
@@ -918,7 +922,7 @@ impl ReceiverThread {
                 .map(|_| vec![0u8; mtu_length])
                 .collect(),
             datagrams: Datagrams::new(),
-            poller: crate::media::poller::TransportPoller::new(),
+            poller,
             readable: Vec::new(),
             transports: Vec::new(),
             descriptors: Vec::new(),
@@ -1501,7 +1505,7 @@ impl ReceiverThread {
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
         datagrams: &mut Datagrams,
-        poller: &mut crate::media::poller::TransportPoller,
+        poller: &mut crate::media::poller::MediaPoller,
         readable: &mut Vec<usize>,
         transports: &mut Vec<(usize, usize)>,
         descriptors: &mut Vec<crate::sys::socket::Descriptor>,
@@ -1513,6 +1517,10 @@ impl ReceiverThread {
         now_ns: i64,
     ) -> usize {
         let mut work = 0;
+
+        // Whatever the bindings do before their transports are read
+        // (`poller_poll_func`'s first half): nothing for the kernel's.
+        poller.pump();
 
         // Which destinations have something to read this pass (G4-3). At or
         // below the poller's threshold this is every one of them, in order —
