@@ -40,7 +40,8 @@ Each rule has one authority. Read that file, not this table.
 | Rule | Authority |
 |---|---|
 | `unsafe` only in ADR-0002's six named zones: `core::pal`, `core::buffer`, `cnc`, the driver `sys` shim, the `tools` archive shim, `dpdk` | `docs/adr/0002` |
-| No async runtime, no FFI, no allocation on hot paths | `docs/adr/0003` |
+| No async runtime, no allocation on hot paths | `docs/adr/0003` |
+| FFI is not a red line, but each use is an exception that names what it buys (ADR-0006 for the media) | `README.md` principle 2 |
 | Aeron's concept nouns are kept; no C-era abbreviations in code | `docs/adr/0005` |
 | Every byte-level claim cites an upstream `file:line` | `docs/roadmap.md` |
 | `schemas/*.xml` are verbatim forks; a deviation is recorded in `docs/compat.md` first | `schemas/README.md` |
