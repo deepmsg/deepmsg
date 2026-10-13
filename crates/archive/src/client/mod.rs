@@ -40,6 +40,7 @@ pub mod context;
 pub mod descriptor_poller;
 pub mod poller;
 pub mod proxy;
+pub mod replay_merge;
 pub mod subscription_descriptor_poller;
 
 pub use archive::{Archive, ArchiveError, Handlers, archive_to_client_error_code};
