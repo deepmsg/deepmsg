@@ -508,6 +508,7 @@ impl Sender {
             status_message_timeout_ns,
             send_to_sm_poll_ratio,
             timer_interval_ns,
+            &crate::media::TransportBindings::Default,
         )?;
 
         let thread = crate::driver::run_agent(
@@ -543,6 +544,7 @@ impl Sender {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        bindings: &crate::media::TransportBindings,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
         let (event_tx, event_rx) = mpsc::channel::<SenderEvent>();
@@ -569,6 +571,7 @@ impl Sender {
                 status_message_timeout_ns,
                 send_to_sm_poll_ratio,
                 timer_interval_ns,
+                bindings.poller(crate::media::Affinity::Sender),
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -657,7 +660,7 @@ pub(crate) struct SenderThread {
     /// Which endpoints have control frames waiting (G4-3). The sender's own
     /// poller, as the reference has one per sender
     /// (`aeron_driver_sender.c:150-180` polls through `sender->poller`).
-    poller: crate::media::poller::TransportPoller,
+    poller: crate::media::poller::MediaPoller,
     readable: Vec<usize>,
     /// The descriptors those endpoints listen on, in the same order — held
     /// rather than built fresh each pass, as the receiver holds its own
@@ -691,6 +694,7 @@ impl SenderThread {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        poller: crate::media::poller::MediaPoller,
         now_ns: i64,
         events: Channel<SenderEvent>,
         commands: Receiver<SenderCommand>,
@@ -718,7 +722,7 @@ impl SenderThread {
                 .map(|_| vec![0u8; mtu_length])
                 .collect(),
             datagrams: Datagrams::new(),
-            poller: crate::media::poller::TransportPoller::new(),
+            poller,
             readable: Vec::new(),
             descriptors: Vec::new(),
             pending_destinations: Vec::new(),
@@ -1152,11 +1156,15 @@ impl SenderThread {
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
         events: &Channel<SenderEvent>,
-        poller: &mut crate::media::poller::TransportPoller,
+        poller: &mut crate::media::poller::MediaPoller,
         readable: &mut Vec<usize>,
         descriptors: &mut Vec<crate::sys::socket::Descriptor>,
     ) -> usize {
         let mut work = 0;
+
+        // Whatever the bindings do before their transports are read
+        // (`poller_poll_func`'s first half): nothing for the kernel's.
+        poller.pump();
 
         // Which endpoints have control frames waiting (G4-3). At or below the
         // poller's threshold that is all of them, in order; above it, only the
@@ -2100,6 +2108,7 @@ mod tests {
         let endpoint = SendChannelEndpoint::create(
             endpoint,
             &mut crate::port_manager::WildcardPortManager::sender(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut endpoint_manager,
             &endpoint_regions,

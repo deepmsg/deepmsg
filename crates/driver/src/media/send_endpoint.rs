@@ -204,6 +204,7 @@ impl SendChannelEndpoint {
     pub fn create(
         channel: UdpChannel,
         port_manager: &mut crate::port_manager::WildcardPortManager,
+        bindings: &super::TransportBindings,
         params: &TransportParams,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -259,11 +260,12 @@ impl SendChannelEndpoint {
             .map_err(SendEndpointError::Port)?;
         let managed_port = bind.port();
 
-        let transport = match super::udp_transport::UdpTransport::open(
+        let transport = match bindings.open(
             bind,
             Some(channel.local_control),
             connect_to,
             params,
+            super::Affinity::Sender,
         ) {
             Ok(transport) => transport,
             Err(error) => {
@@ -305,7 +307,7 @@ impl SendChannelEndpoint {
         let local_sockaddr_counter_id = match publish_local_sockaddr(
             channel_status_counter_id,
             &channel.original_uri,
-            &transport,
+            &*transport,
             counters,
             regions,
             registration_id,
@@ -325,7 +327,7 @@ impl SendChannelEndpoint {
             current_data_addr: channel.remote_data,
             time_of_last_sm_ns: now_ns,
             channel,
-            transport: Box::new(transport),
+            transport,
             data_loss_generator: None,
             destination_tracker,
             channel_status_counter_id,
@@ -1016,6 +1018,7 @@ mod tests {
             SendChannelEndpoint::create(
                 channel(uri),
                 &mut ports(),
+                &crate::media::TransportBindings::Default,
                 &TransportParams::default(),
                 counters,
                 regions,
@@ -1103,6 +1106,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1134,6 +1138,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1177,6 +1182,7 @@ mod tests {
         let endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1234,6 +1240,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1278,6 +1285,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={named}")),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1328,6 +1336,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={named_address}")),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1393,6 +1402,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel(&format!("aeron:udp?endpoint={bound}")),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1463,6 +1473,7 @@ mod tests {
                 "aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
             )),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1541,6 +1552,7 @@ mod tests {
         let error = SendChannelEndpoint::create(
             channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
             &mut manager,
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1573,6 +1585,7 @@ mod tests {
         let endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?control=127.0.0.1:0|control-mode=dynamic"),
             &mut manager,
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1597,6 +1610,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1621,6 +1635,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,
@@ -1671,6 +1686,7 @@ mod tests {
         let mut endpoint = SendChannelEndpoint::create(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             &mut ports(),
+            &crate::media::TransportBindings::Default,
             &TransportParams::default(),
             &mut counters,
             &regions,

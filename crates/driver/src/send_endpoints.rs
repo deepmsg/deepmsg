@@ -256,6 +256,11 @@ pub struct SendChannelEndpoints {
     /// (`aeron_driver_context.c:527,668` read into `context->connect_enabled`,
     /// used at `media/aeron_send_channel_endpoint.c:89`).
     connect_enabled: bool,
+    /// What the endpoints' transports are opened on, set once at start-up
+    /// (`context->udp_channel_transport_bindings`,
+    /// `aeron_driver_context.c:1258-1263`, used at
+    /// `media/aeron_send_channel_endpoint.c:133-140`).
+    transport_bindings: crate::media::TransportBindings,
     /// Which ports a publication whose channel named port zero is given
     /// (`context->sender_port_manager`, `aeron_driver_context.c:428-437`).
     ///
@@ -285,6 +290,7 @@ impl SendChannelEndpoints {
             next_id: 1,
             data_loss_drop_every: None,
             connect_enabled: crate::config::DRIVER_CONNECT_DEFAULT,
+            transport_bindings: crate::media::TransportBindings::Default,
             sender_port_manager: WildcardPortManager::sender(),
         }
     }
@@ -318,6 +324,14 @@ impl SendChannelEndpoints {
     /// would have been made with the old answer.
     pub fn set_connect_enabled(&mut self, connect_enabled: bool) {
         self.connect_enabled = connect_enabled;
+    }
+
+    /// What the endpoints made from here on open their transports on.
+    ///
+    /// Set once at start-up, like the two above: the context's, and read by
+    /// every endpoint it makes.
+    pub fn set_transport_bindings(&mut self, bindings: crate::media::TransportBindings) {
+        self.transport_bindings = bindings;
     }
 
     /// The endpoints, in the order they were created.
@@ -463,6 +477,7 @@ impl SendChannelEndpoints {
         let mut endpoint = SendChannelEndpoint::create(
             channel,
             &mut self.sender_port_manager,
+            &self.transport_bindings,
             params,
             counters,
             regions,

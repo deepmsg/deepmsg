@@ -161,6 +161,7 @@ impl ReceiveDestination {
     pub fn open(
         channel: UdpChannel,
         port_manager: &mut crate::port_manager::WildcardPortManager,
+        bindings: &super::TransportBindings,
         params: &TransportParams,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -185,11 +186,12 @@ impl ReceiveDestination {
         // `:69-75`: the bind address is that one, the interface is the
         // channel's `local_data`, and a destination **never** connects, which
         // is why a subscriber's transport has one descriptor.
-        let transport = match super::udp_transport::UdpTransport::open(
+        let transport = match bindings.open(
             bind,
             Some(channel.local_data),
             None,
             params,
+            super::Affinity::Receiver,
         ) {
             Ok(transport) => transport,
             Err(super::udp_transport::OpenError::Bind(failure)) => {
@@ -209,7 +211,7 @@ impl ReceiveDestination {
         Self::attach(
             channel,
             managed_port,
-            Box::new(transport),
+            transport,
             counters,
             regions,
             registration_id,
@@ -645,6 +647,7 @@ impl ReceiveChannelEndpoint {
         channel: UdpChannel,
         group_tag: Option<i64>,
         port_manager: &mut crate::port_manager::WildcardPortManager,
+        bindings: &super::TransportBindings,
         params: &TransportParams,
         receiver_id: i64,
         stream_session_limit: usize,
@@ -684,6 +687,7 @@ impl ReceiveChannelEndpoint {
             match ReceiveDestination::open(
                 channel.clone(),
                 port_manager,
+                bindings,
                 params,
                 counters,
                 regions,

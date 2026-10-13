@@ -176,6 +176,50 @@ impl Default for TransportPoller {
     }
 }
 
+/// A thread's poller, for whichever bindings the driver runs on
+/// (`poller_init_func` / `poller_poll_func`,
+/// `media/aeron_udp_channel_transport_bindings.h:91-109`; made by
+/// [`super::bindings::TransportBindings::poller`]).
+///
+/// The receiver and the sender use it in two steps where the reference's
+/// `poller_poll_func` takes one: [`MediaPoller::pump`] once at the top of a
+/// pass, then [`MediaPoller::ready`] to choose which transports to read, each
+/// of which is then read through its own [`super::Transport::receive`]. The
+/// reference's poll hands every datagram to a callback as it goes; this
+/// build's passes are written around reading a transport — one datagram per
+/// read, and an answer leaving through the transport it arrived on — so a
+/// bindings with no file descriptors fills its transports in `pump` and is read
+/// the same way as one that has them.
+pub enum MediaPoller {
+    /// The kernel's sockets, through [`TransportPoller`].
+    Kernel(TransportPoller),
+}
+
+impl MediaPoller {
+    /// Whatever a bindings has to do once a pass before its transports are
+    /// read. The kernel delivers into each socket on its own, so for it this
+    /// is nothing.
+    #[inline]
+    pub fn pump(&mut self) {
+        match self {
+            Self::Kernel(_) => {}
+        }
+    }
+
+    /// The indices of `descriptors` this pass should read, appended to
+    /// `ready` ([`TransportPoller::ready`]).
+    ///
+    /// # Errors
+    ///
+    /// The poller's own, as [`TransportPoller::ready`] answers them.
+    #[inline]
+    pub fn ready(&mut self, descriptors: &[Descriptor], ready: &mut Vec<usize>) -> io::Result<()> {
+        match self {
+            Self::Kernel(poller) => poller.ready(descriptors, ready),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

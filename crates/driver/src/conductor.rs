@@ -947,6 +947,7 @@ impl Conductor {
             config.status_message_timeout_ns,
             config.send_to_sm_poll_ratio,
             config.timer_interval_ns,
+            &config.transport_bindings,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -971,6 +972,7 @@ impl Conductor {
             config.receiver_cycle_threshold_ns,
             config.re_resolution_check_interval_ns,
             config.timer_interval_ns,
+            &config.transport_bindings,
         )
         .map_err(ConductorError::Sender)?;
 
@@ -1014,6 +1016,8 @@ impl Conductor {
                 // And whether its endpoints connect their sockets, which is
                 // the context's too (`:527`).
                 endpoints.set_connect_enabled(config.connect_enabled);
+                // And what they open their sockets on (`:1258-1263`).
+                endpoints.set_transport_bindings(config.transport_bindings.clone());
                 endpoints
             },
             network_publications,
@@ -3705,6 +3709,7 @@ impl Conductor {
                     let destination = match ReceiveDestination::open(
                         channel,
                         receive_endpoints.port_manager(),
+                        &config.transport_bindings,
                         &params,
                         counters,
                         &counter_regions,
