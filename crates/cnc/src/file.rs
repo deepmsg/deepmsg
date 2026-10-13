@@ -117,6 +117,38 @@ pub struct CncFile {
     path: PathBuf,
 }
 
+/// What a failed mapping is, given what the file looks like **now**.
+///
+/// The look above and the mapping layer's each ask the file, and the driver is
+/// creating it between them. A file that was not there at the first look — so
+/// that neither of the two states the look above knows about applied, and it
+/// fell through — can be there and empty at the second, and the mapping layer
+/// refuses that with an `io::Error` no waiting client retries. It is the same
+/// state the look above calls [`CncOpenError::TooShort`], so it is called that
+/// here too, and the retry goes on.
+///
+/// **Not hypothetical.** It is what a CI run met: the standalone archive looked
+/// at exactly that instant, gave up on a driver that was a moment from ready,
+/// and the test that was waiting for it timed out. Fourty attempts to reproduce
+/// it here did not — the window is as wide as a call to `open` and lands
+/// whenever the scheduler says so — which is why the rule is a function with
+/// its own test rather than a comment on a call site.
+///
+/// A file that is short but not empty is classified the same way, and that is
+/// deliberate: it is what the length check below would have said had the
+/// mapping succeeded, so deciding it here can only make the two agree.
+fn classify_map_failure(path: &Path, error: io::Error) -> CncOpenError {
+    match std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+    {
+        Some(length) if length <= layout::VERSION_AND_METADATA_LENGTH => {
+            CncOpenError::TooShort { length }
+        }
+        _ => CncOpenError::Io(error),
+    }
+}
+
 impl CncFile {
     /// Assemble a `CncFile` from a mapping this crate created.
     ///
@@ -243,6 +275,10 @@ impl CncFile {
         // would be the one state a waiting client gives up on. It belongs with
         // the other too-short files: a driver creates the file and fills it
         // afterwards.
+        //
+        // This look and the mapping layer's own are two looks at a file the
+        // driver is creating, so **the second one is what decides**: see
+        // [`classify_map_failure`].
         if let Ok(metadata) = std::fs::metadata(&path) {
             if 0 == metadata.len() {
                 return Err(CncOpenError::TooShort { length: 0 });
@@ -254,7 +290,7 @@ impl CncFile {
         } else {
             MappedFile::open_readonly(&path)
         }
-        .map_err(CncOpenError::Io)?;
+        .map_err(|error| classify_map_failure(&path, error))?;
 
         // Strictly greater: a file of exactly the metadata length has no room
         // for a region. The reference uses the same comparison
@@ -800,6 +836,77 @@ mod tests {
             error,
             CncOpenError::Incompatible(CncVersionCompatibility::InsufficientMinor)
         ));
+    }
+
+    /// The **other** look at the file — the mapping layer's — is classified by
+    /// the same rule, so that the state a client can meet between the two looks
+    /// is not the one state it gives up on.
+    ///
+    /// The three cases are the three a mapping can fail for while a driver is
+    /// creating the file: it is there and empty (the window this was found in),
+    /// it is there and too short to hold anything, and it is not there at all.
+    /// The first two are [`CncOpenError::TooShort`]; the third keeps whatever
+    /// the open said, which for a file that is not there is `NotFound` — the
+    /// one `Io` a client does retry.
+    #[test]
+    fn a_mapping_that_failed_is_classified_by_what_the_file_is_now() {
+        let dir = std::env::temp_dir().join(format!("deepmsg-map-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(CNC_FILE_NAME);
+
+        // Not there at either look: the mapping layer's own `NotFound`, which
+        // is retryable and stays that way.
+        let missing = classify_map_failure(
+            &path,
+            io::Error::new(io::ErrorKind::NotFound, "no such file"),
+        );
+        assert!(
+            matches!(missing, CncOpenError::Io(_)),
+            "a file that is not there is not a too-short one: {missing:?}"
+        );
+        assert!(missing.is_retryable());
+
+        // There, and empty — the window: the driver has created it and written
+        // nothing. The mapping layer refuses this, and the refusal is not one a
+        // client retries.
+        std::fs::write(&path, b"").expect("an empty file");
+        let empty = classify_map_failure(
+            &path,
+            io::Error::new(io::ErrorKind::InvalidData, "refusing to map an empty file"),
+        );
+        assert!(
+            matches!(empty, CncOpenError::TooShort { length: 0 }),
+            "the same state the look above already calls too-short: {empty:?}"
+        );
+        assert!(empty.is_retryable(), "and it is worth waiting for");
+
+        // There, and shorter than the metadata block: the length check below
+        // would have said the same had the mapping succeeded.
+        std::fs::write(&path, b"not enough").expect("a short file");
+        let short = classify_map_failure(
+            &path,
+            io::Error::new(io::ErrorKind::InvalidData, "refusing to map an empty file"),
+        );
+        assert!(
+            matches!(short, CncOpenError::TooShort { length: 10 }),
+            "and a short file is the same answer, with its length: {short:?}"
+        );
+        assert!(short.is_retryable());
+
+        // A file that is long enough keeps the mapping's own error: this rule
+        // is about the state the file is in, not about excusing every failure.
+        std::fs::write(&path, vec![0u8; layout::VERSION_AND_METADATA_LENGTH + 1])
+            .expect("a long file");
+        let long = classify_map_failure(
+            &path,
+            io::Error::new(io::ErrorKind::InvalidData, "something else entirely"),
+        );
+        assert!(
+            matches!(long, CncOpenError::Io(_)),
+            "a file that could have been mapped keeps its own error: {long:?}"
+        );
+        assert!(!long.is_retryable());
     }
 
     #[test]
