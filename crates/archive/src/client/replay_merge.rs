@@ -47,7 +47,9 @@
 //!   in the corner where an image closes having already reached the target —
 //!   there are no facts left to decide on.
 
-use deepmsg_client::client::{Client, CommandError, DEFAULT_TIMEOUT};
+use deepmsg_client::client::{
+    AsyncDestination, AsyncDestinationPoll, Client, CommandError, DEFAULT_TIMEOUT,
+};
 use deepmsg_client::image::{Fragment, Image};
 use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_client::subscription::Subscription;
@@ -297,29 +299,41 @@ pub trait MergePeer {
     /// connected.
     fn poll_for_response(&mut self, correlation_id: i64) -> Result<Option<i64>, MergeFailure>;
 
-    /// Add the **replay** destination to the subscription, which is the first
-    /// thing the reference does and the last thing it takes away
-    /// (`Subscription.asyncAddDestination` at `:490`, and `close` at `:206-215`).
+    /// Start putting a destination on the subscription, answering with the
+    /// handle the driver will answer under
+    /// (`Subscription.asyncAddDestination`, `:490`, `:501`, `:666-674`).
+    ///
+    /// **Started and not waited on**: the merge is a turn, and the driver's
+    /// answer is read in a later one ([`MergePeer::destination_answered`]).
+    /// The reference's merge is the reason the asynchronous form exists at all
+    /// — its `async_destination` handle is polled at the top of every turn
+    /// (`:717-731`) and holds the live join off while it is outstanding
+    /// (`:635-643`).
     ///
     /// # Errors
     ///
     /// [`MergeFailure`] if the command could not be sent.
-    fn add_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure>;
+    fn start_add_destination(&mut self, destination: &str) -> Result<i64, MergeFailure>;
 
-    /// Add the live destination to the subscription
-    /// (`Subscription.asyncAddDestination`).
+    /// Start taking one off (`Subscription.asyncRemoveDestination`, `:508`).
     ///
     /// # Errors
     ///
     /// [`MergeFailure`] if the command could not be sent.
-    fn add_live_destination(&mut self, destination: &str) -> Result<(), MergeFailure>;
+    fn start_remove_destination(&mut self, destination: &str) -> Result<i64, MergeFailure>;
 
-    /// Remove the replay destination from the subscription.
+    /// Whether the driver has answered a destination command, polling what is
+    /// there (`aeron_archive_replay_merge_handle_async_destination`,
+    /// `:717-731`).
+    ///
+    /// `false` is "not yet", and the merge goes on waiting for it — which for
+    /// the live destination means it does not ask the archive anything until
+    /// the subscription is actually reading the live stream.
     ///
     /// # Errors
     ///
-    /// [`MergeFailure`] if the command could not be sent.
-    fn remove_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure>;
+    /// [`MergeFailure`] if the driver refused the command.
+    fn destination_answered(&mut self, correlation_id: i64) -> Result<bool, MergeFailure>;
 
     /// Whether the `Aeron` client behind this is closed (`Aeron.isClosed`),
     /// which `close` asks before it touches anything (`:206`).
@@ -350,16 +364,16 @@ pub trait MergePeer {
 /// connection to the driver of its own — so a peer that held a `&mut
 /// Subscription` could not also poll the archive.
 ///
-/// # The two ways this differs from the reference, and why
+/// # Two things that are the reference's shape and are worth naming
 ///
-/// * **Destinations are blocking.** `Subscription.asyncAddDestination` answers
-///   immediately and is polled later; [`Client::add_rcv_destination`] waits for
-///   the driver, so a turn of a merge can block for up to
-///   [`DEFAULT_TIMEOUT`]. The next slice puts the non-blocking form in, and the
-///   merge's live destination moves to it; until then this is the shape.
-/// * **A command that fails is a merge that fails.** The reference's
-///   `asyncAddDestination` answers `false` and the merge treats it as a hard
-///   error (`:490-501`), which is what a blocking call's error becomes here.
+/// * **Destinations are asynchronous.** `Subscription.asyncAddDestination`
+///   answers at once and is polled in a later turn, and that is what
+///   [`MergePeer::start_add_destination`] and
+///   [`MergePeer::destination_answered`] are: the merge starts a command and
+///   carries its correlation id across turns. A blocking add would stop a
+///   merge's turn for as long as the driver took.
+/// * **A command the driver refuses is a merge that fails**, with the driver's
+///   words (`:490-501`).
 pub struct ClientMergePeer<'a> {
     client: &'a mut Client,
     archive: &'a mut Archive,
@@ -414,19 +428,6 @@ impl<'a> ClientMergePeer<'a> {
     /// trait's own `&mut self` receiver would win over an inherent `&self` one.
     fn image_by_session(&self, session_id: i32) -> Option<&Image> {
         self.subscription()?.image_by_session_id(session_id)
-    }
-
-    /// A destination put on the subscription, with the driver's refusal in its
-    /// own words.
-    fn add_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-        self.client
-            .add_rcv_destination(
-                self.subscription_registration_id,
-                destination,
-                DEFAULT_TIMEOUT,
-            )
-            .map(|_| ())
-            .map_err(refused_destination)
     }
 }
 
@@ -548,22 +549,41 @@ impl MergePeer for ClientMergePeer<'_> {
             .poll_for_response(self.client, correlation_id)?)
     }
 
-    fn add_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-        self.add_destination(destination)
-    }
-
-    fn add_live_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-        self.add_destination(destination)
-    }
-
-    fn remove_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
+    fn start_add_destination(&mut self, destination: &str) -> Result<i64, MergeFailure> {
         self.client
-            .remove_rcv_destination(
+            .async_add_rcv_destination(
                 self.subscription_registration_id,
                 destination,
                 DEFAULT_TIMEOUT,
             )
+            .map(|destination| destination.correlation_id())
             .map_err(refused_destination)
+    }
+
+    fn start_remove_destination(&mut self, destination: &str) -> Result<i64, MergeFailure> {
+        self.client
+            .async_remove_rcv_destination(
+                self.subscription_registration_id,
+                destination,
+                DEFAULT_TIMEOUT,
+            )
+            .map(|destination| destination.correlation_id())
+            .map_err(refused_destination)
+    }
+
+    fn destination_answered(&mut self, correlation_id: i64) -> Result<bool, MergeFailure> {
+        match self
+            .client
+            .destination_poll(AsyncDestination::from_correlation_id(correlation_id))
+        {
+            AsyncDestinationPoll::Awaiting => Ok(false),
+            AsyncDestinationPoll::Ready => Ok(true),
+            AsyncDestinationPoll::Failed(error) => Err(refused_destination(error)),
+            // A handle this client is not waiting on: the entry has already
+            // been retired — by a deadline, or by this merge polling twice —
+            // and there is nothing left to wait for.
+            AsyncDestinationPoll::Unknown => Ok(true),
+        }
     }
 
     fn client_is_closed(&self) -> bool {
@@ -636,6 +656,13 @@ pub struct ReplayMerge {
     /// hand; here the first turn does it, so that no caller can construct a
     /// merge and forget to start it. See [`ReplayMerge::do_work`].
     replay_destination_added: bool,
+    /// The destination command the driver has not answered yet, or
+    /// [`NULL_VALUE`] — the reference's `async_destination` handle (`:717-731`).
+    ///
+    /// Only one at a time, which is the reference's own rule: a merge that
+    /// started a second before the first was answered would not know which
+    /// arrival it was looking at.
+    destination_correlation_id: i64,
     state: State,
     failure: Option<MergeFailure>,
 }
@@ -709,6 +736,7 @@ impl ReplayMerge {
             is_replay_active: false,
             image_found: false,
             replay_destination_added: false,
+            destination_correlation_id: NULL_VALUE,
             state,
             failure: None,
         })
@@ -733,8 +761,26 @@ impl ReplayMerge {
         if !self.replay_destination_added {
             let destination = self.replay_destination.clone();
 
-            match peer.add_replay_destination(&destination) {
-                Ok(()) => self.replay_destination_added = true,
+            match peer.start_add_destination(&destination) {
+                Ok(correlation_id) => {
+                    self.replay_destination_added = true;
+                    self.destination_correlation_id = correlation_id;
+                }
+                Err(failure) => {
+                    self.fail(failure);
+
+                    return 0;
+                }
+            }
+        }
+
+        // The driver's answer to a destination, read before the state runs — so
+        // a state that is held off by an outstanding one is held off by a *live*
+        // question rather than by one this turn could have settled.
+        if self.destination_correlation_id != NULL_VALUE {
+            match peer.destination_answered(self.destination_correlation_id) {
+                Ok(true) => self.destination_correlation_id = NULL_VALUE,
+                Ok(false) => {}
                 Err(failure) => {
                     self.fail(failure);
 
@@ -851,7 +897,18 @@ impl ReplayMerge {
         if !peer.client_is_closed() {
             if self.state != State::Merged {
                 let replay_destination = self.replay_destination.clone();
-                let _ = peer.remove_replay_destination(&replay_destination);
+
+                // Started **and drained**: the reference will not go on with the
+                // command outstanding (`:266-282`), because a removal nobody
+                // reads leaves the client holding a pending entry and the
+                // subscription still reading from a destination the caller
+                // thinks is gone. A refusal ends the wait rather than hanging
+                // on it, which is what the C's own `-1` does.
+                if let Ok(correlation_id) = peer.start_remove_destination(&replay_destination) {
+                    while !peer.destination_answered(correlation_id).unwrap_or(true) {
+                        peer.drive_client();
+                    }
+                }
             }
 
             if self.is_replay_active && peer.archive_publication_connected() {
@@ -983,6 +1040,13 @@ impl ReplayMerge {
     }
 
     fn attempt_live_join<P: MergePeer>(&mut self, peer: &mut P, now_ms: i64) -> Outcome {
+        // `:633-639`: a destination the driver has not answered is one whose
+        // answer this turn would be reading as its own — the reference bails
+        // out of the state entirely rather than fall through to the decisions.
+        if self.destination_correlation_id != NULL_VALUE {
+            return Ok(0);
+        }
+
         if self.active_correlation_id == NULL_VALUE {
             if self.call_get_max_recorded_position(peer, now_ms)? {
                 self.time_of_last_progress_ms = now_ms;
@@ -1008,13 +1072,15 @@ impl ReplayMerge {
 
                 if self.should_add_live_destination(facts) {
                     let live_destination = self.live_destination.clone();
-                    peer.add_live_destination(&live_destination)?;
+                    self.destination_correlation_id =
+                        peer.start_add_destination(&live_destination)?;
                     self.time_of_last_progress_ms = now_ms;
                     self.position_of_last_progress = facts.position;
                     self.is_live_added = true;
                 } else if self.should_stop_and_remove_replay(facts) {
                     let replay_destination = self.replay_destination.clone();
-                    peer.remove_replay_destination(&replay_destination)?;
+                    self.destination_correlation_id =
+                        peer.start_remove_destination(&replay_destination)?;
                     self.stop_replay(peer);
                     self.time_of_last_progress_ms = now_ms;
                     self.position_of_last_progress = facts.position;
@@ -1186,9 +1252,17 @@ mod tests {
         /// Which recording each `getMaxRecordedPosition` was about, so that
         /// "the id the merge was built with" is assertable.
         asked_about: Vec<i64>,
-        replay_added: Vec<String>,
-        live_added: Vec<String>,
-        replay_removed: Vec<String>,
+        /// Every destination command started, in order, as (added, uri).
+        started: Vec<(bool, String)>,
+        /// Whether the driver answers destination commands on the turn they are
+        /// started. `false` is a driver that takes its time, which is what holds
+        /// the live join off.
+        answers_destinations: bool,
+        /// Answers waiting to be read, by correlation id.
+        destination_answers: Vec<i64>,
+        /// The id of the last destination command started, so a test that held
+        /// the answer back can give it later.
+        last_destination_id: i64,
         /// The channel each `replay` request was sent on, which is the template
         /// after the merge has finished it.
         replayed: Vec<String>,
@@ -1208,6 +1282,36 @@ mod tests {
     }
 
     impl FakePeer {
+        /// A destination command the merge started, answered on the next turn
+        /// unless the peer is set to make the driver take its time.
+        fn start_destination(
+            &mut self,
+            added: bool,
+            destination: &str,
+        ) -> Result<i64, MergeFailure> {
+            if let Some(message) = &self.refuse_destinations {
+                return Err(MergeFailure::DestinationRefused {
+                    message: message.clone(),
+                });
+            }
+
+            let correlation_id = self.next_correlation_id();
+            self.started.push((added, destination.to_owned()));
+            self.last_destination_id = correlation_id;
+
+            if self.answers_destinations {
+                self.destination_answers.push(correlation_id);
+            }
+
+            Ok(correlation_id)
+        }
+
+        /// The driver answers the destination it was last given, which is how a
+        /// test that made it take its time releases it.
+        fn answer_last_destination(&mut self) {
+            self.destination_answers.push(self.last_destination_id);
+        }
+
         fn new(max_recorded_position: i64) -> Self {
             Self {
                 correlation_ids: 0,
@@ -1220,9 +1324,10 @@ mod tests {
                 pending: Vec::new(),
                 asked: Vec::new(),
                 asked_about: Vec::new(),
-                replay_added: Vec::new(),
-                live_added: Vec::new(),
-                replay_removed: Vec::new(),
+                started: Vec::new(),
+                answers_destinations: true,
+                destination_answers: Vec::new(),
+                last_destination_id: NULL_VALUE,
                 replayed: Vec::new(),
                 replay_relevant_id: 99,
                 asked_sessions: Vec::new(),
@@ -1325,28 +1430,26 @@ mod tests {
             }
         }
 
-        fn add_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-            if let Some(message) = &self.refuse_destinations {
-                return Err(MergeFailure::DestinationRefused {
-                    message: message.clone(),
-                });
-            }
-
-            self.replay_added.push(destination.to_owned());
-
-            Ok(())
+        fn start_add_destination(&mut self, destination: &str) -> Result<i64, MergeFailure> {
+            self.start_destination(true, destination)
         }
 
-        fn add_live_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-            self.live_added.push(destination.to_owned());
-
-            Ok(())
+        fn start_remove_destination(&mut self, destination: &str) -> Result<i64, MergeFailure> {
+            self.start_destination(false, destination)
         }
 
-        fn remove_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
-            self.replay_removed.push(destination.to_owned());
+        fn destination_answered(&mut self, correlation_id: i64) -> Result<bool, MergeFailure> {
+            let Some(index) = self
+                .destination_answers
+                .iter()
+                .position(|answer| *answer == correlation_id)
+            else {
+                return Ok(false);
+            };
 
-            Ok(())
+            self.destination_answers.remove(index);
+
+            Ok(true)
         }
 
         fn client_is_closed(&self) -> bool {
@@ -1443,9 +1546,10 @@ mod tests {
             now += 1;
         }
         assert_eq!(State::Catchup, merge.state());
-        assert!(
-            peer.live_added.is_empty(),
-            "nothing is added before the target"
+        assert_eq!(
+            vec![(true, "aeron:udp?endpoint=localhost:0".to_owned())],
+            peer.started,
+            "the replay destination and nothing else, before the target"
         );
 
         // It has, so the merge asks where the recording is now.
@@ -1455,7 +1559,13 @@ mod tests {
         // The live destination goes on — the target is within a quarter term —
         // and the merge goes back to catching up, now with two destinations.
         turn_until_state(&mut merge, &mut peer, &mut now, State::Catchup);
-        assert_eq!(vec!["aeron:udp?endpoint=localhost:40223"], peer.live_added);
+        assert_eq!(
+            vec![
+                (true, "aeron:udp?endpoint=localhost:0".to_owned()),
+                (true, "aeron:udp?endpoint=localhost:40223".to_owned()),
+            ],
+            peer.started
+        );
         assert!(merge.is_live_added());
 
         // The live destination is on and the recording has not moved, but the
@@ -1474,11 +1584,11 @@ mod tests {
 
             assert!(
                 !merge.is_merged(),
-                "one transport is not a merge: {}",
-                peer.replay_removed.len()
+                "one transport is not a merge: {:?}",
+                peer.started
             );
         }
-        assert!(peer.replay_removed.is_empty(), "and the replay is still on");
+        assert_eq!(2, peer.started.len(), "and the replay is still on");
         assert!(merge.is_live_added(), "with live already added");
 
         // The live stream catches up and carries two transports: the replay
@@ -1494,15 +1604,21 @@ mod tests {
         // What went on the subscription first came off it here, and it is the
         // **destination** — wildcard port and all — and not the replay channel's
         // endpoint, which is the port the subscription resolved.
-        assert_eq!(vec!["aeron:udp?endpoint=localhost:0"], peer.replay_added);
-        assert_eq!(vec!["aeron:udp?endpoint=localhost:0"], peer.replay_removed);
+        assert_eq!(
+            vec![
+                (true, "aeron:udp?endpoint=localhost:0".to_owned()),
+                (true, "aeron:udp?endpoint=localhost:40223".to_owned()),
+                (false, "aeron:udp?endpoint=localhost:0".to_owned()),
+            ],
+            peer.started
+        );
         assert_eq!(vec![99], peer.stopped);
 
         // Closing a merged merge leaves the live destination alone — that is
         // what makes the subscription still usable (`:198-200`).
         merge.close(&mut peer);
         assert_eq!(State::Closed, merge.state());
-        assert_eq!(1, peer.replay_removed.len(), "and nothing more was removed");
+        assert_eq!(3, peer.started.len(), "and nothing more was removed");
     }
 
     /// The replay channel is a **template** the merge finishes, and the replay
@@ -1595,6 +1711,55 @@ mod tests {
         );
     }
 
+    /// A destination the driver has not answered **holds the live join off**,
+    /// and the answer lets it go again.
+    ///
+    /// The reference's rule and the reason its merge keeps a handle at all
+    /// (`:633-639`): a live destination that has been asked for is not a live
+    /// destination yet, and a merge that went on would be reading the archive's
+    /// answer into a state that has already moved.
+    #[test]
+    fn a_destination_in_flight_holds_the_live_join_off() {
+        let mut merge = merge(i64::MAX / 2);
+        let mut peer = FakePeer::new(1024);
+        let mut now = 0;
+        peer.image = Some(catchup_facts(1024, 1));
+
+        turn_until_state(&mut merge, &mut peer, &mut now, State::AttemptLiveJoin);
+
+        // From here the driver takes its time, so the live destination this turn
+        // asks for is one nobody has answered.
+        peer.answers_destinations = false;
+        turn_until_state(&mut merge, &mut peer, &mut now, State::Catchup);
+        assert!(merge.is_live_added(), "the live destination was asked for");
+
+        let asked = peer.asked.len();
+
+        for _ in 0..16 {
+            merge.do_work(&mut peer, now);
+            now += 1;
+        }
+
+        assert_eq!(
+            asked,
+            peer.asked.len(),
+            "the merge asks the archive nothing while a destination is in flight"
+        );
+        assert!(
+            !merge.is_merged(),
+            "and it is not merged on an answer it has not had"
+        );
+
+        // The driver answers, and the merge picks up where it left off.
+        peer.answer_last_destination();
+        peer.max_recorded_position = 2048;
+        peer.image = Some(catchup_facts(2048, 2));
+        peer.answers_destinations = true;
+
+        turn_until_state(&mut merge, &mut peer, &mut now, State::Merged);
+        assert!(merge.is_merged());
+    }
+
     /// The replay destination goes on the subscription **before** anything is
     /// asked of the archive, and to the recording the merge was built with.
     ///
@@ -1610,8 +1775,8 @@ mod tests {
 
         merge.do_work(&mut peer, now);
         assert_eq!(
-            vec!["aeron:udp?endpoint=localhost:0"],
-            peer.replay_added,
+            vec![(true, "aeron:udp?endpoint=localhost:0".to_owned())],
+            peer.started,
             "the destination went on in the first turn"
         );
 
@@ -1619,7 +1784,7 @@ mod tests {
 
         // Once, however many turns went by — a second add would be a second
         // destination on a subscription that has one.
-        assert_eq!(1, peer.replay_added.len());
+        assert_eq!(1, peer.started.len());
         assert!(!peer.asked.is_empty(), "and the archive was asked");
         assert!(
             peer.asked_about

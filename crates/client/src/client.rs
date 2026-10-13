@@ -512,6 +512,22 @@ pub struct AsyncDestination {
     correlation_id: i64,
 }
 
+impl AsyncDestination {
+    /// The handle a caller that kept the **id** across turns puts back
+    /// together — [`AsyncAdd::publication`]'s counterpart, and for the same
+    /// caller: the archive's replay merge carries the correlation id of the
+    /// destination it started (`aeron_archive_replay_merge.c:717-731`) while
+    /// the object it would otherwise hold cannot cross the turn.
+    pub const fn from_correlation_id(correlation_id: i64) -> Self {
+        Self { correlation_id }
+    }
+
+    /// The correlation id the command was sent under.
+    pub const fn correlation_id(&self) -> i64 {
+        self.correlation_id
+    }
+}
+
 /// What [`Client::destination_poll`] found.
 #[derive(Debug)]
 pub enum AsyncDestinationPoll {
