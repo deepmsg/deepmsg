@@ -12,7 +12,7 @@ ordinary safe code.
 
 ## Decision
 
-`unsafe` is allowed in exactly five zones:
+`unsafe` is allowed in exactly six zones:
 
 1. `deepmsg-core::pal` — the platform seam: raw `mmap` / `munmap`, and the
    other syscalls that have no safe Rust spelling as they arrive. Calls
@@ -26,6 +26,12 @@ ordinary safe code.
    signal seam — catching the `SIGTERM` a test harness sends to the pid it
    spawned, and passing it to the two processes that stand where the reference
    ran one. Under the same explicit, documented `#[allow]`.
+6. `deepmsg-dpdk` — the kernel-bypass media seam (ADR-0006): the C shim that
+   turns DPDK's `static inline` data path into real functions, the hand-written
+   `extern "C"` declarations of its stable signatures, and the safe wrappers
+   over them. A library's interface to this process, not the kernel's, which is
+   why it is not part of zone 4; the library is linked from its installed
+   headers at build time rather than loaded at run time.
 
 `pal` and `buffer` are separate zones because they sit on different axes:
 `pal` is platform-specific address-space bookkeeping, one implementation per
@@ -53,12 +59,25 @@ Within the zones:
 
 ## Consequences
 
-- The unsafe review surface is five named modules, not the whole repo.
+- The unsafe review surface is six named modules, not the whole repo.
 - Zero-unsafe crates can be refactored freely.
 - New unsafe needs an ADR amendment, which is the point.
 
 ## Amendment history
 
+- **2026-10-14** — added zone 6, `deepmsg-dpdk`, on the authority of ADR-0006
+  (kernel-bypass media). The axis that decides a zone is again *whose boundary
+  it is*: zone 4 is the kernel's interface to this process — syscalls, signals,
+  and the media syscalls the kernel path sends and receives through — while a
+  kernel-bypass transport's boundary is a **C library's**, with its own
+  headers, its own build step, and its own initialisation lifetime (one
+  `rte_eal_init` per process, after which the process exits). Folding it into
+  zone 4 would put two unrelated lifetimes and two unrelated review surfaces
+  behind one name. Recorded alongside it: nothing is loaded into the process at
+  run time — the library is linked at build time, and the name that selects the
+  media resolves against a table compiled into this binary (ADR-0006). The zone
+  is named while it holds no code, as zone 3's entry below records for itself;
+  the crate that fills it arrives with the media.
 - **2026-09-26** — added zone 1, `deepmsg-core::pal`. The original three zones
   took the mapping as already given; P0-a needed the `mmap` call itself, and
   folding it into `buffer` to avoid an amendment is precisely what the last
