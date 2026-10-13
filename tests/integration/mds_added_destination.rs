@@ -13,7 +13,9 @@
 
 use std::time::{Duration, Instant};
 
-use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
+use deepmsg_client::client::{
+    AsyncDestination, AsyncDestinationPoll, Client, CommandError, DEFAULT_TIMEOUT,
+};
 use deepmsg_tests::driver::{self, OwnDriver};
 
 /// The stream the publisher and both subscriptions use.
@@ -240,4 +242,138 @@ fn local_subscription_close(client: &mut Client, registration_id: i64) {
     client
         .remove_subscription(registration_id, DEFAULT_TIMEOUT)
         .expect("the driver answers a removal it made");
+}
+
+/// The ports the asynchronous half uses. Its own, for the reason the others have
+/// theirs: `cargo test` runs the tests in a file at once.
+const ASYNC_PORT: u16 = 24_916;
+/// See [`ASYNC_PORT`], and the port a **subscription** holds so that the
+/// destination below cannot have it.
+const HELD_PORT: u16 = 24_917;
+
+/// A destination added **without waiting** for the driver: the command goes out,
+/// the answer is read later, and a second subscription is what makes a driver
+/// refuse one.
+///
+/// Three claims, which are the whole of what a non-blocking form has to get
+/// right:
+///
+/// * the command is taken by the driver — the far end connects, which is not
+///   something the caller could have known from its own return value;
+/// * the answer is **consumed** by the poll, so asking twice answers
+///   `Unknown` rather than the same thing forever;
+/// * a driver that refuses says so in the poll, in its own words, rather than
+///   in a return value the caller never looked at.
+///
+/// The refusal is made with a subscriber of this client's own holding an
+/// address: a receive destination binds the address it names rather than
+/// joining a channel endpoint, so one that is already held cannot be created.
+#[test]
+fn a_destination_can_be_added_without_waiting_for_the_driver() {
+    let Some(mut own) = OwnDriver::start("mds-async-destination") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    own.await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect to our driver");
+
+    let publication = client
+        .add_exclusive_publication(&publisher_channel(ASYNC_PORT), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the publication the destination names");
+    let mds = client
+        .add_subscription(MDS_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a manual subscription");
+
+    // The add returns a handle and nothing else: no answer has been read, and
+    // the driver has not been waited on.
+    let added = client
+        .async_add_rcv_destination(mds, &subscriber_channel(ASYNC_PORT), DEFAULT_TIMEOUT)
+        .expect("the command goes into the ring");
+
+    // And nothing has been waited on: an answer can only have been read by
+    // `Client::poll`, which the call above did not make, so the poll below must
+    // find the request still outstanding. This is what says the call returned
+    // **before** the driver answered rather than after — the one thing about a
+    // non-blocking face that its own return value cannot show.
+    assert!(
+        matches!(
+            client.destination_poll(added),
+            AsyncDestinationPoll::Awaiting
+        ),
+        "the command has not been answered yet: nothing has driven the client"
+    );
+
+    let ready = await_destination(&mut client, added);
+    assert!(
+        matches!(ready, AsyncDestinationPoll::Ready),
+        "the driver takes the destination: {ready:?}"
+    );
+    assert!(
+        matches!(
+            client.destination_poll(added),
+            AsyncDestinationPoll::Unknown
+        ),
+        "and the answer was consumed by the poll that read it"
+    );
+
+    // The destination is really on, which is the half a caller cannot see from
+    // its own return value: the publisher is connected to a reader it has never
+    // heard of before this.
+    assert!(
+        await_connected(&mut client, publication),
+        "the publisher behind the address that was just added is connected"
+    );
+
+    // And the remove has the same two faces.
+    let removed = client
+        .async_remove_rcv_destination(mds, &subscriber_channel(ASYNC_PORT), DEFAULT_TIMEOUT)
+        .expect("the command goes into the ring");
+
+    assert!(
+        matches!(
+            await_destination(&mut client, removed),
+            AsyncDestinationPoll::Ready
+        ),
+        "the driver takes the removal"
+    );
+
+    // The refusal: a second subscription holds an address, and a receive
+    // destination naming it is one the driver cannot create.
+    let held = client
+        .add_subscription(&subscriber_channel(HELD_PORT), STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the subscription that holds the address");
+
+    let refused = client
+        .async_add_rcv_destination(mds, &subscriber_channel(HELD_PORT), DEFAULT_TIMEOUT)
+        .expect("the command goes into the ring");
+
+    match await_destination(&mut client, refused) {
+        AsyncDestinationPoll::Failed(CommandError::Driver { message, .. }) => assert!(
+            message.contains("Address already in use"),
+            "the driver's own words for the refusal: {message}"
+        ),
+        other => panic!("a destination that cannot be created is refused: {other:?}"),
+    }
+
+    let _ = held;
+    let _ = own.stop();
+}
+
+/// Drive the client until a destination command has been answered.
+fn await_destination(client: &mut Client, destination: AsyncDestination) -> AsyncDestinationPoll {
+    let deadline = Instant::now() + DEADLINE;
+
+    loop {
+        assert!(Instant::now() < deadline, "the driver never answered");
+
+        client.poll();
+
+        match client.destination_poll(destination) {
+            AsyncDestinationPoll::Awaiting => std::thread::sleep(Duration::from_millis(1)),
+            answered => return answered,
+        }
+    }
 }

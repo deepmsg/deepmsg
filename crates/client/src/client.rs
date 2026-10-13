@@ -494,6 +494,41 @@ pub enum AsyncNextSessionIdPoll {
     Unknown,
 }
 
+/// A **destination** command that has been sent and not yet answered.
+///
+/// The reference's `aeron_async_destination_t`, which is what
+/// `Subscription.asyncAddDestination` hands back and what the archive's replay
+/// merge keeps across turns so the driver may answer in its own time
+/// (`aeron_archive_replay_merge.c:490`, `:717-731` — the merge polls its one
+/// outstanding handle at the top of every turn).
+///
+/// It carries the correlation id and nothing else, like
+/// [`AsyncNextSessionId`] and unlike [`AsyncAdd`]: a destination is not a
+/// resource this client keeps in a list, so there is no second id to find it by
+/// later. What the answer says is only that the driver took the command, which
+/// is also all the blocking [`Client::add_rcv_destination`] waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncDestination {
+    correlation_id: i64,
+}
+
+/// What [`Client::destination_poll`] found.
+#[derive(Debug)]
+pub enum AsyncDestinationPoll {
+    /// The driver has not answered yet. Poll again later.
+    Awaiting,
+    /// It answered, and the destination is the driver's now.
+    Ready,
+    /// The driver refused it, or the deadline passed before it answered — a
+    /// deadline is [`CommandError::TimedOut`], recorded where the pending entry
+    /// was dropped. A refusal here is the driver's own words: a URI no socket
+    /// can be bound for, or one that names no publication of this client's.
+    Failed(CommandError),
+    /// This handle is not one this client is waiting on: it was already polled,
+    /// or never came from this client.
+    Unknown,
+}
+
 /// A removal that has been sent and not yet answered.
 ///
 /// Carries both ids for the same reason [`AsyncAdd`] carries one: the
@@ -1986,19 +2021,104 @@ impl Client {
         .map(|_| ())
     }
 
-    /// Write one of the four destination commands that carry a URI, and wait
-    /// for its answer.
+    /// Add a destination to a subscription **without waiting** for the driver
+    /// (`Subscription.asyncAddDestination`).
     ///
-    /// All four answer with the same eight-byte `aeron_operation_succeeded_t` —
-    /// a bare correlation id (`aeron_control_protocol.h:117-121`) — so one
-    /// helper serves them, and the caller decides what the id means. Which of
-    /// the four was sent lives in the record's type id and nowhere in the
-    /// payload, which is why `type_id` is a parameter here and not a field of
-    /// the record.
+    /// [`Client::add_rcv_destination`]'s other face, and the one a caller that is
+    /// itself inside a turn needs: the command goes out now and
+    /// [`Client::destination_poll`] says later whether the driver took it. The
+    /// reference's archive replay merge is that caller — it adds the live
+    /// destination to a subscription mid-merge, and a merge that waited for the
+    /// driver there would be waiting on a turn only its own caller can drive.
     ///
-    /// `registration_id` is the publication or subscription the destination
-    /// belongs to; the driver tells the two apart by the type id.
-    fn destination_command(
+    /// `timeout` is when to stop waiting, and it is a deadline on the pending
+    /// entry rather than on this call, which returns at once.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent.
+    pub fn async_add_rcv_destination(
+        &mut self,
+        subscription_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<AsyncDestination, CommandError> {
+        let correlation_id = self.submit_destination(
+            ADD_RECEIVE_DESTINATION_TYPE_ID,
+            subscription_id,
+            uri,
+            timeout,
+        )?;
+
+        Ok(AsyncDestination { correlation_id })
+    }
+
+    /// Remove a source from a subscription **without waiting** for the driver
+    /// (`Subscription.asyncRemoveDestination`).
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent.
+    pub fn async_remove_rcv_destination(
+        &mut self,
+        subscription_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<AsyncDestination, CommandError> {
+        let correlation_id = self.submit_destination(
+            REMOVE_RECEIVE_DESTINATION_TYPE_ID,
+            subscription_id,
+            uri,
+            timeout,
+        )?;
+
+        Ok(AsyncDestination { correlation_id })
+    }
+
+    /// What has become of an [`AsyncDestination`] — either add or remove, which
+    /// the driver answers the same way and this client cannot tell apart
+    /// afterwards (`aeron_subscription_async_destination_poll`, whose one return
+    /// value carries both).
+    ///
+    /// Does **not** drive the client: [`Client::poll`] has to have run for a
+    /// driver response to have been read, as for every other reply.
+    ///
+    /// Polling consumes the answer, so a second poll of the same handle answers
+    /// [`AsyncDestinationPoll::Unknown`] — the choice
+    /// [`Client::async_add_poll`] and [`Client::async_next_session_id_poll`]
+    /// make too.
+    pub fn destination_poll(&mut self, destination: AsyncDestination) -> AsyncDestinationPoll {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.correlation_id == destination.correlation_id)
+        else {
+            return AsyncDestinationPoll::Unknown;
+        };
+
+        let Some(outcome) = self.pending[index].outcome.take() else {
+            return AsyncDestinationPoll::Awaiting;
+        };
+
+        self.pending.swap_remove(index);
+
+        match outcome {
+            // The driver's answer to a destination command is a bare
+            // operation-succeeded record, so there is nothing else it could
+            // have been (`aeron_control_protocol.h:117-121`).
+            Ok(Ready::OperationSucceeded) => AsyncDestinationPoll::Ready,
+            Ok(_) => AsyncDestinationPoll::Failed(CommandError::Encoding),
+            Err(error) => AsyncDestinationPoll::Failed(error),
+        }
+    }
+
+    /// The send the four destination commands share: the command into the ring
+    /// and the pending entry its answer will complete.
+    ///
+    /// Split from [`Client::destination_command`] because two of them now have a
+    /// caller that does not wait, and the part they have in common is everything
+    /// up to the wait.
+    fn submit_destination(
         &mut self,
         type_id: i32,
         registration_id: i64,
@@ -2020,6 +2140,30 @@ impl Client {
         }
 
         self.send(type_id, &payload, correlation_id, timeout)?;
+
+        Ok(correlation_id)
+    }
+
+    /// Write one of the four destination commands that carry a URI, and wait
+    /// for its answer.
+    ///
+    /// All four answer with the same eight-byte `aeron_operation_succeeded_t` —
+    /// a bare correlation id (`aeron_control_protocol.h:117-121`) — so one
+    /// helper serves them, and the caller decides what the id means. Which of
+    /// the four was sent lives in the record's type id and nowhere in the
+    /// payload, which is why `type_id` is a parameter here and not a field of
+    /// the record.
+    ///
+    /// `registration_id` is the publication or subscription the destination
+    /// belongs to; the driver tells the two apart by the type id.
+    fn destination_command(
+        &mut self,
+        type_id: i32,
+        registration_id: i64,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<i64, CommandError> {
+        let correlation_id = self.submit_destination(type_id, registration_id, uri, timeout)?;
 
         let Ready::OperationSucceeded = self.wait(correlation_id)? else {
             return Err(CommandError::Encoding);
