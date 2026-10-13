@@ -69,8 +69,19 @@ pub const PARAM_DELIMITER: char = '|';
 /// (`ChannelUriStringBuilder.TAG_PREFIX`).
 pub const TAG_PREFIX: &str = "tag:";
 
-/// `ChannelUri.ENDPOINT_PARAM_NAME` (`ChannelUri.java:84`).
-const ENDPOINT_PARAM_NAME: &str = "endpoint";
+/// `ChannelUri.ENDPOINT_PARAM_NAME` (`ChannelUri.java:84`), which is also
+/// `CommonContext.ENDPOINT_PARAM_NAME` (`:252`) and
+/// `AERON_UDP_CHANNEL_ENDPOINT_KEY`
+/// (`aeron-client/src/main/c/uri/aeron_uri.h:45`).
+pub const ENDPOINT_PARAM_NAME: &str = "endpoint";
+
+/// `CommonContext.LINGER_PARAM_NAME` (`:323`), `AERON_URI_LINGER_TIMEOUT_KEY`
+/// (`aeron_uri.h:59`).
+pub const LINGER_PARAM_NAME: &str = "linger";
+
+/// `CommonContext.EOS_PARAM_NAME` (`:356`), `AERON_URI_EOS_KEY`
+/// (`aeron_uri.h:62`).
+pub const EOS_PARAM_NAME: &str = "eos";
 
 /// Why a URI could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
