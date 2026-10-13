@@ -158,6 +158,82 @@ fn an_image_event_announces_the_image_and_its_removal() {
     );
 }
 
+/// Poll until the subscription holds no image.
+fn await_no_image(client: &mut Client, subscription: i64) {
+    let deadline = Instant::now() + DEADLINE;
+
+    while !client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the image never went away");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A subscription is connected when it has an image and not when it merely has
+/// a channel.
+///
+/// The distinction is the whole of `Subscription.isConnected`
+/// (`Subscription.java:295-311`), and it is one a **live driver** is needed to
+/// draw: the question that is easy to answer by mistake is "has the driver
+/// bound this subscription's socket", which is true from the moment the
+/// subscription is registered and says nothing about whether anything is
+/// publishing to it. A merge that took that answer would go looking for an
+/// image the driver has not matched yet, on every turn, forever.
+#[test]
+fn a_subscription_is_connected_when_it_has_an_image_and_not_before() {
+    let Some((_own, mut client)) = own_driver_and_client("subscription-connected") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    // Registered, and its channel is up by the time `add_subscription`
+    // answers — so everything below is about the image and not about the
+    // registration.
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    client.poll();
+    assert!(
+        !client
+            .subscription(subscription)
+            .expect("the subscription")
+            .is_connected(),
+        "a subscription nothing publishes to is not connected"
+    );
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+
+    await_image(&mut client, subscription);
+    assert!(
+        client
+            .subscription(subscription)
+            .expect("the subscription")
+            .is_connected(),
+        "the image is what connecting is"
+    );
+
+    client
+        .remove_publication(publication, DEFAULT_TIMEOUT)
+        .expect("the publication is removed");
+
+    await_no_image(&mut client, subscription);
+    assert!(
+        !client
+            .subscription(subscription)
+            .expect("the subscription")
+            .is_connected(),
+        "and the subscription is disconnected again when the image goes"
+    );
+}
+
 #[test]
 fn a_fragmented_message_is_delivered_once_per_frame() {
     let Some((_own, mut client)) = own_driver_and_client("fragment-poll") else {

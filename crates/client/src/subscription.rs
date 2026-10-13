@@ -362,6 +362,26 @@ impl Subscription {
         &self.images
     }
 
+    /// Whether this subscription is connected, which the reference defines as
+    /// having at least one **open** image
+    /// (`Subscription.isConnected`, `Subscription.java:295-311`;
+    /// `aeron_subscription_is_connected`,
+    /// `aeron-client/src/main/c/aeron_subscription.c:237-256`).
+    ///
+    /// The reference asks a slightly narrower question than "has an image": an
+    /// image the client has **closed** but not yet pruned does not count
+    /// (`:304`, `:246`). There is no such image here — an image goes when the
+    /// driver says it is unavailable ([`Self::remove_image`], which is where
+    /// `UN_ON_AVAILABLE_IMAGE` lands), so nothing closed is ever still held and
+    /// the two questions are the same list.
+    ///
+    /// The archive's replay merge is what asks: until a subscription is
+    /// connected there is no image to look for, so the state that waits for the
+    /// replay's image does not look (`ReplayMerge.java:429-436`).
+    pub fn is_connected(&self) -> bool {
+        !self.images.is_empty()
+    }
+
     /// The images currently attached, mutably, for a poll.
     pub fn images_mut(&mut self) -> &mut [Image] {
         &mut self.images
@@ -786,6 +806,45 @@ mod tests {
             None,
             subscription.resolved_endpoint(&reader(&metadata, &values)),
             "an address counter that is not up is not an address"
+        );
+    }
+
+    /// A subscription is connected from the first image it holds until the last
+    /// one goes, and not one image sooner or later.
+    ///
+    /// The two ends are what the question is for: a merge that asked a
+    /// subscription with no image to find one would be asking the driver a
+    /// question it has already answered, and a merge that stopped asking while
+    /// an image was still held would miss the replay it is waiting for.
+    #[test]
+    fn a_subscription_is_connected_exactly_while_it_holds_an_image() {
+        let first = TempLog::new("connected-a");
+        let second = TempLog::new("connected-b");
+        first.write(|appender| write_message(appender, b"a1"));
+
+        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
+        assert!(
+            !subscription.is_connected(),
+            "a subscription the driver has matched to nothing is not connected"
+        );
+
+        subscription.add_image(first.image(1));
+        assert!(
+            subscription.is_connected(),
+            "the first image is what connecting is"
+        );
+
+        // Two images, one taken away: still connected. A version of this that
+        // counted images rather than asking whether there is one would answer
+        // the same here, which is why the removal below is the assertion.
+        subscription.add_image(second.image(2));
+        assert!(subscription.remove_image(1), "the first image is removed");
+        assert!(subscription.is_connected(), "the second image is still one");
+
+        assert!(subscription.remove_image(2), "the second image is removed");
+        assert!(
+            !subscription.is_connected(),
+            "and a subscription with no image left is not connected again"
         );
     }
 
