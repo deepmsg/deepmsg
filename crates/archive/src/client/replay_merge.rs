@@ -47,11 +47,17 @@
 //!   in the corner where an image closes having already reached the target —
 //!   there are no facts left to decide on.
 
-use crate::client::archive::ArchiveError;
-use deepmsg_client::image::Fragment;
+use deepmsg_client::client::{Client, CommandError, DEFAULT_TIMEOUT};
+use deepmsg_client::image::{Fragment, Image};
+use deepmsg_client::publication::ExclusivePublication;
+use deepmsg_client::subscription::Subscription;
 use deepmsg_core::uri::{
     ChannelUri, ENDPOINT_PARAM_NAME, EOS_PARAM_NAME, LINGER_PARAM_NAME, UriError,
 };
+
+use crate::client::Archive;
+use crate::client::archive::ArchiveError;
+use crate::client::proxy::ReplayParams;
 
 /// `AeronArchive.NULL_VALUE`, which is `Aeron.NULL_VALUE`.
 pub const NULL_VALUE: i64 = -1;
@@ -217,6 +223,17 @@ pub trait MergePeer {
     /// Whether the subscription is connected (`Subscription.isConnected`).
     fn subscription_connected(&self) -> bool;
 
+    /// One turn of the client behind this peer
+    /// ([`Client::poll`](deepmsg_client::client::Client::poll)).
+    ///
+    /// The reference has nothing to ask for here: its `Aeron` runs a conductor
+    /// thread of its own, so an image that arrives is announced whether or not
+    /// the merge is looking. This build's client is driven by whoever holds it —
+    /// [`ReplayMerge::poll`] is the merge's own turn and drives it there — and a
+    /// merge that never did would wait forever for an image the driver had
+    /// already sent, which is exactly what the first end-to-end run did.
+    fn drive_client(&mut self);
+
     /// The replay's image, if the subscription has one for that session.
     ///
     /// **`None` is two things and the merge tells them apart by having found
@@ -321,6 +338,272 @@ pub trait MergePeer {
         fragment_limit: usize,
         handler: F,
     ) -> usize;
+}
+
+/// The three objects the reference's merge holds, behind the one face
+/// [`MergePeer`] is.
+///
+/// The reference's `ReplayMerge` is handed an `AeronArchive` and reaches the
+/// subscription and the client through it (`ReplayMerge.java:112-133`). Here the
+/// client and the archive client are two borrows and the subscription is an id,
+/// because **our client's methods take the client** — `Subscription` has no
+/// connection to the driver of its own — so a peer that held a `&mut
+/// Subscription` could not also poll the archive.
+///
+/// # The two ways this differs from the reference, and why
+///
+/// * **Destinations are blocking.** `Subscription.asyncAddDestination` answers
+///   immediately and is polled later; [`Client::add_rcv_destination`] waits for
+///   the driver, so a turn of a merge can block for up to
+///   [`DEFAULT_TIMEOUT`]. The next slice puts the non-blocking form in, and the
+///   merge's live destination moves to it; until then this is the shape.
+/// * **A command that fails is a merge that fails.** The reference's
+///   `asyncAddDestination` answers `false` and the merge treats it as a hard
+///   error (`:490-501`), which is what a blocking call's error becomes here.
+pub struct ClientMergePeer<'a> {
+    client: &'a mut Client,
+    archive: &'a mut Archive,
+    /// The subscription this merge was built for. Held as an id rather than as
+    /// a reference, because every read of it also needs the client.
+    subscription_registration_id: i64,
+    /// The stream the subscription reads, which is also the one the replay is
+    /// asked for. Read once, at construction: a subscription's stream is what
+    /// it was asked for and does not change.
+    subscription_stream_id: i32,
+}
+
+impl<'a> ClientMergePeer<'a> {
+    /// A peer over a client, an archive client, and one of the client's
+    /// subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// [`MergeFailure::DestinationRefused`] if the client does not hold that
+    /// subscription, which is a merge that could not do anything at all.
+    pub fn new(
+        client: &'a mut Client,
+        archive: &'a mut Archive,
+        subscription_registration_id: i64,
+    ) -> Result<Self, MergeFailure> {
+        let subscription_stream_id = client
+            .subscription(subscription_registration_id)
+            .map(Subscription::stream_id)
+            .ok_or_else(|| MergeFailure::DestinationRefused {
+                message: format!(
+                    "this client holds no subscription {subscription_registration_id}"
+                ),
+            })?;
+
+        Ok(Self {
+            client,
+            archive,
+            subscription_registration_id,
+            subscription_stream_id,
+        })
+    }
+
+    /// The subscription this merge is over, if the client still holds it.
+    fn subscription(&self) -> Option<&Subscription> {
+        self.client.subscription(self.subscription_registration_id)
+    }
+
+    /// The image carrying the replay, if the subscription has one for that
+    /// session.
+    ///
+    /// Not `image`, which is what [`MergePeer::image`] is called and which the
+    /// trait's own `&mut self` receiver would win over an inherent `&self` one.
+    fn image_by_session(&self, session_id: i32) -> Option<&Image> {
+        self.subscription()?.image_by_session_id(session_id)
+    }
+
+    /// A destination put on the subscription, with the driver's refusal in its
+    /// own words.
+    fn add_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
+        self.client
+            .add_rcv_destination(
+                self.subscription_registration_id,
+                destination,
+                DEFAULT_TIMEOUT,
+            )
+            .map(|_| ())
+            .map_err(refused_destination)
+    }
+}
+
+/// The driver's words for a destination it would not add or remove.
+///
+/// Spelled out rather than inlined because it is the only place this crate
+/// turns a command error into a merge failure, and the two halves of it — which
+/// variant, and whose words go in it — are what the criterion for
+/// [`MergeFailure::DestinationRefused`] is about.
+fn refused_destination(error: CommandError) -> MergeFailure {
+    MergeFailure::DestinationRefused {
+        message: error.to_string(),
+    }
+}
+
+impl MergePeer for ClientMergePeer<'_> {
+    fn drive_client(&mut self) {
+        self.client.poll();
+    }
+
+    fn next_correlation_id(&mut self) -> i64 {
+        // The reference's cannot fail (`aeron_archive_next_correlation_id`), and
+        // this one can: a command ring that cannot be read is a client that is
+        // on its way out. `NULL_VALUE` is the merge's "no correlation id", so
+        // the request that follows is the one that fails, with the client's own
+        // words, rather than a merge that fails here with a number.
+        self.archive
+            .next_correlation_id(self.client)
+            .unwrap_or(NULL_VALUE)
+    }
+
+    fn subscription_stream_id(&self) -> i32 {
+        self.subscription_stream_id
+    }
+
+    fn resolved_endpoint(&mut self) -> Option<String> {
+        let counters = self.client.counters_reader()?;
+
+        self.subscription()?.resolved_endpoint(&counters)
+    }
+
+    fn subscription_connected(&self) -> bool {
+        self.subscription().is_some_and(Subscription::is_connected)
+    }
+
+    fn image(&mut self, session_id: i32) -> Option<ImageFacts> {
+        let image = self.image_by_session(session_id)?;
+
+        Some(ImageFacts {
+            position: image.position(),
+            term_buffer_length: image.term_buffer_length(),
+            // `None` is an image whose transport count cannot be read — a
+            // counter that has gone, which is the client closing it. Zero is
+            // the answer that keeps a merge from treating it as two, which is
+            // the direction a wrong answer must fall.
+            active_transport_count: image.active_transport_count().unwrap_or(0),
+        })
+    }
+
+    fn get_max_recorded_position(
+        &mut self,
+        recording_id: i64,
+        correlation_id: i64,
+    ) -> Result<bool, MergeFailure> {
+        // The proxy retries an offer itself and answers `Err` when it never
+        // landed — which the reference spells `false`, and whose consequence is
+        // the backoff rather than a failed merge (`:761-765`).
+        Ok(self
+            .archive
+            .proxy_mut()
+            .get_max_recorded_position(self.client, correlation_id, recording_id)
+            .is_ok())
+    }
+
+    fn replay(
+        &mut self,
+        recording_id: i64,
+        start_position: i64,
+        length: i64,
+        channel: &str,
+        stream_id: i32,
+        correlation_id: i64,
+    ) -> Result<bool, MergeFailure> {
+        let params = ReplayParams {
+            position: start_position,
+            length,
+            ..ReplayParams::default()
+        };
+
+        Ok(self
+            .archive
+            .proxy_mut()
+            .replay(
+                self.client,
+                correlation_id,
+                recording_id,
+                channel,
+                stream_id,
+                &params,
+            )
+            .is_ok())
+    }
+
+    fn stop_replay(
+        &mut self,
+        replay_session_id: i64,
+        correlation_id: i64,
+    ) -> Result<bool, MergeFailure> {
+        Ok(self
+            .archive
+            .proxy_mut()
+            .stop_replay(self.client, correlation_id, replay_session_id)
+            .is_ok())
+    }
+
+    fn poll_for_response(&mut self, correlation_id: i64) -> Result<Option<i64>, MergeFailure> {
+        Ok(self
+            .archive
+            .poll_for_response(self.client, correlation_id)?)
+    }
+
+    fn add_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
+        self.add_destination(destination)
+    }
+
+    fn add_live_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
+        self.add_destination(destination)
+    }
+
+    fn remove_replay_destination(&mut self, destination: &str) -> Result<(), MergeFailure> {
+        self.client
+            .remove_rcv_destination(
+                self.subscription_registration_id,
+                destination,
+                DEFAULT_TIMEOUT,
+            )
+            .map_err(refused_destination)
+    }
+
+    fn client_is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
+    fn archive_publication_connected(&self) -> bool {
+        // `close`'s own gate, and the same expression `Archive::close` uses
+        // (`:215-220`): a session whose request publication is not connected
+        // cannot be told anything.
+        self.client
+            .exclusive_publication(self.archive.proxy().request_publication())
+            .and_then(ExclusivePublication::is_connected)
+            .unwrap_or(false)
+    }
+
+    fn poll_image<F: FnMut(&Fragment<'_>)>(
+        &mut self,
+        session_id: i32,
+        fragment_limit: usize,
+        handler: F,
+    ) -> usize {
+        // The image's **publication** registration id, which is what the
+        // client's own poll takes; the merge names it by session.
+        let Some(registration_id) = self
+            .image_by_session(session_id)
+            .map(Image::registration_id)
+        else {
+            return 0;
+        };
+
+        self.client
+            .poll_image(
+                self.subscription_registration_id,
+                registration_id,
+                fragment_limit,
+                handler,
+            )
+            .unwrap_or(0)
+    }
 }
 
 /// The state machine.
@@ -489,6 +772,14 @@ impl ReplayMerge {
     /// Poll the image the merge is carrying (`:297-301`), which is the merge's
     /// turn followed by the image's own poll — in that order, because the turn
     /// is what decides whether the image is still the right one.
+    ///
+    /// It is also where the **client** is driven, once a turn
+    /// ([`MergePeer::drive_client`]). That is not the reference's shape — its
+    /// `Aeron` has a conductor thread and this build's client has its caller —
+    /// and it is here rather than in [`ReplayMerge::do_work`] so that a merge
+    /// which is over still takes its client's turns: the subscription is live
+    /// from [`State::Merged`] onward and its messages are read through this same
+    /// call.
     pub fn poll<P, F>(
         &mut self,
         peer: &mut P,
@@ -500,6 +791,7 @@ impl ReplayMerge {
         P: MergePeer,
         F: FnMut(&Fragment<'_>),
     {
+        peer.drive_client();
         self.do_work(peer, now_ms);
 
         if !self.image_found {
@@ -828,11 +1120,19 @@ impl ReplayMerge {
             .ok_or(MergeFailure::ImageClosed)
     }
 
-    /// The replay session as the wire carries it: the archive's id is an `i64`
-    /// on the control channel and an `i32` in an image (`:436` does the same
-    /// narrowing).
+    /// The replay session as an **image** is named by, which is the low half of
+    /// the id the archive answers with.
+    ///
+    /// The archive's `relevantId` for a replay is not a session id but a replay
+    /// id over one: `(replayId << 32) | sessionId` (`ReplaySession.java:338`),
+    /// and the reference reaches the image by **truncating** it —
+    /// `subscription.imageBySessionId((int)replaySessionId)`
+    /// (`ReplayMerge.java:436`), `(int32_t)replay_merge->replay_session_id` in
+    /// the C (`:591`). A narrowing that refused an id it did not fit would
+    /// answer with a session no image has and leave the merge waiting in
+    /// `CATCHUP` for a replay that had arrived.
     fn replay_session(&self) -> i32 {
-        i32::try_from(self.replay_session_id).unwrap_or(i32::MAX)
+        self.replay_session_id as i32
     }
 
     /// `:556-561`: a state change drops whatever correlation the previous state
@@ -892,6 +1192,13 @@ mod tests {
         /// The channel each `replay` request was sent on, which is the template
         /// after the merge has finished it.
         replayed: Vec<String>,
+        /// The `relevantId` a replay is answered with, which for a real archive
+        /// is a replay id over a session id.
+        replay_relevant_id: i64,
+        /// Which session each image was asked for.
+        asked_sessions: Vec<i32>,
+        /// How many turns of the client `poll` took.
+        driven: usize,
         /// Set to make every destination command fail, the way a driver that
         /// will not take one answers.
         refuse_destinations: Option<String>,
@@ -917,6 +1224,9 @@ mod tests {
                 live_added: Vec::new(),
                 replay_removed: Vec::new(),
                 replayed: Vec::new(),
+                replay_relevant_id: 99,
+                asked_sessions: Vec::new(),
+                driven: 0,
                 refuse_destinations: None,
                 stopped: Vec::new(),
                 client_closed: false,
@@ -944,7 +1254,13 @@ mod tests {
             self.subscription_connected
         }
 
-        fn image(&mut self, _session_id: i32) -> Option<ImageFacts> {
+        fn drive_client(&mut self) {
+            self.driven += 1;
+        }
+
+        fn image(&mut self, session_id: i32) -> Option<ImageFacts> {
+            self.asked_sessions.push(session_id);
+
             self.image
         }
 
@@ -976,7 +1292,7 @@ mod tests {
             self.replayed.push(channel.to_owned());
 
             if self.answers {
-                self.pending.push((correlation_id, 99));
+                self.pending.push((correlation_id, self.replay_relevant_id));
             }
 
             Ok(true)
@@ -1249,6 +1565,33 @@ mod tests {
             vec!["aeron:udp?linger=0|eos=false|endpoint=localhost:40123"],
             peer.replayed,
             "the template had no endpoint, so the resolved one is taken whole"
+        );
+    }
+
+    /// The image is looked up by the **low half** of what the archive answered
+    /// with, because a replay's `relevantId` is a replay id over a session id.
+    ///
+    /// The two halves are why the reference casts rather than converts
+    /// (`ReplayMerge.java:436`): the id a replay is answered with is
+    /// `(replayId << 32) | sessionId` (`ReplaySession.java:338`), and it is the
+    /// session an image is named by. A merge that refused an id it could not fit
+    /// in an `i32` would look for a session no subscription has and wait in
+    /// `CATCHUP` for a replay that was already arriving.
+    #[test]
+    fn the_image_is_named_by_the_low_half_of_the_replay_id() {
+        let mut merge = merge(MERGE_PROGRESS_TIMEOUT_DEFAULT_MS);
+        let mut peer = FakePeer::new(1024);
+        peer.replay_relevant_id = (1i64 << 32) | 0x1234;
+        let mut now = 0;
+
+        turn_until_state(&mut merge, &mut peer, &mut now, State::Catchup);
+        merge.do_work(&mut peer, now);
+
+        assert_eq!((1i64 << 32) | 0x1234, merge.replay_session_id());
+        assert_eq!(
+            vec![0x1234],
+            peer.asked_sessions,
+            "the image is asked for by the session, not by the replay id"
         );
     }
 

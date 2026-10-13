@@ -907,6 +907,33 @@ impl Archive {
         }
     }
 
+    /// The recording the archive is making of a stream that is **still live**,
+    /// once its position counter has caught up with the publication.
+    ///
+    /// [`Archive::record`] cannot serve a caller that wants the publication to
+    /// go on publishing: it stops the recording and drops the publication it
+    /// made. This is the same wait without either, for a recovery point — a
+    /// replay merge has to know where the recording has got to while the stream
+    /// it is recording keeps running.
+    ///
+    /// # Panics
+    ///
+    /// As [`Archive::record`]: when the counter never catches up.
+    pub fn recording_of_a_live_stream(
+        &mut self,
+        publication: i64,
+        reader: i64,
+        session_id: i32,
+    ) -> i64 {
+        wait_for_the_counter(
+            &mut self.client,
+            publication,
+            reader,
+            session_id,
+            &self.aeron_dir,
+        )
+    }
+
     /// Read every data frame the subscription has, appending them to `frames`.
     pub fn read_frames(&mut self, subscription: i64, frames: &mut Vec<Frame>) {
         read_frames(&mut self.client, subscription, frames);

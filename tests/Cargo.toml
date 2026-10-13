@@ -494,3 +494,7 @@ path = "integration/heartbeat.rs"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "archive_replay_merge"
+path = "integration/archive_replay_merge.rs"
