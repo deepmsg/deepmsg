@@ -69,6 +69,9 @@ pub const PARAM_DELIMITER: char = '|';
 /// (`ChannelUriStringBuilder.TAG_PREFIX`).
 pub const TAG_PREFIX: &str = "tag:";
 
+/// `ChannelUri.ENDPOINT_PARAM_NAME` (`ChannelUri.java:84`).
+const ENDPOINT_PARAM_NAME: &str = "endpoint";
+
 /// Why a URI could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UriError {
@@ -79,6 +82,19 @@ pub enum UriError {
         /// The text that had neither.
         text: String,
     },
+    /// An endpoint offered as a resolved one that carries no port
+    /// (`ChannelUri.java:620-623`).
+    NoPortInResolvedEndpoint {
+        /// The endpoint it was given.
+        resolved_endpoint: String,
+    },
+    /// An endpoint offered as a resolved one whose **own** port is the wildcard
+    /// (`ChannelUri.java:624-627`): a resolver that answers `:0` has resolved
+    /// nothing.
+    WildcardResolvedEndpoint {
+        /// The endpoint it was given.
+        resolved_endpoint: String,
+    },
 }
 
 impl fmt::Display for UriError {
@@ -86,6 +102,18 @@ impl fmt::Display for UriError {
         match self {
             Self::InvalidScheme => write!(f, "not an aeron: channel URI"),
             Self::MissingValue { text } => write!(f, "parameter `{text}` has no value"),
+            Self::NoPortInResolvedEndpoint { resolved_endpoint } => {
+                write!(
+                    f,
+                    "No port specified on resolvedEndpoint={resolved_endpoint}"
+                )
+            }
+            Self::WildcardResolvedEndpoint { resolved_endpoint } => {
+                write!(
+                    f,
+                    "Wildcard port specified on resolvedEndpoint={resolved_endpoint}"
+                )
+            }
         }
     }
 }
@@ -206,6 +234,55 @@ impl ChannelUri {
 
         let at = position.map_or(self.params.len(), |at| at.min(self.params.len()));
         self.params.insert(at, (key.to_owned(), value));
+    }
+
+    /// `ChannelUri.replaceEndpointWildcardPort` (`ChannelUri.java:613-635`).
+    ///
+    /// A wildcard port belongs to the **subscription** that was given it: the
+    /// host stays the channel's own and the port becomes the one that
+    /// subscription resolved. Three cases, and which one applies is the whole
+    /// method:
+    ///
+    /// * no `endpoint` parameter — the resolved endpoint is taken whole;
+    /// * an `endpoint` ending in `:0` — its host, **the resolved port**;
+    /// * an `endpoint` with a port of its own — left exactly as it was.
+    ///
+    /// The third is what an archive replay merge rides on: the replay channel
+    /// is a template, and a port the client named is a port the client meant.
+    ///
+    /// # Errors
+    ///
+    /// [`UriError::NoPortInResolvedEndpoint`] for a resolved endpoint with no
+    /// `:` in it, and [`UriError::WildcardResolvedEndpoint`] for one that ends
+    /// in `:0` — the reference's two `IllegalArgumentException`s (`:620-627`).
+    pub fn replace_endpoint_wildcard_port(
+        &mut self,
+        resolved_endpoint: &str,
+    ) -> Result<(), UriError> {
+        let Some(port) = resolved_endpoint.rfind(':') else {
+            return Err(UriError::NoPortInResolvedEndpoint {
+                resolved_endpoint: resolved_endpoint.to_owned(),
+            });
+        };
+
+        if resolved_endpoint.ends_with(":0") {
+            return Err(UriError::WildcardResolvedEndpoint {
+                resolved_endpoint: resolved_endpoint.to_owned(),
+            });
+        }
+
+        match self.get(ENDPOINT_PARAM_NAME) {
+            None => self.put(ENDPOINT_PARAM_NAME, resolved_endpoint),
+            Some(existing) if existing.ends_with(":0") => {
+                let resolved_port = resolved_endpoint[port..].to_owned();
+                let endpoint = format!("{}{resolved_port}", &existing[..existing.len() - 2]);
+
+                self.put(ENDPOINT_PARAM_NAME, endpoint);
+            }
+            Some(_) => {}
+        }
+
+        Ok(())
     }
 
     /// The URI written back out — as it was read, apart from any
@@ -686,6 +763,78 @@ pub fn format_duration_ns(value_ns: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard port is resolved by the subscription that owns it: the host
+    /// stays the channel's, the port becomes the resolved one
+    /// (`ChannelUri.java:613-635`).
+    #[test]
+    fn a_wildcard_endpoint_port_takes_the_resolved_one() {
+        let mut uri =
+            ChannelUri::parse("aeron:udp?endpoint=localhost:0|term-length=64k").expect("a uri");
+
+        uri.replace_endpoint_wildcard_port("localhost:40123")
+            .expect("a resolved port");
+
+        assert_eq!(Some("localhost:40123"), uri.get("endpoint"));
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:40123|term-length=64k",
+            uri.build()
+        );
+    }
+
+    /// An endpoint that named a port of its own is left exactly as it was — the
+    /// third of the reference's three cases, and the one a replay merge rides on.
+    #[test]
+    fn an_endpoint_with_a_port_of_its_own_is_not_touched() {
+        let mut uri = ChannelUri::parse("aeron:udp?endpoint=localhost:40123").expect("a uri");
+
+        uri.replace_endpoint_wildcard_port("localhost:59999")
+            .expect("a resolved port");
+
+        assert_eq!(Some("localhost:40123"), uri.get("endpoint"));
+    }
+
+    /// A URI that carries no endpoint at all takes the resolved one whole
+    /// (`ChannelUri.java:628-631`).
+    #[test]
+    fn a_uri_with_no_endpoint_takes_the_resolved_one_whole() {
+        let mut uri = ChannelUri::parse("aeron:udp?term-length=64k").expect("a uri");
+
+        uri.replace_endpoint_wildcard_port("localhost:40123")
+            .expect("a resolved port");
+
+        assert_eq!(Some("localhost:40123"), uri.get("endpoint"));
+        assert_eq!(
+            "aeron:udp?term-length=64k|endpoint=localhost:40123",
+            uri.build()
+        );
+    }
+
+    /// The two resolved endpoints the reference refuses (`ChannelUri.java:620-627`):
+    /// one with no port at all, and one whose own port is the wildcard — a
+    /// resolver that answers `:0` has resolved nothing.
+    #[test]
+    fn a_resolved_endpoint_must_carry_a_port_that_is_not_a_wildcard() {
+        let mut uri = ChannelUri::parse("aeron:udp?endpoint=localhost:0").expect("a uri");
+
+        assert_eq!(
+            Err(UriError::NoPortInResolvedEndpoint {
+                resolved_endpoint: "localhost".to_owned(),
+            }),
+            uri.replace_endpoint_wildcard_port("localhost")
+        );
+        assert_eq!(
+            Err(UriError::WildcardResolvedEndpoint {
+                resolved_endpoint: "localhost:0".to_owned(),
+            }),
+            uri.replace_endpoint_wildcard_port("localhost:0")
+        );
+        assert_eq!(
+            Some("localhost:0"),
+            uri.get("endpoint"),
+            "and neither refusal changed anything"
+        );
+    }
 
     #[test]
     fn a_udp_uri_reads_its_media_and_its_parameters() {
