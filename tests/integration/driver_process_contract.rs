@@ -24,7 +24,10 @@
 //!    **code** — a library to load, a symbol to call — stop the driver, because
 //!    it has heard of them and cannot do what they ask (ADR-0002), and the
 //!    reference would not start over an unloadable one either. See
-//!    [`the_settings_that_name_code_stop_the_driver_with_a_reason`].
+//!    [`the_settings_that_name_code_stop_the_driver_with_a_reason`]. The names
+//!    the reference resolves against a table it compiles in, and `dlsym`s only
+//!    when the table misses — the transport bindings among them — are in the
+//!    same position for a value outside that table, and are in the same test.
 //! 3. **stderr is empty on a clean run.** Every test not annotated
 //!    `@IgnoreStdErr` asserts the driver's stderr file is zero bytes long
 //!    (`MediaDriverTestUtil.java:128-132`, from `:95-99`), so one diagnostic
@@ -191,6 +194,16 @@ const READ: &[(&str, &str)] = &[
     ("AERON_UNTETHERED_LINGER_TIMEOUT", "2s"),
     ("AERON_UNTETHERED_RESTING_TIMEOUT", "2s"),
     ("AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT", "2s"),
+    // The transport bindings, both halves. The harness does not send them —
+    // only the C driver reads them, and only from the environment
+    // (`aeron_driver_context.c:1258-1270`) — but a deployment copying a C
+    // configuration might, and `default` is the one name both drivers serve,
+    // under either of its two spellings.
+    ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "default"),
+    (
+        "AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
+        "aeron_udp_channel_transport_bindings_default",
+    ),
 ];
 
 /// The variables the harness can send **that this driver does not read**, at
@@ -681,6 +694,15 @@ fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
         (
             "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
             "aeron_transport_security_channel_interceptor_load",
+        ),
+        // A transport bindings name outside the one-entry table the reference
+        // compiles in is a name it `dlsym`s, and its context init fails when
+        // that finds nothing (`aeron_symbol_table.c:80-92`). This build has the
+        // table and not the `dlsym`.
+        ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk"),
+        (
+            "AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
+            "aeron_udp_channel_transport_bindings_dpdk",
         ),
     ] {
         let Some(mut fixture) = Fixture::start("refused-code", &[(name, value)]) else {

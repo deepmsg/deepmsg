@@ -417,6 +417,30 @@ another name for allow, by
 which starts this driver with each spelling and sends it the harness's own
 `TERMINATE_DRIVER`.
 
+**The two transport bindings settings are read, and serve the one name the
+reference's table holds.** `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` picks
+the implementation the UDP data paths run on, and
+`AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` the one the conductor's
+name resolver runs on (`aeronmd.h:731,736`; `aeron_driver_context.c:1258-1270`).
+Both are environment-only in the reference, and both resolve against a table it
+compiles in with one entry — `default`, whose symbol is
+`aeron_udp_channel_transport_bindings_default`
+(`media/aeron_udp_channel_transport_bindings.c:59-66`) — under either spelling
+(`aeron-client/src/main/c/util/aeron_symbol_table.c:48-49`). A name the table
+misses is `dlsym`ed (`:80-86`), which is how a bindings object linked into the
+same executable is found, and when that misses too the context init fails
+(`:88-92`). This build serves both spellings of `default` and refuses every
+other name with `ConfigError::UnknownTransportBindings`: the table is the same,
+the `dlsym` is the part ADR-0002 rules out. Until this was bound, both names
+were ignored — which made a driver asked for a media it does not have run on the
+kernel's sockets without saying so. Pinned by
+`crates/driver/src/config.rs::the_transport_bindings_names_serve_default_and_refuse_the_rest`
+and, in the process, by
+`tests/integration/driver_process_contract.rs::every_variable_the_reference_harness_can_send_is_accepted`
+(`default`, both spellings) and
+`::the_settings_that_name_code_stop_the_driver_with_a_reason` (a name outside
+the table).
+
 ## The event log
 
 `AERON_EVENT_LOG` and the three names beside it are **accepted and ignored**:

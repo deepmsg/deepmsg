@@ -1309,6 +1309,15 @@ impl DriverConfig {
             }
         }
 
+        for setting in [
+            Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
+            Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
+        ] {
+            if let Some(value) = get(&setting) {
+                check_transport_bindings(&setting, &value)?;
+            }
+        }
+
         if let Some(value) = get(&Setting::LOSS_REPORT_BUFFER_LENGTH) {
             config.loss_report_buffer_length =
                 i64::try_from(parse_size64(&Setting::LOSS_REPORT_BUFFER_LENGTH, &value)?).map_err(
@@ -2269,6 +2278,22 @@ impl Setting {
         property: "agent.on.start.function",
         env: "AERON_AGENT_ON_START_FUNCTION",
     };
+    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`): which
+    /// implementation of the transport bindings the driver's UDP data paths
+    /// run on (`aeron_driver_context.c:1258-1263`). See
+    /// [`check_transport_bindings`].
+    const UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA: Self = Self {
+        property: "udp.channel.transport.bindings.media",
+        env: "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
+    };
+    /// `AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:736`):
+    /// the same choice for the conductor's own transports, which only the name
+    /// resolver opens (`aeron_driver_context.c:1266-1270`,
+    /// `aeron_driver_name_resolver.c:399`).
+    const CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA: Self = Self {
+        property: "conductor.udp.channel.transport.bindings.media",
+        env: "AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
+    };
     /// `aeron.loss.report.buffer.length` (`aeronmd.h:385`).
     const LOSS_REPORT_BUFFER_LENGTH: Self = Self {
         property: "loss.report.buffer.length",
@@ -2596,6 +2621,15 @@ pub enum ConfigError {
         /// What it was set to.
         value: String,
     },
+    /// A transport bindings name this build does not hold, which for the
+    /// reference is a driver that does not start
+    /// (`aeron_driver_context.c:1258-1270` is a `goto error`).
+    UnknownTransportBindings {
+        /// The setting, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+    },
     /// An interface was named for the driver's own resolver without a name for
     /// the driver to answer to, which the reference refuses
     /// (`aeron_driver_context.c:601-608`).
@@ -2669,6 +2703,13 @@ impl std::fmt::Display for ConfigError {
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
+            Self::UnknownTransportBindings { name, value } => write!(
+                f,
+                "{name} is {value}: could not find udp channel bindings object {value}. \
+                 This build holds one, `default` (the kernel's sockets), and looks no \
+                 other name up — the reference falls back to `dlsym`, and this build \
+                 loads no code (ADR-0002)"
+            ),
             Self::DynamicLoadingNotSupported { property } => write!(
                 f,
                 "{property} names code for this driver to load, and this build loads none: \
@@ -2717,6 +2758,7 @@ impl std::error::Error for ConfigError {
             | Self::NotANumber { .. }
             | Self::OutOfRange { .. }
             | Self::UnknownSupplier { .. }
+            | Self::UnknownTransportBindings { .. }
             | Self::ResolverNameRequired
             | Self::UnknownValidator { .. }
             | Self::UnknownThreadingMode { .. }
@@ -2911,6 +2953,35 @@ fn parse_supplier(setting: &Setting, value: &str) -> Result<Supplier, ConfigErro
         name: setting.property,
         value: value.to_owned(),
     })
+}
+
+/// Check a transport bindings name against the one table this build holds.
+///
+/// The reference scans a table it compiles in, under either the alias or the
+/// symbol each entry carries (`aeron_symbol_table.c:48-49`), and that table
+/// holds one entry: `default`, whose symbol is
+/// `aeron_udp_channel_transport_bindings_default`
+/// (`media/aeron_udp_channel_transport_bindings.c:59-66`). Only after that does
+/// it `dlsym` the name (`aeron_symbol_table.c:80-86`), which is how a bindings
+/// object linked into the same executable is found; when that fails too, its
+/// context init fails (`:88-92`). This build serves both spellings of the one
+/// entry and refuses everything else, because the `dlsym` step is loading code
+/// (ADR-0002).
+///
+/// Both settings are checked the same way: the conductor's has no other value
+/// in the reference's table either.
+///
+/// # Errors
+///
+/// [`ConfigError::UnknownTransportBindings`] for any other name.
+fn check_transport_bindings(setting: &Setting, value: &str) -> Result<(), ConfigError> {
+    match value {
+        "default" | "aeron_udp_channel_transport_bindings_default" => Ok(()),
+        other => Err(ConfigError::UnknownTransportBindings {
+            name: setting.property,
+            value: other.to_owned(),
+        }),
+    }
 }
 
 /// The congestion-control supplier a property names
@@ -4185,6 +4256,40 @@ mod tests {
     /// The two supplier settings name the reference's **symbols**, and a name
     /// its table does not hold is a driver that does not start
     /// (`aeron_driver_context.c:563-580`).
+    #[test]
+    fn the_transport_bindings_names_serve_default_and_refuse_the_rest() {
+        for property in [
+            "aeron.udp.channel.transport.bindings.media",
+            "aeron.conductor.udp.channel.transport.bindings.media",
+        ] {
+            // The table's one entry, under both of the names its scan takes
+            // (`aeron_symbol_table.c:48-49`).
+            for name in ["default", "aeron_udp_channel_transport_bindings_default"] {
+                resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, name)])
+                    .unwrap_or_else(|error| panic!("{property}={name} is served: {error}"));
+            }
+
+            // Anything else is what the reference would `dlsym`, and this
+            // build does not.
+            for name in [
+                "dpdk",
+                "aeron_udp_channel_transport_bindings_dpdk",
+                "Default",
+            ] {
+                match resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, name)]) {
+                    Err(ConfigError::UnknownTransportBindings {
+                        name: setting,
+                        value,
+                    }) => {
+                        assert_eq!(property.strip_prefix("aeron.").unwrap(), setting);
+                        assert_eq!(name, value);
+                    }
+                    other => panic!("{property}={name} must be refused, got {other:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_flow_control_supplier_is_named_by_its_the_references_symbol() {
         let config = resolve(&[
