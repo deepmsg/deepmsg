@@ -90,6 +90,16 @@ impl Datagrams {
         self.count == 0
     }
 
+    /// Empty the batch.
+    ///
+    /// A batch is the caller's, reused across passes: the kernel's own writer
+    /// assigns the count it filled on every call
+    /// ([`DatagramSocket::receive_batch`]), and a transport that composes its
+    /// own descriptions has to say the same thing the same way.
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
     /// Record one more datagram, which is what a transport with no kernel
     /// behind it has to do for itself: the kernel's own writer is
     /// [`DatagramSocket::receive_batch`], and a transport that reads frames

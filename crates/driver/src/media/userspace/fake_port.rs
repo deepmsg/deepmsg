@@ -196,6 +196,24 @@ impl Wire {
         }
     }
 
+    /// Put a frame on the wire from `side`, as a port on it would — the
+    /// injection and all, because it is the same path.
+    ///
+    /// For a test that has something to say to a stack without wanting to be a
+    /// stack: the far end of a capture, an ARP request from a peer that does
+    /// not exist here, a frame that is deliberately wrong.
+    pub fn send(&self, side: Side, frame: &[u8]) {
+        self.enqueue(side, frame.to_vec().into_boxed_slice());
+    }
+
+    /// Take up to `max` frames that crossed into `side`, in order.
+    ///
+    /// The wire as a wire, for reading what a stack sent without a port to
+    /// read it through.
+    pub fn take(&self, side: Side, max: usize) -> Vec<Box<[u8]>> {
+        std::iter::from_fn(|| self.pop(side)).take(max).collect()
+    }
+
     /// The next frame crossing into `side`, if any.
     fn pop(&self, side: Side) -> Option<Box<[u8]>> {
         self.state.lock().expect("the wire").queues[side.other().index()].pop_front()

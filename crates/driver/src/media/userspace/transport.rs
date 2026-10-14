@@ -253,6 +253,11 @@ impl Transport for UserspaceTransport {
     }
 
     fn receive(&mut self, buffers: &mut [Vec<u8>], datagrams: &mut Datagrams) -> io::Result<usize> {
+        // The batch belongs to the caller and is reused across passes, so it
+        // starts empty here — which is what the kernel's own writer does by
+        // assigning the count it filled.
+        datagrams.clear();
+
         let mut received = 0;
 
         while received < buffers.len().min(MAX_BATCH) {
