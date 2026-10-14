@@ -60,6 +60,48 @@ pub enum TransportBindings {
     Userspace(Arc<Stack>),
 }
 
+/// What a media can answer about the addresses it holds.
+///
+/// The kernel's interface list is the only thing that knows which addresses a
+/// machine has — except for a media whose port the driver drives itself
+/// (design §4.9, Q1a). A NIC bound to vfio is not in that list at all, and a
+/// port opened through `net_af_packet` is one the kernel sees and whose frames
+/// this driver's own stack is the one answering for. So a channel that names
+/// an `interface=` asks the media first, and what the media does not hold falls
+/// through to `getifaddrs`.
+///
+/// A trait rather than a method on the bindings, and answered by the **stack**
+/// rather than by the bindings themselves, which is the D4 plan's P-D4-4: what
+/// `udp_channel` wants to know is "does the thing the driver runs on hold this
+/// address", and a driver that later has its conductor resolve names through a
+/// second media asks the same question of it.
+pub trait InterfaceSource {
+    /// The interface holding `address` under `prefix_length`, when this media
+    /// is the one that holds it.
+    fn interface_for(
+        &self,
+        family: crate::sys::AddressFamily,
+        address: std::net::IpAddr,
+        prefix_length: u8,
+    ) -> Option<crate::sys::LocalInterface>;
+}
+
+impl InterfaceSource for TransportBindings {
+    fn interface_for(
+        &self,
+        family: crate::sys::AddressFamily,
+        address: std::net::IpAddr,
+        prefix_length: u8,
+    ) -> Option<crate::sys::LocalInterface> {
+        match self {
+            // The kernel's sockets hold nothing the kernel does not have: the
+            // fallback *is* this media.
+            Self::Default => None,
+            Self::Userspace(stack) => stack.owns(family, address, prefix_length),
+        }
+    }
+}
+
 impl std::fmt::Debug for TransportBindings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -162,5 +204,63 @@ impl TransportBindings {
                 MediaPoller::Userspace(ThreadQueues::new(stack.clone(), affinity))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::userspace::fake_port::{Side, Wire};
+    use crate::media::userspace::stack::{Clock, StackParams};
+    use crate::sys::AddressFamily;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// The bindings answer what the media they name holds — and the kernel's
+    /// bindings hold nothing of their own, because the kernel *is* the
+    /// fallback.
+    ///
+    /// This is the D4 plan's P-D4-4: the question is the stack's, and
+    /// `TransportBindings` only forwards it, so that a driver asks its media
+    /// once and the answer it gets is the media's own.
+    #[test]
+    fn the_bindings_answer_with_the_medias_own_addresses() {
+        let wire = Wire::new();
+        let own = Ipv4Addr::new(10, 10, 0, 1);
+        let stack = Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams::new(own, 24, [0x02, 0, 0, 0, 0, 0x01]),
+            Clock::Monotonic,
+        );
+
+        assert_eq!(
+            None,
+            TransportBindings::Default.interface_for(
+                AddressFamily::Inet,
+                IpAddr::V4(Ipv4Addr::new(10, 10, 0, 1)),
+                24
+            ),
+            "the kernel's own bindings have nothing the kernel does not have"
+        );
+
+        let userspace = TransportBindings::Userspace(stack);
+        let held = userspace
+            .interface_for(
+                AddressFamily::Inet,
+                IpAddr::V4(Ipv4Addr::new(10, 10, 0, 9)),
+                24,
+            )
+            .expect("the stack holds its own prefix");
+        assert_eq!(IpAddr::V4(own), held.address);
+
+        assert_eq!(
+            None,
+            userspace.interface_for(
+                AddressFamily::Inet,
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                24
+            ),
+            "and nothing else, so that the kernel still answers for the rest"
+        );
     }
 }

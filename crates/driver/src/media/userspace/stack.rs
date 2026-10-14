@@ -401,6 +401,15 @@ impl ThreadQueues {
     }
 }
 
+/// The interface index a userspace port reports.
+///
+/// An index is what `IP_MULTICAST_IF` and a group join take, and this media
+/// serves no multicast at all (§4.11) — so the number never reaches the kernel
+/// and what it is has no consequence. It is **nonzero** because zero is what
+/// the kernel's own lookups answer for "no such interface", and a caller that
+/// did use it should not read as a failed lookup.
+pub const PORT_INTERFACE_INDEX: u32 = 1;
+
 /// One machine's userspace stack.
 ///
 /// Not `Debug`: its ports are trait objects, and there is nothing useful to
@@ -503,6 +512,46 @@ impl Stack {
     /// What this stack was configured with.
     pub const fn params(&self) -> &StackParams {
         &self.params
+    }
+
+    /// The interface this stack holds `address` on, when it is this stack that
+    /// holds it (`design.md` §4.9, Q1a).
+    ///
+    /// The kernel's interface list is the only thing that knows which addresses
+    /// a machine has — except for a media that drives its own port. A NIC bound
+    /// to vfio is **not in that list at all** (D0: the port is gone from the
+    /// kernel the moment it is bound), and a port this driver opened is one
+    /// whose address the stack answers ARP for. So the question goes here
+    /// first, and what this stack does not hold falls through to the kernel
+    /// ([`crate::media::InterfaceSource`]).
+    ///
+    /// The answer is this port's own address rather than the one asked about,
+    /// which is what the kernel's own lookup does: `interface=` names a
+    /// *prefix* to match against an interface, and the address that comes back
+    /// is the interface's (`aeron_ip_lookup_func`,
+    /// `aeron-client/src/main/c/util/aeron_netutil.c:479-517`).
+    ///
+    /// The media is IPv4-only (§4.11 refuses IPv6 at the channel), so a v6
+    /// question is one this stack never answers.
+    pub fn owns(
+        &self,
+        family: crate::sys::AddressFamily,
+        address: std::net::IpAddr,
+        prefix_length: u8,
+    ) -> Option<crate::sys::LocalInterface> {
+        if family != crate::sys::AddressFamily::Inet {
+            return None;
+        }
+        let std::net::IpAddr::V4(address) = address else {
+            return None;
+        };
+
+        neighbour::on_the_same_link(self.params.address, address, prefix_length).then_some(
+            crate::sys::LocalInterface {
+                address: std::net::IpAddr::V4(self.params.address),
+                index: PORT_INTERFACE_INDEX,
+            },
+        )
     }
 
     /// What it has counted.
@@ -762,12 +811,44 @@ mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Injection};
     use crate::media::userspace::frame::Received;
+    use crate::sys::AddressFamily;
+    use std::net::IpAddr;
 
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
 
     fn params() -> StackParams {
         StackParams::new(OWN, 24, [0x02, 0, 0, 0, 0, 0x01])
+    }
+
+    /// What a port this stack drives holds, which is what a channel's
+    /// `interface=` is answered from (design §4.9, Q1a).
+    ///
+    /// The answer is the port's **own** address rather than the one asked
+    /// about, which is what the kernel's lookup does too: `interface=` names a
+    /// prefix to match, and the address that comes back is the interface's.
+    #[test]
+    fn a_stack_holds_its_own_prefix_and_nothing_else() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let ipv4 = |octets: [u8; 4]| IpAddr::V4(std::net::Ipv4Addr::from(octets));
+
+        let own = stack
+            .owns(AddressFamily::Inet, ipv4([10, 10, 0, 7]), 24)
+            .expect("the port's prefix is the port's");
+        assert_eq!(ipv4([10, 10, 0, 1]), own.address, "the port's own address");
+        assert_eq!(PORT_INTERFACE_INDEX, own.index);
+
+        assert_eq!(
+            None,
+            stack.owns(AddressFamily::Inet, ipv4([10, 10, 1, 7]), 24),
+            "off this link is not this stack's"
+        );
+        assert_eq!(
+            None,
+            stack.owns(AddressFamily::Inet6, ipv4([10, 10, 0, 7]), 24),
+            "and the media is IPv4-only (§4.11 refuses IPv6 at the channel)"
+        );
     }
 
     fn stack(wire: &Wire) -> Arc<Stack> {

@@ -154,6 +154,10 @@ pub struct AgentResolver {
     /// the allocator is built from — it never allocates, so the view only has
     /// to agree about where an id's value lives.
     free_to_reuse_timeout_ms: i64,
+    /// The media the driver's data paths run on, which is what a channel's
+    /// `interface=` is resolved against before the kernel is asked (design
+    /// §4.9, Q1a): a port this driver drives is one the kernel may not have.
+    bindings: crate::media::TransportBindings,
     /// How long every resolution is held before it is answered
     /// (`debug.resolver.delay.millis`): zero on every driver but a test's, and
     /// what it stands in for is a nameserver that does not answer.
@@ -165,6 +169,7 @@ impl AgentResolver {
     /// agent thread needs to run it.
     pub fn new(
         resolver: Box<dyn Resolver + Send>,
+        bindings: crate::media::TransportBindings,
         cnc: Arc<CncFile>,
         threshold_ns: i64,
         free_to_reuse_timeout_ms: i64,
@@ -172,6 +177,7 @@ impl AgentResolver {
     ) -> Self {
         Self {
             resolver,
+            bindings,
             cnc,
             threshold_ns,
             free_to_reuse_timeout_ms,
@@ -887,6 +893,7 @@ impl AgentLoop {
                     (
                         Some(AgentResolver {
                             resolver,
+                            bindings,
                             cnc,
                             threshold_ns,
                             ..
@@ -899,6 +906,7 @@ impl AgentLoop {
                         Some(regions) if send_destination => {
                             crate::udp_channel::parse_send_destination_with(
                                 &mut **resolver,
+                                Some(bindings as &dyn crate::media::InterfaceSource),
                                 counters,
                                 &regions,
                                 *threshold_ns,
@@ -911,6 +919,7 @@ impl AgentLoop {
                         }
                         Some(regions) => crate::udp_channel::parse_channel_with(
                             &mut **resolver,
+                            Some(bindings as &dyn crate::media::InterfaceSource),
                             counters,
                             &regions,
                             *threshold_ns,

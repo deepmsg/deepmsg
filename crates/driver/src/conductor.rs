@@ -926,6 +926,9 @@ impl Conductor {
         agent_handle
             .attach_resolver(crate::native_resource_agent::AgentResolver::new(
                 resolver,
+                // The media the driver's data paths run on: what a channel's
+                // `interface=` is asked of before the kernel (§4.9, Q1a).
+                config.transport_bindings.clone(),
                 Arc::clone(&cnc),
                 config.name_resolver_threshold_ns,
                 free_to_reuse_ms(config.counter_free_to_reuse_ns),

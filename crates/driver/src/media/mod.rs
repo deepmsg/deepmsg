@@ -49,7 +49,7 @@ pub mod udp_transport;
 pub mod userspace;
 
 pub use crate::sys::socket::Datagrams;
-pub use bindings::{Affinity, TransportBindings};
+pub use bindings::{Affinity, InterfaceSource, TransportBindings};
 pub use loss_generator::{EveryNthDatagram, LossGenerator};
 pub use send_endpoint::SendChannelEndpoint;
 pub use udp_transport::UdpTransport;

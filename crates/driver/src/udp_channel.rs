@@ -66,6 +66,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::channel_uri::{ChannelUri, Transport, UriError};
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
+use crate::media::InterfaceSource;
 use crate::name_resolver::{Resolution, Resolver};
 use crate::sys::{self, AddressFamily};
 
@@ -321,7 +322,13 @@ impl UdpChannel {
     /// [`UdpChannelError`] for a URI this build cannot serve, a channel the
     /// reference refuses, or an address that does not resolve.
     pub fn resolve(original_uri: &[u8], uri: &ChannelUri<'_>) -> Result<Self, UdpChannelError> {
-        Self::resolve_with(&mut Names::System, Unresolved::Refuse, original_uri, uri)
+        Self::resolve_with(
+            &mut Names::System,
+            None,
+            Unresolved::Refuse,
+            original_uri,
+            uri,
+        )
     }
 
     /// [`UdpChannel::resolve`] with the resolver the driver built, which is
@@ -334,6 +341,7 @@ impl UdpChannel {
     /// The same ones, plus whatever the resolver refuses.
     pub fn resolve_with(
         names: &mut Names<'_>,
+        interfaces: Option<&dyn InterfaceSource>,
         unresolved: Unresolved,
         original_uri: &[u8],
         uri: &ChannelUri<'_>,
@@ -409,7 +417,8 @@ impl UdpChannel {
         // tag stops mattering, because the canonical form below is built with
         // neither a tag nor a unique suffix.
         if is_multicast(endpoint_addr.ip()) {
-            let (local, interface_index) = interface.resolve_multicast(endpoint_addr.ip())?;
+            let (local, interface_index) =
+                interface.resolve_multicast(interfaces, endpoint_addr.ip())?;
 
             return Ok(Self {
                 original_uri: original_uri.to_vec(),
@@ -441,7 +450,7 @@ impl UdpChannel {
             || (endpoint.is_some() && endpoint_addr.port() == 0)
             || explicit_control_addr.is_some_and(|addr| addr.port() == 0);
 
-        let (local, interface_index) = interface.resolve(endpoint_addr.ip())?;
+        let (local, interface_index) = interface.resolve(interfaces, endpoint_addr.ip())?;
 
         let (local_data, local_control, has_explicit_control, canonical_form) =
             match (control, explicit_control_addr) {
@@ -1013,7 +1022,11 @@ impl InterfaceSpec {
     ///
     /// [`UdpChannelError::Resolution`] when a named interface has no address,
     /// or an address is not one this host holds.
-    fn resolve(&self, remote: IpAddr) -> Result<(SocketAddr, u32), UdpChannelError> {
+    fn resolve(
+        &self,
+        interfaces: Option<&dyn InterfaceSource>,
+        remote: IpAddr,
+    ) -> Result<(SocketAddr, u32), UdpChannelError> {
         let family = AddressFamily::of(remote);
 
         match self {
@@ -1033,7 +1046,7 @@ impl InterfaceSpec {
                     return Ok((SocketAddr::new(*address, *port), 0));
                 }
 
-                Self::resolve_by_address(family, *address, *prefix_length, *port)
+                Self::resolve_by_address(interfaces, family, *address, *prefix_length, *port)
             }
         }
     }
@@ -1056,7 +1069,11 @@ impl InterfaceSpec {
     ///
     /// As [`Self::resolve`], plus the empty host case: this host has no
     /// interface to join on.
-    fn resolve_multicast(&self, remote: IpAddr) -> Result<(SocketAddr, u32), UdpChannelError> {
+    fn resolve_multicast(
+        &self,
+        interfaces: Option<&dyn InterfaceSource>,
+        remote: IpAddr,
+    ) -> Result<(SocketAddr, u32), UdpChannelError> {
         let family = AddressFamily::of(remote);
 
         match self {
@@ -1066,11 +1083,11 @@ impl InterfaceSpec {
                 address,
                 prefix_length,
                 port,
-            } => Self::resolve_by_address(family, *address, *prefix_length, *port),
+            } => Self::resolve_by_address(interfaces, family, *address, *prefix_length, *port),
 
             Self::Wildcard => {
                 let wildcard = wildcard_socket(family);
-                Self::resolve_by_address(family, wildcard.ip(), 0, wildcard.port())
+                Self::resolve_by_address(interfaces, family, wildcard.ip(), 0, wildcard.port())
             }
         }
     }
@@ -1105,15 +1122,26 @@ impl InterfaceSpec {
     ///
     /// [`UdpChannelError::Resolution`] when no interface on this host matches.
     fn resolve_by_address(
+        interfaces: Option<&dyn InterfaceSource>,
         family: AddressFamily,
         address: IpAddr,
         prefix_length: u8,
         port: u16,
     ) -> Result<(SocketAddr, u32), UdpChannelError> {
-        let found =
-            sys::interface_for_address(family, address, prefix_length).map_err(|error| {
-                UdpChannelError::Resolution(format!("interface {address}: {error}"))
-            })?;
+        // The media first, the kernel second: a port this driver drives is one
+        // the kernel may not have at all, and where it does have one the
+        // address belongs to the frames the media's stack answers for
+        // ([`InterfaceSource`]).
+        let found = match interfaces
+            .and_then(|interfaces| interfaces.interface_for(family, address, prefix_length))
+        {
+            Some(interface) => Some(interface),
+            None => {
+                sys::interface_for_address(family, address, prefix_length).map_err(|error| {
+                    UdpChannelError::Resolution(format!("interface {address}: {error}"))
+                })?
+            }
+        };
 
         let interface = found.ok_or_else(|| {
             UdpChannelError::Resolution(format!("could not find matching interface='{address}'"))
@@ -1379,6 +1407,7 @@ pub fn resolve_host_and_port_with(
 /// answers the client with when the command comes back.
 pub fn parse_channel_with(
     resolver: &mut dyn Resolver,
+    interfaces: Option<&dyn InterfaceSource>,
     counters: &CounterManager,
     regions: &CounterRegions<'_>,
     threshold_ns: i64,
@@ -1394,6 +1423,7 @@ pub fn parse_channel_with(
             regions,
             threshold_ns,
         },
+        interfaces,
         unresolved,
         original_uri,
         &uri,
@@ -1418,6 +1448,7 @@ pub fn parse_channel_with(
 /// destination may not name.
 pub fn parse_send_destination_with(
     resolver: &mut dyn Resolver,
+    interfaces: Option<&dyn InterfaceSource>,
     counters: &CounterManager,
     regions: &CounterRegions<'_>,
     threshold_ns: i64,
@@ -1447,6 +1478,7 @@ pub fn parse_send_destination_with(
             regions,
             threshold_ns,
         },
+        interfaces,
         Unresolved::Keep,
         original_uri,
         &uri,
@@ -1778,6 +1810,87 @@ mod tests {
         text.parse().expect("an address")
     }
 
+    /// A media that holds one address and nothing else — the shape a port this
+    /// driver drives has, from the channel's point of view.
+    struct Holds(Ipv4Addr, u32);
+
+    impl InterfaceSource for Holds {
+        fn interface_for(
+            &self,
+            family: AddressFamily,
+            address: IpAddr,
+            prefix_length: u8,
+        ) -> Option<sys::LocalInterface> {
+            let IpAddr::V4(address) = address else {
+                return None;
+            };
+
+            (family == AddressFamily::Inet
+                && crate::media::userspace::neighbour::on_the_same_link(
+                    self.0,
+                    address,
+                    prefix_length,
+                ))
+            .then_some(sys::LocalInterface {
+                address: IpAddr::V4(self.0),
+                index: self.1,
+            })
+        }
+    }
+
+    /// A channel's `interface=` is the media's to answer before the kernel's.
+    ///
+    /// This is what makes a port the driver drives usable at all: its address
+    /// is not in the kernel's interface list — a NIC bound to vfio is not in
+    /// it at all (D0) — so without this a channel naming it is refused where
+    /// the frames would have gone exactly where it says.
+    #[test]
+    fn an_interface_the_media_holds_is_the_medias_to_answer() {
+        let uri = b"aeron:udp?endpoint=10.10.0.2:40123|interface=10.10.0.9/24";
+        let parsed = ChannelUri::parse(uri).expect("a URI");
+        let media = Holds(Ipv4Addr::new(10, 10, 0, 9), 7);
+
+        let channel = UdpChannel::resolve_with(
+            &mut Names::System,
+            Some(&media),
+            Unresolved::Refuse,
+            uri,
+            &parsed,
+        )
+        .expect("the media holds that address");
+        // Port zero, because the `interface=` names none: a channel that
+        // names an interface and no port on it binds an ephemeral one, which
+        // is what the kernel path does with `interface=eth0` too.
+        assert_eq!(ipv4("10.10.0.9:0"), channel.local_data);
+        assert_eq!(
+            7, channel.interface_index,
+            "and the media's index comes with it"
+        );
+
+        // The same channel with no media to ask is the kernel's to refuse: no
+        // interface on a machine this test runs on holds 10.10.0.9/24, and a
+        // kernel that answered anyway would make this case prove nothing.
+        assert!(
+            UdpChannel::resolve_with(&mut Names::System, None, Unresolved::Refuse, uri, &parsed)
+                .is_err(),
+            "the kernel does not have that address"
+        );
+
+        // And a media that holds something else does not answer for it either:
+        // what falls through to the kernel is what the media does not hold.
+        let elsewhere = Holds(Ipv4Addr::new(192, 168, 1, 1), 8);
+        assert!(
+            UdpChannel::resolve_with(
+                &mut Names::System,
+                Some(&elsewhere),
+                Unresolved::Refuse,
+                uri,
+                &parsed
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn an_endpoint_is_where_a_subscription_listens_and_a_publication_sends() {
         let channel = resolve("aeron:udp?endpoint=127.0.0.1:40123");
@@ -1994,12 +2107,14 @@ mod tests {
         let parsed = ChannelUri::parse(uri).expect("a URI");
 
         assert!(
-            UdpChannel::resolve_with(&mut Names::System, Unresolved::Refuse, uri, &parsed).is_err(),
+            UdpChannel::resolve_with(&mut Names::System, None, Unresolved::Refuse, uri, &parsed)
+                .is_err(),
             "the default is a refusal"
         );
 
-        let kept = UdpChannel::resolve_with(&mut Names::System, Unresolved::Keep, uri, &parsed)
-            .expect("a channel that is kept");
+        let kept =
+            UdpChannel::resolve_with(&mut Names::System, None, Unresolved::Keep, uri, &parsed)
+                .expect("a channel that is kept");
 
         assert_eq!(
             "0.0.0.0:40456".parse::<SocketAddr>().expect("an address"),
@@ -2065,7 +2180,7 @@ mod tests {
         let parsed = ChannelUri::parse(uri).expect("a URI");
 
         // Refused: its own variant, and the code the client is told.
-        let refused = UdpChannel::resolve_with(&mut names, Unresolved::Refuse, uri, &parsed)
+        let refused = UdpChannel::resolve_with(&mut names, None, Unresolved::Refuse, uri, &parsed)
             .expect_err("a name the resolver refused is not a channel");
         assert!(
             matches!(refused, UdpChannelError::UnknownHost(_)),
@@ -2078,7 +2193,7 @@ mod tests {
 
         // Kept: the wildcard where the address would be, the port it named,
         // and the name for the re-resolution that follows.
-        let kept = UdpChannel::resolve_with(&mut names, Unresolved::Keep, uri, &parsed)
+        let kept = UdpChannel::resolve_with(&mut names, None, Unresolved::Keep, uri, &parsed)
             .expect("a destination that is kept");
         assert_eq!(
             "0.0.0.0:24326".parse::<SocketAddr>().expect("an address"),
@@ -2612,6 +2727,7 @@ mod tests {
                 // measurement's own and not a race with a clock.
                 threshold_ns: 0,
             },
+            None,
             Unresolved::Refuse,
             uri,
             &parsed,
@@ -2643,6 +2759,7 @@ mod tests {
                 // measurement's own and not a race with a clock.
                 threshold_ns: 0,
             },
+            None,
             Unresolved::Refuse,
             uri,
             &parsed,
