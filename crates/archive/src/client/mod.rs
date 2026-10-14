@@ -38,6 +38,7 @@ pub mod archive;
 pub mod async_connect;
 pub mod context;
 pub mod descriptor_poller;
+pub mod persistent_subscription;
 pub mod poller;
 pub mod proxy;
 pub mod replay_merge;
@@ -50,6 +51,14 @@ pub use async_connect::{
 pub use context::{ArchiveContext, ClientError, ConcludeError, ControlChannels};
 pub use descriptor_poller::{
     RecordingDescriptor, RecordingDescriptorConsumer, RecordingDescriptorPoller,
+};
+// This layer's `ConcludeError` and `Concluded` are the *archive context*'s
+// (`context.rs`); a persistent subscription's are its own and are named for it,
+// the way `archive_to_client_error_code` is.
+pub use persistent_subscription::{
+    ConcludeError as PersistentSubscriptionConcludeError,
+    Concluded as PersistentSubscriptionConcluded, FROM_LIVE as PERSISTENT_SUBSCRIPTION_FROM_LIVE,
+    FROM_START as PERSISTENT_SUBSCRIPTION_FROM_START, PersistentSubscriptionContext,
 };
 pub use poller::{ControlResponseError, ControlResponsePoller, FRAGMENT_LIMIT_DEFAULT};
 pub use proxy::{ArchiveProxy, ProxyError, ReplayParams, ReplicationParams};
