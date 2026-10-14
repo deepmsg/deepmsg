@@ -326,6 +326,14 @@ path = "integration/persistent_subscription_replay.rs"
 name = "persistent_subscription_counters"
 path = "integration/persistent_subscription_counters.rs"
 
+# P2-C4's response-channel replay: the channel the replay comes back on, and
+# what a replay over a `control-mode=response` channel has to do first — a
+# publication of the client's own, a proxy over it, and a replay token. Needs
+# our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_configured_channel"
+path = "integration/persistent_subscription_configured_channel.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused

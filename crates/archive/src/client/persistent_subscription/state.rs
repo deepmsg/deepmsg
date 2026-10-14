@@ -22,10 +22,25 @@
 //! driver picks is the one the archive is told to replay to (`:1035-1050`,
 //! `:1370-1371`, `:1490-1492`).
 //!
-//! **The live half is the next commit**: the catch-up gate (`:1987-1990`), the
-//! live subscription's three states, `ATTEMPT_SWITCH`, and the two self-healing
-//! edges. Until it lands, a context that asks for it is **refused loudly**
-//! rather than left hanging — see [`NewError::LiveHalfNotYet`].
+//! # The third replay channel shape: a **response channel**
+//!
+//! A replay channel that carries `control-mode=response` is asked for over a
+//! publication of the *client's* own, on the archive's control request channel
+//! (`:1602-1657`) — and a replay made over one needs a **replay token** first
+//! (`:1729-1817`), which is what makes an image that the archive made for
+//! somebody else's session findable. Those four states and the three things they
+//! own — the publication, the proxy over it, and the token — are
+//! [`State::AddRequestPublication`] through [`State::AwaitReplayToken`].
+//!
+//! # The live half, and the two self-healing edges
+//!
+//! The catch-up gate (`:1987-1990`), the live subscription's three states,
+//! `ATTEMPT_SWITCH`, and the two edges back — the live image going away
+//! (`:2247-2268`) and the archive going away (`:804-829`) — are all here. What
+//! those edges do *next* is what the remaining commits of this slice add: the
+//! exit from `AWAIT_LIVE` is where the reference can retry a
+//! `RESOURCE_TEMPORARILY_UNAVAILABLE`, and its `clean_up_replay` — the
+//! `stop_replay` request — belongs with the closing family.
 //!
 //! # The switch is positions, not transports
 //!
@@ -54,7 +69,7 @@ use std::time::{Duration, Instant};
 use deepmsg_client::client::{AsyncAdd, AsyncAddPoll, CommandError};
 use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_core::uri::ChannelUri;
+use deepmsg_core::uri::{ChannelUri, UriError};
 
 use crate::client::async_client::{
     AsyncArchiveClient, AsyncClientError, ControlResponse, Listener,
@@ -65,7 +80,7 @@ use crate::client::persistent_subscription::context::{
     ConcludeError, Concluded, FROM_LIVE, FROM_START, PersistentSubscriptionContext,
 };
 use crate::client::persistent_subscription::counters::{Counters, Identity, NOTHING_JOINED};
-use crate::client::proxy::{NULL_VALUE, ReplayParams};
+use crate::client::proxy::{ArchiveProxy, NULL_VALUE, ReplayParams};
 
 /// `ARCHIVE_REPLAY_ALL_AND_FOLLOW` (`aeron_archive.h:35`): replay everything
 /// there is and keep following it. A replay that stopped at the end of the
@@ -76,17 +91,75 @@ const ALL_AND_FOLLOW: i64 = -1;
 /// will have, written in once the archive has named it (`:1448-1471`).
 const SESSION_ID_KEY: &str = "session-id";
 
+/// The media of a channel that stays inside this process (`media` in a URI).
+const IPC_MEDIA: &str = "ipc";
+
+/// `AERON_URI_RESPONSE_CORRELATION_ID_KEY` (`:1615`): which of the client's
+/// subscriptions a response publication answers.
+const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
+
+/// `AERON_URI_TERM_LENGTH_KEY` (`:1619`).
+const TERM_LENGTH_KEY: &str = "term-length";
+
+/// `AERON_URI_SPIES_SIMULATE_CONNECTION_KEY` (`:1620`).
+const SPIES_SIMULATE_CONNECTION_KEY: &str = "spies-simulate-connection";
+
+/// The channel a response-channel replay's request publication is made on
+/// (`:1610-1621`).
+///
+/// **Its own function because it is the one part of those four states that is
+/// arithmetic rather than waiting**, and because what it does to the control
+/// request channel is easy to read past: four keys come *off* and three go on.
+/// A channel that kept its `session-id` would be a publication claiming to be
+/// the archive's control channel; one that kept `term-id`/`term-offset` would
+/// claim a position in it.
+///
+/// # Errors
+///
+/// [`UriError`] when the control request channel is not a channel at all — the
+/// one failure the reference can have here too, since it builds this string from
+/// the context's own setting (`:1613`).
+fn request_publication_channel(
+    control_channel: &str,
+    term_buffer_length: i32,
+    subscription_id: i64,
+) -> Result<String, UriError> {
+    let mut uri = ChannelUri::parse(control_channel)?;
+
+    for key in REQUEST_PUBLICATION_REMOVED_KEYS {
+        uri.remove(key);
+    }
+
+    uri.put(RESPONSE_CORRELATION_ID_KEY, subscription_id.to_string());
+    uri.put(TERM_LENGTH_KEY, term_buffer_length.to_string());
+    uri.put(SPIES_SIMULATE_CONNECTION_KEY, "false");
+
+    Ok(uri.build())
+}
+
+/// The four the request publication's channel has **taken off** it (`:1614`,
+/// `:1616-1618`).
+///
+/// The reference writes each with a null value, and a null value in a
+/// `aeron_uri_string_builder` is not an empty one: it **removes** the key
+/// (`aeron_uri_string_builder.c:180-183`). So the publication starts from the
+/// control request channel with its session and its term position forgotten —
+/// which is what makes it its own publication rather than a second view of the
+/// archive's control channel.
+const REQUEST_PUBLICATION_REMOVED_KEYS: [&str; 4] =
+    ["session-id", "initial-term-id", "term-id", "term-offset"];
+
 /// How long a subscription of this build's waits for its own driver commands.
 /// Not the reference's `message_timeout_ns`, which is how long it waits for the
 /// *archive*.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The states the replay half walks — thirteen of the reference's eighteen
+/// The reference's eighteen states, in its order
 /// (`…_persistent_subscription.h:75-98`).
 ///
-/// The other five are the response-channel replay's four and `ATTEMPT_SWITCH`,
-/// and they are absent rather than present-and-unreachable: a state nothing can
-/// enter is a claim nothing checks.
+/// Every one of them is here, so [`State::as_counter_value`] has no gaps left —
+/// and no state is present-and-unreachable, which is the other way a list like
+/// this lies: a state nothing can enter is a claim nothing checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Waiting for the archive connection the async client is making.
@@ -106,6 +179,17 @@ pub enum State {
     /// A replay channel that named `endpoint=…:0`, waiting for the port the
     /// driver picked.
     AwaitReplayChannelEndpoint,
+    /// A **response channel** replay: putting an exclusive publication of our
+    /// own on the archive's control request channel, which is where the replay
+    /// request will go out from (`:1602-1657`).
+    AddRequestPublication,
+    /// Waiting for the driver to make that publication.
+    AwaitRequestPublication,
+    /// Asking the archive for the replay token this recording's replay is
+    /// addressed by (`:1729-1758`).
+    SendReplayTokenRequest,
+    /// Waiting for that token (`:1760-1816`).
+    AwaitReplayToken,
     /// Reading the replay, and deciding when it has caught up.
     Replay,
     /// Putting a subscription on the live channel, for a subscription that has
@@ -128,9 +212,10 @@ impl State {
     /// (`…_persistent_subscription.h:76-97`), which is what the reference's
     /// tests and a reader of the counters file go by.
     ///
-    /// The gaps are the five states this half does not have, and they are kept
-    /// as gaps on purpose — a counter that said `Replay` was 8 would agree with
-    /// nothing else.
+    /// The enum is the reference's, in its order, so these are its values and
+    /// not a count: `REPLAY` is twelve because eleven states come before it, and
+    /// a counter that said eight would agree with nothing else. Writing them out
+    /// rather than counting is what makes that checkable by eye.
     #[must_use]
     pub const fn as_counter_value(self) -> i64 {
         match self {
@@ -142,6 +227,10 @@ impl State {
             Self::AddReplaySubscription => 5,
             Self::AwaitReplaySubscription => 6,
             Self::AwaitReplayChannelEndpoint => 7,
+            Self::AddRequestPublication => 8,
+            Self::AwaitRequestPublication => 9,
+            Self::SendReplayTokenRequest => 10,
+            Self::AwaitReplayToken => 11,
             Self::Replay => 12,
             Self::AttemptSwitch => 13,
             Self::AddLiveSubscription => 14,
@@ -263,11 +352,13 @@ enum MaxRecordedPosition {
 
 /// What the archive has answered, filed by correlation id — the operation slots
 /// the reference's `on_archive_control_response` demultiplexes into
-/// (`:831-860`), of which this half uses two.
+/// (`:831-860`). Four of them, one per request this machine makes; the fifth
+/// request, `stop_replay`, is sent and not waited on (`:741-760`).
 #[derive(Debug, Default)]
 struct Ops {
     list_recording: ListRecording,
     replay: Replay,
+    replay_token: ReplayToken,
     max_recorded_position: MaxPosition,
 }
 
@@ -295,6 +386,20 @@ struct ListRecording {
 /// One `replay` request and what came back (`replay_request_t`, `:46-57`).
 #[derive(Debug, Default)]
 struct Replay {
+    correlation_id: i64,
+    received: bool,
+    code: Option<ControlResponseCode>,
+    relevant_id: i64,
+    error_message: String,
+}
+
+/// One `request_replay_token` and what came back
+/// (`replay_token_request`, `…_persistent_subscription.h:136`) — the same four
+/// things a `replay` is answered with, because it is the same kind of operation
+/// (`async_archive_op_t`, `:59-74`). The **relevant id is the token**, which is
+/// the one difference that matters.
+#[derive(Debug, Default)]
+struct ReplayToken {
     correlation_id: i64,
     received: bool,
     code: Option<ControlResponseCode>,
@@ -336,6 +441,15 @@ impl Listener for ArchiveListener {
             ops.replay.error_message = response.error_message.to_owned();
         }
 
+        if response.correlation_id == ops.replay_token.correlation_id
+            && NULL_VALUE != response.correlation_id
+        {
+            ops.replay_token.received = true;
+            ops.replay_token.code = Some(response.code);
+            ops.replay_token.relevant_id = response.relevant_id;
+            ops.replay_token.error_message = response.error_message.to_owned();
+        }
+
         if response.correlation_id == ops.max_recorded_position.correlation_id
             && NULL_VALUE != response.correlation_id
         {
@@ -362,8 +476,8 @@ impl Listener for ArchiveListener {
     }
 }
 
-/// A subscription that replays a recording. See the module header for what is
-/// here and what the next commit brings.
+/// A subscription that replays a recording. See the module header for the path
+/// it walks.
 pub struct PersistentSubscription {
     state: State,
     client: AsyncArchiveClient,
@@ -404,6 +518,23 @@ pub struct PersistentSubscription {
     replay_subscription_add: Option<i64>,
     /// The session the archive named for this replay (`:1446`).
     replay_session_id: i64,
+    /// The `ADD_EXCLUSIVE_PUBLICATION` a **response channel** replay is waiting
+    /// on, whose registration id the driver will answer under (`:1638-1655`).
+    request_publication_add: Option<AsyncAdd>,
+    /// That publication, once the driver has made it (`:1671`). A registration
+    /// id and not the object: the client holds the publication, and every use of
+    /// it — the proxy's offers, the removal — goes through the client.
+    request_publication: Option<i64>,
+    /// The proxy over that publication, which is where the replay request goes
+    /// out instead of on the async client's own (`:1705-1723`).
+    response_channel_proxy: Option<ArchiveProxy>,
+    /// What the archive named this replay's token (`:1804`), sent with the
+    /// replay request so the archive can find the image it made for us.
+    replay_token: i64,
+    /// Whether the replay channel is IPC, which is the one thing that decides
+    /// whether the replay request goes out before the channel's endpoint is
+    /// known or after it (`:1806-1813`).
+    replay_channel_is_ipc: bool,
     /// The deadline of whatever is being waited for, or `None`.
     deadline: Option<Instant>,
     /// The margin the catch-up check allows: a quarter of the recording's term
@@ -437,8 +568,9 @@ enum ReplayChannelType {
     /// `endpoint=…:0`: the driver picks the port, so the subscription goes up
     /// first and the archive is told where to replay to.
     DynamicPort,
-    /// `control-mode=response`: the replay comes back along the control
-    /// channel. C4's seventh commit.
+    /// `control-mode=response`: the replay request goes out over a publication
+    /// of the client's own, on the archive's control request channel, and is
+    /// addressed by a **replay token** the archive hands out (`:1037-1040`).
     ResponseChannel,
 }
 
@@ -453,9 +585,8 @@ impl PersistentSubscription {
     ///
     /// # Errors
     ///
-    /// [`NewError::Context`] for one of the context's ten refusals,
-    /// [`NewError::Subscription`] for a driver that will not take the counters,
-    /// and [`NewError::LiveHalfNotYet`] for a context that needs the live half.
+    /// [`NewError::Context`] for one of the context's ten refusals, and
+    /// [`NewError::Subscription`] for a driver that will not take the counters.
     pub fn new(
         context: PersistentSubscriptionContext,
         credentials: Box<dyn Credentials>,
@@ -528,6 +659,15 @@ impl PersistentSubscription {
             replay_subscription: None,
             replay_subscription_add: None,
             replay_session_id: NULL_VALUE,
+            request_publication_add: None,
+            request_publication: None,
+            response_channel_proxy: None,
+            replay_token: NULL_VALUE,
+            // Read off the **configured** channel, as the reference does at
+            // create (`:1035`), and not off `replay_channel_uri` — which for a
+            // session-specific channel is rewritten with the session id later.
+            replay_channel_is_ipc: ChannelUri::parse(&concluded.replay_channel)
+                .is_ok_and(|uri| uri.media() == IPC_MEDIA),
             deadline: None,
             close_enough_threshold: 0,
             max_recorded_position: MaxRecordedPosition::Idle,
@@ -639,6 +779,10 @@ impl PersistentSubscription {
             State::AddReplaySubscription => self.add_replay_subscription(),
             State::AwaitReplaySubscription => self.await_replay_subscription(),
             State::AwaitReplayChannelEndpoint => self.await_replay_channel_endpoint(),
+            State::AddRequestPublication => self.add_request_publication(),
+            State::AwaitRequestPublication => self.await_request_publication(),
+            State::SendReplayTokenRequest => self.send_replay_token_request(),
+            State::AwaitReplayToken => self.await_replay_token(),
             State::Replay => self.replay(handler, fragment_limit),
             State::AddLiveSubscription => self.add_live_subscription(),
             State::AwaitLive => self.await_live(),
@@ -816,6 +960,12 @@ impl PersistentSubscription {
     }
 
     /// `SEND_REPLAY_REQUEST` (`:1353-1400`).
+    ///
+    /// Three callers, and they arrive with different things in hand: a
+    /// session-specific channel comes here straight from `set_up_replay`, a
+    /// channel the driver picked a port for from `AWAIT_REPLAY_CHANNEL_ENDPOINT`,
+    /// and a **response channel** from `AWAIT_REPLAY_TOKEN` — the last with the
+    /// publication it made and the token it was given (`:1364-1368`).
     fn send_replay_request(&mut self) -> usize {
         let Ok(correlation_id) = self.next_correlation_id() else {
             return 0;
@@ -835,23 +985,51 @@ impl PersistentSubscription {
         let params = ReplayParams {
             position: self.position,
             length: ALL_AND_FOLLOW,
+            // Zero unless this is a response-channel replay, which is the only
+            // kind of replay that has one (`:1367`).
+            replay_token: self.replay_token,
             ..ReplayParams::default()
         };
 
-        let sent = self.client.try_send_replay_request(
-            None,
-            correlation_id,
-            recording_id,
-            &channel,
-            replay_stream_id,
-            &params,
-        );
+        let response_channel = ReplayChannelType::ResponseChannel == self.replay_channel_type;
+
+        let sent = {
+            // Split into two borrows rather than taken as one `self`: a
+            // response-channel replay goes out **through** the client on a
+            // publication the client owns, and the proxy that writes into it is
+            // this object's other half.
+            let Self {
+                client,
+                response_channel_proxy,
+                ..
+            } = self;
+
+            match (response_channel, response_channel_proxy.as_mut()) {
+                (true, Some(proxy)) => client.try_send_replay_request(
+                    Some(proxy),
+                    correlation_id,
+                    recording_id,
+                    &channel,
+                    replay_stream_id,
+                    &params,
+                ),
+                _ => client.try_send_replay_request(
+                    None,
+                    correlation_id,
+                    recording_id,
+                    &channel,
+                    replay_stream_id,
+                    &params,
+                ),
+            }
+        };
 
         if !sent {
             if self.client.is_connected() {
                 return 0;
             }
 
+            self.clean_up_request_publication();
             self.clean_up_replay_subscription();
             self.transition(State::AwaitArchiveConnection);
 
@@ -886,6 +1064,7 @@ impl PersistentSubscription {
                 return 0;
             }
 
+            self.clean_up_request_publication();
             self.clean_up_replay_subscription();
 
             if self.client.is_connected() {
@@ -898,6 +1077,7 @@ impl PersistentSubscription {
         }
 
         if Some(ControlResponseCode::OK) != code {
+            self.clean_up_request_publication();
             self.clean_up_replay_subscription();
             self.fail(SubscriptionError::Refused {
                 request: "Replay request",
@@ -937,6 +1117,12 @@ impl PersistentSubscription {
 
             self.transition(State::AddReplaySubscription);
         } else {
+            // **The publication goes back as soon as the replay is agreed to**
+            // (`:1474`): it was how the request was asked, and the replay itself
+            // arrives on the replay subscription. A response-channel replay that
+            // kept it would be holding a publication open for nothing.
+            self.clean_up_request_publication();
+
             self.deadline = Some(Instant::now() + self.message_timeout);
             self.transition(State::Replay);
         }
@@ -1002,12 +1188,12 @@ impl PersistentSubscription {
                     ReplayChannelType::DynamicPort => {
                         self.transition(State::AwaitReplayChannelEndpoint);
                     }
+                    // A response channel has no endpoint to resolve — the replay
+                    // is addressed to a publication, not to an address — so the
+                    // next thing is the publication that carries the request
+                    // (`:1574-1577`).
                     ReplayChannelType::ResponseChannel => {
-                        self.fail(SubscriptionError::Refused {
-                            request: "replay subscription",
-                            message: "a response-channel replay needs C4's seventh commit"
-                                .to_owned(),
-                        });
+                        self.transition(State::AddRequestPublication);
                     }
                 }
 
@@ -1068,8 +1254,265 @@ impl PersistentSubscription {
         1
     }
 
-    /// `REPLAY` (`:1876-2059`): read the replay, and — next commit — decide when
-    /// it has caught up.
+    /// `ADD_REQUEST_PUBLICATION` (`:1602-1657`).
+    ///
+    /// The publication the replay request goes out on when the replay channel is
+    /// a **response channel**. It is built on the archive's own control request
+    /// channel — the one it is listening on — with four things taken off and
+    /// three put on (`:1613-1621`): the client's replay subscription is named as
+    /// what this publication answers (`response-correlation-id`), the term
+    /// length is the archive's control term length, and
+    /// `spies-simulate-connection` is **off**, because this publication has one
+    /// peer and is not a spy's view of a stream.
+    ///
+    /// ★ The four removals are the part that reads as a no-op and is not: the
+    /// reference passes a **null value** to each, and a null value in a URI
+    /// string builder *removes* the key rather than writing an empty one
+    /// (`aeron_uri_string_builder.c:180-183`). Leaving `session-id` in place
+    /// would make this publication claim to continue the archive's control
+    /// channel's session, and leaving `term-id`/`term-offset` would make it
+    /// claim a position in it.
+    fn add_request_publication(&mut self) -> usize {
+        // Taken out and the borrow dropped before anything below needs `self`
+        // mutably.
+        let control = self.context.archive_context.as_ref().map(|archive| {
+            (
+                archive.control_request_channel.clone(),
+                archive.control_request_stream_id,
+                archive.control_term_buffer_length,
+            )
+        });
+
+        let Some((Some(channel), stream_id, term_length)) = control else {
+            self.fail(SubscriptionError::Refused {
+                request: "request publication",
+                message: "the archive context names no control request channel".to_owned(),
+            });
+
+            return 1;
+        };
+
+        let Some(subscription_id) = self.replay_subscription else {
+            return 0;
+        };
+
+        let Ok(channel) = request_publication_channel(&channel, term_length, subscription_id)
+        else {
+            self.fail(SubscriptionError::Refused {
+                request: "request publication",
+                message: format!("control request channel is not a channel: {channel}"),
+            });
+
+            return 1;
+        };
+
+        // **Started and not waited on**, like the replay subscription's add and
+        // for the same reason: a poll that blocked would make a caller's turn as
+        // long as the driver's answer.
+        let added = match self.client.client_mut() {
+            Some(driver) => {
+                driver.async_add_exclusive_publication(&channel, stream_id, COMMAND_TIMEOUT)
+            }
+            None => Err(CommandError::Encoding),
+        };
+
+        match added {
+            Ok(add) => {
+                self.request_publication_add = Some(add);
+                self.transition(State::AwaitRequestPublication);
+            }
+            Err(error) => self.fail(SubscriptionError::Client(error)),
+        }
+
+        1
+    }
+
+    /// `AWAIT_REQUEST_PUBLICATION` (`:1659-1727`).
+    ///
+    /// When the driver has made the publication, the client builds a proxy over
+    /// it and **tells it the session the archive named** — the same session the
+    /// async client was given at connect (`:1721-1723`) — because a request sent
+    /// on this publication has to look like it comes from the same client the
+    /// connect came from, and a fresh publication would otherwise carry nothing
+    /// that says so.
+    ///
+    /// ★ **One deviation, and it is the one `AWAIT_LIVE` already records**: a
+    /// `RESOURCE_TEMPORARILY_UNAVAILABLE` here is retried by the reference, by
+    /// going back to `set_up_replay` (`:1680-1691`), and anything else is
+    /// terminal. This build's [`CommandError`] does not carry *which* kind of
+    /// refusal it was, so every failure is terminal — retrying all of them would
+    /// spin forever on a permanent one, and a live-lock tells a caller less than
+    /// a failure does.
+    fn await_request_publication(&mut self) -> usize {
+        let Some(add) = self.request_publication_add else {
+            return 0;
+        };
+
+        let outcome = match self.client.client_mut() {
+            Some(driver) => driver.async_add_poll(add),
+            None => AsyncAddPoll::Awaiting,
+        };
+
+        match outcome {
+            AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => 0,
+
+            AsyncAddPoll::Failed(error) => {
+                self.request_publication_add = None;
+                self.clean_up_replay_subscription();
+                self.fail(SubscriptionError::Client(error));
+
+                1
+            }
+
+            AsyncAddPoll::Ready => {
+                let registration_id = add.registration_id();
+                self.request_publication_add = None;
+                self.request_publication = Some(registration_id);
+
+                let Some(archive_context) = self.context.archive_context.clone() else {
+                    self.fail(SubscriptionError::Refused {
+                        request: "request publication",
+                        message: "the archive context names no control request channel".to_owned(),
+                    });
+
+                    return 1;
+                };
+
+                let mut proxy = ArchiveProxy::new(&archive_context, registration_id);
+                proxy.set_control_session_id(self.client.control_session_id());
+
+                self.response_channel_proxy = Some(proxy);
+                self.transition(State::SendReplayTokenRequest);
+
+                1
+            }
+        }
+    }
+
+    /// `SEND_REPLAY_TOKEN_REQUEST` (`:1729-1758`).
+    fn send_replay_token_request(&mut self) -> usize {
+        let Ok(correlation_id) = self.next_correlation_id() else {
+            return 0;
+        };
+
+        let recording_id = self.context.recording_id;
+
+        if !self
+            .client
+            .try_send_replay_token_request(correlation_id, recording_id)
+        {
+            if self.client.is_connected() {
+                return 0;
+            }
+
+            self.clean_up_request_publication();
+            self.clean_up_replay_subscription();
+            self.transition(State::AwaitArchiveConnection);
+
+            return 1;
+        }
+
+        self.ops.borrow_mut().replay_token = ReplayToken {
+            correlation_id,
+            ..ReplayToken::default()
+        };
+        self.deadline = Some(Instant::now() + self.message_timeout);
+        self.transition(State::AwaitReplayToken);
+
+        1
+    }
+
+    /// `AWAIT_REPLAY_TOKEN` (`:1760-1816`).
+    ///
+    /// The token is what the replay request is addressed by, so it is kept and
+    /// sent with it (`:1367`). Where the machine goes next is the one thing IPC
+    /// decides: an IPC replay channel is subscribed to **before** the replay is
+    /// asked for, so with one there is nothing left to resolve and the request
+    /// can go; anything else has an endpoint the driver has to pick first
+    /// (`:1806-1813`).
+    fn await_replay_token(&mut self) -> usize {
+        let (received, code, relevant_id, message) = {
+            let token = &self.ops.borrow().replay_token;
+
+            (
+                token.received,
+                token.code,
+                token.relevant_id,
+                token.error_message.clone(),
+            )
+        };
+
+        if !received {
+            if !self.deadline_passed() {
+                return 0;
+            }
+
+            self.clean_up_request_publication();
+            self.clean_up_replay_subscription();
+
+            if self.client.is_connected() {
+                self.set_up_replay();
+            } else {
+                self.transition(State::AwaitArchiveConnection);
+            }
+
+            return 1;
+        }
+
+        if Some(ControlResponseCode::OK) != code {
+            self.clean_up_request_publication();
+            self.clean_up_replay_subscription();
+
+            // The reference's own words, and its shape: the archive's message
+            // inside ours, and the **relevant id handed on as the code**
+            // (`:1792-1799`), because that is where an `ERROR` response puts it.
+            self.fail(SubscriptionError::Refused {
+                request: "Replay token request",
+                message: format!("Replay token request failed: {message}"),
+            });
+
+            return 1;
+        }
+
+        self.replay_token = relevant_id;
+
+        if self.replay_channel_is_ipc {
+            self.transition(State::SendReplayRequest);
+        } else {
+            self.transition(State::AwaitReplayChannelEndpoint);
+        }
+
+        1
+    }
+
+    /// `clean_up_request_publication` (`:700-723`): give back the publication a
+    /// response-channel replay was asked over — **whether or not the driver ever
+    /// made it**.
+    ///
+    /// The two halves are separate because they are separate in the client: an
+    /// add whose answer has not been polled holds nothing, and is cancelled by
+    /// the id it was made with; a publication that arrived is closed. Both are
+    /// asked for by registration id, which is the one name the driver knows
+    /// either of them by. The third thing is the proxy, which is this
+    /// object's own and outlives neither.
+    fn clean_up_request_publication(&mut self) {
+        if let Some(add) = self.request_publication_add.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.async_add_cancel(add);
+            }
+        }
+
+        if let Some(registration_id) = self.request_publication.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.remove_publication(registration_id, COMMAND_TIMEOUT);
+            }
+        }
+
+        self.response_channel_proxy = None;
+    }
+
+    /// `REPLAY` (`:1876-2059`): read the replay, and decide when it has caught
+    /// up.
     fn replay<H: ControlledHandler>(&mut self, handler: &mut H, fragment_limit: usize) -> usize {
         let Some(registration_id) = self.replay_subscription else {
             return 0;
@@ -1532,11 +1975,7 @@ impl PersistentSubscription {
         }
     }
 
-    /// `LIVE` (`:2247-2268`): read the live stream.
-    ///
-    /// What is missing here is the branch that notices the live image going
-    /// away and starts the replay that heals it (`:2255-2263`) — that is the
-    /// next commit's, with the rest of the self-healing.
+    /// `LIVE` (`:2247-2268`): read the live stream, and notice when it stops.
     fn live<H: ControlledHandler>(&mut self, handler: &mut H, fragment_limit: usize) -> usize {
         let Some(registration_id) = self.live_subscription else {
             return 0;
@@ -1684,6 +2123,7 @@ impl PersistentSubscription {
         }
 
         self.clean_up_live_subscription();
+        self.clean_up_request_publication();
         self.clean_up_replay_subscription();
         self.replay_session_id = NULL_VALUE;
 
@@ -1902,13 +2342,53 @@ mod tests {
         }
     }
 
-    /// The state counter's values are the enum's (`…_persistent_subscription.h:76-97`),
-    /// including the gaps the five states this half does not have leave.
+    /// The state counter's values are the enum's
+    /// (`…_persistent_subscription.h:76-97`), and the enum is the reference's
+    /// eighteen in its order.
     #[test]
     fn the_state_counter_reads_the_enums_own_values() {
         assert_eq!(0, State::AwaitArchiveConnection.as_counter_value());
         assert_eq!(7, State::AwaitReplayChannelEndpoint.as_counter_value());
+        assert_eq!(8, State::AddRequestPublication.as_counter_value());
+        assert_eq!(9, State::AwaitRequestPublication.as_counter_value());
+        assert_eq!(10, State::SendReplayTokenRequest.as_counter_value());
+        assert_eq!(11, State::AwaitReplayToken.as_counter_value());
         assert_eq!(12, State::Replay.as_counter_value());
         assert_eq!(17, State::Failed.as_counter_value());
+    }
+
+    /// ★ The four keys come **off** the control request channel and three go on
+    /// (`:1613-1621`).
+    ///
+    /// The reference passes a **null** value to each of the four, and a null
+    /// value in its URI string builder removes the key rather than writing an
+    /// empty one (`aeron_uri_string_builder.c:180-183`) — which is why this is a
+    /// function with a test rather than five lines inside a state, and why a
+    /// port that read the nulls as empty values would be wrong in a way only a
+    /// channel with those keys set can show.
+    #[test]
+    fn the_request_publication_channel_drops_what_the_reference_drops() {
+        let channel = request_publication_channel(
+            "aeron:udp?endpoint=localhost:8010|session-id=6|initial-term-id=3|term-id=4|term-offset=64",
+            65536,
+            33,
+        )
+        .expect("the control request channel is a channel");
+
+        let uri = ChannelUri::parse(&channel).expect("what was built is a channel");
+
+        for key in REQUEST_PUBLICATION_REMOVED_KEYS {
+            assert_eq!(None, uri.get(key), "{channel} still carries {key}");
+        }
+
+        assert_eq!(Some("33"), uri.get(RESPONSE_CORRELATION_ID_KEY));
+        assert_eq!(Some("65536"), uri.get(TERM_LENGTH_KEY));
+        assert_eq!(Some("false"), uri.get(SPIES_SIMULATE_CONNECTION_KEY));
+        assert_eq!("udp", uri.media());
+        assert_eq!(Some("localhost:8010"), uri.get("endpoint"));
+
+        // Media and endpoint survive; a control request channel that is not a
+        // channel at all is the one failure the reference can have here too.
+        assert!(request_publication_channel("not-a-channel", 65536, 33).is_err());
     }
 }
