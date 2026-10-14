@@ -37,6 +37,42 @@ jobs:
       - name: Lint the interop targets
         run: cargo clippy -p deepmsg-tests --all-targets --features interop -- -D warnings
 
+  # The kernel-bypass media seam (ADR-0006). A job of its own because it is the
+  # only one that installs DPDK, and because the crate it exercises is *empty*
+  # in every other job: `crates/dpdk` compiles to nothing with the feature off,
+  # which is what keeps the workspace buildable on a machine without DPDK.
+  #
+  # T3's cases are all virtual devices — `net_pcap` reading a prepared capture
+  # and writing one back, `net_null` — so this job needs no privileges, no veth
+  # and no huge pages. The one case that does need them (`net_af_packet` over a
+  # veth pair) is `#[ignore]`d and runs on the bench machine; see the D3 plan.
+  dpdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain and CI's components
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --component rustfmt --component clippy --no-self-update
+      - name: Install DPDK
+        # `libdpdk-dev` is the one that matters: the headers, `libdpdk.pc` and
+        # EAL live there. `dpdk` and `dpdk-dev` bring the test binaries and the
+        # binding script, which nothing here uses.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdpdk-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy, with the media compiled in
+        run: cargo clippy -p deepmsg-dpdk --all-targets --features dpdk -- -D warnings
+      - name: T3
+        run: cargo test -p deepmsg-dpdk --features dpdk
+      - name: The workspace still builds without DPDK
+        # The criterion the job above cannot state: with the feature off, this
+        # crate is empty and the default build is the one that was there before
+        # it existed.
+        run: cargo build --workspace
+
   # The generated codecs are checked in (ADR-0004), so nothing but this job
   # stands between a schema edit and a crate that no longer matches it. The
   # check is the one the tool's own documentation promises: regenerate, and the

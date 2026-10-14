@@ -11,6 +11,9 @@ members = [
     "crates/codec/cluster-node-state",
     "crates/client",
     "crates/driver",
+    # ADR-0002's sixth `unsafe` zone (ADR-0006): empty unless the `dpdk`
+    # feature is on, so a machine without DPDK builds and tests it as it is.
+    "crates/dpdk",
     "crates/archive",
     "crates/tools",
     "crates/bench",
