@@ -33,6 +33,7 @@ use super::udp_transport::{OpenError, UdpTransport};
 use super::userspace::stack::{Stack, ThreadQueues};
 use super::userspace::transport::UserspaceTransport;
 use super::{Transport, TransportParams};
+use crate::udp_channel::{UdpChannel, UdpChannelError};
 
 /// The bindings a driver's UDP data paths run on.
 ///
@@ -189,6 +190,52 @@ impl TransportBindings {
         }
     }
 
+    /// Refuse a channel this media cannot serve, where the channel is read
+    /// (design §4.11).
+    ///
+    /// The kernel's bindings serve every shape a channel can take — multicast
+    /// and IPv6 included — so this is the userspace media's list and nothing
+    /// else: a **group** address needs IGMP reports and a group filter on the
+    /// port, and **IPv6** needs NDP, and the userspace stack has neither. Both
+    /// limits are the media's rather than the driver's, which is why the
+    /// message names the media the configuration selected.
+    ///
+    /// **Refused rather than ignored, and that is the whole point of the
+    /// list.** A multicast channel this media accepted would have the group
+    /// bound as if it were one of the port's own addresses — the bind succeeds
+    /// and no frame is ever filed, so a subscription looks connected and
+    /// delivers nothing for as long as it is held. An error the client can read
+    /// is the honest answer to a channel that cannot work.
+    ///
+    /// # Errors
+    ///
+    /// [`UdpChannelError::Unsupported`], which reaches a client as `ON_ERROR`
+    /// carrying `ERROR_CODE_NOT_SUPPORTED` and the message as its text — the
+    /// same shape the timestamp parameters are refused with
+    /// ([`crate::udp_channel::UdpChannel::resolve`]).
+    pub fn refuse_channel(&self, channel: &UdpChannel) -> Result<(), UdpChannelError> {
+        let Self::Userspace(_) = self else {
+            return Ok(());
+        };
+
+        if channel.is_multicast {
+            return Err(UdpChannelError::Unsupported(format!(
+                "the dpdk media does not serve multicast: {} is a group address",
+                channel.remote_data
+            )));
+        }
+
+        for address in [channel.remote_data, channel.local_data] {
+            if address.is_ipv6() {
+                return Err(UdpChannelError::Unsupported(format!(
+                    "the dpdk media does not serve IPv6: {address}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// A poller for the thread `affinity` names (`poller_init_func`,
     /// `:91-94`).
     pub fn poller(&self, affinity: Affinity) -> MediaPoller {
@@ -262,5 +309,82 @@ mod tests {
             ),
             "and nothing else, so that the kernel still answers for the rest"
         );
+    }
+
+    fn channel(uri: &str) -> UdpChannel {
+        let parsed = crate::channel_uri::ChannelUri::parse(uri.as_bytes()).expect("a URI");
+
+        UdpChannel::resolve(uri.as_bytes(), &parsed)
+            .unwrap_or_else(|error| panic!("{uri}: {error}"))
+    }
+
+    fn userspace() -> TransportBindings {
+        let wire = Wire::new();
+        TransportBindings::Userspace(Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+            Clock::Monotonic,
+        ))
+    }
+
+    /// A multicast channel is refused by the media that cannot serve one, and
+    /// served by the one that can (design §4.11, Q1b).
+    ///
+    /// The message is asserted and not just the refusal: a client that is told
+    /// *which* media refused it can tell a deployment mistake from a channel
+    /// this build never serves, and the two would otherwise be one opaque
+    /// "not supported".
+    #[test]
+    fn a_group_address_is_refused_by_the_media_that_has_no_groups() {
+        let group = channel("aeron:udp?endpoint=224.0.1.1:40456");
+
+        assert!(
+            TransportBindings::Default.refuse_channel(&group).is_ok(),
+            "the kernel's sockets serve multicast, and always have"
+        );
+
+        let refusal = userspace()
+            .refuse_channel(&group)
+            .expect_err("the userspace media holds no groups");
+
+        assert_eq!(
+            "the dpdk media does not serve multicast: 224.0.1.1:40456 is a group address",
+            refusal.to_string()
+        );
+        assert_eq!(
+            deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
+            refusal.error_code()
+        );
+    }
+
+    /// The same for an IPv6 channel, which needs NDP.
+    #[test]
+    fn an_ipv6_channel_is_refused_by_the_media_that_has_no_ndp() {
+        let channel = channel("aeron:udp?endpoint=[::1]:40456");
+
+        assert!(
+            TransportBindings::Default.refuse_channel(&channel).is_ok(),
+            "the kernel's sockets serve IPv6"
+        );
+
+        let refusal = userspace()
+            .refuse_channel(&channel)
+            .expect_err("the userspace media speaks IPv4 only");
+
+        assert_eq!(
+            "the dpdk media does not serve IPv6: [::1]:40456",
+            refusal.to_string()
+        );
+    }
+
+    /// And a unicast IPv4 channel is served by both, which is what keeps the
+    /// refusals from being a blanket one.
+    #[test]
+    fn a_unicast_channel_is_served_by_both_media() {
+        let channel = channel("aeron:udp?endpoint=10.10.0.2:40500");
+
+        assert!(TransportBindings::Default.refuse_channel(&channel).is_ok());
+        assert!(userspace().refuse_channel(&channel).is_ok());
     }
 }

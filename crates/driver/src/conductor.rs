@@ -6756,6 +6756,67 @@ mod tests {
         assert_eq!(0, conductor.publications().publications().len());
     }
 
+    /// A channel the **media** cannot serve is refused to the client too, and
+    /// the test above is why this one exists: under `default` a multicast
+    /// channel is served, so the refusal is a property of the media the driver
+    /// was configured with and not of the driver.
+    ///
+    /// This is the wiring the media's own unit tests cannot reach — the
+    /// question is asked in the native resource agent's parse, which is the one
+    /// place a channel is read, and a refusal that never got there would leave
+    /// a group address bound into a subscription that hears nothing.
+    #[test]
+    fn a_group_address_is_refused_by_a_media_that_has_no_groups() {
+        use crate::media::TransportBindings;
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{Clock, StackParams};
+        use std::net::Ipv4Addr;
+
+        let temp = TempDir::new();
+        let mut config = publication_config(&temp.0);
+
+        let wire = Wire::new();
+        config.transport_bindings =
+            TransportBindings::Userspace(crate::media::userspace::stack::Stack::over_a_fake_wire(
+                &wire,
+                Side::A,
+                StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+                Clock::Monotonic,
+            ));
+
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 12, 1001, "aeron:udp?endpoint=224.0.1.1:40456"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(12i64.to_le_bytes(), payload[0..8], "the failing command");
+        assert_eq!(
+            ERROR_CODE_NOT_SUPPORTED.to_le_bytes(),
+            payload[8..12],
+            "a channel this build does not serve"
+        );
+
+        // The text, which is what tells a client *which* media refused it.
+        let text = String::from_utf8_lossy(&payload[12..]);
+        assert!(
+            text.contains("does not serve multicast"),
+            "the client is told what the media cannot do: {text}"
+        );
+    }
+
     #[test]
     fn a_parameter_value_the_reference_cannot_parse_is_generic() {
         // The URI's *structure* reads — the scheme, the transport, the shape
