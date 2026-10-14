@@ -456,6 +456,26 @@ fn a_port_describes_itself_in_the_child() {
     assert_eq!(port._port.mac().len(), 6, "a port has an address");
     assert!(port._port.mtu() > 0, "and reports an MTU");
 
+    // The device's own counters, which a driver publishes as the DPDK media's
+    // 84 and 91: a port that has received nothing has counted nothing, and
+    // nobody has dropped anything either. Read here rather than assumed,
+    // because "the counters are all zero on an idle port" is what makes the
+    // first non-zero reading meaningful.
+    let stats = port._port.stats().expect("a port reports its counters");
+    assert_eq!(0, stats.received + stats.transmitted, "{stats:?}");
+    assert_eq!(0, stats.missed, "{stats:?}");
+    assert_eq!(0, stats.no_buffers, "{stats:?}");
+
+    // And the link, which is what 75's value is: `net_pcap` is a virtual
+    // device with no PHY, and what a virtual device reports about its link is
+    // its own business — so what is asserted is that the question has an
+    // answer, not what the answer is.
+    let link = port._port.link().expect("a port reports its link");
+    assert!(
+        link.up || link.speed_mbps == 0,
+        "a link that is down has no speed: {link:?}"
+    );
+
     // What the port says it can judge, against what its frames say it judged:
     // the case above receives frames from this port and every one of them
     // answers `NotJudged` (D0 — the virtual devices have no checksum offload).

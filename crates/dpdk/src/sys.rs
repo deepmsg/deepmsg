@@ -66,6 +66,31 @@ pub struct ShimPortInfo {
     pub tx_offloads: u64,
 }
 
+/// What a port's own counters are, as this build reads them (mirrors
+/// `shim_port_stats_t`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShimPortStats {
+    pub ipackets: u64,
+    pub opackets: u64,
+    pub ibytes: u64,
+    pub obytes: u64,
+    pub imissed: u64,
+    pub ierrors: u64,
+    pub oerrors: u64,
+    pub rx_nombuf: u64,
+}
+
+/// The link's state, with DPDK's bitfields already resolved by the shim
+/// (mirrors `shim_port_link_t`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShimPortLink {
+    pub speed_mbps: u32,
+    pub up: u8,
+    pub full_duplex: u8,
+}
+
 /// One burst carries at most this many frames (`SHIM_BURST_MAX` in the shim).
 pub const SHIM_BURST_MAX: usize = 64;
 
@@ -123,6 +148,8 @@ unsafe extern "C" {
     pub fn shim_port_close(port: c_uint);
     pub fn shim_port_mac(port: c_uint, out: *mut u8) -> c_int;
     pub fn shim_port_mtu(port: c_uint, out: *mut u16) -> c_int;
+    pub fn shim_port_stats(port: c_uint, out: *mut ShimPortStats) -> c_int;
+    pub fn shim_port_link(port: c_uint, out: *mut ShimPortLink) -> c_int;
 
     // The data path, in batches: one call per burst, whatever it carries.
     pub fn shim_rx_burst(port: c_uint, queue: c_uint, out: *mut ShimRxDesc, max: c_uint) -> c_uint;

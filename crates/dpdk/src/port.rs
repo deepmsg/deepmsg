@@ -122,6 +122,44 @@ impl PortInfo {
     }
 }
 
+/// What a port's own counters say (`rte_eth_stats`).
+///
+/// The device's account rather than this build's: a frame the NIC dropped for
+/// want of room is in `missed` and nowhere else, which is why a driver that
+/// wants to know what it lost must read here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortStats {
+    /// Frames the port handed to this process.
+    pub received: u64,
+    /// Frames the port took for transmission.
+    pub transmitted: u64,
+    /// Bytes of those frames.
+    pub received_bytes: u64,
+    /// Bytes of those frames.
+    pub transmitted_bytes: u64,
+    /// Frames the device dropped because it had nowhere to put them — the one
+    /// loss a driver cannot count for itself.
+    pub missed: u64,
+    /// Receive errors the PMD counted.
+    pub receive_errors: u64,
+    /// Transmit errors the PMD counted.
+    pub transmit_errors: u64,
+    /// Frames dropped because the pool had no buffer for them.
+    pub no_buffers: u64,
+}
+
+/// What a port's link is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// Whether the link is up.
+    pub up: bool,
+    /// Whether it is full duplex.
+    pub full_duplex: bool,
+    /// Its speed, in megabits per second — zero when it is down, and the
+    /// unknown-speed sentinel above that.
+    pub speed_mbps: u32,
+}
+
 /// A started port.
 ///
 /// Held in an [`Arc`]: the queues a thread was handed keep it alive, and the
@@ -172,6 +210,67 @@ impl Port {
         let rc = unsafe { sys::shim_port_mtu(c_uint::from(self.id), &mut mtu) };
         debug_assert_eq!(rc, 0, "a started port reports its MTU");
         mtu
+    }
+
+    /// What the port's own counters say (`rte_eth_stats`).
+    ///
+    /// The call is a plain read of the PMD's counters and is documented as
+    /// callable while the queues are in use; whether a given PMD's
+    /// implementation really is, D3 checks per PMD (the design's §4.10). What
+    /// this build needs from it is `missed` — the frames the *device* dropped,
+    /// which is the only loss a driver can see from its own side of the wire.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD, with DPDK's own words when it set an errno.
+    pub fn stats(&self) -> Result<PortStats, Error> {
+        let mut raw = sys::ShimPortStats::default();
+
+        // SAFETY: the struct is this crate's own layout, mirrored field for
+        // field in the shim, and the port id is one this value was started
+        // with.
+        let rc = unsafe { sys::shim_port_stats(c_uint::from(self.id), &mut raw) };
+        if rc != 0 {
+            return Err(Error::from_call(
+                "the port would not report its counters",
+                rc,
+            ));
+        }
+
+        Ok(PortStats {
+            received: raw.ipackets,
+            transmitted: raw.opackets,
+            received_bytes: raw.ibytes,
+            transmitted_bytes: raw.obytes,
+            missed: raw.imissed,
+            receive_errors: raw.ierrors,
+            transmit_errors: raw.oerrors,
+            no_buffers: raw.rx_nombuf,
+        })
+    }
+
+    /// What the link is doing, without waiting for it.
+    ///
+    /// The non-blocking form on purpose: a link that is still auto-negotiating
+    /// makes the other one wait, and this is read on a timer.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD.
+    pub fn link(&self) -> Result<Link, Error> {
+        let mut raw = sys::ShimPortLink::default();
+
+        // SAFETY: as in `stats` above.
+        let rc = unsafe { sys::shim_port_link(c_uint::from(self.id), &mut raw) };
+        if rc != 0 {
+            return Err(Error::from_call("the port would not report its link", rc));
+        }
+
+        Ok(Link {
+            up: raw.up != 0,
+            full_duplex: raw.full_duplex != 0,
+            speed_mbps: raw.speed_mbps,
+        })
     }
 
     /// Configure and start the port with this name, and hand out its queues.

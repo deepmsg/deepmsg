@@ -46,7 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use error::Error;
 pub use mempool::{Mempool, MempoolSettings, ParkedFrame};
-pub use port::{Checksum, Disposition, Port, PortInfo, PortSettings, QueuePair, RxFrame};
+pub use port::{
+    Checksum, Disposition, Link, Port, PortInfo, PortSettings, PortStats, QueuePair, RxFrame,
+};
 pub use ring::{Consumer, FrameRing, Producer};
 
 /// The lcore id of a thread EAL knows nothing about.
