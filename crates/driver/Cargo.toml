@@ -12,7 +12,7 @@ rust-version.workspace = true
 # queue pairs — is in the crate behind it (`docs/adr/0006`). A build without it
 # is the build the other gates run.
 default = []
-dpdk = ["dep:deepmsg-dpdk"]
+dpdk = ["dep:deepmsg-dpdk", "deepmsg-dpdk/dpdk"]
 
 [dependencies]
 deepmsg-core = { path = "../core" }

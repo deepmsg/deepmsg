@@ -24,6 +24,7 @@
 //!   frame.rs      Ethernet II / IPv4 / UDP / ICMP echo / ARP, as bytes
 //!   packet_io.rs  what a port is: rx_burst, tx_burst, and what a kept frame is
 //!   fake_port.rs  a port over a wire of VecDeques, and the wire's own knobs
+//!   dpdk_port.rs  the same port over a DPDK queue pair, when the build has it
 //!   ports.rs      (ip, port) → the transport that bound it
 //!   neighbour.rs  next hop → MAC
 //!   arp.rs        requests, replies, gleaning, ageing
@@ -40,6 +41,9 @@
 
 pub mod arp;
 pub mod demux;
+/// The port over a DPDK queue pair: the build that has the media at all.
+#[cfg(feature = "dpdk")]
+pub mod dpdk_port;
 pub mod fake_port;
 pub mod frame;
 pub mod neighbour;
