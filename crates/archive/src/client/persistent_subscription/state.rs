@@ -685,6 +685,31 @@ impl PersistentSubscription {
         Ok(subscription)
     }
 
+    /// Close it, giving everything it holds back
+    /// (`aeron_archive_persistent_subscription_close`, `:1074-1097`).
+    ///
+    /// The order is the reference's, and it is the order of **dependency**: the
+    /// live subscription and the request publication go first because they are
+    /// the ones that can be *asking* something, then the replay is stopped
+    /// — which needs the connection — and only then is the replay subscription
+    /// handed back and the client closed under it.
+    ///
+    /// ★ What the reference does that a `Drop` cannot: it is **explicit**. Its
+    /// close returns an `int` a caller is meant to read, and everything it frees
+    /// is freed in a known order rather than whenever the value happens to go
+    /// out of scope. The same is offered here, and `Drop` is deliberately
+    /// **not** implemented for this type: a subscription that closed itself
+    /// would hide the one thing a caller has to decide — whether the application
+    /// is done with it — behind when a local variable happened to die.
+    pub fn close(mut self) {
+        self.clean_up_live_subscription();
+        self.clean_up_request_publication();
+        self.clean_up_replay();
+        self.clean_up_replay_subscription();
+
+        self.client.close();
+    }
+
     /// Where the machine is.
     #[must_use]
     pub const fn state(&self) -> State {
@@ -2124,8 +2149,8 @@ impl PersistentSubscription {
 
         self.clean_up_live_subscription();
         self.clean_up_request_publication();
+        self.clean_up_replay();
         self.clean_up_replay_subscription();
-        self.replay_session_id = NULL_VALUE;
 
         self.transition(State::AwaitArchiveConnection);
     }
@@ -2179,6 +2204,33 @@ impl PersistentSubscription {
             if let Some(counters) = driver.counters_writable() {
                 self.counters.set_join_difference(&counters, value);
             }
+        }
+    }
+
+    /// `clean_up_replay` (`:741-760`): **tell the archive to stop replaying**,
+    /// if a replay is what it is doing.
+    ///
+    /// The one cleanup here that is a request rather than a release: the replay
+    /// is the *archive's* work, on the archive's side of the connection, and
+    /// giving the local subscription back does not stop it. What the reference
+    /// sends is a `stop_replay` naming the replay session id it was given
+    /// (`:1446`), and it does not wait for an answer — the connection may be
+    /// about to go away, which is exactly when this is called.
+    ///
+    /// A correlation id that cannot be drawn (no driver) skips the request and
+    /// still clears the id: the machine has stopped replaying either way, and an
+    /// id left behind would make the next cleanup try again.
+    fn clean_up_replay(&mut self) {
+        if NULL_VALUE == self.replay_session_id {
+            return;
+        }
+
+        let replay_session_id = std::mem::replace(&mut self.replay_session_id, NULL_VALUE);
+
+        if let Ok(correlation_id) = self.next_correlation_id() {
+            let _ = self
+                .client
+                .try_send_stop_replay_request(correlation_id, replay_session_id);
         }
     }
 

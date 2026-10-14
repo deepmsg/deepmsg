@@ -326,6 +326,13 @@ path = "integration/persistent_subscription_replay.rs"
 name = "persistent_subscription_counters"
 path = "integration/persistent_subscription_counters.rs"
 
+# P2-C4's closing family: what a close mid-replay gives back, judged by what can
+# be done afterwards rather than by the absence of a crash. Needs our archiving
+# media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_close"
+path = "integration/persistent_subscription_close.rs"
+
 # P2-C4's timeouts: what a persistent subscription does when an answer never
 # comes, judged by watching it ask again rather than by a poll's return value.
 # Needs our archiving media driver binary, so it runs in CI.
