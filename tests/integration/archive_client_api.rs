@@ -2511,3 +2511,235 @@ fn a_replication_reaches_an_archive_in_another_process() {
     media_driver.stop().expect("the destination driver stops");
     source_driver.stop().expect("the source driver stops");
 }
+
+/// The row a **self**-replication made: the one in this catalog that is not the
+/// source's.
+///
+/// [`the_only_recording`] is the cross-process criterion's, where the
+/// destination archive holds the copy and nothing else. Here both rows are in
+/// one catalog, and the copy is the one with an id of its own.
+fn the_copy(
+    archive: &mut Archive,
+    client: &mut Client,
+    source_id: i64,
+) -> Option<RecordingDescriptor> {
+    let mut rows = Vec::new();
+
+    let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+        rows.push(descriptor.clone());
+    });
+
+    rows.into_iter().find(|row| row.recording_id != source_id)
+}
+
+/// What the tagged replication's signal handler saw
+/// ([`a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay`]).
+///
+/// A sink of its own, for the reason [`SIGNALS`] gives: the handlers are `fn`
+/// pointers, and two rigs in one process share whatever they write to.
+static TAGGED_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+fn collect_tagged_signal(signal: &RecordingSignal) {
+    TAGGED_SIGNALS
+        .lock()
+        .expect("no other test is holding the tagged signals")
+        .push(*signal);
+}
+
+/// The two tags the tagged replication asks for (`ReplicationParams`).
+const CHANNEL_TAG_ID: i64 = 4242;
+const SUBSCRIPTION_TAG_ID: i64 = 4243;
+
+/// **A replication by tag subscribes by tag — and the copy still arrives.**
+///
+/// The `isMds` half of `EXTEND` (`ReplicationSession.java:527-555`): a request
+/// that carries tags, or a live destination, gets a destination recording whose
+/// channel is **rewritten** — the endpoint comes off, the tags go on,
+/// `control-mode=manual` — and then the endpoint is put back as an explicitly
+/// added **destination**.
+///
+/// The two halves are one mechanism, and this is the criterion that says so.
+/// A manual subscription binds nothing on its own: the channel above names no
+/// address at all, so the added destination is what has a socket, and the
+/// replay arrives through it.
+///
+/// **Measured, and the measurement is what says which assertion bites**: with
+/// the `async_add_rcv_destination` call removed, the taps in this criterion
+/// still see the channel rewritten and still see a `REPLICATE_END` — the
+/// session gives up in `AWAIT_IMAGE` and its teardown sends one — so what
+/// fails is the `SYNC` below, ten seconds later, along with the bytes that
+/// never arrived. The signals alone would not have caught it.
+///
+/// The source is this archive, as in
+/// [`a_replicate_fetches_its_source_descriptor_and_extends_the_destination`] —
+/// the shortest path that reaches the branch at all — and what the copy does
+/// with the bytes is still asked of the sources' two catalogs, which is what
+/// makes the destination load-bearing rather than decorative.
+#[test]
+fn a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replication-tagged")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_tagged_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the archive is connected");
+
+    let source = a_stopped_recording(&mut archive, &mut client);
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+    params.channel_tag_id = CHANNEL_TAG_ID;
+    params.subscription_tag_id = SUBSCRIPTION_TAG_ID;
+
+    let _replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            archive::CONTROL_CHANNEL,
+            &params,
+        )
+        .expect("the archive takes the tagged replication");
+
+    // The row the descriptor made, which is the copy's recording. **The row
+    // that is not the source's** — a self-replication leaves two in one
+    // catalog, unlike the cross-process criterion, whose destination holds the
+    // copy alone.
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        copied = the_copy(&mut archive, client, source.recording_id);
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // **The subscription `EXTEND` made**, on the channel it rewrote. The tags
+    // are the request's two ids in the reference's order — `channelTagId` then
+    // `subscriptionTagId` (`:539`) — and the endpoint is what is *not* there.
+    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(
+        &mut client,
+        "the destination's recording subscription",
+        |client| {
+            extended.clear();
+
+            let _ = archive.list_recording_subscriptions(
+                client,
+                0,
+                10,
+                "",
+                Some(RECORDING_STREAM_ID),
+                &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                    extended.push(descriptor.clone());
+                },
+            );
+
+            extended
+                .iter()
+                .any(|subscription| subscription.stripped_channel.contains("tags="))
+        },
+    );
+
+    let tagged = extended
+        .iter()
+        .find(|subscription| subscription.stripped_channel.contains("tags="))
+        .expect("the subscription the extend made");
+
+    assert!(
+        tagged
+            .stripped_channel
+            .contains(&format!("tags={CHANNEL_TAG_ID},{SUBSCRIPTION_TAG_ID}")),
+        "the tags the request carried are on the channel: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        tagged.stripped_channel.contains("control-mode=manual"),
+        "and the subscription reads from where it is told: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        !tagged.stripped_channel.contains("endpoint="),
+        "and it names no address of its own: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        tagged
+            .stripped_channel
+            .contains(&format!("session-id={}", source.session_id)),
+        "with the source's session id, which is what ties the replay to it: {}",
+        tagged.stripped_channel
+    );
+
+    // **And the copy runs to its end**, which is the half the add is
+    // load-bearing for: no image, no SYNC, no end.
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        TAGGED_SIGNALS
+            .lock()
+            .expect("no other test is holding the tagged signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
+    });
+
+    let signals = TAGGED_SIGNALS
+        .lock()
+        .expect("no other test is holding the tagged signals")
+        .clone();
+
+    let synced = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::SYNC)
+        .copied()
+        .expect("a SYNC signal");
+
+    assert!(
+        synced.position >= source.stop_position,
+        "the copy caught up with the source's stop: {} against {}",
+        synced.position,
+        source.stop_position
+    );
+
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "exactly one REPLICATE_END"
+    );
+
+    // **The bytes went through the destination.** The destination's row stops
+    // where the source's does, and it is not empty — which no subscription
+    // that bound nothing could have managed.
+    let copied_after =
+        the_copy(&mut archive, &mut client, source.recording_id).expect("still there");
+
+    assert_eq!(copied.recording_id, copied_after.recording_id);
+    assert!(
+        copied_after.stop_position > copied_after.start_position,
+        "the copy has data in it: {} against a start of {}",
+        copied_after.stop_position,
+        copied_after.start_position
+    );
+    assert_eq!(
+        source.stop_position, copied_after.stop_position,
+        "and it stops exactly where the source's recording stopped"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}

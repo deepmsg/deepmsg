@@ -35,16 +35,24 @@
 //!
 //! # What is here, and what is not
 //!
-//! **One state of twelve walks: `CONNECT`.** It is the one that ends with the
-//! session holding an archive client of its own, which is what every state after
-//! it asks the source through, and the one place a replication can fail outright.
+//! **Nine of the twelve states walk, and every route through the machine ends
+//! at the tenth.** `CONNECT` was first and the rest arrived one commit at a
+//! time, in the order they are listed in [`State`]; what each one does, and
+//! what it is observable through, is that state's own note.
 //!
-//! The other eleven are named, documented and **do nothing**, and that is
-//! deliberate: a state method with a plausible-looking stub is worse than one
-//! with no body at all, because the next reader cannot tell the two apart. They
-//! arrive one commit at a time, in the order they are listed in [`State`].
+//! The two that do not walk are `CATCHUP` and `ATTEMPT_LIVE_JOIN`, the
+//! live-merge pair. They are named and documented rather than stubbed, and that
+//! is deliberate: a state method with a plausible-looking body is worse than
+//! one that does nothing, because the next reader cannot tell the two apart.
+//! What leads to them is a `live_destination` (`:380-399`), which no criterion
+//! this build is held to names — and the branch a **tagged** request reaches
+//! instead is a different one, which [`State`] has the note on.
 
-use deepmsg_client::client::{AsyncNextSessionId, AsyncNextSessionIdPoll, Client};
+use std::time::Duration;
+
+use deepmsg_client::client::{
+    AsyncDestination, AsyncDestinationPoll, AsyncNextSessionId, AsyncNextSessionIdPoll, Client,
+};
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::source_location::SourceLocation;
 
@@ -77,6 +85,10 @@ const ENDPOINT_KEY: &str = "endpoint";
 const LINGER_KEY: &str = "linger";
 /// `CommonContext.EOS_PARAM_NAME` (`CommonContext.java:231`).
 const EOS_KEY: &str = "eos";
+/// `CommonContext.TAGS_PARAM_NAME` (`CommonContext.java:334`).
+const TAGS_KEY: &str = "tags";
+/// `CommonContext.MDC_CONTROL_MODE_MANUAL` (`CommonContext.java:303`).
+const CONTROL_MODE_MANUAL: &str = "manual";
 /// `CommonContext.RESPONSE_CORRELATION_ID_PARAM_NAME`.
 const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
 /// `AeronArchive.NULL_LENGTH` (`AeronArchive.java:106`), which is `NULL_VALUE`:
@@ -139,9 +151,16 @@ impl Credentials for SessionCredentials {
 /// method per state and no state without one. `DO_WORK` is what calls them
 /// (`:217-293`, whose `switch` is the whole of the machine).
 ///
-/// `CATCHUP` and `ATTEMPT_LIVE_JOIN` are the live-merge pair, and the four
-/// criteria this build is held to never reach them (`live_destination` is empty
-/// in all four); they are named here so the pair is not mistaken for a gap.
+/// `CATCHUP` and `ATTEMPT_LIVE_JOIN` are the live-merge pair, and the criteria
+/// this build is held to never reach them (`live_destination` is empty in every
+/// one of them, the tagged replication included); they are named here so the
+/// pair is not mistaken for a gap.
+///
+/// **The pair is not the same thing as the multi-destination branch.**
+/// `EXTEND`'s `isMds` half walks for a **tagged** request, and
+/// `a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay` (in
+/// `deepmsg-tests`) is the criterion that reaches it; the pair is where a
+/// **live destination** leads, and nothing walks it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Connect to the source archive (`connect`, `:401-443`).
@@ -358,6 +377,18 @@ pub struct ReplicationSession {
     /// what keeps [`State::Extend`] from asking again every turn.
     extend_asked: bool,
 
+    /// The destination added to the recording subscription once `EXTEND` has
+    /// made it, while the driver has yet to answer — the reference's
+    /// `recordingSubscription.asyncAddDestination` (`:553`), which it never
+    /// waits for and never reads the answer of.
+    ///
+    /// Kept for one reason: the handle is what retires the client's pending
+    /// entry. The reference's `Subscription` polls its own destinations, so a
+    /// caller that forgets one is a caller that leaks nothing; this client
+    /// retires an entry when it is polled, and the session is the only thing
+    /// that would ever poll this one. See [`ReplicationSession::do_work`].
+    destination_add: Option<AsyncDestination>,
+
     /// What the conductor answered it with, once it has run — the reference's
     /// return value from `conductor.extendRecording`, delivered a turn late
     /// because that is where this build's conductor is.
@@ -474,6 +505,7 @@ impl ReplicationSession {
             credentials,
             now_ms: 0,
             extend_asked: false,
+            destination_add: None,
             extend_answer: None,
             active_correlation_id: NULL_VALUE,
             time_of_last_action_ms: 0,
@@ -553,6 +585,20 @@ impl ReplicationSession {
             return ReplicationProgress::Done;
         }
 
+        // The destination `EXTEND` added, once the driver has answered it.
+        //
+        // Nothing reads the answer — the reference does not either, its
+        // `Subscription` polls its own destinations and no state asks — so what
+        // this is for is the *retirement* of the pending entry: a handle that
+        // is never polled leaves the client holding a record of a command
+        // whose only remaining outcome is a timeout. One poll per turn until it
+        // is answered, and then it is dropped.
+        if self.destination_add.is_some_and(|add| {
+            !matches!(client.destination_poll(add), AsyncDestinationPoll::Awaiting)
+        }) {
+            self.destination_add = None;
+        }
+
         // `ReplicationSession.doWork`'s `try` (`:273-278`): a state that throws
         // has its failure answered **for it**, with `GENERIC` and the
         // exception's own message, and then the state is over. A state that
@@ -561,7 +607,7 @@ impl ReplicationSession {
             State::Connect => self.connect(client),
             State::ReplicateDescriptor => self.replicate_descriptor(client, catalog, now_ms),
             State::SrcRecordingPosition => self.src_recording_position(client, now_ms),
-            State::Extend => self.extend(),
+            State::Extend => self.extend(client),
             State::ReplayToken => self.replay_token(),
             State::GetArchiveProxy => self.get_archive_proxy(),
             State::Replay => self.replay(client, now_ms),
@@ -714,16 +760,38 @@ impl ReplicationSession {
     /// for once the call has been made. The conductor answers every request it
     /// is handed, this turn or the next.
     ///
-    /// **The `isMds` half is not built.** `isTagged || null != liveDestination`
+    /// **The `isMds` half is here too.** `isTagged || null != liveDestination`
     /// (`:527`) rewrites the channel again — endpoint off, tags on,
-    /// `control-mode=manual` — and then adds a destination. No criterion in this
-    /// build's list reaches a tagged or live replication (plan §3.2), so that
-    /// branch is recorded rather than written.
-    fn extend(&mut self) -> Result<(), String> {
+    /// `control-mode=manual` — and then, once the extend has been answered,
+    /// adds the endpoint back as a **destination** (`:550-555`). The two halves
+    /// are one thing: a manual subscription has no endpoints of its own, so the
+    /// destination is what binds the address the replay arrives on, and a
+    /// subscription given the channel without it would never see an image.
+    ///
+    /// It takes the client for that reason, and only for that: the add is a
+    /// client command, and the client here is the one that holds the recording
+    /// subscription — this archive's own.
+    fn extend(&mut self, client: &mut Client) -> Result<(), String> {
         if let Some(answer) = self.extend_answer.take() {
             match answer {
                 Ok(registration_id) => {
                     self.recording_subscription = Some(registration_id);
+
+                    if self.is_mds() {
+                        let destination = self.replay_destination()?;
+                        let timeout = Duration::from_millis(
+                            u64::try_from(self.action_timeout_ms).unwrap_or(u64::MAX),
+                        );
+
+                        self.destination_add = Some(
+                            client
+                                .async_add_rcv_destination(registration_id, &destination, timeout)
+                                .map_err(|error| {
+                                    format!("replay destination could not be added: {error}")
+                                })?,
+                        );
+                    }
+
                     self.go_to(State::ReplayToken);
                 }
                 Err(_) => self.state = State::Done,
@@ -760,6 +828,13 @@ impl ReplicationSession {
     /// `rejoin=false`, so an image that goes away is not fought for, and the
     /// session id the replay will arrive under — which is the **source's**
     /// replay session, settled off the descriptor, not this session's own.
+    ///
+    /// The third is the multi-destination rewrite (`:536-541`), and it undoes
+    /// the first two's subject: the channel stops naming where to bind at all,
+    /// and names **tags** instead — `channelTagId,subscriptionTagId`, the
+    /// pair the request carried — with `control-mode=manual` so the client
+    /// decides where it reads from. The endpoint it takes off is not lost: it
+    /// is what [`Self::replay_destination`] puts back, on the destination.
     fn extend_channel(&self) -> Result<String, String> {
         let mut uri = ChannelUri::parse(&self.replication_channel)
             .map_err(|error| format!("{} is not a channel: {error}", self.replication_channel))?;
@@ -770,7 +845,58 @@ impl ReplicationSession {
             uri.put(SESSION_ID_KEY, self.replay_session_id.to_string());
         }
 
+        if self.is_mds() {
+            uri.remove(ENDPOINT_KEY);
+            uri.put(
+                TAGS_KEY,
+                format!(
+                    "{},{}",
+                    self.request.channel_tag_id, self.request.subscription_tag_id
+                ),
+            );
+            uri.put(CONTROL_MODE_KEY, CONTROL_MODE_MANUAL);
+        }
+
         Ok(uri.build())
+    }
+
+    /// `isMds` (`:527`): whether the destination subscribes **by tag or by
+    /// hand**, which is the one thing `EXTEND` branches on.
+    ///
+    /// The reference's name for the branch is the condition, which reads
+    /// backwards: `isTagged` is the field it keeps for the two tag ids
+    /// (`:95`, `:150`), and a **live destination** joins it because a copy
+    /// that has to follow a stream which comes and goes cannot take its
+    /// address from a channel — it has to be a destination that is added and
+    /// removed, and a destination needs the manual shape to be addable.
+    fn is_mds(&self) -> bool {
+        self.request.channel_tag_id != NULL_VALUE
+            || self.request.subscription_tag_id != NULL_VALUE
+            || self.live_destination.is_some()
+    }
+
+    /// The destination `EXTEND` adds (`:552`), or the reason there cannot be
+    /// one.
+    ///
+    /// **Built from the copy's own channel**, not from the subscription's: the
+    /// reference passes `replicationChannel` (`:552`) and the endpoint it took
+    /// off it (`:529`), so the destination ends up naming the very address the
+    /// channel used to — which is the whole point of the swap. The
+    /// session-id/`rejoin`/tags the subscription's channel carries are
+    /// deliberately not on it; see [`ChannelUri::create_destination_uri`].
+    ///
+    /// The reference keeps the result in `replayDestination` for
+    /// `ATTEMPT_LIVE_JOIN` to remove when the live stream ends (`:875`). That
+    /// state does not walk here yet, so this is computed when it is needed and
+    /// kept nowhere.
+    fn replay_destination(&self) -> Result<String, String> {
+        let endpoint = ChannelUri::parse(&self.replication_channel)
+            .map_err(|error| format!("{} is not a channel: {error}", self.replication_channel))?
+            .get(ENDPOINT_KEY)
+            .map(str::to_owned);
+
+        ChannelUri::create_destination_uri(&self.replication_channel, endpoint.as_deref())
+            .map_err(|error| error.to_string())
     }
 
     /// The conductor's answer to the extend, delivered a turn late
@@ -948,10 +1074,10 @@ impl ReplicationSession {
         }
 
         // `:380-399`. The live branch is out of reach for every criterion this
-        // slice is held to (`live_destination` is empty in all four) and the
-        // state it names does not walk yet; the transition is written down
-        // because the **refusal** in front of it is the reference's, and it is
-        // the one a live request meets.
+        // build is held to (`live_destination` is empty in every one of them)
+        // and the state it names does not walk yet; the transition is written
+        // down because the **refusal** in front of it is the reference's, and
+        // it is the one a live request meets.
         if self.live_destination.is_some() {
             if self.request.stop_position != NULL_POSITION {
                 self.fail(
