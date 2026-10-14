@@ -24,6 +24,7 @@
 //!   frame.rs      Ethernet II / IPv4 / UDP / ICMP echo / ARP, as bytes
 //!   packet_io.rs  what a port is: rx_burst, tx_burst, and what a kept frame is
 //!   fake_port.rs  a port over a wire of VecDeques, and the wire's own knobs
+//!   dpdk_counters.rs  the counters a DPDK media publishes
 //!   eal.rs        what the EAL is started with, and the CPUs it may use
 //!   dpdk_port.rs  the same port over a DPDK queue pair, when the build has it
 //!   dpdk.rs       the media: EAL, pool and port, in the order they open
@@ -46,6 +47,8 @@ pub mod demux;
 /// The media itself — the EAL, the pool, the port — for the build that has it.
 #[cfg(feature = "dpdk")]
 pub mod dpdk;
+/// The counters a DPDK media publishes, which need no DPDK to allocate.
+pub mod dpdk_counters;
 /// The port over a DPDK queue pair: the build that has the media at all.
 #[cfg(feature = "dpdk")]
 pub mod dpdk_port;
