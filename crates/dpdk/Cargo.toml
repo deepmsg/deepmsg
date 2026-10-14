@@ -1,0 +1,18 @@
+[package]
+name = "deepmsg-dpdk"
+description = "The kernel-bypass media seam: DPDK behind a shim (ADR-0006)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Off by default, and the default build is the whole workspace as it was: this
+# crate compiles to nothing and no machine needs DPDK to build it (ADR-0006).
+# `dpdk` compiles the shim against the installed DPDK and links it.
+default = []
+dpdk = []
+
+[lints]
+workspace = true
