@@ -1,7 +1,7 @@
-//! The DPDK media's lifecycle: open, run, and give everything back (D4's
-//! `DpdkMedia`).
+//! The DPDK media's lifecycle and its queue map: open, run, and give
+//! everything back (D4's `DpdkMedia`).
 //!
-//! Three things are being judged, and only the first is about DPDK at all.
+//! What is being judged, and only the first is about DPDK at all:
 //!
 //! * **The close path's account.** A pool in a `OnceLock` is never dropped, so
 //!   `Mempool::available` is the whole ledger of what a media took: the frames
@@ -15,27 +15,35 @@
 //!   `DpdkSettings` and handed to a real `rte_eal_init`, so a composition that
 //!   is wrong only in the presence of an actual EAL fails here rather than
 //!   there.
-//! * **One media per process.** The EAL and the pool are process-wide and
-//!   neither can be made twice, so a second open says so instead of quietly
-//!   configuring a port on the first one's pool.
+//! * **The queue map's edges.** One media per process; a device that cannot
+//!   carry the pairs a threading mode wants, refused by name; and the ready
+//!   ring full, which on this path is a frame going back to its pool rather
+//!   than a `Vec` being dropped.
 //!
 //! Each case runs in a child process of this binary, because `rte_eal_init` is
 //! once per process (D0).
 //!
 //! The port every case here uses is `net_pcap`, which has **one** receive queue
-//! and one transmit queue — so a media opened with one pair, and what §4.7's
-//! "one receive queue and two transmit queues" means for a device that cannot
-//! carry it, is a criterion of its own below.
+//! and one transmit queue — so the modes that put both agents on one thread
+//! open, and `DEDICATED`, which wants three pairs, does not. That is a fact
+//! about the CI path rather than about this port: every virtual device this
+//! build's tests run on reports one queue of each, so the three-pair shape is
+//! one only a real NIC is ever asked for.
 
 #![cfg(feature = "dpdk")]
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 
-use deepmsg_driver::config::DpdkSettings;
+use deepmsg_driver::config::{DpdkSettings, ThreadingMode};
 use deepmsg_driver::media::userspace::dpdk::{DpdkError, DpdkMedia};
-use deepmsg_driver::media::userspace::dpdk_port::DpdkRxPort;
-use deepmsg_driver::media::userspace::packet_io::{Disposition, Offloads, RxPort};
+use deepmsg_driver::media::userspace::frame;
+use deepmsg_driver::media::userspace::frame::{
+    BROADCAST, IPV4_UDP_HEADER_LENGTH, Ipv4Write, UdpWrite,
+};
+use deepmsg_driver::media::userspace::packet_io::{Disposition, Offloads};
 use deepmsg_driver::media::userspace::ports::Binding;
+use deepmsg_driver::media::userspace::stack::{Clock, Stack, StackParams};
 
 mod common;
 
@@ -43,6 +51,12 @@ use common::pcap::{Capture, in_a_child};
 
 /// Where a child is told to find the capture it receives.
 const RX_PCAP: &str = "DEEPMSG_DRIVER_DPDK_MEDIA_RX_PCAP";
+
+/// The stack's own address, which the frames in a capture are addressed to.
+const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
+
+/// The port the frames are for, which the case that pumps binds.
+const BOUND: u16 = 40500;
 
 /// The settings every case here opens with: a `net_pcap` port reading the
 /// capture the parent wrote, and the memory the EAL needs to start without
@@ -55,11 +69,17 @@ fn settings(capture: &str) -> DpdkSettings {
     DpdkSettings {
         eal_args: format!("--no-huge --vdev=net_pcap0,rx_pcap={capture}"),
         port: Some("net_pcap0".to_owned()),
-        address: Some((Ipv4Addr::new(10, 10, 0, 1), 24)),
+        address: Some((OWN, 24)),
         gateway: Some(Ipv4Addr::new(10, 10, 0, 254)),
         ..DpdkSettings::default()
     }
 }
+
+/// The mode every case that only wants a port opens with.
+///
+/// `net_pcap` has one queue of each kind, and this is the map that wants one
+/// pair — the two agents on one thread, sharing the one transmit queue.
+const ONE_PAIR: ThreadingMode = ThreadingMode::Shared;
 
 /// A frame of this file's own: an Ethernet destination and a payload that says
 /// which frame it is.
@@ -72,8 +92,49 @@ fn a_frame(index: u8) -> Vec<u8> {
     frame
 }
 
+/// A frame the stack can route: UDP to `OWN:BOUND`, carrying an Aeron `DATA`
+/// frame, which is what a transport's ring is for.
+///
+/// The destination is the **broadcast** address because the port's own MAC
+/// belongs to the device, and the device does not exist until the child starts
+/// the EAL — which is after this capture has to be on disk. A broadcast frame
+/// is one every port reads ([`frame::EthernetHeader::is_for`]), and the stack
+/// routes it by its address and port like any other.
+fn a_datagram(index: u8) -> Vec<u8> {
+    let mut aeron = vec![0u8; 8 + 16];
+    aeron[6..8].copy_from_slice(&1i16.to_le_bytes()); // frame type: DATA
+    aeron[16] = index;
+
+    let mut bytes = vec![0u8; IPV4_UDP_HEADER_LENGTH + aeron.len()];
+    bytes[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&aeron);
+    let written = frame::write_ipv4_udp(
+        &mut bytes,
+        &UdpWrite {
+            ipv4: Ipv4Write {
+                destination_hardware: BROADCAST,
+                source_hardware: [0x02, 0, 0, 0, 0, 0x02],
+                source: Ipv4Addr::new(10, 10, 0, 2),
+                destination: OWN,
+                identification: u16::from(index),
+            },
+            source_port: 40000,
+            destination_port: BOUND,
+            payload_length: aeron.len(),
+        },
+    )
+    .expect("a frame");
+
+    bytes.truncate(written);
+    bytes
+}
+
 fn capture_of(name: &str, count: u8) -> Capture {
     let frames: Vec<Vec<u8>> = (0..count).map(a_frame).collect();
+    Capture::of(name, &frames)
+}
+
+fn capture_of_datagrams(name: &str, count: u8) -> Capture {
+    let frames: Vec<Vec<u8>> = (0..count).map(a_datagram).collect();
     Capture::of(name, &frames)
 }
 
@@ -94,7 +155,7 @@ fn a_media_gives_its_frames_back_when_it_closes() {
 #[ignore = "runs as a child of `a_media_gives_its_frames_back_when_it_closes`"]
 fn a_media_gives_its_frames_back_when_it_closes_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let mut media = DpdkMedia::open(&settings(&capture), 1).expect("the media opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
 
     let pool = media.pool();
     let whole = media.pool_size();
@@ -110,19 +171,24 @@ fn a_media_gives_its_frames_back_when_it_closes_in_the_child() {
     assert_eq!("net_pcap", media.info().driver);
     assert_eq!(Offloads::NONE, media.offloads());
 
-    let pair = media.take_pair().expect("the pair it was opened with");
-    assert_eq!(0, media.pairs_left(), "and there was one of them");
+    let mut ports = media.into_ports().expect("the mode's three roles");
+    assert_eq!(
+        6,
+        ports.rx.mac().len(),
+        "the receive port's MAC is the device's"
+    );
 
     let binding = Binding {
         slot: 1,
-        port: 40500,
+        port: BOUND,
         generation: 1,
     };
-    let mut port = DpdkRxPort::new(pair, pool);
     let mut parked = Vec::new();
     assert_eq!(
         3,
-        port.rx_burst(3, &mut |_| Disposition::Keep(binding), &mut parked),
+        ports
+            .rx
+            .rx_burst(3, &mut |_| Disposition::Keep(binding), &mut parked),
         "three frames were in the capture"
     );
     assert_eq!(
@@ -132,8 +198,7 @@ fn a_media_gives_its_frames_back_when_it_closes_in_the_child() {
     );
 
     drop(parked);
-    drop(port);
-    drop(media);
+    drop(ports);
 
     assert_eq!(
         whole,
@@ -141,6 +206,159 @@ fn a_media_gives_its_frames_back_when_it_closes_in_the_child() {
         "every frame and the receive queue's own descriptors are back: a pool \
          short here is a frame the close path forgot, or a port that was never \
          closed"
+    );
+}
+
+// ---- one pair, two directions -------------------------------------------
+
+/// Where a child is told to write what it sends.
+const TX_PCAP: &str = "DEEPMSG_DRIVER_DPDK_MEDIA_TX_PCAP";
+
+/// One queue pair carries both directions: the receive port reads its receive
+/// queue and the transmit port writes its transmit queue, out of the pair the
+/// machine gave a mode whose two agents share a thread.
+///
+/// The frame is read back out of the capture the PMD wrote, so what is being
+/// asserted is that a transmit port built from the *shared* pair reaches the
+/// device — a port that had quietly been given a second pair of its own would
+/// pass every other case here and put its frames on a queue nobody reads.
+#[test]
+fn a_shared_pair_carries_frames_both_ways() {
+    let capture = Capture::of("both-ways-rx", &[a_datagram(0)]);
+    let sent = Capture::for_writing("both-ways-tx");
+    in_a_child(
+        "a_shared_pair_carries_frames_both_ways_in_the_child",
+        &[(RX_PCAP, capture.path()), (TX_PCAP, sent.path())],
+    );
+
+    let written = common::pcap::read_capture(std::path::Path::new(sent.path()));
+    assert_eq!(1, written.len(), "one frame left through the port");
+    assert_eq!(
+        a_frame(0),
+        written[0],
+        "and the bytes that left are the bytes that were written into it"
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `a_shared_pair_carries_frames_both_ways`"]
+fn a_shared_pair_carries_frames_both_ways_in_the_child() {
+    use deepmsg_driver::media::userspace::stack::TransmitQueues;
+
+    let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+    let sent = std::env::var(TX_PCAP).expect("and the one to write");
+
+    let media = DpdkMedia::open(
+        &DpdkSettings {
+            eal_args: format!("--no-huge --vdev=net_pcap0,rx_pcap={capture},tx_pcap={sent}"),
+            ..settings(&capture)
+        },
+        ONE_PAIR,
+    )
+    .expect("the media opens");
+
+    let mut ports = media.into_ports().expect("the mode's three roles");
+    let TransmitQueues::Shared(tx) = &mut ports.tx else {
+        panic!("a mode with one pair shares its transmit queue between the two roles");
+    };
+
+    let expected = a_frame(0);
+    assert_eq!(
+        1,
+        tx.tx_burst(1, &mut |room| {
+            room[..expected.len()].copy_from_slice(&expected);
+            expected.len()
+        }),
+        "the frame left through the pair the receive port came from"
+    );
+
+    let mut parked = Vec::new();
+    assert_eq!(
+        1,
+        ports
+            .rx
+            .rx_burst(1, &mut |_| Disposition::Consumed, &mut parked),
+        "and the receive queue of the same pair still hands frames over"
+    );
+}
+
+// ---- the ready ring, on this path ---------------------------------------
+
+/// A frame the ready ring has no room for is counted (88) and **goes straight
+/// back to its pool** — which is the zero-copy path's own way of dropping one:
+/// there is no buffer to free elsewhere, because there was never a buffer to
+/// begin with.
+///
+/// This is the D4 half of the falsification D2 ran over the fake wire ("环容量
+/// 设 1 + 打压", its §7.2): the ring is given room for two frames, eight
+/// arrive, and the six the ring refuses are the pool's again by the time the
+/// pump returns.
+#[test]
+fn a_frame_the_ring_has_no_room_for_goes_back_to_the_pool() {
+    let capture = capture_of_datagrams("ring", 8);
+    in_a_child(
+        "a_frame_the_ring_has_no_room_for_goes_back_to_the_pool_in_the_child",
+        &[(RX_PCAP, capture.path())],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `a_frame_the_ring_has_no_room_for_goes_back_to_the_pool`"]
+fn a_frame_the_ring_has_no_room_for_goes_back_to_the_pool_in_the_child() {
+    let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let pool = media.pool();
+    let whole = media.pool_size();
+
+    let ports = media.into_ports().expect("the mode's three roles");
+    // A window one datagram wide is a ring two frames deep
+    // (`StackParams::ring_capacity`): the smallest one this stack can have.
+    let params = StackParams {
+        receive_window: 1,
+        ..StackParams::new(OWN, 24, ports.rx.mac())
+    };
+    let capacity = params.ring_capacity();
+    assert_eq!(2, capacity, "the smallest ring there is");
+
+    let stack = Stack::new(params, Clock::Monotonic, ports.rx, ports.tx);
+    let (_binding, ring) = stack
+        .bind(Some(OWN), BOUND, None, SocketAddr::from((OWN, BOUND)))
+        .expect("the port binds");
+
+    assert_eq!(
+        8,
+        stack.pump(),
+        "eight datagrams arrived through the PMD in one pass"
+    );
+
+    assert_eq!(
+        capacity,
+        ring.len(),
+        "the ring holds what it has room for and not one more"
+    );
+    assert_eq!(
+        8 - capacity,
+        stack.counters().queue_drop.load(Ordering::Relaxed) as usize,
+        "and every frame it had no room for is counted (88)"
+    );
+    assert_eq!(
+        whole - capacity as u32,
+        pool.available(),
+        "exactly the frames in the ring are out of the pool: the ones 88 counted \
+         are back in it already, because dropping one of these is dropping the \
+         mbuf the port handed over"
+    );
+
+    // Two things hold the parked frames and both have to go: the stack, which
+    // holds the ports, and this test's own handle on the ring the slot table
+    // made.
+    drop(stack);
+    drop(ring);
+
+    assert_eq!(
+        whole,
+        pool.available(),
+        "and the ring's frames are back too, when the stack that held them goes"
     );
 }
 
@@ -166,16 +384,53 @@ fn the_eal_starts_no_workers_of_its_own() {
 #[test]
 #[ignore = "runs as a child of `the_eal_starts_no_workers_of_its_own`"]
 fn the_eal_starts_no_workers_of_its_own_in_the_child() {
+    use deepmsg_dpdk::Eal;
+    use deepmsg_driver::media::userspace::dpdk::register_thread;
+
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let _media = DpdkMedia::open(&settings(&capture), 1).expect("the media opens");
+
+    // Before any media: there is no EAL in this process and nothing to
+    // register with, which is what a driver on the kernel's sockets sees.
+    assert!(
+        register_thread().is_none(),
+        "a process with no EAL has nothing to register a thread with"
+    );
+
+    let _media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
 
     assert_eq!(
         1,
-        deepmsg_dpdk::Eal::lcore_count(),
+        Eal::lcore_count(),
         "one lcore is the process's own thread: a higher number is the EAL's \
          own workers, which is what a driver that pins its threads to CPUs \
          cannot have"
     );
+
+    // The thread that started the EAL is its main lcore, so it has an id
+    // already. A thread the driver starts does not — and that is the thread
+    // `run_agent` registers, because without an id the pool's per-lcore cache
+    // is not used and every allocation it makes goes to the shared ring (R7).
+    assert!(
+        Eal::lcore_id().is_some(),
+        "the thread that initialised the EAL is its main lcore"
+    );
+
+    std::thread::spawn(|| {
+        assert!(
+            Eal::lcore_id().is_none(),
+            "a fresh std::thread has no lcore id"
+        );
+
+        let registered = register_thread().expect("a media is open");
+        assert!(
+            Eal::lcore_id().is_some(),
+            "and registering it is what gives it one"
+        );
+
+        drop(registered);
+    })
+    .join()
+    .expect("the thread joins");
 }
 
 // ---- what a device that cannot carry the shape is told ------------------
@@ -203,7 +458,8 @@ fn a_device_with_too_few_queues_is_refused_by_name() {
 fn a_device_with_too_few_queues_is_refused_by_name_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
 
-    let refused = DpdkMedia::open(&settings(&capture), 3).expect_err("net_pcap has one queue");
+    let refused = DpdkMedia::open(&settings(&capture), ThreadingMode::Dedicated)
+        .expect_err("net_pcap has one queue");
     assert!(matches!(refused, DpdkError::Capability { .. }));
     assert!(
         refused.to_string().contains("net_pcap0"),
@@ -231,11 +487,12 @@ fn a_second_media_is_refused() {
 #[ignore = "runs as a child of `a_second_media_is_refused`"]
 fn a_second_media_is_refused_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let mut media = DpdkMedia::open(&settings(&capture), 1).expect("the first one opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the first one opens");
     let pool = media.pool();
     let whole = media.pool_size();
 
-    let refused = DpdkMedia::open(&settings(&capture), 1).expect_err("the second one does not");
+    let refused =
+        DpdkMedia::open(&settings(&capture), ONE_PAIR).expect_err("the second one does not");
     assert!(matches!(refused, DpdkError::AlreadyOpen));
     assert!(
         refused.to_string().contains("already open"),
@@ -250,18 +507,67 @@ fn a_second_media_is_refused_in_the_child() {
     // The first media is untouched by the refusal, which is the half that
     // matters: a refusal that had opened a port before noticing would leave a
     // configured device and no value to close it with.
-    let pair = media
-        .take_pair()
-        .expect("the first media still has its pair");
-    let mut port = DpdkRxPort::new(pair, pool);
+    let mut ports = media
+        .into_ports()
+        .expect("the first media still has its roles");
     let mut parked = Vec::new();
     assert_eq!(
         1,
-        port.rx_burst(1, &mut |_| Disposition::Consumed, &mut parked),
+        ports
+            .rx
+            .rx_burst(1, &mut |_| Disposition::Consumed, &mut parked),
         "and still runs"
     );
 
-    drop(port);
-    drop(media);
+    drop(ports);
     assert_eq!(whole, pool.available());
+}
+
+/// The stack the media builds carries the media's address, gateway and MAC —
+/// and it is what holds the ports, so dropping it is what stops the port.
+#[test]
+fn the_media_hands_the_stack_its_own_settings() {
+    let capture = capture_of("params", 0);
+    in_a_child(
+        "the_media_hands_the_stack_its_own_settings_in_the_child",
+        &[(RX_PCAP, capture.path())],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `the_media_hands_the_stack_its_own_settings`"]
+fn the_media_hands_the_stack_its_own_settings_in_the_child() {
+    let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let pool = media.pool();
+    let whole = media.pool_size();
+
+    let stack = media.into_stack(Clock::Monotonic).expect("a stack");
+    let params = stack.params();
+
+    assert_eq!(OWN, params.address);
+    assert_eq!(24, params.prefix_length);
+    assert_eq!(Some(Ipv4Addr::new(10, 10, 0, 254)), params.gateway);
+    assert_ne!(
+        [0; 6], params.mac,
+        "the MAC is the device's — a port has an address to send from"
+    );
+    assert_eq!(
+        deepmsg_driver::config::MTU_LENGTH_DEFAULT as usize,
+        params.mtu,
+        "the MTU is the Aeron one the channels are configured with, not the \
+         frame size the port carries (that one is `RxPort::mtu`)"
+    );
+    assert_eq!(
+        deepmsg_driver::config::RCV_INITIAL_WINDOW_LENGTH_DEFAULT as usize,
+        params.receive_window
+    );
+
+    drop(stack);
+
+    assert_eq!(
+        whole,
+        pool.available(),
+        "dropping the stack is what closed the port and gave the frames back"
+    );
 }

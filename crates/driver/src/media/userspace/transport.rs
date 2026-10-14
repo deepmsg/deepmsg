@@ -876,10 +876,10 @@ mod tests {
             },
             super::super::stack::Clock::Monotonic,
             Box::new(wire.port(Side::A, OUR_MAC, 1408)),
-            [
+            super::super::stack::TransmitQueues::PerRole(
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
-            ],
+            ),
         ));
         let mut transport = open(&stack, 40487);
         stack.insert_neighbour(gateway, [0x02, 0, 0, 0, 0, 0xfe]);

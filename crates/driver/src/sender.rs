@@ -47,6 +47,7 @@ use deepmsg_cnc::command::OwnedPublicationError;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
+use crate::config::ThreadNaming;
 use crate::driver::{Role, Timer};
 use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
@@ -512,7 +513,8 @@ impl Sender {
         )?;
 
         let thread = crate::driver::run_agent(
-            Role::Sender.classic_name(),
+            Role::Sender,
+            ThreadNaming::Classic,
             agent,
             crate::driver::default_strategy(),
             None,

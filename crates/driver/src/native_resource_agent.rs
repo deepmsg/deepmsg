@@ -50,6 +50,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use crate::config::ThreadNaming;
 use crate::driver::Role;
 
 use deepmsg_cnc::{CncFile, CounterManager};
@@ -391,7 +392,8 @@ impl NativeResourceAgent {
         } = Self::split(checks)?;
 
         let thread = crate::driver::run_agent(
-            Role::NativeResourceAgent.classic_name(),
+            Role::NativeResourceAgent,
+            ThreadNaming::Classic,
             state,
             crate::driver::default_strategy(),
             None,

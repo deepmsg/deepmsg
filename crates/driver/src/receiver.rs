@@ -35,6 +35,7 @@ use std::thread::JoinHandle;
 use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions};
 
+use crate::config::ThreadNaming;
 use crate::driver::{Role, Timer};
 
 use crate::media::dispatcher::{Interest, SetupInterest};
@@ -698,7 +699,8 @@ impl Receiver {
         )?;
 
         let thread = crate::driver::run_agent(
-            Role::Receiver.classic_name(),
+            Role::Receiver,
+            ThreadNaming::Classic,
             agent,
             crate::driver::default_strategy(),
             None,

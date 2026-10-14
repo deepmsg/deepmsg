@@ -420,22 +420,56 @@ pub struct Stack {
     now: Clock,
 }
 
-impl Stack {
-    /// A stack over the three ports a machine has: one receive queue and one
-    /// transmit queue per agent thread.
+/// The transmit queues a stack's two roles drive.
+///
+/// The design's §4.7 gives a machine one transmit queue per agent thread, and
+/// how many threads there are is the threading mode's business: `DEDICATED`
+/// runs the sender and the receiver apart, so each owns a queue, and
+/// `SHARED_NETWORK` and `SHARED` run both on one thread, so the machine gives
+/// the media one queue and both roles drive it. Which of the two a stack has is
+/// therefore not something it can work out for itself — it is what the media
+/// handed over, and the type is where that is written down.
+pub enum TransmitQueues {
+    /// One queue each: `DEDICATED`, two threads.
+    PerRole(Box<dyn TxPort>, Box<dyn TxPort>),
+    /// One queue for both roles: `SHARED_NETWORK` and `SHARED`, one thread.
     ///
-    /// `tx` is indexed by [`Affinity`]: `0` is the sender's queue and `1` the
-    /// receiver's, which is the design's §4.7 mapping and the reference's own
-    /// discriminants.
+    /// Both affinities reach the same port, and the lock around it is what
+    /// keeps that safe — the two passes are never nested, so one thread
+    /// driving both roles takes it twice in sequence rather than twice at
+    /// once.
+    Shared(Box<dyn TxPort>),
+}
+
+impl Stack {
+    /// A stack over the ports a machine has: one receive queue, and the
+    /// transmit queues its threading mode gives it ([`TransmitQueues`]).
+    ///
+    /// The transmit side is indexed by [`Affinity`]: `0` is the sender's queue
+    /// and `1` the receiver's, which is the design's §4.7 mapping and the
+    /// reference's own discriminants — and under a mode with one queue, both
+    /// entries are the same port.
     pub fn new(
         params: StackParams,
         now: Clock,
         rx: Box<dyn RxPort>,
-        tx: [Box<dyn TxPort>; 2],
+        tx: TransmitQueues,
     ) -> Arc<Self> {
         let capacity = params.ring_capacity();
         let neighbours =
             NeighbourTable::new(NEIGHBOUR_CAPACITY, params.arp_timeout, params.arp_interval);
+
+        // Under a mode with one transmit queue, one `Arc` goes into both slots:
+        // the two roles share the port, and the lock is what serialises them.
+        let tx = match tx {
+            TransmitQueues::PerRole(sender, receiver) => {
+                [Arc::new(Mutex::new(sender)), Arc::new(Mutex::new(receiver))]
+            }
+            TransmitQueues::Shared(both) => {
+                let both = Arc::new(Mutex::new(both));
+                [Arc::clone(&both), both]
+            }
+        };
 
         Arc::new(Self {
             ports: PortTable::new(SLOT_CAPACITY, params.ephemeral_ports.clone()),
@@ -444,7 +478,7 @@ impl Stack {
             identification: AtomicU16::new(0),
             params,
             rx: Arc::new(Mutex::new(rx)),
-            tx: tx.map(|port| Arc::new(Mutex::new(port))),
+            tx,
             counters: StackCounters::default(),
             now,
         })
@@ -462,7 +496,7 @@ impl Stack {
             params,
             now,
             Box::new(port()),
-            [Box::new(port()), Box::new(port())],
+            TransmitQueues::PerRole(Box::new(port()), Box::new(port())),
         )
     }
 
