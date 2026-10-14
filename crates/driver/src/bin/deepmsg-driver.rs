@@ -54,12 +54,13 @@ use std::process::ExitCode;
 
 use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
 use deepmsg_core::clock;
-use deepmsg_driver::config::DriverConfig;
+use deepmsg_driver::config::{DriverConfig, MediaSelection};
 use deepmsg_driver::driver::Driver;
+use deepmsg_driver::media::TransportBindings;
 use deepmsg_driver::{dir, sys};
 
 fn main() -> ExitCode {
-    let config = match DriverConfig::from_args(std::env::args().skip(1)) {
+    let mut config = match DriverConfig::from_args(std::env::args().skip(1)) {
         Ok(config) => config,
         Err(error) => return fail(&format_args!("{error}")),
     };
@@ -81,6 +82,17 @@ fn main() -> ExitCode {
     // refused before a directory is claimed.
     let affinity = match deepmsg_driver::cpuset::apply(&config) {
         Ok(affinity) => affinity,
+        Err(error) => return fail(&format_args!("{error}")),
+    };
+
+    // The media, before anything touches the file system. The EAL has to be up
+    // before the CnC file so that a driver which cannot open its port never
+    // claims a directory at all (design §4.13), which is one step earlier than
+    // the reference has to think about it — this is also the only step of
+    // startup that can fail for a reason that has nothing to do with this
+    // process's own configuration.
+    let media = match bind_the_media(&mut config) {
+        Ok(media) => media,
         Err(error) => return fail(&format_args!("{error}")),
     };
 
@@ -174,7 +186,102 @@ fn main() -> ExitCode {
         eprintln!("deepmsg-driver: {error}");
     }
 
-    shutdown(&mut driver, prepared)
+    let code = shutdown(&mut driver, prepared);
+
+    // The media goes last, and the order is the design's §4.13: the shutdown
+    // above has stopped every runner and closed every transport (a runner's
+    // in-flight frames are back in the pool by then), the ports go when the
+    // bindings that hold them are let go of, and the EAL is the last thing
+    // this process does with DPDK. The pool is a `OnceLock` and is never
+    // dropped — the price P-D4-1 accepted, with its accounting asserted by a
+    // test instead (`dpdk_media.rs`).
+    drop(driver);
+    config.transport_bindings = TransportBindings::Default;
+    close_the_media(media);
+
+    code
+}
+
+/// Give the driver the bindings its configuration asks for, opening the media
+/// first when the configuration names one.
+///
+/// **The EAL comes up here**, which is the whole reason this runs before the
+/// directory is touched: a media that will not open is a driver that never
+/// claims a directory, and a claimed directory a driver cannot use is one
+/// nobody else can have either.
+///
+/// The selection is read and the bindings are built, in that order and in two
+/// values, because they are two different things: what the configuration says
+/// is *which* media (`MediaSelection`), and the bindings are what the endpoints
+/// read once the EAL is up and the stack exists (the DPDK slice's first
+/// commit).
+///
+/// # Errors
+///
+/// A message for the operator, naming what would not open.
+fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
+    match config.media {
+        MediaSelection::Default => Ok(false),
+
+        #[cfg(feature = "dpdk")]
+        MediaSelection::Dpdk => {
+            let media = deepmsg_driver::media::userspace::dpdk::DpdkMedia::open(
+                &config.dpdk,
+                config.threading_mode,
+            )
+            .map_err(|error| format!("the dpdk media would not open: {error}"))?;
+
+            let info = media.info().clone();
+            let stack = media
+                .into_stack(deepmsg_driver::media::userspace::stack::Clock::Monotonic)
+                .map_err(|error| format!("the dpdk media could not build its stack: {error}"))?;
+
+            // stdout: this line is written on every healthy start, and stderr
+            // is the one stream the reference's harness asserts is empty (the
+            // module notes say why).
+            let params = stack.params();
+            println!(
+                "deepmsg-driver: dpdk media on {} ({}), address {}/{} on {}",
+                info.name,
+                info.driver,
+                params.address,
+                params.prefix_length,
+                params
+                    .mac
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+
+            config.transport_bindings = TransportBindings::Userspace(stack);
+            Ok(true)
+        }
+
+        // Unreachable, and it is the parser that makes it so: a build without
+        // the feature refuses the name where the configuration is read
+        // (`ConfigError::DpdkNotInThisBuild`). This arm is here so that the two
+        // builds compile one match rather than two.
+        #[cfg(not(feature = "dpdk"))]
+        MediaSelection::Dpdk => Err("`dpdk` is not a media this build holds".to_owned()),
+    }
+}
+
+/// Shut the media down, if one was opened.
+#[cfg(feature = "dpdk")]
+fn close_the_media(opened: bool) {
+    if opened {
+        // D0: this does not collect the threads EAL started and it does not
+        // make a second `init` possible, so it is the last thing a process
+        // does with DPDK — which is what it is here.
+        let _ = deepmsg_dpdk::Eal::cleanup();
+    }
+}
+
+/// A build with no media has nothing to shut down.
+#[cfg(not(feature = "dpdk"))]
+fn close_the_media(opened: bool) {
+    let _ = opened;
 }
 
 /// Stop the driver the way the reference does, and report how it stopped.
