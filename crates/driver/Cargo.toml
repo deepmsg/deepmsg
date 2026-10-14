@@ -6,9 +6,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# The DPDK media: a port the driver drives itself, instead of the kernel's
+# sockets. Off by default, and everything it needs — the EAL, the mempool, the
+# queue pairs — is in the crate behind it (`docs/adr/0006`). A build without it
+# is the build the other gates run.
+default = []
+dpdk = ["dep:deepmsg-dpdk"]
+
 [dependencies]
 deepmsg-core = { path = "../core" }
 deepmsg-cnc = { path = "../cnc" }
+# The kernel-bypass media crate (ADR-0002's sixth zone). Optional: nothing here
+# links DPDK unless the `dpdk` feature is on.
+deepmsg-dpdk = { path = "../dpdk", optional = true }
 # The signal seam, and later the media syscall shim. ADR-0002 zone 4 belongs
 # to this crate, and `sys` is the module that holds it.
 libc = "0.2"
