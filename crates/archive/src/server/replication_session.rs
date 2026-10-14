@@ -827,7 +827,14 @@ impl ReplicationSession {
         }
 
         if self.extend_asked {
-            return Ok(());
+            // The answer is the **registration**, and the registration is the
+            // driver's to confirm ([`crate::server::conductor`]: the extend's
+            // reply is sent once the subscription is in the registry, the way
+            // the reference's `extendRecording` answers after its own
+            // `addSubscription`). So this state waits like every other one, and
+            // a driver that never answers ends the replication rather than
+            // leaving it here for ever.
+            return self.expire_or_hold(self.now_ms, "the extend was never answered");
         }
 
         let channel = self.extend_channel()?;
