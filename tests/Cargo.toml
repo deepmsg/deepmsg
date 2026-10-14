@@ -291,6 +291,13 @@ path = "integration/archive_async_connect.rs"
 name = "archive_client_api"
 path = "integration/archive_client_api.rs"
 
+# P2-C4's async client: the self-healing one, its callbacks, and the reconnect
+# that only a client which remakes its driver connection can survive. Needs our
+# archiving media driver binary, so it runs in CI.
+[[test]]
+name = "archive_async_client"
+path = "integration/archive_async_client.rs"
+
 # P2-C4's counters: the four a persistent subscription publishes (114–117),
 # read back out of the CnC file by type id the way the reference's own two
 # cases read them. Needs our driver binary, so it runs in CI.

@@ -35,6 +35,7 @@
 //! other slices and are not here.
 
 pub mod archive;
+pub mod async_client;
 pub mod async_connect;
 pub mod context;
 pub mod descriptor_poller;
@@ -45,6 +46,7 @@ pub mod replay_merge;
 pub mod subscription_descriptor_poller;
 
 pub use archive::{Archive, ArchiveError, Handlers, archive_to_client_error_code};
+pub use async_client::{AsyncArchiveClient, AsyncClientError, ControlResponse, Listener, State};
 pub use async_connect::{
     AsyncConnect, ConnectError, ConnectState, Connected, Credentials, NoCredentials, Polled,
 };
