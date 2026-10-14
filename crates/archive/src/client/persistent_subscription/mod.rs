@@ -32,5 +32,11 @@
 //! papered over with an `Option<()>` that nothing can call.
 
 pub mod context;
+pub mod counters;
 
 pub use context::{ConcludeError, Concluded, FROM_LIVE, FROM_START, PersistentSubscriptionContext};
+pub use counters::{
+    Counters, Identity, JOIN_DIFFERENCE_NAME, JOIN_DIFFERENCE_TYPE_ID, LIVE_JOINED_COUNT_TYPE_ID,
+    LIVE_JOINED_NAME, LIVE_LEFT_COUNT_TYPE_ID, LIVE_LEFT_NAME, NOTHING_JOINED, Provided,
+    STATE_NAME, STATE_TYPE_ID,
+};

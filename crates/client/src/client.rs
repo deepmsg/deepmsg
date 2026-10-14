@@ -69,7 +69,7 @@ use deepmsg_cnc::command::{
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
     encode_add_static_counter, encode_client_close, encode_reject_image,
 };
-use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::logbuffer::append::Appended;
 
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
@@ -1087,6 +1087,22 @@ impl Client {
     /// is running does not produce.
     pub fn counters_reader(&self) -> Option<CountersReader<'_>> {
         self.cnc.counters()
+    }
+
+    /// The same region as [`counters_reader`](Self::counters_reader), writable.
+    ///
+    /// The reference writes a counter through the address its **own** mapping
+    /// resolved at create (`aeron_counter_addr`,
+    /// `aeron-client/src/main/c/aeron_counter.c`), so a client is expected to be
+    /// able to write into the region it holds: a counter is not the driver's
+    /// private memory, and its owner is whoever asked for it. This is that
+    /// mapping, handed out rather than kept to the crate.
+    ///
+    /// `None` when the file describes no counter regions, which a driver that
+    /// is running does not produce. Every call borrows the mapping again, so a
+    /// caller that writes in a loop takes one and keeps it.
+    pub fn counters_writable(&self) -> Option<CountersReader<'_, ReadWrite>> {
+        self.cnc.counters_writable()
     }
 
     /// Counter announcements since the last drain, and take them.
