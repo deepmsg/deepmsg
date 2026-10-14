@@ -33,6 +33,7 @@
 
 use std::io;
 
+use crate::media::userspace::stack::ThreadQueues;
 use crate::sys::socket::{Descriptor, Poller};
 
 /// `AERON_UDP_TRANSPORT_POLLER_ITERATION_THRESHOLD`
@@ -193,16 +194,22 @@ impl Default for TransportPoller {
 pub enum MediaPoller {
     /// The kernel's sockets, through [`TransportPoller`].
     Kernel(TransportPoller),
+    /// A userspace stack, which has no descriptors to watch: its frames are
+    /// taken off the port once a pass and filed with the transport they are
+    /// addressed to, and the transports are read from there.
+    Userspace(ThreadQueues),
 }
 
 impl MediaPoller {
     /// Whatever a bindings has to do once a pass before its transports are
     /// read. The kernel delivers into each socket on its own, so for it this
-    /// is nothing.
+    /// is nothing; a userspace stack takes its frames here (see
+    /// [`ThreadQueues::pump`], and note that the sender's thread takes none).
     #[inline]
-    pub fn pump(&mut self) {
+    pub fn pump(&mut self) -> usize {
         match self {
-            Self::Kernel(_) => {}
+            Self::Kernel(_) => 0,
+            Self::Userspace(queues) => queues.pump(),
         }
     }
 
@@ -216,6 +223,19 @@ impl MediaPoller {
     pub fn ready(&mut self, descriptors: &[Descriptor], ready: &mut Vec<usize>) -> io::Result<()> {
         match self {
             Self::Kernel(poller) => poller.ready(descriptors, ready),
+            Self::Userspace(_) => {
+                // A userspace transport has no descriptor, so the caller has
+                // already decided this pass reads every one of them and does
+                // not ask (`receiver.rs:1556`, `sender.rs:1195`): a poller
+                // that cannot see a socket must not be the reason it is
+                // skipped. Answering "all of them" is the same answer the
+                // kernel's poller gives below its threshold, and it is reached
+                // here only if a caller with descriptors of its own ever asks.
+                ready.clear();
+                ready.extend(0..descriptors.len());
+
+                Ok(())
+            }
         }
     }
 }
