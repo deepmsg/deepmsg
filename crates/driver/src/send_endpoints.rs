@@ -428,6 +428,33 @@ impl SendChannelEndpoints {
         now_ns: i64,
         now_ms: i64,
     ) -> Result<EndpointOutcome, EndpointError> {
+        // The media's own two refusals, before the endpoint is found or made,
+        // because both are properties of the *publication* rather than of the
+        // endpoint it lands on: a frame the media cannot carry and a
+        // destination it cannot reach are the same answer whether the channel
+        // is new or one somebody else already opened.
+        //
+        // The channel's own local side is what the first question is asked
+        // with, and the port is not yet assigned to it — which is the port
+        // manager's business and not the media's: what decides which media
+        // carries the channel is the address, and that is already resolved.
+        let connect_to = (channel.has_explicit_endpoint
+            && !channel.is_multi_destination()
+            && self.connect_enabled)
+            .then_some(channel.remote_data);
+
+        self.transport_bindings
+            .refuse_mtu_over_what_it_can_carry(mtu_length)
+            .map_err(EndpointError::ChannelValidation)?;
+
+        self.transport_bindings
+            .refuse_a_destination_it_cannot_reach(
+                channel.local_control,
+                connect_to,
+                channel.remote_data,
+            )
+            .map_err(EndpointError::ChannelValidation)?;
+
         #[allow(clippy::cast_sign_loss)] // a buffer length is not negative
         let context_socket_sndbuf = config.socket_so_sndbuf.max(0) as usize;
 

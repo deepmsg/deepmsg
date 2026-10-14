@@ -6817,6 +6817,94 @@ mod tests {
         );
     }
 
+    /// A publication the media cannot carry is refused where it is opened
+    /// (design §4.11, the `mtu=` and unreachable-destination rows).
+    ///
+    /// Two answers in one test because they are one question asked twice — is
+    /// *this* publication one the media can serve — and both are answered by
+    /// the framing neither the kernel's `validate_mtu_for_sndbuf` nor the
+    /// kernel's route can see: this stack does not fragment, and it has no
+    /// route but its own link and its gateway.
+    #[test]
+    fn a_publication_the_media_cannot_carry_is_refused() {
+        use crate::media::TransportBindings;
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{Clock, StackParams};
+        use std::net::Ipv4Addr;
+
+        let first = TempDir::new();
+        let mut config = publication_config(&first.0);
+
+        // Jumbo frames are what a 1408-byte stack cannot carry, and the number
+        // the reference's own validation chain is happy with.
+        config.mtu_length = 8192;
+
+        let wire = Wire::new();
+        config.transport_bindings =
+            TransportBindings::Userspace(crate::media::userspace::stack::Stack::over_a_fake_wire(
+                &wire,
+                Side::A,
+                StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+                Clock::Monotonic,
+            ));
+
+        let cnc = create(&first.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&first.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:40500"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(13i64.to_le_bytes(), payload[0..8], "the failing command");
+        let text = String::from_utf8_lossy(&payload[12..]);
+        assert!(
+            text.contains("mtuLength=8192") && text.contains("does not fragment"),
+            "the client is told the frame is what the media cannot carry: {text}"
+        );
+
+        // And a destination off the port's link with no gateway on it, at an
+        // MTU the media is happy with — the second thing the kernel's own
+        // checking cannot know, because the kernel is not the one sending.
+        config.mtu_length = 1408;
+        let second = TempDir::new();
+        config.aeron_dir = second.0.clone();
+        let cnc = create(&second.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&second.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 14, 1001, "aeron:udp?endpoint=192.0.2.5:40456"),
+        );
+        let payload = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_ERROR_TYPE_ID,
+        );
+
+        assert_eq!(14i64.to_le_bytes(), payload[0..8]);
+        let text = String::from_utf8_lossy(&payload[12..]);
+        assert!(
+            text.contains("cannot reach 192.0.2.5") && text.contains("ENETUNREACH"),
+            "and this one that the media has no way to get there: {text}"
+        );
+    }
+
     #[test]
     fn a_parameter_value_the_reference_cannot_parse_is_generic() {
         // The URI's *structure* reads — the scheme, the transport, the shape

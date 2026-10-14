@@ -498,7 +498,12 @@ impl Stack {
     /// over one need.
     pub fn over_a_fake_wire(wire: &Wire, side: Side, params: StackParams, now: Clock) -> Arc<Self> {
         let mac = params.mac;
-        let mtu = params.mtu;
+        // A port's MTU counts the Ethernet header and a stack's counts the
+        // frame it was configured for, so the wire's port is given the one the
+        // other is measured from ([`RxPort::mtu`]): `largest_datagram` then
+        // answers exactly what this stack was built to carry, which is what a
+        // fake wire is for.
+        let mtu = params.mtu + super::frame::IPV4_UDP_HEADER_LENGTH;
         let port = || wire.port(side, mac, mtu);
 
         Self::new(
@@ -512,6 +517,21 @@ impl Stack {
     /// What this stack was configured with.
     pub const fn params(&self) -> &StackParams {
         &self.params
+    }
+
+    /// The largest Aeron frame this port can put on a wire or take off one —
+    /// what a channel's `mtu=` has to fit, because this stack does not
+    /// fragment (design §4.8, §4.11).
+    ///
+    /// A port's MTU counts the Ethernet header and a frame's does not, so the
+    /// 42 bytes of Ethernet, IPv4 and UDP headers come off here: a 1500-byte
+    /// port answers 1472, which is the number the design's refusal is written
+    /// against.
+    pub fn largest_datagram(&self) -> usize {
+        let port = self.rx.lock().expect("the receive port");
+
+        port.mtu()
+            .saturating_sub(super::frame::IPV4_UDP_HEADER_LENGTH)
     }
 
     /// The interface this stack holds `address` on, when it is this stack that

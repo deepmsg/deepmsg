@@ -225,6 +225,86 @@ impl TransportBindings {
         }
     }
 
+    /// Refuse a publication whose frames are larger than this media can carry
+    /// (design §4.8, §4.11).
+    ///
+    /// The userspace stack does **not fragment**: a frame the port cannot hold
+    /// is one no send will ever complete, so a publication that asks for one is
+    /// refused where it is opened rather than silently truncated — a truncated
+    /// frame is a message the receiver reassembles into something else.
+    ///
+    /// The kernel's sockets are not asked. They fragment, their limit is the
+    /// route's rather than this driver's, and the reference does not pre-check
+    /// it either — so the fallback answers `Ok` and the kernel's own `EMSGSIZE`
+    /// is what a publication that overshoots meets there.
+    ///
+    /// # Errors
+    ///
+    /// The message a client reads, in the shape the reference's own MTU
+    /// refusals use ([`crate::channel_validation`]).
+    pub fn refuse_mtu_over_what_it_can_carry(&self, mtu_length: usize) -> Result<(), String> {
+        let Self::Userspace(stack) = self else {
+            return Ok(());
+        };
+
+        let largest = stack.largest_datagram();
+
+        if mtu_length > largest {
+            return Err(format!(
+                "mtuLength={mtu_length} > {largest}, the largest frame the dpdk media's port \
+                 can carry (its MTU less the 42 bytes of Ethernet, IPv4 and UDP headers): \
+                 this stack does not fragment"
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Refuse a channel whose datagrams this media would carry and cannot
+    /// deliver (design §4.11): a destination off the port's own link with no
+    /// gateway configured.
+    ///
+    /// Asked of the media that would carry the channel and of no other, which
+    /// is why the two addresses that decide *that* ([`Self::stack_for`]) are
+    /// arguments: a channel the kernel serves is the kernel's to reach or not,
+    /// and the reference's own answer there is the route's.
+    ///
+    /// Without it a publication to an address the media cannot reach opens
+    /// happily and then fails every send with `ENETUNREACH` — a client polling
+    /// a publication that is never going to publish anything.
+    ///
+    /// # Errors
+    ///
+    /// The message a client reads. The reference's code for a destination it
+    /// cannot reach is the errno it fails the `sendto` with, `ENETUNREACH`,
+    /// which composes into the generic code at the client.
+    pub fn refuse_a_destination_it_cannot_reach(
+        &self,
+        bind: SocketAddr,
+        peer: Option<SocketAddr>,
+        destination: SocketAddr,
+    ) -> Result<(), String> {
+        let Some(stack) = self.stack_for(bind, peer) else {
+            return Ok(());
+        };
+
+        let IpAddr::V4(address) = destination.ip() else {
+            // IPv6 is refused at the channel.
+            return Ok(());
+        };
+
+        if stack.next_hop(address).is_some() {
+            return Ok(());
+        }
+
+        Err(format!(
+            "the dpdk media cannot reach {address}: it is not on this port's link \
+             ({}/{}) and no gateway is configured (ENETUNREACH)",
+            stack.params().address,
+            stack.params().prefix_length
+        ))
+    }
+
     /// The userspace stack a channel's data paths run on, or [`None`] for the
     /// kernel's sockets (design §4.9, Q1/Q1a/Q1b).
     ///
@@ -484,6 +564,110 @@ mod tests {
         assert!(
             serves("0.0.0.0:0", None),
             "and with no peer named at all there is nothing the kernel holds"
+        );
+    }
+
+    /// A frame larger than the port can carry is refused, because this stack
+    /// does not fragment (design §4.8, §4.11).
+    ///
+    /// The stack here is built with a 1472-byte frame, which is what a
+    /// 1500-byte Ethernet port answers once the 42 bytes of headers come off —
+    /// and the two numbers either side of it are the ones that matter: the
+    /// reference's own default (1408) fits, and a jumbo frame does not.
+    #[test]
+    fn a_frame_larger_than_the_port_can_carry_is_refused() {
+        let mut params =
+            StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]);
+        params.mtu = 1472;
+
+        let wire = Wire::new();
+        let bindings = TransportBindings::Userspace(Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            params,
+            Clock::Monotonic,
+        ));
+
+        assert_eq!(Ok(()), bindings.refuse_mtu_over_what_it_can_carry(1408));
+        assert_eq!(
+            Ok(()),
+            bindings.refuse_mtu_over_what_it_can_carry(1472),
+            "the largest one fits exactly"
+        );
+
+        let refusal = bindings
+            .refuse_mtu_over_what_it_can_carry(1473)
+            .expect_err("one byte over is over");
+        assert!(
+            refusal.contains("mtuLength=1473 > 1472") && refusal.contains("does not fragment"),
+            "{refusal}"
+        );
+
+        assert_eq!(
+            Ok(()),
+            TransportBindings::Default.refuse_mtu_over_what_it_can_carry(usize::MAX),
+            "the kernel fragments, so it is not this driver's number to hold"
+        );
+    }
+
+    /// A destination this media cannot reach is refused where the publication
+    /// is opened (design §4.11), and one the kernel is serving is not this
+    /// media's to refuse.
+    #[test]
+    fn a_destination_off_the_link_with_no_gateway_is_refused() {
+        let bindings = userspace();
+        let ours = address("0.0.0.0:0");
+        let peer = address("192.0.2.5:40456");
+
+        let refusal = bindings
+            .refuse_a_destination_it_cannot_reach(ours, Some(peer), peer)
+            .expect_err("off this link and no gateway");
+        assert!(
+            refusal.contains("cannot reach 192.0.2.5") && refusal.contains("ENETUNREACH"),
+            "{refusal}"
+        );
+
+        // On the port's own link, and through a gateway, are both reachable.
+        assert_eq!(
+            Ok(()),
+            bindings.refuse_a_destination_it_cannot_reach(
+                ours,
+                Some(address("10.10.0.2:40500")),
+                address("10.10.0.2:40500")
+            )
+        );
+
+        let mut params =
+            StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]);
+        params.gateway = Some(Ipv4Addr::new(10, 10, 0, 254));
+
+        let wire = Wire::new();
+        let with_gateway = TransportBindings::Userspace(Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            params,
+            Clock::Monotonic,
+        ));
+        assert_eq!(
+            Ok(()),
+            with_gateway.refuse_a_destination_it_cannot_reach(ours, Some(peer), peer),
+            "a gateway is a next hop for anywhere"
+        );
+
+        // The kernel's channel: the media is not carrying it, so the answer is
+        // the route's and not this media's.
+        assert_eq!(
+            Ok(()),
+            bindings.refuse_a_destination_it_cannot_reach(
+                ours,
+                Some(address("127.0.0.1:40456")),
+                address("127.0.0.1:40456")
+            ),
+            "loopback is the kernel's to reach"
+        );
+        assert_eq!(
+            Ok(()),
+            TransportBindings::Default.refuse_a_destination_it_cannot_reach(ours, Some(peer), peer)
         );
     }
 
