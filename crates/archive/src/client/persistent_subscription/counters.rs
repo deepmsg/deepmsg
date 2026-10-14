@@ -100,7 +100,7 @@ impl Identity<'_> {
 ///
 /// All four are independent, which is the reference's shape rather than a
 /// convenience: each is guarded by its own `if (NULL == context->…_counter)`.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Provided {
     /// The state counter, if the caller has one.
     pub state: Option<Counter>,

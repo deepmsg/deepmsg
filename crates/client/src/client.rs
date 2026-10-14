@@ -1267,7 +1267,25 @@ impl Client {
     /// image that finds no subscription is dropped rather than deferred. The
     /// channel-status counter id is not known yet — it arrives with the
     /// response, and is written onto the subscription there.
-    fn submit_add_subscription(
+    /// Send an `ADD_SUBSCRIPTION` and return without waiting for the answer.
+    ///
+    /// **The non-blocking face of [`Client::add_subscription`]**, which is
+    /// public for the reason [`crate::client::connected`]'s is: a caller that
+    /// owns its own clock cannot spend a turn waiting for the driver. The
+    /// archive's persistent subscription is that caller — it puts a
+    /// subscription on a replay channel and polls for the answer in its own
+    /// state (`AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_ADD_REPLAY_SUBSCRIPTION`,
+    /// `aeron_archive_persistent_subscription.c:1485-1517`) — and the reference's
+    /// own archive does the same for a recording subscription
+    /// (`ArchiveConductor.java:562-570`).
+    ///
+    /// The registration id is the correlation id the command drew, which is
+    /// also what [`AsyncAdd::subscription`] takes.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent.
+    pub fn submit_add_subscription(
         &mut self,
         channel: &str,
         stream_id: i32,

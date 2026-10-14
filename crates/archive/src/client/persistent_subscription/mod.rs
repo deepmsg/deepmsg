@@ -33,6 +33,7 @@
 
 pub mod context;
 pub mod counters;
+pub mod state;
 
 pub use context::{ConcludeError, Concluded, FROM_LIVE, FROM_START, PersistentSubscriptionContext};
 pub use counters::{
@@ -40,3 +41,4 @@ pub use counters::{
     LIVE_JOINED_NAME, LIVE_LEFT_COUNT_TYPE_ID, LIVE_LEFT_NAME, NOTHING_JOINED, Provided,
     STATE_NAME, STATE_TYPE_ID,
 };
+pub use state::{NewError, PersistentSubscription, State, SubscriptionError, SubscriptionListener};

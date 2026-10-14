@@ -26,6 +26,7 @@ use core::fmt;
 use deepmsg_core::uri::{ChannelUri, UriError};
 
 use crate::client::context::ArchiveContext;
+use crate::client::persistent_subscription::counters::Provided;
 use crate::client::proxy::NULL_VALUE;
 
 /// `AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_FROM_START` (`aeron_archive.h:1348`):
@@ -81,6 +82,14 @@ pub struct PersistentSubscriptionContext {
     /// Whether a client was handed to this context. See
     /// [`set_aeron`](Self::set_aeron) and [`Concluded::owns_aeron`].
     pub has_aeron: bool,
+
+    /// The four counters a caller may bring instead of letting the subscription
+    /// allocate them, one at a time
+    /// (`context_set_state_counter` and the three beside it, `:283-337`).
+    ///
+    /// Which ones are missing is what says which ones to allocate: the reference
+    /// guards each with its own `if (NULL == context->…_counter)` (`:541-584`).
+    pub counters: Provided,
     // The listener is the one field of the reference's context that is not
     // here yet: its type is what `on_live_joined` and friends are called on,
     // so it arrives with them rather than as a placeholder that cannot be

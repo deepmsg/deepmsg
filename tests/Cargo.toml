@@ -298,6 +298,13 @@ path = "integration/archive_client_api.rs"
 name = "archive_async_client"
 path = "integration/archive_async_client.rs"
 
+# P2-C4's persistent subscription, replay half: a recording replayed into the
+# application through the subscription's own poll. Needs our archiving media
+# driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_replay"
+path = "integration/persistent_subscription_replay.rs"
+
 # P2-C4's counters: the four a persistent subscription publishes (114–117),
 # read back out of the CnC file by type id the way the reference's own two
 # cases read them. Needs our driver binary, so it runs in CI.

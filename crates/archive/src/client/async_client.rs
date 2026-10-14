@@ -238,9 +238,18 @@ impl AsyncArchiveClient {
         credentials: Box<dyn Credentials>,
         listener: Box<dyn Listener>,
     ) -> Self {
+        // **Connected here rather than at the first turn**, so that a caller
+        // that has to reach the driver *now* — the persistent subscription
+        // allocates its four counters at create
+        // (`…_persistent_subscription.c:541-584`) — can. A driver that is not up
+        // is not an error: `connecting` makes the connection again on every
+        // connect, so `None` here is the same state the first poll would have
+        // found.
+        let client = Client::connect(&std::path::PathBuf::from(&context.aeron_dir)).ok();
+
         Self {
             state: State::Connecting,
-            client: None,
+            client,
             context,
             credentials,
             listener,
@@ -265,6 +274,19 @@ impl AsyncArchiveClient {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         matches!(self.state, State::Closed)
+    }
+
+    /// The driver connection this client holds.
+    ///
+    /// For a caller that is talking to the same driver about something else —
+    /// the persistent subscription, whose live and replay subscriptions are its
+    /// own but whose driver is this one's — so that there is one connection
+    /// rather than two. `None` before the first connect, and on the turn after
+    /// a disconnect, while the next one is being made.
+    ///
+    /// [`NULL_VALUE`]: crate::client::proxy::NULL_VALUE
+    pub fn client_mut(&mut self) -> Option<&mut Client> {
+        self.client.as_mut()
     }
 
     /// Which session the archive named, or [`NULL_VALUE`] when there is none
@@ -453,7 +475,11 @@ impl AsyncArchiveClient {
 
     /// Close, and say nothing about it: the callers all report a reason
     /// themselves (`:182-186`, `:217-221`).
-    fn close(&mut self) {
+    ///
+    /// Reachable from this crate's persistent subscription, which closes the
+    /// archive client as a side effect of failing
+    /// (`aeron_archive_persistent_subscription.c:72-86`).
+    pub(crate) fn close(&mut self) {
         self.connected = None;
         self.connect = None;
         self.client = None;
