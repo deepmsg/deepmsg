@@ -305,6 +305,13 @@ path = "integration/archive_async_client.rs"
 name = "persistent_subscription_live"
 path = "integration/persistent_subscription_live.rs"
 
+# P2-C4's persistent subscription, the archive half of its self-healing: the
+# archive is killed and restarted while a replay is in flight. Needs our
+# archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_healing"
+path = "integration/persistent_subscription_healing.rs"
+
 # P2-C4's persistent subscription, replay half: a recording replayed into the
 # application through the subscription's own poll. Needs our archiving media
 # driver binary, so it runs in CI.

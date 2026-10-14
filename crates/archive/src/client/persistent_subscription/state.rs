@@ -47,7 +47,7 @@
 //! every borrow of it is taken and dropped around one call.
 
 use core::fmt;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -318,6 +318,11 @@ struct Replay {
 /// back by correlation id, and pass a failure on to the application.
 struct ArchiveListener {
     ops: Rc<RefCell<Ops>>,
+    /// The async client lost the archive. **Shared for the same reason the
+    /// failure is**: this callback runs inside `AsyncArchiveClient::poll`, and
+    /// what to do about it is the state machine's (`on_archive_disconnected`,
+    /// `:804-829`).
+    disconnected: Rc<Cell<bool>>,
     /// The async client failed — a connect that did not finish, or a message it
     /// could not read. **Shared rather than acted on here**: the application's
     /// listener belongs to the subscription, which is the only thing that
@@ -327,6 +332,10 @@ struct ArchiveListener {
 }
 
 impl Listener for ArchiveListener {
+    fn on_disconnected(&mut self) {
+        self.disconnected.set(true);
+    }
+
     fn on_control_response(&mut self, response: &ControlResponse<'_>) {
         let mut ops = self.ops.borrow_mut();
 
@@ -381,6 +390,9 @@ pub struct PersistentSubscription {
     /// Set by the async client's listener when *it* fails; read and cleared by
     /// the next turn. See [`ArchiveListener::failure`].
     archive_failure: Rc<RefCell<Option<String>>>,
+    /// Set by the async client's listener when the archive goes away; read and
+    /// cleared by the next turn.
+    archive_disconnected: Rc<Cell<bool>>,
     listener: Option<Box<dyn SubscriptionListener>>,
     /// How long any answer from the **archive** may take (`message_timeout_ns`,
     /// `:1015`) — snapped at create, because the reference reads it once.
@@ -476,6 +488,7 @@ impl PersistentSubscription {
 
         let ops = Rc::new(RefCell::new(Ops::default()));
         let failure = Rc::new(RefCell::new(None));
+        let disconnected = Rc::new(Cell::new(false));
 
         let mut client = AsyncArchiveClient::new(
             archive_context,
@@ -483,6 +496,7 @@ impl PersistentSubscription {
             Box::new(ArchiveListener {
                 ops: Rc::clone(&ops),
                 failure: Rc::clone(&failure),
+                disconnected: Rc::clone(&disconnected),
             }),
         );
 
@@ -521,6 +535,7 @@ impl PersistentSubscription {
             counters,
             ops,
             archive_failure: failure,
+            archive_disconnected: Rc::clone(&disconnected),
             listener,
             message_timeout: Duration::from_nanos(u64::try_from(message_timeout_ns).unwrap_or(0)),
             position: concluded.start_position,
@@ -616,6 +631,10 @@ impl PersistentSubscription {
         // (`:884-907`) is called from inside that poll; this is the same
         // decision taken one frame out, so that the application's listener is
         // reached from the state machine rather than from the callback.
+        if self.archive_disconnected.replace(false) {
+            self.on_archive_disconnected();
+        }
+
         let archive_failure = self.archive_failure.borrow_mut().take();
 
         if let Some(message) = archive_failure {
@@ -1480,6 +1499,67 @@ impl PersistentSubscription {
     fn listener_on_error(&mut self, error: &SubscriptionError) {
         if let Some(listener) = self.listener.as_mut() {
             listener.on_error(error);
+        }
+    }
+
+    /// **The archive went away** (`on_archive_disconnected`, `:804-829`): save
+    /// where the replay had read to, let go of everything that belonged to that
+    /// connection, and wait for another one.
+    ///
+    /// ★ **Three states are left alone, and each is a decision**:
+    ///
+    /// * `AWAIT_ARCHIVE_CONNECTION` has nothing to clean up — it is already
+    ///   waiting;
+    /// * `LIVE` **keeps reading**: the live subscription is the *driver's*, not
+    ///   the archive's, so an archive that goes away does not stop the stream
+    ///   the application is reading (`shouldContinueConsumingFromLiveWhileArchiveIsUnavailable`).
+    ///   Nothing here asks the archive for anything, so nothing here needs it;
+    /// * `ATTEMPT_SWITCH` is the same thing one step earlier — both images are
+    ///   up and it is the driver that is delivering;
+    /// * and `FAILED` is over.
+    fn on_archive_disconnected(&mut self) {
+        if matches!(
+            self.state,
+            State::AwaitArchiveConnection | State::AttemptSwitch | State::Live | State::Failed
+        ) {
+            return;
+        }
+
+        // Where the replay had read to, if it had. This is the position the
+        // re-listing below will replay from, and it is why a disconnection the
+        // application never hears about costs it no messages.
+        let position = self
+            .client
+            .client_mut()
+            .and_then(|driver| {
+                let subscription = driver.subscription(self.replay_subscription?)?;
+
+                subscription.image_by_session_id(self.replay_session_id as i32)
+            })
+            .map(deepmsg_client::image::Image::position);
+
+        if let Some(position) = position {
+            self.position = position;
+        }
+
+        self.clean_up_live_subscription();
+        self.clean_up_replay_subscription();
+        self.replay_session_id = NULL_VALUE;
+
+        self.transition(State::AwaitArchiveConnection);
+    }
+
+    /// `clean_up_live_subscription` (`:747-777`): give the live subscription
+    /// back to the driver, whichever way it was asked for.
+    fn clean_up_live_subscription(&mut self) {
+        let Some(registration_id) = self.live_subscription.take() else {
+            self.live_subscription_add = None;
+
+            return;
+        };
+
+        if let Some(driver) = self.client.client_mut() {
+            let _ = driver.remove_subscription(registration_id, COMMAND_TIMEOUT);
         }
     }
 
