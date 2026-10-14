@@ -25,7 +25,7 @@
 //! and nothing else, so the resolver opens its socket directly
 //! (`crate::name_resolver::driver`).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use super::poller::{MediaPoller, TransportPoller};
@@ -124,6 +124,31 @@ impl PartialEq for TransportBindings {
 
 impl Eq for TransportBindings {}
 
+/// Whether the kernel is the thing that holds `address`: loopback, or an
+/// address one of its interfaces has.
+///
+/// A media that drives a port itself cannot reach either. Its frames go out of
+/// that port and nowhere else, so a channel whose peer is an address the kernel
+/// holds belongs to the kernel even when the channel named no local address of
+/// its own (design §4.9, Q1a) — which is every publication in the reference's
+/// system tests and this build's interop tests, all of which name `localhost`.
+///
+/// A lookup that could not be made is **not** an answer that the address is the
+/// kernel's: the media is the one the driver was configured for, and a channel
+/// the media cannot reach says so there — `ENETUNREACH`, off this link — rather
+/// than being moved to a socket the configuration did not ask for.
+fn the_kernel_holds(address: Ipv4Addr) -> bool {
+    crate::sys::interface_for_address(
+        crate::sys::AddressFamily::Inet,
+        IpAddr::V4(address),
+        // The whole address, so the match is the address and not the net it
+        // sits in: `127.0.0.2` is not held by a machine whose loopback is
+        // `127.0.0.1`, and a publication to it is not the kernel's to serve.
+        32,
+    )
+    .is_ok_and(|held| held.is_some())
+}
+
 /// Which thread a transport or a poller will be used on
 /// (`aeron_udp_channel_transport_affinity_t`,
 /// `media/aeron_udp_channel_transport_bindings.h:26-32`).
@@ -152,6 +177,14 @@ impl TransportBindings {
     /// Open a transport (`init_func`, `:43-50`), for the thread `affinity`
     /// names.
     ///
+    /// **Which media it is opened on is decided here, per channel**, from the
+    /// two addresses the caller has already resolved
+    /// ([`Self::stack_for`]). A driver configured for the userspace media has
+    /// one, and a channel whose traffic that media cannot carry runs on the
+    /// kernel's sockets instead — which is what keeps a driver whose data paths
+    /// are on a port it drives itself able to serve the channels that never
+    /// touch it (design §4.9, Q1).
+    ///
     /// # Errors
     ///
     /// [`OpenError`], with the bind failure kept apart because the endpoints
@@ -164,17 +197,8 @@ impl TransportBindings {
         params: &TransportParams,
         affinity: Affinity,
     ) -> Result<Box<dyn Transport>, OpenError> {
-        match self {
-            Self::Default => {
-                // The kernel's socket is everyone's: the reference's default
-                // `init_func` (`media/aeron_udp_channel_transport.c:100-107`)
-                // reads the affinity only into its bind errors, which the
-                // endpoints compose themselves.
-                let _ = affinity;
-                let transport = UdpTransport::open(bind, multicast_interface, connect, params)?;
-                Ok(Box::new(transport))
-            }
-            Self::Userspace(stack) => {
+        match self.stack_for(bind, connect) {
+            Some(stack) => {
                 // The transport parameters are the kernel's knobs — socket
                 // buffers, the multicast interface, the TTL — and a userspace
                 // stack has none of them: what it is sized by is its own
@@ -187,6 +211,82 @@ impl TransportBindings {
                 let transport = UserspaceTransport::open(stack.clone(), bind, connect, affinity)?;
                 Ok(Box::new(transport))
             }
+            None => {
+                // The kernel's socket, reached both by the kernel's own
+                // bindings and by a userspace one whose channel is not its to
+                // carry. Its `init_func`
+                // (`media/aeron_udp_channel_transport.c:100-107`) reads the
+                // affinity only into its bind errors, which the endpoints
+                // compose themselves.
+                let _ = affinity;
+                let transport = UdpTransport::open(bind, multicast_interface, connect, params)?;
+                Ok(Box::new(transport))
+            }
+        }
+    }
+
+    /// The userspace stack a channel's data paths run on, or [`None`] for the
+    /// kernel's sockets (design §4.9, Q1/Q1a/Q1b).
+    ///
+    /// **The key is the local side of the channel**, not where its datagrams
+    /// are going: the question is which of the two things this driver can open
+    /// a socket *for* is the one that holds the address the socket is bound to.
+    /// `bind` is therefore what an endpoint is about to bind — a receive
+    /// endpoint's is the channel's `endpoint=`, a send endpoint's is its
+    /// interface or the wildcard (both, and why, in `crate::udp_channel`'s
+    /// module note) — and the answer is the media's own when that address falls
+    /// inside the port's net.
+    ///
+    /// Three cases, and the third is the one the design's own wording leaves
+    /// open:
+    ///
+    /// * **A named local address the port holds** — 10.10.0.2 on a port holding
+    ///   10.10.0.1/24 — is the media's, and there is no fallback from it: a
+    ///   channel that named the media's address is a channel the media must
+    ///   serve, and one it cannot is a failure rather than a silent move to a
+    ///   socket that has no such address.
+    /// * **A named local address it does not hold** — `127.0.0.1`, another
+    ///   interface's — is the **kernel's**, because the kernel is the thing
+    ///   that holds it. This is what keeps every channel in the reference's
+    ///   system tests and this build's interop tests working on a driver whose
+    ///   data paths are on a DPDK port.
+    /// * **No local address at all**: a send endpoint with no `interface=` — a
+    ///   publication — binds the wildcard, and a wildcard is not an address
+    ///   anybody holds. It is the **media's**, because the media is the thing
+    ///   that assigns it a port and its own address, **unless the channel is
+    ///   talking to an address the kernel holds** (loopback, another local
+    ///   interface), which only the kernel can reach. The destination is
+    ///   consulted for that one case and no other; the design's "the key is the
+    ///   local side, not the peer" holds everywhere the local side was written.
+    ///
+    /// Multi-destination and multicast channels reach here too and are answered
+    /// by the same rule: a group address is refused before a transport is
+    /// opened for it ([`Self::refuse_channel`]), and a destination's own
+    /// address is what its transport binds.
+    fn stack_for(&self, bind: SocketAddr, connect: Option<SocketAddr>) -> Option<&Arc<Stack>> {
+        let Self::Userspace(stack) = self else {
+            return None;
+        };
+
+        let IpAddr::V4(address) = bind.ip() else {
+            // IPv6 is refused at the channel, so this is a caller that has
+            // built an address the parse would not have let through.
+            return None;
+        };
+
+        if !address.is_unspecified() {
+            let held = stack.owns(
+                crate::sys::AddressFamily::Inet,
+                IpAddr::V4(address),
+                stack.params().prefix_length,
+            );
+
+            return held.is_some().then_some(stack);
+        }
+
+        match connect.map(|peer| peer.ip()) {
+            Some(IpAddr::V4(peer)) if the_kernel_holds(peer) => None,
+            _ => Some(stack),
         }
     }
 
@@ -326,6 +426,95 @@ mod tests {
             StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
             Clock::Monotonic,
         ))
+    }
+
+    fn address(text: &str) -> SocketAddr {
+        text.parse().expect("an address")
+    }
+
+    /// The media a channel's data paths run on, which is the local side's
+    /// answer and not the peer's (design §4.9, Q1a).
+    ///
+    /// The stack here holds `10.10.0.1/24`, which is the shape a driver whose
+    /// port is a DPDK one has: the kernel does not have that address at all, so
+    /// nothing but this media can bind it.
+    #[test]
+    fn a_channels_local_side_decides_which_media_carries_it() {
+        let bindings = userspace();
+        let serves = |bind: &str, peer: Option<&str>| {
+            bindings
+                .stack_for(address(bind), peer.map(address))
+                .is_some()
+        };
+
+        // A receive endpoint binds the endpoint its channel named, and one in
+        // the port's net is the media's — there is no fallback from it.
+        assert!(serves("10.10.0.2:40500", None), "the port's own net");
+        assert!(
+            serves("10.10.0.9:40500", None),
+            "anywhere in the port's net"
+        );
+
+        // A named address the media does not hold belongs to the kernel, which
+        // is the thing that does hold it — this is every channel in the
+        // system tests that names loopback.
+        assert!(!serves("127.0.0.1:40456", None), "loopback is the kernel's");
+        assert!(
+            !serves("192.168.1.5:40456", None),
+            "and so is another interface's address"
+        );
+
+        // No local address named: a send endpoint binds the wildcard, which is
+        // the media's — the peer decides only when the kernel is the only one
+        // that can reach it.
+        assert!(
+            serves("0.0.0.0:0", Some("10.10.0.2:40500")),
+            "a publication to the port's own net is the media's"
+        );
+        assert!(
+            serves("0.0.0.0:0", Some("192.0.2.5:40456")),
+            "and so is one to an address nobody holds at all — off this link, \
+             which the media is then the one to refuse (`ENETUNREACH`)"
+        );
+        assert!(
+            !serves("0.0.0.0:0", Some("127.0.0.1:40456")),
+            "but a publication to loopback is the kernel's, which is what every \
+             channel in the system tests names"
+        );
+        assert!(
+            serves("0.0.0.0:0", None),
+            "and with no peer named at all there is nothing the kernel holds"
+        );
+    }
+
+    /// The predicate itself, pinned against the kernel's own answer rather than
+    /// by naming an interface: loopback is held by every machine, and an
+    /// address from the range reserved for documentation
+    /// (`192.0.2.0/24`, RFC 5737) is held by none — which is the pair that
+    /// matters, because "another interface's address" is not portable between
+    /// machines and is the same lookup answering yes.
+    #[test]
+    fn the_kernel_holds_loopback_and_not_a_reserved_address() {
+        assert!(the_kernel_holds(Ipv4Addr::LOCALHOST));
+        assert!(!the_kernel_holds(Ipv4Addr::new(192, 0, 2, 5)));
+    }
+
+    /// The kernel's own bindings carry everything, which is what makes the
+    /// fallback a fallback rather than a second media.
+    #[test]
+    fn the_kernels_bindings_carry_every_channel() {
+        let bindings = TransportBindings::Default;
+
+        assert!(
+            bindings
+                .stack_for(address("127.0.0.1:40456"), Some(address("127.0.0.1:40457")))
+                .is_none()
+        );
+        assert!(
+            bindings
+                .stack_for(address("10.10.0.2:40500"), None)
+                .is_none()
+        );
     }
 
     /// A multicast channel is refused by the media that cannot serve one, and

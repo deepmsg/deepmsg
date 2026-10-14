@@ -339,12 +339,24 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
     while !bound.load(Ordering::Acquire) && Instant::now() < ready {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(
-        bound.load(Ordering::Acquire),
-        "the second driver never bound the endpoint the first one sends to; \
-         its stderr was:\n{}",
-        bob.stderr()
-    );
+    // Stopped before either is read, for the reason `Driver::stop` gives: a
+    // live process holds its end of the pipe open, so reading one is a wait
+    // for a write that is not coming. This is the branch a driver on the wrong
+    // media lands in — the endpoint is an address only the media has, so the
+    // kernel answers the bind with `Cannot assign requested address` and the
+    // subscription never becomes ready — and it used to hang here rather than
+    // say so.
+    if !bound.load(Ordering::Acquire) {
+        alice.stop();
+        bob.stop();
+
+        panic!(
+            "the second driver never bound the endpoint the first one sends to.\n\
+             === the second driver: stdout\n{}\n=== the second driver: stderr\n{}",
+            bob.stdout(),
+            bob.stderr()
+        );
+    }
 
     // Alice publishes at the subscriber's endpoint, which is how two machines
     // are joined: the channel names where the frames go, not where they are
