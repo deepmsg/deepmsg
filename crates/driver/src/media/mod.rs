@@ -44,6 +44,7 @@ pub mod interceptor;
 pub mod loss_generator;
 pub mod poller;
 pub mod receive_endpoint;
+pub mod receive_loss;
 pub mod send_endpoint;
 pub mod udp_transport;
 

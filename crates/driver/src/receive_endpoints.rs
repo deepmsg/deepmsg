@@ -378,6 +378,16 @@ impl ReceiveChannelEndpoints {
         // (`aeron_receive_channel_endpoint_set_group_tag`, `:39-46`).
         let group_tag = channel.group_tag.or(config.receiver_group_tag);
 
+        // What this endpoint drops as it receives, decided **here** because
+        // this is where the channel — and so its URI — is known: a rule that
+        // exempts the archive's own recording subscription names a substring of
+        // it, and an endpoint that matches is given no generator rather than one
+        // that always says no (`crate::media::receive_loss`).
+        let data_loss_generator = config
+            .receive_data_loss
+            .as_ref()
+            .and_then(|spec| spec.generator_for(&channel.original_uri));
+
         let endpoint = ReceiveChannelEndpoint::create(
             channel,
             group_tag,
@@ -392,6 +402,7 @@ impl ReceiveChannelEndpoints {
             now_ms,
             now_ns,
             &config.incoming_interceptors,
+            data_loss_generator,
         )
         .map_err(|error| match error {
             ReceiveEndpointError::NoCounter => ReceiveEndpointErrorKind::NoCounter,
@@ -742,6 +753,125 @@ mod tests {
             (0..8).any(|_| first_receiver_id() != first),
             "a constant is not a random start"
         );
+    }
+
+    /// ★ The settings reach the endpoint a subscription is put on, and the
+    /// **channel's own URI** decides whether a rule applies to it: this is the
+    /// seam `debug.receive.data.loss.…` is wired through, and it is judged here
+    /// rather than only through a driver process so that a failure has one
+    /// candidate cause instead of three.
+    #[test]
+    fn the_receive_loss_settings_reach_the_endpoint_and_its_uri_decides() {
+        use crate::media::receive_loss::{DataRange, Spec};
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let range = |stream_id| DataRange {
+            stream_id,
+            active_term_id: 0,
+            min_inclusive: 0,
+            max_exclusive: 4096,
+        };
+
+        let config = |spec: Spec| DriverConfig {
+            receive_data_loss: Some(spec),
+            ..DriverConfig::default()
+        };
+
+        let spec = Spec {
+            data_in_range: Some(range(4218)),
+            endpoint_skip: Some("init-term-id=".to_owned()),
+            ..Spec::default()
+        };
+
+        let datagram = [0u8; 64];
+
+        // An ordinary subscription's endpoint carries the rule.
+        let (_, _, endpoint) = ReceiveChannelEndpoints::default()
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40231"),
+                &TransportParams::default(),
+                &config(spec.clone()),
+                SMALL_WINDOW,
+                &mut counters,
+                &regions,
+                77,
+                1,
+                1_000_000,
+            )
+            .expect("an endpoint");
+
+        assert!(
+            endpoint.expect("a new endpoint").drops_data(
+                "127.0.0.1:40232".parse().expect("an address"),
+                &datagram,
+                4218,
+                7,
+                0,
+                0,
+            ),
+            "the rule named this stream and this endpoint should drop it",
+        );
+
+        // ★ The archive's own recording subscription is exempt: its channel
+        // names `init-term-id=`, which is the whole of how "the recording stays
+        // whole while the reader's copy is missing a range" is built.
+        let (_, _, endpoint) = ReceiveChannelEndpoints::default()
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40233|init-term-id=7"),
+                &TransportParams::default(),
+                &config(spec),
+                SMALL_WINDOW,
+                &mut counters,
+                &regions,
+                78,
+                1,
+                1_000_000,
+            )
+            .expect("an endpoint");
+
+        let mut endpoint = endpoint.expect("a new endpoint");
+
+        assert!(
+            !endpoint.drops_data(
+                "127.0.0.1:40234".parse().expect("an address"),
+                &datagram,
+                4218,
+                7,
+                0,
+                0,
+            ),
+            "an endpoint the skip names is left alone",
+        );
+        assert!(
+            !endpoint.drops_control("127.0.0.1:40234".parse().expect("an address"), &datagram),
+            "and a range rule has no opinion about a handshake anyway",
+        );
+
+        // And a driver configured with no rule drops nothing at all.
+        let (_, _, endpoint) = ReceiveChannelEndpoints::default()
+            .get_or_add(
+                channel("aeron:udp?endpoint=127.0.0.1:40235"),
+                &TransportParams::default(),
+                &DriverConfig::default(),
+                SMALL_WINDOW,
+                &mut counters,
+                &regions,
+                79,
+                1,
+                1_000_000,
+            )
+            .expect("an endpoint");
+
+        assert!(!endpoint.expect("a new endpoint").drops_data(
+            "127.0.0.1:40236".parse().expect("an address"),
+            &datagram,
+            4218,
+            7,
+            0,
+            0,
+        ));
     }
 
     #[test]

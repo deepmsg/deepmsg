@@ -41,6 +41,7 @@ use std::net::SocketAddr;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use super::interceptor::Incoming;
+use super::loss_generator::LossGenerator;
 use crate::protocol::{
     ErrorFrame, MAX_ERROR_TEXT_LENGTH, NakFrame, RspSetupFrame, RttmFrame, StatusMessageFrame,
     header_flags,
@@ -560,6 +561,20 @@ pub struct ReceiveChannelEndpoint {
     /// tag of `-1`: the first sends a 36-byte status message and leaves the
     /// error frame's flag clear, the second sends 44 and sets it.
     group_tag: Option<i64>,
+    /// What this endpoint **drops as it receives**, or [`None`] to drop
+    /// nothing ([`crate::media::receive_loss`]).
+    ///
+    /// The reference's `endpoint->data_loss_generator`
+    /// (`media/aeron_receive_channel_endpoint.h:87`), filled by a supplier the
+    /// context holds rather than by the channel — which is why it hangs here and
+    /// not on a destination: a channel's interceptors are per socket, and this
+    /// is per *endpoint*, and the two are not the same when one channel has
+    /// several destinations.
+    ///
+    /// It is **test-only**: nothing is built unless the driver was configured
+    /// with one of the `debug.receive.data.loss.…` settings, so an ordinary
+    /// driver's receive path is the one it always was.
+    data_loss_generator: Option<Box<dyn LossGenerator>>,
 }
 
 /// Write the address the endpoint is bound to into its channel-status label
@@ -657,6 +672,7 @@ impl ReceiveChannelEndpoint {
         now_ms: i64,
         now_ns: i64,
         interceptors: &[super::interceptor::Interceptor],
+        data_loss_generator: Option<Box<dyn LossGenerator>>,
     ) -> Result<Self, ReceiveEndpointError> {
         let channel_status_counter_id = counter_position::allocate_channel_status_counter(
             counters,
@@ -738,6 +754,7 @@ impl ReceiveChannelEndpoint {
             socket_rcvbuf: params.socket_rcvbuf,
             socket_sndbuf: params.socket_sndbuf,
             group_tag,
+            data_loss_generator,
         })
     }
 
@@ -826,6 +843,12 @@ impl ReceiveChannelEndpoint {
             dispatcher: DataPacketDispatcher::new(stream_session_limit),
             stream_refcounts: Vec::new(),
             session_refcounts: Vec::new(),
+            // An endpoint built around a caller's own transport drops nothing
+            // as it receives: the settings are read where a channel is
+            // *resolved* (`ReceiveChannelEndpoints::get_or_add`), and this
+            // constructor is for a unit test that is already standing where
+            // that path ends.
+            data_loss_generator: None,
             socket_rcvbuf: 0,
             socket_sndbuf: 0,
             group_tag,
@@ -1023,6 +1046,48 @@ impl ReceiveChannelEndpoint {
     /// each datagram to, and a dropped one never reaches the endpoint — so it
     /// moves no counter and wakes nobody, and the peer's loss detection is what
     /// notices.
+    /// Whether the **endpoint's own** generator withholds this `DATA` frame
+    /// (`aeron_receive_channel_endpoint_on_data`,
+    /// `media/aeron_receive_channel_endpoint.c:576-585`).
+    ///
+    /// The frame's fields are passed in rather than read out of `datagram`
+    /// again, because the caller has already parsed them and a second read is a
+    /// second chance to disagree.
+    pub fn drops_data(
+        &mut self,
+        address: std::net::SocketAddr,
+        datagram: &[u8],
+        stream_id: i32,
+        session_id: i32,
+        term_id: i32,
+        term_offset: i32,
+    ) -> bool {
+        self.data_loss_generator.as_mut().is_some_and(|generator| {
+            generator.should_drop_detailed(
+                address,
+                datagram,
+                stream_id,
+                session_id,
+                term_id,
+                term_offset,
+                datagram.len(),
+            )
+        })
+    }
+
+    /// Whether it withholds this `SETUP` or `RTTM`
+    /// (`media/aeron_receive_channel_endpoint.c:618-620`, `:646-648`).
+    ///
+    /// Neither frame carries a term offset a rule could name, which is why the
+    /// reference asks its generators about them through a different entry point
+    /// — and why a generator that answers only the detailed question never
+    /// drops one.
+    pub fn drops_control(&mut self, address: std::net::SocketAddr, datagram: &[u8]) -> bool {
+        self.data_loss_generator
+            .as_mut()
+            .is_some_and(|generator| generator.should_drop(address, datagram, datagram.len()))
+    }
+
     pub fn drops(&mut self, id: DestinationId, datagram: &[u8]) -> bool {
         self.destination_mut(id)
             .is_some_and(|destination| destination.interceptors.drops(datagram))

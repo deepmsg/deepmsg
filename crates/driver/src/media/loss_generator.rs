@@ -62,22 +62,68 @@ use std::net::SocketAddr;
 /// The reference's vtable has two entry points: a *simple* one, named
 /// `should_drop_frame`, which is given the address, the buffer and its length,
 /// and a *detailed* one, which also gets the frame's stream, session, term and
-/// offset so that a generator can name one region of one term. This build has
-/// the simple one, which is what the send endpoint's data path asks for
-/// (`media/aeron_send_channel_endpoint.c:391-403`); the detailed one arrives
-/// with the receive side, which is its only caller
-/// (`media/aeron_receive_channel_endpoint.c:576-585`).
+/// offset so that a generator can name one region of one term.
+///
+/// **Which one is asked depends on the frame type, not on the generator**
+/// (`media/aeron_receive_channel_endpoint.c`): a **`DATA`** frame goes to the
+/// *detailed* question (`:576-585`), and a **`SETUP`** or **`RTTM`** frame —
+/// neither of which carries a term offset a caller could name — goes to the
+/// simple one (`:618-620`, `:646-648`). Both slots may be null, and a null slot
+/// means *no drop*: a generator that answers only the detailed question never
+/// drops a `SETUP`, and one that answers only the simple question never drops
+/// data. That is not an accident of the reference's vtable — it is what makes
+/// `aeron_setup_at_position_loss_generator` able to drop exactly the handshakes
+/// it names and nothing else — so here the two are separate methods and **both
+/// default to `false`**.
+///
+/// The send endpoint's data path asks the simple question
+/// (`media/aeron_send_channel_endpoint.c:391-403`), which is what this build's
+/// [`EveryNthDatagram`] answers.
 ///
 /// The reference's third entry point, `close`, has no counterpart here: a
 /// generator is owned by the endpoint that holds it, so `Drop` is the close.
 pub trait LossGenerator: Send {
-    /// Whether what it is shown should be withheld.
+    /// Whether what it is shown should be withheld — the question a `SETUP` or
+    /// `RTTM` frame is asked, and the one the send path asks.
     ///
-    /// On this build's only caller that is **one whole datagram**: `buffer` is
-    /// the datagram and `length` its length, and a `true` answer keeps every
-    /// frame inside it off the wire. `address` is where it was going, which
-    /// the reference passes as well.
+    /// On the send path that is **one whole datagram**: `buffer` is the datagram
+    /// and `length` its length, and a `true` answer keeps every frame inside it
+    /// off the wire. `address` is where it was going, which the reference passes
+    /// as well.
     fn should_drop(&mut self, address: SocketAddr, buffer: &[u8], length: usize) -> bool;
+
+    /// Whether this **`DATA` frame** should be withheld, with the frame's own
+    /// fields passed in so that a generator can name one stream, one term, or
+    /// one offset in it (`aeron_loss_generator_should_drop_frame_detailed_func_t`,
+    /// `media/aeron_loss_generator.h:44-51`).
+    ///
+    /// The default answers `false`, which is the reference's null slot.
+    // Seven of them because the reference's entry point carries seven
+    // (`media/aeron_loss_generator.h:44-51`), and a rule that could not name a
+    // term offset would not be the rule this exists for.
+    #[allow(clippy::too_many_arguments)]
+    fn should_drop_detailed(
+        &mut self,
+        address: SocketAddr,
+        buffer: &[u8],
+        stream_id: i32,
+        session_id: i32,
+        term_id: i32,
+        term_offset: i32,
+        length: usize,
+    ) -> bool {
+        let _ = (
+            address,
+            buffer,
+            stream_id,
+            session_id,
+            term_id,
+            term_offset,
+            length,
+        );
+
+        false
+    }
 }
 
 /// Withholds every `drop_every`-th datagram it is shown.

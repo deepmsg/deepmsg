@@ -326,6 +326,13 @@ path = "integration/persistent_subscription_replay.rs"
 name = "persistent_subscription_counters"
 path = "integration/persistent_subscription_counters.rs"
 
+# P2-C4's receive-side loss injection: the driver's own `debug.receive.data.loss`
+# rules, judged by what a subscriber is and is not handed. Needs our driver
+# binary, so it runs in CI.
+[[test]]
+name = "receive_loss_injection"
+path = "integration/receive_loss_injection.rs"
+
 # P2-C4's response-channel replay: the channel the replay comes back on, and
 # what a replay over a `control-mode=response` channel has to do first — a
 # publication of the client's own, a proxy over it, and a replay token. Needs

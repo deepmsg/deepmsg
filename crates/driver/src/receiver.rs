@@ -1692,6 +1692,22 @@ impl ReceiverThread {
                     return;
                 };
 
+                // **The endpoint's own generator, before anything else happens
+                // with the frame** (`media/aeron_receive_channel_endpoint.c:576-585`):
+                // a dropped frame is not delivered, not counted against the
+                // image and does not mark the destination alive — which is what
+                // makes the loss real rather than reported.
+                if endpoint.drops_data(
+                    source,
+                    packet,
+                    frame.stream_id,
+                    frame.session_id,
+                    frame.term_id,
+                    frame.term_offset,
+                ) {
+                    return;
+                }
+
                 let is_eos = header.flags & crate::protocol::header_flags::EOS != 0;
 
                 match endpoint.on_data(frame.stream_id, frame.session_id, is_eos) {
@@ -1758,6 +1774,13 @@ impl ReceiverThread {
                 }
             }
             frame_type::SETUP => {
+                // A handshake is asked the **simple** question, and before it is
+                // parsed: neither it nor an `RTTM` carries a term offset a rule
+                // could name (`media/aeron_receive_channel_endpoint.c:618-620`).
+                if endpoint.drops_control(source, packet) {
+                    return;
+                }
+
                 let Some(setup) = SetupFrame::read(packet) else {
                     return;
                 };
@@ -1842,6 +1865,12 @@ impl ReceiverThread {
                 });
             }
             frame_type::RTTM => {
+                // The other frame the simple question is asked about
+                // (`media/aeron_receive_channel_endpoint.c:646-648`).
+                if endpoint.drops_control(source, packet) {
+                    return;
+                }
+
                 let Some(frame) = RttmFrame::read(packet) else {
                     return;
                 };
