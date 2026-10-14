@@ -1914,18 +1914,53 @@ fn collect_cross_signal(signal: &RecordingSignal) {
         .push(*signal);
 }
 
-/// A UDP port this process may use, off a base that keeps two test binaries
-/// running at once apart.
+/// `n` UDP ports this process may use, **probed rather than computed**.
 ///
-/// The source archive of [`a_replication_reaches_an_archive_in_another_process`]
-/// has to **bind** the port its control channel names, so it cannot be the
-/// hard-coded kind the rest of this file uses for addresses nobody binds: two
-/// binaries in one `cargo test` run would fight over it.
-fn free_udp_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
+/// These are ports something *binds* — the source archive of
+/// [`a_replication_reaches_an_archive_in_another_process`] binds the one its
+/// control channel names — so they cannot be the hard-coded kind the rest of
+/// this file uses for addresses nobody binds.
+///
+/// They used to be computed: `20_000 + pid % 20_000 + offset`, "a base that
+/// keeps two test binaries running at once apart". It does not, in either
+/// direction, and the failure that found this out was a **live replication that
+/// waited for ever** (the D2/D4 record's flake, `analysis/archive-client-api-flake.md`
+/// §B):
+///
+/// * **Two binaries' ports overlap by construction.** With pids one apart,
+///   `base + 9` for one is `base + 8` for the next, and the offsets in play
+///   here are 1, 7, 8 and 9 — smaller than the step between the pids. Two test
+///   binaries running at once therefore name the *same* port for two different
+///   roles, and the loser's bind is `EADDRINUSE`.
+/// * **And the arithmetic can land inside the kernel's own ephemeral range**
+///   (32 768-60 999): `base + offset` runs from 20 009 to 40 009, so any process
+///   whose pid is past ~12 759 `% 20 000` is naming ports the kernel hands out
+///   to anyone — including this test's own clients.
+///
+/// What that cost: the live destination's `add_receive_destination` was refused
+/// with `(98) Address already in use`, the replication session **never reads
+/// that answer** (neither does the reference — `ReplicationSession` polls its
+/// destinations only to retire them), so it set `isLiveAdded` anyway and waited
+/// for a stream that had never been added. One bind, and the merge never came.
+///
+/// So the kernel picks, all `n` at once so that they cannot collide with each
+/// other, and the sockets go as soon as their numbers are known — which is the
+/// driver's to bind next, the way every other fixed address in this file is
+/// somebody else's to bind.
+fn free_udp_ports<const N: usize>() -> [u16; N] {
+    let probes: Vec<std::net::UdpSocket> = (0..N)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("the kernel can lend a UDP port"))
+        .collect();
 
-    base.saturating_add(offset)
+    let mut ports = [0u16; N];
+    for (port, probe) in ports.iter_mut().zip(&probes) {
+        *port = probe
+            .local_addr()
+            .expect("a bound socket knows its port")
+            .port();
+    }
+
+    ports
 }
 
 /// **A replicate fetches its source's descriptor, and makes the destination
@@ -2018,9 +2053,28 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
         source.start_position, copied.start_position,
         "the start is the source's"
     );
-    assert_eq!(
-        copied.start_position, copied.stop_position,
-        "and the row begins empty — `addNewRecording(startPosition, startPosition, …)`"
+    // **A copy's stop is three things over its life, and the criterion can see
+    // any of them.** The row is made empty — `addNewRecording(startPosition,
+    // startPosition, …)` (`ReplicationSession.java:336-350`) — the `EXTEND`
+    // state then writes `NULL_POSITION` over its stop because the copy is live
+    // from then on (`Catalog.extendRecording`, `Catalog.java:653-659`), and
+    // once the replay is feeding it the stop is wherever the copy has got to.
+    // All three are the reference's own behaviour, and all three are reachable
+    // *before a client can see the row at all*: the session's states run inside
+    // the archive, and the listing that first finds the row may be after any of
+    // them. Measured, twice: CI lost that race and saw the second
+    // (`left: 0, right: -1`, in 1.23 s), and tightening this to the first two
+    // lost it again and saw the third (`start=0 stop=320`).
+    //
+    // So what is asserted is the one thing true of every one of them, and it is
+    // not nothing: a copy **never ends before it begins**. A stop below the
+    // start is a row claiming to hold data from before its own beginning —
+    // which is the shape a defect here would have.
+    assert!(
+        copied.stop_position == NULL_POSITION || copied.stop_position >= copied.start_position,
+        "a copy never ends before it begins: start={} stop={}",
+        copied.start_position,
+        copied.stop_position
     );
     assert_eq!(source.initial_term_id, copied.initial_term_id);
     assert_eq!(source.segment_file_length, copied.segment_file_length);
@@ -2280,7 +2334,8 @@ fn a_replication_reaches_an_archive_in_another_process() {
     };
 
     // **The source archive**, on a control channel the destination can dial.
-    let source_control = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(1));
+    let [source_control_port] = free_udp_ports::<1>();
+    let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
     let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
     let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
     let source_archive_dir = TempDir::new("archive-client-api-replication-source");
@@ -2818,9 +2873,10 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
     // (*Address already in use*) wherever the source's own reader is on the
     // same host. The reference's test streams its live half dynamically too
     // (`ReplayMergeTest.java:81-88`).
-    let control = format!("127.0.0.1:{}", free_udp_port(7));
-    let source_endpoint = format!("127.0.0.1:{}", free_udp_port(8));
-    let live_endpoint = format!("127.0.0.1:{}", free_udp_port(9));
+    let [control_port, source_port, live_port] = free_udp_ports::<3>();
+    let control = format!("127.0.0.1:{control_port}");
+    let source_endpoint = format!("127.0.0.1:{source_port}");
+    let live_endpoint = format!("127.0.0.1:{live_port}");
 
     let live_channel = format!("aeron:udp?control={control}|control-mode=dynamic|term-length=64k");
 
