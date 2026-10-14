@@ -39,6 +39,7 @@
 //! list).
 
 pub mod arp;
+pub mod demux;
 pub mod fake_port;
 pub mod frame;
 pub mod neighbour;

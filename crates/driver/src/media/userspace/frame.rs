@@ -658,7 +658,11 @@ fn write_ipv4_header(
 }
 
 /// Write an ICMP echo frame of `echo_type`.
-fn write_icmp_echo(
+///
+/// A reply is one byte of this and a request is another, so the two are the
+/// same encoder — and a test that needs a *request* on the wire (an echo
+/// request is what a ping sends, and what this stack answers) needs it too.
+pub(crate) fn write_icmp_echo(
     buffer: &mut [u8],
     frame: &Ipv4Write,
     echo: &IcmpEcho<'_>,

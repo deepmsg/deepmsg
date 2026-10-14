@@ -45,10 +45,11 @@ use crate::media::Affinity;
 use crate::sys::socket::BindFailure;
 
 use super::arp;
+use super::demux;
 use super::fake_port::{Side, Wire};
-use super::frame::{self, ArpPacket, EthernetHeader, Received};
+use super::frame::{self, ArpPacket, EthernetHeader};
 use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
-use super::packet_io::{Disposition, ReadyFrame, RxFrame, RxPort, SlotId, TxPort};
+use super::packet_io::{ReadyFrame, RxPort, SlotId, TxPort};
 use super::ports::{Binding, EPHEMERAL_PORTS, PortTable, SLOT_CAPACITY};
 
 /// How many frames one pass takes off the port.
@@ -337,13 +338,19 @@ impl SlotTable {
 /// Little and `Copy` on purpose: the deferred list is built per pass and
 /// almost always empty, so it costs no allocation, and what it holds is the
 /// description of a frame rather than the frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Deferred {
-    /// The answer to an ARP request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Deferred {
+    /// The answer to an ARP request, described rather than built: an ARP frame
+    /// is `Copy` all the way down, so carrying its description costs no
+    /// allocation.
     ArpReply {
         ethernet: EthernetHeader,
         packet: ArpPacket,
     },
+    /// An answer to an ICMP echo, built while the request's bytes were still
+    /// borrowed — the reply has to carry the request's payload, and that
+    /// payload does not outlive the callback that saw it.
+    IcmpReply(Vec<u8>),
 }
 
 /// One thread's view of a stack: which of the two it is, and the stack.
@@ -555,7 +562,7 @@ impl Stack {
             let mut rx = self.rx.lock().expect("the receive port");
             rx.rx_burst(
                 RX_BURST,
-                &mut |frame| self.route(frame, &mut deferred),
+                &mut |frame| demux::route(self, frame, &mut deferred),
                 &mut kept,
             )
         };
@@ -643,80 +650,35 @@ impl Stack {
         self.identification.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Decide what becomes of one frame: the port's callback, and deliberately
-    /// not where a frame is filed. A kept frame is pushed after the port's
-    /// lock is released, so nothing takes a slot's lock while holding a
-    /// port's (the design's §3.8 lock order).
-    fn route(&self, frame: RxFrame<'_>, deferred: &mut Vec<Deferred>) -> Disposition {
-        // A frame addressed to some other port is not this port's, and the
-        // design drops it **silently** — no counter, because a port that is
-        // not in promiscuous mode is never handed one to begin with (§4.5).
-        let ethernet = match frame::read_ethernet_header(frame.bytes) {
-            Ok(ethernet) if ethernet.is_for(self.params.mac) => ethernet,
-            _ => return Disposition::Consumed,
-        };
-
-        let Ok(received) = frame::read(frame.bytes, frame.checksums) else {
-            // A frame the stack cannot place is counted and dropped by the
-            // slice that owns the counters; until then it is dropped.
-            return Disposition::Consumed;
-        };
-
-        match received {
-            Received::Udp { ipv4, datagram } => {
-                // Gleaning again, and not only for ARP: any frame from an
-                // address on this link carries that address's MAC, and
-                // learning it here is what lets an answer go straight back
-                // without a resolution of its own (design §4.5).
-                self.glean(ipv4.source, ethernet.source);
-                let source = SocketAddr::from((ipv4.source, datagram.source_port));
-
-                match self.ports.lookup(
-                    self.params.address,
-                    ipv4.destination,
-                    datagram.destination_port,
-                    source,
-                ) {
-                    Some(binding) => Disposition::Keep(binding),
-                    None => Disposition::Consumed,
-                }
-            }
-            Received::Arp(packet) => {
-                self.answer_or_learn(&packet, deferred);
-                Disposition::Consumed
-            }
-            // ICMP is answered by the slice that owns the counters.
-            Received::Echo { .. } => Disposition::Consumed,
-        }
-    }
-
-    /// What an arriving ARP packet is worth: what it teaches, and whether it
-    /// has to be answered.
-    fn answer_or_learn(&self, packet: &ArpPacket, deferred: &mut Vec<Deferred>) {
-        self.glean(packet.sender_protocol, packet.sender_hardware);
-
-        if arp::asks_about(packet, self.params.address) {
-            let (ethernet, reply) = arp::reply_to(&self.params, packet);
-            deferred.push(Deferred::ArpReply {
-                ethernet,
-                packet: reply,
-            });
-        }
+    /// The binding a datagram delivered to `destination` from `source`
+    /// reaches, which is the demultiplexer's whole question.
+    pub(crate) fn lookup(
+        &self,
+        destination: Ipv4Addr,
+        port: u16,
+        source: SocketAddr,
+    ) -> Option<Binding> {
+        self.ports
+            .lookup(self.params.address, destination, port, source)
     }
 
     /// Learn what a frame's sender is, when it is on this link.
     ///
     /// Bounded by the link on purpose: a source address that is *not* on this
     /// link arrived through the gateway, so the MAC beside it is the router's
-    /// — remembering it as that address's would send its traffic to the
-    /// router for the wrong reason.
-    fn glean(&self, source: Ipv4Addr, hardware: [u8; 6]) {
+    /// — remembering it as that address's would send its traffic to the router
+    /// for the wrong reason.
+    pub(crate) fn glean(&self, source: Ipv4Addr, hardware: [u8; 6]) {
         if neighbour::on_the_same_link(self.params.address, source, self.params.prefix_length) {
             self.learn(source, hardware);
         }
     }
 
     /// Broadcast an ARP request for `address` out of `affinity`'s queue.
+    ///
+    /// Written straight into the port's own buffer: a request is generated
+    /// from the resolve path, which is per pass rather than per frame, and
+    /// there is nothing to be gained by building it anywhere else first.
     fn send_arp_request(&self, address: Ipv4Addr, affinity: Affinity) {
         let params = &self.params;
         let mut port = self.transmit(affinity).lock().expect("the transmit port");
@@ -734,6 +696,16 @@ impl Stack {
             Deferred::ArpReply { ethernet, packet } => {
                 port.tx_burst(1, &mut |buffer| {
                     frame::write_arp(buffer, &ethernet, &packet).unwrap_or(0)
+                });
+            }
+            Deferred::IcmpReply(bytes) => {
+                port.tx_burst(1, &mut |buffer| {
+                    if buffer.len() < bytes.len() {
+                        return 0;
+                    }
+                    buffer[..bytes.len()].copy_from_slice(&bytes);
+
+                    bytes.len()
                 });
             }
         }
@@ -755,6 +727,7 @@ impl Stack {
 mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Injection};
+    use crate::media::userspace::frame::Received;
 
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
