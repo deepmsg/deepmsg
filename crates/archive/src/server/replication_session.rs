@@ -477,6 +477,80 @@ pub struct ReplicationSession {
     retry_attempts: i32,
 }
 
+/// The channel an `EXTEND` is made on (`ReplicationSession.extend`,
+/// `ReplicationSession.java:525-541`).
+///
+/// A free function over the six things that decide it, and not a method, so
+/// that the channel can be judged **where it is built**. The criteria in
+/// `deepmsg-tests` cannot: a replication's recording subscription is
+/// `autoStop` and goes the moment the copy ends
+/// (`ArchiveConductor.java:1355`), which leaves a window shorter than one
+/// client round trip — so what those criteria assert is the `EXTEND` signal,
+/// and the channel it names is asserted here
+/// (`analysis/archive-client-api-flake.md`, section B).
+///
+/// Three parameters are the channel's own, three are the session's:
+///
+/// * `replication_channel` is the channel the request named;
+/// * `replay_session_id` is what the source's replay will arrive under, which
+///   `on_recording_descriptor` settles from the descriptor and `EXTEND` writes
+///   down — **unless the channel is a response channel**, where the reference
+///   leaves it out (`:532-536` asks `hasControlModeResponse`);
+/// * `is_tagged` and the two ids are the multi-destination rewrite, and a
+///   **live destination** joins it because a copy that has to follow a stream
+///   which comes and goes cannot take its address from a channel (`isMds`,
+///   `:527`).
+fn extend_channel_uri(
+    replication_channel: &str,
+    replay_session_id: i32,
+    is_tagged: bool,
+    channel_tag_id: i64,
+    subscription_tag_id: i64,
+    has_live_destination: bool,
+) -> Result<String, String> {
+    let mut uri = ChannelUri::parse(replication_channel)
+        .map_err(|error| format!("{replication_channel} is not a channel: {error}"))?;
+
+    uri.put(REJOIN_KEY, "false");
+
+    if uri.get(CONTROL_MODE_KEY) != Some(CONTROL_MODE_RESPONSE) {
+        uri.put(SESSION_ID_KEY, replay_session_id.to_string());
+    }
+
+    if is_tagged || has_live_destination {
+        uri.remove(ENDPOINT_KEY);
+
+        // **The tags go on only when there is a tag**, which is the one place
+        // this build departs from the reference's channel text — and it is a
+        // departure the reference's own client library makes for it. The
+        // reference writes `channelTagId + "," + subscriptionTagId`
+        // unconditionally (`:539`), so a replication that named a live
+        // destination and no tags — the only way to reach this branch without
+        // a tag — asks for a subscription on `tags=-1,-1`. That is
+        // `Aeron.NULL_VALUE` written as a tag: the Java driver reads it as a
+        // **real** tag of `-1` (`UdpChannel.java:216-218`, and `matchesTag`
+        // matches on equal tags, `:786`), and the C driver refuses the channel
+        // outright (`aeron_udp_channel.c:385-390`, because its "no tag"
+        // sentinel is the same `-1` its parser returns for a value it cannot
+        // read).
+        //
+        // `ChannelUriStringBuilder.tags(Long, Long)` — the way every other
+        // caller writes this parameter — says "no tags" by leaving it out
+        // (`ChannelUriStringBuilder.java:1250-1264`), and that is what this
+        // does. See `docs/compat.md`, "The channel URIs this driver serves";
+        // the criterion is
+        // `a_live_replication_merges_into_the_stream_it_is_copying` (in
+        // `deepmsg-tests`), which pins the channel the live pair produces.
+        if is_tagged {
+            uri.put(TAGS_KEY, format!("{channel_tag_id},{subscription_tag_id}"));
+        }
+
+        uri.put(CONTROL_MODE_KEY, CONTROL_MODE_MANUAL);
+    }
+
+    Ok(uri.build())
+}
+
 impl ReplicationSession {
     /// A session that has not started: `state = CONNECT`
     /// (`ReplicationSession.java:110`).
@@ -827,7 +901,14 @@ impl ReplicationSession {
         }
 
         if self.extend_asked {
-            return Ok(());
+            // The answer is the **registration**, and the registration is the
+            // driver's to confirm ([`crate::server::conductor`]: the extend's
+            // reply is sent once the subscription is in the registry, the way
+            // the reference's `extendRecording` answers after its own
+            // `addSubscription`). So this state waits like every other one, and
+            // a driver that never answers ends the replication rather than
+            // leaving it here for ever.
+            return self.expire_or_hold(self.now_ms, "the extend was never answered");
         }
 
         let channel = self.extend_channel()?;
@@ -862,53 +943,14 @@ impl ReplicationSession {
     /// decides where it reads from. The endpoint it takes off is not lost: it
     /// is what [`Self::replay_destination`] puts back, on the destination.
     fn extend_channel(&self) -> Result<String, String> {
-        let mut uri = ChannelUri::parse(&self.replication_channel)
-            .map_err(|error| format!("{} is not a channel: {error}", self.replication_channel))?;
-
-        uri.put(REJOIN_KEY, "false");
-
-        if uri.get(CONTROL_MODE_KEY) != Some(CONTROL_MODE_RESPONSE) {
-            uri.put(SESSION_ID_KEY, self.replay_session_id.to_string());
-        }
-
-        if self.is_mds() {
-            uri.remove(ENDPOINT_KEY);
-
-            // **The tags go on only when there is a tag**, which is the one
-            // place this build departs from the reference's channel text — and
-            // it is a departure the reference's own client library makes for
-            // it. The reference writes `channelTagId + "," + subscriptionTagId`
-            // unconditionally (`:539`), so a replication that named a live
-            // destination and no tags — the only way to reach this branch
-            // without a tag — asks for a subscription on
-            // `tags=-1,-1`. That is `Aeron.NULL_VALUE` written as a tag: the
-            // Java driver reads it as a **real** tag of `-1`
-            // (`UdpChannel.java:216-218`, and `matchesTag` matches on equal
-            // tags, `:786`), and the C driver refuses the channel outright
-            // (`aeron_udp_channel.c:385-390`, because its "no tag" sentinel is
-            // the same `-1` its parser returns for a value it cannot read).
-            //
-            // `ChannelUriStringBuilder.tags(Long, Long)` — the way every other
-            // caller writes this parameter — says "no tags" by leaving it out
-            // (`ChannelUriStringBuilder.java:1250-1264`), and that is what this
-            // does. See `docs/compat.md`, "The channel URIs this driver
-            // serves"; the criterion is
-            // `a_live_replication_merges_into_the_stream_it_is_copying` (in
-            // `deepmsg-tests`), which pins the channel the live pair produces.
-            if self.is_tagged() {
-                uri.put(
-                    TAGS_KEY,
-                    format!(
-                        "{},{}",
-                        self.request.channel_tag_id, self.request.subscription_tag_id
-                    ),
-                );
-            }
-
-            uri.put(CONTROL_MODE_KEY, CONTROL_MODE_MANUAL);
-        }
-
-        Ok(uri.build())
+        extend_channel_uri(
+            &self.replication_channel,
+            self.replay_session_id,
+            self.is_tagged(),
+            self.request.channel_tag_id,
+            self.request.subscription_tag_id,
+            self.live_destination.is_some(),
+        )
     }
 
     /// `isMds` (`:527`): whether the destination subscribes **by tag or by
@@ -2100,5 +2142,129 @@ impl ReplicationSession {
             code,
             message,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The channel a request names, in the shape every replication in this
+    /// build's tests uses: a localhost endpoint on an ephemeral port.
+    const PLAIN: &str = "aeron:udp?endpoint=localhost:0";
+
+    /// **What the source's replay arrives under.** The session settles
+    /// `replay_session_id` from the descriptor the source sent
+    /// (`on_recording_descriptor`) and `EXTEND` writes it onto the channel —
+    /// and onto the subscription made from it — because that is the session
+    /// the copy is filed under.
+    ///
+    /// This is the claim the `deepmsg-tests` criteria used to read off the
+    /// recording subscription, which they cannot see (`extend_channel_uri`'s
+    /// note says why). Here it is a value, and it is checked as one.
+    #[test]
+    fn a_plain_extend_names_the_session_the_replay_arrives_under() {
+        let channel = extend_channel_uri(PLAIN, -741727832, false, NULL_VALUE, NULL_VALUE, false)
+            .expect("a channel");
+
+        assert!(
+            channel.contains("session-id=-741727832"),
+            "the replay's session, not this session's own: {channel}"
+        );
+        assert!(
+            channel.contains("rejoin=false"),
+            "and an image that goes away is not fought for: {channel}"
+        );
+        assert!(
+            channel.contains("endpoint=localhost:0"),
+            "a plain extend keeps the address it was given: {channel}"
+        );
+        assert!(
+            !channel.contains("tags=") && !channel.contains("control-mode=manual"),
+            "and it is not the multi-destination shape: {channel}"
+        );
+    }
+
+    /// **A response channel names no session**, and that is the reference's own
+    /// exception: `ReplicationSession.java:532-536` asks
+    /// `hasControlModeResponse()` first, because the response channel is the
+    /// one the answers travel on and it already belongs to a session.
+    #[test]
+    fn a_response_channel_does_not_name_one() {
+        let channel = extend_channel_uri(
+            "aeron:udp?endpoint=localhost:0|control-mode=response",
+            -741727832,
+            false,
+            NULL_VALUE,
+            NULL_VALUE,
+            false,
+        )
+        .expect("a channel");
+
+        assert!(channel.contains("rejoin=false"), "still: {channel}");
+        assert!(
+            !channel.contains("session-id="),
+            "and no session id, which is the one channel that may not carry \
+             one: {channel}"
+        );
+    }
+
+    /// **The multi-destination rewrite**: the address comes off and the tags
+    /// and the manual control mode go on, because the copy has to be able to
+    /// follow a stream that comes and goes (`isMds`, `:527`).
+    #[test]
+    fn a_tagged_extend_names_its_tags_and_reads_by_hand() {
+        let channel = extend_channel_uri(PLAIN, 42, true, 7, 9, false).expect("a channel");
+
+        assert!(
+            channel.contains("tags=7,9"),
+            "the request's two ids, channel tag first (`:539`): {channel}"
+        );
+        assert!(
+            channel.contains("control-mode=manual"),
+            "so the client decides where it reads from: {channel}"
+        );
+        assert!(
+            channel.contains("session-id=42"),
+            "and it is still a session the replay arrives under: {channel}"
+        );
+        assert!(
+            !channel.contains("endpoint="),
+            "with the endpoint taken off — it is what `replay_destination` \
+             puts back, on the destination: {channel}"
+        );
+    }
+
+    /// **A live destination with no tag names none**, which is this build's
+    /// one departure from the reference's channel text and the reason
+    /// `docs/compat.md` has a row about it: the reference writes
+    /// `tags=-1,-1` there, and the C driver refuses that channel outright
+    /// (`aeron_udp_channel.c:385-390`).
+    #[test]
+    fn a_live_replication_without_tags_names_none() {
+        let channel =
+            extend_channel_uri(PLAIN, 42, false, NULL_VALUE, NULL_VALUE, true).expect("a channel");
+
+        assert!(
+            channel.contains("control-mode=manual"),
+            "a live destination still needs the manual shape to be addable: {channel}"
+        );
+        assert!(
+            !channel.contains("tags="),
+            "and it says \"no tags\" by leaving the parameter out, which is \
+             what the reference's own client library does \
+             (`ChannelUriStringBuilder.java:1250-1264`): {channel}"
+        );
+        assert!(!channel.contains("endpoint="), "{channel}");
+    }
+
+    /// A channel that is not a channel is refused where it is built, with the
+    /// text that says which one it was.
+    #[test]
+    fn a_channel_that_is_not_one_is_refused() {
+        let refused = extend_channel_uri("not a channel", 42, false, NULL_VALUE, NULL_VALUE, false)
+            .expect_err("not a channel");
+
+        assert!(refused.contains("not a channel"), "{refused}");
     }
 }

@@ -1325,6 +1325,19 @@ struct PendingStartRecording {
     is_auto_stop: bool,
     /// Whether this subscription is making a recording or appending to one.
     request: RecordingRequest,
+    /// The **replication** waiting for this add's outcome, when one is
+    /// (`None` for a client's own start, which is answered by the control
+    /// session here rather than by a session object).
+    ///
+    /// It is carried because the answer a replication gets means *the
+    /// subscription is registered*, not *the add went out*: the reference's
+    /// `extendRecording` puts the `Subscription` in its registry **before** it
+    /// answers (`ArchiveConductor.java:1131-1138`), so "the extend was
+    /// answered" implies "the listing shows it" there. This build's archive
+    /// shares the driver's process and cannot block on it, so the registration
+    /// has to be asynchronous — and the *answer* is what has to wait, which is
+    /// what this field is for.
+    replication_id: Option<i64>,
 }
 
 /// What the conductor remembers about one live recording
@@ -5137,10 +5150,19 @@ impl Sessions {
                 request,
                 replication_id,
             } => {
-                let outcome = self.extend_recording(client, catalog, &request, now_ms);
+                let outcome =
+                    self.extend_recording(client, catalog, &request, replication_id, now_ms);
 
                 if let Some(replication_id) = replication_id {
-                    self.record_extend_outcome(replication_id, outcome);
+                    if outcome.is_err() {
+                        // A refusal is final — nothing will be registered, so
+                        // there is nothing to wait for.
+                        self.record_extend_outcome(replication_id, outcome);
+                    }
+                    // A success is answered from `claim_pending_starts`, once
+                    // the subscription is in the registry: the answer means
+                    // "the recording subscription is there", which is what the
+                    // reference's ordering makes it mean.
                 }
             }
             Action::StopRecordingQuietly { subscription_id } => {
@@ -5275,6 +5297,7 @@ impl Sessions {
                 original_channel: request.original_channel.clone(),
                 is_auto_stop: request.auto_stop,
                 request: RecordingRequest::Start,
+                replication_id: None,
             }),
             Err(error) => self.send_error(
                 client,
@@ -5402,6 +5425,12 @@ impl Sessions {
                             client,
                         );
                     }
+
+                    // And the replication that asked for it, which is answered
+                    // **here** rather than when the add was issued.
+                    if let Some(replication_id) = start.replication_id {
+                        self.record_extend_outcome(replication_id, Ok(start.registration_id));
+                    }
                 }
                 AsyncAddPoll::Awaiting => index += 1,
                 // A refusal and a handle this client knows nothing about are the
@@ -5409,23 +5438,35 @@ impl Sessions {
                 // the reference's `catch` says so in the driver's words.
                 AsyncAddPoll::Failed(error) => {
                     let start = self.pending_starts.swap_remove(index);
+                    let message = format!("subscription could not be added: {error}");
+
+                    if let Some(replication_id) = start.replication_id {
+                        self.record_extend_outcome(replication_id, Err((0, message.clone())));
+                    }
+
                     self.send_error(
                         client,
                         start.session_id,
                         start.correlation_id,
                         0,
-                        &format!("subscription could not be added: {error}"),
+                        &message,
                         now_ms,
                     );
                 }
                 AsyncAddPoll::Unknown => {
                     let start = self.pending_starts.swap_remove(index);
+                    let message = "subscription add is no longer known".to_owned();
+
+                    if let Some(replication_id) = start.replication_id {
+                        self.record_extend_outcome(replication_id, Err((0, message.clone())));
+                    }
+
                     self.send_error(
                         client,
                         start.session_id,
                         start.correlation_id,
                         0,
-                        "subscription add is no longer known",
+                        &message,
                         now_ms,
                     );
                 }
@@ -5581,6 +5622,7 @@ impl Sessions {
         client: &mut Client,
         catalog: &Catalog,
         request: &ExtendRecordingRequest,
+        replication_id: Option<i64>,
         now_ms: i64,
     ) -> Result<i64, (i64, String)> {
         let ExtendRecordingRequest {
@@ -5637,8 +5679,13 @@ impl Sessions {
                     request: RecordingRequest::Extend {
                         recording_id: *recording_id,
                     },
+                    replication_id,
                 });
 
+                // The id is this call's *request* being accepted, and the
+                // caller decides what to do with it: for a replication it is
+                // **not** the answer, because the subscription it names is not
+                // registered yet (see `PendingStartRecording::replication_id`).
                 Ok(add.registration_id())
             }
             Err(error) => {
