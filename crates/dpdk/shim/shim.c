@@ -203,6 +203,19 @@ int shim_port_info(unsigned port, shim_port_info_t *out)
     return 0;
 }
 
+/*
+ * The two receive offloads this build asks about, by DPDK's own numbering.
+ *
+ * Functions rather than numbers the Rust side carries, because the numbering
+ * is DPDK's: an offload is an `RTE_BIT64(n)` in a header that moves between
+ * versions, and what the driver above this crate wants is the yes-or-no answer
+ * — "does this port judge IPv4 checksums" — not a bit position it would have
+ * to keep in step with a library it never includes.
+ */
+uint64_t shim_rx_offload_ipv4_checksum(void) { return RTE_ETH_RX_OFFLOAD_IPV4_CKSUM; }
+
+uint64_t shim_rx_offload_udp_checksum(void) { return RTE_ETH_RX_OFFLOAD_UDP_CKSUM; }
+
 int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t rx_offloads, uint64_t tx_offloads)
 {
     struct rte_eth_conf conf;

@@ -455,6 +455,17 @@ fn a_port_describes_itself_in_the_child() {
 
     assert_eq!(port._port.mac().len(), 6, "a port has an address");
     assert!(port._port.mtu() > 0, "and reports an MTU");
+
+    // What the port says it can judge, against what its frames say it judged:
+    // the case above receives frames from this port and every one of them
+    // answers `NotJudged` (D0 — the virtual devices have no checksum offload).
+    // A capability read out of `rx_offload_capa` that disagreed with the frames
+    // would be a driver asking a port for something it cannot do.
+    assert!(
+        !info.can_judge_ipv4_checksum() && !info.can_judge_udp_checksum(),
+        "net_pcap judges no checksums, and reports none: {:#x}",
+        info.rx_offloads
+    );
 }
 
 /// A failure carries DPDK's own words, which is what makes an error worth

@@ -60,6 +60,31 @@ pub struct PortInfo {
     pub tx_offloads: u64,
 }
 
+impl PortInfo {
+    /// Whether this port judges the IPv4 header checksum of the frames it
+    /// hands over — `RTE_ETH_RX_OFFLOAD_IPV4_CKSUM` among its receive
+    /// capabilities.
+    ///
+    /// A capability, not a promise: the port judges checksums only if it was
+    /// asked to ([`PortSettings::rx_offloads`]), and what it answers here is
+    /// what it *can* do. The two are the same value for a caller that asks for
+    /// what it reads back, which is what the driver does.
+    pub fn can_judge_ipv4_checksum(&self) -> bool {
+        // SAFETY: the offload's bit, wrapped as a function by the shim: it
+        // reads nothing and cannot fail.
+        let bit = unsafe { sys::shim_rx_offload_ipv4_checksum() };
+        self.rx_offloads & bit != 0
+    }
+
+    /// Whether it judges the UDP checksum; see
+    /// [`can_judge_ipv4_checksum`](Self::can_judge_ipv4_checksum).
+    pub fn can_judge_udp_checksum(&self) -> bool {
+        // SAFETY: as above.
+        let bit = unsafe { sys::shim_rx_offload_udp_checksum() };
+        self.rx_offloads & bit != 0
+    }
+}
+
 /// A started port.
 ///
 /// Held in an [`Arc`]: the queues a thread was handed keep it alive, and the

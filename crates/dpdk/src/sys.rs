@@ -102,6 +102,8 @@ unsafe extern "C" {
     pub fn shim_port_by_name(name: *const c_char) -> c_int;
     pub fn shim_port_name(port: c_uint, out: *mut c_char, cap: c_uint);
     pub fn shim_port_info(port: c_uint, out: *mut ShimPortInfo) -> c_int;
+    pub fn shim_rx_offload_ipv4_checksum() -> u64;
+    pub fn shim_rx_offload_udp_checksum() -> u64;
     pub fn shim_port_configure(
         port: c_uint,
         nb_rx: c_uint,
