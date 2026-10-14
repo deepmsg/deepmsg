@@ -46,6 +46,7 @@ pub mod poller;
 pub mod receive_endpoint;
 pub mod send_endpoint;
 pub mod udp_transport;
+pub mod userspace;
 
 pub use crate::sys::socket::Datagrams;
 pub use bindings::{Affinity, TransportBindings};

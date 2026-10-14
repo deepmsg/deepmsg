@@ -76,3 +76,93 @@ the reference's own decoder's reading of each one recorded in `sbe/golden.tsv`.
 They are the golden for `deepmsg-codec`, and they are a directory of their own
 because they are a set rather than a capture: `sbe/README.md` says how the set
 is built, what the value rule is, and what it deliberately leaves uncovered.
+
+## `frame/`
+
+Two frames a Linux kernel built, captured on the wire, for the userspace UDP
+stack (`crates/driver/src/media/userspace/frame.rs`) to reproduce byte for
+byte:
+
+- `ipv4-udp.bin` — 72 bytes: Ethernet II, IPv4, UDP, 30 bytes of payload.
+- `arp-request.bin` — 42 bytes: the ARP request that resolves a next hop on the
+  same subnet.
+
+Captured 2026-10-14 on a `veth` pair inside a network namespace, with the
+sending side's **TX checksum offload turned off**, so the UDP checksum in the
+file is the one the kernel computed in software.
+
+### Why not the loopback
+
+Because `lo` cannot be made to compute it: `ethtool -k lo` reports
+`tx-checksum-ip-generic: on [fixed]`, and `[fixed]` means it cannot be turned
+off. What such a capture holds is the pseudo-header sum alone — tcpdump says
+`bad udp cksum` — which is the opposite of what a golden for a checksum is for.
+
+### Regenerating
+
+    sudo sh capture.sh        # g13-capture/capture.sh, the recipe below
+
+which is, with nothing left out:
+
+    ip netns add g13; X="ip netns exec g13"
+    $X ip link add va type veth peer name vb
+    $X ip link set va address 02:00:00:00:00:01
+    $X ip link set vb address 02:00:00:00:00:02
+    $X ip link set va up; $X ip link set vb up
+    $X ip addr add 10.77.0.1/24 dev va; $X ip addr add 10.77.0.2/24 dev vb
+    $X ip addr add 10.77.0.3/24 dev vb
+    $X ethtool -K va tx off
+    $X ip neigh replace 10.77.0.2 lladdr 02:00:00:00:00:02 dev va
+    $X tcpdump -i vb -c 1 -w udp.pcap 'udp port 40999' &
+    $X python3 -c 'import socket; s = socket.socket(2, 2); s.bind(("10.77.0.1", 42001));
+                   s.setsockopt(1, 25, b"va"); s.sendto(b"deepmsg golden ipv4/udp frame!", ("10.77.0.2", 40999))'
+    $X tcpdump -i vb -c 1 -w arp.pcap 'arp' &
+    $X python3 -c 'import socket; s = socket.socket(2, 2); s.bind(("10.77.0.1", 42002));
+                   s.setsockopt(1, 25, b"va"); s.sendto(b"arp me", ("10.77.0.3", 40999))'
+    ip netns del g13
+
+then cut the frame out of each pcap (24-byte file header, 16-byte record
+header, the bytes) and check it with `tcpdump -r udp.pcap -vv -e`, which is
+where `[udp sum ok]` has to appear.
+
+### What `ipv4-udp.bin` pins
+
+| field | value |
+|---|---|
+| destination MAC | `02:00:00:00:00:02` |
+| source MAC | `02:00:00:00:00:01` |
+| ethertype | `0x0800` |
+| version / IHL | 4 / 5 |
+| TOS | 0 |
+| total length | 58 |
+| identification | 20175 (`0x4ecf`) — Linux's, and an **input** to the encoder |
+| flags / fragment offset | `DF`, 0 |
+| TTL | 64 |
+| protocol | 17 |
+| header checksum | `0xd747` |
+| source / destination | `10.77.0.1` / `10.77.0.2` |
+| source / destination port | 42001 / 40999 |
+| UDP length / checksum | 38 / `0xf78b` |
+| payload | `deepmsg golden ipv4/udp frame!` |
+
+The identification is the one field the encoder takes rather than derives, and
+the golden is why: Linux fills it per datagram from its own counter pool, so a
+test that wants these bytes reproduces them by feeding the captured value back
+in. TTL 64, TOS 0 and DF are the reference's own defaults for a UDP datagram on
+a Linux host, which is what the userspace stack writes.
+
+### What `arp-request.bin` pins
+
+A request for `10.77.0.3` from `10.77.0.1`/`02:00:00:00:00:01`: the
+broadcast destination, `0x0806`, hardware type 1, protocol type `0x0800`,
+hardware length 6, protocol length 4, operator 1, the sender's MAC and
+address, and a zero target hardware address.
+
+### What it does not pin
+
+**The ARP reply.** This host's kernel does not answer that request — measured,
+not assumed: three requests a second apart, and the far side's `ip neigh`
+ends `FAILED` — so there is no reply to capture here, and the reply's encoder
+is tested against a frame built from the request's own fields (operator 2, the
+target fields filled in). What the request does pin is the field order and
+widths, which the reply shares.
