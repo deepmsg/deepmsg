@@ -8,9 +8,10 @@
 //! # What is here, and what it buys
 //!
 //! The NIC boundary and nothing above it: EAL, ports and their queues, mbufs
-//! and their pool, and the two burst calls that cross into the PMD. Ethernet
-//! and IP framing, ARP, the port and neighbour tables, demultiplexing — all of
-//! that is the driver's, in safe Rust (ADR-0006 decision 4).
+//! and the pool they come from, the two burst calls that cross into the PMD,
+//! and the ring frames cross threads on. Ethernet and IP framing, ARP, the port
+//! and neighbour tables, demultiplexing — all of that is the driver's, in safe
+//! Rust (ADR-0006 decision 4).
 //!
 //! # One EAL per process
 //!
@@ -33,70 +34,23 @@
 #![cfg(feature = "dpdk")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod error;
+mod mempool;
+mod port;
+mod ring;
 mod sys;
 
 use std::ffi::{CString, OsStr, c_char, c_int};
-use std::fmt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use error::Error;
+pub use mempool::{Mempool, MempoolSettings, ParkedFrame};
+pub use port::{Checksum, Disposition, Port, PortInfo, PortSettings, QueuePair, RxFrame};
+pub use ring::{Consumer, FrameRing, Producer};
+
 /// The lcore id of a thread EAL knows nothing about.
 const LCORE_ID_ANY: u32 = u32::MAX;
-
-/// What went wrong inside EAL.
-#[derive(Debug)]
-pub struct EalError {
-    /// DPDK's `rte_errno` where it was DPDK's error, `0` where this crate
-    /// refused the request itself.
-    pub rte_errno: i32,
-    message: String,
-}
-
-impl EalError {
-    /// The current `rte_errno`, worded by DPDK.
-    fn from_rte_errno() -> Self {
-        // SAFETY: `rte_errno` is a thread-local in DPDK and `rte_strerror`
-        // answers a static string for every value it is given, including the
-        // ones it does not know.
-        let (errno, message) = unsafe {
-            let errno = sys::shim_rte_errno();
-            let text = sys::shim_rte_strerror(errno);
-            debug_assert!(
-                !text.is_null(),
-                "rte_strerror answers a string for any errno"
-            );
-            (
-                errno,
-                std::ffi::CStr::from_ptr(text)
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        };
-        Self {
-            rte_errno: errno,
-            message,
-        }
-    }
-
-    fn refused(message: impl Into<String>) -> Self {
-        Self {
-            rte_errno: 0,
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for EalError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.rte_errno == 0 {
-            write!(f, "{}", self.message)
-        } else {
-            write!(f, "{} (rte_errno={})", self.message, self.rte_errno)
-        }
-    }
-}
-
-impl std::error::Error for EalError {}
 
 /// The process's EAL, initialised.
 ///
@@ -127,13 +81,13 @@ impl Eal {
     /// The first call initialises EAL. A second call in the same process — from
     /// anywhere, with any arguments — answers the same `Eal` rather than
     /// initialising again, because that is what the library allows.
-    pub fn init<I, S>(args: I) -> Result<&'static Eal, EalError>
+    pub fn init<I, S>(args: I) -> Result<&'static Eal, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         if CLEANED_UP.load(Ordering::Acquire) {
-            return Err(EalError::refused(
+            return Err(Error::refused(
                 "EAL was cleaned up in this process, and it does not start twice",
             ));
         }
@@ -145,13 +99,11 @@ impl Eal {
         for arg in args {
             let arg = arg.as_ref();
             argv.push(CString::new(arg.as_encoded_bytes()).map_err(|_| {
-                EalError::refused(format!("an EAL argument contains a NUL byte: {arg:?}"))
+                Error::refused(format!("an EAL argument contains a NUL byte: {arg:?}"))
             })?);
         }
         if argv.is_empty() {
-            return Err(EalError::refused(
-                "EAL needs argv[0], the program's own name",
-            ));
+            return Err(Error::refused("EAL needs argv[0], the program's own name"));
         }
         let argc = argv.len() as c_int;
         let mut pointers: Vec<*mut c_char> =
@@ -163,11 +115,10 @@ impl Eal {
         // outlives the call. One call per process is the library's contract and
         // the singleton above is what enforces it: the only way to reach here
         // twice is two threads racing their first `init`, and then DPDK itself
-        // refuses the second — the loser gets an `EalError`, never a second
-        // EAL.
+        // refuses the second — the loser gets an `Error`, never a second EAL.
         let consumed = unsafe { sys::shim_eal_init(argc, pointers.as_mut_ptr()) };
         if consumed < 0 {
-            return Err(EalError::from_rte_errno());
+            return Err(Error::from_rte_errno("EAL would not start"));
         }
 
         let _ = EAL.set(Eal { _private: () });
@@ -184,24 +135,18 @@ impl Eal {
     /// a process does with DPDK, and it is on the caller because the order it
     /// belongs in — threads stopped, transports closed, ports stopped, pool
     /// freed, then this — is the caller's to know (ADR-0006, consequences).
-    pub fn cleanup() -> Result<(), EalError> {
+    pub fn cleanup() -> Result<(), Error> {
         if EAL.get().is_none() {
-            return Err(EalError::refused(
-                "EAL was never initialised in this process",
-            ));
+            return Err(Error::refused("EAL was never initialised in this process"));
         }
         if CLEANED_UP.swap(true, Ordering::AcqRel) {
-            return Err(EalError::refused(
-                "EAL was already cleaned up in this process",
-            ));
+            return Err(Error::refused("EAL was already cleaned up in this process"));
         }
         // SAFETY: called at most once per process — the singleton above means
-        // an `Eal` exists, and a caller that runs this twice is asking DPDK to
-        // clean up twice, which answers a non-zero code rather than
-        // misbehaving.
+        // an `Eal` exists, and the flag means this is the first cleanup.
         let rc = unsafe { sys::shim_eal_cleanup() };
         if rc != 0 {
-            return Err(EalError::from_rte_errno());
+            return Err(Error::from_rte_errno("EAL would not shut down"));
         }
         Ok(())
     }
@@ -237,13 +182,13 @@ pub struct RegisteredThread {
 
 impl RegisteredThread {
     /// Register the calling thread with EAL.
-    pub fn register() -> Result<Self, EalError> {
+    pub fn register() -> Result<Self, Error> {
         // SAFETY: `rte_thread_register` is documented for any thread that EAL
         // did not start, at most once at a time per thread; the guard makes the
         // matching unregister happen exactly once.
         let rc = unsafe { sys::shim_thread_register() };
         if rc != 0 {
-            return Err(EalError::from_rte_errno());
+            return Err(Error::from_rte_errno("the thread would not register"));
         }
         Ok(Self { _private: () })
     }
@@ -267,12 +212,12 @@ impl Drop for RegisteredThread {
 /// DPDK pins the main thread to its main lcore at init. A driver that computes
 /// its lcore argument from the cpuset it was started in does not need this —
 /// nothing moves — but the pair stays for the case where it does.
-pub fn save_affinity() -> Result<(), EalError> {
+pub fn save_affinity() -> Result<(), Error> {
     // SAFETY: `pthread_getaffinity_np` with a buffer owned by the shim's own
     // static is its documented use.
     let rc = unsafe { sys::shim_save_affinity() };
     if rc != 0 {
-        return Err(EalError::refused(format!(
+        return Err(Error::refused(format!(
             "pthread_getaffinity_np answered {rc}"
         )));
     }
@@ -280,11 +225,11 @@ pub fn save_affinity() -> Result<(), EalError> {
 }
 
 /// Put back the affinity [`save_affinity`] saved.
-pub fn restore_affinity() -> Result<(), EalError> {
+pub fn restore_affinity() -> Result<(), Error> {
     // SAFETY: as above; the saved set is the one this thread had.
     let rc = unsafe { sys::shim_restore_affinity() };
     if rc != 0 {
-        return Err(EalError::refused(format!(
+        return Err(Error::refused(format!(
             "pthread_setaffinity_np answered {rc}"
         )));
     }

@@ -19,10 +19,57 @@
  */
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <stdint.h>
+#include <string.h>
 
 #include <rte_eal.h>
 #include <rte_errno.h>
+#include <rte_ether.h>
+#include <rte_ethdev.h>
 #include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_ring.h>
+
+/*
+ * The name a port answers to, as this file carries it. DPDK's own length is
+ * `RTE_ETH_NAME_MAX_LEN`; the assertion below is what keeps the two from
+ * drifting apart silently.
+ */
+#define SHIM_DRIVER_NAME_MAX 64
+
+typedef struct {
+    char driver[SHIM_DRIVER_NAME_MAX];
+    uint16_t max_rx_queues;
+    uint16_t max_tx_queues;
+    uint16_t max_mtu;
+    uint16_t min_mtu;
+    int socket_id;
+    uint64_t rx_offloads;
+    uint64_t tx_offloads;
+} shim_port_info_t;
+
+_Static_assert(RTE_ETH_NAME_MAX_LEN <= SHIM_DRIVER_NAME_MAX,
+    "the shim's driver-name buffer is shorter than DPDK's");
+
+/*
+ * A frame on the way in: the handle Rust owns, the bytes it reads, and the
+ * NIC's verdict on the checksums — a three-valued answer computed *here*, so
+ * that no DPDK bit-field is interpreted on the Rust side.
+ */
+#define SHIM_CKSUM_NONE 0u
+#define SHIM_CKSUM_GOOD 1u
+#define SHIM_CKSUM_BAD  2u
+
+typedef struct {
+    void *mbuf;
+    unsigned char *data;
+    uint16_t len;
+    uint32_t checksum;
+} shim_rx_desc;
+
+/* The batch bound: one call carries at most this many frames. */
+#define SHIM_BURST_MAX 64
 
 /* ---- EAL, once per process ------------------------------------------- */
 
@@ -68,3 +115,208 @@ void shim_thread_unregister(void) { rte_thread_unregister(); }
 unsigned shim_lcore_id(void) { return rte_lcore_id(); }
 
 unsigned shim_lcore_count(void) { return rte_lcore_count(); }
+
+/* ---- the pool the frames come from ------------------------------------ */
+
+/*
+ * `data_room` of zero means DPDK's default, which holds an MTU of 1500 with
+ * its headers. `socket_id` is passed through as given: the ports D0 measured
+ * answer `-1` for their socket, and `-1` *is* `SOCKET_ID_ANY`.
+ */
+void *shim_pool_create(const char *name, unsigned count, unsigned cache, unsigned data_room, int socket_id)
+{
+    unsigned room = (data_room == 0) ? RTE_MBUF_DEFAULT_BUF_SIZE : data_room;
+
+    return rte_pktmbuf_pool_create(name, count, cache, 0, (uint16_t)room, socket_id);
+}
+
+void shim_pool_free(void *pool) { rte_mempool_free(pool); }
+
+unsigned shim_pool_avail(void *pool)
+{
+    return rte_mempool_avail_count(pool);
+}
+
+/* ---- the port, and its queues ----------------------------------------- */
+
+unsigned shim_port_count(void) { return rte_eth_dev_count_avail(); }
+
+/* The port with this name, or -1. A name is a PCI address or a vdev's name. */
+int shim_port_by_name(const char *name)
+{
+    uint16_t port;
+
+    return (rte_eth_dev_get_port_by_name(name, &port) == 0) ? (int)port : -1;
+}
+
+void shim_port_name(unsigned port, char *out, unsigned cap)
+{
+    if (rte_eth_dev_get_name_by_port((uint16_t)port, out) != 0)
+    {
+        out[0] = '\0';
+        return;
+    }
+    out[cap - 1] = '\0';
+}
+
+int shim_port_info(unsigned port, shim_port_info_t *out)
+{
+    struct rte_eth_dev_info info;
+    int rc = rte_eth_dev_info_get((uint16_t)port, &info);
+
+    if (rc != 0)
+    {
+        return rc;
+    }
+    memset(out, 0, sizeof(*out));
+    if (NULL != info.driver_name)
+    {
+        snprintf(out->driver, sizeof(out->driver), "%s", info.driver_name);
+    }
+    out->max_rx_queues = info.max_rx_queues;
+    out->max_tx_queues = info.max_tx_queues;
+    out->max_mtu = info.max_mtu;
+    out->min_mtu = info.min_mtu;
+    out->socket_id = rte_eth_dev_socket_id((uint16_t)port);
+    out->rx_offloads = info.rx_offload_capa;
+    out->tx_offloads = info.tx_offload_capa;
+
+    return 0;
+}
+
+int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t rx_offloads, uint64_t tx_offloads)
+{
+    struct rte_eth_conf conf;
+
+    memset(&conf, 0, sizeof(conf));
+    conf.rxmode.offloads = rx_offloads;
+    conf.txmode.offloads = tx_offloads;
+
+    return rte_eth_dev_configure((uint16_t)port, (uint16_t)nb_rx, (uint16_t)nb_tx, &conf);
+}
+
+int shim_rx_queue_setup(unsigned port, unsigned queue, unsigned descriptors, void *pool)
+{
+    return rte_eth_rx_queue_setup(
+        (uint16_t)port, (uint16_t)queue, (uint16_t)descriptors,
+        rte_eth_dev_socket_id((uint16_t)port), NULL, pool);
+}
+
+int shim_tx_queue_setup(unsigned port, unsigned queue, unsigned descriptors)
+{
+    return rte_eth_tx_queue_setup(
+        (uint16_t)port, (uint16_t)queue, (uint16_t)descriptors,
+        rte_eth_dev_socket_id((uint16_t)port), NULL);
+}
+
+int shim_port_start(unsigned port) { return rte_eth_dev_start((uint16_t)port); }
+
+void shim_port_stop(unsigned port) { rte_eth_dev_stop((uint16_t)port); }
+
+void shim_port_close(unsigned port) { rte_eth_dev_close((uint16_t)port); }
+
+int shim_port_mac(unsigned port, unsigned char *out)
+{
+    struct rte_ether_addr addr;
+    int rc = rte_eth_macaddr_get((uint16_t)port, &addr);
+
+    if (rc == 0)
+    {
+        memcpy(out, addr.addr_bytes, 6);
+    }
+
+    return rc;
+}
+
+int shim_port_mtu(unsigned port, uint16_t *out) { return rte_eth_dev_get_mtu((uint16_t)port, out); }
+
+int shim_port_set_mtu(unsigned port, uint16_t mtu) { return rte_eth_dev_set_mtu((uint16_t)port, mtu); }
+
+/* ---- the data path, in batches ---------------------------------------- */
+
+/*
+ * The NIC's verdict, or "not judged" for a port that has no checksum offload —
+ * which is every virtual device this slice runs on.
+ */
+static uint32_t shim_checksum_of(const struct rte_mbuf *mbuf)
+{
+    if (0 != (mbuf->ol_flags & (RTE_MBUF_F_RX_IP_CKSUM_BAD | RTE_MBUF_F_RX_L4_CKSUM_BAD)))
+    {
+        return SHIM_CKSUM_BAD;
+    }
+    if (0 != (mbuf->ol_flags & (RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_GOOD)))
+    {
+        return SHIM_CKSUM_GOOD;
+    }
+
+    return SHIM_CKSUM_NONE;
+}
+
+/*
+ * One call, up to `max` frames: the whole of what a pass pays to cross into
+ * the PMD, whatever the burst carries.
+ */
+unsigned shim_rx_burst(unsigned port, unsigned queue, shim_rx_desc *out, unsigned max)
+{
+    struct rte_mbuf *mbufs[SHIM_BURST_MAX];
+    unsigned n, i;
+
+    if (max > SHIM_BURST_MAX)
+    {
+        max = SHIM_BURST_MAX;
+    }
+    n = rte_eth_rx_burst((uint16_t)port, (uint16_t)queue, mbufs, (uint16_t)max);
+    for (i = 0; i < n; i++)
+    {
+        out[i].mbuf = mbufs[i];
+        out[i].data = rte_pktmbuf_mtod(mbufs[i], unsigned char *);
+        out[i].len = rte_pktmbuf_data_len(mbufs[i]);
+        out[i].checksum = shim_checksum_of(mbufs[i]);
+    }
+
+    return n;
+}
+
+/*
+ * The same, for frames that came back out of a ring: the handle crossed, the
+ * bytes did not. One call for the whole batch, for the same reason as above.
+ */
+void shim_mbuf_info_bulk(void *const *mbufs, shim_rx_desc *out, unsigned count)
+{
+    unsigned i;
+
+    for (i = 0; i < count; i++)
+    {
+        struct rte_mbuf *mbuf = mbufs[i];
+
+        out[i].mbuf = mbuf;
+        out[i].data = rte_pktmbuf_mtod(mbuf, unsigned char *);
+        out[i].len = rte_pktmbuf_data_len(mbuf);
+        out[i].checksum = shim_checksum_of(mbuf);
+    }
+}
+
+/* Give frames back to their pool. Rust owns the handles; this is the way out. */
+void shim_mbuf_free_bulk(void **mbufs, unsigned count)
+{
+    rte_pktmbuf_free_bulk((struct rte_mbuf **)mbufs, count);
+}
+
+/* ---- a ring, for the frames that cross threads ------------------------ */
+
+void *shim_ring_create(const char *name, unsigned capacity)
+{
+    return rte_ring_create(name, capacity, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+}
+
+void shim_ring_free(void *ring) { rte_ring_free(ring); }
+
+unsigned shim_ring_enqueue_burst(void *ring, void *const *mbufs, unsigned count)
+{
+    return rte_ring_sp_enqueue_burst(ring, mbufs, count, NULL);
+}
+
+unsigned shim_ring_dequeue_burst(void *ring, void **mbufs, unsigned count)
+{
+    return rte_ring_sc_dequeue_burst(ring, mbufs, count, NULL);
+}
