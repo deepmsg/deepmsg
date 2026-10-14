@@ -326,6 +326,13 @@ path = "integration/persistent_subscription_replay.rs"
 name = "persistent_subscription_counters"
 path = "integration/persistent_subscription_counters.rs"
 
+# P2-C4's timeouts: what a persistent subscription does when an answer never
+# comes, judged by watching it ask again rather than by a poll's return value.
+# Needs our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_timeouts"
+path = "integration/persistent_subscription_timeouts.rs"
+
 # P2-C4's alignment, at last: the replay slowed by injected loss while the live
 # stream runs ahead, so `ATTEMPT_SWITCH` has to align two positions that do not
 # agree. Needs our archiving media driver binary, so it runs in CI.
