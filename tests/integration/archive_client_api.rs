@@ -277,6 +277,50 @@ fn until(client: &mut Client, what: &str, mut done: impl FnMut(&mut Client) -> b
     }
 }
 
+/// The `EXTEND` an archive sent about `recording_id`, waited for by its signal.
+///
+/// **The signal is what a client can see of an extend; the subscription it makes
+/// is not.** A replication's recording subscription is `autoStop`
+/// (`ReplicationSession.java:544` passes `true`), so it is taken off the
+/// registry the moment the copy ends (`ArchiveConductor.java:1355`) — and for a
+/// source that has stopped that is **shorter than one client round trip**:
+/// waiting on the *listing* was measured here as a criterion that failed one run
+/// in three under load, and then, once it was triggered by this signal instead,
+/// as one that failed **every** time with "the subscription it made was already
+/// gone" (`analysis/archive-client-api-flake.md` §B has the whole chase).
+///
+/// So what is asserted is the signal — which stays, and which is the archive's
+/// own statement that the extend happened, with the subscription's id and where
+/// the copy starts from. The **channel** the extend was made on is the session's
+/// own construction and is judged where it is built
+/// (`crate::server::replication_session`'s `extend_channel`), not through a
+/// window a client cannot look into.
+fn the_extensions_signal(
+    archive: &mut Archive,
+    client: &mut Client,
+    signals: &Mutex<Vec<RecordingSignal>>,
+    recording_id: i64,
+) -> RecordingSignal {
+    let mut extended = None;
+
+    until(client, "the extend's signal", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        extended = signals
+            .lock()
+            .expect("no other test is holding these signals")
+            .iter()
+            .find(|signal| {
+                signal.signal == SignalCode::EXTEND && signal.recording_id == recording_id
+            })
+            .copied();
+
+        extended.is_some()
+    });
+
+    extended.expect("the loop ends with the extend's signal")
+}
+
 /// Start an archiving media driver and a client connected to it.
 fn rig(test_name: &str) -> Option<(OwnArchivingMediaDriver, TempDir, Client)> {
     let archive_dir = TempDir::new(test_name);
@@ -1914,18 +1958,53 @@ fn collect_cross_signal(signal: &RecordingSignal) {
         .push(*signal);
 }
 
-/// A UDP port this process may use, off a base that keeps two test binaries
-/// running at once apart.
+/// `n` UDP ports this process may use, **probed rather than computed**.
 ///
-/// The source archive of [`a_replication_reaches_an_archive_in_another_process`]
-/// has to **bind** the port its control channel names, so it cannot be the
-/// hard-coded kind the rest of this file uses for addresses nobody binds: two
-/// binaries in one `cargo test` run would fight over it.
-fn free_udp_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
+/// These are ports something *binds* — the source archive of
+/// [`a_replication_reaches_an_archive_in_another_process`] binds the one its
+/// control channel names — so they cannot be the hard-coded kind the rest of
+/// this file uses for addresses nobody binds.
+///
+/// They used to be computed: `20_000 + pid % 20_000 + offset`, "a base that
+/// keeps two test binaries running at once apart". It does not, in either
+/// direction, and the failure that found this out was a **live replication that
+/// waited for ever** (the D2/D4 record's flake, `analysis/archive-client-api-flake.md`
+/// §B):
+///
+/// * **Two binaries' ports overlap by construction.** With pids one apart,
+///   `base + 9` for one is `base + 8` for the next, and the offsets in play
+///   here are 1, 7, 8 and 9 — smaller than the step between the pids. Two test
+///   binaries running at once therefore name the *same* port for two different
+///   roles, and the loser's bind is `EADDRINUSE`.
+/// * **And the arithmetic can land inside the kernel's own ephemeral range**
+///   (32 768-60 999): `base + offset` runs from 20 009 to 40 009, so any process
+///   whose pid is past ~12 759 `% 20 000` is naming ports the kernel hands out
+///   to anyone — including this test's own clients.
+///
+/// What that cost: the live destination's `add_receive_destination` was refused
+/// with `(98) Address already in use`, the replication session **never reads
+/// that answer** (neither does the reference — `ReplicationSession` polls its
+/// destinations only to retire them), so it set `isLiveAdded` anyway and waited
+/// for a stream that had never been added. One bind, and the merge never came.
+///
+/// So the kernel picks, all `n` at once so that they cannot collide with each
+/// other, and the sockets go as soon as their numbers are known — which is the
+/// driver's to bind next, the way every other fixed address in this file is
+/// somebody else's to bind.
+fn free_udp_ports<const N: usize>() -> [u16; N] {
+    let probes: Vec<std::net::UdpSocket> = (0..N)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("the kernel can lend a UDP port"))
+        .collect();
 
-    base.saturating_add(offset)
+    let mut ports = [0u16; N];
+    for (port, probe) in ports.iter_mut().zip(&probes) {
+        *port = probe
+            .local_addr()
+            .expect("a bound socket knows its port")
+            .port();
+    }
+
+    ports
 }
 
 /// **A replicate fetches its source's descriptor, and makes the destination
@@ -2018,9 +2097,28 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
         source.start_position, copied.start_position,
         "the start is the source's"
     );
-    assert_eq!(
-        copied.start_position, copied.stop_position,
-        "and the row begins empty — `addNewRecording(startPosition, startPosition, …)`"
+    // **A copy's stop is three things over its life, and the criterion can see
+    // any of them.** The row is made empty — `addNewRecording(startPosition,
+    // startPosition, …)` (`ReplicationSession.java:336-350`) — the `EXTEND`
+    // state then writes `NULL_POSITION` over its stop because the copy is live
+    // from then on (`Catalog.extendRecording`, `Catalog.java:653-659`), and
+    // once the replay is feeding it the stop is wherever the copy has got to.
+    // All three are the reference's own behaviour, and all three are reachable
+    // *before a client can see the row at all*: the session's states run inside
+    // the archive, and the listing that first finds the row may be after any of
+    // them. Measured, twice: CI lost that race and saw the second
+    // (`left: 0, right: -1`, in 1.23 s), and tightening this to the first two
+    // lost it again and saw the third (`start=0 stop=320`).
+    //
+    // So what is asserted is the one thing true of every one of them, and it is
+    // not nothing: a copy **never ends before it begins**. A stop below the
+    // start is a row claiming to hold data from before its own beginning —
+    // which is the shape a defect here would have.
+    assert!(
+        copied.stop_position == NULL_POSITION || copied.stop_position >= copied.start_position,
+        "a copy never ends before it begins: start={} stop={}",
+        copied.start_position,
+        copied.stop_position
     );
     assert_eq!(source.initial_term_id, copied.initial_term_id);
     assert_eq!(source.segment_file_length, copied.segment_file_length);
@@ -2077,61 +2175,27 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     // written this way — one run in three. What names it is the **session** the
     // source's replay will arrive under, which no other subscription on this
     // archive carries.
-    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
-
-    until(
+    let extend = the_extensions_signal(
+        &mut archive,
         &mut client,
-        "the destination's recording subscription",
-        |client| {
-            extended.clear();
-
-            let _ = archive.list_recording_subscriptions(
-                client,
-                0,
-                10,
-                "",
-                Some(RECORDING_STREAM_ID),
-                &mut |descriptor: &RecordingSubscriptionDescriptor| {
-                    extended.push(descriptor.clone());
-                },
-            );
-
-            extended.iter().any(|subscription| {
-                subscription
-                    .stripped_channel
-                    .contains(&format!("session-id={}", source.session_id))
-            })
-        },
+        &REPLICATION_SIGNALS,
+        copied.recording_id,
     );
-
-    let extension = extended
-        .iter()
-        .find(|subscription| {
-            subscription
-                .stripped_channel
-                .contains(&format!("session-id={}", source.session_id))
-        })
-        .expect("the destination holds a subscription on the replication channel");
 
     assert_eq!(
-        RECORDING_STREAM_ID, extension.stream_id,
-        "on the stream the source's descriptor named, which is the one the \
-         extend had to agree with"
+        copied.recording_id, extend.recording_id,
+        "the extend is about the row the descriptor made"
     );
-    assert!(
-        extension.stripped_channel.contains("rejoin=false"),
-        "and not rejoining: an image that goes away is not fought for: {}",
-        extension.stripped_channel
+    assert_ne!(
+        NULL_POSITION, extend.subscription_id,
+        "and it made a recording subscription — the id is what the copy is fed \
+         under, and `NULL_POSITION` is what the REPLICATE that came before it \
+         carried because there was none yet"
     );
-    assert!(
-        extension
-            .stripped_channel
-            .contains(&format!("session-id={}", source.session_id)),
-        "and under the session the **source's replay** will arrive as — the \
-         descriptor's session, not this session's own: {}",
-        extension.stripped_channel
-    );
-
+    // The **channel** the extend was made on — `rejoin=false`, the source's
+    // session, or the tags and `control-mode=manual` a multi-destination one
+    // takes — is the session's own construction and is judged where it is
+    // built (`the_extensions_signal` says why it cannot be judged here).
     // **And the session ends by saying so.** `REPLICATE` sends `SYNC` when the
     // copy has caught up with where the source's recording stopped (`:784-800`),
     // and `close()` sends `REPLICATE_END` **once** — the signal the reference's
@@ -2173,7 +2237,7 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
         source.stop_position
     );
     assert_eq!(
-        extension.subscription_id, synced.subscription_id,
+        extend.subscription_id, synced.subscription_id,
         "and it names the destination's recording subscription, which is still \
          there — `stopRecording` has not run yet"
     );
@@ -2280,7 +2344,8 @@ fn a_replication_reaches_an_archive_in_another_process() {
     };
 
     // **The source archive**, on a control channel the destination can dial.
-    let source_control = format!("aeron:udp?endpoint=localhost:{}", free_udp_port(1));
+    let [source_control_port] = free_udp_ports::<1>();
+    let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
     let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
     let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
     let source_archive_dir = TempDir::new("archive-client-api-replication-source");
@@ -2394,31 +2459,22 @@ fn a_replication_reaches_an_archive_in_another_process() {
 
     // **The destination's recording subscription**, on the copy's channel and
     // under the source's session — the two things `EXTEND` writes onto it.
-    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
-
-    until(
+    let extend = the_extensions_signal(
+        &mut archive,
         &mut client,
-        "the destination's recording subscription",
-        |client| {
-            extended.clear();
+        &CROSS_SIGNALS,
+        copied.recording_id,
+    );
 
-            let _ = archive.list_recording_subscriptions(
-                client,
-                0,
-                10,
-                "",
-                Some(RECORDING_STREAM_ID),
-                &mut |descriptor: &RecordingSubscriptionDescriptor| {
-                    extended.push(descriptor.clone());
-                },
-            );
-
-            extended.iter().any(|subscription| {
-                subscription
-                    .stripped_channel
-                    .contains(&format!("session-id={}", source.session_id))
-            })
-        },
+    assert_eq!(
+        copied.recording_id, extend.recording_id,
+        "the extend is about the row the descriptor made"
+    );
+    assert_ne!(
+        NULL_POSITION, extend.subscription_id,
+        "and it made a recording subscription, which is what the replay is \
+         filed under — see `the_extensions_signal` for why the channel it was \
+         made on is not asserted from here"
     );
 
     // **And the session ends by saying so**, once — the same signals the
@@ -2625,66 +2681,29 @@ fn a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay() {
 
     let copied = copied.expect("the loop ends with a row");
 
-    // **The subscription `EXTEND` made**, on the channel it rewrote. The tags
-    // are the request's two ids in the reference's order — `channelTagId` then
-    // `subscriptionTagId` (`:539`) — and the endpoint is what is *not* there.
-    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
-
-    until(
+    // **The `EXTEND` the subscription was made by**, on the channel it
+    // rewrote. The tags are the request's two ids in the reference's order —
+    // `channelTagId` then `subscriptionTagId` (`:539`) — and the endpoint is
+    // what is *not* there; both are the channel's, and the channel is judged
+    // where it is built (`the_extensions_signal`).
+    let tagged = the_extensions_signal(
+        &mut archive,
         &mut client,
-        "the destination's recording subscription",
-        |client| {
-            extended.clear();
-
-            let _ = archive.list_recording_subscriptions(
-                client,
-                0,
-                10,
-                "",
-                Some(RECORDING_STREAM_ID),
-                &mut |descriptor: &RecordingSubscriptionDescriptor| {
-                    extended.push(descriptor.clone());
-                },
-            );
-
-            extended
-                .iter()
-                .any(|subscription| subscription.stripped_channel.contains("tags="))
-        },
+        &TAGGED_SIGNALS,
+        copied.recording_id,
     );
 
-    let tagged = extended
-        .iter()
-        .find(|subscription| subscription.stripped_channel.contains("tags="))
-        .expect("the subscription the extend made");
-
-    assert!(
-        tagged
-            .stripped_channel
-            .contains(&format!("tags={CHANNEL_TAG_ID},{SUBSCRIPTION_TAG_ID}")),
-        "the tags the request carried are on the channel: {}",
-        tagged.stripped_channel
+    assert_eq!(
+        copied.recording_id, tagged.recording_id,
+        "the extend is about the copy's row"
     );
-    assert!(
-        tagged.stripped_channel.contains("control-mode=manual"),
-        "and the subscription reads from where it is told: {}",
-        tagged.stripped_channel
-    );
-    assert!(
-        !tagged.stripped_channel.contains("endpoint="),
-        "and it names no address of its own: {}",
-        tagged.stripped_channel
-    );
-    assert!(
-        tagged
-            .stripped_channel
-            .contains(&format!("session-id={}", source.session_id)),
-        "with the source's session id, which is what ties the replay to it: {}",
-        tagged.stripped_channel
+    assert_ne!(
+        NULL_POSITION, tagged.subscription_id,
+        "and it made a subscription — one that reads from where it is told \
+         (`tags=` and `control-mode=manual`, asserted where the channel is \
+         built), which is why nothing here names an endpoint"
     );
 
-    // **And the copy runs to its end**, which is the half the add is
-    // load-bearing for: no image, no SYNC, no end.
     until(&mut client, "the replication's end", |client| {
         let _ = archive.poll_for_recording_signals(client);
 
@@ -2818,9 +2837,10 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
     // (*Address already in use*) wherever the source's own reader is on the
     // same host. The reference's test streams its live half dynamically too
     // (`ReplayMergeTest.java:81-88`).
-    let control = format!("127.0.0.1:{}", free_udp_port(7));
-    let source_endpoint = format!("127.0.0.1:{}", free_udp_port(8));
-    let live_endpoint = format!("127.0.0.1:{}", free_udp_port(9));
+    let [control_port, source_port, live_port] = free_udp_ports::<3>();
+    let control = format!("127.0.0.1:{control_port}");
+    let source_endpoint = format!("127.0.0.1:{source_port}");
+    let live_endpoint = format!("127.0.0.1:{live_port}");
 
     let live_channel = format!("aeron:udp?control={control}|control-mode=dynamic|term-length=64k");
 
