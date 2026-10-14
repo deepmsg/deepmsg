@@ -562,6 +562,59 @@ than the composition an `AERON_SET_ERR` would have built. Asserted by
 `crates/driver/src/conductor.rs::an_unknown_removal_is_answered_with_the_references_code`
 and `::a_refused_log_buffer_is_answered_and_recorded`.
 
+## The null tag a live replication names
+
+`ReplicationSession.extend` writes `tags=<channelTagId>,<subscriptionTagId>` on
+**every** multi-destination channel (`ReplicationSession.java:536-541`), so a
+replication that names a live destination and no tags — the live merge, and the
+only way to reach that branch without a tag — asks for a subscription on
+`tags=-1,-1`: `Aeron.NULL_VALUE` written as a tag. Two things here differ from
+that, in opposite directions.
+
+**This driver serves the channel, and the reference's C driver refuses it.**
+`AERON_URI_INVALID_TAG` is `-1` and it is also what `aeron_uri_parse_tag`
+answers for a value it cannot read (`aeron-client/src/main/c/uri/aeron_uri.h:89`,
+`aeron-client/src/main/c/uri/aeron_uri.c:517-529`), so
+`aeron_udp_channel_finish_parse` refuses `tags=-1` outright
+(`aeron-driver/src/main/c/media/aeron_udp_channel.c:385-390`). The Java driver
+accepts it and reads it as a **real** tag of `-1`
+(`aeron-driver/src/main/java/io/aeron/driver/media/UdpChannel.java:216-218`,
+matched by `:786`), which is not what the archive meant either. This driver
+takes the third reading — `-1` is the null value, so a channel that names it
+names no tag — which puts such a channel in exactly the state a channel with no
+`tags` parameter is in: an endpoint of its own and nothing a tag matcher will
+match. Measured with the reference's own C client, one binary, only the driver
+swapped:
+
+| `aeron:udp?tags=-1,-1\|control-mode=manual` | verdict |
+|---|---|
+| C media driver | refused — `could not parse channel tag string: -1` |
+| Java media driver | served — as a tag of `-1` |
+| **this driver** | served — as no tag |
+
+Pinned by `tests/interop/null_tag_channel.rs::the_null_tag_channel_is_one_the_reference_refuses_and_this_driver_serves`
+— the two verdicts read against a real 1.53.2 C driver in the same test, which
+is the only place the divergence can be read as one — and, in this build alone,
+by `crates/driver/src/udp_channel.rs::a_null_tag_is_no_tag` and
+`::any_other_negative_tag_is_refused` (only the null value is read this way),
+and by
+`tests/integration/mds_added_destination.rs::the_null_tag_channel_a_live_replication_uses_is_served`,
+which serves the reference's own channel string and resolves the destination the
+archive adds to it.
+
+**This build's archive does not write it.** A replication that named no tag gets
+a channel with no `tags` parameter — which is how the reference's own client
+library says "no tags" (`ChannelUriStringBuilder.tags(Long, Long)` leaves the
+parameter out when there is no tag, `ChannelUriStringBuilder.java:1250-1264`)
+and what makes such a channel portable to a driver that follows the C one.
+Pinned by `tests/integration/archive_client_api.rs::a_live_replication_merges_into_the_stream_it_is_copying`,
+which reads the subscription the extend made and fails on a `tags=` in it (as
+well as on the merge it exists for).
+
+The upstream report is `analysis/fix/upstream-issue-live-replication-tags-minus-one.md`
+— the two spellings disagree upstream as well, and a live merge into a Java
+archive on a C driver fails there for the same reason.
+
 ## The UDP data plane (P1-4)
 
 The network channel is now served, both ways: a publication on

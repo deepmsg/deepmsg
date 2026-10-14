@@ -383,9 +383,15 @@ pub struct ReplicationRequest {
     /// Where the copy stops; `NULL_POSITION` copies a source that has not
     /// stopped yet, and follows it.
     pub stop_position: i64,
-    /// A tag for the source channel, for tagged replication — always
-    /// `NULL_VALUE` on the paths this build serves (`:1404-1410` refuses a
-    /// response channel that names one).
+    /// A tag for the source channel, for tagged replication (`:1399-1410`),
+    /// which is one of the two conditions behind `EXTEND`'s multi-destination
+    /// branch (`ReplicationSession.java:527`).
+    ///
+    /// A response channel that names one is refused rather than served, and the
+    /// refusal is the archive's (`:1404-1410`); what is left is a tagged
+    /// replication over a plain channel, which is what
+    /// `a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay`
+    /// (in `deepmsg-tests`) walks.
     pub channel_tag_id: i64,
     /// The same for the source subscription.
     pub subscription_tag_id: i64,

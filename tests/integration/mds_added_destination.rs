@@ -377,3 +377,82 @@ fn await_destination(client: &mut Client, destination: AsyncDestination) -> Asyn
         }
     }
 }
+
+/// **The channel a live replication's destination subscription is built on.**
+///
+/// `ReplicationSession.extend` writes `tags=<channelTagId>,<subscriptionTagId>`
+/// for every multi-destination replication (`ReplicationSession.java:536-541`),
+/// so the live merge — a live destination and no tags is the only way to reach
+/// that branch without one — asks for a subscription on `tags=-1,-1`:
+/// `Aeron.NULL_VALUE` written as a tag.
+///
+/// What the three drivers do with it is not the same, and the third is what
+/// this build does:
+///
+/// | | |
+/// |---|---|
+/// | the reference C driver | refuses it, `could not parse channel tag string: -1` (`aeron_udp_channel.c:385-390`) |
+/// | the reference Java driver | serves it, as a **real** tag of `-1` (`UdpChannel.java:216-218`) |
+/// | **this driver** | serves it, as **no tag** — which is what the value means |
+///
+/// The channel is served at all so that the reference's own archive can start a
+/// live merge on this driver; the archive's destination subscription is what
+/// [`resolve`](deepmsg_client::client::Subscription::resolved_endpoint) is
+/// asked for a moment later, so what is pinned here is the whole of what that
+/// needs: the subscription exists, and a destination added to it has an
+/// address.
+#[test]
+fn the_null_tag_channel_a_live_replication_uses_is_served() {
+    let Some(mut driver) = OwnDriver::start("mds-null-tag") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    driver
+        .await_cnc(Duration::from_secs(10))
+        .expect("the driver publishes its CnC file");
+
+    let mut client = Client::connect(driver.aeron_dir()).expect("connect to it");
+
+    let channel = "aeron:udp?tags=-1,-1|rejoin=false|session-id=7|control-mode=manual";
+
+    let subscription = client
+        .add_subscription(channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the driver serves the channel the reference's archive builds");
+
+    client
+        .add_rcv_destination(
+            subscription,
+            "aeron:udp?endpoint=127.0.0.1:0",
+            DEFAULT_TIMEOUT,
+        )
+        .expect("and takes the destination the extend adds");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut resolved = None;
+
+    while Instant::now() < deadline {
+        let _ = client.poll();
+
+        resolved = client.counters_reader().and_then(|counters| {
+            client
+                .subscription(subscription)?
+                .resolved_endpoint(&counters)
+        });
+
+        if resolved.is_some() {
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let resolved = resolved.expect("the destination's address is resolved");
+
+    assert!(
+        resolved.starts_with("127.0.0.1:") && !resolved.ends_with(":0"),
+        "the port is the one the driver bound, not the wildcard that was asked for: {resolved}"
+    );
+
+    let _ = driver.stop();
+}

@@ -423,6 +423,13 @@ name = "destination_probe"
 path = "interop/destination_probe.rs"
 required-features = ["interop"]
 
+# A channel the reference's C driver refuses and this one serves: the two
+# verdicts of one divergence, read from the same place.
+[[test]]
+name = "null_tag_channel"
+path = "interop/null_tag_channel.rs"
+required-features = ["interop"]
+
 # A padding frame that arrives as its own datagram: the reference's Ping and
 # Pong, on a 64 KiB term, stop at the boundary when the receiver drops it.
 [[test]]

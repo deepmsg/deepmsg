@@ -75,6 +75,10 @@ pub const TAG_PREFIX: &str = "tag:";
 /// (`aeron-client/src/main/c/uri/aeron_uri.h:45`).
 pub const ENDPOINT_PARAM_NAME: &str = "endpoint";
 
+/// `CommonContext.INTERFACE_PARAM_NAME` (`CommonContext.java:257`), which
+/// `ChannelUri.createDestinationUri` carries over (`ChannelUri.java:593-598`).
+pub const INTERFACE_PARAM_NAME: &str = "interface";
+
 /// `CommonContext.LINGER_PARAM_NAME` (`:323`), `AERON_URI_LINGER_TIMEOUT_KEY`
 /// (`aeron_uri.h:59`).
 pub const LINGER_PARAM_NAME: &str = "linger";
@@ -245,6 +249,61 @@ impl ChannelUri {
 
         let at = position.map_or(self.params.len(), |at| at.min(self.params.len()));
         self.params.insert(at, (key.to_owned(), value));
+    }
+
+    /// Take a parameter off the URI (`ChannelUri.remove`, `ChannelUri.java:224-227`).
+    ///
+    /// Every occurrence goes, for the reason [`put`](Self::put)'s note gives:
+    /// [`get`](Self::get) is last-wins, so removing only the first would leave
+    /// the value that does win.
+    ///
+    /// A key that is not there is not an error — the reference's `remove`
+    /// answers `null` and the callers this build has do not read it.
+    pub fn remove(&mut self, key: &str) {
+        self.params.retain(|(name, _)| name != key);
+    }
+
+    /// `ChannelUri.createDestinationUri` (`ChannelUri.java:589-601`): the
+    /// channel that names **a destination**, built from the copy's channel and
+    /// the endpoint taken off it.
+    ///
+    /// Three things about it are the reference's and all three matter here:
+    ///
+    /// * it is **not** the channel it was given with something changed. It is a
+    ///   fresh two-part URI — `aeron:<media>?endpoint=<endpoint>` — so every
+    ///   other parameter of the source channel, `tags`, `control-mode`,
+    ///   `session-id` and `rejoin` among them, is deliberately absent;
+    /// * `interface` is the one exception, carried over because a destination
+    ///   that has to join a multicast group on an interface is a destination
+    ///   that still has to;
+    /// * the endpoint is written as it was found, **including when the channel
+    ///   named none** — the reference concatenates a `String` that is `null`
+    ///   there (`:592`), and this writes the same text rather than inventing a
+    ///   rule the reference does not have.
+    ///
+    /// # Errors
+    ///
+    /// [`UriError`] if `channel` is not a channel.
+    pub fn create_destination_uri(
+        channel: &str,
+        endpoint: Option<&str>,
+    ) -> Result<String, UriError> {
+        let parsed = Self::parse(channel)?;
+
+        let mut out = format!(
+            "{SCHEME}{}?{ENDPOINT_PARAM_NAME}={}",
+            parsed.media(),
+            endpoint.unwrap_or("null")
+        );
+
+        if let Some(interface) = parsed.get(INTERFACE_PARAM_NAME) {
+            out.push(PARAM_DELIMITER);
+            out.push_str(INTERFACE_PARAM_NAME);
+            out.push('=');
+            out.push_str(interface);
+        }
+
+        Ok(out)
     }
 
     /// `ChannelUri.replaceEndpointWildcardPort` (`ChannelUri.java:613-635`).
@@ -774,6 +833,118 @@ pub fn format_duration_ns(value_ns: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A destination is a **fresh** URI: the media and the endpoint that was
+    /// taken off the copy's channel, and nothing else that channel said
+    /// (`ChannelUri.createDestinationUri`, `ChannelUri.java:589-601`).
+    ///
+    /// The four parameters dropped here are the ones `EXTEND` puts on a
+    /// multi-destination replication channel, so this is the shape that call
+    /// produces: the destination names where to bind, and the subscription's
+    /// own channel is where the tags live.
+    #[test]
+    fn a_destination_uri_is_the_media_and_the_endpoint_alone() {
+        let channel = "aeron:udp?tags=1,2|control-mode=manual|rejoin=false|session-id=7";
+
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:8012",
+            ChannelUri::create_destination_uri(channel, Some("localhost:8012"))
+                .expect("a destination")
+        );
+    }
+
+    /// The reference's own six cases (`ChannelUriTest.createDestinationUriTest`,
+    /// `aeron-client/src/test/java/io/aeron/ChannelUriTest.java:204-214`), row
+    /// for row.
+    ///
+    /// They are the whole rule between them: endpoint first and interface
+    /// second whoever named them and in whatever order, every other parameter
+    /// dropped, an `aeron-spy` prefix dropped with them, and `aeron:ipc` — which
+    /// never had an endpoint — taking one anyway.
+    #[test]
+    fn a_destination_uri_is_what_the_reference_says_it_is() {
+        let cases = [
+            (
+                "aeron:udp?endpoint=poison|interface=iface|mtu=4444",
+                "dest1",
+                "aeron:udp?endpoint=dest1|interface=iface",
+            ),
+            ("aeron:ipc", "dest2", "aeron:ipc?endpoint=dest2"),
+            ("aeron:udp", "localhost", "aeron:udp?endpoint=localhost"),
+            (
+                "aeron:ipc?interface=here",
+                "there",
+                "aeron:ipc?endpoint=there|interface=here",
+            ),
+            (
+                "aeron-spy:aeron:udp?eol=true|interface=none",
+                "abc",
+                "aeron:udp?endpoint=abc|interface=none",
+            ),
+            (
+                "aeron:udp?interface=eth0|term-length=64k|ttl=0|endpoint=some",
+                "vm1",
+                "aeron:udp?endpoint=vm1|interface=eth0",
+            ),
+        ];
+
+        for (channel, endpoint, expected) in cases {
+            assert_eq!(
+                expected,
+                ChannelUri::create_destination_uri(channel, Some(endpoint)).expect("a destination"),
+                "for {channel} and {endpoint}"
+            );
+        }
+    }
+
+    /// The channel that actually reaches this — `EXTEND`'s multi-destination
+    /// rewrite (`ReplicationSession.java:536-541`) — so that the four
+    /// parameters it puts on a subscription are the four this drops.
+    #[test]
+    fn a_destination_takes_nothing_off_a_multi_destination_channel_but_its_media() {
+        let channel = "aeron:udp?tags=4242,4243|rejoin=false|session-id=7|control-mode=manual";
+
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:0",
+            ChannelUri::create_destination_uri(channel, Some("localhost:0"))
+                .expect("a destination")
+        );
+    }
+
+    /// A channel with no endpoint writes no endpoint: the reference
+    /// concatenates a `null` there (`:592`) and this writes the same text.
+    #[test]
+    fn a_destination_uri_of_a_channel_with_no_endpoint_says_null() {
+        assert_eq!(
+            "aeron:ipc?endpoint=null",
+            ChannelUri::create_destination_uri("aeron:ipc", None).expect("a destination")
+        );
+    }
+
+    /// `remove` takes every occurrence, for `put`'s reason: `get` is
+    /// last-wins, so leaving the first behind would leave the losing one.
+    #[test]
+    fn removing_a_parameter_takes_every_occurrence() {
+        let mut uri =
+            ChannelUri::parse("aeron:udp?endpoint=localhost:1|endpoint=localhost:2|mtu=1408")
+                .expect("a uri");
+
+        uri.remove("endpoint");
+
+        assert_eq!(None, uri.get("endpoint"));
+        assert_eq!("aeron:udp?mtu=1408", uri.build());
+    }
+
+    /// Removing what is not there is not an error — the reference's `remove`
+    /// answers `null` and the callers that matter do not read it.
+    #[test]
+    fn removing_a_parameter_that_is_not_there_changes_nothing() {
+        let mut uri = ChannelUri::parse("aeron:udp?endpoint=localhost:1").expect("a uri");
+
+        uri.remove("tags");
+
+        assert_eq!("aeron:udp?endpoint=localhost:1", uri.build());
+    }
 
     /// A wildcard port is resolved by the subscription that owns it: the host
     /// stays the channel's, the port becomes the resolved one

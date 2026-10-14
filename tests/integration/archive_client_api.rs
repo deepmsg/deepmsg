@@ -2511,3 +2511,520 @@ fn a_replication_reaches_an_archive_in_another_process() {
     media_driver.stop().expect("the destination driver stops");
     source_driver.stop().expect("the source driver stops");
 }
+
+/// The row a **self**-replication made: the one in this catalog that is not the
+/// source's.
+///
+/// [`the_only_recording`] is the cross-process criterion's, where the
+/// destination archive holds the copy and nothing else. Here both rows are in
+/// one catalog, and the copy is the one with an id of its own.
+fn the_copy(
+    archive: &mut Archive,
+    client: &mut Client,
+    source_id: i64,
+) -> Option<RecordingDescriptor> {
+    let mut rows = Vec::new();
+
+    let _ = archive.list_recordings(client, 0, 10, &mut |descriptor: &RecordingDescriptor| {
+        rows.push(descriptor.clone());
+    });
+
+    rows.into_iter().find(|row| row.recording_id != source_id)
+}
+
+/// What the tagged replication's signal handler saw
+/// ([`a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay`]).
+///
+/// A sink of its own, for the reason [`SIGNALS`] gives: the handlers are `fn`
+/// pointers, and two rigs in one process share whatever they write to.
+static TAGGED_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+fn collect_tagged_signal(signal: &RecordingSignal) {
+    TAGGED_SIGNALS
+        .lock()
+        .expect("no other test is holding the tagged signals")
+        .push(*signal);
+}
+
+/// The two tags the tagged replication asks for (`ReplicationParams`).
+const CHANNEL_TAG_ID: i64 = 4242;
+const SUBSCRIPTION_TAG_ID: i64 = 4243;
+
+/// **A replication by tag subscribes by tag — and the copy still arrives.**
+///
+/// The `isMds` half of `EXTEND` (`ReplicationSession.java:527-555`): a request
+/// that carries tags, or a live destination, gets a destination recording whose
+/// channel is **rewritten** — the endpoint comes off, the tags go on,
+/// `control-mode=manual` — and then the endpoint is put back as an explicitly
+/// added **destination**.
+///
+/// The two halves are one mechanism, and this is the criterion that says so.
+/// A manual subscription binds nothing on its own: the channel above names no
+/// address at all, so the added destination is what has a socket, and the
+/// replay arrives through it.
+///
+/// **Measured, and the measurement is what says which assertion bites**: with
+/// the `async_add_rcv_destination` call removed, the taps in this criterion
+/// still see the channel rewritten and still see a `REPLICATE_END` — the
+/// session gives up in `AWAIT_IMAGE` and its teardown sends one — so what
+/// fails is the `SYNC` below, ten seconds later, along with the bytes that
+/// never arrived. The signals alone would not have caught it.
+///
+/// The source is this archive, as in
+/// [`a_replicate_fetches_its_source_descriptor_and_extends_the_destination`] —
+/// the shortest path that reaches the branch at all — and what the copy does
+/// with the bytes is still asked of the sources' two catalogs, which is what
+/// makes the destination load-bearing rather than decorative.
+#[test]
+fn a_tagged_replication_subscribes_by_tag_and_still_receives_the_replay() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replication-tagged")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_tagged_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the archive is connected");
+
+    let source = a_stopped_recording(&mut archive, &mut client);
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+    params.channel_tag_id = CHANNEL_TAG_ID;
+    params.subscription_tag_id = SUBSCRIPTION_TAG_ID;
+
+    let _replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            archive::CONTROL_CHANNEL,
+            &params,
+        )
+        .expect("the archive takes the tagged replication");
+
+    // The row the descriptor made, which is the copy's recording. **The row
+    // that is not the source's** — a self-replication leaves two in one
+    // catalog, unlike the cross-process criterion, whose destination holds the
+    // copy alone.
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        copied = the_copy(&mut archive, client, source.recording_id);
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // **The subscription `EXTEND` made**, on the channel it rewrote. The tags
+    // are the request's two ids in the reference's order — `channelTagId` then
+    // `subscriptionTagId` (`:539`) — and the endpoint is what is *not* there.
+    let mut extended: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(
+        &mut client,
+        "the destination's recording subscription",
+        |client| {
+            extended.clear();
+
+            let _ = archive.list_recording_subscriptions(
+                client,
+                0,
+                10,
+                "",
+                Some(RECORDING_STREAM_ID),
+                &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                    extended.push(descriptor.clone());
+                },
+            );
+
+            extended
+                .iter()
+                .any(|subscription| subscription.stripped_channel.contains("tags="))
+        },
+    );
+
+    let tagged = extended
+        .iter()
+        .find(|subscription| subscription.stripped_channel.contains("tags="))
+        .expect("the subscription the extend made");
+
+    assert!(
+        tagged
+            .stripped_channel
+            .contains(&format!("tags={CHANNEL_TAG_ID},{SUBSCRIPTION_TAG_ID}")),
+        "the tags the request carried are on the channel: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        tagged.stripped_channel.contains("control-mode=manual"),
+        "and the subscription reads from where it is told: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        !tagged.stripped_channel.contains("endpoint="),
+        "and it names no address of its own: {}",
+        tagged.stripped_channel
+    );
+    assert!(
+        tagged
+            .stripped_channel
+            .contains(&format!("session-id={}", source.session_id)),
+        "with the source's session id, which is what ties the replay to it: {}",
+        tagged.stripped_channel
+    );
+
+    // **And the copy runs to its end**, which is the half the add is
+    // load-bearing for: no image, no SYNC, no end.
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        TAGGED_SIGNALS
+            .lock()
+            .expect("no other test is holding the tagged signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
+    });
+
+    let signals = TAGGED_SIGNALS
+        .lock()
+        .expect("no other test is holding the tagged signals")
+        .clone();
+
+    let synced = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::SYNC)
+        .copied()
+        .expect("a SYNC signal");
+
+    assert!(
+        synced.position >= source.stop_position,
+        "the copy caught up with the source's stop: {} against {}",
+        synced.position,
+        source.stop_position
+    );
+
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "exactly one REPLICATE_END"
+    );
+
+    // **The bytes went through the destination.** The destination's row stops
+    // where the source's does, and it is not empty — which no subscription
+    // that bound nothing could have managed.
+    let copied_after =
+        the_copy(&mut archive, &mut client, source.recording_id).expect("still there");
+
+    assert_eq!(copied.recording_id, copied_after.recording_id);
+    assert!(
+        copied_after.stop_position > copied_after.start_position,
+        "the copy has data in it: {} against a start of {}",
+        copied_after.stop_position,
+        copied_after.start_position
+    );
+    assert_eq!(
+        source.stop_position, copied_after.stop_position,
+        "and it stops exactly where the source's recording stopped"
+    );
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}
+
+/// What the live merge's signal handler saw
+/// ([`a_live_replication_merges_into_the_stream_it_is_copying`]).
+///
+/// A sink of its own, for the reason [`SIGNALS`] gives.
+static LIVE_SIGNALS: Mutex<Vec<RecordingSignal>> = Mutex::new(Vec::new());
+
+fn collect_live_signal(signal: &RecordingSignal) {
+    LIVE_SIGNALS
+        .lock()
+        .expect("no other test is holding the live signals")
+        .push(*signal);
+}
+
+/// The stream the live recording is made on — the one the copy ends up
+/// following.
+const LIVE_STREAM_ID: i32 = 4215;
+
+/// **A replication of a live recording merges into it, and follows it.**
+///
+/// The second half of `isMds`, and the one the branch exists for:
+/// `ATTEMPT_LIVE_JOIN` (`ReplicationSession.java:834-900`). A request that
+/// names a `live_destination` gets a destination recording whose subscription
+/// is wired to the replay, and then — once the replay has caught up — wired to
+/// the **live stream** as well, in the same image under the same session. The
+/// replay is then taken off (`:873-880`) and the copy is live.
+///
+/// Three things are asserted and each is a different half of that:
+///
+/// * the `MERGE` signal arrives, carrying **no subscription id** — the
+///   subscription is let go before the signal is sent (`:876-878`), which is
+///   how a client tells a merge from a sync;
+/// * there is **no `SYNC`**: a live copy ends by merging, not by catching up
+///   with a stop position — so the session took the live route through
+///   `CATCHUP` rather than the bounded one through `REPLICATE`;
+/// * and the copy **follows the stream**: bytes published *after* the merge
+///   move the destination's recording position, which is only possible if the
+///   live destination was added to the subscription the recording is being
+///   written from.
+///
+/// The source is this archive's own live recording, as in the criteria above —
+/// but **live**, which is the difference: it is never stopped, and the
+/// publication writing to it stays open for the whole test.
+#[test]
+fn a_live_replication_merges_into_the_stream_it_is_copying() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replication-live")
+    else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers {
+            recording_signal: Some(collect_live_signal),
+            ..Handlers::default()
+        },
+    )
+    .expect("the archive is connected");
+
+    // **The source is live**, and the live stream is a **dynamic** one: the
+    // publication binds its control address alone and sends to whoever
+    // announces itself, so the archive's recording subscription and the
+    // replication's live destination can be two sockets of their own.
+    //
+    // That is the shape `archive_replay_merge.rs` arrived at for the same
+    // reason, and the reason is worth repeating: a unicast publication binds
+    // its endpoint as soon as it is connected, and a **live destination** is a
+    // receive destination — it binds the address rather than joining the
+    // endpoint already there, so a merge onto a unicast stream fails to add it
+    // (*Address already in use*) wherever the source's own reader is on the
+    // same host. The reference's test streams its live half dynamically too
+    // (`ReplayMergeTest.java:81-88`).
+    let control = format!("127.0.0.1:{}", free_udp_port(7));
+    let source_endpoint = format!("127.0.0.1:{}", free_udp_port(8));
+    let live_endpoint = format!("127.0.0.1:{}", free_udp_port(9));
+
+    let live_channel = format!("aeron:udp?control={control}|control-mode=dynamic|term-length=64k");
+
+    // The channel the **archive records**: a subscriber of the dynamic
+    // publication, which is an endpoint of its own and the control address to
+    // talk to (`aeron_udp_channel.c:465-487`).
+    let recording_channel =
+        format!("aeron:udp?endpoint={source_endpoint}|control={control}|term-length=64k");
+
+    // And what the merge is told to join: the same stream, read at a socket of
+    // its own — which is what makes the two halves one image instead of two.
+    let live_destination = format!("aeron:udp?endpoint={live_endpoint}|control={control}");
+
+    let _source_subscription = archive
+        .start_recording(
+            &mut client,
+            &recording_channel,
+            LIVE_STREAM_ID,
+            false,
+            false,
+        )
+        .expect("the archive records the live stream");
+
+    let live = client
+        .add_exclusive_publication(&live_channel, LIVE_STREAM_ID, archive::COMMAND_TIMEOUT)
+        .expect("the driver takes a publication on the live channel");
+
+    until(&mut client, "the live publication linking", |client| {
+        client
+            .exclusive_publication(live)
+            .and_then(deepmsg_client::publication::ExclusivePublication::is_connected)
+            .unwrap_or(false)
+    });
+
+    let mut source = None;
+
+    until(&mut client, "the source's row", |client| {
+        let _ = client.offer_exclusive(live, b"a message on the live stream");
+        source = the_only_recording(&mut archive, client);
+
+        source.is_some()
+    });
+
+    let source = source.expect("the loop ends with a row");
+
+    // **The replicate**, with a live destination and no stop position — the
+    // shape `onRecordingDescriptor` sends to `SRC_RECORDING_POSITION`
+    // (`:380-399`) and the only one that reaches the live pair.
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+    params.live_destination = live_destination.clone();
+
+    let _replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id,
+            archive::CONTROL_STREAM_ID,
+            archive::CONTROL_CHANNEL,
+            &params,
+        )
+        .expect("the archive takes the live replication");
+
+    let mut copied = None;
+
+    until(&mut client, "the destination's row", |client| {
+        copied = the_copy(&mut archive, client, source.recording_id);
+
+        copied.is_some()
+    });
+
+    let copied = copied.expect("the loop ends with a row");
+
+    // **The channel the live pair is built on**, before it merges.
+    //
+    // A live-only replication is multi-destination (`isMds` is true for a live
+    // destination alone), so the reference builds this channel with the tags
+    // parameter too (`:539`) — and with no tags named that is `tags=-1,-1`,
+    // which the C driver refuses outright and the Java driver reads as a real
+    // tag of `-1`. This build leaves the parameter out, which is how the
+    // reference's own client library says "no tags"
+    // (`ChannelUriStringBuilder.tags(Long, Long)`,
+    // `ChannelUriStringBuilder.java:1250-1264`); the reasoning and the
+    // measurements are in `docs/compat.md`.
+    let mut subscriptions: Vec<RecordingSubscriptionDescriptor> = Vec::new();
+
+    until(&mut client, "the destination's subscription", |client| {
+        subscriptions.clear();
+
+        let _ = archive.list_recording_subscriptions(
+            client,
+            0,
+            10,
+            "",
+            Some(LIVE_STREAM_ID),
+            &mut |descriptor: &RecordingSubscriptionDescriptor| {
+                subscriptions.push(descriptor.clone());
+            },
+        );
+
+        subscriptions.iter().any(|subscription| {
+            subscription
+                .stripped_channel
+                .contains("control-mode=manual")
+        })
+    });
+
+    let extended = subscriptions
+        .iter()
+        .find(|subscription| {
+            subscription
+                .stripped_channel
+                .contains("control-mode=manual")
+        })
+        .expect("the subscription the extend made");
+
+    assert!(
+        !extended.stripped_channel.contains("tags="),
+        "a live-only replication names no tags, and does not write the null one: {}",
+        extended.stripped_channel
+    );
+    assert!(
+        !extended.stripped_channel.contains("endpoint="),
+        "and it names no address of its own: {}",
+        extended.stripped_channel
+    );
+
+    // **The merge.** The stream is kept moving while it is waited for, because
+    // a merge is the copy *joining* it: `shouldStopReplay` waits for the image
+    // to be level with the source and for the stream to be arriving from two
+    // places, and a publication that goes quiet is neither.
+    until(&mut client, "the merge", |client| {
+        let _ = client.offer_exclusive(live, b"still live");
+        let _ = archive.poll_for_recording_signals(client);
+
+        LIVE_SIGNALS
+            .lock()
+            .expect("no other test is holding the live signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::MERGE)
+    });
+
+    until(&mut client, "the replication's end", |client| {
+        let _ = archive.poll_for_recording_signals(client);
+
+        LIVE_SIGNALS
+            .lock()
+            .expect("no other test is holding the live signals")
+            .iter()
+            .any(|signal| signal.signal == SignalCode::REPLICATE_END)
+    });
+
+    let signals = LIVE_SIGNALS
+        .lock()
+        .expect("no other test is holding the live signals")
+        .clone();
+
+    let merged = signals
+        .iter()
+        .find(|signal| signal.signal == SignalCode::MERGE)
+        .copied()
+        .expect("a MERGE signal");
+
+    assert_eq!(
+        copied.recording_id, merged.recording_id,
+        "the merge is about the copy"
+    );
+    assert_eq!(
+        -1, merged.subscription_id,
+        "and carries no subscription: `recordingSubscription = null` comes first (`:877`)"
+    );
+    assert_eq!(
+        0,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::SYNC)
+            .count(),
+        "a live copy merges rather than syncing: no SYNC"
+    );
+    assert_eq!(
+        1,
+        signals
+            .iter()
+            .filter(|signal| signal.signal == SignalCode::REPLICATE_END)
+            .count(),
+        "and it ends once"
+    );
+
+    // **And the copy follows the stream.** This is the assertion the live
+    // destination is load-bearing for: the recording the archive is writing is
+    // fed by the subscription the replay was on, and after the merge the only
+    // destination left on it is the live channel — so bytes offered **now**
+    // moving the recording position is the stream itself arriving there.
+    let before = archive
+        .get_recording_position(&mut client, copied.recording_id)
+        .expect("the copy's recording position");
+
+    until(&mut client, "the copy to follow the stream", |client| {
+        let _ = client.offer_exclusive(live, b"a message after the merge");
+
+        archive
+            .get_recording_position(client, copied.recording_id)
+            .is_ok_and(|position| position > before)
+    });
+
+    archive.close(&client);
+    media_driver.stop().expect("the driver stops");
+}

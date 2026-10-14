@@ -723,8 +723,40 @@ fn channel_tag<'a>(uri: &ChannelUri<'a>) -> Option<&'a str> {
 /// `strtoul(tag, &end, 10)` with the digits requirement but **no** trailing
 /// check, which is what makes `tags=12x` tag twelve
 /// (`aeron_uri_parse_tag`, `aeron-client/src/main/c/uri/aeron_uri.c:517-529`).
+///
+/// # One value the reference's parser cannot produce
+///
+/// **`-1`**, which is [`INVALID_TAG`] — "no tag" — and which the reference's
+/// archive writes for a replication that named no tag at all.
+/// `ReplicationSession.extend` puts `tags=<channelTagId>,<subscriptionTagId>`
+/// on every multi-destination channel (`ReplicationSession.java:539`), so a
+/// live merge — a live destination and no tags is the only way to reach that
+/// branch without one — asks for `tags=-1,-1`.
+///
+/// The C driver refuses that channel (`aeron_udp_channel.c:385-390`): its
+/// parse-failure sentinel and its "no tag" sentinel are the same value
+/// (`#define AERON_URI_INVALID_TAG (-1)`,
+/// `aeron-client/src/main/c/uri/aeron_uri.h:89`), and `strtoul("-1", …)`
+/// consumes the string and lands on it. The Java driver accepts it and reads it
+/// as a **real** tag of `-1` (`UdpChannel.java:216-218`, and `matchesTag`
+/// matches on equal tags, `:786`), which is not what the archive meant either.
+///
+/// This driver takes the third reading, which is the only one that is both
+/// true to the value and usable: **`-1` is the null value, so a channel that
+/// names it names no tag.** It is the same state a channel with no `tags`
+/// parameter reaches — [`canonicalise`] gives both an endpoint of their own
+/// rather than a tag-shared one, and both tag matchers refuse to match on
+/// `INVALID_TAG` (`receive_endpoints.rs:272`, `send_endpoints.rs:664`) — so
+/// what accepting it changes is one input's verdict, not any behaviour.
+/// `docs/compat.md` records the divergence and the measurements behind it.
 fn parse_tag(text: &str) -> Option<i64> {
-    let digits = text.trim_start().trim_start_matches('+');
+    let text = text.trim_start();
+
+    if text == "-1" {
+        return Some(INVALID_TAG);
+    }
+
+    let digits = text.trim_start_matches('+');
     let end = first_non_digit(digits);
 
     if end == 0 {
@@ -1817,6 +1849,51 @@ mod tests {
             refuse("aeron:udp?endpoint=127.0.0.1:1|tags=x"),
             UdpChannelError::InvalidChannel(_)
         ));
+    }
+
+    /// **The null tag is a tag this driver reads and the reference's parser
+    /// cannot produce** ([`parse_tag`]'s note has the whole of it).
+    ///
+    /// The channel is the one the reference's archive builds for a live merge:
+    /// `ReplicationSession.java:536-541` puts the two ids on every
+    /// multi-destination channel, and a live-only replication names both of
+    /// them `NULL_VALUE`. The state it lands in is the one a channel with no
+    /// `tags` parameter is in, which is what the three assertions say: no tag,
+    /// and an endpoint of its own rather than one shared by tag.
+    #[test]
+    fn a_null_tag_is_no_tag() {
+        let channel = resolve("aeron:udp?tags=-1,-1|rejoin=false|session-id=7|control-mode=manual");
+
+        assert_eq!(INVALID_TAG, channel.tag_id, "`-1` is the null value");
+        assert!(
+            !channel.canonical_form.contains("#"),
+            "and it takes the counting suffix a channel with no tags takes: {}",
+            channel.canonical_form
+        );
+    }
+
+    /// The other half of that rule: **only the null value is read this way.**
+    /// Any other negative tag is refused exactly as the reference's parser
+    /// refuses it, because nothing in the reference ever writes one.
+    #[test]
+    fn any_other_negative_tag_is_refused() {
+        assert!(matches!(
+            refuse("aeron:udp?endpoint=127.0.0.1:1|tags=-2"),
+            UdpChannelError::InvalidChannel(_)
+        ));
+    }
+
+    /// And a channel that is *only* a null tag is still a channel with a
+    /// distinguishing characteristic — the reference's own test for that
+    /// (`aeron_udp_channel.c:331-344`) asks whether the parameter is **there**,
+    /// which `channel_tag` answers for `-1` as it does for `7`.
+    #[test]
+    fn a_null_tag_still_identifies_the_channel() {
+        assert_eq!(
+            INVALID_TAG,
+            resolve("aeron:udp?tags=-1,-1").tag_id,
+            "a channel with nothing but a null tag is served, as the reference serves a tagged one"
+        );
     }
 
     #[test]
