@@ -101,17 +101,6 @@ impl Port {
         mtu
     }
 
-    /// Set the port's MTU.
-    pub fn set_mtu(&self, mtu: u16) -> Result<(), Error> {
-        // SAFETY: a port this handle owns, and a number the caller chose; the
-        // PMD refuses one it cannot carry.
-        let rc = unsafe { sys::shim_port_set_mtu(c_uint::from(self.id), mtu) };
-        if rc != 0 {
-            return Err(Error::from_rte_errno("the port refused that MTU"));
-        }
-        Ok(())
-    }
-
     /// Configure and start the port with this name, and hand out its queues.
     ///
     /// One queue pair per index, up to `settings.rx_queues` (and as many
@@ -141,7 +130,7 @@ impl Port {
                     settings.tx_offloads,
                 );
                 if rc != 0 {
-                    return Err(Error::from_rte_errno("the port refused that configuration"));
+                    return Err(Error::from_call("the port refused that configuration", rc));
                 }
 
                 for queue in 0..settings.rx_queues {
@@ -152,7 +141,7 @@ impl Port {
                         pool.handle().as_ptr(),
                     );
                     if rc != 0 {
-                        return Err(Error::from_rte_errno("a receive queue was refused"));
+                        return Err(Error::from_call("a receive queue was refused", rc));
                     }
                 }
 
@@ -163,13 +152,13 @@ impl Port {
                         c_uint::from(settings.tx_descriptors),
                     );
                     if rc != 0 {
-                        return Err(Error::from_rte_errno("a transmit queue was refused"));
+                        return Err(Error::from_call("a transmit queue was refused", rc));
                     }
                 }
 
                 let rc = sys::shim_port_start(c_uint::from(id));
                 if rc != 0 {
-                    return Err(Error::from_rte_errno("the port would not start"));
+                    return Err(Error::from_call("the port would not start", rc));
                 }
             }
             Ok(())

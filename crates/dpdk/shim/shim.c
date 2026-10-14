@@ -16,6 +16,11 @@
  *     control plane is called a handful of times at startup; the data path is
  *     batched so that a pass crosses this boundary a constant number of times,
  *     not once per frame.
+ *   - **A call whose failure a caller reads clears `rte_errno` first.** DPDK
+ *     leaves it alone on some failures and stale on others, and an error that
+ *     says "Success" or names an earlier call's failure is worse than none;
+ *     `rte_errno` is reset at the top of those calls so what comes back is
+ *     theirs.
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -202,6 +207,7 @@ int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t 
 {
     struct rte_eth_conf conf;
 
+    rte_errno = 0; /* this call's failure, not an earlier one's */
     memset(&conf, 0, sizeof(conf));
     conf.rxmode.offloads = rx_offloads;
     conf.txmode.offloads = tx_offloads;
@@ -211,6 +217,8 @@ int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t 
 
 int shim_rx_queue_setup(unsigned port, unsigned queue, unsigned descriptors, void *pool)
 {
+    rte_errno = 0;
+
     return rte_eth_rx_queue_setup(
         (uint16_t)port, (uint16_t)queue, (uint16_t)descriptors,
         rte_eth_dev_socket_id((uint16_t)port), NULL, pool);
@@ -218,12 +226,19 @@ int shim_rx_queue_setup(unsigned port, unsigned queue, unsigned descriptors, voi
 
 int shim_tx_queue_setup(unsigned port, unsigned queue, unsigned descriptors)
 {
+    rte_errno = 0;
+
     return rte_eth_tx_queue_setup(
         (uint16_t)port, (uint16_t)queue, (uint16_t)descriptors,
         rte_eth_dev_socket_id((uint16_t)port), NULL);
 }
 
-int shim_port_start(unsigned port) { return rte_eth_dev_start((uint16_t)port); }
+int shim_port_start(unsigned port)
+{
+    rte_errno = 0;
+
+    return rte_eth_dev_start((uint16_t)port);
+}
 
 void shim_port_stop(unsigned port) { rte_eth_dev_stop((uint16_t)port); }
 
@@ -243,8 +258,6 @@ int shim_port_mac(unsigned port, unsigned char *out)
 }
 
 int shim_port_mtu(unsigned port, uint16_t *out) { return rte_eth_dev_get_mtu((uint16_t)port, out); }
-
-int shim_port_set_mtu(unsigned port, uint16_t mtu) { return rte_eth_dev_set_mtu((uint16_t)port, mtu); }
 
 /* ---- the data path, in batches ---------------------------------------- */
 

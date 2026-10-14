@@ -121,7 +121,6 @@ unsafe extern "C" {
     pub fn shim_port_close(port: c_uint);
     pub fn shim_port_mac(port: c_uint, out: *mut u8) -> c_int;
     pub fn shim_port_mtu(port: c_uint, out: *mut u16) -> c_int;
-    pub fn shim_port_set_mtu(port: c_uint, mtu: u16) -> c_int;
 
     // The data path, in batches: one call per burst, whatever it carries.
     pub fn shim_rx_burst(port: c_uint, queue: c_uint, out: *mut ShimRxDesc, max: c_uint) -> c_uint;

@@ -419,6 +419,123 @@ fn a_burst_answers_what_it_was_asked_for_in_the_child() {
     );
 }
 
+// ---- what the port says, and what a refusal says ------------------------
+
+/// The port describes itself: its name, its PMD, its queues, its MAC and its
+/// MTU — the surface D4's configuration checks read.
+#[test]
+fn a_port_describes_itself() {
+    let empty = Capture::of("described", &[]);
+    in_a_child(
+        "a_port_describes_itself_in_the_child",
+        &[(RX_PCAP, empty.path())],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `a_port_describes_itself`"]
+fn a_port_describes_itself_in_the_child() {
+    let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+    let port = Started::net_pcap("net_pcap0", &capture);
+
+    assert!(
+        Port::names().iter().any(|name| name == "net_pcap0"),
+        "the port answers to the name it was given: {:?}",
+        Port::names()
+    );
+
+    let info = port._port.info();
+    assert_eq!(info.name, "net_pcap0");
+    assert_eq!(info.driver, "net_pcap");
+    assert!(info.max_rx_queues >= 1 && info.max_tx_queues >= 1);
+    assert_eq!(
+        info.socket_id, None,
+        "a port that reports -1 has no socket, and -1 is not a socket number (D0)"
+    );
+
+    assert_eq!(port._port.mac().len(), 6, "a port has an address");
+    assert!(port._port.mtu() > 0, "and reports an MTU");
+}
+
+/// A failure carries DPDK's own words, which is what makes an error worth
+/// reading at three in the morning.
+#[test]
+fn a_refusal_says_what_dpdk_said() {
+    let empty = Capture::of("refused", &[]);
+    in_a_child(
+        "a_refusal_says_what_dpdk_said_in_the_child",
+        &[(RX_PCAP, empty.path())],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `a_refusal_says_what_dpdk_said`"]
+fn a_refusal_says_what_dpdk_said_in_the_child() {
+    let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+
+    let mut args = EAL_ARGS.to_vec();
+    let vdev = net_pcap("net_pcap0", &capture);
+    args.push(&vdev);
+    Eal::init(args).expect("EAL starts");
+
+    // A pool of four billion frames: DPDK cannot make it, and says why.
+    let refused = Mempool::create(
+        "t3_absurd",
+        &MempoolSettings {
+            count: u32::MAX,
+            cache: 0,
+            ..MempoolSettings::default()
+        },
+    )
+    .expect_err("a pool that cannot be made is an error");
+
+    assert_ne!(
+        refused.code, 0,
+        "the error carries DPDK's errno, not this crate's refusal: {refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("the mempool could not be made"),
+        "and says which call answered it: {refused}"
+    );
+
+    let pool = Mempool::create("t3_pool", &MempoolSettings::default()).expect("a pool");
+
+    // More receive queues than the PMD has: the call answers a code without
+    // setting an errno, and the code is what the error has to carry.
+    let refused = Port::start(
+        "net_pcap0",
+        &PortSettings {
+            rx_queues: 2,
+            tx_queues: 0,
+            ..PortSettings::default()
+        },
+        &pool,
+    )
+    .expect_err("net_pcap has one receive queue");
+    assert_ne!(
+        refused.code, 0,
+        "the error carries the call's code: {refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("the port refused that configuration"),
+        "and names the call that answered: {refused}"
+    );
+
+    // A port that does not exist: this crate's own refusal, with no code,
+    // because nothing was called.
+    let refused =
+        Port::start("no-such-port", &carrying(), &pool).expect_err("there is no such port");
+    assert_eq!(refused.code, 0, "nothing was called: {refused}");
+    assert!(
+        refused.to_string().contains("no-such-port"),
+        "and it names the port: {refused}"
+    );
+}
+
 // ---- the transmit path -------------------------------------------------
 
 /// Where a child is told to write what it sends.

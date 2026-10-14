@@ -9,9 +9,10 @@ use crate::sys;
 /// A failure from the shim, or a refusal by this crate.
 #[derive(Debug)]
 pub struct Error {
-    /// DPDK's `rte_errno` where the failure was DPDK's, `0` where this crate
-    /// refused the request itself.
-    pub rte_errno: i32,
+    /// DPDK's `rte_errno` where DPDK set one, the call's own return code where
+    /// it answered one without setting an errno, and `0` where this crate
+    /// refused the request itself and called nothing.
+    pub code: i32,
     message: String,
 }
 
@@ -36,15 +37,34 @@ impl Error {
         };
 
         Self {
-            rte_errno,
-            message: format!("{what}: {text}"),
+            code: rte_errno,
+            message: format!("{what}: {text} (rte_errno={rte_errno})"),
+        }
+    }
+
+    /// A call that answered a return code, where DPDK may have left `rte_errno`
+    /// alone.
+    ///
+    /// Some calls do: `net_pcap` answers `-ENOTSUP` to an MTU it will not take
+    /// and sets nothing, and "Success" is not a useful thing for a caller to
+    /// read — a case this crate found by asking one.
+    pub(crate) fn from_call(what: &str, rc: i32) -> Self {
+        // SAFETY: as in `from_rte_errno`.
+        let rte_errno = unsafe { sys::shim_rte_errno() };
+        if rte_errno == 0 {
+            Self {
+                code: rc,
+                message: format!("{what}: the call answered {rc}"),
+            }
+        } else {
+            Self::from_rte_errno(what)
         }
     }
 
     /// This crate's own refusal: nothing was called.
     pub(crate) fn refused(message: impl Into<String>) -> Self {
         Self {
-            rte_errno: 0,
+            code: 0,
             message: message.into(),
         }
     }
@@ -52,11 +72,7 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.rte_errno == 0 {
-            write!(f, "{}", self.message)
-        } else {
-            write!(f, "{} (rte_errno={})", self.message, self.rte_errno)
-        }
+        f.write_str(&self.message)
     }
 }
 
