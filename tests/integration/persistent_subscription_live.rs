@@ -106,12 +106,17 @@ impl ControlledHandler for Collector {
 #[derive(Default)]
 struct Joins {
     live_joined: usize,
+    live_left: usize,
     errors: Vec<String>,
 }
 
 impl SubscriptionListener for Joins {
     fn on_live_joined(&mut self) {
         self.live_joined += 1;
+    }
+
+    fn on_live_left(&mut self) {
+        self.live_left += 1;
     }
 
     fn on_error(&mut self, error: &SubscriptionError) {
@@ -125,6 +130,10 @@ struct SharedJoins(std::rc::Rc<std::cell::RefCell<Joins>>);
 impl SubscriptionListener for SharedJoins {
     fn on_live_joined(&mut self) {
         self.0.borrow_mut().live_joined += 1;
+    }
+
+    fn on_live_left(&mut self) {
+        self.0.borrow_mut().live_left += 1;
     }
 
     fn on_error(&mut self, error: &SubscriptionError) {
@@ -196,6 +205,15 @@ impl Source {
             .offer_exclusive(self.publication, payload)
             .expect("the live stream takes a message");
 
+        self.client.poll();
+    }
+
+    /// **Take the publication away**: the publisher stops, and the live stream
+    /// the subscription is reading is over.
+    fn stop(&mut self) {
+        self.client
+            .remove_publication(self.publication, archive::COMMAND_TIMEOUT)
+            .expect("the live publication is given back");
         self.client.poll();
     }
 
@@ -358,6 +376,123 @@ fn no_fragment_limit_at_all() {
 #[test]
 fn a_replay_channel_whose_port_the_driver_picks() {
     replay_then_join("ps-live-dynamic-port", REPLAY_CHANNEL_DYNAMIC_PORT, 10);
+}
+
+/// **`shouldHandlePublisherStoppingWhileLive`** (`…_persistent_subscription_test.cpp:1722`):
+/// the publisher goes away while the subscription is reading it, and the
+/// subscription goes **back to replaying** rather than failing — with the
+/// messages it already delivered not delivered again.
+#[test]
+fn the_subscription_goes_back_to_replaying_when_the_publisher_stops() {
+    let test_name = "ps-live-publisher-stops";
+
+    let Some((media_driver, _archive_dir)) = rig(test_name) else {
+        return;
+    };
+
+    let mut source = Source::start(media_driver.aeron_dir());
+
+    let mut context = PersistentSubscriptionContext::new();
+    context.archive_context = Some(context_for(media_driver.aeron_dir()));
+    context.recording_id = source.recording_id;
+    context.live_channel = Some(LIVE_CHANNEL.to_owned());
+    context.live_stream_id = LIVE_STREAM_ID;
+    context.replay_channel = Some(REPLAY_CHANNEL_IPC.to_owned());
+    context.replay_stream_id = REPLAY_STREAM_ID;
+    context.start_position = FROM_START;
+
+    let joins = std::rc::Rc::new(std::cell::RefCell::new(Joins::default()));
+
+    let mut subscription = PersistentSubscription::new(
+        context,
+        Box::new(NoCredentials),
+        Some(Box::new(SharedJoins(std::rc::Rc::clone(&joins)))),
+    )
+    .expect("the subscription is created");
+
+    let mut collector = Collector::default();
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    // Replayed, then live — the same run the cells above make.
+    while collector.messages.len() < REPLAYED.len() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: the recording never replayed"
+        );
+        subscription.controlled_poll(&mut collector, 10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    for payload in LIVE {
+        source.publish(payload);
+    }
+
+    let wanted = REPLAYED.len() + LIVE.len();
+
+    while collector.messages.len() < wanted || !subscription.is_live() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: {} of {wanted}, state {:?}{}",
+            collector.messages.len(),
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // **The publisher stops.** The live image goes with it, and what the
+    // subscription must do is the reference's `on_live_left`: tell the
+    // application, and go back to replaying — which is where the re-listing it
+    // does next takes it, because the recording is still there and it is still
+    // the thing being followed.
+    source.stop();
+
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    while 1 != joins.borrow().live_left {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: never left the live stream; state {:?}{}",
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        assert!(
+            !subscription.has_failed(),
+            "{test_name}: a publisher stopping is not a failure: {}",
+            subscription.failure_reason().unwrap_or("")
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // **The edge's own contract, and only that.** The publisher stopping is not
+    // a failure the application hears about through `on_error`, the live stream
+    // is left once, and nothing already delivered comes back.
+    //
+    // ★ What the machine does *next* is not asserted, and cannot be yet: the
+    // position it left at is exactly the recording's stop position, so the
+    // reference's next step is `ADD_LIVE_SUBSCRIPTION` — look for a live stream
+    // again — and that state, with `AWAIT_LIVE` beside it, is the live-start
+    // path this slice has not built. Whichever commit builds it is the one that
+    // can assert the recovery; what this one can assert is that the way there is
+    // taken, by the right state, without a re-delivery.
+    assert_eq!(wanted, collector.messages.len(), "{:?}", collector.messages);
+    assert!(!subscription.is_live(), "{test_name}");
+
+    let heard = joins.borrow();
+    assert!(heard.errors.is_empty(), "{:?}", heard.errors);
+    assert_eq!(1, heard.live_left, "{test_name}");
+    assert_eq!(1, heard.live_joined, "{test_name}");
+    drop(heard);
+
+    match subscription.state() {
+        State::SendListRecordingRequest | State::AwaitListRecordingResponse | State::Failed => {}
+        other => panic!("{test_name}: left the live stream into {other:?}"),
+    }
 }
 
 /// Why the subscription is where it is, for a failure message.

@@ -1451,11 +1451,61 @@ impl PersistentSubscription {
             return 0;
         };
 
+        // ★ **The image is gone: the live stream stopped** (`:2255-2263`).
+        //
+        // The reference asks `aeron_image_is_closed(image)`; this build's
+        // `Image` has no such flag — an image that can no longer be read is one
+        // its subscription has let go of — so the question is whether the
+        // subscription still has one. It had one when this state was entered,
+        // which is what makes "no image now" mean closed rather than "not yet".
+        //
+        // What is remembered is where it got to, so that the replay which
+        // follows resumes from there: the publisher stopping is not a message
+        // lost, it is a stream that has to be re-read from the same place.
+        let still_has_an_image = self
+            .client
+            .client_mut()
+            .and_then(|driver| driver.subscription(registration_id))
+            .is_some_and(|subscription| !subscription.images().is_empty());
+
+        if !still_has_an_image {
+            self.clean_up_live_subscription();
+            self.refresh_recording_descriptor();
+            self.on_live_left();
+
+            return 1;
+        }
+
         let Some(driver) = self.client.client_mut() else {
             return 0;
         };
 
         driver.poll_subscription_controlled(registration_id, fragment_limit, handler)
+    }
+
+    /// `refresh_recording_descriptor` (`:1181-1185`): go back to the beginning
+    /// of the path, which is how this machine re-reads a recording whose
+    /// descriptor has changed — or whose live stream has to be found again.
+    ///
+    /// Only the live subscription goes: the replay subscription and the position
+    /// are what the re-listing is *for*, and the descriptor's own answer is what
+    /// continues from where this left off.
+    fn refresh_recording_descriptor(&mut self) {
+        self.clean_up_live_subscription();
+        self.transition(State::SendListRecordingRequest);
+    }
+
+    /// `on_live_left` (`:937-949`): count it, and tell the application.
+    fn on_live_left(&mut self) {
+        if let Some(driver) = self.client.client_mut() {
+            if let Some(counters) = driver.counters_writable() {
+                self.counters.note_live_left(&counters);
+            }
+        }
+
+        if let Some(listener) = self.listener.as_mut() {
+            listener.on_live_left();
+        }
     }
 
     /// `set_live_image_deadline` (`:779-784`).
