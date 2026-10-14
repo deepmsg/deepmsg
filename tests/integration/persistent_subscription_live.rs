@@ -1,0 +1,427 @@
+//! P2-C4: the persistent subscription's **live half**, against a real archive.
+//!
+//! # What is judged here
+//!
+//! `shouldReplayExistingRecordingThenJoinLive` — the reference's case
+//! (`…_persistent_subscription_test.cpp:1011`), which is a table of twelve:
+//! three fragment limits by four channel shapes. What each cell asks for is one
+//! run of the whole thing:
+//!
+//! 1. five messages are recorded **before the subscription exists**;
+//! 2. the subscription replays them, in order, through the application's own
+//!    handler, while `is_replaying()`;
+//! 3. five more are published to the **live** stream, which is the same stream
+//!    the recording was made from;
+//! 4. all ten arrive, in order, and the subscription says `is_live()` and not
+//!    `is_replaying()` — with `on_live_joined` fired exactly once.
+//!
+//! # What this build reproduces of the reference's twelve cells, and what it does not
+//!
+//! The fragment limits are the reference's three (`1`, `10`, and an unlimited
+//! one). The channel shapes are two of the reference's four: an **IPC** stream,
+//! and a **UDP channel whose endpoint is port zero** — which is not one of the
+//! reference's four cells at all, but is the shape its *own default context*
+//! uses (`aeron:udp?endpoint=localhost:0`, `…_persistent_subscription_test.cpp:718`),
+//! and it is the one that exercises `AWAIT_REPLAY_CHANNEL_ENDPOINT`: the driver
+//! picks the port and the archive has to be told which one.
+//!
+//! # What none of these cells judge: the alignment itself, measured
+//!
+//! ★ `ATTEMPT_SWITCH` has two paths and these cells take the **short one**. The
+//! live subscription joins a stream that is *idle* at that moment, so the live
+//! image's position and the replay's are equal and the switch is immediate
+//! (`:2072-2074`); the two catch-up handlers that align an **ahead** live stream
+//! (`:2002-2058`) are never entered. Tried the other way round — publishing the
+//! live batch after the subscription has reached the switch — and the image
+//! still joins at the position the replay has read to, because an image's
+//! position is where it has been *read*, and a live image's starts at its join
+//! position.
+//!
+//! A mutation of the live probe's `ABORT` (consume instead of leave it)
+//! **survives** every cell here, which is the same fact from the other side.
+//! What reaches the alignment is a live stream that is already ahead when the
+//! subscription joins it, and the reference's cases for that are in its
+//! *resilience* binary (`shouldCatchUpToLiveDuringAttemptSwitchWith…`) — P2-C4's
+//! eighth commit, with the loss generators.
+//!
+//! **Unicast, multicast and multi-destination live streams are not here.** They
+//! are the same state machine over media this build's own tests cover elsewhere,
+//! and reproducing them would need the recording, the live publication and the
+//! live subscription on three more media — which is a test of the *driver*, not
+//! of this machine. Recorded rather than pretended.
+
+use std::time::{Duration, Instant};
+
+use deepmsg_archive::client::context::{
+    AERON_DIR_ENV, CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV,
+};
+use deepmsg_archive::client::persistent_subscription::{
+    FROM_START, PersistentSubscription, PersistentSubscriptionContext, State, SubscriptionError,
+    SubscriptionListener,
+};
+use deepmsg_archive::client::{Archive, ArchiveContext, Handlers, NoCredentials};
+use deepmsg_client::client::Client;
+use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
+use deepmsg_tests::archive;
+use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
+use deepmsg_tests::temp::TempDir;
+
+/// The stream that is **recorded and then live**: the subscription's live stream
+/// id has to be this one, because a descriptor whose stream differs from the
+/// configured live stream is refused (`:1204`).
+const LIVE_CHANNEL: &str = "aeron:ipc?alias=ps-live";
+const LIVE_STREAM_ID: i32 = 4218;
+
+/// Where the replay arrives. Its own stream, and *not* the live one.
+const REPLAY_CHANNEL_IPC: &str = "aeron:ipc?alias=ps-live-replay";
+const REPLAY_CHANNEL_DYNAMIC_PORT: &str = "aeron:udp?endpoint=localhost:0";
+const REPLAY_STREAM_ID: i32 = 4219;
+
+/// What the recording holds before the subscription exists, and what is
+/// published to it afterwards.
+const REPLAYED: [&[u8]; 5] = [
+    b"replayed 0",
+    b"replayed 1",
+    b"replayed 2",
+    b"replayed 3",
+    b"replayed 4",
+];
+const LIVE: [&[u8]; 5] = [b"live 0", b"live 1", b"live 2", b"live 3", b"live 4"];
+
+/// What the application's handler was handed.
+#[derive(Default)]
+struct Collector {
+    messages: Vec<Vec<u8>>,
+}
+
+impl ControlledHandler for Collector {
+    fn on_message(&mut self, message: Message<'_>) -> Action {
+        self.messages.push(message.payload.to_vec());
+
+        Action::Continue
+    }
+}
+
+/// What the application's listener heard.
+#[derive(Default)]
+struct Joins {
+    live_joined: usize,
+    errors: Vec<String>,
+}
+
+impl SubscriptionListener for Joins {
+    fn on_live_joined(&mut self) {
+        self.live_joined += 1;
+    }
+
+    fn on_error(&mut self, error: &SubscriptionError) {
+        self.errors.push(format!("{error}"));
+    }
+}
+
+/// The same listener, shared with the test that owns it.
+struct SharedJoins(std::rc::Rc<std::cell::RefCell<Joins>>);
+
+impl SubscriptionListener for SharedJoins {
+    fn on_live_joined(&mut self) {
+        self.0.borrow_mut().live_joined += 1;
+    }
+
+    fn on_error(&mut self, error: &SubscriptionError) {
+        self.0.borrow_mut().errors.push(format!("{error}"));
+    }
+}
+
+/// The recording, and the publication still writing to it.
+struct Source {
+    client: Client,
+    archive: Archive,
+    publication: i64,
+    recording_id: i64,
+}
+
+impl Source {
+    /// Start a recording, publish `REPLAYED` into it, and **keep it live** —
+    /// which is the reference's own shape: its `PersistentPublication` holds an
+    /// exclusive publication that the archive records
+    /// (`…_persistent_subscription_test.cpp:225-557`), and the live half of the
+    /// case publishes through it.
+    fn start(aeron_dir: &std::path::Path) -> Self {
+        let mut client = Client::connect(aeron_dir).expect("connect to our driver");
+
+        let mut archive = Archive::connect(
+            &context(aeron_dir),
+            &mut client,
+            &mut NoCredentials,
+            Handlers::default(),
+        )
+        .expect("the archive is connected");
+
+        archive
+            .start_recording(&mut client, LIVE_CHANNEL, LIVE_STREAM_ID, false, false)
+            .expect("the archive starts recording");
+
+        let publication = client
+            .add_exclusive_publication(LIVE_CHANNEL, LIVE_STREAM_ID, archive::COMMAND_TIMEOUT)
+            .expect("the driver takes a publication on the live channel");
+
+        until(&mut client, "the recording publication linking", |client| {
+            client
+                .exclusive_publication(publication)
+                .and_then(deepmsg_client::publication::ExclusivePublication::is_connected)
+                .unwrap_or(false)
+        });
+
+        let mut source = Self {
+            client,
+            archive,
+            publication,
+            recording_id: 0,
+        };
+
+        for payload in REPLAYED {
+            source.publish(payload);
+        }
+
+        let row = source.await_row();
+
+        source.recording_id = row;
+
+        source
+    }
+
+    /// Offer one message to the live stream, and let the driver turn.
+    fn publish(&mut self, payload: &[u8]) {
+        self.client
+            .offer_exclusive(self.publication, payload)
+            .expect("the live stream takes a message");
+
+        self.client.poll();
+    }
+
+    /// The one recording in the catalog, once it is there.
+    fn await_row(&mut self) -> i64 {
+        let mut recording_id = None;
+
+        until(&mut self.client, "the recording's catalog row", |client| {
+            let mut rows = Vec::new();
+            let _ = self.archive.list_recordings(
+                client,
+                0,
+                10,
+                &mut |descriptor: &deepmsg_archive::client::RecordingDescriptor| {
+                    rows.push(descriptor.clone());
+                },
+            );
+
+            if rows.len() == 1 {
+                recording_id = rows.first().map(|row| row.recording_id);
+            }
+
+            recording_id.is_some()
+        });
+
+        recording_id.expect("the loop ends with a row")
+    }
+}
+
+/// Run the reference's case once, for a `(replay channel, fragment limit)` cell.
+fn replay_then_join(test_name: &str, replay_channel: &str, fragment_limit: usize) {
+    let Some((media_driver, _archive_dir)) = rig(test_name) else {
+        return;
+    };
+
+    let mut source = Source::start(media_driver.aeron_dir());
+
+    let mut context = PersistentSubscriptionContext::new();
+    context.archive_context = Some(context_for(media_driver.aeron_dir()));
+    context.recording_id = source.recording_id;
+    context.live_channel = Some(LIVE_CHANNEL.to_owned());
+    context.live_stream_id = LIVE_STREAM_ID;
+    context.replay_channel = Some(replay_channel.to_owned());
+    context.replay_stream_id = REPLAY_STREAM_ID;
+    context.start_position = FROM_START;
+
+    let joins = std::rc::Rc::new(std::cell::RefCell::new(Joins::default()));
+
+    let mut subscription = PersistentSubscription::new(
+        context,
+        Box::new(NoCredentials),
+        Some(Box::new(SharedJoins(std::rc::Rc::clone(&joins)))),
+    )
+    .expect("the subscription is created");
+
+    let mut collector = Collector::default();
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    // The recording first, through the same poll the application uses — and the
+    // subscription has to say it is replaying while it does.
+    while collector.messages.len() < REPLAYED.len() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: {} of {} replayed; state {:?}{}",
+            collector.messages.len(),
+            REPLAYED.len(),
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        subscription.controlled_poll(&mut collector, fragment_limit);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(
+        subscription.is_replaying(),
+        "{test_name}: the recording arrived but the subscription is {:?}",
+        subscription.state()
+    );
+    assert_eq!(
+        0,
+        joins.borrow().live_joined,
+        "{test_name}: joined too early"
+    );
+
+    // And now the live stream: the same publication, still open, on the stream
+    // the recording was made from.
+    for payload in LIVE {
+        source.publish(payload);
+    }
+
+    let deadline = Instant::now() + archive::DEADLINE;
+    let wanted = REPLAYED.len() + LIVE.len();
+
+    while collector.messages.len() < wanted || !subscription.is_live() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: {} of {wanted} messages, state {:?}{}",
+            collector.messages.len(),
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        assert!(
+            !subscription.has_failed(),
+            "{test_name}: failed with {} messages in{}",
+            collector.messages.len(),
+            reason(&subscription, &joins)
+        );
+
+        subscription.controlled_poll(&mut collector, fragment_limit);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // **All ten, in order, with no seam between the two halves** — which is the
+    // whole point of the state machine: the recording's last message is followed
+    // by the live stream's first, once each.
+    let expected: Vec<Vec<u8>> = REPLAYED
+        .iter()
+        .chain(LIVE.iter())
+        .map(|payload| payload.to_vec())
+        .collect();
+    assert_eq!(expected, collector.messages, "{test_name}");
+
+    assert_eq!(1, joins.borrow().live_joined, "{test_name}");
+    assert!(subscription.is_live(), "{test_name}");
+    assert!(!subscription.is_replaying(), "{test_name}");
+    assert_eq!(State::Live, subscription.state(), "{test_name}");
+    assert!(
+        joins.borrow().errors.is_empty(),
+        "{:?}",
+        joins.borrow().errors
+    );
+}
+
+/// The reference's first fragment limit (`:988-1005`).
+#[test]
+fn one_fragment_a_turn() {
+    replay_then_join("ps-live-1", REPLAY_CHANNEL_IPC, 1);
+}
+
+/// Its second, and its default (`aeron_archive_persistent_subscription_poll`'s
+/// fragment limit of 10).
+#[test]
+fn ten_fragments_a_turn() {
+    replay_then_join("ps-live-10", REPLAY_CHANNEL_IPC, 10);
+}
+
+/// Its third: no limit at all (`INT_MAX` there, which no `usize` can exceed
+/// here).
+#[test]
+fn no_fragment_limit_at_all() {
+    replay_then_join("ps-live-max", REPLAY_CHANNEL_IPC, usize::MAX);
+}
+
+/// ★ The replay channel whose endpoint is **port zero**, which is the shape the
+/// reference's own default context uses and the only one that reaches
+/// `AWAIT_REPLAY_CHANNEL_ENDPOINT`: the driver picks the port, and the archive
+/// has to be told which one before it can replay anything.
+#[test]
+fn a_replay_channel_whose_port_the_driver_picks() {
+    replay_then_join("ps-live-dynamic-port", REPLAY_CHANNEL_DYNAMIC_PORT, 10);
+}
+
+/// Why the subscription is where it is, for a failure message.
+fn reason(
+    subscription: &PersistentSubscription,
+    joins: &std::rc::Rc<std::cell::RefCell<Joins>>,
+) -> String {
+    let failure = subscription
+        .failure_reason()
+        .map_or(String::new(), |reason| format!(", failed: {reason}"));
+    let errors = joins.borrow().errors.join("; ");
+
+    if errors.is_empty() {
+        failure
+    } else {
+        format!("{failure}, errors: {errors}")
+    }
+}
+
+/// An archive of ours, running.
+fn rig(test_name: &str) -> Option<(OwnArchivingMediaDriver, TempDir)> {
+    let archive_dir = TempDir::new(test_name);
+    let properties: Vec<&str> = archive::PROPERTIES.to_vec();
+
+    let Some(mut media_driver) =
+        OwnArchivingMediaDriver::start(test_name, archive_dir.path(), &properties)
+    else {
+        archiving_driver::announce_skip();
+        return None;
+    };
+
+    media_driver
+        .await_ready(archive::DEADLINE)
+        .expect("the archiving media driver comes up");
+
+    Some((media_driver, archive_dir))
+}
+
+/// The archive's control channel, and a response channel to be answered on.
+fn context_for(aeron_dir: &std::path::Path) -> ArchiveContext {
+    context(aeron_dir)
+}
+
+fn context(aeron_dir: &std::path::Path) -> ArchiveContext {
+    ArchiveContext::resolve(&[
+        (AERON_DIR_ENV.to_owned(), aeron_dir.display().to_string()),
+        (
+            CONTROL_CHANNEL_ENV.to_owned(),
+            archive::CONTROL_CHANNEL.to_owned(),
+        ),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV.to_owned(),
+            archive::RESPONSE_CHANNEL.to_owned(),
+        ),
+    ])
+}
+
+/// Drive a client until `done`, or fail.
+fn until(client: &mut Client, what: &str, mut done: impl FnMut(&mut Client) -> bool) {
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    while !done(client) {
+        assert!(Instant::now() < deadline, "{what} never happened");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}

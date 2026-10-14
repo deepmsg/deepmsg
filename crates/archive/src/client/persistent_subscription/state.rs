@@ -52,7 +52,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{AsyncAdd, AsyncAddPoll, CommandError};
-use deepmsg_client::fragment_assembler::ControlledHandler;
+use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
 use deepmsg_core::uri::ChannelUri;
 
@@ -106,9 +106,13 @@ pub enum State {
     /// A replay channel that named `endpoint=…:0`, waiting for the port the
     /// driver picked.
     AwaitReplayChannelEndpoint,
-    /// Reading the replay, and (in the next commit) deciding when it is caught
-    /// up.
+    /// Reading the replay, and deciding when it has caught up.
     Replay,
+    /// The live subscription is up: aligning the replay's position with the
+    /// live image's, so that the seam has no message twice and none missing.
+    AttemptSwitch,
+    /// Reading the live stream.
+    Live,
     /// Terminal.
     Failed,
 }
@@ -133,6 +137,12 @@ impl State {
             Self::AwaitReplaySubscription => 6,
             Self::AwaitReplayChannelEndpoint => 7,
             Self::Replay => 12,
+            Self::AttemptSwitch => 13,
+            // 14 and 15 are `ADD_LIVE_SUBSCRIPTION` and `AWAIT_LIVE`, which are
+            // the *other* way into the live stream: a subscription that has
+            // nothing to replay. They arrive with that path, which `new` refuses
+            // today.
+            Self::Live => 16,
             Self::Failed => 17,
         }
     }
@@ -238,6 +248,31 @@ impl From<ConcludeError> for NewError {
     }
 }
 
+/// The sub-machine that asks the archive how far the recording has got, so that
+/// "has the replay caught up?" has an answer (`:604-698`).
+///
+/// It is a sub-machine rather than a request because the answer has to be
+/// *rechecked*: an answer taken once and kept would be a recording that has
+/// moved on since, and one taken every turn would be a request per turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxRecordedPosition {
+    /// Nothing asked yet, or the last answer was caught up with.
+    Idle,
+    /// The request has been sent and nothing has come back.
+    Awaiting {
+        /// What it was sent with.
+        correlation_id: i64,
+        /// When its answer stops being waited for.
+        deadline: Instant,
+    },
+    /// The answer named a position the replay has not reached: the replay has
+    /// to read what it has before it is worth asking again (`:671-681`).
+    RecheckRequired {
+        /// The position the answer named.
+        max_recorded_position: i64,
+    },
+}
+
 /// What the archive has answered, filed by correlation id — the operation slots
 /// the reference's `on_archive_control_response` demultiplexes into
 /// (`:831-860`), of which this half uses two.
@@ -245,6 +280,16 @@ impl From<ConcludeError> for NewError {
 struct Ops {
     list_recording: ListRecording,
     replay: Replay,
+    max_recorded_position: MaxPosition,
+}
+
+/// One `get_max_recorded_position` request and what came back (`:59-74`).
+#[derive(Debug, Default)]
+struct MaxPosition {
+    correlation_id: i64,
+    received: bool,
+    code: Option<ControlResponseCode>,
+    max_recorded_position: i64,
 }
 
 /// One `list_recording` request and the descriptor it was answered with
@@ -255,6 +300,7 @@ struct ListRecording {
     received: bool,
     start_position: i64,
     stop_position: i64,
+    term_buffer_length: i32,
     stream_id: i32,
 }
 
@@ -292,6 +338,14 @@ impl Listener for ArchiveListener {
             ops.replay.relevant_id = response.relevant_id;
             ops.replay.error_message = response.error_message.to_owned();
         }
+
+        if response.correlation_id == ops.max_recorded_position.correlation_id
+            && NULL_VALUE != response.correlation_id
+        {
+            ops.max_recorded_position.received = true;
+            ops.max_recorded_position.code = Some(response.code);
+            ops.max_recorded_position.max_recorded_position = response.relevant_id;
+        }
     }
 
     fn on_recording_descriptor(&mut self, descriptor: &RecordingDescriptor) {
@@ -301,6 +355,7 @@ impl Listener for ArchiveListener {
             ops.list_recording.received = true;
             ops.list_recording.start_position = descriptor.start_position;
             ops.list_recording.stop_position = descriptor.stop_position;
+            ops.list_recording.term_buffer_length = descriptor.term_buffer_length;
             ops.list_recording.stream_id = descriptor.stream_id;
         }
     }
@@ -351,6 +406,24 @@ pub struct PersistentSubscription {
     replay_session_id: i64,
     /// The deadline of whatever is being waited for, or `None`.
     deadline: Option<Instant>,
+    /// The margin the catch-up check allows: a quarter of the recording's term
+    /// buffer (`:1157-1159`).
+    close_enough_threshold: i64,
+    /// The `max_recorded_position` sub-machine.
+    max_recorded_position: MaxRecordedPosition,
+    /// Where the live stream takes over, found by the live side of the
+    /// alignment; [`NULL_VALUE`] until it is (`:2002-2017`).
+    next_live_position: i64,
+    /// The live channel's subscription, once the driver has made it.
+    live_subscription: Option<i64>,
+    /// The `ADD_SUBSCRIPTION` on the live channel that is in flight.
+    live_subscription_add: Option<i64>,
+    /// When the live subscription's image should have appeared by (`:779-784`).
+    live_image_deadline: Option<Instant>,
+    /// Set when that deadline has already been reported, so that the listener is
+    /// told **once per deadline** rather than on every turn after it (`:783`,
+    /// `:789`).
+    live_image_deadline_breached: bool,
     /// How it failed, if it did (`:52-57`).
     failure: Option<String>,
 }
@@ -459,6 +532,13 @@ impl PersistentSubscription {
             replay_subscription_add: None,
             replay_session_id: NULL_VALUE,
             deadline: None,
+            close_enough_threshold: 0,
+            max_recorded_position: MaxRecordedPosition::Idle,
+            next_live_position: NULL_VALUE,
+            live_subscription: None,
+            live_subscription_add: None,
+            live_image_deadline: None,
+            live_image_deadline_breached: false,
             failure: None,
             concluded,
         };
@@ -474,11 +554,21 @@ impl PersistentSubscription {
         self.state
     }
 
-    /// Whether the recording is being replayed (`:2382-2387`) — which the
-    /// reference counts `ATTEMPT_SWITCH` as, too.
+    /// Whether the recording is being replayed (`:2382-2387`).
+    ///
+    /// **`ATTEMPT_SWITCH` counts.** It is still the replay delivering messages —
+    /// the switch is the replay finishing, not the live stream starting — and
+    /// the reference's own case asserts this predicate while the machine is
+    /// exactly there.
     #[must_use]
     pub const fn is_replaying(&self) -> bool {
-        matches!(self.state, State::Replay)
+        matches!(self.state, State::Replay | State::AttemptSwitch)
+    }
+
+    /// Whether the live stream is being read (`:2377-2380`).
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        matches!(self.state, State::Live)
     }
 
     /// Whether it has failed (`:2389-2392`).
@@ -549,6 +639,8 @@ impl PersistentSubscription {
             State::AwaitReplaySubscription => self.await_replay_subscription(),
             State::AwaitReplayChannelEndpoint => self.await_replay_channel_endpoint(),
             State::Replay => self.replay(handler, fragment_limit),
+            State::AttemptSwitch => self.attempt_switch(handler, fragment_limit),
+            State::Live => self.live(handler, fragment_limit),
             State::Failed => 0,
         };
 
@@ -711,12 +803,12 @@ impl PersistentSubscription {
     /// `set_up_replay` (`:1164-1177`): the state every path back into a replay
     /// goes through, so that the catch-up bookkeeping is never half-reset.
     ///
-    /// What it resets that is missing here is the catch-up bookkeeping itself —
-    /// the `max_recorded_position` sub-machine (`:604-698`) and the margin it
-    /// allows, a quarter of the recording's term buffer (`:1157-1159`). Both
-    /// belong to the gate that decides when to go live, which is the live half.
     fn set_up_replay(&mut self) {
         self.set_join_difference(NOTHING_JOINED);
+        self.close_enough_threshold =
+            i64::from(self.ops.borrow().list_recording.term_buffer_length >> 2);
+        self.max_recorded_position = MaxRecordedPosition::Idle;
+        self.next_live_position = NULL_VALUE;
 
         self.transition(match self.replay_channel_type {
             ReplayChannelType::SessionSpecific => State::SendReplayRequest,
@@ -1008,16 +1100,387 @@ impl PersistentSubscription {
             return 0;
         };
 
+        let fragments = {
+            let Some(driver) = self.client.client_mut() else {
+                return 0;
+            };
+
+            driver.poll_subscription_controlled(registration_id, fragment_limit, handler)
+        };
+
+        self.position = image_position;
+
+        // `:1916-1957`: a live subscription asked for *during* a replay is
+        // picked up here, because this is the state that asked for it. The
+        // reference polls it in `REPLAY` rather than moving to a state of its
+        // own — the two states that do that (`ADD_LIVE_SUBSCRIPTION`,
+        // `AWAIT_LIVE`) are the *other* way into the live stream, the one a
+        // subscription with nothing to replay takes.
+        if self.live_subscription.is_none() {
+            if let Some(registration_id) = self.live_subscription_add {
+                let outcome = match self.client.client_mut() {
+                    Some(driver) => driver.async_add_poll(AsyncAdd::subscription(registration_id)),
+                    None => AsyncAddPoll::Awaiting,
+                };
+
+                match outcome {
+                    AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => {}
+                    AsyncAddPoll::Ready => {
+                        self.live_subscription_add = None;
+                        self.live_subscription = Some(registration_id);
+                        self.set_live_image_deadline();
+                    }
+                    AsyncAddPoll::Failed(error) => {
+                        self.live_subscription_add = None;
+                        self.clean_up_replay_subscription();
+                        self.fail(SubscriptionError::Client(error));
+
+                        return 1;
+                    }
+                }
+            }
+        }
+
+        // `:1959-1975`: with a live subscription up, this is no longer a replay
+        // — it is an alignment. What the difference between the two positions
+        // is gets counted, because it is the one number that says how far
+        // behind the live stream this subscription was when it joined.
+        if let Some(live_registration_id) = self.live_subscription {
+            let live_position = self
+                .client
+                .client_mut()
+                .and_then(|driver| driver.subscription(live_registration_id))
+                .and_then(|subscription| subscription.images().first())
+                .map(deepmsg_client::image::Image::position);
+
+            if let Some(live_position) = live_position {
+                self.set_join_difference(live_position - self.position);
+                self.transition(State::AttemptSwitch);
+
+                return 1;
+            }
+
+            if !self.live_image_deadline_breached && self.live_image_deadline_passed() {
+                self.on_live_image_deadline_breached();
+            }
+        }
+
+        // ★ **The gate that decides when this stops being a replay**
+        // (`:1987-1996`): no live subscription yet, nothing being added, and the
+        // recording has been caught up with. Note what is *not* asked here — a
+        // transport count, which is the replay merge's question and not this
+        // machine's.
+        if self.live_subscription.is_none()
+            && self.live_subscription_add.is_none()
+            && self.max_recorded_position_is_caught_up(self.position)
+            && !self.do_add_live_subscription()
+        {
+            self.clean_up_replay_subscription();
+
+            return 1;
+        }
+
+        fragments
+    }
+
+    /// The `max_recorded_position` sub-machine (`:604-698`), which answers
+    /// whether the replay has caught up with a recording that is still being
+    /// written to.
+    ///
+    /// Three things about it are the reference's and each of them is why it is a
+    /// sub-machine:
+    ///
+    /// * a request that has just been sent **never** counts as caught up
+    ///   (`:604-620` always answers false), so the first turn after a request
+    ///   costs a round trip rather than a wrong answer;
+    /// * an answer is only good for the position the replay had when it was
+    ///   *asked* — if the recording has moved on, the replay has to read what it
+    ///   has before asking again (`:671-681`), which is what stops a busy
+    ///   recording from being asked once per turn;
+    /// * the margin is a quarter of the recording's term buffer
+    ///   (`:1157-1159`), so "caught up" is "close enough that the live stream's
+    ///   first message will arrive after the last replayed one".
+    fn max_recorded_position_is_caught_up(&mut self, replayed_position: i64) -> bool {
+        match self.max_recorded_position {
+            MaxRecordedPosition::Idle => {
+                self.request_max_recorded_position();
+
+                false
+            }
+            MaxRecordedPosition::Awaiting { deadline, .. } => {
+                let (received, code, max_recorded_position) = {
+                    let op = &self.ops.borrow().max_recorded_position;
+
+                    (op.received, op.code, op.max_recorded_position)
+                };
+
+                if received {
+                    if Some(ControlResponseCode::OK) != code {
+                        // Terminal, and not retried: an archive that refuses
+                        // this request is an archive this subscription cannot
+                        // reason about (`:634-644`).
+                        self.fail(SubscriptionError::Refused {
+                            request: "Get max recorded position request",
+                            message: format!("the archive answered {code:?}"),
+                        });
+
+                        return false;
+                    }
+
+                    if replayed_position >= max_recorded_position - self.close_enough_threshold {
+                        return true;
+                    }
+
+                    self.max_recorded_position = MaxRecordedPosition::RecheckRequired {
+                        max_recorded_position,
+                    };
+                } else if Instant::now() >= deadline {
+                    // The answer never came: ask again (`:660-663`).
+                    self.max_recorded_position = MaxRecordedPosition::Idle;
+                }
+
+                false
+            }
+            MaxRecordedPosition::RecheckRequired {
+                max_recorded_position,
+            } => {
+                if replayed_position >= max_recorded_position {
+                    self.max_recorded_position = MaxRecordedPosition::Idle;
+                }
+
+                false
+            }
+        }
+    }
+
+    /// `request_max_position` (`:604-620`).
+    fn request_max_recorded_position(&mut self) {
+        let Ok(correlation_id) = self.next_correlation_id() else {
+            return;
+        };
+
+        let recording_id = self.context.recording_id;
+
+        if !self
+            .client
+            .try_send_max_recorded_position_request(correlation_id, recording_id)
+        {
+            // Not sent, so not waited for: the next turn tries again, which is
+            // the same thing the reference does by leaving the sub-machine in
+            // `REQUEST_MAX_POSITION`.
+            return;
+        }
+
+        self.ops.borrow_mut().max_recorded_position = MaxPosition {
+            correlation_id,
+            ..MaxPosition::default()
+        };
+        self.max_recorded_position = MaxRecordedPosition::Awaiting {
+            correlation_id,
+            deadline: Instant::now() + self.message_timeout,
+        };
+    }
+
+    /// `ATTEMPT_SWITCH` (`:2060-2133`): the replay has caught up and the live
+    /// subscription is up, so the two are aligned and the live stream takes
+    /// over.
+    ///
+    /// **The alignment is explicit**, which is what separates this machine from
+    /// the replay merge: the merge deduplicates at the frame layer by trusting
+    /// that a replay channel carries the live stream's session, and this asks
+    /// instead. Two passes, one per side:
+    ///
+    /// 1. the **live** image is read until a message *past* where the replay has
+    ///    got to arrives. That message is where the live stream would take over
+    ///    (`next_live_position`), and it is left **unconsumed** — so it is not
+    ///    lost, it is simply not read twice;
+    /// 2. the **replay** image is read up to that position, delivering
+    ///    everything before it as usual, and when the message *at* that position
+    ///    arrives the replay stops — without consuming it, because the live
+    ///    image is the one that will deliver it.
+    ///
+    /// Then the live stream takes over. If the two positions were already equal
+    /// there is nothing to align and the switch is immediate (`:2072-2074`).
+    fn attempt_switch<H: ControlledHandler>(
+        &mut self,
+        handler: &mut H,
+        fragment_limit: usize,
+    ) -> usize {
+        let (Some(replay_registration_id), Some(live_registration_id)) =
+            (self.replay_subscription, self.live_subscription)
+        else {
+            return 0;
+        };
+
+        let Some((replay_position, live_position)) = ({
+            let driver = self.client.client_mut();
+
+            driver.map(|driver| {
+                let position = |registration_id: i64| {
+                    driver
+                        .subscription(registration_id)
+                        .and_then(|subscription| subscription.images().first())
+                        .map(deepmsg_client::image::Image::position)
+                };
+
+                (
+                    position(replay_registration_id),
+                    position(live_registration_id),
+                )
+            })
+        }) else {
+            return 0;
+        };
+
+        let (Some(replay_position), Some(live_position)) = (replay_position, live_position) else {
+            return 0;
+        };
+
+        if replay_position == live_position {
+            self.position = replay_position;
+            self.set_join_difference(0);
+            self.transition(State::Live);
+            self.on_live_joined();
+
+            return 1;
+        }
+
+        // 1. Where the live stream takes over, once per alignment.
+        if NULL_VALUE == self.next_live_position {
+            let mut probe = LiveCatchup {
+                replay_position,
+                found: None,
+            };
+
+            if let Some(driver) = self.client.client_mut() {
+                driver.poll_subscription_controlled(
+                    live_registration_id,
+                    fragment_limit,
+                    &mut probe,
+                );
+            }
+
+            if let Some(next_live_position) = probe.found {
+                self.next_live_position = next_live_position;
+            }
+        }
+
+        // 2. The replay reads up to it, and stops there.
+        let mut switch = ReplayCatchup {
+            next_live_position: self.next_live_position,
+            arrived: false,
+            handler,
+        };
+
+        let fragments = match self.client.client_mut() {
+            Some(driver) => driver.poll_subscription_controlled(
+                replay_registration_id,
+                fragment_limit,
+                &mut switch,
+            ),
+            None => 0,
+        };
+
+        if switch.arrived {
+            self.position = self.next_live_position;
+            self.transition(State::Live);
+            self.on_live_joined();
+        }
+
+        fragments
+    }
+
+    /// `do_add_live_subscription` (`:1818-1847`): let go of whatever live
+    /// subscription there was and ask the driver for another.
+    ///
+    /// Answers whether the request went out. **Called from the catch-up gate
+    /// without a state transition**: the machine stays in `REPLAY` and picks
+    /// the add up from there (`:1916-1957`), which is why the same helper serves
+    /// the `ADD_LIVE_SUBSCRIPTION` state with the live-start path.
+    fn do_add_live_subscription(&mut self) -> bool {
+        self.live_subscription = None;
+        self.live_subscription_add = None;
+
+        let channel = self.concluded.live_channel.clone();
+        let stream_id = self.concluded.live_stream_id;
+
+        let Some(driver) = self.client.client_mut() else {
+            return false;
+        };
+
+        match driver.submit_add_subscription(&channel, stream_id, COMMAND_TIMEOUT) {
+            Ok(registration_id) => {
+                self.live_subscription_add = Some(registration_id);
+
+                true
+            }
+            Err(error) => {
+                self.fail(SubscriptionError::Client(error));
+
+                false
+            }
+        }
+    }
+
+    /// `LIVE` (`:2247-2268`): read the live stream.
+    ///
+    /// What is missing here is the branch that notices the live image going
+    /// away and starts the replay that heals it (`:2255-2263`) — that is the
+    /// next commit's, with the rest of the self-healing.
+    fn live<H: ControlledHandler>(&mut self, handler: &mut H, fragment_limit: usize) -> usize {
+        let Some(registration_id) = self.live_subscription else {
+            return 0;
+        };
+
         let Some(driver) = self.client.client_mut() else {
             return 0;
         };
 
-        let fragments =
-            driver.poll_subscription_controlled(registration_id, fragment_limit, handler);
+        driver.poll_subscription_controlled(registration_id, fragment_limit, handler)
+    }
 
-        self.position = image_position;
+    /// `set_live_image_deadline` (`:779-784`).
+    fn set_live_image_deadline(&mut self) {
+        self.live_image_deadline = Some(Instant::now() + self.message_timeout);
+        self.live_image_deadline_breached = false;
+    }
 
-        fragments
+    /// Whether that deadline has passed.
+    fn live_image_deadline_passed(&self) -> bool {
+        self.live_image_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// `on_live_image_deadline_breached` (`:786-798`): a **non-terminal** error,
+    /// reported **once** — the latch is what stops a subscription that is
+    /// waiting for an image from saying so on every turn.
+    fn on_live_image_deadline_breached(&mut self) {
+        self.live_image_deadline_breached = true;
+
+        self.listener_on_error(&SubscriptionError::Descriptor(
+            "No image became available on the live subscription within the message timeout."
+                .to_owned(),
+        ));
+    }
+
+    /// `on_live_joined` (`:921-935`): count it, and tell the application.
+    fn on_live_joined(&mut self) {
+        if let Some(driver) = self.client.client_mut() {
+            if let Some(counters) = driver.counters_writable() {
+                self.counters.note_live_joined(&counters);
+            }
+        }
+
+        if let Some(listener) = self.listener.as_mut() {
+            listener.on_live_joined();
+        }
+    }
+
+    /// The application's listener, told about something that is not terminal.
+    fn listener_on_error(&mut self, error: &SubscriptionError) {
+        if let Some(listener) = self.listener.as_mut() {
+            listener.on_error(error);
+        }
     }
 
     /// `transition` (`:72-86`): the state, the counter, and the one side effect
@@ -1089,6 +1552,63 @@ impl PersistentSubscription {
             Some(driver) => driver.next_correlation_id(),
             None => Err(CommandError::Encoding),
         }
+    }
+}
+
+/// The **live** side of the alignment (`live_catchup_fragment_handler`,
+/// `:2002-2017`): read the live image until a message past where the replay has
+/// got to, and leave that one unconsumed.
+///
+/// The `ABORT` is the whole of it. The reference's note is worth keeping: this
+/// handler does **not** deliver anything to the application — what it is looking
+/// for is a position, not a message, and a live message delivered here would be
+/// a message delivered twice.
+struct LiveCatchup {
+    /// Where the replay has read to.
+    replay_position: i64,
+    /// The first live position past it, if this poll found one.
+    found: Option<i64>,
+}
+
+impl ControlledHandler for LiveCatchup {
+    fn on_message(&mut self, message: Message<'_>) -> Action {
+        if message.header.position <= self.replay_position {
+            return Action::Continue;
+        }
+
+        self.found = Some(message.header.position);
+
+        Action::Abort
+    }
+}
+
+/// The **replay** side of the alignment
+/// (`replay_catchup_controlled_fragment_handler`, `:2019-2037`): deliver what is
+/// before the switch point, and stop at it.
+struct ReplayCatchup<'a, H> {
+    /// The live position the switch happens at, or [`NULL_VALUE`] when the live
+    /// side has not found one yet — in which case this is an ordinary replay
+    /// poll.
+    next_live_position: i64,
+    /// Whether the message at that position arrived, which is what the caller
+    /// turns into the switch.
+    arrived: bool,
+    /// The application's own handler, which everything before the switch goes
+    /// to.
+    handler: &'a mut H,
+}
+
+impl<H: ControlledHandler> ControlledHandler for ReplayCatchup<'_, H> {
+    fn on_message(&mut self, message: Message<'_>) -> Action {
+        if NULL_VALUE != self.next_live_position
+            && message.header.position == self.next_live_position
+        {
+            self.arrived = true;
+
+            return Action::Abort;
+        }
+
+        self.handler.on_message(message)
     }
 }
 
