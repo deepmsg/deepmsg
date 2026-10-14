@@ -42,6 +42,46 @@ impl Default for PortSettings {
     }
 }
 
+impl PortSettings {
+    /// Ask `port` for the checksum offloads this build reads back — the ones
+    /// [`PortInfo::can_judge_ipv4_checksum`] and
+    /// [`PortInfo::can_judge_udp_checksum`] answer about — and leave every
+    /// other setting as it is.
+    ///
+    /// What a port *can* do and what it *does* are the same thing only because
+    /// a caller asks: `rte_eth_dev_configure` refuses a bit the device does not
+    /// have rather than ignoring it, so the bits come from the port's own
+    /// capabilities and nothing else is asked for. A port with neither — every
+    /// virtual device this build's tests run on — is asked for nothing, and its
+    /// settings come back unchanged.
+    #[must_use = "the settings it builds are the ones to start the port with"]
+    pub fn asking_for_checksum_offloads(mut self, port: &PortInfo) -> Self {
+        let (ipv4, udp) = checksum_offload_bits();
+
+        if port.can_judge_ipv4_checksum() {
+            self.rx_offloads |= ipv4;
+        }
+        if port.can_judge_udp_checksum() {
+            self.rx_offloads |= udp;
+        }
+
+        self
+    }
+}
+
+/// The two receive offloads this build asks about, as the bits DPDK numbers
+/// them by.
+fn checksum_offload_bits() -> (u64, u64) {
+    // SAFETY: header constants, wrapped as functions by the shim (`shim.c`);
+    // they read nothing and cannot fail.
+    unsafe {
+        (
+            sys::shim_rx_offload_ipv4_checksum(),
+            sys::shim_rx_offload_udp_checksum(),
+        )
+    }
+}
+
 /// What a port says it is, read once when it is started.
 #[derive(Clone, Debug)]
 pub struct PortInfo {
@@ -70,18 +110,15 @@ impl PortInfo {
     /// what it *can* do. The two are the same value for a caller that asks for
     /// what it reads back, which is what the driver does.
     pub fn can_judge_ipv4_checksum(&self) -> bool {
-        // SAFETY: the offload's bit, wrapped as a function by the shim: it
-        // reads nothing and cannot fail.
-        let bit = unsafe { sys::shim_rx_offload_ipv4_checksum() };
-        self.rx_offloads & bit != 0
+        let (ipv4, _) = checksum_offload_bits();
+        self.rx_offloads & ipv4 != 0
     }
 
     /// Whether it judges the UDP checksum; see
     /// [`can_judge_ipv4_checksum`](Self::can_judge_ipv4_checksum).
     pub fn can_judge_udp_checksum(&self) -> bool {
-        // SAFETY: as above.
-        let bit = unsafe { sys::shim_rx_offload_udp_checksum() };
-        self.rx_offloads & bit != 0
+        let (_, udp) = checksum_offload_bits();
+        self.rx_offloads & udp != 0
     }
 }
 
@@ -542,4 +579,81 @@ fn info_of(id: u16) -> Result<PortInfo, Error> {
         rx_offloads: raw.rx_offloads,
         tx_offloads: raw.tx_offloads,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port's description, for the cases below that ask it something without
+    /// an EAL to make a real one.
+    fn described(rx_offloads: u64) -> PortInfo {
+        PortInfo {
+            name: "a-port".to_owned(),
+            driver: "a-pmd".to_owned(),
+            max_rx_queues: 4,
+            max_tx_queues: 4,
+            min_mtu: 68,
+            max_mtu: 1500,
+            socket_id: None,
+            rx_offloads,
+            tx_offloads: 0,
+        }
+    }
+
+    /// What a port is asked for is exactly what it can judge.
+    ///
+    /// The asymmetry matters: `rte_eth_dev_configure` refuses a bit the device
+    /// does not have rather than ignoring it, so a caller that asked for both
+    /// regardless would fail to *start* on every virtual device this build
+    /// tests on — and a caller that asked for neither would leave a real NIC's
+    /// checksum hardware idle, which is the whole of what an offload buys.
+    #[test]
+    fn a_port_is_asked_for_the_checksums_it_can_judge() {
+        let (ipv4, udp) = checksum_offload_bits();
+        assert_ne!(ipv4, udp, "the two offloads are two bits, not one");
+
+        assert_eq!(
+            0,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(0))
+                .rx_offloads,
+            "a port that judges nothing is asked for nothing"
+        );
+        assert_eq!(
+            ipv4 | udp,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(ipv4 | udp))
+                .rx_offloads
+        );
+        assert_eq!(
+            ipv4,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(ipv4))
+                .rx_offloads,
+            "and only the half of it the port has"
+        );
+
+        assert!(described(ipv4).can_judge_ipv4_checksum());
+        assert!(
+            !described(ipv4).can_judge_udp_checksum(),
+            "one bit set is not both offloads"
+        );
+    }
+
+    /// Asking is not a rewrite: an offload the caller set for its own reasons
+    /// survives, because this adds to the settings rather than replacing them.
+    #[test]
+    fn asking_leaves_the_other_offloads_alone() {
+        let (ipv4, _) = checksum_offload_bits();
+        let other = 1u64; // whatever bit a caller set for itself
+
+        let asked = PortSettings {
+            rx_offloads: other,
+            ..PortSettings::default()
+        }
+        .asking_for_checksum_offloads(&described(ipv4));
+
+        assert_eq!(other | ipv4, asked.rx_offloads);
+    }
 }
