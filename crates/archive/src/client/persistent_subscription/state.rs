@@ -2157,15 +2157,25 @@ impl PersistentSubscription {
 
     /// `clean_up_live_subscription` (`:747-777`): give the live subscription
     /// back to the driver, whichever way it was asked for.
+    ///
+    /// **Whichever way** is the part that is easy to get wrong: an add the driver
+    /// has not answered yet is *cancelled*, and one that arrived is *removed*.
+    /// Dropping the id of an add still in flight would leave the driver to make
+    /// a subscription this machine no longer knows about — a leak with no name
+    /// on it, and one nothing ever polls. The reference cancels
+    /// (`aeron_async_add_subscription_cancel`, `:747-760`), and so does this,
+    /// through the same call [`Self::clean_up_request_publication`] uses.
     fn clean_up_live_subscription(&mut self) {
-        let Some(registration_id) = self.live_subscription.take() else {
-            self.live_subscription_add = None;
+        if let Some(registration_id) = self.live_subscription_add.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.async_add_cancel(AsyncAdd::subscription(registration_id));
+            }
+        }
 
-            return;
-        };
-
-        if let Some(driver) = self.client.client_mut() {
-            let _ = driver.remove_subscription(registration_id, COMMAND_TIMEOUT);
+        if let Some(registration_id) = self.live_subscription.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.remove_subscription(registration_id, COMMAND_TIMEOUT);
+            }
         }
     }
 
@@ -2235,16 +2245,20 @@ impl PersistentSubscription {
     }
 
     /// `clean_up_replay_subscription` (`:725-745`): give the subscription back
-    /// to the driver, whichever way it was asked for.
+    /// to the driver, whichever way it was asked for — a pending add cancelled,
+    /// one that arrived removed. See [`Self::clean_up_live_subscription`] for
+    /// why the difference is worth the branch.
     fn clean_up_replay_subscription(&mut self) {
-        let Some(registration_id) = self.replay_subscription.take() else {
-            self.replay_subscription_add = None;
+        if let Some(registration_id) = self.replay_subscription_add.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.async_add_cancel(AsyncAdd::subscription(registration_id));
+            }
+        }
 
-            return;
-        };
-
-        if let Some(driver) = self.client.client_mut() {
-            let _ = driver.remove_subscription(registration_id, COMMAND_TIMEOUT);
+        if let Some(registration_id) = self.replay_subscription.take() {
+            if let Some(driver) = self.client.client_mut() {
+                let _ = driver.remove_subscription(registration_id, COMMAND_TIMEOUT);
+            }
         }
     }
 

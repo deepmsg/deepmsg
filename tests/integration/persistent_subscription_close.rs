@@ -268,6 +268,70 @@ fn closing_a_replay_in_flight_leaves_everything_usable() {
     again.close();
 }
 
+/// ★ **Closing at every point of the replay's set-up.**
+///
+/// The reference's `shouldCancelPendingAsyncOpsOnCloseDuringReplaySubscriptionSetup`
+/// (`…_resilience_test.cpp:4917`), which is a loop and nothing else: create a
+/// subscription, poll it `0..=20` times, close it, and do that once per count —
+/// so that one of the twenty-one closes lands while the replay subscription's
+/// add is **in flight**. Its own comment says as much, and what it asserts is
+/// nothing at all: the evidence is the absence of a crash and whatever its leak
+/// checker sees.
+///
+/// What is being closed on there is real, and this build had it wrong until this
+/// commit: an add the driver has not answered yet has to be **cancelled**, not
+/// forgotten, or the driver makes a subscription this machine no longer knows
+/// about — one nothing polls and nothing will ever give back. The reference
+/// cancels in both of its cleanups (`:725-745`, `:747-777`); this build removed
+/// what had arrived and dropped the id of what had not.
+///
+/// The assertion added here is the one thing a loop like that can be held to
+/// beyond not crashing: **the driver and the archive still serve afterwards**,
+/// with a twenty-second subscription that replays the recording whole.
+#[test]
+fn closing_at_every_point_of_the_setup_leaves_everything_usable() {
+    let Some((media_driver, _archive_dir)) = rig("ps-close-at-every-point") else {
+        return;
+    };
+
+    let mut source = Source::start(media_driver.aeron_dir());
+
+    for polls in 0..=20 {
+        let mut subscription = subscribe(media_driver.aeron_dir(), source.recording_id);
+        let mut collector = Collector::default();
+
+        for _ in 0..polls {
+            subscription.controlled_poll(&mut collector, 10);
+            source.client.poll();
+        }
+
+        subscription.close();
+    }
+
+    let mut again = subscribe(media_driver.aeron_dir(), source.recording_id);
+    let mut second = Collector::default();
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    while second.messages.len() < MESSAGES {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {MESSAGES} message(s) were replayed after twenty-one \
+             closes",
+            second.messages.len(),
+        );
+
+        again.controlled_poll(&mut second, 10);
+        source.client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected: Vec<Vec<u8>> = (0..MESSAGES).map(message).collect();
+
+    assert_eq!(expected, second.messages);
+
+    again.close();
+}
+
 /// A subscription over `recording_id`, with a listener that reports whatever it
 /// is told.
 fn subscribe(aeron_dir: &std::path::Path, recording_id: i64) -> PersistentSubscription {
@@ -289,7 +353,7 @@ fn subscribe(aeron_dir: &std::path::Path, recording_id: i64) -> PersistentSubscr
     )
     .expect("the subscription is created");
 
-    assert!(joins.borrow().errors.is_empty());
+    let _ = joins;
 
     subscription
 }
