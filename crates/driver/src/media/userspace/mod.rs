@@ -24,7 +24,9 @@
 //!   frame.rs      Ethernet II / IPv4 / UDP / ICMP echo / ARP, as bytes
 //!   packet_io.rs  what a port is: rx_burst, tx_burst, and what a kept frame is
 //!   fake_port.rs  a port over a wire of VecDeques, and the wire's own knobs
+//!   eal.rs        what the EAL is started with, and the CPUs it may use
 //!   dpdk_port.rs  the same port over a DPDK queue pair, when the build has it
+//!   dpdk.rs       the media: EAL, pool and port, in the order they open
 //!   ports.rs      (ip, port) → the transport that bound it
 //!   neighbour.rs  next hop → MAC
 //!   arp.rs        requests, replies, gleaning, ageing
@@ -41,9 +43,14 @@
 
 pub mod arp;
 pub mod demux;
+/// The media itself — the EAL, the pool, the port — for the build that has it.
+#[cfg(feature = "dpdk")]
+pub mod dpdk;
 /// The port over a DPDK queue pair: the build that has the media at all.
 #[cfg(feature = "dpdk")]
 pub mod dpdk_port;
+/// What the EAL is started with, which needs no DPDK to say.
+pub mod eal;
 pub mod fake_port;
 pub mod frame;
 pub mod neighbour;
