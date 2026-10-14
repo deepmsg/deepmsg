@@ -326,6 +326,13 @@ path = "integration/persistent_subscription_replay.rs"
 name = "persistent_subscription_counters"
 path = "integration/persistent_subscription_counters.rs"
 
+# P2-C4's alignment, at last: the replay slowed by injected loss while the live
+# stream runs ahead, so `ATTEMPT_SWITCH` has to align two positions that do not
+# agree. Needs our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_loss"
+path = "integration/persistent_subscription_loss.rs"
+
 # P2-C4's receive-side loss injection: the driver's own `debug.receive.data.loss`
 # rules, judged by what a subscriber is and is not handed. Needs our driver
 # binary, so it runs in CI.
