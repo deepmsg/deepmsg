@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
-use deepmsg_cnc::{CncFile, CounterRegions};
+use deepmsg_cnc::CncFile;
 use deepmsg_driver::system_counters::id;
 
 /// The two ends of the pair, named by whoever made it.
@@ -102,7 +102,10 @@ impl Driver {
             ))
             .arg("-Ddeepmsg.dpdk.port=net_af_packet0")
             .arg(format!("-Ddeepmsg.dpdk.ipv4.address={address}"))
-            .stdout(Stdio::null())
+            // Both streams kept: the media's own line ("dpdk media on …") goes
+            // to stdout and a refusal to stderr, and a case that fails without
+            // either is a case nobody can read.
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("the driver binary is built alongside this test");
@@ -132,26 +135,58 @@ impl Driver {
 
             if !self.is_running() {
                 let dir = self.dir.display().to_string();
+                let stderr = self.stderr();
+                let stdout = self.stdout();
                 panic!(
-                    "the driver in {dir} exited before publishing a CnC file; its stderr was:\n{}",
-                    self.stderr()
+                    "the driver in {dir} exited before publishing a CnC file;\n\
+                     stdout:\n{stdout}\nstderr:\n{stderr}"
                 );
             }
 
             if Instant::now() >= deadline {
                 let dir = self.dir.display().to_string();
+                // Stopped first: this branch is reached with the driver still
+                // running, and reading a pipe whose writer is alive waits for a
+                // write that is never coming — a case that should fail after
+                // `READY_TIMEOUT` would instead sit there until the harness
+                // killed it.
+                self.stop();
+                let stderr = self.stderr();
+                let stdout = self.stdout();
                 panic!(
-                    "no CnC file for pid {pid} in {dir} within {READY_TIMEOUT:?}; its stderr \
-                     so far:\n{}",
-                    self.stderr(),
+                    "no CnC file for pid {pid} in {dir} within {READY_TIMEOUT:?};\n\
+                     stdout:\n{stdout}\nstderr:\n{stderr}"
                 );
             }
             std::thread::sleep(Duration::from_millis(16));
         }
     }
 
+    /// Stop the driver, so that its output can be read.
+    ///
+    /// A pipe stays open while its writer lives, so `stdout()`/`stderr()`
+    /// **block** until the process is gone — which is worth knowing before
+    /// calling them on a driver that is still running, and is what made this
+    /// case hang instead of fail the first time it was written.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Everything the driver has written to stdout, which is where a healthy
+    /// start says which port it is on.
+    fn stdout(&mut self) -> String {
+        use std::io::Read as _;
+
+        let mut out = String::new();
+        if let Some(mut stdout) = self.child.stdout.take() {
+            let _ = stdout.read_to_string(&mut out);
+        }
+        out
     }
 
     /// Everything the driver has written to stderr, once it has exited.
@@ -195,10 +230,15 @@ impl Drop for TempDir {
 }
 
 /// One driver's counter, read the way a client reads it.
+///
+/// Through [`CncFile::counters`] and not [`CncFile::counter_regions`]: the two
+/// are the same bytes at two access levels, and the second is the **writer's**
+/// pair — it is built from writable windows and answers `None` on the
+/// read-only mapping [`CncFile::try_open`] makes, which is the one this case
+/// holds. A counter is read, not allocated, here.
 fn counter(cnc: &CncFile, counter_id: i32) -> i64 {
-    let regions: CounterRegions<'_> = cnc.counter_regions().expect("a mapped CnC file");
-    regions
-        .reader()
+    cnc.counters()
+        .expect("a mapped CnC file")
         .value(counter_id)
         .unwrap_or_else(|| panic!("counter {counter_id} is allocated"))
 }
@@ -250,11 +290,15 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
     // shared loop to order them in.
     let bound = Arc::new(AtomicBool::new(false));
     let received = Arc::new(AtomicBool::new(false));
+    let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let subscriber = {
         let dir = bob_dir.0.clone();
         let bound = Arc::clone(&bound);
         let received = Arc::clone(&received);
+        let messages = Arc::clone(&messages);
+        let first = Arc::clone(&first);
 
         std::thread::spawn(move || {
             let mut client = Client::connect(&dir).expect("a client for the second driver");
@@ -265,7 +309,24 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
 
             let deadline = Instant::now() + TIMEOUT;
             while Instant::now() < deadline && !received.load(Ordering::Acquire) {
+                // One duty cycle before the read, and it is not a formality:
+                // `ON_AVAILABLE_IMAGE` is what puts the image on the
+                // subscription, and it arrives on the same to-clients ring the
+                // driver's ready responses do. A loop that only calls
+                // `poll_subscription` never takes it off, and a subscription
+                // with no images polls nothing however healthy the driver is —
+                // which is exactly how this case failed before it was written
+                // down here (`userspace_two_drivers.rs` polls the same way).
+                client.poll();
+
                 let _ = client.poll_subscription(subscription, 10, |message| {
+                    messages.fetch_add(1, Ordering::Relaxed);
+
+                    let mut first = first.lock().expect("the first message");
+                    if first.is_empty() {
+                        *first = message.payload.to_vec();
+                    }
+
                     if message.payload == PAYLOAD {
                         received.store(true, Ordering::Release);
                     }
@@ -297,6 +358,10 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
     let mut offered = false;
     while Instant::now() < deadline && !received.load(Ordering::Acquire) {
         offered |= alice_client.offer(publication, PAYLOAD).is_some();
+        // The publisher's duty cycle too: `offer` writes into the term buffer
+        // either way, but everything the publisher is *told* — its connection
+        // state, an unavailable image — comes off the same ring.
+        alice_client.poll();
         std::thread::sleep(Duration::from_millis(5));
     }
 
@@ -306,13 +371,28 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
     // thread's, and the thread goes when the test process does.
     drop(subscriber);
 
+    // What the subscriber saw, before the assertions judge it: a case that
+    // fails with "no message" and no count says nothing about whether the
+    // frames arrived at all.
+    let seen = messages.load(Ordering::Relaxed);
+    let first_payload = first.lock().expect("the first message").clone();
     assert!(offered, "the publication was offered at least once");
-    assert!(
-        received.load(Ordering::Acquire),
-        "the message did not cross between the two drivers; the first driver's \
-         stderr was:\n{}",
-        alice.stderr()
-    );
+    if !received.load(Ordering::Acquire) {
+        alice.stop();
+        bob.stop();
+
+        let alice_err = alice.stderr();
+        let alice_out = alice.stdout();
+        let bob_err = bob.stderr();
+        let bob_out = bob.stdout();
+        panic!(
+            "the message did not cross between the two drivers.\n\
+             === the sender: stdout\n{alice_out}\n=== the sender: stderr\n{alice_err}\n\
+             === the receiver: stdout\n{bob_out}\n=== the receiver: stderr\n{bob_err}\n\
+             the subscriber's callback saw {seen} messages, the first of them {:?}",
+            String::from_utf8_lossy(&first_payload)
+        );
+    }
 
     // What the two drivers published about the frames, which is what says the
     // media moved them rather than the message arriving by some other route:
