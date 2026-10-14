@@ -434,17 +434,17 @@ impl SendChannelEndpoints {
         // destination it cannot reach are the same answer whether the channel
         // is new or one somebody else already opened.
         //
-        // The channel's own local side is what the first question is asked
-        // with, and the port is not yet assigned to it — which is the port
-        // manager's business and not the media's: what decides which media
-        // carries the channel is the address, and that is already resolved.
+        // The channel's own local side is what both questions are asked with,
+        // and the port is not yet assigned to it — which is the port manager's
+        // business and not the media's: what decides which media carries the
+        // channel is the address, and that is already resolved.
         let connect_to = (channel.has_explicit_endpoint
             && !channel.is_multi_destination()
             && self.connect_enabled)
             .then_some(channel.remote_data);
 
         self.transport_bindings
-            .refuse_mtu_over_what_it_can_carry(mtu_length)
+            .refuse_mtu_over_what_it_can_carry(channel.local_control, connect_to, mtu_length)
             .map_err(EndpointError::ChannelValidation)?;
 
         self.transport_bindings

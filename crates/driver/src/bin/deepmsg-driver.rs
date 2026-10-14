@@ -255,6 +255,19 @@ fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
             );
 
             config.transport_bindings = TransportBindings::Userspace(stack);
+
+            // Also stdout, and for the same reason: an idle strategy that
+            // sleeps is a legitimate configuration (§4.12 refuses nothing),
+            // and what this warns about is a counter climbing on a driver that
+            // is otherwise healthy — the kind of line the operator who chose
+            // the strategy is the one who needs.
+            if let Some(warning) = config
+                .transport_bindings
+                .idle_warning(&config.sender_idle, &config.receiver_idle)
+            {
+                println!("deepmsg-driver: WARNING: {warning}");
+            }
+
             Ok(true)
         }
 

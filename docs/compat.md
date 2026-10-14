@@ -417,29 +417,106 @@ another name for allow, by
 which starts this driver with each spelling and sends it the harness's own
 `TERMINATE_DRIVER`.
 
-**The two transport bindings settings are read, and serve the one name the
-reference's table holds.** `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` picks
-the implementation the UDP data paths run on, and
+**The two transport bindings settings are read, and serve the names this build
+compiles in.** `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` picks the
+implementation the UDP data paths run on, and
 `AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` the one the conductor's
 name resolver runs on (`aeronmd.h:731,736`; `aeron_driver_context.c:1258-1270`).
 Both are environment-only in the reference, and both resolve against a table it
-compiles in with one entry — `default`, whose symbol is
+compiles in — `default`, whose symbol is
 `aeron_udp_channel_transport_bindings_default`
 (`media/aeron_udp_channel_transport_bindings.c:59-66`) — under either spelling
 (`aeron-client/src/main/c/util/aeron_symbol_table.c:48-49`). A name the table
 misses is `dlsym`ed (`:80-86`), which is how a bindings object linked into the
 same executable is found, and when that misses too the context init fails
-(`:88-92`). This build serves both spellings of `default` and refuses every
-other name with `ConfigError::UnknownTransportBindings`: the table is the same,
-the `dlsym` is the part ADR-0002 rules out. Until this was bound, both names
-were ignored — which made a driver asked for a media it does not have run on the
-kernel's sockets without saying so. Pinned by
+(`:88-92`). This build serves both spellings of `default` — and one more name,
+which the next paragraph places — and refuses anything else with
+`ConfigError::UnknownTransportBindings`: the table is what is compiled in, the
+`dlsym` is the part ADR-0002 rules out.
+
+**`dpdk` is a second name in that table, and a build without the media is a
+different refusal from a name that is not there.** The media selection also
+reads `dpdk`, which is what a build with the `dpdk` feature runs its data paths
+on (ADR-0006); the same name in a build **without** the feature is
+`ConfigError::DpdkNotInThisBuild`, whose message says the feature is missing
+rather than sending a reader looking for a typo in a name the build does hold.
+Both are "the driver does not start", which is the reference's own answer to a
+bindings name it does not hold — but only one of them is somebody's mistake.
+The conductor's twin is `default` and nothing else: the media's own name
+resolution is not the conductor's, so a `dpdk` there is unknown however the
+build was made. Until this was bound, both names were ignored — which made a
+driver asked for a media it does not have run on the kernel's sockets without
+saying so. Pinned by
 `crates/driver/src/config.rs::the_transport_bindings_names_serve_default_and_refuse_the_rest`
 and, in the process, by
 `tests/integration/driver_process_contract.rs::every_variable_the_reference_harness_can_send_is_accepted`
 (`default`, both spellings) and
 `::the_settings_that_name_code_stop_the_driver_with_a_reason` (a name outside
 the table).
+
+## The DPDK media
+
+The reference's DPDK media is Premium and closed (ADR-0006), so what asking for
+`dpdk` means cannot be diffed against it; the counter labels and the ARP policy
+are this repo's own for the same reason. Three differences are load-bearing
+enough to write down, and all three are departures from the reference's
+*behaviour* rather than from its bytes.
+
+**A channel runs on the media that holds its local side, and falls back to the
+kernel when that is not the DPDK port.** The reference has one media, so no
+channel ever had to be assigned to one; this build has two, and the key is the
+address an endpoint is about to **bind** — a receive endpoint's `endpoint=`, a
+send endpoint's `interface=` — matched against the port's own address and
+prefix. A named address the port holds (10.10.0.2 on a port holding
+10.10.0.1/24) is the media's, and there is **no** fallback from it: a channel
+that named the media's address is one the media must serve, and one it cannot
+is a failure rather than a silent move to a socket with no such address. A
+named address it does **not** hold is the kernel's, because the kernel is the
+thing that holds it. And a channel with no local address at all — every
+publication, whose send endpoint binds the wildcard (the module note in
+`crates/driver/src/udp_channel.rs`) — is the media's **unless its peer is an
+address the kernel holds**, loopback or another interface's, which only the
+kernel can reach. That last case is the one the design's own rule ("the key is
+the local side, not the peer", §3.2) leaves open, and it is deliberate: without
+it every publication in the reference's system tests and this build's interop
+suite — all of which name `localhost` — would land on a media that cannot reach
+it. Pinned by
+`crates/driver/src/media/bindings.rs::a_channels_local_side_decides_which_media_carries_it`,
+`::the_kernels_bindings_carry_every_channel`,
+`::the_kernel_holds_loopback_and_not_a_reserved_address` and
+`::a_unicast_channel_is_served_by_both_media`, and end to end by
+`crates/driver/tests/dpdk_two_drivers.rs::a_message_crosses_between_two_drivers_on_a_dpdk_port`.
+
+**A DPDK build refuses the channels that media cannot serve, rather than
+binding them and delivering nothing.** The reference serves a group address and
+an IPv6 peer on the kernel, and a build without the media still does — but a
+driver **configured for** the media refuses both wherever the channel is read,
+including the ones a fallback would otherwise have handed to the kernel: the
+support surface is the media's, not the address's (Q1b, §4.11). The list is: **a
+group address**, which would need IGMP reports and a group filter on the port
+and would otherwise be bound as if it were one of the port's own addresses — a
+subscription that looks connected and never delivers a byte; **IPv6**, which
+would need NDP; an **`mtu=` larger than the port can carry**, because this stack
+does not fragment, and a truncated frame is a message the receiver reassembles
+into something else; and **a destination off the port's link with no gateway**,
+which the reference answers with `ENETUNREACH` from the route and this build
+answers at the channel so that a client is not handed a publication that fails
+every send. All four reach a client as `ON_ERROR` with `ERROR_CODE_NOT_SUPPORTED`
+and the message as its text, the shape the timestamp parameters are already
+refused in. The multicast half is the one with a cost written down: the
+reference's system tests that name `224.x`/`239.x` are red under a DPDK build,
+which is why the compatibility promise for that build is the **non-multicast
+subset** and why its known-red list is a file rather than a claim (ADR-0006).
+Pinned by
+`crates/driver/src/media/bindings.rs::a_group_address_is_refused_by_the_media_that_has_no_groups`,
+`::an_ipv6_channel_is_refused_by_the_media_that_has_no_ndp`,
+`::a_frame_larger_than_the_port_can_carry_is_refused` and
+`::a_destination_off_the_link_with_no_gateway_is_refused`.
+
+**The media's own parameters are this repo's names** (Q2): the channel's media
+selection keeps the reference's setting name, and everything the media itself
+is configured with does not, because the reference's names for them are not
+visible. `## Configuration names` below has the row.
 
 ## The event log
 
@@ -919,3 +996,32 @@ near `INT64_MAX` turns into a wrapped deadline — a driver that looks healthy a
 spins a core. deepmsg computes its deadlines with saturating arithmetic *and*
 refuses the value, because a tier period above an hour is a typo rather than a
 configuration.
+
+`deepmsg.dpdk.*` — and its environment spelling `DEEPMSG_DPDK_*` — is the one
+group of settings that is **not** the reference's, and the only one where the
+prefix is a different prefix rather than the same name under both. The
+reference's DPDK media is Premium and closed (ADR-0006), so its names for the
+port, the address, the gateway, the neighbours, the descriptors and the ARP
+timers are not visible to be matched, and inventing names that might collide
+with Premium's would be worse than owning them. They are derived from one
+property name — `deepmsg.dpdk.rx.descriptors` and `DEEPMSG_DPDK_RX_DESCRIPTORS`
+— and read through the same chain every other setting is read through
+(`crates/driver/src/config.rs::lookup`), so the two spellings of the prefix are
+also the two spellings of the environment variable. The media **selection** is
+not in this group: it
+keeps the reference's setting name, because it is the reference's setting and
+the two builds should be asked for a media the same way. A configuration
+migrated from Premium's DPDK support is therefore read as settings this driver
+has never heard of, which are ignored by design, and the driver runs on the
+kernel without saying so — the price of owning the names, and the reason the
+media's start line names the port and the address it bound. Pinned by
+`crates/driver/src/config.rs::the_dpdk_settings_come_from_their_own_names`.
+
+Two of those settings are refused rather than served, and both are about
+keeping the driver's own arithmetic authoritative: an EAL argument this driver
+sets itself (or one that would move the media onto CPUs of the caller's
+choosing — `-l`, `-c`, `--lcores`, `--main-lcore`) is
+`ConfigError::DpdkEalArgument`, because either one silently changes which cores
+the port runs on and only the driver's cpuset arithmetic knows what it is
+allowed to use (ADR-0006). Refusing beats merging: an argument merged in is a
+port running somewhere nobody chose.

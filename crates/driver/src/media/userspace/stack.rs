@@ -130,6 +130,16 @@ pub struct StackParams {
     pub arp_interval: Duration,
     /// How long an ARP entry stays good without being refreshed.
     pub arp_timeout: Duration,
+    /// Next hops that were configured rather than learned
+    /// (`deepmsg.dpdk.static.neighbours`): address and MAC, each of which
+    /// never ages out.
+    ///
+    /// A deployment whose peers are known does not have to pay for the ARP
+    /// exchange that finds them, and a peer that never answers an ARP request
+    /// is still reachable when its MAC is written down. Configuration rather
+    /// than a call after the fact, so that every stack built from these
+    /// parameters — including a fake wire's — starts with the same table.
+    pub static_neighbours: Vec<(Ipv4Addr, [u8; 6])>,
 }
 
 impl StackParams {
@@ -146,6 +156,7 @@ impl StackParams {
             ephemeral_ports: EPHEMERAL_PORTS,
             arp_interval: Duration::from_secs(1),
             arp_timeout: Duration::from_secs(300),
+            static_neighbours: Vec::new(),
         }
     }
 
@@ -493,8 +504,16 @@ impl Stack {
         device: Option<DeviceParts>,
     ) -> Arc<Self> {
         let capacity = params.ring_capacity();
-        let neighbours =
+        let mut neighbours =
             NeighbourTable::new(NEIGHBOUR_CAPACITY, params.arp_timeout, params.arp_interval);
+
+        // The configured next hops, before the stack exists to ask for them: a
+        // fixed entry is one no ARP request is ever sent for, and one nothing
+        // learned off the wire overwrites ([`NeighbourTable::learn`]) — what
+        // was configured is what is used.
+        for (address, hardware) in &params.static_neighbours {
+            neighbours.insert_fixed(*address, *hardware);
+        }
 
         // Under a mode with one transmit queue, one `Arc` goes into both slots:
         // the two roles share the port, and the lock is what serialises them.
@@ -973,6 +992,48 @@ mod tests {
 
     fn far_end(wire: &Wire) -> FakePort {
         wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500)
+    }
+
+    /// A next hop that was configured is in the table before the stack has
+    /// seen a frame, and stays what it was configured as.
+    ///
+    /// What this buys is the ARP exchange a deployment with known peers does
+    /// not have to pay for, and a peer whose answer never comes. The second
+    /// assertion is the half worth pinning: an entry that learning could
+    /// overwrite would be one the wire decides, which is the opposite of
+    /// configured.
+    #[test]
+    fn a_configured_next_hop_is_there_before_a_frame_is() {
+        let wire = Wire::new();
+        let configured = Ipv4Addr::new(10, 10, 0, 9);
+        let hardware = [0x02, 0, 0, 0, 0, 0x09];
+        let stack = Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams {
+                static_neighbours: vec![(configured, hardware)],
+                ..params()
+            },
+            Clock::Monotonic,
+        );
+
+        assert_eq!(
+            NextHop::Known(hardware),
+            stack.neighbour(configured),
+            "no ARP request was needed, and none was sent"
+        );
+        assert_eq!(
+            NextHop::Unknown,
+            stack.neighbour(PEER),
+            "and nothing else came with it"
+        );
+
+        stack.learn(configured, [0x02, 0, 0, 0, 0, 0xee]);
+        assert_eq!(
+            NextHop::Known(hardware),
+            stack.neighbour(configured),
+            "what the wire says does not move what was configured"
+        );
     }
 
     /// The ring's capacity is a consequence of the window and the MTU, and it

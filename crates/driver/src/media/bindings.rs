@@ -13,9 +13,11 @@
 //!
 //! An `enum`, not a `dyn`: the set of bindings is fixed when the driver is
 //! compiled, and the data paths are where this build counts its indirect calls
-//! (the `lto = "fat"` note in the workspace's `Cargo.toml`). One variant today,
-//! the kernel's sockets, which is the only name the configuration serves
-//! (`crate::config`, `parse_transport_bindings`).
+//! (the `lto = "fat"` note in the workspace's `Cargo.toml`). Two variants: the
+//! kernel's sockets, which is what `default` names, and the userspace stack a
+//! build with the `dpdk` feature runs `dpdk` on (`crate::config`,
+//! `parse_media`). Which of the two a **channel** runs on is decided per
+//! channel, in [`TransportBindings::stack_for`].
 //!
 //! **The conductor's transports do not come through here.** The reference
 //! gives the conductor a bindings of its own
@@ -33,6 +35,8 @@ use super::udp_transport::{OpenError, UdpTransport};
 use super::userspace::stack::{Stack, ThreadQueues};
 use super::userspace::transport::UserspaceTransport;
 use super::{Transport, TransportParams};
+use crate::config::IdleStrategySetting;
+use crate::idle::Strategy;
 use crate::udp_channel::{UdpChannel, UdpChannelError};
 
 /// The bindings a driver's UDP data paths run on.
@@ -149,6 +153,19 @@ fn the_kernel_holds(address: Ipv4Addr) -> bool {
     .is_ok_and(|held| held.is_some())
 }
 
+/// Whether an agent configured with this strategy stays on its core.
+///
+/// Two of the reference's five do: `noop` returns at once and `spin` reads the
+/// CPU until it is told to stop. The other three (`yield`, `backoff`,
+/// `sleep-ns`) hand the core back, which is what a port this driver drives
+/// itself cannot afford — there is no interrupt to be woken by.
+fn keeps_the_cpu(setting: &IdleStrategySetting) -> bool {
+    matches!(
+        setting.strategy(),
+        Some(Strategy::Noop | Strategy::BusySpinning)
+    )
+}
+
 /// Which thread a transport or a poller will be used on
 /// (`aeron_udp_channel_transport_affinity_t`,
 /// `media/aeron_udp_channel_transport_bindings.h:26-32`).
@@ -238,12 +255,25 @@ impl TransportBindings {
     /// it either — so the fallback answers `Ok` and the kernel's own `EMSGSIZE`
     /// is what a publication that overshoots meets there.
     ///
+    /// **Asked of the media that would carry the channel and of no other**,
+    /// which is why the two addresses that decide that ([`Self::stack_for`])
+    /// are arguments: a channel whose local side is not on this port is the
+    /// kernel's, and the size its datagrams may have is the kernel's too.
+    /// Without that, a publication to a loopback endpoint with an `mtu=` the
+    /// port happens to be too small for would be refused with a reason about a
+    /// port it was never going to use.
+    ///
     /// # Errors
     ///
     /// The message a client reads, in the shape the reference's own MTU
     /// refusals use ([`crate::channel_validation`]).
-    pub fn refuse_mtu_over_what_it_can_carry(&self, mtu_length: usize) -> Result<(), String> {
-        let Self::Userspace(stack) = self else {
+    pub fn refuse_mtu_over_what_it_can_carry(
+        &self,
+        bind: SocketAddr,
+        peer: Option<SocketAddr>,
+        mtu_length: usize,
+    ) -> Result<(), String> {
+        let Some(stack) = self.stack_for(bind, peer) else {
             return Ok(());
         };
 
@@ -302,6 +332,52 @@ impl TransportBindings {
              ({}/{}) and no gateway is configured (ENETUNREACH)",
             stack.params().address,
             stack.params().prefix_length
+        ))
+    }
+
+    /// The line a driver on this media owes an operator when one of its two
+    /// network agents is configured to give up the CPU (design §4.12).
+    ///
+    /// A port this media drives has no interrupt to wake a thread with: a frame
+    /// that arrives while the receiver sleeps waits in the receive ring, and a
+    /// ring that fills drops what a sleeping thread was not there to take. So
+    /// an idle that is neither `noop` nor `spin` is a counter that will climb
+    /// for a reason nothing else in the driver reports — worth a line, not a
+    /// refusal, because the reference lets a caller choose its own strategy and
+    /// an idle is a legitimate thing to want on a quiet driver.
+    ///
+    /// **The conductor's idle is not asked about**: it drives no port, and the
+    /// native resource agent's is the sleeping one by design
+    /// ([`IdleStrategySetting::sleeping_default`]) — the two slots whose
+    /// defaults would make this fire on every start are the two that never
+    /// touch a queue.
+    ///
+    /// [`None`] for the kernel's bindings, whose sockets are woken by the
+    /// kernel, and for two strategies that keep the CPU.
+    pub fn idle_warning(
+        &self,
+        sender: &IdleStrategySetting,
+        receiver: &IdleStrategySetting,
+    ) -> Option<String> {
+        let Self::Userspace(_) = self else {
+            return None;
+        };
+
+        let sleeping = [("sender", sender), ("receiver", receiver)]
+            .into_iter()
+            .filter(|(_, setting)| !keeps_the_cpu(setting))
+            .map(|(agent, setting)| format!("the {agent}'s (`{}`)", setting.name))
+            .collect::<Vec<_>>();
+
+        if sleeping.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "{} on the dpdk media: a sleeping agent is not there to take the frames the \
+             port's receive ring is holding, and a ring that fills drops them — `noop` or \
+             `spin` is what a port this driver drives itself wants (§4.12)",
+            sleeping.join(" and ")
         ))
     }
 
@@ -588,25 +664,49 @@ mod tests {
             Clock::Monotonic,
         ));
 
-        assert_eq!(Ok(()), bindings.refuse_mtu_over_what_it_can_carry(1408));
+        // A publication to the port's own net, which is the media's to carry.
+        let ours = address("0.0.0.0:0");
+        let peer = address("10.10.0.2:40500");
+
         assert_eq!(
             Ok(()),
-            bindings.refuse_mtu_over_what_it_can_carry(1472),
+            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1408)
+        );
+        assert_eq!(
+            Ok(()),
+            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1472),
             "the largest one fits exactly"
         );
 
         let refusal = bindings
-            .refuse_mtu_over_what_it_can_carry(1473)
+            .refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1473)
             .expect_err("one byte over is over");
         assert!(
             refusal.contains("mtuLength=1473 > 1472") && refusal.contains("does not fragment"),
             "{refusal}"
         );
 
+        // A publication to loopback is the kernel's, and so is the size its
+        // datagrams may be: the port this media drives is not carrying it, and
+        // a reason about that port's MTU would be about the wrong thing.
         assert_eq!(
             Ok(()),
-            TransportBindings::Default.refuse_mtu_over_what_it_can_carry(usize::MAX),
-            "the kernel fragments, so it is not this driver's number to hold"
+            bindings.refuse_mtu_over_what_it_can_carry(
+                ours,
+                Some(address("127.0.0.1:40456")),
+                8192
+            ),
+            "the kernel fragments, and this channel never reaches the port"
+        );
+
+        assert_eq!(
+            Ok(()),
+            TransportBindings::Default.refuse_mtu_over_what_it_can_carry(
+                ours,
+                Some(peer),
+                usize::MAX
+            ),
+            "and the kernel's bindings are not asked at all"
         );
     }
 
@@ -759,5 +859,59 @@ mod tests {
 
         assert!(TransportBindings::Default.refuse_channel(&channel).is_ok());
         assert!(userspace().refuse_channel(&channel).is_ok());
+    }
+
+    fn idle(name: &str) -> IdleStrategySetting {
+        IdleStrategySetting {
+            name: name.to_owned(),
+            init_args: None,
+        }
+    }
+
+    /// A strategy that gives the CPU back is worth a line on the media that
+    /// cannot be woken by an interrupt — and only there.
+    ///
+    /// The three that sleep are the warning; `noop` and `spin` are not, which
+    /// is the half that would be missing if this were written the other way
+    /// round (a warning on every start is a warning nobody reads). The
+    /// kernel's bindings never warn, because their sockets are the kernel's to
+    /// wake.
+    #[test]
+    fn a_sleeping_agent_is_worth_a_line_on_the_media_that_cannot_wake_it() {
+        let userspace = userspace();
+
+        for name in ["yield", "backoff", "sleep-ns"] {
+            let warning = userspace
+                .idle_warning(&idle(name), &idle(name))
+                .unwrap_or_else(|| panic!("{name} hands the core back"));
+            assert!(
+                warning.contains("sender")
+                    && warning.contains("receiver")
+                    && warning.contains(name),
+                "the line names both agents and both strategies: {warning}"
+            );
+
+            assert_eq!(
+                None,
+                TransportBindings::Default.idle_warning(&idle(name), &idle(name)),
+                "the kernel's sockets are woken by the kernel"
+            );
+        }
+
+        for name in ["noop", "spin"] {
+            assert_eq!(
+                None,
+                userspace.idle_warning(&idle(name), &idle(name)),
+                "{name} stays on its core"
+            );
+        }
+
+        let one = userspace
+            .idle_warning(&idle("noop"), &idle("backoff"))
+            .expect("the receiver sleeps");
+        assert!(
+            one.contains("receiver") && !one.contains("sender"),
+            "only the agent that sleeps is named: {one}"
+        );
     }
 }

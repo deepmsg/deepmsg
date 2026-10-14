@@ -532,9 +532,10 @@ fn pool_frames(settings: &DpdkSettings, pairs: u16) -> u32 {
 /// terms come from, and the media's own MTU is the frame size the port carries
 /// ([`RxPort::mtu`]).
 ///
-/// **Static neighbours are not here yet**: `StackParams` has no field for them
-/// and the neighbour table has no seeding path, so `deepmsg.dpdk.static.
-/// neighbours` is read and unused until the slice that adds one.
+/// The static neighbours are the media's too, and they are **parameters**
+/// rather than a call after the stack is built: the table a stack starts with
+/// is part of what it was configured with, and a stack built from these
+/// parameters — a fake wire's included — seeds the same entries.
 fn stack_params(settings: &DpdkSettings, mac: [u8; 6]) -> Result<StackParams, DpdkError> {
     let (address, prefix_length) = settings.address.ok_or(DpdkError::Missing {
         setting: "deepmsg.dpdk.ipv4.address",
@@ -550,6 +551,7 @@ fn stack_params(settings: &DpdkSettings, mac: [u8; 6]) -> Result<StackParams, Dp
         ephemeral_ports: settings.ephemeral_ports.clone(),
         arp_interval: settings.arp_retry,
         arp_timeout: settings.arp_timeout,
+        static_neighbours: settings.static_neighbours.clone(),
     })
 }
 
@@ -697,5 +699,40 @@ mod tests {
 
         assert!(check_capability(&described(1), 1).is_ok());
         assert!(check_capability(&described(3), 3).is_ok());
+    }
+
+    /// The configured next hops travel with the stack's other settings, rather
+    /// than being inserted once the stack exists.
+    ///
+    /// Both halves are the point: the media reads
+    /// `deepmsg.dpdk.static.neighbours`, and what a stack is built from is the
+    /// same table ([`StackParams::static_neighbours`]) — so a stack gets them
+    /// however it is built, and a test of the seeding needs no EAL.
+    #[test]
+    fn the_static_neighbours_reach_the_stacks_parameters() {
+        let configured = vec![
+            (
+                std::net::Ipv4Addr::new(10, 10, 0, 2),
+                [0x02, 0, 0, 0, 0, 0x02],
+            ),
+            (
+                std::net::Ipv4Addr::new(10, 10, 0, 3),
+                [0x02, 0, 0, 0, 0, 0x03],
+            ),
+        ];
+        let settings = DpdkSettings {
+            static_neighbours: configured.clone(),
+            ..settings()
+        };
+
+        let params =
+            stack_params(&settings, [0x02, 0, 0, 0, 0, 0x01]).expect("a stack's parameters");
+
+        assert_eq!(configured, params.static_neighbours);
+        assert_eq!(
+            Some((std::net::Ipv4Addr::new(10, 10, 0, 1), 24)),
+            Some((params.address, params.prefix_length)),
+            "and the rest of the parameters are still the media's"
+        );
     }
 }
