@@ -291,6 +291,77 @@ path = "integration/archive_async_connect.rs"
 name = "archive_client_api"
 path = "integration/archive_client_api.rs"
 
+# P2-C4's async client: the self-healing one, its callbacks, and the reconnect
+# that only a client which remakes its driver connection can survive. Needs our
+# archiving media driver binary, so it runs in CI.
+[[test]]
+name = "archive_async_client"
+path = "integration/archive_async_client.rs"
+
+# P2-C4's persistent subscription, live half: the reference's
+# `shouldReplayExistingRecordingThenJoinLive`, four of its twelve cells. Needs
+# our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_live"
+path = "integration/persistent_subscription_live.rs"
+
+# P2-C4's persistent subscription, the archive half of its self-healing: the
+# archive is killed and restarted while a replay is in flight. Needs our
+# archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_healing"
+path = "integration/persistent_subscription_healing.rs"
+
+# P2-C4's persistent subscription, replay half: a recording replayed into the
+# application through the subscription's own poll. Needs our archiving media
+# driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_replay"
+path = "integration/persistent_subscription_replay.rs"
+
+# P2-C4's counters: the four a persistent subscription publishes (114–117),
+# read back out of the CnC file by type id the way the reference's own two
+# cases read them. Needs our driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_counters"
+path = "integration/persistent_subscription_counters.rs"
+
+# P2-C4's closing family: what a close mid-replay gives back, judged by what can
+# be done afterwards rather than by the absence of a crash. Needs our archiving
+# media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_close"
+path = "integration/persistent_subscription_close.rs"
+
+# P2-C4's timeouts: what a persistent subscription does when an answer never
+# comes, judged by watching it ask again rather than by a poll's return value.
+# Needs our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_timeouts"
+path = "integration/persistent_subscription_timeouts.rs"
+
+# P2-C4's alignment, at last: the replay slowed by injected loss while the live
+# stream runs ahead, so `ATTEMPT_SWITCH` has to align two positions that do not
+# agree. Needs our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_loss"
+path = "integration/persistent_subscription_loss.rs"
+
+# P2-C4's receive-side loss injection: the driver's own `debug.receive.data.loss`
+# rules, judged by what a subscriber is and is not handed. Needs our driver
+# binary, so it runs in CI.
+[[test]]
+name = "receive_loss_injection"
+path = "integration/receive_loss_injection.rs"
+
+# P2-C4's response-channel replay: the channel the replay comes back on, and
+# what a replay over a `control-mode=response` channel has to do first — a
+# publication of the client's own, a proxy over it, and a replay token. Needs
+# our archiving media driver binary, so it runs in CI.
+[[test]]
+name = "persistent_subscription_configured_channel"
+path = "integration/persistent_subscription_configured_channel.rs"
+
 # P2-S5's acceptance, and the same criterion again: the segment operations, on
 # the four things the C suite cannot see — the bytes a truncate leaves in the
 # segment file it cut, a delete that has to wait for a replay, a replay refused

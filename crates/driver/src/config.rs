@@ -760,6 +760,27 @@ pub struct DriverConfig {
     /// and its value is a count rather than a rate: `None` injects nothing.
     /// `docs/compat.md` records the difference.
     pub data_loss_drop_every: Option<u64>,
+    /// What to drop on the **receive** side
+    /// (`debug.receive.data.loss.…`), so that a test can put loss *under a
+    /// subscriber* rather than under a sender.
+    ///
+    /// The send-side knob beside this one drops whole datagrams on their way
+    /// out, which is enough to exercise recovery but not enough to exercise
+    /// anything that depends on **who** is missing what: a datagram dropped on
+    /// the wire never reaches the archive's recording either, so "the recording
+    /// is whole and the reader is not" cannot be built with it. The reference's
+    /// answer is its `aeron-test-support` family, whose generators are hung on a
+    /// receive endpoint and can name a stream, a term, an offset range, or one
+    /// handshake — and which endpoint they hang on is decided by the channel's
+    /// URI, so that the archive's own subscription can be exempted.
+    ///
+    /// **This has no counterpart in the reference either.** Its generators are
+    /// installed by a test that starts the driver in its own process and calls
+    /// `aeron_loss_generator_…_enable` on a running one; a driver here is a
+    /// process of its own, so what it drops is decided **before it starts** and
+    /// cannot be changed while a case runs. `docs/compat.md` records the
+    /// difference, as it does for `data_loss_drop_every`.
+    pub receive_data_loss: Option<crate::media::receive_loss::Spec>,
     /// Hold every resolution this many milliseconds before it is answered
     /// (`debug.resolver.delay.millis`), so that a test can put a name that
     /// stalls under the driver and watch the conductor's own clock while it
@@ -991,6 +1012,7 @@ impl Default for DriverConfig {
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
             data_loss_drop_every: None,
+            receive_data_loss: None,
             debug_resolver_delay_ms: 0,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
             name_resolver_supplier: NAME_RESOLVER_SUPPLIER_DEFAULT,
@@ -1748,6 +1770,8 @@ impl DriverConfig {
                 Ok(drop_every) => config.data_loss_drop_every = Some(drop_every),
             }
         }
+
+        config.receive_data_loss = receive_data_loss(&get)?;
 
         if let Some(value) = get(&Setting::NAME_RESOLVER_SUPPLIER) {
             config.name_resolver_supplier = crate::name_resolver::Supplier::from_name(&value)
@@ -2564,6 +2588,72 @@ impl Setting {
         property: "debug.resolver.delay.millis",
         env: "DEEPMSG_DEBUG_RESOLVER_DELAY_MILLIS",
     };
+    /// `deepmsg.debug.receive.data.loss.stream.id`: drop the `DATA` of one
+    /// stream as it arrives.
+    ///
+    /// The first of the receive-side family; [`DriverConfig::receive_data_loss`]
+    /// says what they are for and which combination of them is a rule.
+    const RECEIVE_LOSS_STREAM_ID: Self = Self {
+        property: "debug.receive.data.loss.stream.id",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_STREAM_ID",
+    };
+    /// `deepmsg.debug.receive.data.loss.every`: drop one matching `DATA` frame
+    /// in every this many, which is what turns the stream above — or nothing at
+    /// all — into a *rate*.
+    const RECEIVE_LOSS_EVERY: Self = Self {
+        property: "debug.receive.data.loss.every",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_EVERY",
+    };
+    /// `deepmsg.debug.receive.data.loss.pass.first`: how many frames of the
+    /// stream a **blackout** lets through before it starts.
+    ///
+    /// Half of the one rule here that ends by itself; see
+    /// [`crate::media::receive_loss::Blackout`]. What it is for is the
+    /// reference's response-dropping cases, which pass the archive's handshake
+    /// and then block — a shape no unbounded rule can hold, because a machine
+    /// that is retrying has to be let through again.
+    const RECEIVE_LOSS_PASS_FIRST: Self = Self {
+        property: "debug.receive.data.loss.pass.first",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_PASS_FIRST",
+    };
+    /// `deepmsg.debug.receive.data.loss.until.millis`: how long the blackout
+    /// withholds, **measured from the stream's first frame**.
+    ///
+    /// ★ A **time**, and measuring is what said so: a bound counted in frames was
+    /// spent by the transport's own retransmissions and then never reached at
+    /// all, because withholding everything stops the frames arriving long before
+    /// a frame budget is used up. The reference reaches for a time in the same
+    /// place — its composite predicate drops `SETUP`s "until
+    /// `g_setup_drop_until_ns`" (`…_resilience_test.cpp:1948-1950`).
+    const RECEIVE_LOSS_UNTIL_MILLIS: Self = Self {
+        property: "debug.receive.data.loss.until.millis",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_UNTIL_MILLIS",
+    };
+    /// `deepmsg.debug.receive.data.loss.setup.at.position`:
+    /// `<stream>,<initial-term-id>,<active-term-id>,<term-offset>` — drop the one
+    /// `SETUP` that names that position, so that a subscriber attaches late.
+    const RECEIVE_LOSS_SETUP_AT_POSITION: Self = Self {
+        property: "debug.receive.data.loss.setup.at.position",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_SETUP_AT_POSITION",
+    };
+    /// `deepmsg.debug.receive.data.loss.data.in.range`:
+    /// `<stream>,<active-term-id>,<min-offset>,<max-offset>` — drop the `DATA` of
+    /// one term whose offset is in `[min, max)`.
+    const RECEIVE_LOSS_DATA_IN_RANGE: Self = Self {
+        property: "debug.receive.data.loss.data.in.range",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_DATA_IN_RANGE",
+    };
+    /// `deepmsg.debug.receive.data.loss.endpoint.skip`: leave alone any receive
+    /// endpoint whose channel URI contains this substring.
+    ///
+    /// What it is for is the archive's own recording subscription, whose channel
+    /// names `init-term-id=`: with it, a case can make a **reader** lose a range
+    /// while the **recording** keeps it, which is the only way to test that the
+    /// replay fills a gap the live stream left.
+    const RECEIVE_LOSS_ENDPOINT_SKIP: Self = Self {
+        property: "debug.receive.data.loss.endpoint.skip",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_ENDPOINT_SKIP",
+    };
 }
 
 /// Why a configuration could not be resolved.
@@ -2620,6 +2710,16 @@ pub enum ConfigError {
         name: &'static str,
         /// What it was set to.
         value: String,
+    },
+    /// Two settings that would both decide what the receive side drops.
+    ///
+    /// Only one rule can be in force, and naming two is refused rather than
+    /// resolved by an order nothing documents — see [`receive_data_loss`].
+    ConflictingSettings {
+        /// The rule that was named first, by property name.
+        first: &'static str,
+        /// And the one that would have decided instead.
+        second: &'static str,
     },
     /// A supplier name the reference's symbol table does not know — flow
     /// control, congestion control or name resolution — which for the
@@ -2709,6 +2809,11 @@ impl std::fmt::Display for ConfigError {
             Self::OutOfRange { name, value } => {
                 write!(f, "{name} is {value}, outside the range the driver holds")
             }
+            Self::ConflictingSettings { first, second } => write!(
+                f,
+                "{first} and {second} both name a rule for what the receive side \
+                 should drop, and only one can be in force"
+            ),
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
@@ -2766,6 +2871,7 @@ impl std::error::Error for ConfigError {
             | Self::NotABoolean { .. }
             | Self::NotANumber { .. }
             | Self::OutOfRange { .. }
+            | Self::ConflictingSettings { .. }
             | Self::UnknownSupplier { .. }
             | Self::UnknownTransportBindings { .. }
             | Self::ResolverNameRequired
@@ -2854,6 +2960,169 @@ fn property(properties: &[(String, String)], name: &str) -> Option<String> {
 /// The reference compares a prefix, so `turnip` is `true` and `offside` is
 /// `false`; this accepts the six whole words instead. The divergence can only
 /// turn a typo into an error, never a value into a different value.
+/// Read the receive-side loss settings into the one rule they name.
+///
+/// **At most one rule**, and a second one is a refusal rather than a precedence:
+/// which of two rules a `match` happens to reach first is not something a reader
+/// of the settings could tell, and a driver that silently dropped by the wrong
+/// one would make a case fail somewhere far from its cause.
+fn receive_data_loss(
+    get: &impl Fn(&Setting) -> Option<String>,
+) -> Result<Option<crate::media::receive_loss::Spec>, ConfigError> {
+    let mut spec = crate::media::receive_loss::Spec::default();
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_STREAM_ID) {
+        spec.stream_id = Some(parse_int32(&Setting::RECEIVE_LOSS_STREAM_ID, &value)?);
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_EVERY) {
+        // The same reading `debug.send.data.loss.drop.every` gets, and for the
+        // same reason: zero injects nothing, and one would withhold everything.
+        match u64::try_from(parse_count(&Setting::RECEIVE_LOSS_EVERY, &value)?) {
+            Ok(0) => {}
+            Ok(1) | Err(_) => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::RECEIVE_LOSS_EVERY.property,
+                    value,
+                });
+            }
+            Ok(every) => spec.every = Some(every),
+        }
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_PASS_FIRST) {
+        spec.pass_first = Some(
+            match parse_count(&Setting::RECEIVE_LOSS_PASS_FIRST, &value) {
+                Ok(count) if count >= 0 => u64::try_from(count).unwrap_or(0),
+                _ => {
+                    return Err(ConfigError::OutOfRange {
+                        name: Setting::RECEIVE_LOSS_PASS_FIRST.property,
+                        value,
+                    });
+                }
+            },
+        );
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_UNTIL_MILLIS) {
+        // Zero is "no blackout", the same as leaving it unset — and a blackout
+        // that withholds for no time at all is a rule that says nothing, so a
+        // `pass.first` beside it is refused rather than silently ignored.
+        match u64::try_from(parse_count(&Setting::RECEIVE_LOSS_UNTIL_MILLIS, &value)?) {
+            Ok(0) => {}
+            Ok(until_ms) => spec.until_ms = Some(until_ms),
+            Err(_) => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+                    value,
+                });
+            }
+        }
+    }
+
+    if spec.pass_first.is_some() && spec.until_ms.is_none() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::RECEIVE_LOSS_PASS_FIRST.property,
+            second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+        });
+    }
+
+    // A rate and a blackout both decide *which* matching frames are withheld,
+    // and they answer it differently: one every n, against a window from a
+    // point. Both at once is not a third rule, it is two.
+    if spec.every.is_some() && spec.until_ms.is_some() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::RECEIVE_LOSS_EVERY.property,
+            second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+        });
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_SETUP_AT_POSITION) {
+        let [stream_id, initial_term_id, active_term_id, term_offset] =
+            parse_four(&Setting::RECEIVE_LOSS_SETUP_AT_POSITION, &value)?;
+
+        spec.setup_at_position = Some(crate::media::receive_loss::SetupPosition {
+            stream_id,
+            initial_term_id,
+            active_term_id,
+            term_offset,
+        });
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_DATA_IN_RANGE) {
+        let [stream_id, active_term_id, min_inclusive, max_exclusive] =
+            parse_four(&Setting::RECEIVE_LOSS_DATA_IN_RANGE, &value)?;
+
+        spec.data_in_range = Some(crate::media::receive_loss::DataRange {
+            stream_id,
+            active_term_id,
+            min_inclusive,
+            max_exclusive,
+        });
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_ENDPOINT_SKIP) {
+        spec.endpoint_skip = Some(value);
+    }
+
+    let named: [(&'static str, bool); 3] = [
+        (
+            Setting::RECEIVE_LOSS_SETUP_AT_POSITION.property,
+            spec.setup_at_position.is_some(),
+        ),
+        (
+            Setting::RECEIVE_LOSS_DATA_IN_RANGE.property,
+            spec.data_in_range.is_some(),
+        ),
+        (
+            Setting::RECEIVE_LOSS_STREAM_ID.property,
+            spec.stream_id.is_some() || spec.every.is_some() || spec.until_ms.is_some(),
+        ),
+    ];
+
+    let mut rules = named.iter().filter(|(_, set)| *set).map(|(name, _)| *name);
+
+    if let (Some(first), Some(second)) = (rules.next(), rules.next()) {
+        return Err(ConfigError::ConflictingSettings { first, second });
+    }
+
+    Ok((!spec.is_empty()).then_some(spec))
+}
+
+/// One comma-separated `int32`, which is what a rule's own scalar is.
+fn parse_int32(setting: &Setting, value: &str) -> Result<i32, ConfigError> {
+    value
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| ConfigError::OutOfRange {
+            name: setting.property,
+            value: value.to_owned(),
+        })
+}
+
+/// Four comma-separated `int32`s — the spelling of both positioned rules
+/// (`<stream>,<term>,<min>,<max>`).
+fn parse_four(setting: &Setting, value: &str) -> Result<[i32; 4], ConfigError> {
+    let refused = || ConfigError::OutOfRange {
+        name: setting.property,
+        value: value.to_owned(),
+    };
+
+    let parts: Vec<&str> = value.split(',').collect();
+
+    if parts.len() != 4 {
+        return Err(refused());
+    }
+
+    let mut parsed = [0i32; 4];
+
+    for (slot, text) in parsed.iter_mut().zip(parts) {
+        *slot = text.trim().parse::<i32>().map_err(|_| refused())?;
+    }
+
+    Ok(parsed)
+}
+
 fn parse_bool(setting: &Setting, value: &str) -> Result<bool, ConfigError> {
     match value {
         "1" | "on" | "true" => Ok(true),
@@ -3592,6 +3861,142 @@ mod tests {
             .data_loss_drop_every,
             "zero is the same as unset"
         );
+    }
+
+    /// The receive-side family: which settings make which rule, and that two
+    /// rules at once are a refusal rather than a precedence.
+    #[test]
+    fn the_receive_loss_settings_become_one_rule() {
+        use crate::media::receive_loss::{DataRange, SetupPosition};
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.receive.data.loss.stream.id", "5101"),
+            ("deepmsg.debug.receive.data.loss.every", "2"),
+        ])
+        .expect("a stream and a rate are one rule");
+
+        let spec = config.receive_data_loss.expect("the settings ask for loss");
+        assert_eq!(Some(5101), spec.stream_id);
+        assert_eq!(Some(2), spec.every);
+        assert_eq!(None, spec.endpoint_skip);
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            (
+                "deepmsg.debug.receive.data.loss.setup.at.position",
+                "5101, 100, 101, 4096",
+            ),
+        ])
+        .expect("one handshake is one rule");
+
+        assert_eq!(
+            Some(SetupPosition {
+                stream_id: 5101,
+                initial_term_id: 100,
+                active_term_id: 101,
+                term_offset: 4096,
+            }),
+            config.receive_data_loss.expect("a rule").setup_at_position,
+        );
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            (
+                "deepmsg.debug.receive.data.loss.data.in.range",
+                "5101,5,0,4096",
+            ),
+            (
+                "deepmsg.debug.receive.data.loss.endpoint.skip",
+                "init-term-id=",
+            ),
+        ])
+        .expect("a range with a skip is one rule");
+
+        let spec = config.receive_data_loss.expect("a rule");
+        assert_eq!(
+            Some(DataRange {
+                stream_id: 5101,
+                active_term_id: 5,
+                min_inclusive: 0,
+                max_exclusive: 4096,
+            }),
+            spec.data_in_range,
+        );
+        assert_eq!(Some("init-term-id=".to_owned()), spec.endpoint_skip);
+
+        // Nothing named is no rule at all, and the driver drops nothing.
+        assert_eq!(
+            Option::None,
+            resolve(&[("deepmsg.dir", "/tmp/aeron")])
+                .expect("a config")
+                .receive_data_loss,
+        );
+
+        // ★ Two rules at once: refused, because which one won would be an
+        // implementation detail rather than a documented order.
+        assert!(
+            matches!(
+                resolve(&[
+                    ("deepmsg.dir", "/tmp/aeron"),
+                    ("deepmsg.debug.receive.data.loss.stream.id", "5101"),
+                    (
+                        "deepmsg.debug.receive.data.loss.data.in.range",
+                        "5101,5,0,4096"
+                    ),
+                ]),
+                Err(ConfigError::ConflictingSettings { .. })
+            ),
+            "two rules must not both be in force",
+        );
+
+        // A blackout: pass the stream's first two frames, withhold for three
+        // seconds, and then let everything through — the shape the reference's
+        // response-dropping cases need, and the only rule here that ends by
+        // itself.
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.receive.data.loss.stream.id", "20"),
+            ("deepmsg.debug.receive.data.loss.pass.first", "2"),
+            ("deepmsg.debug.receive.data.loss.until.millis", "3000"),
+        ])
+        .expect("a stream and a blackout are one rule");
+
+        let spec = config.receive_data_loss.expect("a rule");
+        assert_eq!(Some(20), spec.stream_id);
+        assert_eq!(Some(2), spec.pass_first);
+        assert_eq!(Some(3000), spec.until_ms);
+
+        // Without the window there is no blackout, and a `pass.first` on its own
+        // says nothing — refused rather than read as an empty rule.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.pass.first", "2"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+
+        // A rate and a blackout both answer "which matching frames", and
+        // differently.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.every", "2"),
+                ("deepmsg.debug.receive.data.loss.until.millis", "3000"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+
+        // And a rule whose value is not four numbers is refused rather than
+        // half-read.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.data.in.range", "5101,5,0"),
+            ]),
+            Err(ConfigError::OutOfRange { .. })
+        ));
     }
 
     #[test]

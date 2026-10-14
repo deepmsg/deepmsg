@@ -69,7 +69,7 @@ use deepmsg_cnc::command::{
     REMOVE_RECEIVE_DESTINATION_TYPE_ID, RemoveCounter, Response, decode_response,
     encode_add_static_counter, encode_client_close, encode_reject_image,
 };
-use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
+use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::logbuffer::append::Appended;
 
 use deepmsg_cnc::counters::{CLIENT_HEARTBEAT_TYPE_ID, CountersReader};
@@ -1089,6 +1089,22 @@ impl Client {
         self.cnc.counters()
     }
 
+    /// The same region as [`counters_reader`](Self::counters_reader), writable.
+    ///
+    /// The reference writes a counter through the address its **own** mapping
+    /// resolved at create (`aeron_counter_addr`,
+    /// `aeron-client/src/main/c/aeron_counter.c`), so a client is expected to be
+    /// able to write into the region it holds: a counter is not the driver's
+    /// private memory, and its owner is whoever asked for it. This is that
+    /// mapping, handed out rather than kept to the crate.
+    ///
+    /// `None` when the file describes no counter regions, which a driver that
+    /// is running does not produce. Every call borrows the mapping again, so a
+    /// caller that writes in a loop takes one and keeps it.
+    pub fn counters_writable(&self) -> Option<CountersReader<'_, ReadWrite>> {
+        self.cnc.counters_writable()
+    }
+
     /// Counter announcements since the last drain, and take them.
     ///
     /// Every counter that appeared or went away on the broadcast, whoever
@@ -1251,7 +1267,25 @@ impl Client {
     /// image that finds no subscription is dropped rather than deferred. The
     /// channel-status counter id is not known yet — it arrives with the
     /// response, and is written onto the subscription there.
-    fn submit_add_subscription(
+    /// Send an `ADD_SUBSCRIPTION` and return without waiting for the answer.
+    ///
+    /// **The non-blocking face of [`Client::add_subscription`]**, which is
+    /// public for the reason [`crate::client::connected`]'s is: a caller that
+    /// owns its own clock cannot spend a turn waiting for the driver. The
+    /// archive's persistent subscription is that caller — it puts a
+    /// subscription on a replay channel and polls for the answer in its own
+    /// state (`AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_ADD_REPLAY_SUBSCRIPTION`,
+    /// `aeron_archive_persistent_subscription.c:1485-1517`) — and the reference's
+    /// own archive does the same for a recording subscription
+    /// (`ArchiveConductor.java:562-570`).
+    ///
+    /// The registration id is the correlation id the command drew, which is
+    /// also what [`AsyncAdd::subscription`] takes.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError`] if the command could not be sent.
+    pub fn submit_add_subscription(
         &mut self,
         channel: &str,
         stream_id: i32,
