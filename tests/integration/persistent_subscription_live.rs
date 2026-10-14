@@ -495,6 +495,103 @@ fn the_subscription_goes_back_to_replaying_when_the_publisher_stops() {
     }
 }
 
+/// **`shouldStartFromLiveWithNoInitialReplayIfRequested`**
+/// (`…_persistent_subscription_test.cpp:1101`): a subscription whose start
+/// position is the live one **replays nothing** — the messages already recorded
+/// are not for it — and joins the live stream directly.
+///
+/// This is the *other* way into the live stream, and the only one that goes
+/// through `ADD_LIVE_SUBSCRIPTION` and `AWAIT_LIVE`: there is nothing to replay,
+/// so there is no replay to catch up with and no switch to align.
+#[test]
+fn a_subscription_can_start_from_live_with_nothing_to_replay() {
+    let test_name = "ps-live-from-live";
+
+    let Some((media_driver, _archive_dir)) = rig(test_name) else {
+        return;
+    };
+
+    let mut source = Source::start(media_driver.aeron_dir());
+
+    let mut context = PersistentSubscriptionContext::new();
+    context.archive_context = Some(context_for(media_driver.aeron_dir()));
+    context.recording_id = source.recording_id;
+    context.live_channel = Some(LIVE_CHANNEL.to_owned());
+    context.live_stream_id = LIVE_STREAM_ID;
+    context.replay_channel = Some(REPLAY_CHANNEL_IPC.to_owned());
+    context.replay_stream_id = REPLAY_STREAM_ID;
+    // ★ The whole of what is being asked: start where the stream is now.
+    context.start_position = deepmsg_archive::client::persistent_subscription::FROM_LIVE;
+
+    let joins = std::rc::Rc::new(std::cell::RefCell::new(Joins::default()));
+
+    let mut subscription = PersistentSubscription::new(
+        context,
+        Box::new(NoCredentials),
+        Some(Box::new(SharedJoins(std::rc::Rc::clone(&joins)))),
+    )
+    .expect("the subscription is created");
+
+    let mut collector = Collector::default();
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    // Joined, without a single replayed message: the recording has five in it
+    // and the application has seen none of them.
+    while !subscription.is_live() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: never joined the live stream; state {:?}{}",
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        assert!(
+            !subscription.has_failed(),
+            "{test_name}: {}",
+            subscription.failure_reason().unwrap_or("")
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(
+        collector.messages.is_empty(),
+        "starting from live replays nothing: {:?}",
+        collector.messages
+    );
+
+    // And the live stream is the subscription's from here.
+    for payload in LIVE {
+        source.publish(payload);
+    }
+
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    while collector.messages.len() < LIVE.len() {
+        assert!(
+            Instant::now() < deadline,
+            "{test_name}: {} of {} live messages; state {:?}{}",
+            collector.messages.len(),
+            LIVE.len(),
+            subscription.state(),
+            reason(&subscription, &joins)
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected: Vec<Vec<u8>> = LIVE.iter().map(|payload| payload.to_vec()).collect();
+    assert_eq!(expected, collector.messages, "{test_name}");
+    assert_eq!(1, joins.borrow().live_joined, "{test_name}");
+    assert!(
+        joins.borrow().errors.is_empty(),
+        "{:?}",
+        joins.borrow().errors
+    );
+}
+
 /// Why the subscription is where it is, for a failure message.
 fn reason(
     subscription: &PersistentSubscription,

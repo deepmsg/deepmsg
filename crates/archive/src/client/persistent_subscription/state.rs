@@ -108,6 +108,12 @@ pub enum State {
     AwaitReplayChannelEndpoint,
     /// Reading the replay, and deciding when it has caught up.
     Replay,
+    /// Putting a subscription on the live channel, for a subscription that has
+    /// nothing to replay — a start position at (or past) the end of the
+    /// recording.
+    AddLiveSubscription,
+    /// Waiting for the live stream's image.
+    AwaitLive,
     /// The live subscription is up: aligning the replay's position with the
     /// live image's, so that the seam has no message twice and none missing.
     AttemptSwitch,
@@ -138,10 +144,8 @@ impl State {
             Self::AwaitReplayChannelEndpoint => 7,
             Self::Replay => 12,
             Self::AttemptSwitch => 13,
-            // 14 and 15 are `ADD_LIVE_SUBSCRIPTION` and `AWAIT_LIVE`, which are
-            // the *other* way into the live stream: a subscription that has
-            // nothing to replay. They arrive with that path, which `new` refuses
-            // today.
+            Self::AddLiveSubscription => 14,
+            Self::AwaitLive => 15,
             Self::Live => 16,
             Self::Failed => 17,
         }
@@ -206,16 +210,6 @@ pub enum NewError {
     Context(ConcludeError),
     /// The driver could not be reached, or would not take the counters.
     Subscription(SubscriptionError),
-    /// ★ **This build's replay half cannot serve a context that goes straight
-    /// to live.**
-    ///
-    /// A context whose start position is `FROM_LIVE`, or whose recording has
-    /// already stopped at the position the subscription starts from, needs the
-    /// **live half** — the catch-up gate and the live subscription's three
-    /// states — which is the next commit of this slice. Refused here rather
-    /// than accepted and then never satisfied: a caller that got a subscription
-    /// back would be told, by nothing, that no message will ever arrive.
-    LiveHalfNotYet,
 }
 
 impl fmt::Display for NewError {
@@ -223,11 +217,6 @@ impl fmt::Display for NewError {
         match self {
             Self::Context(error) => write!(f, "{error}"),
             Self::Subscription(error) => write!(f, "{error}"),
-            Self::LiveHalfNotYet => write!(
-                f,
-                "a start position of FROM_LIVE needs the live half of this state machine, which \
-                 this build does not have yet"
-            ),
         }
     }
 }
@@ -237,7 +226,6 @@ impl std::error::Error for NewError {
         match self {
             Self::Context(error) => Some(error),
             Self::Subscription(error) => Some(error),
-            Self::LiveHalfNotYet => None,
         }
     }
 }
@@ -475,12 +463,6 @@ impl PersistentSubscription {
     ) -> Result<Self, NewError> {
         let concluded = context.conclude()?;
 
-        // ★ Loudly, and before anything is started: a start position of
-        // `FROM_LIVE` is the live half's job — see `NewError::LiveHalfNotYet`.
-        if concluded.start_position == FROM_LIVE {
-            return Err(NewError::LiveHalfNotYet);
-        }
-
         let archive_context = context
             .archive_context
             .clone()
@@ -658,6 +640,8 @@ impl PersistentSubscription {
             State::AwaitReplaySubscription => self.await_replay_subscription(),
             State::AwaitReplayChannelEndpoint => self.await_replay_channel_endpoint(),
             State::Replay => self.replay(handler, fragment_limit),
+            State::AddLiveSubscription => self.add_live_subscription(),
+            State::AwaitLive => self.await_live(),
             State::AttemptSwitch => self.attempt_switch(handler, fragment_limit),
             State::Live => self.live(handler, fragment_limit),
             State::Failed => 0,
@@ -731,21 +715,17 @@ impl PersistentSubscription {
             return 1;
         }
 
-        // When the recording has nothing to replay — the subscription starts at
-        // the live position, or at the position the recording stopped at — the
-        // live half takes over (`:1339-1341`). It is not here yet, and a
-        // subscription that reached this point would never deliver a message,
-        // so it is refused where the caller can see it.
+        // **When there is nothing to replay, the live stream is joined
+        // directly** (`:1339-1341`): the subscription starts at the live
+        // position, or the recording stopped at the position it starts from, and
+        // in both cases a replay would deliver nothing — so the live
+        // subscription is the whole of the path.
         let stop_position = self.ops.borrow().list_recording.stop_position;
 
-        if self.position == stop_position {
-            self.fail(SubscriptionError::Refused {
-                request: "list recording",
-                message: format!(
-                    "the recording stopped at the position this subscription starts from \
-                     ({stop_position}), which needs the live half"
-                ),
-            });
+        if FROM_LIVE == self.position
+            || (NULL_VALUE != stop_position && self.position == stop_position)
+        {
+            self.transition(State::AddLiveSubscription);
 
             return 1;
         }
@@ -1298,6 +1278,117 @@ impl PersistentSubscription {
             correlation_id,
             deadline: Instant::now() + self.message_timeout,
         };
+    }
+
+    /// `ADD_LIVE_SUBSCRIPTION` (`:2135-2144`).
+    fn add_live_subscription(&mut self) -> usize {
+        if self.do_add_live_subscription() {
+            self.transition(State::AwaitLive);
+        }
+
+        1
+    }
+
+    /// `AWAIT_LIVE` (`:2146-2245`): wait for the live stream's image, and check
+    /// the position it joined at against the one this subscription has read to.
+    ///
+    /// The three-way comparison is the reference's and each arm is a different
+    /// answer to the same question — did the live stream start where this
+    /// subscription left off (`:2202-2226`):
+    ///
+    /// * **behind**: the application would see a message twice and no alignment
+    ///   can fix that, so it is terminal;
+    /// * **ahead**: there is a gap this subscription has not read, so it goes
+    ///   back for it — the same re-listing the healing edges use;
+    /// * **equal**: this is where it was, and the live stream is its own from
+    ///   here.
+    fn await_live(&mut self) -> usize {
+        if self.live_subscription.is_none() {
+            let Some(registration_id) = self.live_subscription_add else {
+                return 0;
+            };
+
+            let outcome = match self.client.client_mut() {
+                Some(driver) => driver.async_add_poll(AsyncAdd::subscription(registration_id)),
+                None => AsyncAddPoll::Awaiting,
+            };
+
+            match outcome {
+                AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return 0,
+                AsyncAddPoll::Ready => {
+                    self.live_subscription_add = None;
+                    self.live_subscription = Some(registration_id);
+                    self.set_live_image_deadline();
+                }
+                AsyncAddPoll::Failed(error) => {
+                    // **A recorded deviation.** The reference retries a
+                    // `RESOURCE_TEMPORARILY_UNAVAILABLE` and fails on anything
+                    // else (`:2160-2171`); this build's `CommandError` does not
+                    // carry which refusal it was, so every one of them is
+                    // terminal. Retrying all of them would be a livelock on the
+                    // permanent ones, and a livelock says less than a failure
+                    // does.
+                    self.live_subscription_add = None;
+                    self.fail(SubscriptionError::Client(error));
+
+                    return 1;
+                }
+            }
+        }
+
+        let Some(registration_id) = self.live_subscription else {
+            return 0;
+        };
+
+        let live_position = self
+            .client
+            .client_mut()
+            .and_then(|driver| driver.subscription(registration_id))
+            .and_then(|subscription| subscription.images().first())
+            .map(deepmsg_client::image::Image::position);
+
+        let Some(live_position) = live_position else {
+            if !self.live_image_deadline_breached && self.live_image_deadline_passed() {
+                self.on_live_image_deadline_breached();
+            }
+
+            return 0;
+        };
+
+        self.advance_last_observed_live_position(live_position);
+
+        if self.position >= 0 {
+            if live_position < self.position {
+                self.clean_up_live_subscription();
+                self.fail(SubscriptionError::Descriptor(format!(
+                    "ERROR - live stream joined at position {live_position} which is earlier than \
+                     last seen position {}",
+                    self.position
+                )));
+
+                return 1;
+            }
+
+            if live_position > self.position {
+                self.refresh_recording_descriptor();
+
+                return 1;
+            }
+        }
+
+        self.position = live_position;
+        self.set_join_difference(0);
+        self.transition(State::Live);
+        self.on_live_joined();
+
+        1
+    }
+
+    /// `advance_last_observed_live_position` (`:1187-1195`): a high-water mark,
+    /// never a step backwards — it is what keeps a replay from being started
+    /// behind where the live stream has already been seen (`:1223`).
+    fn advance_last_observed_live_position(&mut self, position: i64) {
+        self.last_observed_live_position = self.last_observed_live_position.max(position);
     }
 
     /// `ATTEMPT_SWITCH` (`:2060-2133`): the replay has caught up and the live
