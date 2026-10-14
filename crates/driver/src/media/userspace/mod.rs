@@ -38,8 +38,10 @@
 //! needs any of those is counted and dropped, not handled (the design's §4.11
 //! list).
 
+pub mod arp;
 pub mod fake_port;
 pub mod frame;
+pub mod neighbour;
 pub mod packet_io;
 pub mod ports;
 pub mod stack;

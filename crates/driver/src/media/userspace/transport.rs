@@ -25,12 +25,14 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::media::udp_transport::OpenError;
 use crate::media::{Affinity, Transport};
 use crate::sys::socket::{Datagram, Datagrams, MAX_BATCH};
 
-use super::frame::{self, Received};
+use super::frame::{self, IPV4_UDP_HEADER_LENGTH, Ipv4Write, Received, UdpWrite};
+use super::neighbour::NextHop;
 use super::ports::Binding;
 use super::stack::{ReadyRing, Stack};
 
@@ -130,30 +132,124 @@ impl UserspaceTransport {
     /// peer when there is one, and the caller's argument otherwise — which is
     /// the kernel's own choice (`aeron_udp_channel_transport_send`,
     /// `aeron_udp_channel_transport.c:818-902`).
-    fn destination(&self, address: Option<SocketAddr>) -> Option<Ipv4Addr> {
-        let destination = self.peer.or(address)?;
+    #[allow(clippy::unused_self)]
+    fn destination(&self, address: Option<SocketAddr>) -> Option<SocketAddr> {
+        self.peer.or(address)
+    }
 
-        match destination.ip() {
-            IpAddr::V4(address) => Some(address),
-            IpAddr::V6(_) => None,
+    /// Write one frame in front of a payload, headers and checksums included.
+    ///
+    /// Answers the frame's length, or `None` when it does not fit the port — a
+    /// datagram longer than the MTU, which the channel validation refuses
+    /// before a channel is opened at all (§4.8). It is refused here rather
+    /// than truncated: a short frame on the wire is one the peer counts, and
+    /// reports as corruption.
+    fn build(
+        &self,
+        buffer: &mut [u8],
+        payload: &[u8],
+        destination: Ipv4Addr,
+        destination_port: u16,
+        hardware: [u8; 6],
+        identification: u16,
+    ) -> Option<usize> {
+        let params = self.stack.params();
+        let end = IPV4_UDP_HEADER_LENGTH.checked_add(payload.len())?;
+        if buffer.len() < end {
+            return None;
         }
+
+        buffer[IPV4_UDP_HEADER_LENGTH..end].copy_from_slice(payload);
+
+        frame::write_ipv4_udp(
+            buffer,
+            &UdpWrite {
+                ipv4: Ipv4Write {
+                    destination_hardware: hardware,
+                    source_hardware: params.mac,
+                    source: params.address,
+                    destination,
+                    identification,
+                },
+                source_port: self.local.port(),
+                destination_port,
+                payload_length: payload.len(),
+            },
+        )
     }
 }
 
 impl Transport for UserspaceTransport {
     fn send(&mut self, address: Option<SocketAddr>, buffers: &[&[u8]]) -> io::Result<usize> {
-        // The neighbour table arrives with the next slice. An address with no
-        // MAC behind it is back pressure, not a failure (Q3) — the caller
-        // comes back on its next pass, which is what it does for a full socket
-        // buffer.
-        // The destination is worked out here even though nothing is sent with
-        // it, because the shape of this call is what the next slice fills in:
-        // a connected transport sends where it was connected and ignores the
-        // argument, an unconnected one uses it (`media/mod.rs:90-93`).
-        let _ = self.destination(address);
-        let _ = buffers;
+        let Some(destination) = self.destination(address) else {
+            // Nowhere to send it: the kernel answers the same way for a
+            // `sendto` with no address on an unconnected socket.
+            return Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ));
+        };
 
-        Ok(0)
+        let IpAddr::V4(destination_address) = destination.ip() else {
+            return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+        };
+
+        // Off this link and no gateway: there is nothing to send it to, which
+        // the design refuses at the channel and which is this transport's
+        // answer if one gets here anyway (§4.11).
+        let Some(next_hop) = self.stack.next_hop(destination_address) else {
+            return Err(io::Error::from_raw_os_error(libc::ENETUNREACH));
+        };
+
+        // An unresolved next hop is back pressure, not a failure (Q3): the
+        // frame did not leave, the request for its MAC did, and the caller
+        // comes back on its next pass — which is what it does for a full
+        // socket buffer too.
+        let NextHop::Known(hardware) = self.stack.resolve(next_hop, self.affinity) else {
+            self.stack
+                .counters()
+                .arp_miss
+                .fetch_add(1, Ordering::Relaxed);
+
+            return Ok(0);
+        };
+
+        let count = buffers.len().min(MAX_BATCH);
+        let identification = self.stack.next_identification();
+        let mut next = 0;
+
+        let taken = {
+            let mut port = self
+                .stack
+                .transmit(self.affinity)
+                .lock()
+                .expect("the transmit port");
+
+            port.tx_burst(count, &mut |buffer| {
+                let Some(payload) = buffers.get(next) else {
+                    return 0;
+                };
+                next += 1;
+
+                self.build(
+                    buffer,
+                    payload,
+                    destination_address,
+                    destination.port(),
+                    hardware,
+                    identification,
+                )
+                .unwrap_or(0)
+            })
+        };
+
+        // What the port would not take is what the caller still has to send,
+        // and it is counted where the design counts it (78).
+        if taken < count {
+            self.stack
+                .counters()
+                .tx_eagain
+                .fetch_add((count - taken) as u64, Ordering::Relaxed);
+        }
+
+        Ok(taken)
     }
 
     fn receive(&mut self, buffers: &mut [Vec<u8>], datagrams: &mut Datagrams) -> io::Result<usize> {
@@ -256,18 +352,22 @@ impl Drop for UserspaceTransport {
 mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Side, Wire};
-    use crate::media::userspace::frame::{IPV4_UDP_HEADER_LENGTH, Ipv4Write, UdpWrite};
-    use crate::media::userspace::packet_io::TxPort;
+    use crate::media::userspace::frame::{
+        ARP_REPLY, ARP_REQUEST, ArpPacket, BROADCAST, ETHERNET_TYPE_ARP, EthernetHeader,
+        IPV4_UDP_HEADER_LENGTH, Ipv4Write, UdpWrite,
+    };
+    use crate::media::userspace::packet_io::{Disposition, RxPort, TxPort};
     use crate::media::userspace::stack::StackParams;
 
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
+    const OUR_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
 
     fn stack(wire: &Wire) -> Arc<Stack> {
         Stack::over_a_fake_wire(
             wire,
             Side::A,
-            StackParams::new(OWN, 24, [0x02, 0, 0, 0, 0, 0x01]),
+            StackParams::new(OWN, 24, OUR_MAC),
             super::super::stack::Clock::Monotonic,
         )
     }
@@ -561,8 +661,260 @@ mod tests {
         assert_eq!(Some(elsewhere), connected.connected_address());
     }
 
-    /// Sending is back pressure until the neighbour table arrives: not an
-    /// error, and not a frame.
+    /// What arrives teaches where it came from: a frame from an address on
+    /// this link carries that address's MAC, and the next send to it needs no
+    /// resolution of its own (the design's gleaning, §4.5).
+    #[test]
+    fn a_frame_from_a_peer_teaches_its_mac() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let _transport = open(&stack, 40481);
+
+        send_udp(
+            &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
+            40481,
+            b"hello",
+        );
+        stack.pump();
+
+        assert_eq!(
+            NextHop::Known([0x02, 0, 0, 0, 0, 0x02]),
+            stack.neighbour(PEER)
+        );
+    }
+
+    /// An ARP request for this port's address is answered, and answered to the
+    /// asker — which is the only way a kernel peer can ever resolve this
+    /// stack.
+    #[test]
+    fn an_arp_request_from_the_wire_is_answered() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let _transport = open(&stack, 40482);
+
+        let asker = [0x02, 0, 0, 0, 0, 0x02];
+        let mut bytes = vec![0u8; 64];
+        let written = frame::write_arp(
+            &mut bytes,
+            &EthernetHeader {
+                destination: BROADCAST,
+                source: asker,
+                ether_type: ETHERNET_TYPE_ARP,
+            },
+            &ArpPacket {
+                operation: ARP_REQUEST,
+                sender_hardware: asker,
+                sender_protocol: PEER,
+                target_hardware: [0; 6],
+                target_protocol: OWN,
+            },
+        )
+        .expect("a frame");
+        wire.port(Side::B, asker, 1500).tx_burst(1, &mut |buffer| {
+            buffer[..written].copy_from_slice(&bytes[..written]);
+            written
+        });
+
+        assert_eq!(1, stack.pump(), "the request was read");
+
+        // And the answer is on the wire, addressed back to the asker.
+        assert_eq!(1, wire.queued(Side::A));
+        let mut kept = Vec::new();
+        wire.port(Side::B, asker, 1500).rx_burst(
+            1,
+            &mut |frame| {
+                let ethernet = frame::read_ethernet_header(frame.bytes).expect("a header");
+                assert_eq!(asker, ethernet.destination, "straight back to the asker");
+
+                let Ok(Received::Arp(packet)) = frame::read(frame.bytes, frame.checksums) else {
+                    panic!("the frame that left is an ARP reply");
+                };
+                assert_eq!(ARP_REPLY, packet.operation);
+                assert_eq!(OUR_MAC, packet.sender_hardware);
+                assert_eq!(OWN, packet.sender_protocol);
+                assert_eq!(PEER, packet.target_protocol, "the address that asked");
+
+                Disposition::Consumed
+            },
+            &mut kept,
+        );
+
+        // And asking taught the table who the asker is, on the way past.
+        assert_eq!(NextHop::Known(asker), stack.neighbour(PEER));
+    }
+
+    /// A request for somebody else's address is not this port's to answer.
+    #[test]
+    fn a_request_for_another_address_is_not_answered() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let _transport = open(&stack, 40483);
+
+        let mut bytes = vec![0u8; 64];
+        let written = frame::write_arp(
+            &mut bytes,
+            &EthernetHeader {
+                destination: BROADCAST,
+                source: [0x02, 0, 0, 0, 0, 0x02],
+                ether_type: ETHERNET_TYPE_ARP,
+            },
+            &ArpPacket {
+                operation: ARP_REQUEST,
+                sender_hardware: [0x02, 0, 0, 0, 0, 0x02],
+                sender_protocol: PEER,
+                target_hardware: [0; 6],
+                target_protocol: Ipv4Addr::new(10, 10, 0, 9),
+            },
+        )
+        .expect("a frame");
+        wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500)
+            .tx_burst(1, &mut |buffer| {
+                buffer[..written].copy_from_slice(&bytes[..written]);
+                written
+            });
+
+        stack.pump();
+
+        assert_eq!(
+            0,
+            wire.queued(Side::A),
+            "no answer to somebody else's question"
+        );
+    }
+
+    /// With a next hop known, a frame leaves with that MAC and the payload
+    /// unchanged, addressed from this port's own address and port.
+    #[test]
+    fn a_frame_leaves_with_the_next_hops_mac() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let mut transport = open(&stack, 40484);
+        stack.insert_neighbour(PEER, [0x02, 0, 0, 0, 0, 0x02]);
+
+        assert_eq!(
+            1,
+            transport
+                .send(Some(SocketAddr::from((PEER, 40999))), &[b"aeron payload"])
+                .expect("a send")
+        );
+
+        let mut kept = Vec::new();
+        wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500).rx_burst(
+            1,
+            &mut |frame| {
+                let ethernet = frame::read_ethernet_header(frame.bytes).expect("a header");
+                assert_eq!([0x02, 0, 0, 0, 0, 0x02], ethernet.destination);
+                assert_eq!(OUR_MAC, ethernet.source);
+
+                let Ok(Received::Udp { ipv4, datagram }) =
+                    frame::read(frame.bytes, frame.checksums)
+                else {
+                    panic!("a UDP frame");
+                };
+                assert_eq!(OWN, ipv4.source);
+                assert_eq!(PEER, ipv4.destination);
+                assert_eq!(40484, datagram.source_port, "from the port it bound");
+                assert_eq!(40999, datagram.destination_port);
+                assert_eq!(b"aeron payload", datagram.payload);
+
+                Disposition::Consumed
+            },
+            &mut kept,
+        );
+    }
+
+    /// A batch goes out as a batch, and what the port would not take is what
+    /// the caller still has (G7).
+    #[test]
+    fn a_batch_goes_out_as_a_batch() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let mut transport = open(&stack, 40485);
+        stack.insert_neighbour(PEER, [0x02, 0, 0, 0, 0, 0x02]);
+
+        assert_eq!(
+            3,
+            transport
+                .send(
+                    Some(SocketAddr::from((PEER, 40999))),
+                    &[b"one", b"two", b"three"]
+                )
+                .expect("a send")
+        );
+        assert_eq!(3, wire.queued(Side::A));
+    }
+
+    /// An off-link destination with no gateway has nothing to be sent to, and
+    /// that is the design's refusal rather than a drop (§4.11).
+    #[test]
+    fn an_off_link_destination_needs_a_gateway() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let mut transport = open(&stack, 40486);
+        let far = SocketAddr::from((Ipv4Addr::new(10, 10, 9, 9), 40999));
+
+        assert_eq!(
+            Some(libc::ENETUNREACH),
+            transport
+                .send(Some(far), &[b"off the link"])
+                .expect_err("no gateway")
+                .raw_os_error()
+        );
+
+        // With a gateway, the frame goes to the gateway's MAC and carries the
+        // far address as its destination.
+        let gateway = Ipv4Addr::new(10, 10, 0, 254);
+        let stack = Arc::new(Stack::new(
+            StackParams {
+                gateway: Some(gateway),
+                ..StackParams::new(OWN, 24, OUR_MAC)
+            },
+            super::super::stack::Clock::Monotonic,
+            Box::new(wire.port(Side::A, OUR_MAC, 1408)),
+            [
+                Box::new(wire.port(Side::A, OUR_MAC, 1408)),
+                Box::new(wire.port(Side::A, OUR_MAC, 1408)),
+            ],
+        ));
+        let mut transport = open(&stack, 40487);
+        stack.insert_neighbour(gateway, [0x02, 0, 0, 0, 0, 0xfe]);
+
+        assert_eq!(
+            1,
+            transport
+                .send(Some(far), &[b"off the link"])
+                .expect("a send")
+        );
+
+        let mut kept = Vec::new();
+        wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500).rx_burst(
+            1,
+            &mut |frame| {
+                let ethernet = frame::read_ethernet_header(frame.bytes).expect("a header");
+                assert_eq!(
+                    [0x02, 0, 0, 0, 0, 0xfe],
+                    ethernet.destination,
+                    "to the gateway"
+                );
+
+                let Ok(Received::Udp { ipv4, .. }) = frame::read(frame.bytes, frame.checksums)
+                else {
+                    panic!("a UDP frame");
+                };
+                assert_eq!(
+                    Ipv4Addr::new(10, 10, 9, 9),
+                    ipv4.destination,
+                    "for the far address"
+                );
+
+                Disposition::Consumed
+            },
+            &mut kept,
+        );
+    }
+
+    /// Sending is back pressure while a next hop is unresolved: not an error,
+    /// and the frame does not leave.
     #[test]
     fn sending_without_a_neighbour_is_back_pressure() {
         let wire = Wire::new();
@@ -575,6 +927,27 @@ mod tests {
                 .send(Some(SocketAddr::from((PEER, 40000))), &[b"nothing"])
                 .expect("back pressure, not a failure")
         );
-        assert_eq!(0, wire.queued(Side::A), "and nothing left");
+        assert_eq!(1, stack.counters().arp_miss.load(Ordering::Relaxed));
+
+        // What left is the question, not the frame: one broadcast asking who
+        // holds the next hop.
+        assert_eq!(1, wire.queued(Side::A));
+        let mut far = wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500);
+        let mut kept = Vec::new();
+        far.rx_burst(
+            1,
+            &mut |frame| {
+                let received = frame::read(frame.bytes, frame.checksums);
+                let Ok(Received::Arp(packet)) = received else {
+                    panic!("the frame that left is an ARP request");
+                };
+                assert_eq!(ARP_REQUEST, packet.operation);
+                assert_eq!(PEER, packet.target_protocol);
+                assert_eq!(OWN, packet.sender_protocol);
+
+                Disposition::Consumed
+            },
+            &mut kept,
+        );
     }
 }

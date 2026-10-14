@@ -36,7 +36,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,8 +44,10 @@ use crate::config::{MTU_LENGTH_DEFAULT, RCV_INITIAL_WINDOW_LENGTH_DEFAULT};
 use crate::media::Affinity;
 use crate::sys::socket::BindFailure;
 
+use super::arp;
 use super::fake_port::{Side, Wire};
-use super::frame::{self, Received};
+use super::frame::{self, ArpPacket, EthernetHeader, Received};
+use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
 use super::packet_io::{Disposition, ReadyFrame, RxFrame, RxPort, SlotId, TxPort};
 use super::ports::{Binding, EPHEMERAL_PORTS, PortTable, SLOT_CAPACITY};
 
@@ -329,6 +331,21 @@ impl SlotTable {
     }
 }
 
+/// A frame the stack has to send, held until it is out of the receive port's
+/// callback.
+///
+/// Little and `Copy` on purpose: the deferred list is built per pass and
+/// almost always empty, so it costs no allocation, and what it holds is the
+/// description of a frame rather than the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    /// The answer to an ARP request.
+    ArpReply {
+        ethernet: EthernetHeader,
+        packet: ArpPacket,
+    },
+}
+
 /// One thread's view of a stack: which of the two it is, and the stack.
 ///
 /// The three ports are the stack's, not this type's — this is what the poller
@@ -384,7 +401,12 @@ impl ThreadQueues {
 pub struct Stack {
     params: StackParams,
     ports: PortTable,
+    neighbours: Mutex<NeighbourTable>,
     slots: SlotTable,
+    /// The identification field of the next frame this stack sends. Linux
+    /// fills it from a counter of its own and nothing reads it (§4.5), but it
+    /// has to change between datagrams for the header to be honest.
+    identification: AtomicU16,
     rx: Arc<Mutex<Box<dyn RxPort>>>,
     tx: [Arc<Mutex<Box<dyn TxPort>>>; 2],
     counters: StackCounters,
@@ -405,10 +427,14 @@ impl Stack {
         tx: [Box<dyn TxPort>; 2],
     ) -> Arc<Self> {
         let capacity = params.ring_capacity();
+        let neighbours =
+            NeighbourTable::new(NEIGHBOUR_CAPACITY, params.arp_timeout, params.arp_interval);
 
         Arc::new(Self {
             ports: PortTable::new(SLOT_CAPACITY, params.ephemeral_ports.clone()),
+            neighbours: Mutex::new(neighbours),
             slots: SlotTable::new(SLOT_CAPACITY, capacity),
+            identification: AtomicU16::new(0),
             params,
             rx: Arc::new(Mutex::new(rx)),
             tx: tx.map(|port| Arc::new(Mutex::new(port))),
@@ -524,30 +550,111 @@ impl Stack {
     /// a stack has no threads of its own.
     pub fn pump(&self) -> usize {
         let mut kept = Vec::new();
+        let mut deferred = Vec::new();
         let handed = {
             let mut rx = self.rx.lock().expect("the receive port");
-            rx.rx_burst(RX_BURST, &mut |frame| self.route(frame), &mut kept)
+            rx.rx_burst(
+                RX_BURST,
+                &mut |frame| self.route(frame, &mut deferred),
+                &mut kept,
+            )
         };
 
         for (binding, frame) in kept {
             self.deliver(binding, frame);
         }
 
+        // Nothing is sent from inside the callback: an answer leaves through a
+        // transmit port, and a port that shares a lock with the receive port
+        // would deadlock against itself. The design's §3.8 lock order is
+        // `rx` → slot and nothing else.
+        for outgoing in deferred {
+            self.send_deferred(outgoing, Affinity::Receiver);
+        }
+
         handed
+    }
+
+    /// The next hop a frame for `destination` goes to: the destination itself
+    /// when it is on this link, and the gateway when it is not.
+    ///
+    /// Answers `None` for an off-link destination with no gateway, which the
+    /// design refuses at the channel (§4.11) — here it is the transport's
+    /// `ENETUNREACH`.
+    pub fn next_hop(&self, destination: Ipv4Addr) -> Option<Ipv4Addr> {
+        if neighbour::on_the_same_link(self.params.address, destination, self.params.prefix_length)
+        {
+            return Some(destination);
+        }
+
+        self.params.gateway
+    }
+
+    /// What to send to for `address`, asking about it if the throttle allows.
+    ///
+    /// The request goes out of `affinity`'s queue, because it is the thread
+    /// that needs the answer and it is already holding that port.
+    pub fn resolve(&self, address: Ipv4Addr, affinity: Affinity) -> NextHop {
+        let now = self.now.now();
+        let mut neighbours = self.neighbours.lock().expect("the neighbour table");
+
+        if let NextHop::Known(hardware) = neighbours.resolve(address, now) {
+            return NextHop::Known(hardware);
+        }
+
+        let ask = neighbours.ask(address, now);
+        drop(neighbours);
+
+        if ask {
+            self.send_arp_request(address, affinity);
+        }
+
+        NextHop::Unknown
+    }
+
+    /// Record what an address's MAC is — what gleaning and an answer both come
+    /// to.
+    pub fn learn(&self, address: Ipv4Addr, hardware: [u8; 6]) {
+        let now = self.now.now();
+        self.neighbours
+            .lock()
+            .expect("the neighbour table")
+            .learn(address, hardware, now);
+    }
+
+    /// Configure a next hop that never ages out.
+    pub fn insert_neighbour(&self, address: Ipv4Addr, hardware: [u8; 6]) {
+        self.neighbours
+            .lock()
+            .expect("the neighbour table")
+            .insert_fixed(address, hardware);
+    }
+
+    /// Whether a MAC is known for `address`, without asking.
+    pub fn neighbour(&self, address: Ipv4Addr) -> NextHop {
+        self.neighbours
+            .lock()
+            .expect("the neighbour table")
+            .resolve(address, self.now.now())
+    }
+
+    /// The identification field for the next frame this stack sends.
+    pub fn next_identification(&self) -> u16 {
+        self.identification.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Decide what becomes of one frame: the port's callback, and deliberately
     /// not where a frame is filed. A kept frame is pushed after the port's
     /// lock is released, so nothing takes a slot's lock while holding a
     /// port's (the design's §3.8 lock order).
-    fn route(&self, frame: RxFrame<'_>) -> Disposition {
+    fn route(&self, frame: RxFrame<'_>, deferred: &mut Vec<Deferred>) -> Disposition {
         // A frame addressed to some other port is not this port's, and the
         // design drops it **silently** — no counter, because a port that is
         // not in promiscuous mode is never handed one to begin with (§4.5).
-        match frame::read_ethernet_header(frame.bytes) {
-            Ok(ethernet) if ethernet.is_for(self.params.mac) => {}
+        let ethernet = match frame::read_ethernet_header(frame.bytes) {
+            Ok(ethernet) if ethernet.is_for(self.params.mac) => ethernet,
             _ => return Disposition::Consumed,
-        }
+        };
 
         let Ok(received) = frame::read(frame.bytes, frame.checksums) else {
             // A frame the stack cannot place is counted and dropped by the
@@ -557,6 +664,11 @@ impl Stack {
 
         match received {
             Received::Udp { ipv4, datagram } => {
+                // Gleaning again, and not only for ARP: any frame from an
+                // address on this link carries that address's MAC, and
+                // learning it here is what lets an answer go straight back
+                // without a resolution of its own (design §4.5).
+                self.glean(ipv4.source, ethernet.source);
                 let source = SocketAddr::from((ipv4.source, datagram.source_port));
 
                 match self.ports.lookup(
@@ -569,9 +681,61 @@ impl Stack {
                     None => Disposition::Consumed,
                 }
             }
-            // ARP is answered by the slice that owns the neighbour table, ICMP
-            // by the one that owns the counters.
-            Received::Arp(_) | Received::Echo { .. } => Disposition::Consumed,
+            Received::Arp(packet) => {
+                self.answer_or_learn(&packet, deferred);
+                Disposition::Consumed
+            }
+            // ICMP is answered by the slice that owns the counters.
+            Received::Echo { .. } => Disposition::Consumed,
+        }
+    }
+
+    /// What an arriving ARP packet is worth: what it teaches, and whether it
+    /// has to be answered.
+    fn answer_or_learn(&self, packet: &ArpPacket, deferred: &mut Vec<Deferred>) {
+        self.glean(packet.sender_protocol, packet.sender_hardware);
+
+        if arp::asks_about(packet, self.params.address) {
+            let (ethernet, reply) = arp::reply_to(&self.params, packet);
+            deferred.push(Deferred::ArpReply {
+                ethernet,
+                packet: reply,
+            });
+        }
+    }
+
+    /// Learn what a frame's sender is, when it is on this link.
+    ///
+    /// Bounded by the link on purpose: a source address that is *not* on this
+    /// link arrived through the gateway, so the MAC beside it is the router's
+    /// — remembering it as that address's would send its traffic to the
+    /// router for the wrong reason.
+    fn glean(&self, source: Ipv4Addr, hardware: [u8; 6]) {
+        if neighbour::on_the_same_link(self.params.address, source, self.params.prefix_length) {
+            self.learn(source, hardware);
+        }
+    }
+
+    /// Broadcast an ARP request for `address` out of `affinity`'s queue.
+    fn send_arp_request(&self, address: Ipv4Addr, affinity: Affinity) {
+        let params = &self.params;
+        let mut port = self.transmit(affinity).lock().expect("the transmit port");
+
+        port.tx_burst(1, &mut |buffer| {
+            arp::write_request(buffer, params, address).unwrap_or(0)
+        });
+    }
+
+    /// Send a frame the router could not send from inside the port's callback.
+    fn send_deferred(&self, deferred: Deferred, affinity: Affinity) {
+        let mut port = self.transmit(affinity).lock().expect("the transmit port");
+
+        match deferred {
+            Deferred::ArpReply { ethernet, packet } => {
+                port.tx_burst(1, &mut |buffer| {
+                    frame::write_arp(buffer, &ethernet, &packet).unwrap_or(0)
+                });
+            }
         }
     }
 
