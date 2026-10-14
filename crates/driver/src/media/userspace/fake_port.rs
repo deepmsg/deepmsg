@@ -32,7 +32,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::frame::Checksums;
-use super::packet_io::{Disposition, ReadyFrame, RxFrame, RxPort, SlotId, TxPort};
+use super::packet_io::{Disposition, ReadyFrame, RxFrame, RxPort, TxPort};
+use super::ports::Binding;
 
 /// Which end of a wire a port is on.
 ///
@@ -238,7 +239,7 @@ impl RxPort for FakePort {
         &mut self,
         max: usize,
         f: &mut dyn FnMut(RxFrame<'_>) -> Disposition,
-        kept: &mut Vec<(SlotId, ReadyFrame)>,
+        kept: &mut Vec<(Binding, ReadyFrame)>,
     ) -> usize {
         let limit = max.min(self.wire.delivery_capacity(self.side));
 
@@ -255,7 +256,7 @@ impl RxPort for FakePort {
                 checksums: Checksums::Software,
             }) {
                 Disposition::Consumed => {}
-                Disposition::Keep(slot) => kept.push((slot, ReadyFrame::Bytes(frame))),
+                Disposition::Keep(binding) => kept.push((binding, ReadyFrame::Bytes(frame))),
             }
             handed += 1;
         }
@@ -329,7 +330,14 @@ mod tests {
     /// Everything a port has to hand, and what it was asked to keep.
     fn receive(port: &mut FakePort, max: usize) -> Vec<Vec<u8>> {
         let mut kept = Vec::new();
-        port.rx_burst(max, &mut |_| Disposition::Keep(0), &mut kept);
+        // Nothing here binds a port, so the binding is a placeholder: what it
+        // holds is the caller's business, and the wire only has to carry it.
+        let binding = Binding {
+            slot: 0,
+            port: 0,
+            generation: 0,
+        };
+        port.rx_burst(max, &mut |_| Disposition::Keep(binding), &mut kept);
 
         kept.into_iter()
             .map(|(_, frame)| frame.as_bytes().to_vec())
@@ -378,7 +386,11 @@ mod tests {
             8,
             &mut |frame| {
                 if frame.bytes[0] == 0x11 {
-                    Disposition::Keep(7)
+                    Disposition::Keep(Binding {
+                        slot: 7,
+                        port: 44000,
+                        generation: 3,
+                    })
                 } else {
                     Disposition::Consumed
                 }
@@ -388,7 +400,14 @@ mod tests {
 
         assert_eq!(2, handed, "both were handed over");
         assert_eq!(1, kept.len(), "and one was kept");
-        assert_eq!(7, kept[0].0);
+        assert_eq!(
+            Binding {
+                slot: 7,
+                port: 44000,
+                generation: 3
+            },
+            kept[0].0
+        );
         assert_eq!(&[0x11; 4], kept[0].1.as_bytes());
         assert!(receive(&mut receiver, 8).is_empty(), "the other is gone");
     }

@@ -26,20 +26,60 @@
 //! (`crate::name_resolver::driver`).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use super::poller::{MediaPoller, TransportPoller};
 use super::udp_transport::{OpenError, UdpTransport};
+use super::userspace::stack::{Stack, ThreadQueues};
+use super::userspace::transport::UserspaceTransport;
 use super::{Transport, TransportParams};
 
 /// The bindings a driver's UDP data paths run on.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// `Debug` and `PartialEq` are written out rather than derived, because a
+/// stack is neither: two bindings are the same when they are the same
+/// *stack*, which is what the port table, the rings and the ports are — an
+/// `Arc` and so a pointer, not a value. `Clone` and `Default` still derive,
+/// and the driver compares bindings in one place: the configuration's own
+/// test, which asks that the only name it serves resolves to `Default`
+/// (`crate::config`).
+#[derive(Clone, Default)]
 pub enum TransportBindings {
     /// `default`: the kernel's sockets
     /// (`aeron_udp_channel_transport_bindings_default`,
     /// `media/aeron_udp_channel_transport_bindings.c:38-57`).
     #[default]
     Default,
+    /// A userspace stack: Ethernet frames in and out of a port the caller
+    /// owns, with no socket underneath.
+    ///
+    /// The stack is built by whoever owns the ports and handed to the driver,
+    /// because a port is a thing the driver does not have — in the DPDK build
+    /// it is a queue pair on an EAL that must be initialised before the driver
+    /// exists at all (the design's §4.13).
+    Userspace(Arc<Stack>),
 }
+
+impl std::fmt::Debug for TransportBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "Default"),
+            Self::Userspace(_) => write!(f, "Userspace(<stack>)"),
+        }
+    }
+}
+
+impl PartialEq for TransportBindings {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Default, Self::Default) => true,
+            (Self::Userspace(one), Self::Userspace(other)) => Arc::ptr_eq(one, other),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TransportBindings {}
 
 /// Which thread a transport or a poller will be used on
 /// (`aeron_udp_channel_transport_affinity_t`,
@@ -91,6 +131,19 @@ impl TransportBindings {
                 let transport = UdpTransport::open(bind, multicast_interface, connect, params)?;
                 Ok(Box::new(transport))
             }
+            Self::Userspace(stack) => {
+                // The transport parameters are the kernel's knobs — socket
+                // buffers, the multicast interface, the TTL — and a userspace
+                // stack has none of them: what it is sized by is its own
+                // configuration, which the caller built the stack with. The
+                // design records what each one means here rather than
+                // pretending to apply it (§4.11): `so-rcvbuf` and `so-sndbuf`
+                // are accepted and do nothing, and the channel is refused for
+                // a multicast group before a transport is ever opened for it.
+                let _ = (multicast_interface, params);
+                let transport = UserspaceTransport::open(stack.clone(), bind, connect, affinity)?;
+                Ok(Box::new(transport))
+            }
         }
     }
 
@@ -101,6 +154,12 @@ impl TransportBindings {
             Self::Default => {
                 let _ = affinity;
                 MediaPoller::Kernel(TransportPoller::new())
+            }
+            // One per agent thread, and the two behave differently: see
+            // [`ThreadQueues::pump`]. The reference passes the same affinity to
+            // `poller_init_func` for the same reason.
+            Self::Userspace(stack) => {
+                MediaPoller::Userspace(ThreadQueues::new(stack.clone(), affinity))
             }
         }
     }

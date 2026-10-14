@@ -25,6 +25,7 @@
 //! stay in step are one list too many (§3.3 of the plan).
 
 use super::frame::Checksums;
+use super::ports::Binding;
 
 /// Which of the stack's slots a kept frame belongs to.
 ///
@@ -52,9 +53,15 @@ pub struct RxFrame<'a> {
 pub enum Disposition {
     /// Nobody wants it: the port releases it.
     Consumed,
-    /// It belongs to the transport holding `SlotId`: the port moves it into
-    /// the burst's `kept` list.
-    Keep(SlotId),
+    /// It belongs to the transport holding this binding: the port moves it
+    /// into the burst's `kept` list.
+    ///
+    /// The whole binding travels, not just the slot, and the port does not
+    /// need to know why: what the identity buys is that the frame is filed
+    /// under the binding it was *routed* under. A slot is handed on to the
+    /// next transport that binds the port, and the frame that was in flight
+    /// while that happened must not arrive at the new one (§3.2 of the plan).
+    Keep(Binding),
 }
 
 /// A frame that has left its port but not yet its transport.
@@ -90,15 +97,15 @@ pub trait RxPort: Send {
     /// Answers how many frames were handed over — which is how many times `f`
     /// was called, not how many were kept.
     ///
-    /// A frame `f` answers `Keep(slot)` for is moved into `kept` as a
-    /// `(slot, frame)` pair, appending. The list is the caller's and is not
+    /// A frame `f` answers `Keep(binding)` for is moved into `kept` as a
+    /// `(binding, frame)` pair, appending. The list is the caller's and is not
     /// cleared here: a burst may be run into a list that already holds a
     /// previous burst's frames.
     fn rx_burst(
         &mut self,
         max: usize,
         f: &mut dyn FnMut(RxFrame<'_>) -> Disposition,
-        kept: &mut Vec<(SlotId, ReadyFrame)>,
+        kept: &mut Vec<(Binding, ReadyFrame)>,
     ) -> usize;
 
     /// This port's MAC address, which every frame it sends has to carry as its

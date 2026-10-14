@@ -89,6 +89,26 @@ impl Datagrams {
     pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    /// Record one more datagram, which is what a transport with no kernel
+    /// behind it has to do for itself: the kernel's own writer is
+    /// [`DatagramSocket::receive_batch`], and a transport that reads frames
+    /// somewhere else (`crate::media::userspace`) composes the same
+    /// descriptions and hands them on.
+    ///
+    /// Answers whether there was room. The batch holds [`MAX_BATCH`], the
+    /// number the kernel would have written, and a caller with more datagrams
+    /// than that has read more than one call may carry.
+    pub fn push(&mut self, datagram: Datagram) -> bool {
+        if self.count == self.datagrams.len() {
+            return false;
+        }
+
+        self.datagrams[self.count] = datagram;
+        self.count += 1;
+
+        true
+    }
 }
 
 impl Default for Datagrams {
