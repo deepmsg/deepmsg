@@ -145,6 +145,17 @@ impl Port {
         &self.info
     }
 
+    /// What the port named `name` is, before anything is configured on it.
+    ///
+    /// A caller has to be able to read a port before it starts it, because what
+    /// a port can do decides what it is asked for: a capability the device does
+    /// not have makes [`Port::start`] fail rather than be ignored
+    /// ([`PortSettings::asking_for_checksum_offloads`]), and a queue count past
+    /// the device's maximum is a configuration it will refuse.
+    pub fn describe(name: &str) -> Result<PortInfo, Error> {
+        info_of(id_of(name)?)
+    }
+
     /// This port's hardware address.
     pub fn mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
