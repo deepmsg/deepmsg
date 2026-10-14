@@ -38,4 +38,6 @@
 //! needs any of those is counted and dropped, not handled (the design's §4.11
 //! list).
 
+pub mod fake_port;
 pub mod frame;
+pub mod packet_io;
