@@ -941,6 +941,7 @@ mod tests {
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
             ),
+            None,
         ));
         let mut transport = open(&stack, 40487);
         stack.insert_neighbour(gateway, [0x02, 0, 0, 0, 0, 0xfe]);

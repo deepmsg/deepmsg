@@ -320,7 +320,7 @@ fn a_frame_the_ring_has_no_room_for_goes_back_to_the_pool_in_the_child() {
     let capacity = params.ring_capacity();
     assert_eq!(2, capacity, "the smallest ring there is");
 
-    let stack = Stack::new(params, Clock::Monotonic, ports.rx, ports.tx);
+    let stack = Stack::new(params, Clock::Monotonic, ports.rx, ports.tx, None);
     let (_binding, ring) = stack
         .bind(Some(OWN), BOUND, None, SocketAddr::from((OWN, BOUND)))
         .expect("the port binds");

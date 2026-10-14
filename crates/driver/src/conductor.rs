@@ -644,6 +644,10 @@ pub struct Conductor {
     termination: TerminationPolicy,
     timer_interval_ns: i64,
     liveness_timeout_ns: i64,
+    /// The DPDK media's counters, when this driver is running on one — the
+    /// port's own for a port it drives, and [`None`] for a driver whose data
+    /// paths are the kernel's (design §4.10).
+    media_counters: Option<crate::media::userspace::dpdk_counters::DpdkCounters>,
     clock: CachedClock,
     clock_update_deadline_ns: i64,
     timeout_check_deadline_ns: i64,
@@ -808,6 +812,33 @@ impl Conductor {
                 },
             )
             .map_err(ConductorError::SystemCounters)?
+        };
+
+        // The media's own counters, which come **after** the system counters
+        // and never before them: the system ones have to be the first thing
+        // allocated on a fresh CnC file, in table order, and a driver that put
+        // a port's counters in front of them would move every id a reader
+        // knows (`aeron-client/src/main/c/aeron_counters.h:155-173`, and
+        // `system_counters`' own note).
+        //
+        // Nothing is allocated on a driver whose data paths are the kernel's:
+        // there is no port to count, and there is nothing to label.
+        let media_counters = match &config.transport_bindings {
+            crate::media::TransportBindings::Userspace(stack) => {
+                let regions = cnc
+                    .counter_regions()
+                    .ok_or(ConductorError::NoCounterRegions)?;
+
+                stack.identity().and_then(|identity| {
+                    crate::media::userspace::dpdk_counters::DpdkCounters::allocate(
+                        &mut counters,
+                        &regions,
+                        &identity,
+                        now_ms,
+                    )
+                })
+            }
+            crate::media::TransportBindings::Default => None,
         };
 
         // The resolver the settings named, built where the counters and the
@@ -988,6 +1019,7 @@ impl Conductor {
             transmitter,
             counters,
             system_counters: owned_counters,
+            media_counters,
             parked_command: None,
             agent_parsed_channel: None,
             resumed_destination: None,
@@ -1096,6 +1128,7 @@ impl Conductor {
             work_count += self.check_publications(now_ns);
             work_count += self.check_untethered_publications(now_ns);
             work_count += usize::from(self.check_for_blocked_commands(now_ns));
+            work_count += self.poll_media_counters();
             self.timeout_check_deadline_ns = now_ns.saturating_add(self.timer_interval_ns);
         }
 
@@ -1377,6 +1410,56 @@ impl Conductor {
     /// finished its life is a request to release it. The third is a fault, for
     /// the error log this thread does not write itself.
     ///
+    /// Put the media's counters where a reader can see them (design §4.10).
+    ///
+    /// Two halves, and both are on this timer for the same reason: they are
+    /// numbers that move whether or not the driver is asked anything, and a
+    /// reader that polls one should not be told the answer by whichever pass
+    /// happened to have work to do. The **stack's** own counts are its atomics
+    /// read out — one write each, no copying between two places that could
+    /// drift — and the **port's** are three numbers only a device and its pool
+    /// know, which is why they cost a call into the PMD.
+    ///
+    /// A driver whose data paths are the kernel's has no counters here and
+    /// answers nothing, which is the same answer as a build with no DPDK in it:
+    /// the field is what is absent, not the call.
+    fn poll_media_counters(&mut self) -> usize {
+        let Some(media) = self.media_counters.as_ref() else {
+            return 0;
+        };
+
+        let crate::media::TransportBindings::Userspace(stack) = &self.config.transport_bindings
+        else {
+            return 0;
+        };
+
+        let Some(regions) = self.cnc.counter_regions() else {
+            return 0;
+        };
+
+        let counters = stack.counters();
+
+        let _ = media.publish(&self.counters, &regions, counters);
+        let _ = media.publish_poller(
+            &self.counters,
+            &regions,
+            counters.poller.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        if let Err(error) = media.sample(&self.counters, &regions, stack) {
+            // Counted, and recorded: a port that has stopped answering is a
+            // driver whose numbers have stopped moving, and 79 is what a reader
+            // can see that in.
+            let _ = media.record_error(&self.counters, &regions);
+            self.pending_log_errors.push((
+                deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
+                format!("could not read the dpdk port's counters: {error}"),
+            ));
+        }
+
+        1
+    }
+
     /// The create itself is like every other create here: it burns a
     /// registration id, asks the agent for a log buffer off-thread, and the
     /// image is built when the buffer lands (`poll_images`).
@@ -6902,6 +6985,129 @@ mod tests {
         assert!(
             text.contains("cannot reach 192.0.2.5") && text.contains("ENETUNREACH"),
             "and this one that the media has no way to get there: {text}"
+        );
+    }
+
+    /// The media's counters: allocated where the driver opens one, and written
+    /// by the conductor's own timer, which is the whole of the design's §4.10
+    /// for a port this driver drives (design §3.3).
+    ///
+    /// The path end to end, in the gate every change goes through rather than
+    /// in the one that needs DPDK: a stack with a **device behind it** answers
+    /// for its port and counts into its own atomics, the conductor allocates
+    /// the counters at startup, its timer writes them, and a second mapping of
+    /// the CnC file reads them back the way a client does.
+    #[test]
+    fn the_medias_counters_are_published_where_a_client_reads_them() {
+        use crate::media::TransportBindings;
+        use crate::media::userspace::dpdk_counters::{Device, type_id};
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{
+            Clock, DeviceParts, Stack, StackParams, TransmitQueues,
+        };
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::Ordering;
+
+        let temp = TempDir::new();
+        let wire = Wire::new();
+        let mac = [0x02, 0, 0, 0, 0, 0x01];
+        let params = StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, mac);
+        // What the port counts, fixed: this is a test of where the numbers go,
+        // not of what a device would say.
+        let reading = Device {
+            up: true,
+            received: 11,
+            transmitted: 22,
+            missed: 7,
+            mempool_available: 99,
+            ..Device::default()
+        };
+
+        let stack = Stack::new(
+            params.clone(),
+            Clock::Monotonic,
+            Box::new(wire.port(Side::A, mac, 1514)),
+            TransmitQueues::PerRole(
+                Box::new(wire.port(Side::A, mac, 1514)),
+                Box::new(wire.port(Side::A, mac, 1514)),
+            ),
+            Some(DeviceParts {
+                name: "0000:03:00.1".to_owned(),
+                driver: "a-pmd".to_owned(),
+                read: Box::new(move || Ok(reading)),
+            }),
+        );
+
+        // One of the stack's own counts, which the timer forwards rather than
+        // re-counting.
+        stack.counters().arp_miss.fetch_add(3, Ordering::Relaxed);
+
+        let mut config = publication_config(&temp.0);
+        config.transport_bindings = TransportBindings::Userspace(std::sync::Arc::clone(&stack));
+
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, _receiver) = events_reader(&temp.0);
+
+        // The tier is a deadline in the monotonic clock and it is met here
+        // rather than waited for: the conductor is built with the deadline in
+        // its own past, so the first pass takes it — which is also what a
+        // driver does, and why a counter appears within milliseconds of start
+        // rather than an interval after it.
+        conductor.timeout_check_deadline_ns = 0;
+        conductor.do_work();
+
+        let reader = cnc.counters().expect("the counter regions");
+        let mut published = Vec::new();
+        reader.for_each(|descriptor| published.push(descriptor.clone()));
+
+        let value = |what: i32| {
+            published
+                .iter()
+                .find(|descriptor| descriptor.type_id == what)
+                .map_or_else(|| panic!("a counter of type {what}"), |found| found.value)
+        };
+
+        assert_eq!(1, value(type_id::PORT_INFO), "the link is up");
+        assert_eq!(7, value(type_id::MISSED_PACKETS), "what the device dropped");
+        assert_eq!(99, value(type_id::MEMPOOL_AVAILABLE), "what the pool has");
+        assert_eq!(
+            11,
+            value(type_id::PKTS),
+            "the first of the two packet counts"
+        );
+        assert_eq!(3, value(type_id::ARP_MISS), "and one the stack counted");
+
+        // The label, which is what makes a set of these readable as a set: a
+        // reader that has found one has found the port they all belong to.
+        let labelled = published
+            .iter()
+            .find(|descriptor| descriptor.type_id == type_id::MISSED_PACKETS)
+            .expect("the missed counter");
+        assert_eq!(
+            "dpdk port: 0000:03:00.1 mac=02:00:00:00:00:01 ip=10.10.0.1/24 driver=a-pmd \
+             missed-packets",
+            labelled.label
+        );
+
+        // And no driver whose data paths are the kernel's has any of them: the
+        // counters come from the media being open, not from the build.
+        let plain = TempDir::new();
+        let plain_config = publication_config(&plain.0);
+        let cnc = create(&plain.0);
+        let mut conductor = Conductor::new(cnc, &plain_config).expect("conductor");
+        conductor.timeout_check_deadline_ns = 0;
+        conductor.do_work();
+
+        let (cnc, _receiver) = events_reader(&plain.0);
+        let reader = cnc.counters().expect("the counter regions");
+        let mut published = Vec::new();
+        reader.for_each(|descriptor| published.push(descriptor.clone()));
+        assert!(
+            published
+                .iter()
+                .all(|descriptor| descriptor.type_id < type_id::PORT_INFO),
+            "a driver on the kernel's sockets allocates the system counters and nothing else"
         );
     }
 

@@ -46,6 +46,7 @@ use crate::sys::socket::BindFailure;
 
 use super::arp;
 use super::demux;
+use super::dpdk_counters::{Device, PortIdentity};
 use super::fake_port::{Side, Wire};
 use super::frame::{self, ArpPacket, EthernetHeader};
 use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
@@ -412,6 +413,30 @@ pub const PORT_INTERFACE_INDEX: u32 = 1;
 
 /// One machine's userspace stack.
 ///
+/// What a stack needs to answer for the device it drives (design §4.10).
+///
+/// Two things a fake wire has not got and a port has: what the port calls
+/// itself, which is what its counters are labelled with, and how to read the
+/// numbers only a device and its pool know. The reading is a boxed function
+/// rather than a field of DPDK types so that a stack is one type in both
+/// builds, and so that a test can put a device behind a fake wire.
+pub struct DeviceParts {
+    /// The name EAL knows the port by.
+    pub name: String,
+    /// The PMD's name.
+    pub driver: String,
+    /// Reads what only the device and its pool can answer.
+    pub read: DeviceReader,
+}
+
+/// How a stack reads its device — see [`DeviceParts`].
+///
+/// # Errors
+///
+/// The device's own words, as a `String` because the type that fails belongs to
+/// a crate this module does not depend on.
+pub type DeviceReader = Box<dyn Fn() -> Result<Device, String> + Send + Sync>;
+
 /// Not `Debug`: its ports are trait objects, and there is nothing useful to
 /// print about a stack that its accessors do not already answer.
 pub struct Stack {
@@ -427,6 +452,8 @@ pub struct Stack {
     tx: [Arc<Mutex<Box<dyn TxPort>>>; 2],
     counters: StackCounters,
     now: Clock,
+    /// The port this stack drives, when it drives one ([`DeviceParts`]).
+    device: Option<DeviceParts>,
 }
 
 /// The transmit queues a stack's two roles drive.
@@ -463,6 +490,7 @@ impl Stack {
         now: Clock,
         rx: Box<dyn RxPort>,
         tx: TransmitQueues,
+        device: Option<DeviceParts>,
     ) -> Arc<Self> {
         let capacity = params.ring_capacity();
         let neighbours =
@@ -490,7 +518,37 @@ impl Stack {
             tx,
             counters: StackCounters::default(),
             now,
+            device,
         })
+    }
+
+    /// What the port this stack drives says about itself, which is what its
+    /// counters are labelled with (design §4.10).
+    ///
+    /// [`None`] on a stack with no device behind it — a fake wire's — because a
+    /// label naming a port that does not exist is a counter a reader cannot
+    /// place, and there is nothing to place it by.
+    pub fn identity(&self) -> Option<PortIdentity<'_>> {
+        let device = self.device.as_ref()?;
+
+        Some(PortIdentity {
+            name: &device.name,
+            driver: &device.driver,
+            mac: self.params.mac,
+            address: self.params.address,
+            prefix_length: self.params.prefix_length,
+        })
+    }
+
+    /// Read what the device and its pool answered, or [`None`] on a stack with
+    /// no device behind it.
+    ///
+    /// Asked on the timer that publishes this media's counters, which is why
+    /// the read is the device's own: what only a port knows — what it dropped,
+    /// what the link is doing, what the pool has free — is not in any counter
+    /// this stack keeps.
+    pub fn device_reading(&self) -> Option<Result<Device, String>> {
+        Some((self.device.as_ref()?.read)())
     }
 
     /// A stack whose three ports are all on one side of a [`Wire`] — the shape
@@ -511,6 +569,7 @@ impl Stack {
             now,
             Box::new(port()),
             TransmitQueues::PerRole(Box::new(port()), Box::new(port())),
+            None,
         )
     }
 

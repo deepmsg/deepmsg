@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_cnc::CncFile;
+use deepmsg_driver::media::userspace::dpdk_counters::type_id;
 use deepmsg_driver::system_counters::id;
 
 /// The two ends of the pair, named by whoever made it.
@@ -227,6 +228,23 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// One driver's counter **of a type**, read the way a client reads it.
+///
+/// By type rather than by id because the media's counters are allocated after
+/// the system ones and the manager hands the ids out: the type is what the
+/// reference's own table names (`aeron-client/src/main/c/aeron_counters.h`), and
+/// it is also what tells one of a media's counters from a driver's.
+fn media_counter(cnc: &CncFile, type_id: i32) -> Option<i64> {
+    let mut found = None;
+    cnc.counters()?.for_each(|descriptor| {
+        if descriptor.type_id == type_id {
+            found = Some(descriptor.value);
+        }
+    });
+
+    found
 }
 
 /// One driver's counter, read the way a client reads it.
@@ -418,6 +436,39 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
         counter(&bob_cnc, id::BYTES_RECEIVED) > 0,
         "the second driver received no bytes through its port"
     );
+
+    // The media's **own** counters, which is the half of §4.10 that needs a
+    // real port: 75 is the link's state and 91 is what the pool has free, and
+    // both are numbers only the device and the pool can answer. A driver whose
+    // data paths are the kernel's has neither, so this is also what says the
+    // media is where the frames went.
+    //
+    // Read as soon as they appear rather than after a fixed wait: the
+    // conductor publishes them on the timer tier, whose first firing is the
+    // pass after startup and whose next is an interval later.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let up = |cnc: &CncFile| media_counter(cnc, type_id::PORT_INFO);
+        if up(&alice_cnc) == Some(1) && up(&bob_cnc) == Some(1) {
+            break;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the media's own counters were never published: the sender's link is {:?} and \
+             the receiver's {:?}",
+            up(&alice_cnc),
+            up(&bob_cnc)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    for (name, cnc) in [("the sender", &alice_cnc), ("the receiver", &bob_cnc)] {
+        assert!(
+            media_counter(cnc, type_id::MEMPOOL_AVAILABLE).is_some_and(|free| free > 0),
+            "{name}'s pool has frames to give"
+        );
+    }
 
     assert!(
         alice.is_running() && bob.is_running(),

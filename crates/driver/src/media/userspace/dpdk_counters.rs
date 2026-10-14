@@ -27,10 +27,12 @@
 //! # Why this is not behind the `dpdk` feature
 //!
 //! Allocation, labels and forwarding need neither DPDK nor a port: they are the
-//! CnC file and a handful of atomics. Only [`DpdkCounters::sample`] reaches the
-//! crate, so it is the only part that is gated — and the criteria for the
-//! export path (a counter allocated here is a counter a client can read) run in
-//! the gate every change goes through rather than in the one that needs DPDK.
+//! CnC file and a handful of atomics. The one method that reads a device —
+//! [`DpdkCounters::sample`] — reads it **through the stack**, which is where
+//! the port and the pool are reachable from ([`crate::media::userspace::stack::DeviceParts`]),
+//! so nothing here is gated at all and the criteria for the export path (a
+//! counter allocated here is a counter a client can read) run in the gate every
+//! change goes through rather than in the one that needs DPDK.
 //!
 //! # Port and thread, not "per ready queue"
 //!
@@ -47,7 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use deepmsg_cnc::layout;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
-use super::stack::StackCounters;
+use super::stack::{Stack, StackCounters};
 
 /// The reference's own type ids for these counters
 /// (`aeron-client/src/main/c/aeron_counters.h:155-173`).
@@ -216,6 +218,8 @@ pub struct DpdkCounters {
     mempool: i32,
     /// 87 — the passes a poller has made, one per thread role.
     poller: i32,
+    /// 79 — reads of the device that failed.
+    errors: i32,
     /// The rest: what the stack has already counted, published under the type
     /// the reference gives it.
     forwarded: Vec<Forwarded>,
@@ -271,11 +275,10 @@ impl DpdkCounters {
         let transmitted_bytes = allocate("bytes-sent", type_id::BYTES)?;
         let missed = allocate("missed-packets", type_id::MISSED_PACKETS)?;
         let mempool = allocate("mempool-available", type_id::MEMPOOL_AVAILABLE)?;
-        // 79 is the port's own failures, which nothing here records yet: it is
-        // allocated so that a reader comparing this media's counter set against
-        // the reference's finds the shape it expects, and the writer lands with
-        // the error paths that have somewhere to put it.
-        let _errors = allocate("error", type_id::ERROR)?;
+        // 79 is the port's own failures. Its writer is the timer that reads the
+        // device: a read that fails is a failure of this media's port and of
+        // nothing else, which is what makes one number enough for it.
+        let errors = allocate("error", type_id::ERROR)?;
 
         // 87 is one per poller rather than one per port, and in this build
         // there is one poller per agent role.
@@ -327,6 +330,7 @@ impl DpdkCounters {
             missed,
             mempool,
             poller,
+            errors,
             forwarded,
         })
     }
@@ -376,37 +380,52 @@ impl DpdkCounters {
     /// (`rte_eth_stats_get` is documented as callable, but a PMD's own
     /// implementation is its own).
     ///
+    /// **The read is the stack's**, which is what keeps this module free of the
+    /// DPDK crate: a stack that drives a device knows how to read it and one
+    /// that does not answers nothing, so the timer asks the same question of
+    /// both and neither has to be told which it is.
+    ///
     /// # Errors
     ///
-    /// The error from the port, which the caller records as it records any
-    /// other failure of the media — this build's 79 is for exactly that.
-    #[cfg(feature = "dpdk")]
+    /// The device's own words, which the caller records as it records any other
+    /// failure of the media — a device read that fails is what this build's 79
+    /// is for.
     pub fn sample(
         &self,
         manager: &CounterManager,
         regions: &CounterRegions<'_>,
-        port: &deepmsg_dpdk::Port,
-        pool: &deepmsg_dpdk::Mempool,
-    ) -> Result<(), deepmsg_dpdk::Error> {
-        let stats = port.stats()?;
-        let link = port.link()?;
+        stack: &Stack,
+    ) -> Result<(), String> {
+        let Some(reading) = stack.device_reading() else {
+            return Ok(());
+        };
 
-        let _ = self.publish_device(
-            manager,
-            regions,
-            &Device {
-                up: link.up,
-                no_buffers: stats.no_buffers,
-                received: stats.received,
-                transmitted: stats.transmitted,
-                received_bytes: stats.received_bytes,
-                transmitted_bytes: stats.transmitted_bytes,
-                missed: stats.missed,
-                mempool_available: pool.available(),
-            },
-        );
+        let device = reading?;
+
+        let _ = self.publish_device(manager, regions, &device);
 
         Ok(())
+    }
+
+    /// Count a read of the device that failed.
+    ///
+    /// The one thing this media's own 79 is for: a port that will not answer is
+    /// a driver whose numbers stop moving, and a reader that can see the failure
+    /// counted can tell that from an idle port.
+    ///
+    /// # Errors
+    ///
+    /// `None` if the counter cannot be read or written, which means the CnC
+    /// file is not the one it was allocated on.
+    pub fn record_error(
+        &self,
+        manager: &CounterManager,
+        regions: &CounterRegions<'_>,
+    ) -> Option<()> {
+        let value = manager.value(regions, self.errors).unwrap_or(0);
+        manager.set_value(regions, self.errors, value.saturating_add(1))?;
+
+        Some(())
     }
 
     /// Publish what the device answered.
@@ -449,6 +468,7 @@ impl std::fmt::Debug for DpdkCounters {
             .field("port_info", &self.link)
             .field("missed", &self.missed)
             .field("mempool", &self.mempool)
+            .field("errors", &self.errors)
             .field("forwarded", &self.forwarded.len())
             .finish()
     }

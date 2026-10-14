@@ -400,9 +400,42 @@ impl DpdkMedia {
             }
         };
         let params = stack_params(&self.settings, mac)?;
+
+        // What the counters will be labelled with, and how the timer reads the
+        // numbers only the device has (design §4.10) — taken **before** the
+        // pairs go into the ports, because that is the last moment anything
+        // here holds a port.
+        //
+        // The two handles are what makes the media's own counters reachable at
+        // all: a `Port` is otherwise buried in the queue pair that the endpoint
+        // holding it drives from another thread, and the pool is a process
+        // static nothing else can reach. They are what a device read needs and
+        // nothing else does.
+        let device_port = self.pairs.first().map(|pair| Arc::clone(pair.port()));
+        let pool = self.pool();
+        let device = device_port.map(|port| crate::media::userspace::stack::DeviceParts {
+            name: self.info.name.clone(),
+            driver: self.info.driver.clone(),
+            read: Box::new(move || {
+                let stats = port.stats().map_err(|error| error.to_string())?;
+                let link = port.link().map_err(|error| error.to_string())?;
+
+                Ok(crate::media::userspace::dpdk_counters::Device {
+                    up: link.up,
+                    no_buffers: stats.no_buffers,
+                    received: stats.received,
+                    transmitted: stats.transmitted,
+                    received_bytes: stats.received_bytes,
+                    transmitted_bytes: stats.transmitted_bytes,
+                    missed: stats.missed,
+                    mempool_available: pool.available(),
+                })
+            }),
+        });
+
         let ports = self.into_ports()?;
 
-        Ok(Stack::new(params, now, ports.rx, ports.tx))
+        Ok(Stack::new(params, now, ports.rx, ports.tx, device))
     }
 }
 
