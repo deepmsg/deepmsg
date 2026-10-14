@@ -29,6 +29,29 @@ pub const SHIM_CKSUM_NONE: u32 = 0;
 pub const SHIM_CKSUM_GOOD: u32 = 1;
 pub const SHIM_CKSUM_BAD: u32 = 2;
 
+/// One frame to transmit: allocated by the shim, written here, handed back in
+/// a burst. `ol_flags` is the offload the caller wants for this frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ShimTxSlot {
+    pub mbuf: *mut c_void,
+    pub data: *mut u8,
+    pub room: u16,
+    pub len: u16,
+    pub ol_flags: u64,
+}
+
+impl ShimTxSlot {
+    /// An empty slot, for the array a burst is filled into.
+    pub const EMPTY: Self = Self {
+        mbuf: std::ptr::null_mut(),
+        data: std::ptr::null_mut(),
+        room: 0,
+        len: 0,
+        ol_flags: 0,
+    };
+}
+
 /// What a port is, as far as this build asks (mirrors `shim_port_info_t`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +125,13 @@ unsafe extern "C" {
 
     // The data path, in batches: one call per burst, whatever it carries.
     pub fn shim_rx_burst(port: c_uint, queue: c_uint, out: *mut ShimRxDesc, max: c_uint) -> c_uint;
+    pub fn shim_tx_alloc(pool: *mut c_void, out: *mut ShimTxSlot, count: c_uint) -> c_uint;
+    pub fn shim_tx_burst(
+        port: c_uint,
+        queue: c_uint,
+        slots: *mut ShimTxSlot,
+        count: c_uint,
+    ) -> c_uint;
     pub fn shim_mbuf_info_bulk(mbufs: *const *mut c_void, out: *mut ShimRxDesc, count: c_uint);
     pub fn shim_mbuf_free_bulk(mbufs: *mut *mut c_void, count: c_uint);
 

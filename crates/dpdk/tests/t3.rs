@@ -126,9 +126,41 @@ impl Capture {
         Self(path)
     }
 
+    /// A path with nothing at it: what a `tx_pcap` port is told to write to.
+    fn for_writing(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "deepmsg-dpdk-t3-{}-{name}.pcap",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
     fn path(&self) -> &str {
         self.0.to_str().expect("a UTF-8 path")
     }
+}
+
+/// Read a capture back: the frames in it, in order.
+fn read_capture(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).unwrap_or_else(|error| {
+        panic!("reading {}: {error}", path.display());
+    });
+    assert!(bytes.len() >= 24, "a capture has a file header");
+
+    let mut frames = Vec::new();
+    let mut cursor = 24; // the file header
+    while cursor + 16 <= bytes.len() {
+        let lengths = &bytes[cursor..cursor + 16];
+        let incl_len = u32::from_le_bytes(lengths[8..12].try_into().expect("four bytes"));
+        cursor += 16;
+        let end = cursor + incl_len as usize;
+        assert!(end <= bytes.len(), "a record's frame is in the file");
+        frames.push(bytes[cursor..end].to_vec());
+        cursor = end;
+    }
+
+    frames
 }
 
 impl Drop for Capture {
@@ -387,7 +419,155 @@ fn a_burst_answers_what_it_was_asked_for_in_the_child() {
     );
 }
 
+// ---- the transmit path -------------------------------------------------
+
+/// Where a child is told to write what it sends.
+const TX_PCAP: &str = "DEEPMSG_DPDK_T3_TX_PCAP";
+
+/// A frame handed to the port leaves through it, byte for byte — read back out
+/// of the capture the PMD wrote.
+#[test]
+fn a_transmitted_frame_leaves_through_the_pmd() {
+    let capture = Capture::for_writing("tx");
+    in_a_child(
+        "a_transmitted_frame_leaves_through_the_pmd_in_the_child",
+        &[(TX_PCAP, capture.path())],
+    );
+
+    let written = read_capture(Path::new(capture.path()));
+    assert_eq!(written.len(), 1, "one frame left through the port");
+    assert_eq!(
+        written[0],
+        a_frame(0),
+        "the bytes that left are the bytes that were written into the frame"
+    );
+}
+
+/// The body of the case above.
+#[test]
+#[ignore = "runs as a child of `a_transmitted_frame_leaves_through_the_pmd`"]
+fn a_transmitted_frame_leaves_through_the_pmd_in_the_child() {
+    let capture = std::env::var(TX_PCAP).expect("the parent passes the capture's path");
+    let expected = a_frame(0);
+    let mut port = Started::net_pcap_tx("net_pcap0", &capture);
+    let before = port.pool.available();
+
+    let sent = port.pairs[0].tx_burst(&port.pool, 1, &mut |room| {
+        room[..expected.len()].copy_from_slice(&expected);
+        expected.len()
+    });
+
+    assert_eq!(sent, 1, "the frame left");
+    assert_eq!(
+        port.pool.available(),
+        before,
+        "the frame the NIC took is no longer the pool's, and nothing else was lost"
+    );
+}
+
+/// The ports a frame and a queue pair have to cross.
+///
+/// `QueuePair`, `ParkedFrame` and the ring's halves are `Send`: they are made
+/// on one thread and used on another. They are also not `Sync`, which is the
+/// other half of the same invariant — and that half cannot be asserted here,
+/// because proving the *absence* of a trait needs a compile-fail harness this
+/// workspace has no room for. What enforces it is the type: `PhantomData<*mut
+/// ()>` in `QueuePair` and in both ring halves.
+#[test]
+fn what_crosses_threads_can() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<QueuePair>();
+    assert_send::<ParkedFrame<'static>>();
+    assert_send::<deepmsg_dpdk::Producer<'static>>();
+    assert_send::<deepmsg_dpdk::Consumer<'static>>();
+    assert_send::<Mempool>();
+    assert_send::<Port>();
+}
+
+// ---- the case that needs privileges ------------------------------------
+
+/// The two ends of a veth pair, for the case below.
+const VETH_A: &str = "DEEPMSG_DPDK_T3_VETH_A";
+const VETH_B: &str = "DEEPMSG_DPDK_T3_VETH_B";
+
+/// A frame crosses a real kernel interface, through `net_af_packet`.
+///
+/// `#[ignore]`d, and the only case here that is: it needs a veth pair and
+/// `CAP_NET_RAW`, which is to say root. T3's criteria do not rest on it — the
+/// frame path is judged on `net_pcap` above, without privileges — so this is
+/// the bench machine's case, run by hand:
+///
+/// ```text
+/// sudo ip link add deepmsg-a type veth peer name deepmsg-b
+/// sudo ip link set deepmsg-a up && sudo ip link set deepmsg-b up
+/// sudo -E env PATH="$PATH" RUSTUP_HOME=~/.rustup CARGO_HOME=~/.cargo \
+///     cargo test -p deepmsg-dpdk --features dpdk -- --ignored af_packet
+/// ```
+#[test]
+#[ignore = "needs a veth pair and CAP_NET_RAW: set DEEPMSG_DPDK_T3_VETH_A/_B and run under sudo"]
+fn af_packet_carries_a_frame_through_a_veth() {
+    let (a, b) = match (std::env::var(VETH_A), std::env::var(VETH_B)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => panic!(
+            "set {VETH_A} and {VETH_B} to the two ends of a veth pair:\n  \
+             sudo ip link add deepmsg-a type veth peer name deepmsg-b\n  \
+             sudo ip link set deepmsg-a up\n  sudo ip link set deepmsg-b up"
+        ),
+    };
+    let _ = (&a, &b);
+
+    let expected = a_frame(0);
+    let args = [
+        EAL_ARGS[0],
+        EAL_ARGS[1],
+        EAL_ARGS[2],
+        EAL_ARGS[3],
+        &format!("--vdev=net_af_packet0,iface={a}"),
+        &format!("--vdev=net_af_packet1,iface={b}"),
+    ];
+
+    let mut sending = Started::start(&args, "net_af_packet0", carrying());
+    let mut receiving = Started::start(&args, "net_af_packet1", carrying());
+
+    let sent = sending.pairs[0].tx_burst(&sending.pool, 1, &mut |room| {
+        room[..expected.len()].copy_from_slice(&expected);
+        expected.len()
+    });
+    assert_eq!(sent, 1, "the frame left the first interface");
+
+    let mut arrived = Vec::new();
+    let received = receive(&receiving.pool, &mut receiving.pairs[0], &mut arrived, 1);
+    assert_eq!(received, 1, "and arrived on the other one");
+    assert_eq!(
+        arrived[0].bytes(),
+        expected.as_slice(),
+        "the bytes that crossed the veth are the bytes that were sent"
+    );
+}
+
 // ---- the pieces the cases above share ---------------------------------
+
+/// A port that only receives: one receive queue, and nothing to send on.
+fn reading() -> PortSettings {
+    PortSettings {
+        rx_queues: 1,
+        tx_queues: 0,
+        rx_descriptors: 128,
+        ..PortSettings::default()
+    }
+}
+
+/// A port with one queue pair, which is what a case that sends needs.
+fn carrying() -> PortSettings {
+    PortSettings {
+        rx_queues: 1,
+        tx_queues: 1,
+        rx_descriptors: 128,
+        tx_descriptors: 128,
+        ..PortSettings::default()
+    }
+}
 
 /// A started port, its pool, and its queue pairs: what a child case needs
 /// before it can receive anything.
@@ -407,14 +587,28 @@ impl Started {
         let mut args = EAL_ARGS.to_vec();
         let vdev = net_pcap(name, capture);
         args.push(&vdev);
-        Self::start(name, args)
+        Self::start(&args, name, reading())
     }
 
-    fn start(name: &str, args: Vec<&str>) -> Self {
+    /// A `net_pcap` port writing to `capture`: nothing arrives, everything
+    /// sent lands in the file.
+    fn net_pcap_tx(name: &str, capture: &str) -> Self {
+        let mut args = EAL_ARGS.to_vec();
+        let vdev = format!("--vdev={name},tx_pcap={capture}");
+        args.push(&vdev);
+        Self::start(&args, name, carrying())
+    }
+
+    /// Start the named port on an EAL already given `args`.
+    ///
+    /// A case with two ports calls this twice: the EAL's `init` answers the
+    /// first call and every later one, so the devices both ports need are in
+    /// the first argument list.
+    fn start(args: &[&str], name: &str, settings: PortSettings) -> Self {
         Eal::init(args).expect("EAL starts");
 
         let pool = Mempool::create(
-            "t3_pool",
+            &format!("t3_{name}_pool"),
             &MempoolSettings {
                 count: 1023,
                 cache: 64,
@@ -423,17 +617,7 @@ impl Started {
         )
         .expect("a pool");
 
-        let (port, pairs) = Port::start(
-            name,
-            &PortSettings {
-                rx_queues: 1,
-                tx_queues: 0,
-                rx_descriptors: 128,
-                ..PortSettings::default()
-            },
-            &pool,
-        )
-        .expect("the port starts");
+        let (port, pairs) = Port::start(name, &settings, &pool).expect("the port starts");
 
         Self {
             pairs,

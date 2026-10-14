@@ -321,6 +321,76 @@ impl QueuePair {
     }
 }
 
+impl QueuePair {
+    /// Allocate up to `count` frames, let `fill` write each, and hand them to
+    /// the NIC. Answers how many left.
+    ///
+    /// `fill` is given the frame's room — headers and payload both, because
+    /// this is the whole frame — and answers how many bytes it wrote; more than
+    /// the room is refused by an assertion rather than truncated silently. The
+    /// frames the NIC did not take are freed **inside the burst**, so the
+    /// number this answers is exactly what left the machine, which is what a
+    /// sender's position advances by. A `fill` that panics leaks the frames the
+    /// burst had not reached; as on the receive side, a panic here is already
+    /// the end of the process's media.
+    ///
+    /// Zero frames come back when the pool has none: that is back pressure, and
+    /// the caller tries again next pass.
+    pub fn tx_burst(
+        &mut self,
+        pool: &Mempool,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> usize {
+        let count = count.min(SHIM_BURST_MAX);
+        if count == 0 {
+            return 0;
+        }
+
+        let mut slots = [sys::ShimTxSlot::EMPTY; SHIM_BURST_MAX];
+        // SAFETY: the slot array holds `SHIM_BURST_MAX` writable slots and
+        // `count` is at most that; the pool outlives the frames it hands over,
+        // which is what the borrow says.
+        let allocated = unsafe {
+            sys::shim_tx_alloc(pool.handle().as_ptr(), slots.as_mut_ptr(), count as c_uint)
+        } as usize;
+        if allocated == 0 {
+            return 0;
+        }
+
+        for slot in &mut slots[..allocated] {
+            // SAFETY: the shim allocated this frame and wrote down the bytes
+            // this side may fill; the borrow of the room ends before the frame
+            // is handed over, so nothing is aliased when it goes.
+            let written = unsafe {
+                let room = std::slice::from_raw_parts_mut(slot.data, usize::from(slot.room));
+                let written = fill(room);
+                assert!(
+                    written <= room.len(),
+                    "a frame cannot be longer than the room it was given: {written} > {}",
+                    room.len()
+                );
+                written
+            };
+            slot.len = written as u16;
+        }
+
+        // SAFETY: the first `allocated` slots hold live frames this code owns,
+        // with the lengths it just wrote; the queue index is one this pair was
+        // set up with, and `Send + !Sync` means no other thread is in it.
+        let sent = unsafe {
+            sys::shim_tx_burst(
+                c_uint::from(self.port.id),
+                c_uint::from(self.tx_queue),
+                slots.as_mut_ptr(),
+                allocated as c_uint,
+            )
+        };
+
+        sent as usize
+    }
+}
+
 impl std::fmt::Debug for QueuePair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuePair")

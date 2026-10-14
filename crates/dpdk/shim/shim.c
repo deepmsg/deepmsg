@@ -68,6 +68,20 @@ typedef struct {
     uint32_t checksum;
 } shim_rx_desc;
 
+/*
+ * A frame on the way out: allocated by the shim, written by Rust, handed over
+ * in one burst. `room` is what Rust may write, `len` is what it wrote, and
+ * `ol_flags` is the offload it wants for this frame (zero when the port has
+ * none, which is what the virtual devices have).
+ */
+typedef struct {
+    void *mbuf;
+    unsigned char *data;
+    uint16_t room;
+    uint16_t len;
+    uint64_t ol_flags;
+} shim_tx_slot;
+
 /* The batch bound: one call carries at most this many frames. */
 #define SHIM_BURST_MAX 64
 
@@ -294,6 +308,78 @@ void shim_mbuf_info_bulk(void *const *mbufs, shim_rx_desc *out, unsigned count)
         out[i].len = rte_pktmbuf_data_len(mbuf);
         out[i].checksum = shim_checksum_of(mbuf);
     }
+}
+
+/*
+ * Frames to write into: the handle, the bytes Rust may fill, and how many of
+ * them there are. Zero when the pool had none — back pressure, not an error,
+ * which the caller answers by trying again next pass.
+ */
+unsigned shim_tx_alloc(void *pool, shim_tx_slot *out, unsigned count)
+{
+    struct rte_mbuf *mbufs[SHIM_BURST_MAX];
+    unsigned i;
+
+    if (count > SHIM_BURST_MAX)
+    {
+        count = SHIM_BURST_MAX;
+    }
+    if (0 != rte_pktmbuf_alloc_bulk(pool, mbufs, count))
+    {
+        return 0;
+    }
+    for (i = 0; i < count; i++)
+    {
+        out[i].mbuf = mbufs[i];
+        out[i].data = rte_pktmbuf_mtod(mbufs[i], unsigned char *);
+        out[i].room = (uint16_t)rte_pktmbuf_tailroom(mbufs[i]);
+        out[i].len = 0;
+        out[i].ol_flags = 0;
+    }
+
+    return count;
+}
+
+/*
+ * Hand the written frames to the NIC and answer how many left.
+ *
+ * The ones it did not take are freed **here**: the caller's count is then the
+ * truth about what left this machine, which is what a sender's position
+ * advances by. Their slots are cleared so that nothing frees them twice.
+ */
+unsigned shim_tx_burst(unsigned port, unsigned queue, shim_tx_slot *slots, unsigned count)
+{
+    struct rte_mbuf *mbufs[SHIM_BURST_MAX];
+    unsigned sent, i;
+
+    if (count > SHIM_BURST_MAX)
+    {
+        count = SHIM_BURST_MAX;
+    }
+    for (i = 0; i < count; i++)
+    {
+        struct rte_mbuf *mbuf = slots[i].mbuf;
+
+        mbuf->data_len = slots[i].len;
+        mbuf->pkt_len = slots[i].len;
+        mbuf->ol_flags |= slots[i].ol_flags;
+        mbufs[i] = mbuf;
+    }
+
+    sent = rte_eth_tx_burst((uint16_t)port, (uint16_t)queue, mbufs, (uint16_t)count);
+    if (sent < count)
+    {
+        rte_pktmbuf_free_bulk(&mbufs[sent], count - sent);
+    }
+    for (i = sent; i < count; i++)
+    {
+        slots[i].mbuf = NULL;
+        slots[i].data = NULL;
+        slots[i].room = 0;
+        slots[i].len = 0;
+    }
+
+    return sent;
 }
 
 /* Give frames back to their pool. Rust owns the handles; this is the way out. */
