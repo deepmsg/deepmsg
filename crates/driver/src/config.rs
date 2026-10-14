@@ -2604,6 +2604,31 @@ impl Setting {
         property: "debug.receive.data.loss.every",
         env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_EVERY",
     };
+    /// `deepmsg.debug.receive.data.loss.pass.first`: how many frames of the
+    /// stream a **blackout** lets through before it starts.
+    ///
+    /// Half of the one rule here that ends by itself; see
+    /// [`crate::media::receive_loss::Blackout`]. What it is for is the
+    /// reference's response-dropping cases, which pass the archive's handshake
+    /// and then block — a shape no unbounded rule can hold, because a machine
+    /// that is retrying has to be let through again.
+    const RECEIVE_LOSS_PASS_FIRST: Self = Self {
+        property: "debug.receive.data.loss.pass.first",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_PASS_FIRST",
+    };
+    /// `deepmsg.debug.receive.data.loss.until.millis`: how long the blackout
+    /// withholds, **measured from the stream's first frame**.
+    ///
+    /// ★ A **time**, and measuring is what said so: a bound counted in frames was
+    /// spent by the transport's own retransmissions and then never reached at
+    /// all, because withholding everything stops the frames arriving long before
+    /// a frame budget is used up. The reference reaches for a time in the same
+    /// place — its composite predicate drops `SETUP`s "until
+    /// `g_setup_drop_until_ns`" (`…_resilience_test.cpp:1948-1950`).
+    const RECEIVE_LOSS_UNTIL_MILLIS: Self = Self {
+        property: "debug.receive.data.loss.until.millis",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_UNTIL_MILLIS",
+    };
     /// `deepmsg.debug.receive.data.loss.setup.at.position`:
     /// `<stream>,<initial-term-id>,<active-term-id>,<term-offset>` — drop the one
     /// `SETUP` that names that position, so that a subscriber attaches late.
@@ -2965,6 +2990,53 @@ fn receive_data_loss(
         }
     }
 
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_PASS_FIRST) {
+        spec.pass_first = Some(
+            match parse_count(&Setting::RECEIVE_LOSS_PASS_FIRST, &value) {
+                Ok(count) if count >= 0 => u64::try_from(count).unwrap_or(0),
+                _ => {
+                    return Err(ConfigError::OutOfRange {
+                        name: Setting::RECEIVE_LOSS_PASS_FIRST.property,
+                        value,
+                    });
+                }
+            },
+        );
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_UNTIL_MILLIS) {
+        // Zero is "no blackout", the same as leaving it unset — and a blackout
+        // that withholds for no time at all is a rule that says nothing, so a
+        // `pass.first` beside it is refused rather than silently ignored.
+        match u64::try_from(parse_count(&Setting::RECEIVE_LOSS_UNTIL_MILLIS, &value)?) {
+            Ok(0) => {}
+            Ok(until_ms) => spec.until_ms = Some(until_ms),
+            Err(_) => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+                    value,
+                });
+            }
+        }
+    }
+
+    if spec.pass_first.is_some() && spec.until_ms.is_none() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::RECEIVE_LOSS_PASS_FIRST.property,
+            second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+        });
+    }
+
+    // A rate and a blackout both decide *which* matching frames are withheld,
+    // and they answer it differently: one every n, against a window from a
+    // point. Both at once is not a third rule, it is two.
+    if spec.every.is_some() && spec.until_ms.is_some() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::RECEIVE_LOSS_EVERY.property,
+            second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+        });
+    }
+
     if let Some(value) = get(&Setting::RECEIVE_LOSS_SETUP_AT_POSITION) {
         let [stream_id, initial_term_id, active_term_id, term_offset] =
             parse_four(&Setting::RECEIVE_LOSS_SETUP_AT_POSITION, &value)?;
@@ -3004,7 +3076,7 @@ fn receive_data_loss(
         ),
         (
             Setting::RECEIVE_LOSS_STREAM_ID.property,
-            spec.stream_id.is_some() || spec.every.is_some(),
+            spec.stream_id.is_some() || spec.every.is_some() || spec.until_ms.is_some(),
         ),
     ];
 
@@ -3877,6 +3949,44 @@ mod tests {
             ),
             "two rules must not both be in force",
         );
+
+        // A blackout: pass the stream's first two frames, withhold for three
+        // seconds, and then let everything through — the shape the reference's
+        // response-dropping cases need, and the only rule here that ends by
+        // itself.
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.receive.data.loss.stream.id", "20"),
+            ("deepmsg.debug.receive.data.loss.pass.first", "2"),
+            ("deepmsg.debug.receive.data.loss.until.millis", "3000"),
+        ])
+        .expect("a stream and a blackout are one rule");
+
+        let spec = config.receive_data_loss.expect("a rule");
+        assert_eq!(Some(20), spec.stream_id);
+        assert_eq!(Some(2), spec.pass_first);
+        assert_eq!(Some(3000), spec.until_ms);
+
+        // Without the window there is no blackout, and a `pass.first` on its own
+        // says nothing — refused rather than read as an empty rule.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.pass.first", "2"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+
+        // A rate and a blackout both answer "which matching frames", and
+        // differently.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.every", "2"),
+                ("deepmsg.debug.receive.data.loss.until.millis", "3000"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
 
         // And a rule whose value is not four numbers is refused rather than
         // half-read.

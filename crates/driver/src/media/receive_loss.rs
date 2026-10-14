@@ -48,6 +48,7 @@
 //! That deviation is recorded in `docs/compat.md`.
 
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use crate::media::loss_generator::LossGenerator;
 use crate::protocol::{DataFrame, FrameHeader, SetupFrame};
@@ -358,6 +359,138 @@ impl LossGenerator for DataInRange {
     }
 }
 
+/// Drop one stream's frames **for a while**, and then stop
+/// (`drop_payloads_after_threshold`,
+/// `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1926-1939`;
+/// the time-bounded predicate beside it is `:1952`).
+///
+/// The first `pass_first` frames of the stream go through, everything after them
+/// is withheld for `until`, and after that everything goes through again. That is
+/// what makes a rule **self-healing**, and it is the reason this exists: the
+/// reference's cases that drop *responses* pass their handshake, block for a
+/// while, and then have to let the machine recover — which its own generators do
+/// by being disabled from the test's thread (`…_stream_id_loss_generator_disable`).
+/// A driver whose rules are fixed before it starts has no such moment, so the
+/// bound has to be **in the rule**.
+///
+/// ★★ **The bound is a time, and measuring is what said so.** A first version
+/// bounded it by a **count of frames**, and the log showed it failing twice over.
+/// First the count was burned through in milliseconds, because a withheld frame
+/// is *retransmitted* — the receiver notices the gap and asks — so what advanced
+/// the counter was the transport's own recovery rather than anything the machine
+/// under test did; counting **distinct frames** fixed that. And then, with the
+/// count honest, it still never reached its end: the count stalled after about
+/// ten frames and the machine sat in `AWAIT_LIST_RECORDING_RESPONSE` until its
+/// own deadline, because **frames stop arriving long before a frame budget is
+/// spent** — withholding everything tears the channel down rather than delaying
+/// it. A time is immune to both: it does not care how many times a frame is sent,
+/// and it ends whether or not the channel is still carrying anything.
+///
+/// The reference reached for a time in the same place: its composite predicate
+/// drops `SETUP`s "until `g_setup_drop_until_ns`" (`:1948-1950`).
+///
+/// # What counts as a frame
+///
+/// ★ **Heartbeats pass and are not counted.** A `DATA` frame that is nothing but
+/// its header is how a publication carries `EOS` and `REVOKE`, and — as
+/// important here — how a session says it is still alive: a blackout that
+/// swallowed them would drop the connection rather than a response. The
+/// reference's own predicate draws the line in the same place (`:1928-1937`).
+#[derive(Debug, Clone)]
+pub struct Blackout {
+    /// Which stream's frames this counts, or `None` for any.
+    stream_id: Option<i32>,
+    /// How many frames of the stream go through before the blackout starts.
+    pass_first: u64,
+    /// How long it withholds once it has.
+    until: Duration,
+    /// When the stream's first frame arrived, which is what `until` is measured
+    /// from — `None` until one has.
+    started: Option<Instant>,
+    /// The frames it has been shown, **by the position that names them**, so
+    /// that `pass_first` counts frames of the stream and not transmissions of
+    /// them.
+    seen: Vec<(i32, i32)>,
+}
+
+impl Blackout {
+    /// Pass the first `pass_first` frames of `stream_id`, withhold what follows
+    /// for `until`, and let the rest through.
+    #[must_use]
+    pub const fn new(stream_id: Option<i32>, pass_first: u64, until: Duration) -> Self {
+        Self {
+            stream_id,
+            pass_first,
+            until,
+            started: None,
+            seen: Vec::new(),
+        }
+    }
+
+    /// How many **distinct** frames of the stream it has been shown.
+    #[must_use]
+    pub fn matched(&self) -> u64 {
+        self.seen.len() as u64
+    }
+
+    /// Whether the blackout is still in force, from the stream's first frame.
+    fn holding(&self) -> bool {
+        self.started
+            .is_some_and(|started| started.elapsed() < self.until)
+    }
+}
+
+impl LossGenerator for Blackout {
+    fn should_drop(&mut self, _address: SocketAddr, _buffer: &[u8], _length: usize) -> bool {
+        false
+    }
+
+    fn should_drop_detailed(
+        &mut self,
+        _address: SocketAddr,
+        buffer: &[u8],
+        stream_id: i32,
+        _session_id: i32,
+        term_id: i32,
+        term_offset: i32,
+        length: usize,
+    ) -> bool {
+        if self.stream_id.is_some_and(|wanted| wanted != stream_id) {
+            return false;
+        }
+
+        if length == DataFrame::LENGTH {
+            // A frame that is only its header is a heartbeat: it passes, and it
+            // is not one of the frames being counted.
+            if let Some(header) = FrameHeader::read(buffer) {
+                if header.frame_length == 0 {
+                    return false;
+                }
+            }
+        }
+
+        // Which frame of the stream this is — the same answer for a frame that
+        // arrives twice, so that retransmission cannot spend the
+        // `pass_first` budget.
+        let position = (term_id, term_offset);
+
+        let ordinal = match self.seen.iter().position(|seen| *seen == position) {
+            Some(index) => index as u64 + 1,
+            None => {
+                self.seen.push(position);
+
+                self.seen.len() as u64
+            }
+        };
+
+        if self.started.is_none() {
+            self.started = Some(Instant::now());
+        }
+
+        ordinal > self.pass_first && self.holding()
+    }
+}
+
 /// Where a `SETUP` is named (`…_setup_at_position_loss_generator.h:31-40`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetupPosition {
@@ -398,6 +531,11 @@ pub struct Spec {
     pub stream_id: Option<i32>,
     /// One frame in every this many, or `None` for all of them.
     pub every: Option<u64>,
+    /// How many matching frames a **blackout** lets through first.
+    pub pass_first: Option<u64>,
+    /// How long a **blackout** withholds once it has started, in milliseconds,
+    /// or `None` for no blackout.
+    pub until_ms: Option<u64>,
     /// The one `SETUP` to drop.
     pub setup_at_position: Option<SetupPosition>,
     /// The one run of `DATA` to drop.
@@ -412,6 +550,7 @@ impl Spec {
     pub const fn is_empty(&self) -> bool {
         self.stream_id.is_none()
             && self.every.is_none()
+            && self.until_ms.is_none()
             && self.setup_at_position.is_none()
             && self.data_in_range.is_none()
     }
@@ -446,6 +585,16 @@ impl Spec {
                 position.initial_term_id,
                 position.active_term_id,
                 position.term_offset,
+            )));
+        }
+
+        // A blackout comes before the unbounded rules, and is the only one that
+        // ends by itself — see [`Blackout`].
+        if let Some(until_ms) = self.until_ms {
+            return Some(Box::new(Blackout::new(
+                self.stream_id,
+                self.pass_first.unwrap_or(0),
+                Duration::from_millis(until_ms),
             )));
         }
 
@@ -648,6 +797,109 @@ mod tests {
         assert!(!detailed(&mut generator, &data_frame(4219, 5, 1500, 32)));
 
         assert_eq!(2, generator.dropped());
+    }
+
+    /// ★ A blackout is **bounded**: it ends by itself, and that is the whole of
+    /// why it exists — a machine that is retrying drives the count up and the
+    /// frames start arriving again with nothing having to be switched off.
+    /// A frame of the stream at a position of its own.
+    fn nth_frame(stream_id: i32, index: i32) -> Vec<u8> {
+        data_frame(stream_id, 1, index * 64, 32)
+    }
+
+    #[test]
+    fn a_blackout_passes_its_first_frames_and_then_holds() {
+        let mut generator = Blackout::new(Some(4218), 2, Duration::from_secs(60));
+
+        // Two through, and then withheld for as long as the window lasts.
+        assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
+        assert!(!detailed(&mut generator, &nth_frame(4218, 1)));
+        assert!(detailed(&mut generator, &nth_frame(4218, 2)));
+        assert!(detailed(&mut generator, &nth_frame(4218, 3)));
+        assert_eq!(4, generator.matched());
+
+        // Another stream is not what it counts.
+        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+
+        assert!(!detailed(&mut generator, &data_frame(4219, 1, 0, 32)));
+        assert!(detailed(&mut generator, &nth_frame(4218, 0)));
+        assert_eq!(1, generator.matched());
+    }
+
+    /// ★★ **The window ends by itself**, and it ends by *time* — which is the
+    /// correction measuring forced. A bound counted in frames was spent twice
+    /// over: first by the transport's own retransmissions, and then never
+    /// reached at all, because withholding everything stops the frames arriving
+    /// long before a frame budget is used up.
+    #[test]
+    fn a_blackout_ends_when_its_window_does() {
+        let mut generator = Blackout::new(Some(4218), 0, Duration::from_millis(1));
+
+        assert!(detailed(&mut generator, &nth_frame(4218, 0)));
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // The window is over: this frame and every one after it go through.
+        assert!(!detailed(&mut generator, &nth_frame(4218, 1)));
+        assert!(!detailed(&mut generator, &nth_frame(4218, 2)));
+    }
+
+    /// ★ A heartbeat inside a blackout passes **and does not count** — a session
+    /// that is told nothing while its responses are withheld still has to look
+    /// alive, and a bounded drop that swallowed the heartbeats would drop the
+    /// connection rather than the responses.
+    #[test]
+    fn a_heartbeat_is_neither_dropped_nor_counted_by_a_blackout() {
+        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+
+        let mut heartbeat = data_frame(4218, 1, 0, 0);
+        heartbeat[0..4].copy_from_slice(&0i32.to_le_bytes());
+
+        assert!(!detailed(&mut generator, &heartbeat));
+        assert_eq!(0, generator.matched());
+
+        // What the blackout counts is the first *payload* frame, not the first
+        // frame — and while its window is open, every payload frame is withheld.
+        assert!(detailed(&mut generator, &nth_frame(4218, 0)));
+        assert!(!detailed(&mut generator, &heartbeat));
+        assert_eq!(1, generator.matched());
+        assert!(detailed(&mut generator, &nth_frame(4218, 1)));
+        assert_eq!(2, generator.matched());
+    }
+
+    /// ★ **A retransmission is the same frame.** The counter that made this real:
+    /// a withheld frame is asked for again, and a blackout that counted every
+    /// arrival was burned through by those retransmissions long before the
+    /// machine it was aimed at retried anything.
+    #[test]
+    fn a_retransmission_neither_advances_nor_escapes_a_blackout() {
+        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+
+        let first = data_frame(4218, 1, 0, 32);
+
+        assert!(detailed(&mut generator, &first));
+        assert_eq!(1, generator.matched());
+
+        // The same frame again, ten times: still withheld, and still one frame.
+        for _ in 0..10 {
+            assert!(detailed(&mut generator, &first));
+        }
+
+        assert_eq!(1, generator.matched());
+
+        // And `pass_first` still counts **frames of the stream**: a second
+        // distinct frame is the second frame, whatever the transport did with
+        // the first.
+        let mut generator = Blackout::new(Some(4218), 1, Duration::from_secs(60));
+
+        assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
+
+        for _ in 0..10 {
+            assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
+        }
+
+        assert!(detailed(&mut generator, &nth_frame(4218, 1)));
+        assert_eq!(2, generator.matched());
     }
 
     /// ★ The skip is what makes "the recording stays whole while one reader's

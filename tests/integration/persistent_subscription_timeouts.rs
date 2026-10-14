@@ -84,6 +84,15 @@ const REPLAY_STREAM_ID: i32 = 4249;
 /// What the recording holds — the reference's ten (`:4139`).
 const MESSAGES: usize = 10;
 
+const ARCHIVE_CONTROL_UDP: &str = "aeron:udp?endpoint=127.0.0.1:18010";
+const RESPONSE_STREAM_ID: i32 = 20;
+
+fn free_port(offset: u16) -> u16 {
+    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
+    let base = 20_000 + (std::process::id() as u16 % 20_000);
+    base.saturating_add(offset)
+}
+
 /// A deadline that has always passed by the time it is looked at (`:4161`).
 const INSTANT: i64 = 1;
 
@@ -354,6 +363,150 @@ fn a_list_recording_request_that_times_out_is_asked_again() {
     );
 }
 
+/// ★ **A control response that is withheld does not fail the subscription, and
+/// the blackout ends by itself.**
+///
+/// The reference's `shouldTimeoutOnListRecordingAndReplayResponseWhenResponsesDropped`
+/// (`…_resilience_test.cpp:4284`): pass the archive's connect handshake, withhold
+/// everything after it, so the list-recording response never arrives and its
+/// deadline fires. The reference then **turns the loss off** from its own thread
+/// and waits for the machine to recover.
+///
+/// This build has no such moment — a rule is fixed before its driver starts — so
+/// the bound is **in the rule**, and it is a **time**: the stream's first two
+/// frames go through, everything after them is withheld for three seconds, and
+/// then the responses arrive again with nothing having been switched off.
+///
+/// ★ Why a *time* and not a count of frames is written up on `Blackout`, and it
+/// cost two measurements to learn: a frame budget is spent by the transport's
+/// own retransmissions, and then — with that fixed — never spent at all, because
+/// withholding everything stops the frames arriving long before the budget runs
+/// out.
+#[test]
+fn a_withheld_control_response_does_not_fail_the_subscription() {
+    let properties = [
+        format!("-Ddeepmsg.debug.receive.data.loss.stream.id={RESPONSE_STREAM_ID}"),
+        "-Ddeepmsg.debug.receive.data.loss.pass.first=2".to_owned(),
+        "-Ddeepmsg.debug.receive.data.loss.until.millis=3000".to_owned(),
+    ];
+    let properties: Vec<&str> = properties.iter().map(String::as_str).collect();
+
+    let Some((media_driver, _archive_dir)) =
+        rig_on_udp_control("ps-timeout-response-drop", &properties)
+    else {
+        return;
+    };
+
+    // ★ The recording is made over the fixture's **own** channels, and only the
+    // subscription is answered on UDP. The rule acts on a receive endpoint, and
+    // a source sharing the subscription's endpoint would have its own control
+    // responses withheld — the connect among them.
+    let mut source = Source::start(media_driver.aeron_dir());
+
+    let mut context = PersistentSubscriptionContext::new();
+    context.archive_context = Some(context_with_udp_response(
+        media_driver.aeron_dir(),
+        free_port(60),
+    ));
+    context.recording_id = source.recording_id;
+    context.live_channel = Some(LIVE_CHANNEL.to_owned());
+    context.live_stream_id = LIVE_STREAM_ID;
+    context.replay_channel = Some(REPLAY_CHANNEL.to_owned());
+    context.replay_stream_id = REPLAY_STREAM_ID;
+    context.start_position = FROM_START;
+
+    let joins = std::rc::Rc::new(std::cell::RefCell::new(Joins::default()));
+
+    let mut subscription = PersistentSubscription::new(
+        context,
+        Box::new(NoCredentials),
+        Some(Box::new(SharedJoins(std::rc::Rc::clone(&joins)))),
+    )
+    .expect("the subscription is created");
+
+    // The reference's own 200 ms (`:4318`): short enough that a three-second
+    // blackout is several deadlines long.
+    subscription.set_message_timeout_ns_for_testing(200_000_000);
+
+    let mut collector = Collector::default();
+
+    // ★ **A window in which nothing gets through.** This is the witness, and it
+    // had to be this rather than a count of retries: an earlier version counted
+    // entries into the asking state and reported two **with and without the
+    // blackout**, because that state is also where a turn ends when the send
+    // itself could not happen. What a withheld response looks like is a machine
+    // that has delivered **nothing**.
+    let through_the_blackout = Instant::now() + Duration::from_millis(1500);
+
+    while Instant::now() < through_the_blackout {
+        subscription.controlled_poll(&mut collector, 10);
+        source.client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+
+        assert!(
+            !subscription.has_failed(),
+            "a withheld response must not fail the subscription{}",
+            reason(&subscription, &joins),
+        );
+    }
+
+    assert!(
+        collector.messages.is_empty(),
+        "the recording arrived while its responses were being withheld, so \
+         nothing was withheld and this case judged nothing",
+    );
+
+    // And the window ends by itself: nothing is switched off, and the machine
+    // finishes on the responses that arrive after it.
+    let deadline = Instant::now() + archive::DEADLINE;
+
+    while !subscription.is_live() {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription never became live after the blackout ended: state \
+             {:?}{}",
+            subscription.state(),
+            reason(&subscription, &joins),
+        );
+
+        assert!(
+            !subscription.has_failed(),
+            "a withheld response must not fail the subscription{}",
+            reason(&subscription, &joins),
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        source.client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let expected: Vec<Vec<u8>> = (0..MESSAGES)
+        .map(|index| format!("message {index:04}").into_bytes())
+        .collect();
+
+    while collector.messages.len() < expected.len() {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {} message(s) arrived{}",
+            collector.messages.len(),
+            expected.len(),
+            reason(&subscription, &joins),
+        );
+
+        subscription.controlled_poll(&mut collector, 10);
+        source.client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        expected,
+        collector.messages,
+        "the recording did not arrive whole and in order after the blackout \
+         ended{}",
+        reason(&subscription, &joins),
+    );
+}
+
 /// Why the subscription is where it is, for a failure message.
 fn reason(
     subscription: &PersistentSubscription,
@@ -373,8 +526,14 @@ fn reason(
 
 /// An archive of ours, running.
 fn rig(test_name: &str) -> Option<(OwnArchivingMediaDriver, TempDir)> {
+    rig_with(test_name, &[])
+}
+
+fn rig_with(test_name: &str, extra: &[&str]) -> Option<(OwnArchivingMediaDriver, TempDir)> {
     let archive_dir = TempDir::new(test_name);
-    let properties: Vec<&str> = archive::PROPERTIES.to_vec();
+
+    let mut properties: Vec<&str> = archive::PROPERTIES.to_vec();
+    properties.extend_from_slice(extra);
 
     let Some(mut media_driver) =
         OwnArchivingMediaDriver::start(test_name, archive_dir.path(), &properties)
@@ -407,6 +566,37 @@ fn context(aeron_dir: &std::path::Path) -> ArchiveContext {
             archive::RESPONSE_CHANNEL.to_owned(),
         ),
     ])
+}
+
+/// The same channels, with the answers coming back over **UDP** — and the
+/// request channel moved with them.
+///
+/// ★ **Both halves move together, and that is measured rather than assumed.** A
+/// version that asked to be answered on a UDP response channel while
+/// *requesting over IPC* timed out on the connect with **no rule configured at
+/// all**, so what does not work is the pairing, not the rule. The pair that does
+/// is the one the ninth commit's UDP cell uses.
+fn context_with_udp_response(aeron_dir: &std::path::Path, port: u16) -> ArchiveContext {
+    let mut context = context(aeron_dir);
+
+    context.control_request_channel = Some(ARCHIVE_CONTROL_UDP.to_owned());
+    context.control_response_channel = Some(format!(
+        "aeron:udp?control-mode=response|control=127.0.0.1:{port}"
+    ));
+
+    context
+}
+
+fn rig_on_udp_control(
+    test_name: &str,
+    extra: &[&str],
+) -> Option<(OwnArchivingMediaDriver, TempDir)> {
+    let control = format!("-Daeron.archive.control.channel={ARCHIVE_CONTROL_UDP}");
+    let mut properties: Vec<&str> = extra.to_vec();
+
+    properties.push(control.as_str());
+
+    rig_with(test_name, &properties)
 }
 
 /// Drive a client until `done`, or fail.
