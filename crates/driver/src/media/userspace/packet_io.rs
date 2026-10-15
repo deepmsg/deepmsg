@@ -66,13 +66,20 @@ pub enum Disposition {
 
 /// A frame that has left its port but not yet its transport.
 ///
-/// One variant today — the bytes, owned. The DPDK build adds a second, a
-/// parked mbuf, and the transport's `receive` is the one place both end up as
-/// the caller's buffer.
+/// One variant in a build without DPDK — the bytes, owned. The build that has
+/// it adds a second, a frame still parked in the port's own pool, and the
+/// transport's `receive` is the one place both end up as the caller's buffer.
+/// That is where the zero-copy path stops: the frame is never copied on its way
+/// from the NIC to the ready ring, and `receive` is the single copy the kernel
+/// path pays too.
 #[derive(Debug)]
 pub enum ReadyFrame {
     /// A whole Ethernet frame, owned by the stack from here on.
     Bytes(Box<[u8]>),
+    /// A frame the DPDK port parked without copying, held in the pool it came
+    /// from. It goes back to that pool when this is dropped.
+    #[cfg(feature = "dpdk")]
+    Mbuf(deepmsg_dpdk::ParkedFrame<'static>),
 }
 
 impl ReadyFrame {
@@ -80,6 +87,82 @@ impl ReadyFrame {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Bytes(bytes) => bytes,
+            #[cfg(feature = "dpdk")]
+            Self::Mbuf(frame) => frame.bytes(),
+        }
+    }
+}
+
+/// What a port's hardware did to a frame's checksums.
+///
+/// The DPDK crate's `Checksum`, in this stack's words, and here rather than
+/// there on purpose: what the three answers *mean* for this stack is a rule
+/// this module owns, tests where the `dpdk` feature is off, and would otherwise
+/// be untestable without an EAL and a port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The hardware checked them and they held.
+    Passed,
+    /// It checked them and they did not. A frame no transport sees.
+    Failed,
+    /// It checked nothing: nothing in this port looks at checksums.
+    NotJudged,
+}
+
+/// Which checksums a port's hardware judges for it.
+///
+/// The design's §4.4 asks this of the port because the answer changes what the
+/// stack has to do with a frame: a port that judges a checksum hands a verdict
+/// over with every frame, and one that does not leaves all of it to
+/// [`super::frame::read`], whose arithmetic is the same either way.
+///
+/// Both are reported and both are read: a port that judges the IPv4 header and
+/// not the datagram behind it can call a frame good whose UDP checksum nobody
+/// looked at, which is why [`Offloads::checksums`] wants the pair and not
+/// either half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Offloads {
+    /// The port checks the IPv4 header checksum.
+    pub ipv4_checksum: bool,
+    /// The port checks the UDP checksum.
+    pub udp_checksum: bool,
+}
+
+impl Offloads {
+    /// A port that judges nothing, so every frame it hands over is the
+    /// stack's to verify. The in-memory wire, and every virtual device this
+    /// build's CI runs on (D0).
+    pub const NONE: Self = Self {
+        ipv4_checksum: false,
+        udp_checksum: false,
+    };
+
+    /// Whether the port's verdict on a frame accounts for both checksums this
+    /// stack cares about.
+    pub const fn judges_both(self) -> bool {
+        self.ipv4_checksum && self.udp_checksum
+    }
+
+    /// What this stack may believe about a frame the port's hardware answered
+    /// `verdict` about.
+    ///
+    /// `Passed` is worth taking only when the port judges both checksums: the
+    /// answer that comes back for a frame is one value
+    /// (`rte_mbuf`'s `ol_flags`), and a port that judged the IPv4 header alone
+    /// says "good" about a frame whose UDP checksum nobody has computed.
+    /// Anything less than both falls through to the stack's own arithmetic,
+    /// which is the same arithmetic and reaches the same answer.
+    ///
+    /// `Failed` answers `Software` too, and that is not a second look at the
+    /// same question: a frame the hardware rejected is a frame this stack
+    /// drops, and dropping it is [`super::frame::read`]'s answer to arithmetic
+    /// that does not hold — which is where counter 89 is counted and where the
+    /// transport that would have received it never hears of it. Dropping it at
+    /// the port instead would lose the count and the reason.
+    pub const fn checksums(self, verdict: Verdict) -> Checksums {
+        match verdict {
+            Verdict::Passed if self.judges_both() => Checksums::Verified,
+            Verdict::Passed | Verdict::Failed | Verdict::NotJudged => Checksums::Software,
         }
     }
 }
@@ -107,6 +190,15 @@ pub trait RxPort: Send {
         f: &mut dyn FnMut(RxFrame<'_>) -> Disposition,
         kept: &mut Vec<(Binding, ReadyFrame)>,
     ) -> usize;
+
+    /// Which checksums this port's hardware judges, so that the reader knows
+    /// what a frame's [`Checksums`] is worth ([`Offloads::checksums`]).
+    ///
+    /// The port decides each frame's answer itself, in the same place it gets
+    /// the hardware's verdict; this is the same fact said once, for the
+    /// startup that reports what the media is running on and for the tests
+    /// that hold the two together.
+    fn offloads(&self) -> Offloads;
 
     /// This port's MAC address, which every frame it sends has to carry as its
     /// source.
@@ -139,4 +231,69 @@ pub trait TxPort: Send {
 
     /// The largest frame this port will send (see [`RxPort::mtu`]).
     fn mtu(&self) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port that judges both checksums answers the same arithmetic the stack
+    /// would have done, so taking its word for a frame costs nothing and saves
+    /// the work — which is the whole of what an offload buys (§4.5).
+    #[test]
+    fn a_port_that_judges_both_checksums_has_its_verdict_taken() {
+        let judging = Offloads {
+            ipv4_checksum: true,
+            udp_checksum: true,
+        };
+
+        assert!(judging.judges_both());
+        assert_eq!(judging.checksums(Verdict::Passed), Checksums::Verified);
+    }
+
+    /// The falsification the plan names: a port that judges neither — or one
+    /// of the two — must not carry a frame past the stack's own verification
+    /// on the strength of a "good" nobody qualified.
+    ///
+    /// The half-offload case is the one that is easy to get wrong and
+    /// invisible when wrong: a port that judges the IPv4 header and not the
+    /// datagram behind it answers `Passed` about a frame whose UDP checksum
+    /// nobody computed, and a stack that took it would hand a corrupt datagram
+    /// to a transport.
+    #[test]
+    fn a_port_that_judges_one_checksum_vouches_for_nothing() {
+        for offloads in [
+            Offloads::NONE,
+            Offloads {
+                ipv4_checksum: true,
+                udp_checksum: false,
+            },
+            Offloads {
+                ipv4_checksum: false,
+                udp_checksum: true,
+            },
+        ] {
+            assert!(!offloads.judges_both(), "{offloads:?}");
+            assert_eq!(
+                offloads.checksums(Verdict::Passed),
+                Checksums::Software,
+                "{offloads:?} does not judge both, so the frame is the stack's"
+            );
+        }
+    }
+
+    /// A frame the hardware rejected is not one the port drops quietly: it is
+    /// one the stack's own arithmetic is allowed to reach the same answer
+    /// about, which is where counter 89 is counted and where the transport
+    /// that would have received it never hears of it.
+    #[test]
+    fn a_frame_the_hardware_rejected_is_the_stacks_to_check() {
+        let judging = Offloads {
+            ipv4_checksum: true,
+            udp_checksum: true,
+        };
+
+        assert_eq!(judging.checksums(Verdict::Failed), Checksums::Software);
+        assert_eq!(judging.checksums(Verdict::NotJudged), Checksums::Software);
+    }
 }

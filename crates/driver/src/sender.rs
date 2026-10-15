@@ -47,6 +47,7 @@ use deepmsg_cnc::command::OwnedPublicationError;
 use deepmsg_cnc::layout::NULL_VALUE;
 use deepmsg_cnc::{CncFile, CounterManager, CounterRegions, layout};
 
+use crate::config::ThreadNaming;
 use crate::driver::{Role, Timer};
 use crate::media::destination_tracker::DESTINATION_TIMEOUT_NS;
 use crate::media::send_endpoint::SendChannelEndpoint;
@@ -512,7 +513,8 @@ impl Sender {
         )?;
 
         let thread = crate::driver::run_agent(
-            Role::Sender.classic_name(),
+            Role::Sender,
+            ThreadNaming::Classic,
             agent,
             crate::driver::default_strategy(),
             None,
@@ -1220,6 +1222,14 @@ impl SenderThread {
             if received == 0 {
                 continue;
             }
+
+            // What this endpoint's transport has received — the status
+            // messages and NAKs the receivers answer with — counted here
+            // because this is the thread that read them (design §4.10, type
+            // 76).
+            endpoints[index]
+                .1
+                .count_received_packets(counters, regions, received);
 
             // Borrowed, not copied — the same nine-hundred-byte copy the
             // receiver had, on the sender's side of the same loop: once per

@@ -98,13 +98,14 @@ pub(crate) trait Agent: Send + 'static {
 ///
 /// [`io::Error`] if the thread cannot be spawned.
 pub(crate) fn run_agent(
-    name: &str,
+    role: Role,
+    naming: ThreadNaming,
     mut agent: impl Agent,
     mut idle: Strategy,
     affinity: Option<i32>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
-        .name(thread_name(name))
+        .name(thread_name(role.name(naming)))
         .spawn(move || {
             // The reference pins each agent as it starts, from the runner's
             // `on_start` (`aeronmd.c:137-141`), and a failure there is a
@@ -113,6 +114,24 @@ pub(crate) fn run_agent(
             if let Some(cpu) = affinity {
                 let _ = sys::set_current_thread_affinity(cpu);
             }
+
+            // Then, if a DPDK media is what this driver's data paths run on,
+            // the thread joins the EAL. Both halves are the runner's
+            // `on_start` and both are here for the same reason: a thread EAL
+            // did not start has no lcore id, and without one the pool's
+            // per-lcore cache is not used — every allocation a sender makes
+            // goes to the shared ring instead (R7). Registering does not move
+            // the thread, which is why it comes after the pinning above.
+            //
+            // Bound to a name rather than to `_`: the guard unregisters when
+            // it is dropped, and it has to be the end of this thread that
+            // drops it.
+            #[cfg(feature = "dpdk")]
+            let _registered = if role.drives_the_media() {
+                crate::media::userspace::dpdk::register_thread()
+            } else {
+                None
+            };
 
             while let Some(work) = agent.do_work() {
                 idle.idle(work);
@@ -161,10 +180,23 @@ impl Role {
         }
     }
 
-    /// The name under the default naming, for the paths that start one agent on
-    /// a thread of its own and have no driver's settings to read.
-    pub(crate) const fn classic_name(self) -> &'static str {
-        self.name(ThreadNaming::Classic)
+    /// Whether this role's thread drives the media — a receive or a transmit
+    /// port, and so the pool.
+    ///
+    /// The two that do not are the conductor and the native resource agent:
+    /// the design's §4.7 keeps both off the media (the name resolver runs on
+    /// the kernel's bindings), and neither allocates a frame. What the answer
+    /// buys is a thread's registration with a DPDK EAL
+    /// ([`run_agent`]): registering is what turns on the pool's per-lcore
+    /// cache, and registering a thread that never allocates takes a cache out
+    /// of the pool's own accounting for nothing (§4.8 counts the caches in the
+    /// formula).
+    #[cfg(feature = "dpdk")]
+    pub(crate) const fn drives_the_media(self) -> bool {
+        match self {
+            Self::Sender | Self::Receiver | Self::SharedNetwork | Self::Shared => true,
+            Self::Conductor | Self::NativeResourceAgent => false,
+        }
     }
 }
 
@@ -510,6 +542,18 @@ impl Driver {
             let _ = sys::set_current_thread_affinity(cpu);
         }
 
+        // Under `SHARED` and `INVOKER` this thread runs the sender's and the
+        // receiver's passes as well as the conductor's (`start_runners` starts
+        // nothing for either mode), so it is one of the media's threads and
+        // registers with the EAL the way `run_agent`'s do. The other two modes
+        // leave the media to their runners and register nothing here.
+        #[cfg(feature = "dpdk")]
+        let _registered = if self.runner_zero_role().drives_the_media() {
+            crate::media::userspace::dpdk::register_thread()
+        } else {
+            None
+        };
+
         let mut idle = strategy(self.idle.runner_zero(self.mode))?;
 
         while self.conductor.is_running() && sys::stop_signal().is_none() {
@@ -662,7 +706,7 @@ impl Driver {
         idle: Strategy,
         affinity: Option<i32>,
     ) -> io::Result<()> {
-        let thread = run_agent(role.name(self.naming), agent, idle, affinity)?;
+        let thread = run_agent(role, self.naming, agent, idle, affinity)?;
         self.threads.push(thread);
 
         Ok(())
@@ -690,19 +734,22 @@ pub(crate) fn spawn_dedicated(
     let naming = config.thread_naming;
 
     threads.push(run_agent(
-        Role::Sender.name(naming),
+        Role::Sender,
+        naming,
         states.sender,
         strategy(&config.sender_idle)?,
         None,
     )?);
     threads.push(run_agent(
-        Role::Receiver.name(naming),
+        Role::Receiver,
+        naming,
         states.receiver,
         strategy(&config.receiver_idle)?,
         None,
     )?);
     threads.push(run_agent(
-        Role::NativeResourceAgent.name(naming),
+        Role::NativeResourceAgent,
+        naming,
         states.native_resource_agent,
         strategy(&config.native_resource_agent_idle)?,
         None,
@@ -714,6 +761,29 @@ pub(crate) fn spawn_dedicated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roles whose threads touch the media, and the two whose do not.
+    ///
+    /// What the answer decides is whether the thread registers with a DPDK
+    /// EAL (`run_agent`), and the two that do not are the two §4.7 keeps off
+    /// the media: the conductor's work is on the kernel's bindings, and the
+    /// native resource agent neither receives nor allocates a frame.
+    #[cfg(feature = "dpdk")]
+    #[test]
+    fn the_network_roles_are_the_ones_that_drive_the_media() {
+        for role in [
+            Role::Sender,
+            Role::Receiver,
+            Role::SharedNetwork,
+            Role::Shared,
+        ] {
+            assert!(role.drives_the_media(), "{role:?}");
+        }
+
+        for role in [Role::Conductor, Role::NativeResourceAgent] {
+            assert!(!role.drives_the_media(), "{role:?}");
+        }
+    }
 
     /// The names are the reference's two tables, and the one role they share
     /// (`aeron_driver_context.h:37-48`).

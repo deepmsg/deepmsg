@@ -46,6 +46,7 @@ use crate::sys::socket::BindFailure;
 
 use super::arp;
 use super::demux;
+use super::dpdk_counters::{Device, PortIdentity};
 use super::fake_port::{Side, Wire};
 use super::frame::{self, ArpPacket, EthernetHeader};
 use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
@@ -129,6 +130,16 @@ pub struct StackParams {
     pub arp_interval: Duration,
     /// How long an ARP entry stays good without being refreshed.
     pub arp_timeout: Duration,
+    /// Next hops that were configured rather than learned
+    /// (`deepmsg.dpdk.static.neighbours`): address and MAC, each of which
+    /// never ages out.
+    ///
+    /// A deployment whose peers are known does not have to pay for the ARP
+    /// exchange that finds them, and a peer that never answers an ARP request
+    /// is still reachable when its MAC is written down. Configuration rather
+    /// than a call after the fact, so that every stack built from these
+    /// parameters — including a fake wire's — starts with the same table.
+    pub static_neighbours: Vec<(Ipv4Addr, [u8; 6])>,
 }
 
 impl StackParams {
@@ -145,6 +156,7 @@ impl StackParams {
             ephemeral_ports: EPHEMERAL_PORTS,
             arp_interval: Duration::from_secs(1),
             arp_timeout: Duration::from_secs(300),
+            static_neighbours: Vec::new(),
         }
     }
 
@@ -401,8 +413,41 @@ impl ThreadQueues {
     }
 }
 
+/// The interface index a userspace port reports.
+///
+/// An index is what `IP_MULTICAST_IF` and a group join take, and this media
+/// serves no multicast at all (§4.11) — so the number never reaches the kernel
+/// and what it is has no consequence. It is **nonzero** because zero is what
+/// the kernel's own lookups answer for "no such interface", and a caller that
+/// did use it should not read as a failed lookup.
+pub const PORT_INTERFACE_INDEX: u32 = 1;
+
 /// One machine's userspace stack.
 ///
+/// What a stack needs to answer for the device it drives (design §4.10).
+///
+/// Two things a fake wire has not got and a port has: what the port calls
+/// itself, which is what its counters are labelled with, and how to read the
+/// numbers only a device and its pool know. The reading is a boxed function
+/// rather than a field of DPDK types so that a stack is one type in both
+/// builds, and so that a test can put a device behind a fake wire.
+pub struct DeviceParts {
+    /// The name EAL knows the port by.
+    pub name: String,
+    /// The PMD's name.
+    pub driver: String,
+    /// Reads what only the device and its pool can answer.
+    pub read: DeviceReader,
+}
+
+/// How a stack reads its device — see [`DeviceParts`].
+///
+/// # Errors
+///
+/// The device's own words, as a `String` because the type that fails belongs to
+/// a crate this module does not depend on.
+pub type DeviceReader = Box<dyn Fn() -> Result<Device, String> + Send + Sync>;
+
 /// Not `Debug`: its ports are trait objects, and there is nothing useful to
 /// print about a stack that its accessors do not already answer.
 pub struct Stack {
@@ -418,24 +463,69 @@ pub struct Stack {
     tx: [Arc<Mutex<Box<dyn TxPort>>>; 2],
     counters: StackCounters,
     now: Clock,
+    /// The port this stack drives, when it drives one ([`DeviceParts`]).
+    device: Option<DeviceParts>,
+}
+
+/// The transmit queues a stack's two roles drive.
+///
+/// The design's §4.7 gives a machine one transmit queue per agent thread, and
+/// how many threads there are is the threading mode's business: `DEDICATED`
+/// runs the sender and the receiver apart, so each owns a queue, and
+/// `SHARED_NETWORK` and `SHARED` run both on one thread, so the machine gives
+/// the media one queue and both roles drive it. Which of the two a stack has is
+/// therefore not something it can work out for itself — it is what the media
+/// handed over, and the type is where that is written down.
+pub enum TransmitQueues {
+    /// One queue each: `DEDICATED`, two threads.
+    PerRole(Box<dyn TxPort>, Box<dyn TxPort>),
+    /// One queue for both roles: `SHARED_NETWORK` and `SHARED`, one thread.
+    ///
+    /// Both affinities reach the same port, and the lock around it is what
+    /// keeps that safe — the two passes are never nested, so one thread
+    /// driving both roles takes it twice in sequence rather than twice at
+    /// once.
+    Shared(Box<dyn TxPort>),
 }
 
 impl Stack {
-    /// A stack over the three ports a machine has: one receive queue and one
-    /// transmit queue per agent thread.
+    /// A stack over the ports a machine has: one receive queue, and the
+    /// transmit queues its threading mode gives it ([`TransmitQueues`]).
     ///
-    /// `tx` is indexed by [`Affinity`]: `0` is the sender's queue and `1` the
-    /// receiver's, which is the design's §4.7 mapping and the reference's own
-    /// discriminants.
+    /// The transmit side is indexed by [`Affinity`]: `0` is the sender's queue
+    /// and `1` the receiver's, which is the design's §4.7 mapping and the
+    /// reference's own discriminants — and under a mode with one queue, both
+    /// entries are the same port.
     pub fn new(
         params: StackParams,
         now: Clock,
         rx: Box<dyn RxPort>,
-        tx: [Box<dyn TxPort>; 2],
+        tx: TransmitQueues,
+        device: Option<DeviceParts>,
     ) -> Arc<Self> {
         let capacity = params.ring_capacity();
-        let neighbours =
+        let mut neighbours =
             NeighbourTable::new(NEIGHBOUR_CAPACITY, params.arp_timeout, params.arp_interval);
+
+        // The configured next hops, before the stack exists to ask for them: a
+        // fixed entry is one no ARP request is ever sent for, and one nothing
+        // learned off the wire overwrites ([`NeighbourTable::learn`]) — what
+        // was configured is what is used.
+        for (address, hardware) in &params.static_neighbours {
+            neighbours.insert_fixed(*address, *hardware);
+        }
+
+        // Under a mode with one transmit queue, one `Arc` goes into both slots:
+        // the two roles share the port, and the lock is what serialises them.
+        let tx = match tx {
+            TransmitQueues::PerRole(sender, receiver) => {
+                [Arc::new(Mutex::new(sender)), Arc::new(Mutex::new(receiver))]
+            }
+            TransmitQueues::Shared(both) => {
+                let both = Arc::new(Mutex::new(both));
+                [Arc::clone(&both), both]
+            }
+        };
 
         Arc::new(Self {
             ports: PortTable::new(SLOT_CAPACITY, params.ephemeral_ports.clone()),
@@ -444,10 +534,40 @@ impl Stack {
             identification: AtomicU16::new(0),
             params,
             rx: Arc::new(Mutex::new(rx)),
-            tx: tx.map(|port| Arc::new(Mutex::new(port))),
+            tx,
             counters: StackCounters::default(),
             now,
+            device,
         })
+    }
+
+    /// What the port this stack drives says about itself, which is what its
+    /// counters are labelled with (design §4.10).
+    ///
+    /// [`None`] on a stack with no device behind it — a fake wire's — because a
+    /// label naming a port that does not exist is a counter a reader cannot
+    /// place, and there is nothing to place it by.
+    pub fn identity(&self) -> Option<PortIdentity<'_>> {
+        let device = self.device.as_ref()?;
+
+        Some(PortIdentity {
+            name: &device.name,
+            driver: &device.driver,
+            mac: self.params.mac,
+            address: self.params.address,
+            prefix_length: self.params.prefix_length,
+        })
+    }
+
+    /// Read what the device and its pool answered, or [`None`] on a stack with
+    /// no device behind it.
+    ///
+    /// Asked on the timer that publishes this media's counters, which is why
+    /// the read is the device's own: what only a port knows — what it dropped,
+    /// what the link is doing, what the pool has free — is not in any counter
+    /// this stack keeps.
+    pub fn device_reading(&self) -> Option<Result<Device, String>> {
+        Some((self.device.as_ref()?.read)())
     }
 
     /// A stack whose three ports are all on one side of a [`Wire`] — the shape
@@ -455,20 +575,81 @@ impl Stack {
     /// over one need.
     pub fn over_a_fake_wire(wire: &Wire, side: Side, params: StackParams, now: Clock) -> Arc<Self> {
         let mac = params.mac;
-        let mtu = params.mtu;
+        // A port's MTU counts the Ethernet header and a stack's counts the
+        // frame it was configured for, so the wire's port is given the one the
+        // other is measured from ([`RxPort::mtu`]): `largest_datagram` then
+        // answers exactly what this stack was built to carry, which is what a
+        // fake wire is for.
+        let mtu = params.mtu + super::frame::IPV4_UDP_HEADER_LENGTH;
         let port = || wire.port(side, mac, mtu);
 
         Self::new(
             params,
             now,
             Box::new(port()),
-            [Box::new(port()), Box::new(port())],
+            TransmitQueues::PerRole(Box::new(port()), Box::new(port())),
+            None,
         )
     }
 
     /// What this stack was configured with.
     pub const fn params(&self) -> &StackParams {
         &self.params
+    }
+
+    /// The largest Aeron frame this port can put on a wire or take off one —
+    /// what a channel's `mtu=` has to fit, because this stack does not
+    /// fragment (design §4.8, §4.11).
+    ///
+    /// A port's MTU counts the Ethernet header and a frame's does not, so the
+    /// 42 bytes of Ethernet, IPv4 and UDP headers come off here: a 1500-byte
+    /// port answers 1472, which is the number the design's refusal is written
+    /// against.
+    pub fn largest_datagram(&self) -> usize {
+        let port = self.rx.lock().expect("the receive port");
+
+        port.mtu()
+            .saturating_sub(super::frame::IPV4_UDP_HEADER_LENGTH)
+    }
+
+    /// The interface this stack holds `address` on, when it is this stack that
+    /// holds it (`design.md` §4.9, Q1a).
+    ///
+    /// The kernel's interface list is the only thing that knows which addresses
+    /// a machine has — except for a media that drives its own port. A NIC bound
+    /// to vfio is **not in that list at all** (D0: the port is gone from the
+    /// kernel the moment it is bound), and a port this driver opened is one
+    /// whose address the stack answers ARP for. So the question goes here
+    /// first, and what this stack does not hold falls through to the kernel
+    /// ([`crate::media::InterfaceSource`]).
+    ///
+    /// The answer is this port's own address rather than the one asked about,
+    /// which is what the kernel's own lookup does: `interface=` names a
+    /// *prefix* to match against an interface, and the address that comes back
+    /// is the interface's (`aeron_ip_lookup_func`,
+    /// `aeron-client/src/main/c/util/aeron_netutil.c:479-517`).
+    ///
+    /// The media is IPv4-only (§4.11 refuses IPv6 at the channel), so a v6
+    /// question is one this stack never answers.
+    pub fn owns(
+        &self,
+        family: crate::sys::AddressFamily,
+        address: std::net::IpAddr,
+        prefix_length: u8,
+    ) -> Option<crate::sys::LocalInterface> {
+        if family != crate::sys::AddressFamily::Inet {
+            return None;
+        }
+        let std::net::IpAddr::V4(address) = address else {
+            return None;
+        };
+
+        neighbour::on_the_same_link(self.params.address, address, prefix_length).then_some(
+            crate::sys::LocalInterface {
+                address: std::net::IpAddr::V4(self.params.address),
+                index: PORT_INTERFACE_INDEX,
+            },
+        )
     }
 
     /// What it has counted.
@@ -728,12 +909,44 @@ mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Injection};
     use crate::media::userspace::frame::Received;
+    use crate::sys::AddressFamily;
+    use std::net::IpAddr;
 
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
 
     fn params() -> StackParams {
         StackParams::new(OWN, 24, [0x02, 0, 0, 0, 0, 0x01])
+    }
+
+    /// What a port this stack drives holds, which is what a channel's
+    /// `interface=` is answered from (design §4.9, Q1a).
+    ///
+    /// The answer is the port's **own** address rather than the one asked
+    /// about, which is what the kernel's lookup does too: `interface=` names a
+    /// prefix to match, and the address that comes back is the interface's.
+    #[test]
+    fn a_stack_holds_its_own_prefix_and_nothing_else() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let ipv4 = |octets: [u8; 4]| IpAddr::V4(std::net::Ipv4Addr::from(octets));
+
+        let own = stack
+            .owns(AddressFamily::Inet, ipv4([10, 10, 0, 7]), 24)
+            .expect("the port's prefix is the port's");
+        assert_eq!(ipv4([10, 10, 0, 1]), own.address, "the port's own address");
+        assert_eq!(PORT_INTERFACE_INDEX, own.index);
+
+        assert_eq!(
+            None,
+            stack.owns(AddressFamily::Inet, ipv4([10, 10, 1, 7]), 24),
+            "off this link is not this stack's"
+        );
+        assert_eq!(
+            None,
+            stack.owns(AddressFamily::Inet6, ipv4([10, 10, 0, 7]), 24),
+            "and the media is IPv4-only (§4.11 refuses IPv6 at the channel)"
+        );
     }
 
     fn stack(wire: &Wire) -> Arc<Stack> {
@@ -779,6 +992,48 @@ mod tests {
 
     fn far_end(wire: &Wire) -> FakePort {
         wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500)
+    }
+
+    /// A next hop that was configured is in the table before the stack has
+    /// seen a frame, and stays what it was configured as.
+    ///
+    /// What this buys is the ARP exchange a deployment with known peers does
+    /// not have to pay for, and a peer whose answer never comes. The second
+    /// assertion is the half worth pinning: an entry that learning could
+    /// overwrite would be one the wire decides, which is the opposite of
+    /// configured.
+    #[test]
+    fn a_configured_next_hop_is_there_before_a_frame_is() {
+        let wire = Wire::new();
+        let configured = Ipv4Addr::new(10, 10, 0, 9);
+        let hardware = [0x02, 0, 0, 0, 0, 0x09];
+        let stack = Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams {
+                static_neighbours: vec![(configured, hardware)],
+                ..params()
+            },
+            Clock::Monotonic,
+        );
+
+        assert_eq!(
+            NextHop::Known(hardware),
+            stack.neighbour(configured),
+            "no ARP request was needed, and none was sent"
+        );
+        assert_eq!(
+            NextHop::Unknown,
+            stack.neighbour(PEER),
+            "and nothing else came with it"
+        );
+
+        stack.learn(configured, [0x02, 0, 0, 0, 0, 0xee]);
+        assert_eq!(
+            NextHop::Known(hardware),
+            stack.neighbour(configured),
+            "what the wire says does not move what was configured"
+        );
     }
 
     /// The ring's capacity is a consequence of the window and the MTU, and it

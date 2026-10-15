@@ -58,6 +58,29 @@ _Static_assert(RTE_ETH_NAME_MAX_LEN <= SHIM_DRIVER_NAME_MAX,
     "the shim's driver-name buffer is shorter than DPDK's");
 
 /*
+ * What a port's own counters are, cut down to the eight this build reads:
+ * `rte_eth_stats` also carries a per-queue breakdown whose length is a
+ * build-time constant, and Rust never sees any of it.
+ */
+typedef struct {
+    uint64_t ipackets;
+    uint64_t opackets;
+    uint64_t ibytes;
+    uint64_t obytes;
+    uint64_t imissed;
+    uint64_t ierrors;
+    uint64_t oerrors;
+    uint64_t rx_nombuf;
+} shim_port_stats_t;
+
+/* The link's state, with the bitfields already resolved. */
+typedef struct {
+    uint32_t speed_mbps;
+    uint8_t up;
+    uint8_t full_duplex;
+} shim_port_link_t;
+
+/*
  * A frame on the way in: the handle Rust owns, the bytes it reads, and the
  * NIC's verdict on the checksums — a three-valued answer computed *here*, so
  * that no DPDK bit-field is interpreted on the Rust side.
@@ -203,6 +226,19 @@ int shim_port_info(unsigned port, shim_port_info_t *out)
     return 0;
 }
 
+/*
+ * The two receive offloads this build asks about, by DPDK's own numbering.
+ *
+ * Functions rather than numbers the Rust side carries, because the numbering
+ * is DPDK's: an offload is an `RTE_BIT64(n)` in a header that moves between
+ * versions, and what the driver above this crate wants is the yes-or-no answer
+ * — "does this port judge IPv4 checksums" — not a bit position it would have
+ * to keep in step with a library it never includes.
+ */
+uint64_t shim_rx_offload_ipv4_checksum(void) { return RTE_ETH_RX_OFFLOAD_IPV4_CKSUM; }
+
+uint64_t shim_rx_offload_udp_checksum(void) { return RTE_ETH_RX_OFFLOAD_UDP_CKSUM; }
+
 int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t rx_offloads, uint64_t tx_offloads)
 {
     struct rte_eth_conf conf;
@@ -258,6 +294,52 @@ int shim_port_mac(unsigned port, unsigned char *out)
 }
 
 int shim_port_mtu(unsigned port, uint16_t *out) { return rte_eth_dev_get_mtu((uint16_t)port, out); }
+
+int shim_port_stats(unsigned port, shim_port_stats_t *out)
+{
+    struct rte_eth_stats stats;
+
+    rte_errno = 0; /* this call's failure, not an earlier one's */
+    if (0 != rte_eth_stats_get((uint16_t)port, &stats))
+    {
+        return -1;
+    }
+    out->ipackets = stats.ipackets;
+    out->opackets = stats.opackets;
+    out->ibytes = stats.ibytes;
+    out->obytes = stats.obytes;
+    out->imissed = stats.imissed;
+    out->ierrors = stats.ierrors;
+    out->oerrors = stats.oerrors;
+    out->rx_nombuf = stats.rx_nombuf;
+
+    return 0;
+}
+
+/*
+ * The link's state. `rte_eth_link` is a bitfield union in this version of DPDK
+ * — `link_status` is three bits of a `uint32_t` — which is the sort of thing
+ * this shim exists to keep on the C side of the boundary.
+ *
+ * The `_nowait` call: a link that is still auto-negotiating makes the blocking
+ * one wait for it, and this is read on a timer by a conductor that has other
+ * things to do.
+ */
+int shim_port_link(unsigned port, shim_port_link_t *out)
+{
+    struct rte_eth_link link;
+
+    rte_errno = 0;
+    if (0 != rte_eth_link_get_nowait((uint16_t)port, &link))
+    {
+        return -1;
+    }
+    out->speed_mbps = link.link_speed;
+    out->up = 0 != link.link_status;
+    out->full_duplex = 0 != link.link_duplex;
+
+    return 0;
+}
 
 /* ---- the data path, in batches ---------------------------------------- */
 

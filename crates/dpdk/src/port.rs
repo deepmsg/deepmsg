@@ -42,6 +42,46 @@ impl Default for PortSettings {
     }
 }
 
+impl PortSettings {
+    /// Ask `port` for the checksum offloads this build reads back — the ones
+    /// [`PortInfo::can_judge_ipv4_checksum`] and
+    /// [`PortInfo::can_judge_udp_checksum`] answer about — and leave every
+    /// other setting as it is.
+    ///
+    /// What a port *can* do and what it *does* are the same thing only because
+    /// a caller asks: `rte_eth_dev_configure` refuses a bit the device does not
+    /// have rather than ignoring it, so the bits come from the port's own
+    /// capabilities and nothing else is asked for. A port with neither — every
+    /// virtual device this build's tests run on — is asked for nothing, and its
+    /// settings come back unchanged.
+    #[must_use = "the settings it builds are the ones to start the port with"]
+    pub fn asking_for_checksum_offloads(mut self, port: &PortInfo) -> Self {
+        let (ipv4, udp) = checksum_offload_bits();
+
+        if port.can_judge_ipv4_checksum() {
+            self.rx_offloads |= ipv4;
+        }
+        if port.can_judge_udp_checksum() {
+            self.rx_offloads |= udp;
+        }
+
+        self
+    }
+}
+
+/// The two receive offloads this build asks about, as the bits DPDK numbers
+/// them by.
+fn checksum_offload_bits() -> (u64, u64) {
+    // SAFETY: header constants, wrapped as functions by the shim (`shim.c`);
+    // they read nothing and cannot fail.
+    unsafe {
+        (
+            sys::shim_rx_offload_ipv4_checksum(),
+            sys::shim_rx_offload_udp_checksum(),
+        )
+    }
+}
+
 /// What a port says it is, read once when it is started.
 #[derive(Clone, Debug)]
 pub struct PortInfo {
@@ -58,6 +98,66 @@ pub struct PortInfo {
     pub socket_id: Option<u32>,
     pub rx_offloads: u64,
     pub tx_offloads: u64,
+}
+
+impl PortInfo {
+    /// Whether this port judges the IPv4 header checksum of the frames it
+    /// hands over — `RTE_ETH_RX_OFFLOAD_IPV4_CKSUM` among its receive
+    /// capabilities.
+    ///
+    /// A capability, not a promise: the port judges checksums only if it was
+    /// asked to ([`PortSettings::rx_offloads`]), and what it answers here is
+    /// what it *can* do. The two are the same value for a caller that asks for
+    /// what it reads back, which is what the driver does.
+    pub fn can_judge_ipv4_checksum(&self) -> bool {
+        let (ipv4, _) = checksum_offload_bits();
+        self.rx_offloads & ipv4 != 0
+    }
+
+    /// Whether it judges the UDP checksum; see
+    /// [`can_judge_ipv4_checksum`](Self::can_judge_ipv4_checksum).
+    pub fn can_judge_udp_checksum(&self) -> bool {
+        let (_, udp) = checksum_offload_bits();
+        self.rx_offloads & udp != 0
+    }
+}
+
+/// What a port's own counters say (`rte_eth_stats`).
+///
+/// The device's account rather than this build's: a frame the NIC dropped for
+/// want of room is in `missed` and nowhere else, which is why a driver that
+/// wants to know what it lost must read here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortStats {
+    /// Frames the port handed to this process.
+    pub received: u64,
+    /// Frames the port took for transmission.
+    pub transmitted: u64,
+    /// Bytes of those frames.
+    pub received_bytes: u64,
+    /// Bytes of those frames.
+    pub transmitted_bytes: u64,
+    /// Frames the device dropped because it had nowhere to put them — the one
+    /// loss a driver cannot count for itself.
+    pub missed: u64,
+    /// Receive errors the PMD counted.
+    pub receive_errors: u64,
+    /// Transmit errors the PMD counted.
+    pub transmit_errors: u64,
+    /// Frames dropped because the pool had no buffer for them.
+    pub no_buffers: u64,
+}
+
+/// What a port's link is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// Whether the link is up.
+    pub up: bool,
+    /// Whether it is full duplex.
+    pub full_duplex: bool,
+    /// Its speed, in megabits per second — zero when it is down, and the
+    /// unknown-speed sentinel above that.
+    pub speed_mbps: u32,
 }
 
 /// A started port.
@@ -83,6 +183,17 @@ impl Port {
         &self.info
     }
 
+    /// What the port named `name` is, before anything is configured on it.
+    ///
+    /// A caller has to be able to read a port before it starts it, because what
+    /// a port can do decides what it is asked for: a capability the device does
+    /// not have makes [`Port::start`] fail rather than be ignored
+    /// ([`PortSettings::asking_for_checksum_offloads`]), and a queue count past
+    /// the device's maximum is a configuration it will refuse.
+    pub fn describe(name: &str) -> Result<PortInfo, Error> {
+        info_of(id_of(name)?)
+    }
+
     /// This port's hardware address.
     pub fn mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
@@ -99,6 +210,67 @@ impl Port {
         let rc = unsafe { sys::shim_port_mtu(c_uint::from(self.id), &mut mtu) };
         debug_assert_eq!(rc, 0, "a started port reports its MTU");
         mtu
+    }
+
+    /// What the port's own counters say (`rte_eth_stats`).
+    ///
+    /// The call is a plain read of the PMD's counters and is documented as
+    /// callable while the queues are in use; whether a given PMD's
+    /// implementation really is, D3 checks per PMD (the design's §4.10). What
+    /// this build needs from it is `missed` — the frames the *device* dropped,
+    /// which is the only loss a driver can see from its own side of the wire.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD, with DPDK's own words when it set an errno.
+    pub fn stats(&self) -> Result<PortStats, Error> {
+        let mut raw = sys::ShimPortStats::default();
+
+        // SAFETY: the struct is this crate's own layout, mirrored field for
+        // field in the shim, and the port id is one this value was started
+        // with.
+        let rc = unsafe { sys::shim_port_stats(c_uint::from(self.id), &mut raw) };
+        if rc != 0 {
+            return Err(Error::from_call(
+                "the port would not report its counters",
+                rc,
+            ));
+        }
+
+        Ok(PortStats {
+            received: raw.ipackets,
+            transmitted: raw.opackets,
+            received_bytes: raw.ibytes,
+            transmitted_bytes: raw.obytes,
+            missed: raw.imissed,
+            receive_errors: raw.ierrors,
+            transmit_errors: raw.oerrors,
+            no_buffers: raw.rx_nombuf,
+        })
+    }
+
+    /// What the link is doing, without waiting for it.
+    ///
+    /// The non-blocking form on purpose: a link that is still auto-negotiating
+    /// makes the other one wait, and this is read on a timer.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD.
+    pub fn link(&self) -> Result<Link, Error> {
+        let mut raw = sys::ShimPortLink::default();
+
+        // SAFETY: as in `stats` above.
+        let rc = unsafe { sys::shim_port_link(c_uint::from(self.id), &mut raw) };
+        if rc != 0 {
+            return Err(Error::from_call("the port would not report its link", rc));
+        }
+
+        Ok(Link {
+            up: raw.up != 0,
+            full_duplex: raw.full_duplex != 0,
+            speed_mbps: raw.speed_mbps,
+        })
     }
 
     /// Configure and start the port with this name, and hand out its queues.
@@ -517,4 +689,81 @@ fn info_of(id: u16) -> Result<PortInfo, Error> {
         rx_offloads: raw.rx_offloads,
         tx_offloads: raw.tx_offloads,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port's description, for the cases below that ask it something without
+    /// an EAL to make a real one.
+    fn described(rx_offloads: u64) -> PortInfo {
+        PortInfo {
+            name: "a-port".to_owned(),
+            driver: "a-pmd".to_owned(),
+            max_rx_queues: 4,
+            max_tx_queues: 4,
+            min_mtu: 68,
+            max_mtu: 1500,
+            socket_id: None,
+            rx_offloads,
+            tx_offloads: 0,
+        }
+    }
+
+    /// What a port is asked for is exactly what it can judge.
+    ///
+    /// The asymmetry matters: `rte_eth_dev_configure` refuses a bit the device
+    /// does not have rather than ignoring it, so a caller that asked for both
+    /// regardless would fail to *start* on every virtual device this build
+    /// tests on — and a caller that asked for neither would leave a real NIC's
+    /// checksum hardware idle, which is the whole of what an offload buys.
+    #[test]
+    fn a_port_is_asked_for_the_checksums_it_can_judge() {
+        let (ipv4, udp) = checksum_offload_bits();
+        assert_ne!(ipv4, udp, "the two offloads are two bits, not one");
+
+        assert_eq!(
+            0,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(0))
+                .rx_offloads,
+            "a port that judges nothing is asked for nothing"
+        );
+        assert_eq!(
+            ipv4 | udp,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(ipv4 | udp))
+                .rx_offloads
+        );
+        assert_eq!(
+            ipv4,
+            PortSettings::default()
+                .asking_for_checksum_offloads(&described(ipv4))
+                .rx_offloads,
+            "and only the half of it the port has"
+        );
+
+        assert!(described(ipv4).can_judge_ipv4_checksum());
+        assert!(
+            !described(ipv4).can_judge_udp_checksum(),
+            "one bit set is not both offloads"
+        );
+    }
+
+    /// Asking is not a rewrite: an offload the caller set for its own reasons
+    /// survives, because this adds to the settings rather than replacing them.
+    #[test]
+    fn asking_leaves_the_other_offloads_alone() {
+        let (ipv4, _) = checksum_offload_bits();
+        let other = 1u64; // whatever bit a caller set for itself
+
+        let asked = PortSettings {
+            rx_offloads: other,
+            ..PortSettings::default()
+        }
+        .asking_for_checksum_offloads(&described(ipv4));
+
+        assert_eq!(other | ipv4, asked.rx_offloads);
+    }
 }

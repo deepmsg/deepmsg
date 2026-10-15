@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::frame::Checksums;
-use super::packet_io::{Disposition, ReadyFrame, RxFrame, RxPort, TxPort};
+use super::packet_io::{Disposition, Offloads, ReadyFrame, RxFrame, RxPort, TxPort};
 use super::ports::Binding;
 
 /// Which end of a wire a port is on.
@@ -280,6 +280,12 @@ impl RxPort for FakePort {
         }
 
         handed
+    }
+
+    /// Nothing: a wire has no hardware to ask, and every frame it carries
+    /// arrives with `Checksums::Software` for exactly that reason.
+    fn offloads(&self) -> Offloads {
+        Offloads::NONE
     }
 
     fn mac(&self) -> [u8; 6] {

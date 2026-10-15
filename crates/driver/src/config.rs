@@ -40,7 +40,10 @@
 //! surface much later as a capacity that is subtly wrong. A bad value here is
 //! a start-up error, and the error names the setting.
 
+use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use deepmsg_cnc::{CLIENT_LIVENESS_TIMEOUT_NS_DEFAULT, CncCreateError, CncLayout};
 
@@ -501,6 +504,102 @@ impl TerminationPolicy {
 // `Eq` is not derived: a `loss` interceptor's rate is an `f64`
 // (`media/aeron_udp_channel_transport_loss.c:24`), and that is the reference's
 // type for it too.
+/// Which media the driver's UDP data paths run on
+/// (`AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA`, `aeronmd.h:731`).
+///
+/// The *selection*, not the bindings themselves: the bindings are a value the
+/// driver binary builds once the EAL is up and the stack exists, and the
+/// configuration is read before either (`design.md` §4.13: EAL first, so that a
+/// failure leaves no half a driver directory).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaSelection {
+    /// `default`: the kernel's sockets.
+    #[default]
+    Default,
+    /// `dpdk`: Ethernet frames in and out of a port this driver owns. Only a
+    /// build with the `dpdk` feature serves this name — the reference's own
+    /// behaviour for a name it does not hold is a driver that does not start,
+    /// and so is this.
+    Dpdk,
+}
+
+/// The settings of the DPDK media (`design.md` §4.9).
+///
+/// Read whatever the selection is: a driver configured for the kernel may
+/// still carry these, and it is the selection that decides whether they are
+/// used. Every one of them has the design's default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DpdkSettings {
+    /// What the EAL is initialised with, verbatim.
+    pub eal_args: String,
+    /// The port, by PCI address or virtual-device name; `None` takes the first
+    /// one the EAL found.
+    pub port: Option<String>,
+    /// This port's own address and prefix length, which the media has no way
+    /// to guess.
+    pub address: Option<(Ipv4Addr, u8)>,
+    /// The next hop for destinations off this link.
+    pub gateway: Option<Ipv4Addr>,
+    /// Addresses that never age out, as `(address, mac)`.
+    pub static_neighbours: Vec<(Ipv4Addr, [u8; 6])>,
+    /// Receive descriptors.
+    pub rx_descriptors: u16,
+    /// Transmit descriptors.
+    pub tx_descriptors: u16,
+    /// The pool's size; `None` computes it from the descriptors and the rings
+    /// (§4.8).
+    pub mempool_size: Option<u32>,
+    /// The pool's per-lcore cache.
+    pub mempool_cache: u32,
+    /// How many frames one pass takes off the port.
+    pub rx_burst: usize,
+    /// The capacity of the cross-thread ring — the ready ring, in this build.
+    pub sender_ring: usize,
+    /// The range a bind of port zero draws from.
+    pub ephemeral_ports: RangeInclusive<u16>,
+    /// How long a learned address stays good.
+    pub arp_timeout: Duration,
+    /// How often an unresolved one is asked about.
+    pub arp_retry: Duration,
+}
+
+impl Default for DpdkSettings {
+    fn default() -> Self {
+        Self {
+            eal_args: String::new(),
+            port: None,
+            address: None,
+            gateway: None,
+            static_neighbours: Vec::new(),
+            rx_descriptors: DPDK_RX_DESCRIPTORS_DEFAULT,
+            tx_descriptors: DPDK_TX_DESCRIPTORS_DEFAULT,
+            mempool_size: None,
+            mempool_cache: DPDK_MEMPOOL_CACHE_DEFAULT,
+            rx_burst: DPDK_RX_BURST_DEFAULT,
+            sender_ring: DPDK_SENDER_RING_DEFAULT,
+            ephemeral_ports: crate::media::userspace::ports::EPHEMERAL_PORTS,
+            arp_timeout: DPDK_ARP_TIMEOUT_DEFAULT,
+            arp_retry: DPDK_ARP_RETRY_DEFAULT,
+        }
+    }
+}
+
+/// `RTE_ETH_RX_DESC_DEFAULT` / `RTE_ETH_TX_DESC_DEFAULT` are DPDK's own
+/// thousand, which is what the design's table takes.
+pub const DPDK_RX_DESCRIPTORS_DEFAULT: u16 = 1024;
+/// See [`DPDK_RX_DESCRIPTORS_DEFAULT`].
+pub const DPDK_TX_DESCRIPTORS_DEFAULT: u16 = 1024;
+/// `design.md` §4.8's cache default.
+pub const DPDK_MEMPOOL_CACHE_DEFAULT: u32 = 256;
+/// `design.md` §4.5's burst: one pass takes up to this many frames.
+pub const DPDK_RX_BURST_DEFAULT: usize = 32;
+/// `design.md` §4.7's cross-thread ring, which in this build is the ready ring.
+pub const DPDK_SENDER_RING_DEFAULT: usize = 1024;
+/// The design's ARP ageing.
+pub const DPDK_ARP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
+/// The design's ARP retry interval.
+pub const DPDK_ARP_RETRY_DEFAULT: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DriverConfig {
     /// Where the CnC file, the term buffers and the subdirectories live.
@@ -907,6 +1006,14 @@ pub struct DriverConfig {
     /// one its only user, the name resolver, always runs on
     /// ([`crate::media::bindings`]).
     pub transport_bindings: crate::media::TransportBindings,
+    /// Which media that setting named ([`MediaSelection`]). The bindings above
+    /// are the value the driver runs on; this is what the configuration said,
+    /// and the binary is what turns one into the other — after the EAL is up,
+    /// and before the CnC file exists.
+    pub media: MediaSelection,
+    /// The DPDK media's own settings, used when [`Self::media`] is
+    /// [`MediaSelection::Dpdk`] and ignored otherwise (`design.md` §4.9).
+    pub dpdk: DpdkSettings,
     /// `aeron.driver.cpuset.affinity` (`AERON_DRIVER_CPUSET_AFFINITY`,
     /// `aeronmd.h:969`): whether the driver pins its agents to the CPUs its
     /// cgroup allows (`aeron_driver.c:1138-1209`). **Off by default**, which is
@@ -1040,6 +1147,8 @@ impl Default for DriverConfig {
             loss_report_buffer_length: LOSS_REPORT_BUFFER_LENGTH_DEFAULT,
             connect_enabled: DRIVER_CONNECT_DEFAULT,
             transport_bindings: crate::media::TransportBindings::Default,
+            media: MediaSelection::Default,
+            dpdk: DpdkSettings::default(),
             cpuset_affinity: false,
             cpuset_warnings_as_errors: false,
             conductor_cpu_affinity: CPU_AFFINITY_DEFAULT,
@@ -1339,9 +1448,9 @@ impl DriverConfig {
         }
 
         if let Some(value) = get(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
-            config.transport_bindings =
-                parse_transport_bindings(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA, &value)?;
+            config.media = parse_media(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA, &value)?;
         }
+        parse_dpdk(&get, &mut config.dpdk)?;
         if let Some(value) = get(&Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
             parse_transport_bindings(
                 &Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
@@ -2002,6 +2111,98 @@ impl Setting {
     const DIR: Self = Self {
         property: "dir",
         env: "AERON_DIR",
+    };
+    /// `deepmsg.dpdk.eal.args` (`DEEPMSG_DPDK_EAL_ARGS`): what the EAL is
+    /// initialised with, verbatim (`design.md` §4.9). The driver appends its
+    /// own arguments and **refuses** rather than overwrite a conflict.
+    const DPDK_EAL_ARGS: Self = Self {
+        property: "dpdk.eal.args",
+        env: "DEEPMSG_DPDK_EAL_ARGS",
+    };
+    /// `deepmsg.dpdk.port` (`DEEPMSG_DPDK_PORT`): the port by PCI address or
+    /// by virtual-device name. Unset takes the first one the EAL found.
+    const DPDK_PORT: Self = Self {
+        property: "dpdk.port",
+        env: "DEEPMSG_DPDK_PORT",
+    };
+    /// `deepmsg.dpdk.ipv4.address` (`DEEPMSG_DPDK_IPV4_ADDRESS`): this port's
+    /// own address and prefix length, as `10.10.0.1/24`. Mandatory when the
+    /// media is `dpdk` — it is what the stack answers ARP for and what decides
+    /// which channels are the port's (§4.9's ownership rule).
+    const DPDK_IPV4_ADDRESS: Self = Self {
+        property: "dpdk.ipv4.address",
+        env: "DEEPMSG_DPDK_IPV4_ADDRESS",
+    };
+    /// `deepmsg.dpdk.ipv4.gateway` (`DEEPMSG_DPDK_IPV4_GATEWAY`): the next hop
+    /// for destinations off this link. Without one, an off-link destination is
+    /// refused rather than guessed at.
+    const DPDK_IPV4_GATEWAY: Self = Self {
+        property: "dpdk.ipv4.gateway",
+        env: "DEEPMSG_DPDK_IPV4_GATEWAY",
+    };
+    /// `deepmsg.dpdk.static.neighbours` (`DEEPMSG_DPDK_STATIC_NEIGHBOURS`):
+    /// `ip=mac,ip=mac`, entries that never age out. A production deployment is
+    /// recommended to be all of these: a resolved address is a delay nobody
+    /// has to pay.
+    const DPDK_STATIC_NEIGHBOURS: Self = Self {
+        property: "dpdk.static.neighbours",
+        env: "DEEPMSG_DPDK_STATIC_NEIGHBOURS",
+    };
+    /// `deepmsg.dpdk.rx.descriptors` / `.tx.descriptors`
+    /// (`DEEPMSG_DPDK_RX_DESCRIPTORS`, `DEEPMSG_DPDK_TX_DESCRIPTORS`).
+    const DPDK_RX_DESCRIPTORS: Self = Self {
+        property: "dpdk.rx.descriptors",
+        env: "DEEPMSG_DPDK_RX_DESCRIPTORS",
+    };
+    /// See [`Self::DPDK_RX_DESCRIPTORS`].
+    const DPDK_TX_DESCRIPTORS: Self = Self {
+        property: "dpdk.tx.descriptors",
+        env: "DEEPMSG_DPDK_TX_DESCRIPTORS",
+    };
+    /// `deepmsg.dpdk.mempool.size` / `.cache`
+    /// (`DEEPMSG_DPDK_MEMPOOL_SIZE`, `DEEPMSG_DPDK_MEMPOOL_CACHE`). The size
+    /// is computed from the descriptors and the rings when it is not given
+    /// (design §4.8).
+    const DPDK_MEMPOOL_SIZE: Self = Self {
+        property: "dpdk.mempool.size",
+        env: "DEEPMSG_DPDK_MEMPOOL_SIZE",
+    };
+    /// See [`Self::DPDK_MEMPOOL_SIZE`].
+    const DPDK_MEMPOOL_CACHE: Self = Self {
+        property: "dpdk.mempool.cache",
+        env: "DEEPMSG_DPDK_MEMPOOL_CACHE",
+    };
+    /// `deepmsg.dpdk.rx.burst` (`DEEPMSG_DPDK_RX_BURST`): how many frames one
+    /// pass takes off the port.
+    const DPDK_RX_BURST: Self = Self {
+        property: "dpdk.rx.burst",
+        env: "DEEPMSG_DPDK_RX_BURST",
+    };
+    /// `deepmsg.dpdk.sender.ring` (`DEEPMSG_DPDK_SENDER_RING`): the capacity
+    /// of the cross-thread ring — which in this build is the ready ring itself
+    /// (§4.7's plan A, as the D2 slice left it).
+    const DPDK_SENDER_RING: Self = Self {
+        property: "dpdk.sender.ring",
+        env: "DEEPMSG_DPDK_SENDER_RING",
+    };
+    /// `deepmsg.dpdk.ephemeral.ports` (`DEEPMSG_DPDK_EPHEMERAL_PORTS`):
+    /// `first-last`, the range a bind of port zero draws from.
+    const DPDK_EPHEMERAL_PORTS: Self = Self {
+        property: "dpdk.ephemeral.ports",
+        env: "DEEPMSG_DPDK_EPHEMERAL_PORTS",
+    };
+    /// `deepmsg.dpdk.arp.timeout.ms` / `.retry.ms`
+    /// (`DEEPMSG_DPDK_ARP_TIMEOUT_MS`, `DEEPMSG_DPDK_ARP_RETRY_MS`): how long a
+    /// learned address stays good, and how often an unresolved one is asked
+    /// about.
+    const DPDK_ARP_TIMEOUT_MS: Self = Self {
+        property: "dpdk.arp.timeout.ms",
+        env: "DEEPMSG_DPDK_ARP_TIMEOUT_MS",
+    };
+    /// See [`Self::DPDK_ARP_TIMEOUT_MS`].
+    const DPDK_ARP_RETRY_MS: Self = Self {
+        property: "dpdk.arp.retry.ms",
+        env: "DEEPMSG_DPDK_ARP_RETRY_MS",
     };
     /// `aeron.dir.warn.if.exists` (`:46`).
     const DIR_WARN_IF_EXISTS: Self = Self {
@@ -2680,6 +2881,15 @@ pub enum ConfigError {
         /// The argument as it arrived.
         argument: String,
     },
+    /// A value the setting's shape does not hold: an address that is not one,
+    /// a prefix past 32, a neighbour list that is not `ip=mac`, a port range
+    /// that is not `first-last`.
+    MalformedValue {
+        /// The setting, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+    },
     /// No aeron directory was configured.
     MissingAeronDir {
         /// The property that would have set it.
@@ -2739,6 +2949,32 @@ pub enum ConfigError {
         /// What it was set to.
         value: String,
     },
+    /// `dpdk` named as the media in a build without the feature.
+    ///
+    /// The reference's own answer to a bindings name it does not hold is a
+    /// driver that does not start (`aeron_driver_context.c:1258-1270`), and so
+    /// is this — but the message has to say which of the two it was, because
+    /// "unknown name" sends a reader looking for a typo.
+    DpdkNotInThisBuild {
+        /// The setting, by property name.
+        name: &'static str,
+        /// What it was set to.
+        value: String,
+    },
+    /// An EAL argument this driver sets itself, or one that would move the
+    /// media onto CPUs the driver chooses (`-l`/`-c`/`--lcores`/`--main-lcore`).
+    ///
+    /// Refused rather than merged: either one silently changes which cores the
+    /// port runs on, and the driver's own cpuset arithmetic (design §4.7) is
+    /// the only place that knows what it is allowed to use.
+    DpdkEalArgument {
+        /// The setting, by property name.
+        name: &'static str,
+        /// The argument that clashed.
+        argument: String,
+        /// What the setting was set to.
+        value: String,
+    },
     /// An interface was named for the driver's own resolver without a name for
     /// the driver to answer to, which the reference refuses
     /// (`aeron_driver_context.c:601-608`).
@@ -2794,6 +3030,9 @@ impl std::fmt::Display for ConfigError {
             Self::MalformedArgument { argument } => {
                 write!(f, "expected -Dname=value, got {argument}")
             }
+            Self::MalformedValue { name, value } => {
+                write!(f, "{name} is {value}, which is not a value it holds")
+            }
             Self::Interceptor(error) => write!(f, "{error}"),
             Self::MissingAeronDir { property, env } => write!(
                 f,
@@ -2823,6 +3062,25 @@ impl std::fmt::Display for ConfigError {
                  This build holds one, `default` (the kernel's sockets), and looks no \
                  other name up — the reference falls back to `dlsym`, and this build \
                  loads no code (ADR-0002)"
+            ),
+            Self::DpdkNotInThisBuild { name, value } => write!(
+                f,
+                "{name} is {value}: could not find udp channel bindings object {value} \
+                 in this build, which holds one (`default`, the kernel's sockets) and the \
+                 `dpdk` media only with the `dpdk` feature. The reference looks the name \
+                 up with `dlsym`, and this build loads no code (ADR-0002): build with \
+                 `--features dpdk` to serve it"
+            ),
+            Self::DpdkEalArgument {
+                name,
+                argument,
+                value,
+            } => write!(
+                f,
+                "{name} is {value}: {argument} is an argument this driver sets itself \
+                 (it appends `--no-telemetry`, `--lcores=0@<the process's own cpuset>` and \
+                 one of `--in-memory`/`--no-shconf`), or names the lcores the media runs \
+                 on, which the driver's own cpuset arithmetic owns"
             ),
             Self::DynamicLoadingNotSupported { property } => write!(
                 f,
@@ -2874,6 +3132,9 @@ impl std::error::Error for ConfigError {
             | Self::ConflictingSettings { .. }
             | Self::UnknownSupplier { .. }
             | Self::UnknownTransportBindings { .. }
+            | Self::MalformedValue { .. }
+            | Self::DpdkNotInThisBuild { .. }
+            | Self::DpdkEalArgument { .. }
             | Self::ResolverNameRequired
             | Self::UnknownValidator { .. }
             | Self::UnknownThreadingMode { .. }
@@ -2914,6 +3175,246 @@ where
     }
 
     Ok(properties)
+}
+
+/// Which media a bindings name selects.
+///
+/// Three answers, and the middle one is the reference's own: a name this build
+/// does not hold is a driver that does not start
+/// (`aeron_driver_context.c:1258-1270` is a `goto error`). `dpdk` is such a
+/// name in a build without the feature, and the message says which of the two
+/// it was rather than pretending the name is unknown.
+///
+/// # Errors
+///
+/// [`ConfigError::UnknownTransportBindings`] for any other name, and
+/// [`ConfigError::DpdkNotInThisBuild`] for `dpdk` without the feature.
+fn parse_media(setting: &Setting, value: &str) -> Result<MediaSelection, ConfigError> {
+    match value {
+        "default" | "aeron_udp_channel_transport_bindings_default" => Ok(MediaSelection::Default),
+        "dpdk" => {
+            #[cfg(feature = "dpdk")]
+            {
+                Ok(MediaSelection::Dpdk)
+            }
+            #[cfg(not(feature = "dpdk"))]
+            {
+                Err(ConfigError::DpdkNotInThisBuild {
+                    name: setting.property,
+                    value: value.to_owned(),
+                })
+            }
+        }
+        other => Err(ConfigError::UnknownTransportBindings {
+            name: setting.property,
+            value: other.to_owned(),
+        }),
+    }
+}
+
+/// The DPDK media's settings, from wherever they are set.
+///
+/// # Errors
+///
+/// [`ConfigError::NotANumber`], [`ConfigError::OutOfRange`] and
+/// [`ConfigError::MalformedArgument`] for a value that is not one, and
+/// [`ConfigError::DpdkEalArgument`] for an EAL argument this driver sets
+/// itself.
+fn parse_dpdk(
+    get: &impl Fn(&Setting) -> Option<String>,
+    dpdk: &mut DpdkSettings,
+) -> Result<(), ConfigError> {
+    if let Some(value) = get(&Setting::DPDK_EAL_ARGS) {
+        for argument in value.split_whitespace() {
+            // The flag alone, or the flag with a value: `-l 2-3` and `-l2-3`
+            // are both the EAL's, and both are refused.
+            let flag = argument.split('=').next().unwrap_or(argument);
+            if matches!(
+                flag,
+                "-l" | "-c"
+                    | "--lcores"
+                    | "--main-lcore"
+                    | "--no-telemetry"
+                    | "--in-memory"
+                    | "--no-shconf"
+            ) || argument.starts_with("-l")
+                || argument.starts_with("-c")
+            {
+                return Err(ConfigError::DpdkEalArgument {
+                    name: Setting::DPDK_EAL_ARGS.property,
+                    argument: argument.to_owned(),
+                    value: value.clone(),
+                });
+            }
+        }
+
+        dpdk.eal_args = value;
+    }
+
+    if let Some(value) = get(&Setting::DPDK_PORT) {
+        dpdk.port = Some(value);
+    }
+    if let Some(value) = get(&Setting::DPDK_IPV4_ADDRESS) {
+        dpdk.address = Some(parse_ipv4_prefix(&Setting::DPDK_IPV4_ADDRESS, &value)?);
+    }
+    if let Some(value) = get(&Setting::DPDK_IPV4_GATEWAY) {
+        dpdk.gateway = Some(parse_ipv4(&Setting::DPDK_IPV4_GATEWAY, &value)?);
+    }
+    if let Some(value) = get(&Setting::DPDK_STATIC_NEIGHBOURS) {
+        dpdk.static_neighbours = parse_neighbours(&Setting::DPDK_STATIC_NEIGHBOURS, &value)?;
+    }
+    for (setting, field) in [
+        (Setting::DPDK_RX_DESCRIPTORS, &mut dpdk.rx_descriptors),
+        (Setting::DPDK_TX_DESCRIPTORS, &mut dpdk.tx_descriptors),
+    ] {
+        if let Some(value) = get(&setting) {
+            *field = u16::try_from(parse_count(&setting, &value)?).map_err(|_| {
+                ConfigError::OutOfRange {
+                    name: setting.property,
+                    value: value.clone(),
+                }
+            })?;
+        }
+    }
+    if let Some(value) = get(&Setting::DPDK_MEMPOOL_SIZE) {
+        dpdk.mempool_size = Some(
+            u32::try_from(parse_count(&Setting::DPDK_MEMPOOL_SIZE, &value)?).map_err(|_| {
+                ConfigError::OutOfRange {
+                    name: Setting::DPDK_MEMPOOL_SIZE.property,
+                    value: value.clone(),
+                }
+            })?,
+        );
+    }
+    if let Some(value) = get(&Setting::DPDK_MEMPOOL_CACHE) {
+        dpdk.mempool_cache = u32::try_from(parse_count(&Setting::DPDK_MEMPOOL_CACHE, &value)?)
+            .map_err(|_| ConfigError::OutOfRange {
+                name: Setting::DPDK_MEMPOOL_CACHE.property,
+                value: value.clone(),
+            })?;
+    }
+    if let Some(value) = get(&Setting::DPDK_RX_BURST) {
+        let burst = parse_count(&Setting::DPDK_RX_BURST, &value)?;
+        if !(1..=1024).contains(&burst) {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::DPDK_RX_BURST.property,
+                value,
+            });
+        }
+        dpdk.rx_burst = usize::try_from(burst).expect("a positive count");
+    }
+    if let Some(value) = get(&Setting::DPDK_SENDER_RING) {
+        let ring = parse_count(&Setting::DPDK_SENDER_RING, &value)?;
+        if ring < 2 {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::DPDK_SENDER_RING.property,
+                value,
+            });
+        }
+        dpdk.sender_ring = usize::try_from(ring).expect("a positive count");
+    }
+    if let Some(value) = get(&Setting::DPDK_EPHEMERAL_PORTS) {
+        dpdk.ephemeral_ports = parse_ports(&Setting::DPDK_EPHEMERAL_PORTS, &value)?;
+    }
+    if let Some(value) = get(&Setting::DPDK_ARP_TIMEOUT_MS) {
+        dpdk.arp_timeout = Duration::from_millis(
+            u64::try_from(parse_count(&Setting::DPDK_ARP_TIMEOUT_MS, &value)?).map_err(|_| {
+                ConfigError::OutOfRange {
+                    name: Setting::DPDK_ARP_TIMEOUT_MS.property,
+                    value,
+                }
+            })?,
+        );
+    }
+    if let Some(value) = get(&Setting::DPDK_ARP_RETRY_MS) {
+        dpdk.arp_retry = Duration::from_millis(
+            u64::try_from(parse_count(&Setting::DPDK_ARP_RETRY_MS, &value)?).map_err(|_| {
+                ConfigError::OutOfRange {
+                    name: Setting::DPDK_ARP_RETRY_MS.property,
+                    value,
+                }
+            })?,
+        );
+    }
+
+    Ok(())
+}
+
+/// `10.10.0.1/24`, which is how the media is told which addresses are its own.
+fn parse_ipv4_prefix(setting: &Setting, value: &str) -> Result<(Ipv4Addr, u8), ConfigError> {
+    let malformed = || ConfigError::MalformedValue {
+        name: setting.property,
+        value: value.to_owned(),
+    };
+
+    let (address, prefix) = value.split_once('/').ok_or_else(malformed)?;
+    let address = address.parse::<Ipv4Addr>().map_err(|_| malformed())?;
+    let prefix = prefix
+        .parse::<u8>()
+        .ok()
+        .filter(|prefix| *prefix <= 32)
+        .ok_or_else(malformed)?;
+
+    Ok((address, prefix))
+}
+
+/// One address, with nothing after it.
+fn parse_ipv4(setting: &Setting, value: &str) -> Result<Ipv4Addr, ConfigError> {
+    value
+        .parse::<Ipv4Addr>()
+        .map_err(|_| ConfigError::MalformedValue {
+            name: setting.property,
+            value: value.to_owned(),
+        })
+}
+
+/// `ip=mac,ip=mac`.
+fn parse_neighbours(
+    setting: &Setting,
+    value: &str,
+) -> Result<Vec<(Ipv4Addr, [u8; 6])>, ConfigError> {
+    let malformed = || ConfigError::MalformedValue {
+        name: setting.property,
+        value: value.to_owned(),
+    };
+
+    let mut neighbours = Vec::new();
+    for entry in value.split(',').filter(|entry| !entry.trim().is_empty()) {
+        let (address, hardware) = entry.split_once('=').ok_or_else(malformed)?;
+        let address = address
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map_err(|_| malformed())?;
+        let mut mac = [0u8; 6];
+        let octets: Vec<&str> = hardware.trim().split(':').collect();
+        if octets.len() != 6 {
+            return Err(malformed());
+        }
+        for (slot, octet) in mac.iter_mut().zip(octets) {
+            *slot = u8::from_str_radix(octet, 16).map_err(|_| malformed())?;
+        }
+
+        neighbours.push((address, mac));
+    }
+
+    Ok(neighbours)
+}
+
+/// `first-last`, both inclusive.
+fn parse_ports(setting: &Setting, value: &str) -> Result<RangeInclusive<u16>, ConfigError> {
+    let malformed = || ConfigError::MalformedValue {
+        name: setting.property,
+        value: value.to_owned(),
+    };
+
+    let (first, last) = value.split_once('-').ok_or_else(malformed)?;
+    let first = first.trim().parse::<u16>().map_err(|_| malformed())?;
+    let last = last.trim().parse::<u16>().map_err(|_| malformed())?;
+    if first > last {
+        return Err(malformed());
+    }
+
+    Ok(first..=last)
 }
 
 /// The value of a setting, from the first place that has one.
@@ -4690,15 +5191,40 @@ mod tests {
                     crate::media::TransportBindings::Default,
                     config.transport_bindings
                 );
+                assert_eq!(MediaSelection::Default, config.media);
+            }
+
+            // `dpdk` is a name the *table* holds, and a build without the
+            // feature is one that cannot serve it: the reference's answer to a
+            // name it does not hold is a driver that does not start, and the
+            // message says which of the two it was rather than sending a
+            // reader looking for a typo.
+            //
+            // Only the driver's setting: the conductor's twin serves `default`
+            // and nothing else (the module note in `crate::media::bindings`).
+            if property == Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA.property {
+                #[cfg(not(feature = "dpdk"))]
+                match resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, "dpdk")]) {
+                    Err(ConfigError::DpdkNotInThisBuild { name, value }) => {
+                        assert_eq!(property.strip_prefix("aeron.").unwrap(), name);
+                        assert_eq!("dpdk", value);
+                    }
+                    other => {
+                        panic!("aeron.{property}=dpdk must name the missing feature, got {other:?}")
+                    }
+                }
+
+                #[cfg(feature = "dpdk")]
+                {
+                    let config = resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, "dpdk")])
+                        .expect("a config");
+                    assert_eq!(MediaSelection::Dpdk, config.media);
+                }
             }
 
             // Anything else is what the reference would `dlsym`, and this
             // build does not.
-            for name in [
-                "dpdk",
-                "aeron_udp_channel_transport_bindings_dpdk",
-                "Default",
-            ] {
+            for name in ["aeron_udp_channel_transport_bindings_dpdk", "Default"] {
                 match resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, name)]) {
                     Err(ConfigError::UnknownTransportBindings {
                         name: setting,
@@ -4711,6 +5237,136 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The DPDK media's settings, under the names ADR-0005's prefix gives
+    /// them: `deepmsg.dpdk.<name>` and `DEEPMSG_DPDK_<NAME>`, both derived
+    /// from the one property name (design §4.9, Q2).
+    #[test]
+    fn the_dpdk_settings_come_from_their_own_names() {
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.ipv4.address", "10.10.0.1/24"),
+            ("deepmsg.dpdk.ipv4.gateway", "10.10.0.254"),
+            (
+                "deepmsg.dpdk.static.neighbours",
+                "10.10.0.2=02:00:00:00:00:02,10.10.0.3=02:00:00:00:00:03",
+            ),
+            ("deepmsg.dpdk.rx.descriptors", "2048"),
+            ("deepmsg.dpdk.ephemeral.ports", "40000-40100"),
+            ("deepmsg.dpdk.arp.timeout.ms", "1500"),
+        ])
+        .expect("a config");
+
+        assert_eq!(Some((Ipv4Addr::new(10, 10, 0, 1), 24)), config.dpdk.address);
+        assert_eq!(Some(Ipv4Addr::new(10, 10, 0, 254)), config.dpdk.gateway);
+        assert_eq!(
+            vec![
+                (Ipv4Addr::new(10, 10, 0, 2), [2, 0, 0, 0, 0, 2]),
+                (Ipv4Addr::new(10, 10, 0, 3), [2, 0, 0, 0, 0, 3]),
+            ],
+            config.dpdk.static_neighbours
+        );
+        assert_eq!(1024, config.dpdk.tx_descriptors, "the design's default");
+        assert_eq!(2048, config.dpdk.rx_descriptors);
+        assert_eq!(40000..=40100, config.dpdk.ephemeral_ports);
+        assert_eq!(Duration::from_millis(1500), config.dpdk.arp_timeout);
+        assert_eq!(DPDK_RX_BURST_DEFAULT, config.dpdk.rx_burst, "and the rest");
+
+        // And the environment variable is the property name, not a spelling of
+        // its own.
+        let from_env = resolve_with_env(
+            &[("aeron.dir", "/tmp/aeron-test")],
+            &[("DEEPMSG_DPDK_EAL_ARGS", "--vdev=net_null0 --no-huge")],
+        )
+        .expect("a config");
+        assert_eq!("--vdev=net_null0 --no-huge", from_env.dpdk.eal_args);
+    }
+
+    /// Every one of them refuses a value it does not hold, rather than
+    /// carrying it to a port that would fail somewhere further away.
+    #[test]
+    fn a_dpdk_setting_that_is_not_a_value_is_refused() {
+        for (property, value) in [
+            // No prefix length: the media cannot guess which addresses are its
+            // own from an address alone.
+            ("deepmsg.dpdk.ipv4.address", "10.10.0.1"),
+            ("deepmsg.dpdk.ipv4.address", "10.10.0.1/33"),
+            ("deepmsg.dpdk.ipv4.address", "not an address/24"),
+            ("deepmsg.dpdk.ipv4.gateway", "10.10.0"),
+            ("deepmsg.dpdk.static.neighbours", "10.10.0.2"),
+            ("deepmsg.dpdk.static.neighbours", "10.10.0.2=02:00:00:00:00"),
+            (
+                "deepmsg.dpdk.static.neighbours",
+                "10.10.0.2=zz:00:00:00:00:02",
+            ),
+            ("deepmsg.dpdk.ephemeral.ports", "40000"),
+            ("deepmsg.dpdk.ephemeral.ports", "40100-40000"),
+            ("deepmsg.dpdk.rx.burst", "0"),
+            ("deepmsg.dpdk.sender.ring", "1"),
+            ("deepmsg.dpdk.rx.descriptors", "70000"),
+            ("deepmsg.dpdk.rx.descriptors", "lots"),
+        ] {
+            match resolve(&[("aeron.dir", "/tmp/aeron-test"), (property, value)]) {
+                Err(
+                    ConfigError::MalformedValue { .. }
+                    | ConfigError::OutOfRange { .. }
+                    | ConfigError::NotANumber { .. },
+                ) => {}
+                other => panic!("{property}={value} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The EAL arguments this driver sets itself — and the lcores the media
+    /// runs on — are refused rather than merged: either one silently changes
+    /// which CPUs the port uses, and the driver's own cpuset arithmetic is the
+    /// only thing that knows what it may use (design §4.7).
+    #[test]
+    fn an_eal_argument_the_driver_owns_is_refused() {
+        for argument in [
+            "-l 2-3",
+            "-l2-3",
+            "-c 0x1",
+            "--lcores=0@(1-2)",
+            "--main-lcore=1",
+            "--no-telemetry",
+            "--in-memory",
+            "--no-shconf",
+        ] {
+            let value = format!("--vdev=net_null0 {argument}");
+            match resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.eal.args", &value),
+            ]) {
+                Err(ConfigError::DpdkEalArgument {
+                    name,
+                    argument: refused,
+                    ..
+                }) => {
+                    assert_eq!("dpdk.eal.args", name);
+                    assert!(
+                        value.contains(&refused),
+                        "{refused} is one of the arguments"
+                    );
+                }
+                other => panic!("{value} must be refused, got {other:?}"),
+            }
+        }
+
+        // And the ones that are the operator's own go through untouched.
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            (
+                "deepmsg.dpdk.eal.args",
+                "--vdev=net_pcap0,tx_pcap=/tmp/out.pcap --no-huge -m 512",
+            ),
+        ])
+        .expect("a config");
+        assert_eq!(
+            "--vdev=net_pcap0,tx_pcap=/tmp/out.pcap --no-huge -m 512",
+            config.dpdk.eal_args
+        );
     }
 
     #[test]

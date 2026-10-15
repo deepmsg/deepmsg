@@ -306,6 +306,7 @@ dependencies = [
  "deepmsg-client",
  "deepmsg-cnc",
  "deepmsg-core",
+ "deepmsg-dpdk",
  "libc",
 ]
 

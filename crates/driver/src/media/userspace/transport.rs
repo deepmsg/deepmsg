@@ -356,6 +356,7 @@ impl Drop for UserspaceTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::TransportParams;
     use crate::media::userspace::fake_port::{FakePort, Side, Wire};
     use crate::media::userspace::frame::{
         ARP_REPLY, ARP_REQUEST, ArpPacket, BROADCAST, ETHERNET_TYPE_ARP, EthernetHeader,
@@ -430,6 +431,66 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// G11: what a channel's socket-buffer parameters mean here — accepted, and
+    /// nothing (design §4.11).
+    ///
+    /// `so-rcvbuf` and `so-sndbuf` are kernel socket options and a userspace
+    /// stack has no socket to set them on. The design's answer is to take them
+    /// and not act on them, rather than to refuse a channel that names one:
+    /// every deployment that tunes a driver's buffers names them, and a media
+    /// that refused them would refuse those channels for a reason that has
+    /// nothing to do with what the channel asks for.
+    ///
+    /// What the number *would* have bought is still answered — a receiver's
+    /// window is sized against what its transport can hold — so
+    /// `receive_buffer_size` answers this ring's capacity times the frame the
+    /// stack was built for, which is the same question `SO_RCVBUF` answers for
+    /// a kernel socket.
+    #[test]
+    fn the_socket_buffer_parameters_are_taken_and_do_nothing() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+
+        // Two transports of the same channel with wildly different buffers,
+        // which is all a parameter that does nothing can differ by. Opened
+        // through the bindings, because those are what a channel reaches and
+        // where the parameters are dropped.
+        let small = open_with_buffers(&stack, 64);
+        let large = open_with_buffers(&stack, 8 * 1024 * 1024);
+
+        assert_eq!(
+            small.receive_buffer_size().expect("a length"),
+            large.receive_buffer_size().expect("a length"),
+            "the buffer a channel named is not what this transport is sized by"
+        );
+        assert_eq!(
+            stack.params().ring_capacity() * stack.params().mtu,
+            large.receive_buffer_size().expect("a length"),
+            "and what it is sized by is its own ring and frame"
+        );
+    }
+
+    /// A transport of the same channel, asked for `so_rcvbuf` bytes, opened the
+    /// way an endpoint opens one.
+    fn open_with_buffers(stack: &Arc<Stack>, so_rcvbuf: usize) -> Box<dyn crate::media::Transport> {
+        let params = TransportParams {
+            socket_rcvbuf: so_rcvbuf,
+            socket_sndbuf: so_rcvbuf,
+            multicast_if_index: 0,
+            ttl: 0,
+        };
+
+        crate::media::TransportBindings::Userspace(Arc::clone(stack))
+            .open(
+                SocketAddr::from((OWN, 0)),
+                None,
+                None,
+                &params,
+                Affinity::Receiver,
+            )
+            .expect("a transport")
     }
 
     /// G1: a channel that asks for port zero is given one, and the address it
@@ -876,10 +937,11 @@ mod tests {
             },
             super::super::stack::Clock::Monotonic,
             Box::new(wire.port(Side::A, OUR_MAC, 1408)),
-            [
+            super::super::stack::TransmitQueues::PerRole(
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
                 Box::new(wire.port(Side::A, OUR_MAC, 1408)),
-            ],
+            ),
+            None,
         ));
         let mut transport = open(&stack, 40487);
         stack.insert_neighbour(gateway, [0x02, 0, 0, 0, 0, 0xfe]);

@@ -38,6 +38,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+use deepmsg_cnc::layout;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use super::interceptor::Incoming;
@@ -212,6 +213,7 @@ impl ReceiveDestination {
         Self::attach(
             channel,
             managed_port,
+            bindings,
             transport,
             counters,
             regions,
@@ -234,6 +236,7 @@ impl ReceiveDestination {
     fn attach(
         channel: UdpChannel,
         managed_port: u16,
+        bindings: &super::TransportBindings,
         transport: Box<dyn Transport>,
         counters: &mut CounterManager,
         regions: &CounterRegions<'_>,
@@ -253,6 +256,12 @@ impl ReceiveDestination {
         )
         .ok_or(ReceiveEndpointError::NoCounter)?;
 
+        // A destination never connects — that is why its transport has one
+        // descriptor and why the peer half of its counter is `*` — and the
+        // media's answer for a socket it does not drive is the null id.
+        let transport_counter_id =
+            bindings.transport_counter(&*transport, None, counters, regions, now_ms);
+
         let has_explicit_control = channel.has_explicit_control;
 
         // `:120-129`: a group's control address is its twin, an explicit
@@ -270,11 +279,32 @@ impl ReceiveDestination {
             transport,
             interceptors: Incoming::new(interceptors),
             local_sockaddr_counter_id,
+            transport_counter_id,
             managed_port,
             has_explicit_control,
             control_addr,
             time_of_last_activity_ns: now_ns,
         })
+    }
+
+    /// Count the datagrams one pass read off this destination's socket.
+    ///
+    /// The receiver is the thread that read them, and the counter is where a
+    /// reader outside the process sees them (design §4.10, type 76) — one
+    /// number per transport, so that a driver with several quiet channels can
+    /// be told apart from a driver with one broken one.
+    pub fn count_received_packets(
+        &self,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        received: usize,
+    ) {
+        super::userspace::dpdk_counters::count_received_packets(
+            counters,
+            regions,
+            self.transport_counter_id,
+            received,
+        );
     }
 
     /// Data, a `SETUP` or an `RTTM` arrived for this destination, which is what
@@ -316,6 +346,12 @@ impl ReceiveDestination {
     /// (`rcv-local-sockaddr`, type 14).
     pub const fn local_sockaddr_counter_id(&self) -> i32 {
         self.local_sockaddr_counter_id
+    }
+
+    /// The counter that says what this transport has received (type 76), or
+    /// [`layout::NULL_COUNTER_ID`] when the media publishes none.
+    pub const fn transport_counter_id(&self) -> i32 {
+        self.transport_counter_id
     }
 
     /// The port the wildcard port manager is holding for this destination, and
@@ -474,6 +510,14 @@ pub struct ReceiveDestination {
     /// `rcv-local-sockaddr` (type 14): where this destination is **actually**
     /// bound, which is not what the channel said when it named port zero.
     local_sockaddr_counter_id: i32,
+    /// The DPDK media's `DPDK_TRANSPORT` (type 76), one per transport: what
+    /// this destination's socket has received. [`layout::NULL_COUNTER_ID`] on
+    /// the kernel's media, which publishes no such counter.
+    ///
+    /// Held here rather than on the stack because the transport is what it
+    /// counts, and written by the receiver — which is the thread that reads the
+    /// transport ([`Self::count_received_packets`]).
+    transport_counter_id: i32,
     /// The port the wildcard port manager is holding for this destination, and
     /// zero when it holds none
     /// (`aeron_receive_destination.port_manager` + the bind address it was
@@ -642,6 +686,10 @@ fn release_counters(
 ) {
     for (_, destination) in destinations {
         counters.free(regions, destination.local_sockaddr_counter_id, now_ms);
+
+        if destination.transport_counter_id != layout::NULL_COUNTER_ID {
+            counters.free(regions, destination.transport_counter_id, now_ms);
+        }
     }
 
     counters.free(regions, channel_status_counter_id, now_ms);
@@ -768,6 +816,7 @@ impl ReceiveChannelEndpoint {
     pub fn with_transport(
         channel: UdpChannel,
         group_tag: Option<i64>,
+        bindings: &super::TransportBindings,
         transport: Box<dyn Transport>,
         receiver_id: i64,
         stream_session_limit: usize,
@@ -800,6 +849,7 @@ impl ReceiveChannelEndpoint {
                 // A transport a caller built was not bound by the manager, so
                 // there is no port for it to hold — the tests' seam.
                 0,
+                bindings,
                 transport,
                 counters,
                 regions,
@@ -1873,6 +1923,7 @@ mod tests {
         let first = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             &mut counters,
             &regions,
@@ -1887,6 +1938,7 @@ mod tests {
         let second = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40124"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40124),
             &mut counters,
             &regions,
@@ -1930,6 +1982,7 @@ mod tests {
         let mut with_control = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             &mut counters,
             &regions,
@@ -1944,6 +1997,7 @@ mod tests {
         let without = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40125"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40125),
             &mut counters,
             &regions,
@@ -2008,6 +2062,7 @@ mod tests {
         let with_control = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             &mut counters,
             &regions,
@@ -2032,6 +2087,7 @@ mod tests {
         let without = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40125"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40125),
             &mut counters,
             &regions,
@@ -2067,6 +2123,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40223|control-mode=manual"),
             None,
+            &crate::media::TransportBindings::Default,
             stub(40223),
             1,
             16,
@@ -2117,6 +2174,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             None,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             1,
             16,
@@ -2138,6 +2196,7 @@ mod tests {
         let added = ReceiveDestination::attach(
             channel("aeron:udp?endpoint=127.0.0.1:40124"),
             0,
+            &crate::media::TransportBindings::Default,
             stub(40124),
             &mut counters,
             &regions,
@@ -2190,6 +2249,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             None,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             1,
             16,
@@ -2208,6 +2268,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40124"),
                 0,
+                &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
                 &mut counters,
                 &regions,
@@ -2226,6 +2287,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40125"),
                 0,
+                &crate::media::TransportBindings::Default,
                 Box::new(second.clone()),
                 &mut counters,
                 &regions,
@@ -2277,6 +2339,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             None,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             1,
             16,
@@ -2296,6 +2359,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40124"),
                 0,
+                &crate::media::TransportBindings::Default,
                 Box::new(first.clone()),
                 &mut counters,
                 &regions,
@@ -2312,6 +2376,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40125"),
                 0,
+                &crate::media::TransportBindings::Default,
                 Box::new(second.clone()),
                 &mut counters,
                 &regions,
@@ -2369,6 +2434,7 @@ mod tests {
         let endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123"),
             group_tag,
+            &crate::media::TransportBindings::Default,
             Box::new(sent.clone()),
             1234,
             16,
@@ -2403,6 +2469,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40124|control=127.0.0.1:40125"),
             None,
+            &crate::media::TransportBindings::Default,
             Box::new(sent.clone()),
             1234,
             16,
@@ -2686,6 +2753,130 @@ mod tests {
         assert_eq!(ErrorFrame::LENGTH + 1023, frame.len());
     }
 
+    /// The counter that says what one transport has received, and the media
+    /// that has one to give (design §4.10, type 76).
+    ///
+    /// Two answers in one case because they are one question — is this a
+    /// transport on the DPDK media — and the per-port counts cannot answer the
+    /// question the counter exists for: *which* channel is quiet. The value
+    /// moves where the datagrams are read, which is the receiver
+    /// ([`ReceiveDestination::count_received_packets`]), and the counter is the
+    /// total rather than the last pass.
+    #[test]
+    fn a_destination_on_the_media_has_a_transport_counter_and_the_kernels_has_none() {
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{Clock, Stack, StackParams};
+        use crate::media::userspace::transport::UserspaceTransport;
+        use crate::media::{Affinity, TransportBindings};
+        use deepmsg_cnc::CounterDescriptor;
+        use std::net::Ipv4Addr;
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        // The kernel's media publishes no 76, so a destination on it has none —
+        // and counting into the null id is nothing rather than a failure.
+        let kernel = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            0,
+            &TransportBindings::Default,
+            stub(40123),
+            &mut counters,
+            &regions,
+            7,
+            1,
+            1_000,
+            1_000_000,
+            &[],
+        )
+        .expect("a destination");
+
+        assert_eq!(layout::NULL_COUNTER_ID, kernel.transport_counter_id());
+        kernel.count_received_packets(&counters, &regions, 5);
+
+        // The media's own, on a transport bound to one of the stack's
+        // addresses: the label is where a reader outside the process sees which
+        // transport a number belongs to.
+        let wire = Wire::new();
+        let stack = Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+            Clock::Monotonic,
+        );
+        let bindings = TransportBindings::Userspace(std::sync::Arc::clone(&stack));
+        let transport = UserspaceTransport::open(
+            std::sync::Arc::clone(&stack),
+            SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 40456)),
+            None,
+            Affinity::Receiver,
+        )
+        .expect("a transport");
+
+        let destination = ReceiveDestination::attach(
+            channel("aeron:udp?endpoint=10.10.0.1:40456"),
+            0,
+            &bindings,
+            Box::new(transport),
+            &mut counters,
+            &regions,
+            8,
+            1,
+            1_000,
+            1_000_000,
+            &[],
+        )
+        .expect("a destination");
+
+        let counter_id = destination.transport_counter_id();
+        assert_ne!(
+            layout::NULL_COUNTER_ID,
+            counter_id,
+            "the media the driver is configured for publishes one"
+        );
+
+        let mut transport_counters = Vec::new();
+        regions.reader().for_each(|descriptor: &CounterDescriptor| {
+            if descriptor.type_id == super::super::userspace::dpdk_counters::type_id::TRANSPORT {
+                transport_counters.push(descriptor.clone());
+            }
+        });
+
+        assert_eq!(1, transport_counters.len(), "one per transport");
+        assert_eq!(
+            "dpdk transport: 10.10.0.1:40456 -> *", transport_counters[0].label,
+            "a destination never connects, so it hears from anyone"
+        );
+
+        destination.count_received_packets(&counters, &regions, 3);
+        destination.count_received_packets(&counters, &regions, 4);
+        assert_eq!(
+            Some(7),
+            counters.value(&regions, counter_id),
+            "the counter is the total, one batch at a time"
+        );
+
+        // And a create that comes apart gives both back — the destination's
+        // address and its transport — rather than leaving a counter nobody
+        // owns, which is what a reader would keep finding a transport in.
+        release_counters(
+            &[(DestinationId::FIRST, destination)],
+            1,
+            &mut counters,
+            &regions,
+            2_000,
+        );
+
+        let mut left = 0;
+        regions.reader().for_each(|descriptor: &CounterDescriptor| {
+            if descriptor.type_id == super::super::userspace::dpdk_counters::type_id::TRANSPORT {
+                left += 1;
+            }
+        });
+
+        assert_eq!(0, left, "the transport counter went back");
+    }
+
     /// A removed destination hands back the port the manager held for it,
     /// which is what the receiver puts in
     /// [`crate::receiver::ReleasedDestination`] for the conductor to give back.
@@ -2702,6 +2893,7 @@ mod tests {
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
             channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
             None,
+            &crate::media::TransportBindings::Default,
             stub(40123),
             1,
             16,
@@ -2719,6 +2911,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel(uri),
                 40310,
+                &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
                 &mut counters,
                 &regions,
@@ -2744,6 +2937,7 @@ mod tests {
             ReceiveDestination::attach(
                 channel("aeron:udp?endpoint=127.0.0.1:40125"),
                 0,
+                &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
                 &mut counters,
                 &regions,

@@ -50,6 +50,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use crate::config::ThreadNaming;
 use crate::driver::Role;
 
 use deepmsg_cnc::{CncFile, CounterManager};
@@ -153,6 +154,10 @@ pub struct AgentResolver {
     /// the allocator is built from — it never allocates, so the view only has
     /// to agree about where an id's value lives.
     free_to_reuse_timeout_ms: i64,
+    /// The media the driver's data paths run on, which is what a channel's
+    /// `interface=` is resolved against before the kernel is asked (design
+    /// §4.9, Q1a): a port this driver drives is one the kernel may not have.
+    bindings: crate::media::TransportBindings,
     /// How long every resolution is held before it is answered
     /// (`debug.resolver.delay.millis`): zero on every driver but a test's, and
     /// what it stands in for is a nameserver that does not answer.
@@ -164,6 +169,7 @@ impl AgentResolver {
     /// agent thread needs to run it.
     pub fn new(
         resolver: Box<dyn Resolver + Send>,
+        bindings: crate::media::TransportBindings,
         cnc: Arc<CncFile>,
         threshold_ns: i64,
         free_to_reuse_timeout_ms: i64,
@@ -171,6 +177,7 @@ impl AgentResolver {
     ) -> Self {
         Self {
             resolver,
+            bindings,
             cnc,
             threshold_ns,
             free_to_reuse_timeout_ms,
@@ -391,7 +398,8 @@ impl NativeResourceAgent {
         } = Self::split(checks)?;
 
         let thread = crate::driver::run_agent(
-            Role::NativeResourceAgent.classic_name(),
+            Role::NativeResourceAgent,
+            ThreadNaming::Classic,
             state,
             crate::driver::default_strategy(),
             None,
@@ -885,44 +893,60 @@ impl AgentLoop {
                     (
                         Some(AgentResolver {
                             resolver,
+                            bindings,
                             cnc,
                             threshold_ns,
                             ..
                         }),
                         Some(counters),
-                    ) => match cnc.counter_regions() {
-                        // A send destination is validated and its address
-                        // resolved beside the channel, because the address is
-                        // what a removal matches it by (`:311-350`).
-                        Some(regions) if send_destination => {
-                            crate::udp_channel::parse_send_destination_with(
+                    ) => {
+                        let parsed = match cnc.counter_regions() {
+                            // A send destination is validated and its address
+                            // resolved beside the channel, because the address is
+                            // what a removal matches it by (`:311-350`).
+                            Some(regions) if send_destination => {
+                                crate::udp_channel::parse_send_destination_with(
+                                    &mut **resolver,
+                                    Some(bindings as &dyn crate::media::InterfaceSource),
+                                    counters,
+                                    &regions,
+                                    *threshold_ns,
+                                    &original_uri,
+                                )
+                                .map(|(channel, address)| {
+                                    ParsedChannel {
+                                        channel,
+                                        send_destination_address: address,
+                                    }
+                                })
+                            }
+                            Some(regions) => crate::udp_channel::parse_channel_with(
                                 &mut **resolver,
+                                Some(bindings as &dyn crate::media::InterfaceSource),
                                 counters,
                                 &regions,
                                 *threshold_ns,
+                                unresolved,
                                 &original_uri,
                             )
-                            .map(|(channel, address)| ParsedChannel {
+                            .map(|channel| ParsedChannel {
                                 channel,
-                                send_destination_address: address,
-                            })
-                        }
-                        Some(regions) => crate::udp_channel::parse_channel_with(
-                            &mut **resolver,
-                            counters,
-                            &regions,
-                            *threshold_ns,
-                            unresolved,
-                            &original_uri,
-                        )
-                        .map(|channel| ParsedChannel {
-                            channel,
-                            send_destination_address: None,
-                        }),
-                        None => Err(UdpChannelError::Resolution(
-                            "the driver's counters are not mapped".to_owned(),
-                        )),
-                    },
+                                send_destination_address: None,
+                            }),
+                            None => Err(UdpChannelError::Resolution(
+                                "the driver's counters are not mapped".to_owned(),
+                            )),
+                        };
+
+                        // The media's own answer, asked where the channel is
+                        // read: a channel the media cannot serve is refused to
+                        // the client rather than bound into a subscription that
+                        // hears nothing (design §4.11).
+                        parsed.and_then(|parsed| {
+                            bindings.refuse_channel(&parsed.channel)?;
+                            Ok(parsed)
+                        })
+                    }
                     _ => Err(UdpChannelError::Resolution(
                         "this agent has no resolver".to_owned(),
                     )),

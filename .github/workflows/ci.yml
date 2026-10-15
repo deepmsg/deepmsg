@@ -64,9 +64,19 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy, with the media compiled in
-        run: cargo clippy -p deepmsg-dpdk --all-targets --features dpdk -- -D warnings
+        # Both crates, because the driver is where the port is driven from:
+        # `dpdk` is a feature of each, and this turns it on for the two of them.
+        run: cargo clippy -p deepmsg-dpdk -p deepmsg-driver --all-targets --features dpdk -- -D warnings
       - name: T3
         run: cargo test -p deepmsg-dpdk --features dpdk
+      - name: The driver over a real PMD
+        # `net_pcap` again, so this needs no more privilege than T3 does. The
+        # `--lib` half is the one test in `dpdk_port.rs` that can be run
+        # without an EAL; everything that wants one is in `tests/dpdk_port.rs`,
+        # where each case re-enters its own binary as a child.
+        run: |
+          cargo test -p deepmsg-driver --features dpdk --lib
+          cargo test -p deepmsg-driver --features dpdk --test 'dpdk_*'
       - name: The workspace still builds without DPDK
         # The criterion the job above cannot state: with the feature off, this
         # crate is empty and the default build is the one that was there before
