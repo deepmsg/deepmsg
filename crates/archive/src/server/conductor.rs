@@ -153,7 +153,7 @@ use crate::server::delete_segments::{
     DeleteSegmentsSession, Progress as DeleteProgress, find_detached_segments, list_segment_files,
     min_segment_position,
 };
-use crate::server::recorder::Recorder;
+use crate::server::recorder::RecorderHalf;
 use crate::server::recording_pos::RecordingPos;
 use crate::server::recording_session::{RecordingImage, RecordingSession};
 use crate::server::replay_session::{
@@ -2524,7 +2524,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
         catalog: &mut Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         self.allocate_session_counter(client, counters);
@@ -2801,7 +2801,7 @@ impl Sessions {
         client: &mut Client,
         catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         let mut index = 0;
@@ -2958,7 +2958,7 @@ impl Sessions {
         client: &mut Client,
         catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         mut session: RecordingSession,
         now_ms: i64,
     ) {
@@ -3042,7 +3042,7 @@ impl Sessions {
     fn close_and_remove_recording_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         subscription_id: i64,
         reason: &str,
     ) {
@@ -5147,7 +5147,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         catalog: &mut Catalog,
         action: Action,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         match action {
@@ -5514,7 +5514,7 @@ impl Sessions {
     fn stop_recording_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         subscription_id: i64,
@@ -5576,7 +5576,7 @@ impl Sessions {
     fn stop_recording(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         stream_id: i32,
@@ -5980,7 +5980,7 @@ impl Sessions {
         &mut self,
         client: &mut Client,
         catalog: &Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
@@ -6073,7 +6073,7 @@ impl Sessions {
     fn abort_recording_session_and_close_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         subscription_id: i64,
     ) {
         recorder.abort_sessions_for(subscription_id, "stop recording");
@@ -6584,7 +6584,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
         catalog: &mut Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         for intent in std::mem::take(&mut self.pending) {
@@ -7359,12 +7359,12 @@ pub struct ArchiveConductor {
     ///
     /// Held here rather than by the sessions because that is where the reference
     /// holds it: its conductor owns the recorder and drives it on its own turn,
-    /// **after** its own sessions (`SharedModeArchiveConductor.java:56-63`). The
+    /// **after** its own sessions (`SharedModeArchiveConductor.java:57-66`). The
     /// cost of the split is one parameter: two of the things a control session
     /// can ask for are things the recorder has to be told about
     /// (`:1766-1772`, `:1356-1359`), so [`Sessions::drive`] is lent it for the
     /// length of a turn.
-    recorder: Recorder,
+    recorder: RecorderHalf,
     command_timeout: Duration,
 }
 
@@ -7450,7 +7450,7 @@ impl ArchiveConductor {
             duty_cycles: None,
             cnc,
             catalog,
-            recorder: Recorder::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
+            recorder: RecorderHalf::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -7560,7 +7560,7 @@ impl ArchiveConductor {
         );
 
         // The recorder gets its own turn, and it is the turn **after** the
-        // sessions (`SharedModeArchiveConductor.java:56-63`). What a session
+        // sessions (`SharedModeArchiveConductor.java:57-66`). What a session
         // that ended this turn owes is collected here, where the catalog and
         // the control sessions are.
         //

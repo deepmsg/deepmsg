@@ -3,7 +3,7 @@
 //!
 //! `ArchiveConductor.Recorder` is a `SessionWorker` of its own
 //! (`ArchiveConductor.java:2699-2744`), driven on its own turn by the
-//! conductor that owns it (`SharedModeArchiveConductor.java:56-63` — the
+//! conductor that owns it (`SharedModeArchiveConductor.java:57-66` — the
 //! recorder runs *after* the conductor's own sessions). What it holds is the
 //! recording sessions and three running totals; what it does not hold is
 //! anything the *conductor* does when a session ends, which in the reference is
@@ -170,6 +170,98 @@ pub struct Recorder {
     /// command the driver answers on a later turn, which is the loop
     /// [`CounterAllocator`] runs.
     allocator: CounterAllocator<RecorderCounter>,
+}
+
+/// The recorder as the conductor holds it (P2-9a).
+///
+/// Under `SHARED` the conductor drives every session inside its own turn
+/// (`SharedModeArchiveConductor.java:57-66`) and so holds the [`Recorder`]
+/// itself. Under `DEDICATED` the recorder is an agent on a thread of its own
+/// (`DedicatedModeArchiveConductor.java:54-55`) and what the conductor holds is
+/// a **channel** to it. The conductor asks the same six questions either way —
+/// the four a request asks of the recorder, the turn, and the sessions that
+/// finished — so it asks them of this.
+///
+/// # Why a seam rather than two conductors
+///
+/// `SHARED` has to stay exactly what it was. It is the mode the reference's own
+/// C suite runs (306 criteria), so a queue placed in front of the recorder there
+/// would change the thing being accepted rather than add a second thing beside
+/// it. Everything the threaded arm does differently is therefore decided here,
+/// in one place, and the inline arm is the reference's own call sequence.
+///
+/// # What a command cannot carry
+///
+/// Two of the six hand the recorder something it cannot be told about without
+/// the *client*: [`Recorder::allocate`] sends the three `add_counter` commands
+/// that become 105/106/107, and a driver answers a command only on a turn. So
+/// allocation stays where the client is — the conductor — and what crosses to a
+/// worker is the three counters it ends up with ([`Recorder::set_counters`]).
+/// That is the reference's own split too: its recorder is constructed inside
+/// `Archive.Context.conclude` (`:1587-1626`), on the thread that owns the
+/// `Aeron`, and only afterwards handed to a runner.
+pub enum RecorderHalf {
+    /// `SHARED`: the conductor's turn drives every session.
+    Inline(Recorder),
+}
+
+impl RecorderHalf {
+    /// A recorder for an archive with this id, in the conductor's own turn.
+    #[must_use]
+    pub const fn new(archive_id: i64) -> Self {
+        Self::Inline(Recorder::new(archive_id))
+    }
+
+    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    pub fn add_session(&mut self, session: RecordingSession) {
+        match self {
+            Self::Inline(recorder) => recorder.add_session(session),
+        }
+    }
+
+    /// Abort every session reading this subscription
+    /// (`ArchiveConductor.abortRecordingSessionAndCloseSubscription`, `:1766-1772`).
+    pub fn abort_sessions_for(&mut self, subscription_id: i64, reason: &str) {
+        match self {
+            Self::Inline(recorder) => recorder.abort_sessions_for(subscription_id, reason),
+        }
+    }
+
+    /// Abort **one** session, by the recording it is making
+    /// (`ArchiveConductor.stopRecordingByIdentity`, `:1306-1310`).
+    pub fn abort_session(&mut self, recording_id: i64, reason: &str) {
+        match self {
+            Self::Inline(recorder) => recorder.abort_session(recording_id, reason),
+        }
+    }
+
+    /// Ask for the three counters and take each up when the driver answers
+    /// (`Archive.java:1587-1626`).
+    pub fn allocate(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        timeout: std::time::Duration,
+    ) {
+        match self {
+            Self::Inline(recorder) => recorder.allocate(client, counters, timeout),
+        }
+    }
+
+    /// One turn of every session (`SessionWorker.doWork` over
+    /// `RecordingSession.doWork`).
+    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
+        match self {
+            Self::Inline(recorder) => recorder.drive(counters),
+        }
+    }
+
+    /// The sessions that finished, for the conductor to close.
+    pub fn take_finished(&mut self) -> Vec<RecordingSession> {
+        match self {
+            Self::Inline(recorder) => recorder.take_finished(),
+        }
+    }
 }
 
 impl Recorder {
