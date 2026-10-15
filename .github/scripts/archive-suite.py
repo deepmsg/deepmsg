@@ -122,6 +122,7 @@ def run_binary(
     build: Path,
     binary: str,
     reports: Path,
+    output_dir: Path,
     cases: list[str],
     binaries: list[str | None],
     java: str,
@@ -148,14 +149,21 @@ def run_binary(
     # Once, not per case: `working_directory` walks the build tree.
     cwd = working_directory(build, binary)
     report = reports / f"{binary}.xml"
+    # ★ **What the binary says is kept**, next to the table the caller asked
+    # for. It used to be thrown away, and the first run of the CI job that wraps
+    # this was red with no way to tell why: a gtest failure's message is the whole
+    # of the evidence, and it is not in any XML. Written through a file rather
+    # than captured, so a binary that hangs still leaves what it managed to say.
+    log = output_dir / f"{binary}.log"
     try:
-        subprocess.run(
-            [str(path), f"--gtest_output=xml:{report}"],
-            cwd=cwd,
-            timeout=binary_timeout,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with log.open("w") as sink:
+            subprocess.run(
+                [str(path), f"--gtest_output=xml:{report}"],
+                cwd=cwd,
+                timeout=binary_timeout,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+            )
     except subprocess.TimeoutExpired:
         # The suite's own readiness wait has no timeout, so a process that
         # never comes up is a hang. Naming the cases here is the only way the
@@ -170,13 +178,15 @@ def run_binary(
     for index, case in enumerate(cases):
         one = reports / f"{binary}.{index}.xml"
         try:
-            subprocess.run(
-                [str(path), f"--gtest_output=xml:{one}", f"--gtest_filter={case}"],
-                cwd=cwd,
-                timeout=case_timeout,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            with log.open("a") as sink:
+                sink.write(f"\n\n### {case}, in its own process\n\n")
+                subprocess.run(
+                    [str(path), f"--gtest_output=xml:{one}", f"--gtest_filter={case}"],
+                    cwd=cwd,
+                    timeout=case_timeout,
+                    stdout=sink,
+                    stderr=subprocess.STDOUT,
+                )
         except subprocess.TimeoutExpired:
             outcomes[case] = "timeout"
             continue
@@ -391,6 +401,10 @@ def main() -> int:
         args.log.unlink()
 
     reports = Path(tempfile.mkdtemp(prefix="p2-0b-run-"))
+    # Beside the table, not in the temporary directory the reports live in: this
+    # is the half a red run is read from, so it has to survive the run.
+    output_dir = args.out.parent / f"{args.out.name}.d"
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
         # Before the first binary too: a run started on top of an earlier run's
         # leftovers fails on the control port, and the failure lands on whichever
@@ -412,6 +426,7 @@ def main() -> int:
                 args.build,
                 binary,
                 reports,
+                output_dir,
                 sorted(cases_for.get(binary, [])),
                 list(named.values()),
                 args.java,

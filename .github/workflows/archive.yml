@@ -154,6 +154,7 @@ jobs:
           name: archive-suite
           path: |
             archive-suite.tsv
+            archive-suite.tsv.d/
             archive-suite/shim.log
             suite-exit.txt
           if-no-files-found: ignore
