@@ -402,6 +402,16 @@ pub struct Blackout {
     stream_id: Option<i32>,
     /// How many frames of the stream go through before the blackout starts.
     pass_first: u64,
+    /// How long after the stream's first frame the blackout **opens**. What
+    /// `pass_first` cannot say, and the reason this is here: a case that wants
+    /// "the handshake and the listing get through, then one response is held
+    /// back" is naming a **moment**, and counting frames names it only if the
+    /// handshake's frame count is known — measured at three *and* four on this
+    /// machine, so counting cannot name it at all.
+    ///
+    /// Zero is the whole of what was here before: the blackout opens with the
+    /// first frame that has passed `pass_first`.
+    from: Duration,
     /// How long it withholds once it has.
     until: Duration,
     /// When the stream's first frame arrived, which is what `until` is measured
@@ -415,12 +425,22 @@ pub struct Blackout {
 
 impl Blackout {
     /// Pass the first `pass_first` frames of `stream_id`, withhold what follows
-    /// for `until`, and let the rest through.
+    /// **between `from` and `until`** — both measured from the stream's first
+    /// frame — and let the rest through.
+    ///
+    /// `from` of zero is a blackout that opens as soon as `pass_first` frames
+    /// have gone through, which is what this rule was before it had one.
     #[must_use]
-    pub const fn new(stream_id: Option<i32>, pass_first: u64, until: Duration) -> Self {
+    pub const fn new(
+        stream_id: Option<i32>,
+        pass_first: u64,
+        from: Duration,
+        until: Duration,
+    ) -> Self {
         Self {
             stream_id,
             pass_first,
+            from,
             until,
             started: None,
             seen: Vec::new(),
@@ -433,10 +453,11 @@ impl Blackout {
         self.seen.len() as u64
     }
 
-    /// Whether the blackout is still in force, from the stream's first frame.
+    /// Whether the blackout is in force, from the stream's first frame: it opens
+    /// at `from` and shuts at `until`.
     fn holding(&self) -> bool {
         self.started
-            .is_some_and(|started| started.elapsed() < self.until)
+            .is_some_and(|started| self.from <= started.elapsed() && started.elapsed() < self.until)
     }
 }
 
@@ -533,6 +554,9 @@ pub struct Spec {
     pub every: Option<u64>,
     /// How many matching frames a **blackout** lets through first.
     pub pass_first: Option<u64>,
+    /// How long after the stream's first frame a **blackout** opens, in
+    /// milliseconds, or `None` for "as soon as `pass_first` frames have gone".
+    pub from_ms: Option<u64>,
     /// How long a **blackout** withholds once it has started, in milliseconds,
     /// or `None` for no blackout.
     pub until_ms: Option<u64>,
@@ -594,6 +618,7 @@ impl Spec {
             return Some(Box::new(Blackout::new(
                 self.stream_id,
                 self.pass_first.unwrap_or(0),
+                Duration::from_millis(self.from_ms.unwrap_or(0)),
                 Duration::from_millis(until_ms),
             )));
         }
@@ -809,7 +834,7 @@ mod tests {
 
     #[test]
     fn a_blackout_passes_its_first_frames_and_then_holds() {
-        let mut generator = Blackout::new(Some(4218), 2, Duration::from_secs(60));
+        let mut generator = Blackout::new(Some(4218), 2, Duration::ZERO, Duration::from_secs(60));
 
         // Two through, and then withheld for as long as the window lasts.
         assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
@@ -819,7 +844,7 @@ mod tests {
         assert_eq!(4, generator.matched());
 
         // Another stream is not what it counts.
-        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
 
         assert!(!detailed(&mut generator, &data_frame(4219, 1, 0, 32)));
         assert!(detailed(&mut generator, &nth_frame(4218, 0)));
@@ -833,7 +858,7 @@ mod tests {
     /// long before a frame budget is used up.
     #[test]
     fn a_blackout_ends_when_its_window_does() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::from_millis(1));
+        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_millis(1));
 
         assert!(detailed(&mut generator, &nth_frame(4218, 0)));
 
@@ -844,13 +869,49 @@ mod tests {
         assert!(!detailed(&mut generator, &nth_frame(4218, 2)));
     }
 
+    /// ★ **The window is a span, not "everything after the first frames".**
+    ///
+    /// This is what `pass.first` cannot say and the reason `from` is here: the
+    /// reference's response-dropping cases let an archive's handshake and
+    /// listing through and then hold **one response** back, and "after the
+    /// handshake" is a *moment*. Counting frames names it only if the
+    /// handshake's frame count is known, and measured on this machine it is
+    /// three *and* four — so a rule that counted could not name it at all.
+    ///
+    /// A `from` of zero is the rule as it was before it had one, which is what
+    /// the other cases here assert with `Duration::ZERO`.
+    #[test]
+    fn a_blackout_can_open_later_and_lets_what_came_before_it_through() {
+        let mut generator = Blackout::new(
+            Some(4218),
+            0,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        );
+
+        // Before the window opens: through, and counted as frames of the stream.
+        assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
+        assert!(!detailed(&mut generator, &nth_frame(4218, 1)));
+        assert_eq!(2, generator.matched());
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Inside it: withheld.
+        assert!(detailed(&mut generator, &nth_frame(4218, 2)));
+
+        std::thread::sleep(Duration::from_millis(120));
+
+        // And past it: through again, the window having ended by itself.
+        assert!(!detailed(&mut generator, &nth_frame(4218, 3)));
+    }
+
     /// ★ A heartbeat inside a blackout passes **and does not count** — a session
     /// that is told nothing while its responses are withheld still has to look
     /// alive, and a bounded drop that swallowed the heartbeats would drop the
     /// connection rather than the responses.
     #[test]
     fn a_heartbeat_is_neither_dropped_nor_counted_by_a_blackout() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
 
         let mut heartbeat = data_frame(4218, 1, 0, 0);
         heartbeat[0..4].copy_from_slice(&0i32.to_le_bytes());
@@ -873,7 +934,7 @@ mod tests {
     /// machine it was aimed at retried anything.
     #[test]
     fn a_retransmission_neither_advances_nor_escapes_a_blackout() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::from_secs(60));
+        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
 
         let first = data_frame(4218, 1, 0, 32);
 
@@ -890,7 +951,7 @@ mod tests {
         // And `pass_first` still counts **frames of the stream**: a second
         // distinct frame is the second frame, whatever the transport did with
         // the first.
-        let mut generator = Blackout::new(Some(4218), 1, Duration::from_secs(60));
+        let mut generator = Blackout::new(Some(4218), 1, Duration::ZERO, Duration::from_secs(60));
 
         assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
 

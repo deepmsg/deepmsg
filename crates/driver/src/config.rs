@@ -2830,6 +2830,21 @@ impl Setting {
         property: "debug.receive.data.loss.until.millis",
         env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_UNTIL_MILLIS",
     };
+    /// `deepmsg.debug.receive.data.loss.from.millis`: how long after the
+    /// stream's first frame a **blackout** opens, so that the window is a
+    /// **span** — `[from, until)` — rather than "everything after the first
+    /// `pass.first` frames".
+    ///
+    /// ★ It is here because `pass.first` cannot say what the reference's
+    /// response-dropping cases need. They let the archive's handshake and the
+    /// listing through and then hold one response back, and "after the
+    /// handshake" is a **moment**: counting frames names it only if the
+    /// handshake's frame count is known, which on this machine it is not
+    /// (measured at three and at four).
+    const RECEIVE_LOSS_FROM_MILLIS: Self = Self {
+        property: "debug.receive.data.loss.from.millis",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_FROM_MILLIS",
+    };
     /// `deepmsg.debug.receive.data.loss.setup.at.position`:
     /// `<stream>,<initial-term-id>,<active-term-id>,<term-offset>` — drop the one
     /// `SETUP` that names that position, so that a subscriber attaches late.
@@ -3526,6 +3541,39 @@ fn receive_data_loss(
             first: Setting::RECEIVE_LOSS_PASS_FIRST.property,
             second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
         });
+    }
+
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_FROM_MILLIS) {
+        spec.from_ms = Some(
+            match u64::try_from(parse_count(&Setting::RECEIVE_LOSS_FROM_MILLIS, &value)?) {
+                Ok(from_ms) => from_ms,
+                Err(_) => {
+                    return Err(ConfigError::OutOfRange {
+                        name: Setting::RECEIVE_LOSS_FROM_MILLIS.property,
+                        value,
+                    });
+                }
+            },
+        );
+    }
+
+    // Where the window opens has no meaning without where it shuts, and a window
+    // that opens at or after it shuts is a rule that says nothing: both are
+    // refused rather than quietly ignored.
+    if spec.from_ms.is_some() {
+        let Some(until_ms) = spec.until_ms else {
+            return Err(ConfigError::ConflictingSettings {
+                first: Setting::RECEIVE_LOSS_FROM_MILLIS.property,
+                second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+            });
+        };
+
+        if spec.from_ms.is_some_and(|from_ms| from_ms >= until_ms) {
+            return Err(ConfigError::OutOfRange {
+                name: Setting::RECEIVE_LOSS_FROM_MILLIS.property,
+                value: get(&Setting::RECEIVE_LOSS_FROM_MILLIS).unwrap_or_default(),
+            });
+        }
     }
 
     // A rate and a blackout both decide *which* matching frames are withheld,
@@ -4477,6 +4525,45 @@ mod tests {
             ]),
             Err(ConfigError::ConflictingSettings { .. })
         ));
+
+        // ★ And the window has **two ends**: where it opens is a moment the
+        // reference's response-dropping cases need and frames cannot name.
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.receive.data.loss.stream.id", "20"),
+            ("deepmsg.debug.receive.data.loss.from.millis", "1000"),
+            ("deepmsg.debug.receive.data.loss.until.millis", "8000"),
+        ])
+        .expect("a span is one rule");
+
+        let spec = config.receive_data_loss.expect("a rule");
+        assert_eq!(Some(1000), spec.from_ms);
+        assert_eq!(Some(8000), spec.until_ms);
+
+        // Where the window opens says nothing without where it shuts.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.from.millis", "1000"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+
+        // And a window that opens at or after it shuts is a rule that says
+        // nothing, so it is refused rather than quietly read as one.
+        for from in ["8000", "9000"] {
+            assert!(
+                matches!(
+                    resolve(&[
+                        ("deepmsg.dir", "/tmp/aeron"),
+                        ("deepmsg.debug.receive.data.loss.from.millis", from),
+                        ("deepmsg.debug.receive.data.loss.until.millis", "8000"),
+                    ]),
+                    Err(ConfigError::OutOfRange { .. })
+                ),
+                "from={from} against until=8000 must be refused"
+            );
+        }
 
         // A rate and a blackout both answer "which matching frames", and
         // differently.
