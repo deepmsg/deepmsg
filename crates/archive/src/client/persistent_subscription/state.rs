@@ -1226,6 +1226,10 @@ impl PersistentSubscription {
             }
             AsyncAddPoll::Failed(error) => {
                 self.replay_subscription_add = None;
+                // `:1529`: the replay is stopped before the subscription is
+                // given back, on every way out of this state — the reference
+                // calls it ahead of the branch, not inside either arm.
+                self.clean_up_replay();
                 self.clean_up_replay_subscription();
                 self.fail(SubscriptionError::Client(error));
 
@@ -1558,6 +1562,11 @@ impl PersistentSubscription {
             // The image has not appeared. The reference waits for it until the
             // deadline and then starts the replay over (`:1880-1903`).
             if self.deadline_passed() {
+                // `:1892-1894`: an image that never appeared means the replay is
+                // over as far as this machine is concerned, so the archive is
+                // told to stop it **before** the subscription goes back and the
+                // whole replay is set up again.
+                self.clean_up_replay();
                 self.clean_up_replay_subscription();
                 self.set_up_replay();
 
@@ -1599,6 +1608,9 @@ impl PersistentSubscription {
                     }
                     AsyncAddPoll::Failed(error) => {
                         self.live_subscription_add = None;
+                        // `:1929-1931`: the live half failed, so the replay half
+                        // goes with it — stopped first, then given back.
+                        self.clean_up_replay();
                         self.clean_up_replay_subscription();
                         self.fail(SubscriptionError::Client(error));
 
@@ -1642,6 +1654,11 @@ impl PersistentSubscription {
             && self.max_recorded_position_is_caught_up(self.position)
             && !self.do_add_live_subscription()
         {
+            // `:1993-1995`: the live subscription could not be asked for, so
+            // this machine is not going to reach the live stream on this
+            // attempt — and the replay is stopped and given back rather than
+            // left running against the archive.
+            self.clean_up_replay();
             self.clean_up_replay_subscription();
 
             return 1;
