@@ -495,8 +495,8 @@ named address it does **not** hold is the kernel's, because the kernel is the
 thing that holds it.
 
 **A channel with no local address at all is the media's unless what it talks to
-is loopback** — and *what it talks to* is two things. A publication's send
-endpoint binds the wildcard (the module note in
+is loopback, or names nothing** — and *what it talks to* is two things. A
+publication's send endpoint binds the wildcard (the module note in
 `crates/driver/src/udp_channel.rs`), so its destination decides; an **MDC
 channel** names `control=` and no `endpoint=` at all, both of its halves bind
 the wildcard, every frame either one sends goes to the control address, and
@@ -507,6 +507,21 @@ the reference's system tests and this build's interop suite — all of which nam
 the design's own rule ("the key is the local side, not the peer", §3.2) does
 not decide on its own.
 
+**A manual channel — the one shape that names nothing anywhere — is the
+kernel's**, and the wildcard is what makes it visible: `control-mode=manual`
+writes `0.0.0.0` into every slot it has, its destinations arrive later through
+`addDestination`, and **an unspecified address is not a name**. Ownership is
+settled when the channel is opened and the media is asked about *addresses*, so
+a channel that names none has told this rule nothing to decide with. **The
+consequence is a difference a deployment can feel and is deliberate**: a manual
+channel reaches its destinations over the kernel, so the `localhost` ones the
+reference's own tests add (`MultipathTest`, `MdsAndMdcInteractionTest`) work,
+and destinations on a port this driver drives do not. The reference resolves the
+other way — it creates no transport at all for a manual subscription and one per
+destination as each is added (`aeron_driver_conductor.c:2099`, `:5903`) — which
+puts ownership in the data path rather than at the open, and this build declined
+it for that reason (D5 record, 第 10 笔).
+
 **Loopback and nothing else**, which is narrower than "an address the machine
 holds": a *routable* address is one the media must carry, because carrying it is
 what putting frames on a wire means — and a cross-media test's peer is an
@@ -514,6 +529,8 @@ address the same machine's kernel holds (the other end of the cable is a port of
 this host), so the broader reading would hand that publication to the kernel and
 the frames would never reach the wire. Pinned by
 `crates/driver/src/media/bindings.rs::a_channels_local_side_decides_which_media_carries_it`,
+`::a_channel_that_names_no_address_is_the_kernels` (the manual shape, in both
+slots a wildcard can be written into),
 `::a_channel_with_no_destination_is_decided_by_its_control_address` (a loopback
 control address is the kernel's, a routable one stays the media's),
 `::only_loopback_cannot_be_reached_over_a_wire`,

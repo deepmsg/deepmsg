@@ -465,17 +465,43 @@ impl TransportBindings {
     ///   data paths are on a DPDK port.
     /// * **No local address at all**: a send endpoint with no `interface=` — a
     ///   publication — binds the wildcard, and a wildcard is not an address
-    ///   anybody holds. It is the **media's**, because the media is the thing
-    ///   that assigns it a port and its own address, **unless the channel is
-    ///   talking to loopback**, which a frame on a wire can never reach. What
-    ///   the channel is talking to is its destination **and its control
-    ///   address** — an MDC channel has no destination yet and does all of its
-    ///   talking to `control=`, so a control address of loopback makes the
-    ///   channel the kernel's just as a loopback peer does. Those two are
-    ///   consulted for that one case and no other; the design's "the key is the
-    ///   local side, not the peer" holds everywhere the local side was written
-    ///   ([`only_the_kernel_can_reach`] has why the fallback is loopback and
-    ///   not "any address this machine has").
+    ///   anybody holds. It is the **media's** — the media is the thing that
+    ///   assigns it a port and its own address — **when the channel is talking
+    ///   to something a frame on a wire can reach**. What it is talking to is
+    ///   its destination **and its control address** — an MDC channel has no
+    ///   destination yet and does all of its talking to `control=`, so a
+    ///   control address of loopback makes the channel the kernel's just as a
+    ///   loopback peer does. Those two are consulted for that one case and no
+    ///   other; the design's "the key is the local side, not the peer" holds
+    ///   everywhere the local side was written ([`only_the_kernel_can_reach`]
+    ///   has why the fallback is loopback and not "any address this machine
+    ///   has").
+    /// * **Neither, which is what the manual control mode is**: a
+    ///   `control-mode=manual` channel names **no address at all** — no
+    ///   endpoint, no control, no tag — and writes the wildcard into all three
+    ///   slots, its destinations arriving later. **An unspecified address is
+    ///   not a name**, so this rule has been told nothing, and the channel is
+    ///   the **kernel's**.
+    ///
+    ///   **Why the kernel, and why decided here rather than when a destination
+    ///   appears.** Ownership is settled when the channel is opened (P-D4): a
+    ///   manual channel's destinations do not exist yet, so a rule that read
+    ///   them would not be this rule. And the media is asked about
+    ///   *addresses* — a channel that has named none has told it nothing, so
+    ///   answering "the media" claims for the port a channel that named no
+    ///   address the port could ever be asked to carry. The price is written
+    ///   down rather than hidden: **a manual channel whose destinations are the
+    ///   port's own runs on the kernel and cannot reach them**, and one that
+    ///   wants the media has to name what it is talking to.
+    ///
+    ///   The reference resolves the other way — it builds no transport at all
+    ///   for a manual subscription and creates one per destination as each is
+    ///   added (`aeron_driver_conductor.c:2099`, then `:5903`) — and its own
+    ///   manual channels talk to `localhost`
+    ///   (`aeron-system-tests/src/test/java/io/aeron/MultipathTest.java:41-43`),
+    ///   which is the kernel's either way. Following it there would move
+    ///   ownership out of the open and into the data path, which is the trade
+    ///   this build declined (D5 record, 第 10 笔).
     ///
     /// Multi-destination and multicast channels reach here too and are answered
     /// by the same rule: a group address is refused before a transport is
@@ -507,7 +533,24 @@ impl TransportBindings {
             return held.is_some().then_some(stack);
         }
 
-        let unreachable = [connect, control].into_iter().flatten().any(
+        // **An unspecified address is not a name.** A channel that names
+        // nothing writes the wildcard where an address would go — the manual
+        // control mode does it in every slot — so the two are told apart here,
+        // once, rather than by whichever caller happened to fill the slot.
+        let named = [connect, control]
+            .into_iter()
+            .flatten()
+            .filter(|address| !address.ip().is_unspecified())
+            .collect::<Vec<_>>();
+
+        // **Nothing named is the kernel's** (the third case in this function's
+        // note): there is no address here for the media to have been asked
+        // about.
+        if named.is_empty() {
+            return None;
+        }
+
+        let unreachable = named.iter().any(
             |address| matches!(address.ip(), IpAddr::V4(peer) if only_the_kernel_can_reach(peer)),
         );
 
@@ -716,8 +759,57 @@ mod tests {
              channel in the system tests names"
         );
         assert!(
-            serves("0.0.0.0:0", None),
-            "and with no peer named at all there is nothing the kernel holds"
+            !serves("0.0.0.0:0", None),
+            "and a channel that names nothing at all is the kernel's: the media \
+             is asked about addresses, ownership is settled at the open, and \
+             there is no address here to settle it with"
+        );
+        assert!(
+            !serves("0.0.0.0:0", Some("0.0.0.0:0")),
+            "which is exactly what a manual channel looks like to this rule — \
+             the wildcard written where an address would go is not a name"
+        );
+    }
+
+    /// **A `control-mode=manual` channel is the kernel's**, and this is the case
+    /// the reference's own system tests drove out.
+    ///
+    /// It is the one shape that names no address *anywhere*: no `endpoint=`, no
+    /// `control=`, no tag, and its destinations arrive later through
+    /// `addDestination` — so there is nothing at the open for this rule to read.
+    /// The reference answers it at each destination instead
+    /// (`aeron_driver_conductor.c:2099`, `:5903`); this build answers it here and
+    /// takes the consequence, which the second half of this test writes down: a
+    /// manual channel's destinations are reached over the kernel, so the ones
+    /// the reference's own tests add (`localhost`) work and the ones on a port
+    /// this driver drives do not.
+    #[test]
+    fn a_channel_that_names_no_address_is_the_kernels() {
+        let bindings = userspace();
+
+        // Every slot the wildcard can be written into, named as the parse would
+        // leave them for `aeron:udp?control-mode=manual`.
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), Some(address("0.0.0.0:0")), None)
+                .is_none(),
+            "the manual publication's shape: wildcard bind, wildcard control"
+        );
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), None, Some(address("0.0.0.0:0")))
+                .is_none(),
+            "and the same channel read through the control slot"
+        );
+
+        // What still decides: a channel that named the port's own peer, or a
+        // control address a frame can reach. Those are the cases above; this is
+        // the one line that says the wildcard itself decides nothing.
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), Some(address("10.10.0.2:40500")), None)
+                .is_some(),
+            "a named destination that is not loopback is still the media's"
         );
     }
 
