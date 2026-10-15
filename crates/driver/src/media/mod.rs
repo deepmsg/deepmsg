@@ -73,6 +73,28 @@ pub struct TransportParams {
     /// own hop limit, because the reference and the channel agree on zero
     /// meaning "not set".
     pub ttl: u8,
+    /// The **control** address this channel names, from whichever of the
+    /// parse's two control fields it landed in — and `None` when it names none.
+    ///
+    /// The kernel's sockets have no use for it: the address is already where
+    /// their own bind and connect put it. The userspace media's **selection**
+    /// does, and this is the address an MDC channel is decided by. A dynamic
+    /// MDC channel names `control=` and **no `endpoint=` at all**, so its
+    /// destination is learned later and the wildcard is what both of its halves
+    /// bind — while every frame either half sends goes to this address. A
+    /// control address only the kernel can reach (loopback) therefore makes the
+    /// whole channel the kernel's, exactly as a loopback peer does for a
+    /// publication; without it such a channel is handed to a port that can
+    /// never reach the far end (the D5 record's 第 6 笔, where the reference's
+    /// own tests found this).
+    ///
+    /// Which field the parse uses depends on the shape rather than on the
+    /// reading: `control=127.0.0.1:8338|control-mode=dynamic` fills
+    /// **`local_control`** (and `local_data`, the address the publication
+    /// binds) and leaves the remote pair unspecified, while a plain
+    /// `endpoint=…` channel fills the remote pair and leaves these at zero.
+    /// Both are "the control address the channel named", so both are asked.
+    pub control: Option<SocketAddr>,
 }
 
 /// What the endpoints, the publications and the images are allowed to ask of

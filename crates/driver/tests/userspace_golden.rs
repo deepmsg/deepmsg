@@ -16,6 +16,7 @@ use deepmsg_driver::media::udp_transport::OpenError;
 use deepmsg_driver::media::userspace::fake_port::{Side, Wire};
 use deepmsg_driver::media::userspace::frame::{self, Checksums, Received};
 use deepmsg_driver::media::userspace::stack::{Clock, Stack, StackParams};
+use deepmsg_driver::media::userspace::transport::UserspaceTransport;
 use deepmsg_driver::media::{Affinity, Transport, TransportBindings, TransportParams};
 use deepmsg_driver::sys::socket::Datagrams;
 
@@ -82,14 +83,23 @@ impl Machine {
         )
     }
 
+    /// A transport bound to the wildcard, **asked of the stack and not of the
+    /// bindings**.
+    ///
+    /// That is the ownership rule rather than a shortcut around it: a channel
+    /// that names no address at all is the kernel's
+    /// (`media/bindings.rs::a_channel_that_names_no_address_is_the_kernels`),
+    /// so a wildcard binding reached through a *channel's* shape is a kernel
+    /// socket and never this stack. G3 is about what this stack does with a
+    /// wildcard — hears what is addressed to the port's own address and nothing
+    /// else — so it asks the stack, which is the layer that question belongs to.
     fn wildcard(&self, port: u16) -> Result<Box<dyn Transport>, OpenError> {
-        self.bindings.open(
+        Ok(Box::new(UserspaceTransport::open(
+            Arc::clone(&self.stack),
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
             None,
-            None,
-            &TransportParams::default(),
             Affinity::Receiver,
-        )
+        )?))
     }
 
     /// Everything the far end has been sent, in order.

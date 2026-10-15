@@ -1463,6 +1463,7 @@ pub fn transport_params(config: &DriverConfig, channel: &UdpChannel) -> Transpor
         } else {
             config.socket_multicast_ttl
         },
+        control: channel.named_control_address(),
     }
 }
 

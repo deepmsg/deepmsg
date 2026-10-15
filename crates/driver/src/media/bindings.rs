@@ -131,29 +131,33 @@ impl PartialEq for TransportBindings {
 
 impl Eq for TransportBindings {}
 
-/// Whether the kernel is the thing that holds `address`: loopback, or an
-/// address one of its interfaces has.
+/// Whether a frame for `address` can **only** be delivered by the kernel:
+/// loopback, and nothing else.
 ///
-/// A media that drives a port itself cannot reach either. Its frames go out of
-/// that port and nowhere else, so a channel whose peer is an address the kernel
-/// holds belongs to the kernel even when the channel named no local address of
-/// its own (design §4.9, Q1a) — which is every publication in the reference's
-/// system tests and this build's interop tests, all of which name `localhost`.
+/// A media that drives a port itself puts its frames on that port and nowhere
+/// else, so a channel whose peer is loopback is one the media cannot serve: a
+/// datagram for `127.0.0.1` never reaches a wire. That is the whole of the
+/// fallback for a channel that named no local address of its own, and it is
+/// what keeps every publication in the reference's system tests and this
+/// build's interop tests — all of which name `localhost` — working on a driver
+/// whose data paths are on a port it drives (design §4.9, Q1a).
 ///
-/// A lookup that could not be made is **not** an answer that the address is the
-/// kernel's: the media is the one the driver was configured for, and a channel
-/// the media cannot reach says so there — `ENETUNREACH`, off this link — rather
-/// than being moved to a socket the configuration did not ask for.
-fn the_kernel_holds(address: Ipv4Addr) -> bool {
-    crate::sys::interface_for_address(
-        crate::sys::AddressFamily::Inet,
-        IpAddr::V4(address),
-        // The whole address, so the match is the address and not the net it
-        // sits in: `127.0.0.2` is not held by a machine whose loopback is
-        // `127.0.0.1`, and a publication to it is not the kernel's to serve.
-        32,
-    )
-    .is_ok_and(|held| held.is_some())
+/// **It is deliberately not "an address one of the machine's interfaces
+/// has".** That was the first reading, and it makes the answer depend on what
+/// the machine happens to have configured: a peer that is a *routable* address
+/// the kernel also holds — the reference driver's own address, when both ends
+/// are ports of one machine, which is exactly the shape a cross-media test has
+/// — would be handed to the kernel, and the frames a publication puts on a
+/// wire would never reach the media at all. A routable address is one the
+/// media must carry, because carrying it is what putting frames on a wire
+/// means. The kernel is the fallback for what the wire cannot do.
+///
+/// Nothing is asked of the interface list, so the answer is the same on every
+/// machine — and a channel naming an address the media cannot reach says so
+/// there, as `ENETUNREACH`, rather than being moved to a socket the
+/// configuration did not ask for.
+fn only_the_kernel_can_reach(address: Ipv4Addr) -> bool {
+    address.is_loopback()
 }
 
 /// Whether an agent configured with this strategy stays on its core.
@@ -217,7 +221,7 @@ impl TransportBindings {
         params: &TransportParams,
         affinity: Affinity,
     ) -> Result<Box<dyn Transport>, OpenError> {
-        match self.stack_for(bind, connect) {
+        match self.stack_for(bind, connect, params.control) {
             Some(stack) => {
                 // The transport parameters are the kernel's knobs — socket
                 // buffers, the multicast interface, the TTL — and a userspace
@@ -274,9 +278,10 @@ impl TransportBindings {
         &self,
         bind: SocketAddr,
         peer: Option<SocketAddr>,
+        control: Option<SocketAddr>,
         mtu_length: usize,
     ) -> Result<(), String> {
-        let Some(stack) = self.stack_for(bind, peer) else {
+        let Some(stack) = self.stack_for(bind, peer, control) else {
             return Ok(());
         };
 
@@ -315,9 +320,10 @@ impl TransportBindings {
         &self,
         bind: SocketAddr,
         peer: Option<SocketAddr>,
+        control: Option<SocketAddr>,
         destination: SocketAddr,
     ) -> Result<(), String> {
-        let Some(stack) = self.stack_for(bind, peer) else {
+        let Some(stack) = self.stack_for(bind, peer, control) else {
             return Ok(());
         };
 
@@ -325,6 +331,17 @@ impl TransportBindings {
             // IPv6 is refused at the channel.
             return Ok(());
         };
+
+        // **An unspecified destination names no address to reach.** It is what
+        // an MDC channel has until it learns one — the destination arrives with
+        // the stream, and the conversation that finds it goes to the control
+        // address — so the media has nothing to say about it here. Measured on
+        // the reference's own `ChannelValidationTest` and `MultipathTest`, which
+        // publish to `endpoint=0.0.0.0` and were refused with `ENETUNREACH` for
+        // a destination nobody was going to send to.
+        if address.is_unspecified() {
+            return Ok(());
+        }
 
         if stack.next_hop(address).is_some() {
             return Ok(());
@@ -448,18 +465,54 @@ impl TransportBindings {
     ///   data paths are on a DPDK port.
     /// * **No local address at all**: a send endpoint with no `interface=` — a
     ///   publication — binds the wildcard, and a wildcard is not an address
-    ///   anybody holds. It is the **media's**, because the media is the thing
-    ///   that assigns it a port and its own address, **unless the channel is
-    ///   talking to an address the kernel holds** (loopback, another local
-    ///   interface), which only the kernel can reach. The destination is
-    ///   consulted for that one case and no other; the design's "the key is the
-    ///   local side, not the peer" holds everywhere the local side was written.
+    ///   anybody holds. It is the **media's** — the media is the thing that
+    ///   assigns it a port and its own address — **when the channel is talking
+    ///   to something a frame on a wire can reach**. What it is talking to is
+    ///   its destination **and its control address** — an MDC channel has no
+    ///   destination yet and does all of its talking to `control=`, so a
+    ///   control address of loopback makes the channel the kernel's just as a
+    ///   loopback peer does. Those two are consulted for that one case and no
+    ///   other; the design's "the key is the local side, not the peer" holds
+    ///   everywhere the local side was written ([`only_the_kernel_can_reach`]
+    ///   has why the fallback is loopback and not "any address this machine
+    ///   has").
+    /// * **Neither, which is what the manual control mode is**: a
+    ///   `control-mode=manual` channel names **no address at all** — no
+    ///   endpoint, no control, no tag — and writes the wildcard into all three
+    ///   slots, its destinations arriving later. **An unspecified address is
+    ///   not a name**, so this rule has been told nothing, and the channel is
+    ///   the **kernel's**.
+    ///
+    ///   **Why the kernel, and why decided here rather than when a destination
+    ///   appears.** Ownership is settled when the channel is opened (P-D4): a
+    ///   manual channel's destinations do not exist yet, so a rule that read
+    ///   them would not be this rule. And the media is asked about
+    ///   *addresses* — a channel that has named none has told it nothing, so
+    ///   answering "the media" claims for the port a channel that named no
+    ///   address the port could ever be asked to carry. The price is written
+    ///   down rather than hidden: **a manual channel whose destinations are the
+    ///   port's own runs on the kernel and cannot reach them**, and one that
+    ///   wants the media has to name what it is talking to.
+    ///
+    ///   The reference resolves the other way — it builds no transport at all
+    ///   for a manual subscription and creates one per destination as each is
+    ///   added (`aeron_driver_conductor.c:2099`, then `:5903`) — and its own
+    ///   manual channels talk to `localhost`
+    ///   (`aeron-system-tests/src/test/java/io/aeron/MultipathTest.java:41-43`),
+    ///   which is the kernel's either way. Following it there would move
+    ///   ownership out of the open and into the data path, which is the trade
+    ///   this build declined (D5 record, 第 10 笔).
     ///
     /// Multi-destination and multicast channels reach here too and are answered
     /// by the same rule: a group address is refused before a transport is
     /// opened for it ([`Self::refuse_channel`]), and a destination's own
     /// address is what its transport binds.
-    fn stack_for(&self, bind: SocketAddr, connect: Option<SocketAddr>) -> Option<&Arc<Stack>> {
+    fn stack_for(
+        &self,
+        bind: SocketAddr,
+        connect: Option<SocketAddr>,
+        control: Option<SocketAddr>,
+    ) -> Option<&Arc<Stack>> {
         let Self::Userspace(stack) = self else {
             return None;
         };
@@ -480,10 +533,32 @@ impl TransportBindings {
             return held.is_some().then_some(stack);
         }
 
-        match connect.map(|peer| peer.ip()) {
-            Some(IpAddr::V4(peer)) if the_kernel_holds(peer) => None,
-            _ => Some(stack),
+        // **An unspecified address is not a name.** A channel that names
+        // nothing writes the wildcard where an address would go — the manual
+        // control mode does it in every slot — so the two are told apart here,
+        // once, rather than by whichever caller happened to fill the slot.
+        let named = [connect, control]
+            .into_iter()
+            .flatten()
+            .filter(|address| !address.ip().is_unspecified())
+            .collect::<Vec<_>>();
+
+        // **Nothing named is the kernel's** (the third case in this function's
+        // note): there is no address here for the media to have been asked
+        // about.
+        if named.is_empty() {
+            return None;
         }
+
+        let unreachable = named.iter().any(
+            |address| matches!(address.ip(), IpAddr::V4(peer) if only_the_kernel_can_reach(peer)),
+        );
+
+        if unreachable {
+            return None;
+        }
+
+        Some(stack)
     }
 
     /// Refuse a channel this media cannot serve, where the channel is read
@@ -639,7 +714,7 @@ mod tests {
         let bindings = userspace();
         let serves = |bind: &str, peer: Option<&str>| {
             bindings
-                .stack_for(address(bind), peer.map(address))
+                .stack_for(address(bind), peer.map(address), None)
                 .is_some()
         };
 
@@ -661,8 +736,8 @@ mod tests {
         );
 
         // No local address named: a send endpoint binds the wildcard, which is
-        // the media's — the peer decides only when the kernel is the only one
-        // that can reach it.
+        // the media's — the peer decides only when a frame on a wire could not
+        // reach it at all, which is loopback and nothing else.
         assert!(
             serves("0.0.0.0:0", Some("10.10.0.2:40500")),
             "a publication to the port's own net is the media's"
@@ -673,13 +748,102 @@ mod tests {
              which the media is then the one to refuse (`ENETUNREACH`)"
         );
         assert!(
+            serves("0.0.0.0:0", Some("10.10.1.7:40456")),
+            "and one to a routable address this machine may hold itself, which \
+             is what a cross-media test's peer is: the answer does not depend \
+             on what the machine has configured"
+        );
+        assert!(
             !serves("0.0.0.0:0", Some("127.0.0.1:40456")),
             "but a publication to loopback is the kernel's, which is what every \
              channel in the system tests names"
         );
         assert!(
-            serves("0.0.0.0:0", None),
-            "and with no peer named at all there is nothing the kernel holds"
+            !serves("0.0.0.0:0", None),
+            "and a channel that names nothing at all is the kernel's: the media \
+             is asked about addresses, ownership is settled at the open, and \
+             there is no address here to settle it with"
+        );
+        assert!(
+            !serves("0.0.0.0:0", Some("0.0.0.0:0")),
+            "which is exactly what a manual channel looks like to this rule — \
+             the wildcard written where an address would go is not a name"
+        );
+    }
+
+    /// **A `control-mode=manual` channel is the kernel's**, and this is the case
+    /// the reference's own system tests drove out.
+    ///
+    /// It is the one shape that names no address *anywhere*: no `endpoint=`, no
+    /// `control=`, no tag, and its destinations arrive later through
+    /// `addDestination` — so there is nothing at the open for this rule to read.
+    /// The reference answers it at each destination instead
+    /// (`aeron_driver_conductor.c:2099`, `:5903`); this build answers it here and
+    /// takes the consequence, which the second half of this test writes down: a
+    /// manual channel's destinations are reached over the kernel, so the ones
+    /// the reference's own tests add (`localhost`) work and the ones on a port
+    /// this driver drives do not.
+    #[test]
+    fn a_channel_that_names_no_address_is_the_kernels() {
+        let bindings = userspace();
+
+        // Every slot the wildcard can be written into, named as the parse would
+        // leave them for `aeron:udp?control-mode=manual`.
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), Some(address("0.0.0.0:0")), None)
+                .is_none(),
+            "the manual publication's shape: wildcard bind, wildcard control"
+        );
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), None, Some(address("0.0.0.0:0")))
+                .is_none(),
+            "and the same channel read through the control slot"
+        );
+
+        // What still decides: a channel that named the port's own peer, or a
+        // control address a frame can reach. Those are the cases above; this is
+        // the one line that says the wildcard itself decides nothing.
+        assert!(
+            bindings
+                .stack_for(address("0.0.0.0:0"), Some(address("10.10.0.2:40500")), None)
+                .is_some(),
+            "a named destination that is not loopback is still the media's"
+        );
+    }
+
+    /// An **MDC channel** is decided by the address it will talk to, which is
+    /// its control address rather than a destination it has not learned yet.
+    ///
+    /// This is the case the reference's own system tests found (the D5 record's
+    /// 第 6 笔): `control=localhost:7779|control-mode=dynamic` names no local
+    /// address and no destination, so the rule above called it the media's —
+    /// and a port of this driver's own can never reach loopback, so the channel
+    /// never connected to anything. What is asserted here is the pair that
+    /// tells the two apart: a **loopback** control address is the kernel's, and
+    /// a **routable** one stays the media's, because MDC over a port this
+    /// driver drives is a deployment the media is supposed to serve.
+    #[test]
+    fn a_channel_with_no_destination_is_decided_by_its_control_address() {
+        let bindings = userspace();
+        let with_control = |control: &str| {
+            bindings
+                .stack_for(address("0.0.0.0:0"), None, Some(address(control)))
+                .is_some()
+        };
+
+        assert!(
+            !with_control("127.0.0.1:7779"),
+            "an MDC channel whose control address is loopback is the kernel's:              nothing a frame on a wire does reaches 127.0.0.1"
+        );
+        assert!(
+            with_control("10.10.0.2:7779"),
+            "but one whose control address is routable is the media's, which is              what MDC over this port is for"
+        );
+        assert!(
+            with_control("192.0.2.5:7779"),
+            "and an address nobody holds is still the media's to reach or to              refuse — off this link, with `ENETUNREACH`"
         );
     }
 
@@ -710,16 +874,16 @@ mod tests {
 
         assert_eq!(
             Ok(()),
-            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1408)
+            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), None, 1408)
         );
         assert_eq!(
             Ok(()),
-            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1472),
+            bindings.refuse_mtu_over_what_it_can_carry(ours, Some(peer), None, 1472),
             "the largest one fits exactly"
         );
 
         let refusal = bindings
-            .refuse_mtu_over_what_it_can_carry(ours, Some(peer), 1473)
+            .refuse_mtu_over_what_it_can_carry(ours, Some(peer), None, 1473)
             .expect_err("one byte over is over");
         assert!(
             refusal.contains("mtuLength=1473 > 1472") && refusal.contains("does not fragment"),
@@ -734,6 +898,7 @@ mod tests {
             bindings.refuse_mtu_over_what_it_can_carry(
                 ours,
                 Some(address("127.0.0.1:40456")),
+                None,
                 8192
             ),
             "the kernel fragments, and this channel never reaches the port"
@@ -744,6 +909,7 @@ mod tests {
             TransportBindings::Default.refuse_mtu_over_what_it_can_carry(
                 ours,
                 Some(peer),
+                None,
                 usize::MAX
             ),
             "and the kernel's bindings are not asked at all"
@@ -760,7 +926,7 @@ mod tests {
         let peer = address("192.0.2.5:40456");
 
         let refusal = bindings
-            .refuse_a_destination_it_cannot_reach(ours, Some(peer), peer)
+            .refuse_a_destination_it_cannot_reach(ours, Some(peer), None, peer)
             .expect_err("off this link and no gateway");
         assert!(
             refusal.contains("cannot reach 192.0.2.5") && refusal.contains("ENETUNREACH"),
@@ -773,8 +939,27 @@ mod tests {
             bindings.refuse_a_destination_it_cannot_reach(
                 ours,
                 Some(address("10.10.0.2:40500")),
+                None,
                 address("10.10.0.2:40500")
             )
+        );
+
+        // **A destination of `0.0.0.0` is not a destination.** It is what an MDC
+        // channel has until the stream tells it otherwise, so there is nothing
+        // here for the media to size up — and refusing it was a real defect:
+        // measured on the reference's own `ChannelValidationTest` and
+        // `MultipathTest`, whose channels publish to `endpoint=0.0.0.0` and were
+        // answered `ENETUNREACH` for an address nobody was going to send to
+        // (the D5 record's 第 6 笔).
+        assert_eq!(
+            Ok(()),
+            bindings.refuse_a_destination_it_cannot_reach(
+                ours,
+                Some(peer),
+                None,
+                address("0.0.0.0:0")
+            ),
+            "an unspecified destination names no address to reach"
         );
 
         let mut params =
@@ -790,7 +975,7 @@ mod tests {
         ));
         assert_eq!(
             Ok(()),
-            with_gateway.refuse_a_destination_it_cannot_reach(ours, Some(peer), peer),
+            with_gateway.refuse_a_destination_it_cannot_reach(ours, Some(peer), None, peer),
             "a gateway is a next hop for anywhere"
         );
 
@@ -801,26 +986,56 @@ mod tests {
             bindings.refuse_a_destination_it_cannot_reach(
                 ours,
                 Some(address("127.0.0.1:40456")),
+                None,
                 address("127.0.0.1:40456")
             ),
             "loopback is the kernel's to reach"
         );
         assert_eq!(
             Ok(()),
-            TransportBindings::Default.refuse_a_destination_it_cannot_reach(ours, Some(peer), peer)
+            TransportBindings::Default.refuse_a_destination_it_cannot_reach(
+                ours,
+                Some(peer),
+                None,
+                peer
+            )
         );
     }
 
-    /// The predicate itself, pinned against the kernel's own answer rather than
-    /// by naming an interface: loopback is held by every machine, and an
-    /// address from the range reserved for documentation
-    /// (`192.0.2.0/24`, RFC 5737) is held by none — which is the pair that
-    /// matters, because "another interface's address" is not portable between
-    /// machines and is the same lookup answering yes.
+    /// The fallback predicate: loopback is the kernel's and nothing else is,
+    /// and the test says so without asking any machine anything — which is the
+    /// point of the rule rather than a property of this test.
+    ///
+    /// An address from the range reserved for documentation (`192.0.2.0/24`,
+    /// RFC 5737) is the one that says "a routable address is the media's"
+    /// without depending on what this machine has configured: whether the
+    /// kernel *also* holds it is no longer the question, and the third address
+    /// here — a port's own address on a machine that has one — is the case
+    /// that made the difference (a cross-media test's peer is the other end of
+    /// the same machine).
     #[test]
-    fn the_kernel_holds_loopback_and_not_a_reserved_address() {
-        assert!(the_kernel_holds(Ipv4Addr::LOCALHOST));
-        assert!(!the_kernel_holds(Ipv4Addr::new(192, 0, 2, 5)));
+    fn only_loopback_cannot_be_reached_over_a_wire() {
+        assert!(only_the_kernel_can_reach(Ipv4Addr::LOCALHOST));
+        assert!(
+            only_the_kernel_can_reach(Ipv4Addr::new(127, 0, 0, 2)),
+            "the whole of 127/8 is loopback, and a frame for any of it stays \
+             inside the machine"
+        );
+
+        for routable in [
+            // Reserved for documentation: no machine holds it, and it is still
+            // the media's — a channel naming it says the media is what could
+            // reach it, or `ENETUNREACH` if it cannot.
+            Ipv4Addr::new(192, 0, 2, 5),
+            // And one a machine may well hold itself, which is what the rule
+            // had to stop asking about.
+            Ipv4Addr::new(10, 10, 0, 2),
+        ] {
+            assert!(
+                !only_the_kernel_can_reach(routable),
+                "{routable} is a frame on a wire's to carry"
+            );
+        }
     }
 
     /// The kernel's own bindings carry everything, which is what makes the
@@ -831,12 +1046,16 @@ mod tests {
 
         assert!(
             bindings
-                .stack_for(address("127.0.0.1:40456"), Some(address("127.0.0.1:40457")))
+                .stack_for(
+                    address("127.0.0.1:40456"),
+                    Some(address("127.0.0.1:40457")),
+                    None,
+                )
                 .is_none()
         );
         assert!(
             bindings
-                .stack_for(address("10.10.0.2:40500"), None)
+                .stack_for(address("10.10.0.2:40500"), None, None)
                 .is_none()
         );
     }

@@ -444,13 +444,19 @@ impl SendChannelEndpoints {
             .then_some(channel.remote_data);
 
         self.transport_bindings
-            .refuse_mtu_over_what_it_can_carry(channel.local_control, connect_to, mtu_length)
+            .refuse_mtu_over_what_it_can_carry(
+                channel.local_control,
+                connect_to,
+                channel.named_control_address(),
+                mtu_length,
+            )
             .map_err(EndpointError::ChannelValidation)?;
 
         self.transport_bindings
             .refuse_a_destination_it_cannot_reach(
                 channel.local_control,
                 connect_to,
+                channel.named_control_address(),
                 channel.remote_data,
             )
             .map_err(EndpointError::ChannelValidation)?;

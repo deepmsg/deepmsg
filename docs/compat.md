@@ -511,20 +511,57 @@ prefix. A named address the port holds (10.10.0.2 on a port holding
 that named the media's address is one the media must serve, and one it cannot
 is a failure rather than a silent move to a socket with no such address. A
 named address it does **not** hold is the kernel's, because the kernel is the
-thing that holds it. And a channel with no local address at all — every
-publication, whose send endpoint binds the wildcard (the module note in
-`crates/driver/src/udp_channel.rs`) — is the media's **unless its peer is an
-address the kernel holds**, loopback or another interface's, which only the
-kernel can reach. That last case is the one the design's own rule ("the key is
-the local side, not the peer", §3.2) leaves open, and it is deliberate: without
-it every publication in the reference's system tests and this build's interop
-suite — all of which name `localhost` — would land on a media that cannot reach
-it. Pinned by
+thing that holds it.
+
+**A channel with no local address at all is the media's unless what it talks to
+is loopback, or names nothing** — and *what it talks to* is two things. A
+publication's send endpoint binds the wildcard (the module note in
+`crates/driver/src/udp_channel.rs`), so its destination decides; an **MDC
+channel** names `control=` and no `endpoint=` at all, both of its halves bind
+the wildcard, every frame either one sends goes to the control address, and
+**that** decides. Loopback is not an address a frame on a wire can reach, so
+those channels are the kernel's, and without that clause every publication in
+the reference's system tests and this build's interop suite — all of which name
+`localhost` — would land on a media that cannot reach it. This is the one place
+the design's own rule ("the key is the local side, not the peer", §3.2) does
+not decide on its own.
+
+**A manual channel — the one shape that names nothing anywhere — is the
+kernel's**, and the wildcard is what makes it visible: `control-mode=manual`
+writes `0.0.0.0` into every slot it has, its destinations arrive later through
+`addDestination`, and **an unspecified address is not a name**. Ownership is
+settled when the channel is opened and the media is asked about *addresses*, so
+a channel that names none has told this rule nothing to decide with. **The
+consequence is a difference a deployment can feel and is deliberate**: a manual
+channel reaches its destinations over the kernel, so the `localhost` ones the
+reference's own tests add (`MultipathTest`, `MdsAndMdcInteractionTest`) work,
+and destinations on a port this driver drives do not. The reference resolves the
+other way — it creates no transport at all for a manual subscription and one per
+destination as each is added (`aeron_driver_conductor.c:2099`, `:5903`) — which
+puts ownership in the data path rather than at the open, and this build declined
+it for that reason (D5 record, 第 10 笔).
+
+**Loopback and nothing else**, which is narrower than "an address the machine
+holds": a *routable* address is one the media must carry, because carrying it is
+what putting frames on a wire means — and a cross-media test's peer is an
+address the same machine's kernel holds (the other end of the cable is a port of
+this host), so the broader reading would hand that publication to the kernel and
+the frames would never reach the wire. Pinned by
 `crates/driver/src/media/bindings.rs::a_channels_local_side_decides_which_media_carries_it`,
-`::the_kernels_bindings_carry_every_channel`,
-`::the_kernel_holds_loopback_and_not_a_reserved_address` and
-`::a_unicast_channel_is_served_by_both_media`, and end to end by
-`crates/driver/tests/dpdk_two_drivers.rs::a_message_crosses_between_two_drivers_on_a_dpdk_port`.
+`::a_channel_that_names_no_address_is_the_kernels` (the manual shape, in both
+slots a wildcard can be written into),
+`::a_channel_with_no_destination_is_decided_by_its_control_address` (a loopback
+control address is the kernel's, a routable one stays the media's),
+`::only_loopback_cannot_be_reached_over_a_wire`,
+`::the_kernels_bindings_carry_every_channel` and
+`::a_unicast_channel_is_served_by_both_media`;
+`crates/driver/src/udp_channel.rs::the_control_address_a_channel_names_is_found_wherever_the_parse_put_it`
+for the pair of fields a channel's control address can arrive in; and end to end
+by `crates/driver/tests/dpdk_two_drivers.rs::a_message_crosses_between_two_drivers_on_a_dpdk_port`
+(two drivers on the media) and
+`tests/interop/dpdk_cross_media.rs::our_driver_publishes_across_a_real_port_to_the_reference`
+with `::our_driver_subscribes_across_a_real_port_from_the_reference` (one driver
+on the media and the reference's on the kernel, over a cable).
 
 **A DPDK build refuses the channels that media cannot serve, rather than
 binding them and delivering nothing.** The reference serves a group address and
@@ -540,17 +577,46 @@ does not fragment, and a truncated frame is a message the receiver reassembles
 into something else; and **a destination off the port's link with no gateway**,
 which the reference answers with `ENETUNREACH` from the route and this build
 answers at the channel so that a client is not handed a publication that fails
-every send. All four reach a client as `ON_ERROR` with `ERROR_CODE_NOT_SUPPORTED`
-and the message as its text, the shape the timestamp parameters are already
-refused in. The multicast half is the one with a cost written down: the
-reference's system tests that name `224.x`/`239.x` are red under a DPDK build,
-which is why the compatibility promise for that build is the **non-multicast
-subset** and why its known-red list is a file rather than a claim (ADR-0006).
-Pinned by
+every send — **unless the destination names no address at all**, because
+`endpoint=0.0.0.0` is what an MDC channel has until its stream tells it
+otherwise, and there is nothing there to reach. All four reach a client as
+`ON_ERROR` with `ERROR_CODE_NOT_SUPPORTED` and the message as its text, the
+shape the timestamp parameters are already refused in. The multicast half is the
+one with a cost written down: the reference's system tests that name
+`224.x`/`239.x` are red under a DPDK build, which is why the compatibility
+promise for that build is the **non-multicast subset** and why its known-red
+list is a file rather than a claim — it is
+`analysis/dpdk/dpdk-system-tests-red-2026-10-15.md`, where that list was
+**measured** by running the reference's own suite twice against this driver (on
+the kernel and on the media) and diffing the two (ADR-0006). Pinned by
 `crates/driver/src/media/bindings.rs::a_group_address_is_refused_by_the_media_that_has_no_groups`,
 `::an_ipv6_channel_is_refused_by_the_media_that_has_no_ndp`,
 `::a_frame_larger_than_the_port_can_carry_is_refused` and
-`::a_destination_off_the_link_with_no_gateway_is_refused`.
+`::a_destination_off_the_link_with_no_gateway_is_refused` (which carries the
+unspecified-destination case beside the refusal it does not make).
+
+**A driver on the media keeps the reference's stderr contract, and it costs the
+PMD's own error lines.** The reference's test harness asserts the driver
+process's **stderr is zero bytes** after every test method
+(`aeron-test-support/src/main/java/io/aeron/test/MediaDriverTestUtil.java:128-131`),
+and it is the reference's own C harness that launches this driver — so an EAL
+that prints `EAL: Detected CPU lcores: …` and five lines like it at startup
+(measured: 257 bytes) fails tests that have nothing to do with the EAL. This
+build therefore appends `--log-level=1` as an argument of its own, the fourth
+after `--no-telemetry`, the lcore set and the memory flag; level 0 is not a
+level (the EAL answers `Invalid log level: 0`, on stderr), and `lib.eal:1` is
+not enough because a **PMD** reports at INFO and ERR too. What it costs is the
+PMD's own error lines and nothing this build read: the shim never reports
+through logs, it answers a code and `rte_errno`. An operator's `--log-level` is
+**refused** rather than merged, like the lcore arguments and for the same shape
+of reason — a silent override there is a driver whose stderr is not empty, with
+nothing to point at. Pinned by
+`crates/driver/src/media/userspace/eal.rs::the_eal_is_always_told_to_keep_quiet`,
+`crates/driver/src/config.rs::an_eal_argument_the_driver_owns_is_refused` and,
+as a real driver process on the media,
+`crates/driver/tests/dpdk_media.rs::a_driver_on_the_media_writes_nothing_to_stderr`
+(which asserts the media line on stdout as well, because an empty stderr is also
+what a driver with no EAL at all produces).
 
 **The media's own parameters are this repo's names** (Q2): the channel's media
 selection keeps the reference's setting name, and everything the media itself
@@ -756,7 +822,7 @@ be falsified.
 | **Loss injection is configured by this build's own property, and a datagram it withholds is reported as sent** | Two differences in one seam. The reference's debug loss surface is eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}` variables (`media/aeron_debug_channel_endpoint_configuration.h:22-29`) read by an installer the driver context never calls — only a C++ test does (`aeron-driver/src/test/c/media/aeron_test_loss_generators_test.cpp:467`, `media/aeron_debug_channel_endpoint_configuration.c:126-172`) — so a driver started as a process has no way in, and every interop test here starts one. This build reads `deepmsg.debug.send.data.loss.drop.every` instead: a count, not a rate, over outgoing datagrams, on the send endpoint's data slot only. The second difference is what a withheld call reports: the reference answers `0` (`media/aeron_send_channel_endpoint.c:391-403`), so its sender never advances `snd-pos` and the frames go out on a later pass — no gap, nothing retransmitted. Here the withheld datagram counts as handed over, which is the only way a gap, a NAK and a retransmission become observable on a wire that does not lose anything. Covered by `tests/interop/udp_transport.rs::a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it`; the generator itself is `crates/driver/src/media/loss_generator.rs`. |
 | **The receive side has its own loss injection, and it cannot be switched on while a case runs** | The reference's `aeron-test-support` generators hang on a **receive endpoint** and are enabled and disabled from the test's own thread while it runs (`aeron_stream_id_loss_generator.c:60-72`, `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1500-1600`), because its driver runs in the test's process. A driver here is a process of its own, so what it drops is decided **before it starts**: `deepmsg.debug.receive.data.loss.{stream.id,every,setup.at.position,data.in.range,endpoint.skip,pass.first,from.millis,until.millis}`, **one rule at a time** — two are refused rather than ordered — and a case that wants loss to begin at a chosen moment says so as a **bounded window** instead of a call — a position, or a **span of time measured from the stream's first frame** (`from.millis` with `until.millis`, or `pass.first` with `until.millis`; what the reference reaches for is the same shape, its composite predicate dropping `SETUP`s "until `g_setup_drop_until_ns`", `..._persistent_subscription_resilience_test.cpp:1948-1950`). Where the window opens is a setting of its own because counting frames cannot name it: the frame a case wants to hold back is behind a handshake whose frame count is not a constant (measured at three and at four on this machine). The five rules are the reference's five, case for case (a stream; a rate over one stream; a rate over any; one `SETUP` at a named position; one run of one term, heartbeats excepted), including the per-endpoint skip that exempts the archive's own recording subscription by a substring of its channel URI. Covered by `tests/integration/receive_loss_injection.rs` and the generators' own tests in `crates/driver/src/media/receive_loss.rs`. |
 | **An image's `sparse` byte is its channel's, not the oldest matching subscription's** | Both of the metadata bytes an image copies from a subscription (`aeron_publication_image.c:280-281`) are read here off the channel the `SETUP` carried (`crates/driver/src/publication_images.rs::begin_create`). The reference reads `reliable` off the link being linked and `sparse` off the **oldest** subscription matching the image (`aeron_driver_conductor_is_oldest_subscription_sparse`, `aeron_driver_conductor.c:6715-6717`). The channel that created the image is one of those subscriptions, so the two agree until two subscriptions that name different `sparse` share one image — a byte nothing in this build reads, and the only one of the pair where they can differ. Covered by `crates/driver/src/publication_image.rs::an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse`. |
-| **A `loss` interceptor draws from its own generator, not the process's** | The reference has one process-wide `erand48` state — `static unsigned short data_loss_xsubi[3]` (`media/aeron_udp_channel_transport_loss.c:47`) — so which frames it drops depends on what every other transport has received, in order. Here each channel's interceptor keeps its own, seeded the same way, because the alternative is a global the receive threads would have to synchronise on. The **rate** and the **message-type mask** are the same either way; the frames are a different draw from the same distribution. `crates/driver/src/media/interceptor.rs::the_generator_is_the_one_the_reference_draws_from` pins the generator against values taken from `erand48` itself — the three shorts are in glibc's order, least significant first, and getting that backwards still yields numbers in `[0, 1)` — and `::the_loss_interceptor_drops_only_what_the_mask_names` the mask. |
+| **A `loss` interceptor draws from its own generator, not the process's** | The reference has one process-wide `erand48` state — `static unsigned short data_loss_xsubi[3]` (`media/aeron_udp_channel_transport_loss.c:47`) — so which frames it drops depends on what every other transport has received, in order. Here each channel's interceptor keeps its own, seeded the same way, because the alternative is a global the receive threads would have to synchronise on. The **rate** and the **message-type mask** mean the same either way; the frames are a different draw from the same distribution. What is **not** the same is what a `rate` with no mask does: here it drops nothing, because the mask is the set of frames the rate applies to and it starts empty — and the reference does not define the case at all, since it parses the keys into a `malloc`ed struct it never initialises and writes only the ones it was given (`media/aeron_udp_channel_transport_loss.c:102-113`), so a rate alone there is whatever the allocator left behind. The harness always sends a mask, which is why neither end has had to decide. `crates/driver/src/media/interceptor.rs::the_generator_is_the_one_the_reference_draws_from` pins the generator against values taken from `erand48` itself — the three shorts are in glibc's order, least significant first, and getting that backwards still yields numbers in `[0, 1)` — and `::the_loss_interceptor_drops_only_what_the_mask_names` the mask, including that a mask leaving DATA out drops no data (DATA is frame type 1, so its bit is `0x2`, which is the arithmetic the `recv-msg-mask` example in that module's note got wrong until the mask was measured against a real stream). |
 | **A gap on an unreliable stream is filled, not asked for** | Not a divergence but the opposite — it is the reference's behaviour, absent until now: `reliable=false` was parsed and dropped, so a client that named it got a reliable stream. An image whose channel said `false` now takes the reference's zero delay generator, which it returns **before** reading `nak-delay=` (`aeron_publication_image.c:92-95`), and covers each hole with a padding frame instead of sending a NAK, counting `loss-gap-fills` (`:1053-1066`). The data in the hole is gone, which is what the parameter means. Covered by `tests/integration/unreliable_stream.rs`; the reader half of it is `crates/client/src/image.rs`'s `Step::Padding`, which used to end the term at a padding frame where the reference steps over it (`aeron_image.c:375-379`) — invisible until an image started leaving padding **mid-term**. |
 
 The first row is the one a client can see from outside, and it is the reason

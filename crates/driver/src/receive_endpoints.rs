@@ -571,6 +571,7 @@ impl ReceiveChannelEndpoints {
             } else {
                 config.socket_multicast_ttl
             },
+            control: channel.named_control_address(),
         }
     }
 

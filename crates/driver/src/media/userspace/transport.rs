@@ -480,6 +480,7 @@ mod tests {
             socket_sndbuf: so_rcvbuf,
             multicast_if_index: 0,
             ttl: 0,
+            control: None,
         };
 
         crate::media::TransportBindings::Userspace(Arc::clone(stack))

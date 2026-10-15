@@ -2981,7 +2981,12 @@ pub enum ConfigError {
     ///
     /// Refused rather than merged: either one silently changes which cores the
     /// port runs on, and the driver's own cpuset arithmetic (design §4.7) is
-    /// the only place that knows what it is allowed to use.
+    /// the only place that knows what it is allowed to use. `--log-level` is
+    /// refused for the same *shape* of reason and not the same one: the driver
+    /// sets it because a driver process's stderr has to be empty for the
+    /// reference's harness, and an operator's level silently replacing it is a
+    /// driver that fails those tests with nothing to point at
+    /// ([`crate::media::userspace::eal::LOG_LEVEL`]).
     DpdkEalArgument {
         /// The setting, by property name.
         name: &'static str,
@@ -3093,9 +3098,10 @@ impl std::fmt::Display for ConfigError {
             } => write!(
                 f,
                 "{name} is {value}: {argument} is an argument this driver sets itself \
-                 (it appends `--no-telemetry`, `--lcores=0@<the process's own cpuset>` and \
-                 one of `--in-memory`/`--no-shconf`), or names the lcores the media runs \
-                 on, which the driver's own cpuset arithmetic owns"
+                 (it appends `--no-telemetry`, `--log-level=1`, \
+                 `--lcores=0@<the process's own cpuset>` and one of \
+                 `--in-memory`/`--no-shconf`), or names the lcores the media runs on, \
+                 which the driver's own cpuset arithmetic owns"
             ),
             Self::DynamicLoadingNotSupported { property } => write!(
                 f,
@@ -3252,6 +3258,7 @@ fn parse_dpdk(
                     | "--no-telemetry"
                     | "--in-memory"
                     | "--no-shconf"
+                    | "--log-level"
             ) || argument.starts_with("-l")
                 || argument.starts_with("-c")
             {
@@ -5408,7 +5415,10 @@ mod tests {
     /// The EAL arguments this driver sets itself — and the lcores the media
     /// runs on — are refused rather than merged: either one silently changes
     /// which CPUs the port uses, and the driver's own cpuset arithmetic is the
-    /// only thing that knows what it may use (design §4.7).
+    /// only thing that knows what it may use (design §4.7). `--log-level` is
+    /// on the list for the same reason at one remove: an operator's level
+    /// replacing the driver's is a driver whose stderr is not empty, which is
+    /// the one thing the reference's harness asserts about it.
     #[test]
     fn an_eal_argument_the_driver_owns_is_refused() {
         for argument in [
@@ -5420,6 +5430,8 @@ mod tests {
             "--no-telemetry",
             "--in-memory",
             "--no-shconf",
+            "--log-level=8",
+            "--log-level",
         ] {
             let value = format!("--vdev=net_null0 {argument}");
             match resolve(&[

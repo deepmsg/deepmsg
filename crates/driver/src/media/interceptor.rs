@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS=loss,fixed-loss
-//! AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS=rate=0.1|seed=3405691582|recv-msg-mask=0x9
+//! AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_LOSS_ARGS=rate=0.1|seed=3405691582|recv-msg-mask=0xa
 //! ```
 //!
 //! # Two deliberate divergences
@@ -123,7 +123,21 @@ pub struct LossParams {
     /// `seed` — the generator's seed, split into the three halves of a
     /// `erand48` state (`media/aeron_udp_channel_transport_loss.c:85-87`).
     pub seed: u64,
-    /// `recv-msg-mask` — one bit per frame type, so `0x9` is DATA and SM.
+    /// `recv-msg-mask` — one bit per frame type, `1 << type`, and the types
+    /// are `AERON_HDR_TYPE_PAD` 0, `DATA` 1 and `SM` 3
+    /// (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:172-175`), so
+    /// **DATA and SM are `0xa`** — `0x2` and `0x8` — and a mask that does not
+    /// name DATA drops no data however high the rate is.
+    ///
+    /// **A `rate` with no mask drops nothing**, here and in the reference: this
+    /// is the set of frames the rate applies to, and this build starts it at
+    /// zero. The reference does not define the case at all — it parses the keys
+    /// into a `malloc`ed struct it never initialises
+    /// (`media/aeron_udp_channel_transport_loss.c:103`, with only the keys that
+    /// were given written), so a `rate` alone there is whatever the allocator
+    /// left behind. The harness always sends a mask
+    /// (`CTestMediaDriver.java:383-447`), which is why neither end has had to
+    /// decide.
     pub message_type_mask: u32,
 }
 

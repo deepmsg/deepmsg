@@ -571,3 +571,80 @@ fn the_media_hands_the_stack_its_own_settings_in_the_child() {
         "dropping the stack is what closed the port and gave the frames back"
     );
 }
+
+/// A driver running on the media leaves **stderr empty**, which is a contract
+/// and not a preference: the reference's own harness asserts the driver
+/// process's stderr is zero bytes after every test method
+/// (`aeron-test-support/src/main/java/io/aeron/test/MediaDriverTestUtil.java:128-131`),
+/// and it launches this driver with the reference's own C harness. An EAL's
+/// five startup lines are enough to fail every one of those tests for a reason
+/// that has nothing to do with them, which is what `--log-level=1` is for
+/// (`eal.rs::LOG_LEVEL`).
+///
+/// **And the media line has to be there**, because an empty stderr is also
+/// what a driver that never opened a media produces: without
+/// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` in its environment this driver
+/// runs on the kernel's sockets with no EAL at all, and this case would pass
+/// while proving nothing. It is the same trap T4 fell into, and the same fix —
+/// assert the thing that says the media is where the process is.
+///
+/// `net_null` and `--no-huge`, so this needs no privilege and no device: the
+/// question is what the driver *says*, not what its port does.
+#[test]
+fn a_driver_on_the_media_writes_nothing_to_stderr() {
+    let dir = std::env::temp_dir().join(format!(
+        "deepmsg-dpdk-stderr-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_nanos()
+    ));
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_deepmsg-driver"))
+        .arg(format!("-Ddeepmsg.dir={}", dir.display()))
+        .arg("-Daeron.threading.mode=SHARED")
+        .arg("-Ddeepmsg.dpdk.eal.args=--no-huge --vdev=net_null0")
+        .arg("-Ddeepmsg.dpdk.port=net_null0")
+        .arg("-Ddeepmsg.dpdk.ipv4.address=10.10.0.9/24")
+        .env("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the driver binary is built alongside this test");
+
+    // The CnC file is published after the media is open, so waiting for it is
+    // waiting for the EAL to have started and said whatever it was going to
+    // say.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !dir.join(deepmsg_cnc::CNC_FILE_NAME).exists() {
+        assert!(
+            child.try_wait().expect("a status").is_none(),
+            "the driver exited before it published its CnC file"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no CnC file in {} within 20 s",
+            dir.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("the driver's output");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("dpdk media on net_null0"),
+        "the media is where this process runs, which is what makes the \
+         assertion below worth making:\n{stdout}"
+    );
+    assert_eq!(
+        "", stderr,
+        "an EAL and a PMD write to stderr, and the reference's harness reads \
+         it:\n{stderr}"
+    );
+}
