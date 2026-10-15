@@ -625,6 +625,27 @@ impl ReplayPublications for Client {
 mod tests {
     use super::*;
 
+    /// ★ The protocol version this build sends is the reference's, component for
+    /// component: `PROTOCOL_MAJOR_VERSION = 1`, `PROTOCOL_MINOR_VERSION = 12`,
+    /// `PROTOCOL_PATCH_VERSION = 0` (`client/AeronArchive.java:2648`, `:2654`,
+    /// `:2660`, composed at `:2667-2668`).
+    ///
+    /// **The interop suite cannot pin this and does not**: the reference compares
+    /// the *major* only, so a wrong minor would pass every case in
+    /// `tests/interop` and every case of its own C suite. Pinned here instead,
+    /// which is what `docs/compat.md`'s row for it points at — the same reading
+    /// the CnC version's row takes.
+    ///
+    /// The other half of the reference's version story is the threshold where the
+    /// archive id appeared: `PROTOCOL_VERSION_WITH_ARCHIVE_ID =
+    /// compose(1, 11, 0)` (`:3839`), which is a *floor*, not this value.
+    #[test]
+    fn the_protocol_version_is_the_references_own() {
+        assert_eq!(1, PROTOCOL_SEMANTIC_VERSION >> 16);
+        assert_eq!(12, (PROTOCOL_SEMANTIC_VERSION >> 8) & 0xFF);
+        assert_eq!(0, PROTOCOL_SEMANTIC_VERSION & 0xFF);
+    }
+
     use deepmsg_codec::archive::challenge_codec::ChallengeDecoder;
     use deepmsg_codec::archive::control_response_code::ControlResponseCode;
     use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;

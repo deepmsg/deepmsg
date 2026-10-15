@@ -26,13 +26,16 @@ compatibility with Aeron **1.53.2**.
   the same interval-log result files — and `echo-node` is the far end of the
   same measurement. Both run under `bench/`, the two batches that measure this
   build against the reference's own benchmark repository.
-- **The archive is nearly complete** (P2). Recording, replay, replication and
-  the catalog are implemented, with a server and a client whose command set is
-  the reference's own (start/stop recording, list, replicate, truncate, purge,
-  extend, segment attach/detach/delete/purge, find-last-matching, the replay
-  family, positions, recording subscriptions). The on-disk formats and the SBE
-  control protocol are pinned against the reference's Java archive in
-  `tests/interop` and `crates/archive/tests`.
+- **The archive is complete** (P2), and "complete" is a measurement rather than a
+  claim: everything the reference's archive does — recording, replay,
+  replication, the catalog, segments, the client's command set, and a persistent
+  subscription built on it — is implemented, and the two are **swappable for one
+  another**. The reference's own C suite run against this build passes **306 of
+  306**; this build's archive client against the reference's Java archive passes
+  **341 interop tests**; and the on-disk formats are pinned by goldens the
+  reference itself wrote, read back by this build and by the reference's own
+  `ArchiveTool`. `docs/roadmap.md` records the six ways the swap is judged
+  (LA-0…LA-5) and where the two that are not finished stand.
 - **The cluster is not started** (P3). `crates/cluster` is a placeholder and the
   seams it will need — cluster schemas, reserved counter ids — are preserved so
   that it can be added without rework. Premium features (Cluster Standby and
