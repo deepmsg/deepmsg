@@ -77,7 +77,7 @@ use deepmsg_driver::driver::Driver;
 use deepmsg_driver::sys;
 
 use crate::catalog::Catalog;
-use crate::mark_file::{ArchiveMarkFile, ERROR_BUFFER_LENGTH_DEFAULT, Header};
+use crate::mark_file::{ArchiveMarkFile, Header};
 use crate::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
 use crate::server::config::ArchiveConfig;
 use crate::server::counters::{
@@ -93,12 +93,6 @@ use crate::server::counters::{
 /// under [`DriverHalf::Owned`], where the driver is this process's own. See
 /// [`DriverHalf::error_counter_id`].
 const DRIVER_ERROR_COUNTER_ID: i32 = 15;
-
-/// `Archive.Configuration.MAX_CATALOG_ENTRIES_DEFAULT` (`Archive.java:472`).
-///
-/// Reached through `getSizeAsLong` (`:849-851`), so a property may spell it
-/// `128` or `8k`; this build does not read the name yet and uses the default.
-const MAX_CATALOG_ENTRIES_DEFAULT: usize = 8 * 1024;
 
 /// `AeronArchive.Configuration.RECORDING_EVENTS_STREAM_ID_DEFAULT`
 /// (`client/AeronArchive.java:2791`).
@@ -388,15 +382,21 @@ pub fn run(
     // dealt with.
     //
     // Two things about the call are worth stating, because the reference's are
-    // implicit. The capacity is `aeron.archive.max.catalog.entries`'s default
-    // (`Archive.java:472`, read as a size at `:849-851`) — the property itself
-    // is not read yet, so a deployment that sets it gets the default. And a
+    // implicit. The capacity is `aeron.archive.catalog.capacity` (`Archive.java:487`,
+    // read as a size at `:861`) — **not** `aeron.archive.max.catalog.entries`,
+    // which this used to pass the default of: that name has no reader in the
+    // reference either (`maxCatalogEntries()` is defined and never called), so
+    // what a deployment set there was being used as the file's starting size.
+    // And a
     // **fresh** catalog starts at recording id 0, because the reference's field
     // starts at 0 and `Archive` constructs its `Catalog` without seeding it
     // (`Catalog.java:148`, `Archive.java:1503-1511`).
-    let mut catalog =
-        Catalog::open_or_create(&archive_config.archive_dir, MAX_CATALOG_ENTRIES_DEFAULT, 0)
-            .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
+    let mut catalog = Catalog::open_or_create(
+        &archive_config.archive_dir,
+        archive_config.catalog_capacity,
+        0,
+    )
+    .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
 
     // **The repair the caller has to ask for**, and this is that caller: a
     // recording that was being written when the last archive died has a `VALID`
@@ -537,7 +537,9 @@ fn create_mark_file(
     ArchiveMarkFile::create(
         &directory,
         &header,
-        ERROR_BUFFER_LENGTH_DEFAULT,
+        // `aeron.archive.error.buffer.length` (`Archive.java:627`), which is what
+        // this was hardcoded to.
+        archive_config.error_buffer_length,
         FILE_PAGE_SIZE_DEFAULT,
         i64::from(std::process::id()),
     )

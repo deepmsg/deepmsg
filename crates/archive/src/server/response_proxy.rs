@@ -136,16 +136,20 @@ pub struct ControlResponseProxy {
     ///
     /// [`DEFAULT_TIMEOUT`]: deepmsg_client::client::DEFAULT_TIMEOUT
     command_timeout: Duration,
+    /// How many times one response is offered before the turn gives up
+    /// (`aeron.archive.message.retry.attempts`, `AeronArchive.java:2686`).
+    send_attempts: usize,
     /// Reused across sends, as the reference's is.
     buffer: Vec<u8>,
 }
 
 impl ControlResponseProxy {
     /// A proxy that has not asked for its publication yet.
-    pub fn new(command_timeout: Duration) -> Self {
+    pub fn new(command_timeout: Duration, send_attempts: usize) -> Self {
         Self {
             publication: Publication::NotAskedFor,
             command_timeout,
+            send_attempts,
             buffer: vec![0u8; INITIAL_BUFFER_LENGTH],
         }
     }
@@ -162,7 +166,7 @@ impl ControlResponseProxy {
 
 impl Default for ControlResponseProxy {
     fn default() -> Self {
-        Self::new(deepmsg_client::client::DEFAULT_TIMEOUT)
+        Self::new(deepmsg_client::client::DEFAULT_TIMEOUT, SEND_ATTEMPTS)
     }
 }
 
@@ -265,7 +269,7 @@ impl Egress for ControlResponseProxy {
 
         let length = encode(&mut self.buffer, response);
 
-        for _ in 0..SEND_ATTEMPTS {
+        for _ in 0..self.send_attempts {
             match publications.offer_exclusive(registration_id, &self.buffer[..length]) {
                 Some(Appended::Ok { .. }) => return Offered::Sent,
 
@@ -722,7 +726,7 @@ mod tests {
 
     /// A proxy whose publication is already in hand.
     fn a_proxy() -> (ControlResponseProxy, FakePublications) {
-        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1), SEND_ATTEMPTS);
         let mut publications = FakePublications::default();
 
         proxy
@@ -1129,7 +1133,7 @@ mod tests {
     /// which the session already knows how to end on.
     #[test]
     fn a_refused_publication_is_answered_with_its_reason() {
-        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1), SEND_ATTEMPTS);
         let mut publications = FakePublications {
             poll: Poll::Refused,
             ..FakePublications::default()
@@ -1168,7 +1172,7 @@ mod tests {
     /// and the registration is not asked for a second time.
     #[test]
     fn a_publication_the_driver_has_not_answered_yet_is_waited_on() {
-        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1), SEND_ATTEMPTS);
         let mut publications = FakePublications {
             poll: Poll::Awaiting,
             ..FakePublications::default()
@@ -1191,7 +1195,7 @@ mod tests {
     /// (`ControlSession.java:861-867`).
     #[test]
     fn a_publication_already_asked_for_is_not_asked_for_again() {
-        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1));
+        let mut proxy = ControlResponseProxy::new(Duration::from_secs(1), SEND_ATTEMPTS);
         let mut publications = FakePublications::default();
 
         proxy
