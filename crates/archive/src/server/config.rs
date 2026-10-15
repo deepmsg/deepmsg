@@ -73,6 +73,42 @@ impl fmt::Display for ThreadingMode {
     }
 }
 
+/// Which spelling of its name a thread the archive starts is given
+/// (`CommonContext.java:534-566`, read through `CommonContext.threadName`).
+///
+/// **Not one of the archive's own 45 names.** `aeron.thread.naming` is a
+/// `CommonContext` name — the client, the driver and the archive all resolve it
+/// through the same static — which is why it is not in the ledger
+/// `every_name_the_reference_reads_is_accounted_for` keeps.
+///
+/// The reference **throws** on a value that is neither spelling
+/// (`:563-565`), so a typo is a refusal here rather than a silent fall back to
+/// `classic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadNaming {
+    /// `classic`, the default (`:547`): `archive-conductor`,
+    /// `archive-recorder`, `archive-replayer`.
+    Classic,
+    /// `new` (`:543`): the same three as `aeron-ar-cnd` / `aeron-ar-rec` /
+    /// `aeron-ar-rep`.
+    New,
+}
+
+impl ThreadNaming {
+    /// `THREAD_NAMING_DEFAULT` (`CommonContext.java:547`), which is `classic`.
+    pub const DEFAULT: Self = Self::Classic;
+
+    /// The naming `value` names, or `None` for one the reference does not know
+    /// (its `default ->` arm, `:564-565`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "classic" => Some(Self::Classic),
+            "new" => Some(Self::New),
+            _ => None,
+        }
+    }
+}
+
 /// A setting's value was there and could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -98,6 +134,9 @@ pub enum ConfigError {
     InvalidValue { name: String, value: String },
     /// A threading mode that is not one of the three.
     UnknownThreadingMode { value: String },
+    /// A thread naming mode that is neither `classic` nor `new`
+    /// (`CommonContext.java:563-565`).
+    UnknownThreadNaming { value: String },
     /// `aeron.archive.segment.file.length` is not a power of two
     /// (`Archive.java:1482-1485`).
     SegmentFileLengthNotPowerOfTwo { length: usize },
@@ -161,6 +200,9 @@ impl fmt::Display for ConfigError {
                     "aeron.archive.threading.mode={value} is not one of DEDICATED, SHARED, INVOKER"
                 )
             }
+            Self::UnknownThreadNaming { value } => {
+                write!(f, "aeron.thread.naming={value} is not one of classic, new")
+            }
         }
     }
 }
@@ -187,6 +229,11 @@ mod settings {
     pub const DIR_DELETE_ON_START: &str = "aeron.archive.dir.delete.on.start";
     /// `Archive.java:394`, default `DEDICATED` (`:393`).
     pub const THREADING_MODE: &str = "aeron.archive.threading.mode";
+    /// `CommonContext.java:534`, default `classic` (`:547`) — **not one of the
+    /// archive's 45**: it is a `CommonContext` name, resolved by the same static
+    /// the client and the driver use, so it is deliberately outside the three
+    /// lists `every_name_the_reference_reads_is_accounted_for` keeps.
+    pub const THREAD_NAMING: &str = "aeron.thread.naming";
     /// `Archive.java:590`, default `DefaultAuthenticatorSupplier` (`:597`).
     pub const AUTHENTICATOR_SUPPLIER: &str = "aeron.archive.authenticator.supplier";
     /// `Archive.java:603`.
@@ -488,6 +535,10 @@ pub struct ArchiveConfig {
     pub session_liveness_check_interval_ns: i64,
     /// `DEDICATED`, `SHARED` or `INVOKER` (`Archive.java:394-397`).
     pub threading_mode: ThreadingMode,
+    /// Which spelling the threads the archive starts are named with
+    /// (`CommonContext.java:557-566`). Read only when there are threads to name
+    /// — see [`crate::server::threading`].
+    pub thread_naming: ThreadNaming,
     /// The authenticator to build (`Archive.java:590-597`).
     pub authenticator_supplier: String,
     /// The authorisation service to build (`Archive.java:603-610`).
@@ -625,6 +676,18 @@ impl ArchiveConfig {
             }
         };
 
+        // The reference's own refusal, and it is a throw rather than a fall
+        // back: `CommonContext.threadName`'s `default ->` arm
+        // (`CommonContext.java:564-565`).
+        let thread_naming = match get(settings::THREAD_NAMING) {
+            None => ThreadNaming::DEFAULT,
+            Some(value) => {
+                ThreadNaming::parse(value).ok_or_else(|| ConfigError::UnknownThreadNaming {
+                    value: value.to_owned(),
+                })?
+            }
+        };
+
         let archive_id = match get(settings::ARCHIVE_ID) {
             // Absent is "not told", which the archive runs as
             // [`ARCHIVE_ID_DEFAULT`]. **A configured id is an id whatever its
@@ -737,6 +800,7 @@ impl ArchiveConfig {
             )?
             .unwrap_or(SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS),
             threading_mode,
+            thread_naming,
             authenticator_supplier: non_empty(get(settings::AUTHENTICATOR_SUPPLIER))
                 .unwrap_or(AUTHENTICATOR_SUPPLIER_DEFAULT)
                 .to_owned(),
@@ -1182,6 +1246,33 @@ mod tests {
             config.mark_file_path(),
             PathBuf::from("aeron-archive/archive-mark.dat"),
             "an unnamed mark file directory is the archive directory"
+        );
+    }
+
+    /// `aeron.thread.naming` is a `CommonContext` name rather than one of the
+    /// archive's own, so it is not in the 45-name ledger above — which means
+    /// the ledger does not pin it and this does.
+    #[test]
+    fn the_thread_naming_is_the_references_and_a_typo_is_refused() {
+        let config = ArchiveConfig::resolve(&archive_defaults()).expect("the defaults resolve");
+        assert_eq!(
+            config.thread_naming,
+            ThreadNaming::Classic,
+            "`THREAD_NAMING_DEFAULT` is `classic` (`CommonContext.java:547`)"
+        );
+
+        let config = resolve_with(&archive_defaults(), settings::THREAD_NAMING, "new")
+            .expect("`new` is a spelling the reference knows");
+        assert_eq!(config.thread_naming, ThreadNaming::New);
+
+        // The reference's `default ->` arm throws (`:564-565`), so this is a
+        // refusal and not a fall back to `classic`.
+        assert!(
+            matches!(
+                resolve_with(&archive_defaults(), settings::THREAD_NAMING, "Classic"),
+                Err(ConfigError::UnknownThreadNaming { value }) if value == "Classic"
+            ),
+            "a value that is neither spelling is refused by name"
         );
     }
 
