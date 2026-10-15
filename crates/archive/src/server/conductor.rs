@@ -1828,6 +1828,10 @@ pub struct Sessions {
     liveness_check_interval_ms: i64,
     /// How long a command to the driver may take.
     command_timeout: Duration,
+    /// How many times one response is offered before the turn gives up
+    /// (`aeron.archive.message.retry.attempts`, `AeronArchive.java:2686`) — the
+    /// name behind [`crate::server::response_proxy::SEND_ATTEMPTS`].
+    send_attempts: usize,
     /// What the archive's own control settings contribute to a response
     /// channel (`:460-474`).
     response_channel_defaults: ResponseChannelDefaults,
@@ -2412,6 +2416,7 @@ impl Sessions {
         connect_timeout_ms: i64,
         liveness_check_interval_ms: i64,
         command_timeout: Duration,
+        send_attempts: usize,
         response_channel_defaults: ResponseChannelDefaults,
         recording: RecordingSettings,
         replay: ReplaySettings,
@@ -2424,6 +2429,7 @@ impl Sessions {
             connect_timeout_ms,
             liveness_check_interval_ms,
             command_timeout,
+            send_attempts,
             response_channel_defaults,
             recording,
             replay,
@@ -6525,7 +6531,7 @@ impl Sessions {
                 self.connect_timeout_ms,
                 self.liveness_check_interval_ms,
                 now_ms,
-                ControlResponseProxy::new(self.command_timeout),
+                ControlResponseProxy::new(self.command_timeout, self.send_attempts),
             );
 
             if let Some(counter) = counter {
@@ -7375,7 +7381,11 @@ impl ArchiveConductor {
             config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT),
             config.connect_timeout_ns / 1_000_000,
             config.session_liveness_check_interval_ns / 1_000_000,
-            DEFAULT_TIMEOUT,
+            // `aeron.archive.message.timeout` (`AeronArchive.java:2680`): what a
+            // session waits for an answer. It was `DEFAULT_TIMEOUT` — the same
+            // ten seconds — with no way to say otherwise.
+            Duration::from_nanos(u64::try_from(config.message_timeout_ns).unwrap_or(0)),
+            config.message_retry_attempts,
             ResponseChannelDefaults {
                 term_buffer_length: config.control_term_buffer_length as i32,
                 term_buffer_sparse: config.control_term_buffer_sparse,
@@ -9214,6 +9224,7 @@ mod tests {
             5_000,
             1_000,
             Duration::from_secs(1),
+            crate::server::response_proxy::SEND_ATTEMPTS,
             DEFAULTS,
             recording_settings(),
             ReplaySettings {

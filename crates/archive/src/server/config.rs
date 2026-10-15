@@ -239,10 +239,167 @@ mod settings {
     pub const FILE_SYNC_LEVEL: &str = "aeron.archive.file.sync.level";
     /// `AeronArchive.java:2797`, default false (`:2803`).
     pub const RECORDING_EVENTS_ENABLED: &str = "aeron.archive.recording.events.enabled";
+    /// `AeronArchive.java:2770`, default
+    /// `aeron:udp?control-mode=dynamic|control=localhost:8030` (`:2778-2779`).
+    pub const RECORDING_EVENTS_CHANNEL: &str = "aeron.archive.recording.events.channel";
+    /// `AeronArchive.java:2785`, default 30 (`:2791`).
+    pub const RECORDING_EVENTS_STREAM_ID: &str = "aeron.archive.recording.events.stream.id";
+
+    /// `Archive.java:479`, default `Catalog.DEFAULT_CAPACITY` (`:487`,
+    /// `Catalog.java:105`), read as a size at `:861`.
+    pub const CATALOG_CAPACITY: &str = "aeron.archive.catalog.capacity";
+    /// `Archive.java:380`, default `FILE_SYNC_LEVEL_DEFAULT` (`:388`), read at
+    /// `:756`.
+    pub const CATALOG_FILE_SYNC_LEVEL: &str = "aeron.archive.catalog.file.sync.level";
+    /// `Archive.java:627`, default 1 MiB (`:633`), read at `:946`.
+    pub const ERROR_BUFFER_LENGTH: &str = "aeron.archive.error.buffer.length";
+
+    /// `AeronArchive.java:2674`, default 10 s (`:2680`), read at `:2864`.
+    ///
+    /// What this build's control sessions already wait — as
+    /// `deepmsg_client::client::DEFAULT_TIMEOUT` — and what the name makes
+    /// configurable.
+    pub const MESSAGE_TIMEOUT: &str = "aeron.archive.message.timeout";
+    /// `AeronArchive.java:2686`, default 3 (`:2692`), read at `:2875`.
+    ///
+    /// What [`crate::server::response_proxy::SEND_ATTEMPTS`] already is.
+    pub const MESSAGE_RETRY_ATTEMPTS: &str = "aeron.archive.message.retry.attempts";
+
+    /// `Archive.java:526`, default `Context.replayLingerTimeoutNs()` (`:535`),
+    /// read at `:884`.
+    pub const REPLAY_LINGER_TIMEOUT: &str = "aeron.archive.replay.linger.timeout";
+    /// `Archive.java:647`, default off, read at `:1027`.
+    pub const REPLAY_CHECKSUM: &str = "aeron.archive.replay.checksum";
+    /// `Archive.java:640`, default off, read at `:1017`. The recording side of
+    /// the same choice.
+    pub const RECORD_CHECKSUM: &str = "aeron.archive.record.checksum";
+    /// `Archive.java:376`, default the archive's own idle strategy (`:422`).
+    pub const IDLE_STRATEGY: &str = "aeron.archive.idle.strategy";
+
+    /// ★ The four below belong to other slices, and this build **refuses them by
+    /// name** rather than accepting them silently: the cycle thresholds are
+    /// P2-9b's counters, and the two idle strategies are P2-9a's threading work.
+    /// A name that is accepted and does nothing would make those slices look
+    /// wired when they are not.
+    ///
+    /// `Archive.java:542`, default 100 ms (`:548`), read at `:894`.
+    pub const CONDUCTOR_CYCLE_THRESHOLD: &str = "aeron.archive.conductor.cycle.threshold";
+    /// `Archive.java:554`, default 100 ms (`:560`), read at `:904`.
+    pub const RECORDER_CYCLE_THRESHOLD: &str = "aeron.archive.recorder.cycle.threshold";
+    /// `Archive.java:566`, default 100 ms (`:572`), read at `:914`.
+    pub const REPLAYER_CYCLE_THRESHOLD: &str = "aeron.archive.replayer.cycle.threshold";
+    /// `Archive.java:406`, read by the recorder's idle strategy supplier
+    /// (`:786-802`).
+    pub const RECORDER_IDLE_STRATEGY: &str = "aeron.archive.recorder.idle.strategy";
+    /// `Archive.java:412`, similarly (`:804-820`).
+    pub const REPLAYER_IDLE_STRATEGY: &str = "aeron.archive.replayer.idle.strategy";
+
+    /// `Archive.java:463`, default 8192 (`:472`), read at `:851` — and **read by
+    /// nobody else**: the reference exposes it and constructs its `Catalog`
+    /// without it (`Archive.java:1504-1511`, where the arguments are the sync
+    /// level, the capacity, the clock and the checksum). Accepted here for the
+    /// same reason it is inert there.
+    pub const MAX_CATALOG_ENTRIES: &str = "aeron.archive.max.catalog.entries";
+    /// `AeronArchive.java:2848`, default `""` (`:3025`) — a name the **client**
+    /// reads (`ArchiveContext::client_name`), and one this build already carries
+    /// as a recorded deviation on that side (`crate::client::context`). The
+    /// archive server has no reader for it in the reference either.
+    pub const CLIENT_NAME: &str = "aeron.archive.client.name";
 }
+
+/// ★ **The names the reference reads that this build accepts and does not act
+/// on**, with the reason each one is on the list.
+///
+/// It is here, and not only in the test below, because it is the thing a reader
+/// of this module needs: the reference's 45 names all change its behaviour, and
+/// fourteen of them do not change this build's. Two of the fourteen are the
+/// reference's own doing — `max.catalog.entries` has no reader there either, and
+/// `client.name` is read by the *client* — and the rest are work this build has
+/// not done.
+///
+/// Every name here is **accepted**, which is the reference's own behaviour for a
+/// name it does not know (`System.getProperty` per name, no validation): a
+/// deployment's property file starts this archive whether or not this build can
+/// honour all of it. What the list buys is that the gap is written down and
+/// pinned by `every_name_the_reference_reads_is_accounted_for` below, instead of
+/// being discovered by the deployment.
+pub const NOT_HONOURED: &[(&str, &str)] = &[
+    (
+        settings::RECORD_CHECKSUM,
+        "recordings are written without a checksum; the reference's default is off too, \
+         but a deployment that asks for `crc32` is not told it will not get it",
+    ),
+    (settings::REPLAY_CHECKSUM, "a replay is not checksummed"),
+    (
+        settings::REPLAY_LINGER_TIMEOUT,
+        "the replay publication is not given a linger",
+    ),
+    (
+        settings::CATALOG_FILE_SYNC_LEVEL,
+        "the catalog is not forced to disk on a level",
+    ),
+    (
+        settings::CONDUCTOR_CYCLE_THRESHOLD,
+        "the cycle-time counters and their thresholds are P2-9b's",
+    ),
+    (
+        settings::RECORDER_CYCLE_THRESHOLD,
+        "the same, for the recorder's",
+    ),
+    (
+        settings::REPLAYER_CYCLE_THRESHOLD,
+        "the same, for the replayer's",
+    ),
+    (
+        settings::IDLE_STRATEGY,
+        "P2-9a: this build's archive does not run agents of its own to idle",
+    ),
+    (
+        settings::RECORDER_IDLE_STRATEGY,
+        "the same, for the recorder's",
+    ),
+    (
+        settings::REPLAYER_IDLE_STRATEGY,
+        "the same, for the replayer's",
+    ),
+    (
+        settings::MAX_CATALOG_ENTRIES,
+        "★ the reference has no reader for it either: `Archive.maxCatalogEntries()` is \
+         defined and never called, and its `Catalog` is constructed without it \
+         (`Archive.java:1504-1511`)",
+    ),
+    (
+        settings::CLIENT_NAME,
+        "★ it is read by the *client* (`AeronArchive.java:3025`); this build's client takes \
+         it from `AERON_ARCHIVE_CLIENT_NAME` instead, which is a recorded deviation on \
+         that side",
+    ),
+    (
+        settings::RECORDING_EVENTS_CHANNEL,
+        "only read when the events publication is enabled, and this build refuses that",
+    ),
+    (
+        settings::RECORDING_EVENTS_STREAM_ID,
+        "the same: it is the events publication's stream",
+    ),
+];
 
 /// The reference's default archive directory (`Archive.java:315`).
 const ARCHIVE_DIR_DEFAULT: &str = "aeron-archive";
+
+/// `AeronArchive.Configuration.MESSAGE_TIMEOUT_DEFAULT_NS` (`:2680`).
+const MESSAGE_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
+
+/// `AeronArchive.Configuration.MESSAGE_RETRY_ATTEMPTS_DEFAULT` (`:2692`), which
+/// is what [`crate::server::response_proxy::SEND_ATTEMPTS`] already is.
+const MESSAGE_RETRY_ATTEMPTS_DEFAULT: usize = 3;
+
+/// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`:633`).
+const ERROR_BUFFER_LENGTH_DEFAULT: usize = 1024 * 1024;
+
+/// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:105`), which is what
+/// `Archive.Configuration.CATALOG_CAPACITY_DEFAULT` is (`:487`).
+const CATALOG_CAPACITY_DEFAULT: usize = 1024 * 1024;
 /// `AeronArchive.java:2722`.
 const LOCAL_CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=64k";
 /// `AeronArchive.java:2710`.
@@ -368,6 +525,20 @@ pub struct ArchiveConfig {
     /// (`AeronArchive.java:2797`). This build refuses it — see
     /// [`ConfigError::RecordingEventsNotImplemented`].
     pub recording_events_enabled: bool,
+    /// How long a control session waits for the archive's answer
+    /// (`AeronArchive.java:2680`, ten seconds) — what this build's sessions
+    /// already wait, now a name a deployment can set.
+    pub message_timeout_ns: i64,
+    /// How many times one response is offered before the turn gives up
+    /// (`AeronArchive.java:2692`, three) — what
+    /// [`crate::server::response_proxy::SEND_ATTEMPTS`] is.
+    pub message_retry_attempts: usize,
+    /// The mark file's error buffer (`Archive.java:633`, 1 MiB).
+    pub error_buffer_length: usize,
+    /// The size a catalog **starts** at (`Archive.java:487`,
+    /// `Catalog.DEFAULT_CAPACITY`); it grows as records are added, so this is
+    /// where the file begins rather than how large it may become.
+    pub catalog_capacity: usize,
 }
 
 impl ArchiveConfig {
@@ -597,6 +768,27 @@ impl ArchiveConfig {
             file_sync_level: integer(get(settings::FILE_SYNC_LEVEL), settings::FILE_SYNC_LEVEL)?
                 .unwrap_or(0),
             recording_events_enabled,
+            // The three names this slice wires. Each is read the way its
+            // neighbours are — through the same helpers — so that a value that
+            // will not parse is the *same* refusal as everywhere else in this
+            // table, not a new one.
+            message_timeout_ns: duration(
+                get(settings::MESSAGE_TIMEOUT),
+                settings::MESSAGE_TIMEOUT,
+            )?
+            .unwrap_or(MESSAGE_TIMEOUT_DEFAULT_NS),
+            message_retry_attempts: retry_attempts(
+                get(settings::MESSAGE_RETRY_ATTEMPTS),
+                settings::MESSAGE_RETRY_ATTEMPTS,
+            )?
+            .unwrap_or(MESSAGE_RETRY_ATTEMPTS_DEFAULT),
+            error_buffer_length: size(
+                get(settings::ERROR_BUFFER_LENGTH),
+                settings::ERROR_BUFFER_LENGTH,
+            )?
+            .unwrap_or(ERROR_BUFFER_LENGTH_DEFAULT),
+            catalog_capacity: size(get(settings::CATALOG_CAPACITY), settings::CATALOG_CAPACITY)?
+                .unwrap_or(CATALOG_CAPACITY_DEFAULT),
         })
     }
 
@@ -624,6 +816,23 @@ fn boolean(value: Option<&str>) -> Option<bool> {
 }
 
 /// An `i32` property, with the name only there to say which one was wrong.
+/// A count of attempts, which is a `usize` here and an `int` there
+/// (`AeronArchive.Configuration.MESSAGE_RETRY_ATTEMPTS_PROP_NAME`). Zero is
+/// refused the way `integer` refuses what will not read: a response offered no
+/// times is a setting that says nothing.
+fn retry_attempts(value: Option<&str>, name: &str) -> Result<Option<usize>, ConfigError> {
+    match value {
+        None => Ok(None),
+        Some(value) => match value.parse::<usize>() {
+            Ok(attempts) if attempts > 0 => Ok(Some(attempts)),
+            _ => Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            }),
+        },
+    }
+}
+
 fn integer(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError> {
     match value {
         None => Ok(None),
@@ -730,24 +939,24 @@ mod tests {
     /// the one property that has no default supplied.
     fn archive_defaults() -> Vec<(String, String)> {
         props(&[
-            ("aeron.dir", "/dev/shm/aeron-test"),
-            ("aeron.archive.dir", "/tmp/archive/source"),
-            ("aeron.archive.mark.file.dir", "/dev/shm/aeron-test"),
+            (settings::AERON_DIR, "/dev/shm/aeron-test"),
+            (settings::ARCHIVE_DIR, "/tmp/archive/source"),
+            (settings::MARK_FILE_DIR, "/dev/shm/aeron-test"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
             (
-                "aeron.archive.replication.channel",
+                settings::REPLICATION_CHANNEL,
                 "aeron:udp?endpoint=localhost:0",
             ),
-            ("aeron.archive.id", "42"),
-            ("aeron.archive.threading.mode", "SHARED"),
-            ("aeron.archive.idle.strategy", "yield"),
-            ("aeron.archive.max.concurrent.replays", "100"),
-            ("aeron.archive.control.channel.enabled", "true"),
-            ("aeron.archive.segment.file.length", "131072"),
-            ("aeron.archive.recording.events.enabled", "false"),
+            (settings::ARCHIVE_ID, "42"),
+            (settings::THREADING_MODE, "SHARED"),
+            (settings::IDLE_STRATEGY, "yield"),
+            (settings::MAX_CONCURRENT_REPLAYS, "100"),
+            (settings::CONTROL_CHANNEL_ENABLED, "true"),
+            (settings::SEGMENT_FILE_LENGTH, "131072"),
+            (settings::RECORDING_EVENTS_ENABLED, "false"),
         ])
     }
 
@@ -824,12 +1033,12 @@ mod tests {
     #[test]
     fn the_segment_file_length_is_refused_the_references_way() {
         let not_a_power_of_two = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.segment.file.length", "100000"),
+            (settings::SEGMENT_FILE_LENGTH, "100000"),
         ]))
         .expect_err("100000 is not a power of two");
         assert_eq!(
@@ -838,12 +1047,12 @@ mod tests {
         );
 
         let too_small = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.segment.file.length", "32k"),
+            (settings::SEGMENT_FILE_LENGTH, "32k"),
         ]))
         .expect_err("a term is at least 64k");
         assert_eq!(
@@ -852,12 +1061,12 @@ mod tests {
         );
 
         let too_big = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.segment.file.length", "2g"),
+            (settings::SEGMENT_FILE_LENGTH, "2g"),
         ]))
         .expect_err("a term is at most 1g");
         assert_eq!(
@@ -869,23 +1078,23 @@ mod tests {
     #[test]
     fn the_file_io_max_length_is_refused_the_references_way() {
         let too_small = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.file.io.max.length", "32k"),
+            (settings::FILE_IO_MAX_LENGTH, "32k"),
         ]))
         .expect_err("a term is at least 64k");
         assert_eq!(too_small.to_string(), "invalid fileIoMaxLength=32768");
 
         let not_a_power_of_two = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.file.io.max.length", "96k"),
+            (settings::FILE_IO_MAX_LENGTH, "96k"),
         ]))
         .expect_err("96k is not a power of two");
         assert_eq!(
@@ -902,7 +1111,7 @@ mod tests {
     fn recording_events_are_refused_rather_than_ignored() {
         let mut properties = archive_defaults();
         properties.push((
-            "aeron.archive.recording.events.enabled".to_owned(),
+            settings::RECORDING_EVENTS_ENABLED.to_owned(),
             "true".to_owned(),
         ));
 
@@ -936,9 +1145,9 @@ mod tests {
         // against — a typo here is a name no deployment sets and nobody misses
         // until a real one does.
         let config = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/aeron-test"),
+            (settings::AERON_DIR, "/dev/shm/aeron-test"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
         ]))
@@ -963,7 +1172,7 @@ mod tests {
     fn a_mark_file_directory_moves_the_mark_file_and_nothing_else() {
         let mut properties = archive_defaults();
         properties.push((
-            "aeron.archive.mark.file.dir".to_owned(),
+            settings::MARK_FILE_DIR.to_owned(),
             "/dev/shm/aeron-test".to_owned(),
         ));
 
@@ -980,7 +1189,7 @@ mod tests {
     fn the_two_control_channels_media_types_are_refused_the_references_way() {
         // These are the two refusals P2-1c met the hard way, and the words
         // matter: a client reads them.
-        let no_channel = ArchiveConfig::resolve(&props(&[("aeron.dir", "/dev/shm/a")]))
+        let no_channel = ArchiveConfig::resolve(&props(&[(settings::AERON_DIR, "/dev/shm/a")]))
             .expect_err("the control channel has no default");
         assert_eq!(no_channel, ConfigError::MissingControlChannel);
         assert_eq!(
@@ -989,8 +1198,8 @@ mod tests {
         );
 
         let ipc_control = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
-            ("aeron.archive.control.channel", "aeron:ipc?term-length=64k"),
+            (settings::AERON_DIR, "/dev/shm/a"),
+            (settings::CONTROL_CHANNEL, "aeron:ipc?term-length=64k"),
         ]))
         .expect_err("a control channel must be UDP");
         assert_eq!(
@@ -1000,13 +1209,13 @@ mod tests {
         );
 
         let udp_local = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
             (
-                "aeron.archive.local.control.channel",
+                settings::LOCAL_CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:0",
             ),
         ]))
@@ -1022,8 +1231,8 @@ mod tests {
         // `ArchiveConductor.java:239-240` adds the local subscription with no
         // condition on it, so IPC-only mode still has one channel to serve.
         let config = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
-            ("aeron.archive.control.channel.enabled", "false"),
+            (settings::AERON_DIR, "/dev/shm/a"),
+            (settings::CONTROL_CHANNEL_ENABLED, "false"),
         ]))
         .expect("resolves");
 
@@ -1035,14 +1244,14 @@ mod tests {
     #[test]
     fn sizes_and_durations_are_read_the_references_way() {
         let config = ArchiveConfig::resolve(&props(&[
-            ("aeron.dir", "/dev/shm/a"),
+            (settings::AERON_DIR, "/dev/shm/a"),
             (
-                "aeron.archive.control.channel",
+                settings::CONTROL_CHANNEL,
                 "aeron:udp?endpoint=localhost:8010",
             ),
-            ("aeron.archive.control.term.buffer.length", "1m"),
-            ("aeron.archive.control.mtu.length", "1408"),
-            ("aeron.archive.connect.timeout", "250ms"),
+            (settings::CONTROL_TERM_BUFFER_LENGTH, "1m"),
+            (settings::CONTROL_MTU_LENGTH, "1408"),
+            (settings::CONNECT_TIMEOUT, "250ms"),
             ("aeron.archive.session.liveness.check.interval", "2s"),
         ]))
         .expect("resolves");
@@ -1059,11 +1268,11 @@ mod tests {
         // *name* is ignored, but a name that is present with a value nobody can
         // use must not quietly become the default.
         for (name, value) in [
-            ("aeron.archive.control.stream.id", "ten"),
-            ("aeron.archive.control.term.buffer.length", "64 kilo"),
-            ("aeron.archive.connect.timeout", "soon"),
-            ("aeron.archive.id", "the-answer"),
-            ("aeron.archive.threading.mode", "PARALLEL"),
+            (settings::CONTROL_STREAM_ID, "ten"),
+            (settings::CONTROL_TERM_BUFFER_LENGTH, "64 kilo"),
+            (settings::CONNECT_TIMEOUT, "soon"),
+            (settings::ARCHIVE_ID, "the-answer"),
+            (settings::THREADING_MODE, "PARALLEL"),
         ] {
             let mut properties = archive_defaults();
             properties.retain(|(property, _)| property != name);
@@ -1076,19 +1285,146 @@ mod tests {
         }
     }
 
+    /// ★ **Every one of the reference's 45 names is accounted for, and the
+    /// account is what this case keeps from rotting.**
+    ///
+    /// The reference reads 45 `aeron.archive.*` names and **honours every one of
+    /// them**: a deployment's property file is its configuration, and nothing in
+    /// it is dropped on the floor. This build reads the same names, and what it
+    /// does with some of them is less — so each name is in exactly one of three
+    /// lists, and a name that moves between them without this list moving is a
+    /// failing case:
+    ///
+    /// * **honoured**: setting it changes the resolved configuration;
+    /// * **accepted, not honoured**: setting it changes nothing, and the reason
+    ///   beside it is a fact about this build or about the reference — not an
+    ///   apology. Two of the fourteen are the reference's own doing:
+    ///   `max.catalog.entries` has **no reader there either**
+    ///   (`Archive.maxCatalogEntries()` is defined and never called), and
+    ///   `client.name` is read by the *client*, whose handling of it here is a
+    ///   recorded deviation;
+    /// * **refused**: one name, the events publication, refused by name rather
+    ///   than accepted with nothing behind it.
+    ///
+    /// What this replaces is silence: before this slice a deployment could set
+    /// any of the fourteen and be told nothing at all — three of them
+    /// (`message.timeout`, `message.retry.attempts`, `error.buffer.length`) were
+    /// hardcoded to the reference's own defaults, so only a deployment that
+    /// *changed* one was affected, and it could not tell.
+    #[test]
+    fn every_name_the_reference_reads_is_accounted_for() {
+        // (name, a value a deployment might set — never the default)
+        const HONOURED: &[(&str, &str)] = &[
+            (settings::ARCHIVE_DIR, "/tmp/archive/other"),
+            (settings::MARK_FILE_DIR, "/dev/shm/aeron-other"),
+            (settings::DIR_DELETE_ON_START, "true"),
+            (settings::THREADING_MODE, "INVOKER"),
+            (settings::AUTHENTICATOR_SUPPLIER, "SomeAuthenticator"),
+            (settings::AUTHORISATION_SERVICE_SUPPLIER, "SomeService"),
+            (settings::CONNECT_TIMEOUT, "7s"),
+            ("aeron.archive.session.liveness.check.interval", "2s"),
+            (
+                settings::REPLICATION_CHANNEL,
+                "aeron:udp?endpoint=localhost:9999",
+            ),
+            (settings::ARCHIVE_ID, "7"),
+            (settings::CONTROL_CHANNEL_ENABLED, "false"),
+            (
+                settings::CONTROL_CHANNEL,
+                "aeron:udp?endpoint=localhost:8123",
+            ),
+            (settings::CONTROL_STREAM_ID, "11"),
+            (
+                settings::LOCAL_CONTROL_CHANNEL,
+                "aeron:ipc?term-length=128k",
+            ),
+            (settings::LOCAL_CONTROL_STREAM_ID, "12"),
+            (
+                settings::CONTROL_RESPONSE_CHANNEL,
+                "aeron:ipc?term-length=64k",
+            ),
+            (settings::CONTROL_RESPONSE_STREAM_ID, "21"),
+            (settings::CONTROL_TERM_BUFFER_SPARSE, "false"),
+            (settings::CONTROL_TERM_BUFFER_LENGTH, "128k"),
+            (settings::CONTROL_MTU_LENGTH, "1408"),
+            (settings::MAX_CONCURRENT_RECORDINGS, "5"),
+            (settings::MAX_CONCURRENT_REPLAYS, "7"),
+            (settings::SEGMENT_FILE_LENGTH, "262144"),
+            (settings::FILE_IO_MAX_LENGTH, "262144"),
+            (settings::LOW_STORAGE_SPACE_THRESHOLD, "512k"),
+            (settings::FILE_SYNC_LEVEL, "1"),
+            // The three this slice wired, each of which was hardcoded to the
+            // reference's default before it.
+            (settings::MESSAGE_TIMEOUT, "5s"),
+            (settings::MESSAGE_RETRY_ATTEMPTS, "5"),
+            (settings::ERROR_BUFFER_LENGTH, "2m"),
+            (settings::CATALOG_CAPACITY, "2m"),
+        ];
+
+        // (name, a value) — the one the reference has that this build refuses
+        const REFUSED: &[(&str, &str)] = &[(settings::RECORDING_EVENTS_ENABLED, "true")];
+
+        let baseline = ArchiveConfig::resolve(&archive_defaults()).expect("the defaults resolve");
+
+        for (name, value) in HONOURED {
+            let config = resolve_with(&archive_defaults(), name, value)
+                .unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+
+            assert_ne!(
+                baseline, config,
+                "{name} is listed as honoured, but setting it to {value} changed nothing"
+            );
+        }
+
+        for (name, why) in NOT_HONOURED {
+            // A value a deployment might set: any value at all will do, because
+            // what is asserted is that it changes nothing.
+            let config = resolve_with(&archive_defaults(), name, "0001")
+                .unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+
+            assert_eq!(
+                baseline, config,
+                "{name} is listed as not honoured ({why}), but setting it changed the configuration"
+            );
+        }
+
+        for (name, value) in REFUSED {
+            assert!(
+                matches!(
+                    resolve_with(&archive_defaults(), name, value),
+                    Err(ConfigError::RecordingEventsNotImplemented)
+                ),
+                "{name}={value} must be refused by name"
+            );
+        }
+
+        assert_eq!(
+            45,
+            HONOURED.len() + NOT_HONOURED.len() + REFUSED.len(),
+            "the reference reads 45 names, and every one of them belongs in exactly one list"
+        );
+    }
+
+    /// The defaults with one name set to `value`, spelled the way a deployment
+    /// would.
+    fn resolve_with(
+        defaults: &[(String, String)],
+        name: &str,
+        value: &str,
+    ) -> Result<ArchiveConfig, ConfigError> {
+        let mut properties = defaults.to_vec();
+        properties.push((name.to_owned(), value.to_owned()));
+
+        ArchiveConfig::resolve(&properties)
+    }
+
     #[test]
     fn an_unknown_name_is_ignored() {
         // 45 names exist and this slice reads twenty; the rest arrive with the
         // sessions that use them. A deployment that spells all 45 must start.
         let mut properties = archive_defaults();
-        properties.push((
-            "aeron.archive.segment.file.length".to_owned(),
-            "128m".to_owned(),
-        ));
-        properties.push((
-            "aeron.archive.record.checksum".to_owned(),
-            "crc32".to_owned(),
-        ));
+        properties.push((settings::SEGMENT_FILE_LENGTH.to_owned(), "128m".to_owned()));
+        properties.push((settings::RECORD_CHECKSUM.to_owned(), "crc32".to_owned()));
 
         assert!(ArchiveConfig::resolve(&properties).is_ok());
     }
@@ -1096,7 +1432,7 @@ mod tests {
     #[test]
     fn the_last_spelling_of_a_name_wins() {
         let mut properties = archive_defaults();
-        properties.push(("aeron.archive.id".to_owned(), "7".to_owned()));
+        properties.push((settings::ARCHIVE_ID.to_owned(), "7".to_owned()));
 
         assert_eq!(
             ArchiveConfig::resolve(&properties)
