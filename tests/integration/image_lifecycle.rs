@@ -554,3 +554,84 @@ fn a_run_of_frames_can_be_read_in_one_call() {
         "the run was consumed, not re-delivered"
     );
 }
+
+/// An image that **left** the subscription is still told when its stream is
+/// over — both ways it can be over.
+///
+/// This is what a reader that took an image out needs, and there is nowhere
+/// else for it to come from: `Client::take_image` gives the image to a thread
+/// that polls no client (the archive's recorder is the caller this exists for),
+/// so the `ImageEvent`s the client queues are not on its path, and
+/// `Subscription::image` no longer finds it. What reaches it is
+/// [`Image::is_closed`], flipped by the client on the two endings below.
+///
+/// ★ The second ending is the one that is easy to miss, and it was: a
+/// subscription leaving a live client is the **normal** end of a recording
+/// (`stop subscription`), and before this test it left a handed-out image
+/// looking open — an archive session that read a stream nobody was serving any
+/// more, and never ended.
+#[test]
+fn an_image_that_left_the_subscription_hears_that_it_is_over() {
+    let Some((_own, mut client)) = own_driver_and_client("image-handover") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    let image = client
+        .take_image(subscription, publication)
+        .expect("the subscription hands the image over");
+    assert!(!image.is_closed(), "it is open when it is handed over");
+    assert!(
+        client
+            .subscription(subscription)
+            .expect("the subscription")
+            .images()
+            .is_empty(),
+        "and it is no longer the subscription's"
+    );
+
+    // Ending one: the driver withdraws it, which the client hears as an
+    // `Unavailable` event and the holder as the flag.
+    client
+        .remove_publication(publication, DEFAULT_TIMEOUT)
+        .expect("the publication is removed");
+
+    let deadline = Instant::now() + DEADLINE;
+    while !image.is_closed() {
+        assert!(Instant::now() < deadline, "the withdrawal never reached it");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Ending two: the subscription itself goes, with an image still in hand.
+    let second_publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication for the second ending");
+    let second_subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription for the second ending");
+
+    await_image(&mut client, second_subscription);
+
+    let held = client
+        .take_image(second_subscription, second_publication)
+        .expect("the second subscription hands its image over");
+
+    client
+        .remove_subscription(second_subscription, DEFAULT_TIMEOUT)
+        .expect("the subscription goes");
+
+    assert!(
+        held.is_closed(),
+        "a subscription that leaves the client ends the images it gave away"
+    );
+}

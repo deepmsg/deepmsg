@@ -15,7 +15,7 @@ use deepmsg_cnc::counters::{
 };
 
 use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
-use crate::image::{ControlledFragments, Fragment, Image};
+use crate::image::{ControlledFragments, Fragment, Image, ImageView};
 
 /// A subscription and the images attached to it.
 /// One object a controlled scan can call: the assembler, and the handler it
@@ -49,6 +49,17 @@ pub struct Subscription {
     channel: String,
     stream_id: i32,
     images: Vec<Image>,
+    /// The images that have left this subscription for a holder of their own
+    /// ([`Client::take_image`](crate::client::Client::take_image)).
+    ///
+    /// Kept because the news that an image is gone arrives here and nowhere
+    /// else: `ON_UNAVAILABLE_IMAGE` names a publication registration id, and
+    /// this subscription is what that id belongs to. An image that is not in
+    /// [`Subscription::images`] any more has nothing to be removed, so without
+    /// this list the driver withdrawing a handed-out image would be swallowed
+    /// in silence — and its holder, which has no other way to hear, would go on
+    /// reading a log buffer whose publisher is gone.
+    handed_out: Vec<HandedOut>,
     /// Which image the next poll starts from.
     ///
     /// The reference's `roundRobinIndex` (`Subscription.java`, in both `poll`
@@ -83,6 +94,7 @@ impl Subscription {
             channel,
             stream_id,
             images: Vec::new(),
+            handed_out: Vec::new(),
             round_robin: 0,
             assembler: FragmentAssembler::new(),
         }
@@ -396,6 +408,25 @@ impl Subscription {
 
     /// An image by the **session** its stream is in
     /// (`Subscription.imageBySessionId`, `Subscription.java:339-352`;
+    /// An image by its session id — **whether this subscription still holds it
+    /// or has handed it over**.
+    ///
+    /// The lookup a second reader of a recording's image needs
+    /// (`ReplicationSession`, which watches the image this archive's recorder is
+    /// reading). The reference answers it by walking its `Image` objects, one of
+    /// which is the object the recorder holds; here the two places an image can
+    /// be are asked in turn, and both answer the same questions.
+    pub fn image_view_by_session_id(&self, session_id: i32) -> Option<ImageView> {
+        if let Some(image) = self.image_by_session_id(session_id) {
+            return Some(image.view());
+        }
+
+        self.handed_out
+            .iter()
+            .find(|handed| handed.view.session_id() == session_id)
+            .map(|handed| handed.view.clone())
+    }
+
     /// `aeron_subscription_image_by_session_id`,
     /// `aeron-client/src/main/c/aeron_subscription.c:291-318`).
     ///
@@ -500,6 +531,74 @@ impl Subscription {
             .retain(|image| image.registration_id() != publication_registration_id);
         self.images.len() != before
     }
+
+    /// Hand an image over to a reader of its own, and remember that it did.
+    ///
+    /// `None` when this subscription holds no such image — which is the answer
+    /// for an id that was never here, and for one that has already been handed
+    /// over or withdrawn. The image **leaves** the subscription: what is left
+    /// behind is [`HandedOut`], which is the ids and the closed flag and cannot
+    /// read anything.
+    pub fn take_image(&mut self, publication_registration_id: i64) -> Option<Image> {
+        let index = self
+            .images
+            .iter()
+            .position(|image| image.registration_id() == publication_registration_id)?;
+
+        let image = self.images.swap_remove(index);
+        self.handed_out.push(HandedOut {
+            publication_registration_id,
+            view: image.view(),
+        });
+
+        Some(image)
+    }
+
+    /// Tell **every** image this subscription handed over that it is over.
+    ///
+    /// What a subscription leaving a live client means for the images it gave
+    /// away: they are the images of a subscription that no longer exists, and
+    /// their holders have nothing else to hear it from. See
+    /// [`Client::forget_subscription`](crate::client::Client), which is the
+    /// path this is called from.
+    pub(crate) fn close_handed_out_images(&mut self) {
+        for handed in &self.handed_out {
+            handed.view.close();
+        }
+    }
+
+    /// Tell a handed-out image that the driver withdrew it, reporting whether
+    /// there was one to tell.
+    ///
+    /// The counterpart of [`Subscription::remove_image`] for an image that is
+    /// no longer here to be removed: it flips the flag its holder reads
+    /// ([`Image::is_closed`]) and forgets the record, because an image the
+    /// driver has withdrawn cannot come back under the same registration id.
+    pub(crate) fn close_handed_out(&mut self, publication_registration_id: i64) -> bool {
+        let before = self.handed_out.len();
+        self.handed_out.retain(|handed| {
+            if handed.publication_registration_id == publication_registration_id {
+                handed.view.close();
+                false
+            } else {
+                true
+            }
+        });
+
+        self.handed_out.len() != before
+    }
+}
+
+/// An image this subscription gave away, as much of it as is left here.
+///
+/// Not the image: the holder owns that, and reads it. What the subscription
+/// keeps is what it needs to answer `ON_UNAVAILABLE_IMAGE` — the id it is named
+/// by, and the flag the holder watches — and an [`ImageView`], which is how
+/// everything else that used to find this image in the subscription still finds
+/// it (the log under the same `Arc`, and the position the holder publishes).
+pub struct HandedOut {
+    publication_registration_id: i64,
+    view: ImageView,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -858,5 +957,54 @@ mod tests {
         assert_eq!(0, subscription.take_rotation());
         assert_eq!(1, subscription.take_rotation());
         assert_eq!(0, subscription.take_rotation(), "and the next one wraps");
+    }
+
+    /// An image that leaves the subscription is still told when its stream is
+    /// over — by the driver withdrawing it (`close_handed_out`), and by the
+    /// subscription itself going away (`close_handed_out_images`).
+    ///
+    /// This is the whole of what `HandedOut` is for, and both halves matter: an
+    /// application reading a handed-out image polls no client, so the flag is
+    /// the only notice it can get. The second half is the one that is easy to
+    /// miss — the image is not in the subscription any more, so dropping the
+    /// subscription drops nothing that would tell it.
+    #[test]
+    fn an_image_that_left_the_subscription_hears_that_it_is_over() {
+        let log = TempLog::new("handed-out");
+        log.write(|appender| write_message(appender, b"a message"));
+
+        let mut subscription = Subscription::new(1, "aeron:ipc".to_string(), 1, 0);
+        subscription.add_image(log.image(7));
+
+        let image = subscription
+            .take_image(7)
+            .expect("the image is handed over");
+        assert!(!image.is_closed());
+        assert!(
+            subscription.image(7).is_none(),
+            "and it is no longer the subscription's"
+        );
+
+        assert!(
+            subscription.close_handed_out(7),
+            "the driver withdrawing it reaches the holder"
+        );
+        assert!(image.is_closed());
+        assert!(
+            !subscription.close_handed_out(7),
+            "an image the driver withdrew cannot be withdrawn twice"
+        );
+
+        // The other ending: a *second* image, handed over, and the subscription
+        // itself forgotten.
+        subscription.add_image(log.image(8));
+        let second = subscription.take_image(8).expect("handed over");
+        assert!(!second.is_closed());
+
+        subscription.close_handed_out_images();
+        assert!(
+            second.is_closed(),
+            "a subscription leaving a live client ends the images it gave away"
+        );
     }
 }

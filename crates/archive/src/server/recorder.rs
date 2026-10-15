@@ -298,16 +298,17 @@ impl Recorder {
     /// The sessions are driven first and removed afterwards, which is the
     /// worker's own order (`SessionWorker.java:56-81`) — and the reason a
     /// session that finished this turn still gets its turn.
-    pub fn drive(
-        &mut self,
-        client: &mut Client,
-        counters: &CountersReader<'_, ReadWrite>,
-    ) -> usize {
+    ///
+    /// **No client** (P2-9a): a session holds its own image and takes its
+    /// answers from it, so this is the same call the reference's recorder makes
+    /// — `SessionWorker.doWork`, with nothing of the `Aeron` client in it —
+    /// which is what lets this run on a thread of its own.
+    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
         let mut work = 0;
         let totals = &mut self.totals;
 
         for session in &mut self.sessions {
-            work += session.do_work(client, counters, totals);
+            work += session.do_work(counters, totals);
         }
 
         let mut index = 0;
@@ -517,8 +518,7 @@ mod tests {
             recording_id * 1024,
             128 * 1024,
             subscription_id,
-            11,
-            64 * 1024,
+            Box::new(crate::server::recording_session::FakeImage::new()),
             1024 * 1024,
             0,
             false,

@@ -155,7 +155,7 @@ use crate::server::delete_segments::{
 };
 use crate::server::recorder::Recorder;
 use crate::server::recording_pos::RecordingPos;
-use crate::server::recording_session::RecordingSession;
+use crate::server::recording_session::{RecordingImage, RecordingSession};
 use crate::server::replay_session::{
     Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
 };
@@ -1386,8 +1386,15 @@ struct PendingRecording {
     image_session_id: i32,
     segment_file_length: usize,
     subscription_id: i64,
-    image_id: i64,
-    term_buffer_length: i32,
+    /// The image the session will read, **taken out of the client** when the
+    /// driver announced it (`Client::take_image`) and held here until the
+    /// position counter has been claimed and the session can be built.
+    ///
+    /// It is taken early because the announcement is where it exists: the
+    /// `Available` event is drained in the same turn as the poll that produced
+    /// it, and the session that reads it is made once the counter the driver
+    /// answers with is in hand — a turn or more later.
+    image: Box<dyn RecordingImage>,
     is_auto_stop: bool,
     position: RecordingPos,
 }
@@ -2637,26 +2644,33 @@ impl Sessions {
                 continue;
             };
 
+            // ★ The image **leaves the client here** (P2-9a): the session that
+            // reads it is made a turn or more later, once the position counter
+            // the driver answers with is in hand, and it reads on a thread the
+            // client is not on. The reference moves the same object the same
+            // way — its `AvailableImageHandler` hands the session its `Image`
+            // (`ArchiveConductor.java:562`, `:1991`) — and the difference is
+            // only that Rust has one owner to move.
+            //
+            // Everything the row needs is read off it first, because after the
+            // hand-over the subscription no longer has it and only the session
+            // that gets it can be asked.
+            let Some(image) =
+                client.take_image(subscription_registration_id, publication_registration_id)
+            else {
+                continue;
+            };
+
             // The image itself, for the five things only it knows: the catalog
             // row keeps every one of them (`:1999-2019`).
-            // Everything the image says about itself, read out **before**
-            // anything below needs the client mutably: an image is borrowed
-            // from the client it came out of, and the decisions this method
-            // makes are about to call it.
-            let facts = match client
-                .subscription(subscription_registration_id)
-                .and_then(|subscription| subscription.image(publication_registration_id))
-            {
-                Some(image) => ImageFacts {
-                    session_id: image.session_id(),
-                    stream_id: image.stream_id(),
-                    join_position: image.join_position(),
-                    initial_term_id: image.initial_term_id(),
-                    term_buffer_length: image.term_buffer_length(),
-                    mtu_length: image.mtu_length().unwrap_or(0),
-                    source_identity: image.source_identity().to_owned(),
-                },
-                None => continue,
+            let facts = ImageFacts {
+                session_id: image.session_id(),
+                stream_id: image.stream_id(),
+                join_position: image.join_position(),
+                initial_term_id: image.initial_term_id(),
+                term_buffer_length: image.term_buffer_length(),
+                mtu_length: image.mtu_length().unwrap_or(0),
+                source_identity: image.source_identity().to_owned(),
             };
 
             let start_position = facts.join_position;
@@ -2756,8 +2770,7 @@ impl Sessions {
                     request: subscription.request,
                     image_session_id: facts.session_id,
                     subscription_id: subscription_registration_id,
-                    image_id: publication_registration_id,
-                    term_buffer_length,
+                    image: Box::new(image),
                     is_auto_stop: subscription.is_auto_stop,
                     position,
                 }),
@@ -2835,8 +2848,7 @@ impl Sessions {
             request,
             image_session_id,
             subscription_id,
-            image_id,
-            term_buffer_length,
+            image,
             is_auto_stop,
             position,
         } = pending;
@@ -2860,8 +2872,7 @@ impl Sessions {
             start_position,
             segment_file_length,
             subscription_id,
-            image_id,
-            term_buffer_length,
+            image,
             self.recording.file_io_max_length,
             self.recording.file_sync_level,
             is_auto_stop,
@@ -7560,7 +7571,7 @@ impl ArchiveConductor {
         // steps every counter here takes.
         recorder.allocate(client, &counters, *command_timeout);
 
-        work += recorder.drive(client, &counters);
+        work += recorder.drive(&counters);
 
         for session in recorder.take_finished() {
             sessions.close_recording_session(client, catalog, &counters, recorder, session, now_ms);
