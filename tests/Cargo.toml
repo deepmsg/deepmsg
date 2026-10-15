@@ -11,6 +11,10 @@ publish = false
 # Tests that require the reference C driver from the Aeron 1.53.2 checkout
 # (see docs/reference.md for the expected sibling-directory layout).
 interop = []
+# Tests in which *this* build's driver runs on the DPDK media, which is a
+# feature of `deepmsg-driver` rather than of this crate: the pairing that has
+# to be asserted is that the driver binary the harness spawns was built with it.
+dpdk = ["deepmsg-driver/dpdk"]
 
 [dependencies]
 deepmsg-core = { path = "../crates/core" }
@@ -40,6 +44,14 @@ path = "integration/loss_report.rs"
 name = "loss_report_reference"
 path = "interop/loss_report.rs"
 required-features = ["interop"]
+
+# T5: two media, one cable. Needs a device bound to vfio-pci and root, so it is
+# `#[ignore]`d and run by hand on a machine that has one; it is listed here so
+# that the `dpdk` job compiles it.
+[[test]]
+name = "dpdk_cross_media"
+path = "interop/dpdk_cross_media.rs"
+required-features = ["interop", "dpdk"]
 
 [[test]]
 name = "java_archive_id"

@@ -77,6 +77,14 @@ jobs:
         run: |
           cargo test -p deepmsg-driver --features dpdk --lib
           cargo test -p deepmsg-driver --features dpdk --test 'dpdk_*'
+      - name: The cross-media case compiles
+        # T5 needs a device bound to `vfio-pci` and root, so no runner can run
+        # it — what this buys is the other half: the file and its feature wiring
+        # are checked on every change, so a case that can only be run by hand is
+        # not a case that quietly stops compiling. `interop` too, because the
+        # file is in the interop suite.
+        run: cargo test -p deepmsg-tests --features interop,dpdk --test dpdk_cross_media --no-run
+
       - name: The workspace still builds without DPDK
         # The criterion the job above cannot state: with the feature off, this
         # crate is empty and the default build is the one that was there before
