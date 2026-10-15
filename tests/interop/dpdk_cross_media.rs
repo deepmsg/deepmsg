@@ -650,3 +650,164 @@ fn a_withheld_frame_is_asked_for_again_over_the_port() {
 fn counter_value_of(cnc: &CncFile, counter_id: i32) -> Option<i64> {
     cnc.counters()?.value(counter_id)
 }
+
+/// A frame the reference sends is dropped **on this side**, our NAK goes out,
+/// and the reference sends it again — over the port.
+///
+/// The interceptor chain hangs on the receive *endpoint*
+/// (`crates/driver/src/receiver.rs`, `endpoint.drops`), not on a transport, so
+/// it is the same chain a kernel socket would have; what it costs the frames is
+/// what makes this driver the one that has to ask. The NAK that goes out is
+/// ours and the retransmission is the reference's, which is the other direction
+/// of the same exchange.
+///
+/// **`fixed-loss`, not `loss`.** A rate is a *draw*: over the few frames this
+/// case carries, one can drop nothing at all — measured, twice, with a rate of
+/// an eighth and then a half over all frame types, on a stream that arrived
+/// whole with a NAK counter reading zero. `fixed-loss` is a **rule** — a byte
+/// range of one term, dropped once per stream and session
+/// (`media/aeron_udp_channel_transport_fixed_loss.c`) — so the hole is not a
+/// probability. The arrangement is the reference harness's own
+/// (`CTestMediaDriver.java:409-426`), and the range needs the stream pinned:
+/// the channel names `init-term-id=0|term-id=0|term-offset=0` so that term 0 is
+/// the term the stream starts in, which is the term the interceptor has been
+/// told about.
+///
+/// `AERON_NAK_UNICAST_DELAY` is set the way the harness sets it
+/// (`CTestMediaDriver.java:449-452`), so the NAK is not coalesced into a delay
+/// this case would have to wait out.
+#[test]
+#[ignore = "needs two cabled ports, one bound to vfio-pci, and the kernel's half configured"]
+fn a_frame_dropped_here_is_asked_for_again_over_the_port() {
+    use deepmsg_driver::position::type_id::RECEIVER_NAKS_SENT;
+
+    assert!(
+        the_kernel_holds(REFERENCE),
+        "the kernel has to hold {REFERENCE} on {} (see this file's runbook)",
+        variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT)
+    );
+
+    let Some(publisher_binary) = samples::locate("BasicPublisher") else {
+        driver::announce_tool_skip("BasicPublisher");
+        return;
+    };
+    let Some((mut reference, reference_dir)) = reference_driver("dpc-reference-lossy-sender")
+    else {
+        driver::announce_skip();
+        return;
+    };
+
+    let port = 41_000 + (std::process::id() % 100) as u16;
+    // The position triple is what makes `term-id=0` in the interceptor's range
+    // a real term: a publication that names no position picks a random initial
+    // term id.
+    let channel = format!(
+        "aeron:udp?endpoint={OWN}:{port}|term-length=64k|init-term-id=0|term-id=0|term-offset=0"
+    );
+
+    let port_number = variable(OWN_PCI, OWN_PCI_DEFAULT);
+    let address = format!("{OWN}/{PREFIX}");
+    let Some(mut own) = OwnDriver::start_with_env(
+        "dpc-our-lossy-subscriber",
+        &[
+            &format!("-Ddeepmsg.dpdk.port={port_number}"),
+            &format!("-Ddeepmsg.dpdk.ipv4.address={address}"),
+            "-Daeron.threading.mode=SHARED",
+        ],
+        &[
+            ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk"),
+            // **`fixed-loss`, not `loss`.** A rate is a *draw*: over the few
+            // frames this case carries one can easily drop nothing at all, and
+            // a `rate` with no `recv-msg-mask` drops **nothing at all** —
+            // measured, over three runs of this case, as a stream that arrived
+            // whole with `receiver-naks-sent` reading zero. `fixed-loss` is a
+            // **rule**: a byte range of one term, dropped once per stream and
+            // session, which is the arrangement the reference's own harness
+            // uses (`CTestMediaDriver.java:409-426`). The range needs the
+            // stream pinned to the term it names, which is why the channel
+            // below carries `init-term-id=0|term-id=0|term-offset=0`.
+            ("AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS", "fixed-loss"),
+            (
+                "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_FIXED_LOSS_ARGS",
+                "term-id=0|term-offset=0|length=2048",
+            ),
+            // The harness sets this too (`CTestMediaDriver.java:449-452`), so
+            // the NAK is not coalesced into a delay this case would have to
+            // wait out.
+            ("AERON_NAK_UNICAST_DELAY", "0"),
+        ],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver publishes a CnC file");
+    await_the_media_link(&own_cnc);
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = std::thread::spawn({
+        let dir = own.aeron_dir().to_path_buf();
+        let seen = Arc::clone(&seen);
+        let channel = channel.clone();
+        move || {
+            let mut client = Client::connect(&dir).expect("connect our client");
+            let subscription = client
+                .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+                .expect("our driver confirms the subscription");
+
+            let deadline = Instant::now() + CROSSING_TIMEOUT;
+            // The publisher sends one a second and then exits, so the count is
+            // the budget: wait for as many as it promised.
+            while seen.lock().expect("the seen list").len() < 8 && Instant::now() < deadline {
+                client.poll();
+                client.poll_subscription(subscription, 10, |message| {
+                    seen.lock()
+                        .expect("the seen list")
+                        .push(String::from_utf8_lossy(&message.payload).into_owned());
+                });
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    });
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver publishes a CnC file");
+
+    let publisher = samples::Sample::start(
+        &publisher_binary,
+        "publisher",
+        &reference_dir,
+        &["-c", &channel, "-s", &STREAM_ID.to_string(), "-m", "8"],
+    );
+    publisher.await_output(READY_TIMEOUT, "its channel", |output| {
+        output.contains("Publishing to channel")
+    });
+
+    let _ = subscriber.join();
+    let seen = seen.lock().expect("the seen list").clone();
+
+    let reader = deepmsg_cnc::CncFile::try_open(own.aeron_dir()).expect("the CnC file");
+    let counters = reader.counters().expect("the counter regions");
+    let naks = counters
+        .find_by_type_id(RECEIVER_NAKS_SENT)
+        .and_then(|counter| counters.value(counter.counter_id));
+
+    let _ = own.stop();
+    let _ = reference.stop();
+
+    assert_eq!(
+        8,
+        seen.len(),
+        "the reference's stream did not arrive whole even though a dropped frame \
+         is what a NAK is for: {seen:?}\n{}",
+        publisher.output()
+    );
+    assert!(
+        naks.is_some_and(|value| value > 0),
+        "this driver asked for nothing, so nothing here was dropped: \
+         receiver-naks-sent={naks:?} over {seen:?}\n=== this driver's log\n{}",
+        own.log_tail(25)
+    );
+}
