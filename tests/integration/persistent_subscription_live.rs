@@ -49,6 +49,36 @@
 //! and reproducing them would need the recording, the live publication and the
 //! live subscription on three more media — which is a test of the *driver*, not
 //! of this machine. Recorded rather than pretended.
+//!
+//! # ★ And what one cell now judges that the reference's own case does not: the release
+//!
+//! Being live is the **end of the replay**, and the reference says what that
+//! means where the machine finds out it is live (`:2123-2131`): the archive is
+//! told to **stop** the replay (`clean_up_replay`) and the subscription it was
+//! read through is **given back** (`clean_up_replay_subscription`) — both before
+//! the application is told it is live. This build did neither, and measured: the
+//! replay channel's receive endpoint stayed in the driver's counters from the
+//! switch to the end of the run.
+//!
+//! The driver is what says the subscription went back: a **UDP** receive endpoint
+//! has a `rcv-channel` counter (type 7) that is given back when the endpoint is
+//! (`media/receive_endpoint.rs`), where an **IPC** subscription has none at all
+//! (`crates/driver/src/ipc_subscriptions.rs:630` reports
+//! `CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`, as the reference does). So the
+//! dynamic-port cell — the only UDP one — asserts that the counter for its
+//! channel is **gone** once the machine is live, bounded because the endpoint
+//! goes back only after the image it carried has lingered out (measured at
+//! 2.6–3.1 s). That is also why this channel carries an alias
+//! (`|alias=ps-live-replay`): the counter's label is the channel as the client
+//! sent it, and an alias is what makes it *this* channel's counter.
+//!
+//! ★ Two ways this assertion was wrong before it was right, both measured:
+//! **waiting without driving the machine** let its own client go stale, and the
+//! driver then reaped it — which takes its subscriptions back and satisfies the
+//! wait for the wrong reason, at about ten seconds (the helper drives the
+//! subscription every turn for that reason); and the mutation that removes the
+//! two cleanups leaves the counter standing until the deadline, which is the
+//! criterion doing its job.
 
 use std::time::{Duration, Instant};
 
@@ -62,6 +92,7 @@ use deepmsg_archive::client::persistent_subscription::{
 use deepmsg_archive::client::{Archive, ArchiveContext, Handlers, NoCredentials};
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
+use deepmsg_driver::position::channel_type_id;
 use deepmsg_tests::archive;
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::temp::TempDir;
@@ -74,7 +105,15 @@ const LIVE_STREAM_ID: i32 = 4218;
 
 /// Where the replay arrives. Its own stream, and *not* the live one.
 const REPLAY_CHANNEL_IPC: &str = "aeron:ipc?alias=ps-live-replay";
-const REPLAY_CHANNEL_DYNAMIC_PORT: &str = "aeron:udp?endpoint=localhost:0";
+/// The dynamic-port replay channel, with an **alias**: the shape is the
+/// reference's own (`endpoint=localhost:0`, which is what asks the driver for a
+/// port), and the alias is what the driver's `rcv-channel` counter for the
+/// subscription is labelled with — the one channel in this file a counter can be
+/// asked about, and the reason it is the one the release is judged on.
+const REPLAY_CHANNEL_DYNAMIC_PORT: &str = "aeron:udp?endpoint=localhost:0|alias=ps-live-replay";
+
+/// The alias in [`REPLAY_CHANNEL_DYNAMIC_PORT`], which is what the label carries.
+const REPLAY_ALIAS_DYNAMIC_PORT: &str = "ps-live-replay";
 const REPLAY_STREAM_ID: i32 = 4219;
 
 /// What the recording holds before the subscription exists, and what is
@@ -299,6 +338,23 @@ fn replay_then_join(test_name: &str, replay_channel: &str, fragment_limit: usize
         "{test_name}: joined too early"
     );
 
+    // ★ **The witness, for the one channel that has one, before it is used.**
+    // A UDP replay channel is a receive endpoint the driver keeps a
+    // `rcv-channel` counter for; an IPC one has no counter at all (the file head
+    // says why). While the replay is running the subscription is there, and it is
+    // there where the assertion below will look — without this, that zero could
+    // be a matcher that matches nothing.
+    let counted = replay_channel.starts_with("aeron:udp");
+
+    if counted {
+        assert_eq!(
+            1,
+            receive_channels(&source.client, REPLAY_ALIAS_DYNAMIC_PORT),
+            "{test_name}: the driver is not holding the replay channel's counter, so \
+             the release below would be judged by nothing"
+        );
+    }
+
     // And now the live stream: the same publication, still open, on the stream
     // the recording was made from.
     for payload in LIVE {
@@ -337,6 +393,25 @@ fn replay_then_join(test_name: &str, replay_channel: &str, fragment_limit: usize
         .map(|payload| payload.to_vec())
         .collect();
     assert_eq!(expected, collector.messages, "{test_name}");
+
+    // ★ **The replay is finished with the moment this machine is live** — and
+    // the driver says so: the subscription the replay was read through is given
+    // back, and the archive is told to stop it (`state.rs`'s `attempt_switch`,
+    // the reference's `:2123-2131`). Until that was done, the endpoint stayed in
+    // the counters for the rest of the run.
+    //
+    // Bounded, because the endpoint goes back only after the image it carried has
+    // lingered out. Only the UDP channel has an endpoint to ask about.
+    if counted {
+        await_receive_channels(
+            &mut source.client,
+            &mut subscription,
+            &mut collector,
+            REPLAY_ALIAS_DYNAMIC_PORT,
+            0,
+            test_name,
+        );
+    }
 
     assert_eq!(1, joins.borrow().live_joined, "{test_name}");
     assert!(subscription.is_live(), "{test_name}");
@@ -593,6 +668,61 @@ fn a_subscription_can_start_from_live_with_nothing_to_replay() {
 }
 
 /// Why the subscription is where it is, for a failure message.
+/// How many `rcv-channel` counters the driver is holding for the endpoint an
+/// alias names.
+///
+/// The label is `"<name>: <the channel the client sent> <address>"`
+/// (`crates/driver/src/media/receive_endpoint.rs:618-625`), so an alias survives
+/// into it.
+fn receive_channels(client: &Client, alias: &str) -> usize {
+    let region = client.counters_reader().expect("a counters region");
+    let mut count = 0;
+
+    let _ = region.for_each(|descriptor| {
+        if channel_type_id::RECEIVE_CHANNEL_STATUS == descriptor.type_id
+            && descriptor.label.contains(alias)
+        {
+            count += 1;
+        }
+    });
+
+    count
+}
+
+/// Wait, bounded, for the driver to be holding `expected` counters for an alias.
+///
+/// ★ **Waited for, never read once**: an endpoint is given back only after the
+/// image it carried is done, which is a linger — measured between 2.6 s and
+/// 3.1 s on this machine.
+fn await_receive_channels(
+    client: &mut Client,
+    subscription: &mut PersistentSubscription,
+    collector: &mut Collector,
+    alias: &str,
+    expected: usize,
+    what: &str,
+) {
+    let deadline = Instant::now() + archive::DEADLINE;
+    let mut held = receive_channels(client, alias);
+
+    while held != expected {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the driver is still holding {held} rcv-channel counter(s) for \
+             {alias}, not {expected}"
+        );
+
+        // ★ **The machine has to keep being driven.** Its own client goes stale
+        // otherwise, and a driver that reaps a stale client takes that client's
+        // subscriptions back — which would satisfy this wait for the wrong
+        // reason, at about ten seconds.
+        subscription.controlled_poll(collector, 10);
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+        held = receive_channels(client, alias);
+    }
+}
+
 fn reason(
     subscription: &PersistentSubscription,
     joins: &std::rc::Rc<std::cell::RefCell<Joins>>,
