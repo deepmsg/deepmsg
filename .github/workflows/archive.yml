@@ -1,0 +1,265 @@
+name: archive
+
+# The reference's own archive C suite, run against **this build's archive**.
+#
+# This is the LA-1 instrument `docs/roadmap.md` names: the reference's C client
+# against this build, case for case, and the table it publishes is what says
+# whether the archive here can stand in for the reference's.
+#
+# # Why it is a workflow of its own
+#
+# `ci.yml`'s three jobs are three-minute gates that every pull request pays for.
+# This one is about ten, and it is not a gate on the same thing: it needs a
+# reference checkout, a CMake build of the reference's own tests, and five
+# minutes of running them. As a fourth job there it would slow every pull request
+# down for a result about the archive; as a manual job (`interop.yml` is manual
+# because it takes twenty-one minutes) the red/green table would never be on a
+# pull request at all — which is the one thing this job is for.
+#
+# # What runs
+#
+# The nine archive binaries the reference's suite is made of, case by case
+# (`.github/scripts/archive-suite.py`, which also checks that the cases that ran
+# are the ones in `crates/archive/tests/reference-cases.tsv` — the committed
+# ledger is the denominator, so a binary that quietly lost a case is reported
+# rather than passed). The shim is configured by the runner, and the binaries
+# under test are `cargo build --bins`'s — not `cargo test`'s, which does not
+# rebuild them (a trap this repository has paid for three times).
+#
+# # ★ A red case here is not necessarily a defect in this build — and four are
+#
+# The reference is checked out at its **released tag**, with none of the local
+# test-side fixes a development machine carries. Measured on the development
+# machine by holding those fixes out (`analysis/archive/deepmsg-p2-9d-plan-ci.md`
+# §4): **302 passed, 4 failed**, and the four are the same four the fixes are for —
+# the persistent-subscription suite's drop waits race the flood that is meant to
+# over-run them, on a driver whose over-run gate follows the subscriber's *read*
+# position (`aeron_publication_image.c:983`):
+#
+#   * `AeronArchivePersistentSubscriptionTest.canFallbackToReplayAfterStartingFromLive`
+#   * `AeronArchivePersistentSubscriptionTest.cannotFallbackToReplayWhenRecordingHasBeenRemoved`
+#   * `AeronArchivePersistentSubscriptionTest.shouldDropFromLiveBackToReplayThenJoinLiveAgain`
+#   * `PersistentSubscriptionWrapperTest.shouldCycleThroughMultipleLiveReplayTransitions`
+#
+# ★ **And a fifth, which is this build's and is on CI only.** The first runs of
+# this job found `shouldRecoverFromArchiveRestartDuringReplay` failing with the
+# archive dead at start-up — `deepmsg-archive: the driver refused a subscription
+# to aeron:udp?endpoint=localhost:8010|sparse=true: the media driver has been shut
+# down` — and the test then timing out on `aeron_archive_connect`. The harness
+# starts a media driver and an archive back to back in the same aeron directory,
+# and this build's archive binary subscribes as soon as it finds the CnC file:
+# it reads the one the **previous** case left behind, is refused, and exits. The
+# reference's archive waits for a live driver there (its Aeron client waits on the
+# CnC's liveness), which is why this is a deviation here and not a flaky test. It
+# is recorded in the baseline below and is **not** a defect of the suite: it is
+# the first thing this job found, which is what it is for.
+#
+# They are shown exactly as they are, and the report is
+# `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`.
+#
+# ★ What that is **not** is a list of failures to ignore. The job asserts that the
+# failing set is **exactly** the recorded four: a fifth failure fails the job, and
+# so does one of the four starting to pass, because that would mean the baseline
+# moved and the note above is now wrong. What the four buy is a check that is
+# green when nothing has changed and red when anything has — not a check nobody
+# reads.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The exact reference commit the byte contracts were read from
+  # (`docs/reference.md`), and the tag `1.53.2` is that commit — the same
+  # checkout `interop.yml` makes, with the same assertion that the tag still is.
+  AERON_COMMIT: 664f58e705
+
+jobs:
+  archive-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A **sibling** clone, not `actions/checkout`: that action refuses a path
+      # outside the workspace, and `tests/src/driver.rs` hard-codes
+      # `../../aeron/...`. A shallow clone of the tag is the whole of it, and the
+      # prefix assertion is what keeps "the tag is the pinned commit" honest.
+      - name: Check out the reference at the pinned commit
+        working-directory: ${{ github.workspace }}/..
+        run: |
+          git clone --quiet --depth 1 --branch 1.53.2 \
+            https://github.com/aeron-io/aeron.git aeron
+          actual=$(git -C aeron rev-parse HEAD)
+          case "$actual" in
+            "$AERON_COMMIT"*) echo "reference at $actual (pinned $AERON_COMMIT)" ;;
+            *)
+              echo "::error::the 1.53.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
+              exit 1
+              ;;
+          esac
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --no-self-update
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build this build's binaries, and the shim the archive is replaced by
+        run: cargo build --bins
+
+      # Keyed on the reference commit, like `interop.yml`'s Gradle cache: the
+      # reference's tests are what is compiled here, and this build's binaries
+      # are found at run time (`target/debug/...`), so a change here does not
+      # invalidate it. The second component is a manual salt for the day the
+      # cache is suspected rather than the code.
+      - name: Cache the reference's archive test build
+        uses: actions/cache@v4
+        with:
+          path: ../aeron/cppbuild/archive-suite
+          key: aeron-${{ env.AERON_COMMIT }}-cppbuild-v1
+
+      - name: Configure and build the reference's archive tests
+        working-directory: ../aeron
+        run: |
+          cmake -B cppbuild/archive-suite -DCMAKE_BUILD_TYPE=Release \
+            -DAERON_TESTS=ON -DAERON_SYSTEM_TESTS=ON -DAERON_UNIT_TESTS=ON \
+            -DBUILD_AERON_ARCHIVE_API=ON \
+            -DJava_JAVA_EXECUTABLE="${{ github.workspace }}/target/debug/archive-shim"
+          cmake --build cppbuild/archive-suite -j "$(nproc)" --target \
+            aeron_archive_test \
+            aeron_archive_persistent_subscription_test \
+            aeron_archive_persistent_subscription_context_test \
+            aeron_archive_persistent_subscription_resilience_test \
+            aeron_archive_async_client_test \
+            aeron_archive_async_connect_leak_test \
+            archiveTestW persistentSubscriptionTestW persistentSubscriptionContextTestW
+
+      # `|| true` and not `continue-on-error`: the exit status is *checked*
+      # below, by the step that knows the recorded baseline. A non-zero exit for
+      # any other reason — the case set not matching the ledger, a class the shim
+      # did not recognise — is caught by that step too, because the table it
+      # reads is what those checks are about.
+      - name: Run the suite, case by case
+        run: |
+          set +e
+          mkdir -p archive-suite
+          .github/scripts/archive-suite.py ../aeron/cppbuild/archive-suite archive-suite.tsv \
+            --mode deepmsg \
+            --driver "${{ github.workspace }}/target/debug/deepmsg-driver" \
+            --archiving-media-driver "${{ github.workspace }}/target/debug/deepmsg-archiving-media-driver" \
+            --archive "${{ github.workspace }}/target/debug/deepmsg-archive" \
+            --log "${{ github.workspace }}/archive-suite/shim.log" \
+            --binary-timeout 2400
+          echo "the suite exited $?" | tee suite-exit.txt
+
+      # The table and the shim's log are the two things a red run is diagnosed
+      # from, and neither is in the job's log: the runner writes the first to a
+      # file, and the archive's own output goes through the shim into the second.
+      - name: Keep the table and the shim's log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-suite
+          path: |
+            archive-suite.tsv
+            archive-suite.tsv.d/
+            archive-suite/shim.log
+            suite-exit.txt
+            archive-suite-table.md
+          if-no-files-found: ignore
+
+      # ★ The baseline, pinned. The four are the reference's own drop-wait races
+      # (the header names them and `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`
+      # is the report); anything outside them is this build's.
+      - name: The failing set is the recorded one
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          RECORDED = {
+              # The reference's own drop-wait races, on its released tag.
+              "AeronArchivePersistentSubscriptionTest.canFallbackToReplayAfterStartingFromLive",
+              "AeronArchivePersistentSubscriptionTest.cannotFallbackToReplayWhenRecordingHasBeenRemoved",
+              "AeronArchivePersistentSubscriptionTest.shouldDropFromLiveBackToReplayThenJoinLiveAgain",
+              "PersistentSubscriptionWrapperTest.shouldCycleThroughMultipleLiveReplayTransitions",
+              # ★ This build's, and only on CI: the archive binary subscribes to a
+              # CnC a previous case left behind rather than waiting for a live
+              # driver. The header says so; the fix is its own piece.
+              "AeronArchivePersistentSubscriptionTest.shouldRecoverFromArchiveRestartDuringReplay",
+          }
+
+          path = Path("archive-suite.tsv")
+          if not path.exists():
+              raise SystemExit("the suite wrote no table; see the run above")
+
+          rows = [line.split("\t") for line in path.read_text().splitlines()[1:]]
+          ran = {case for case, _, _ in rows}
+          failed = {case for case, _, status in rows if status != "passed"}
+          print(f"{len(rows)} cases ran; {len(failed)} failed")
+
+          missing, extra = RECORDED - failed, failed - RECORDED
+          for case in sorted(extra):
+              print(f"::error::{case} failed, and it is not one of the recorded ones")
+          for case in sorted(missing):
+              print(f"::error::{case} now passes; the recorded baseline has moved, update it here")
+          if extra or missing:
+              raise SystemExit(1)
+          print("the recorded set is exactly the failing set; nothing else moved")
+          PY
+
+      # The acceptance for this job is the table itself, on the pull request, so
+      # it is rendered whether or not the run above passed.
+      # Written to a file, appended to the summary and printed: the summary is
+      # what a reader of the pull request sees, and the other two are what makes
+      # it checkable from the log and from the artifact.
+      - name: The table
+        if: always()
+        run: |
+          python3 - <<'PY' > archive-suite-table.md
+
+          from collections import Counter
+          from pathlib import Path
+
+          path = Path("archive-suite.tsv")
+          if not path.exists():
+              print("## The reference's archive C suite (LA-1)\n")
+              print("The suite did not get as far as writing a table.")
+              raise SystemExit(0)
+
+          rows = [line.rstrip("\n").split("\t") for line in path.read_text().splitlines()[1:]]
+          counts = Counter(status for _, _, status in rows)
+
+          print("## The reference's archive C suite against this build (LA-1)\n")
+          print(f"**{counts['passed']} passed / {counts['failed']} failed** of {len(rows)} cases.\n")
+
+          per_binary = Counter()
+          totals = Counter()
+          for _, binary, status in rows:
+              totals[binary] += 1
+              if status == "passed":
+                  per_binary[binary] += 1
+
+          print("| binary | passed | of |")
+          print("|---|---|---|")
+          for binary in sorted(totals):
+              print(f"| `{binary}` | {per_binary[binary]} | {totals[binary]} |")
+
+          failed = [(case, binary) for case, binary, status in rows if status != "passed"]
+          if failed:
+              print("\n### Failing cases\n")
+              for case, binary in failed:
+                  print(f"- `{binary}` — `{case}`")
+
+          print("\n<details><summary>every case</summary>\n")
+          print("| case | binary | status |")
+          print("|---|---|---|")
+          for case, binary, status in rows:
+              print(f"| `{case}` | `{binary}` | {status} |")
+          print("\n</details>")
+          PY
+          cat archive-suite-table.md | tee -a "$GITHUB_STEP_SUMMARY"
