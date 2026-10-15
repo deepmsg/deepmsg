@@ -1223,6 +1223,14 @@ impl SenderThread {
                 continue;
             }
 
+            // What this endpoint's transport has received — the status
+            // messages and NAKs the receivers answer with — counted here
+            // because this is the thread that read them (design §4.10, type
+            // 76).
+            endpoints[index]
+                .1
+                .count_received_packets(counters, regions, received);
+
             // Borrowed, not copied — the same nine-hundred-byte copy the
             // receiver had, on the sender's side of the same loop: once per
             // destination, per pass, for a batch the loop only reads.

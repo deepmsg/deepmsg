@@ -88,6 +88,11 @@ fn ttl_asymmetry(setup_ttl: i32, channel: &UdpChannel) -> bool {
 pub struct ReleasedDestination {
     /// The `rcv-local-sockaddr` counter it held.
     pub counter_id: i32,
+    /// The transport counter it held, or [`layout::NULL_COUNTER_ID`] when the
+    /// media publishes none. It travels back for the same reason the address
+    /// does: the conductor allocated it, and a counter left behind is one
+    /// nobody owns.
+    pub transport_counter_id: i32,
     /// The port the wildcard port manager held for it, or zero when the
     /// manager held none — a channel that named a port, or one the kernel
     /// chose (`aeron_port_manager.c:165-174`, where a zero is not a port).
@@ -978,6 +983,7 @@ impl ReceiverThread {
                                     .iter()
                                     .map(|(_, destination)| ReleasedDestination {
                                         counter_id: destination.local_sockaddr_counter_id(),
+                                        transport_counter_id: destination.transport_counter_id(),
                                         managed_port: destination.managed_port(),
                                     })
                                     .collect(),
@@ -1076,6 +1082,7 @@ impl ReceiverThread {
                             if let Some((id, destination)) = endpoint.remove_destination(&channel) {
                                 released = Some(ReleasedDestination {
                                     counter_id: destination.local_sockaddr_counter_id(),
+                                    transport_counter_id: destination.transport_counter_id(),
                                     managed_port: destination.managed_port(),
                                 });
                                 removed = Some(id);
@@ -1602,6 +1609,15 @@ impl ReceiverThread {
 
                 if received == 0 {
                     continue;
+                }
+
+                // What this transport has received, which is the one counter a
+                // reader can use to tell a channel that is quiet from one that
+                // is broken (design §4.10, type 76). Written here because this
+                // is the thread that read the datagrams: the media's own
+                // per-port count cannot answer *which* channel.
+                if let Some(entry) = endpoint.destination(destination) {
+                    entry.count_received_packets(counters, regions, received);
                 }
 
                 // Borrowed, not copied. This used to be `let batch = *datagrams;`

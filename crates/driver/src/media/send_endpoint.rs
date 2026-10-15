@@ -27,6 +27,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+use deepmsg_cnc::layout;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::position as counter_position;
@@ -139,6 +140,11 @@ pub struct SendChannelEndpoint {
     /// zero, and then the port the kernel chose is readable from nowhere else.
     /// A client that has to tell someone where to reply finds it here.
     local_sockaddr_counter_id: i32,
+    /// The DPDK media's `DPDK_TRANSPORT` (type 76): what this endpoint's
+    /// transport has received — the status messages and NAKs the receivers
+    /// answer with. [`layout::NULL_COUNTER_ID`] on the kernel's media, which
+    /// publishes no such counter.
+    transport_counter_id: i32,
     /// The port the wildcard port manager gave this endpoint, and zero when it
     /// gave none (`aeron_wildcard_port_manager_get_managed_port`,
     /// `aeron_port_manager.c:121-163`).
@@ -323,6 +329,13 @@ impl SendChannelEndpoint {
             }
         };
 
+        // What this transport will have received: the status messages and NAKs
+        // the receivers send back, which is the only traffic a send endpoint
+        // hears (design §4.10, type 76). The peer is the one it was connected
+        // to, which is the same address a send goes to.
+        let transport_counter_id =
+            bindings.transport_counter(&*transport, connect_to, counters, regions, now_ms);
+
         Ok(Self {
             current_data_addr: channel.remote_data,
             time_of_last_sm_ns: now_ns,
@@ -332,6 +345,7 @@ impl SendChannelEndpoint {
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            transport_counter_id,
             managed_port,
             publications: Vec::new(),
             socket_rcvbuf: params.socket_rcvbuf,
@@ -405,6 +419,9 @@ impl SendChannelEndpoint {
             destination_tracker,
             channel_status_counter_id,
             local_sockaddr_counter_id,
+            // A transport a caller built is the tests' seam and not the
+            // media's, so there is nothing this endpoint could count into.
+            transport_counter_id: layout::NULL_COUNTER_ID,
             // A transport a caller built was not bound by the manager, so
             // there is no port to give back — the tests' seam, and the one
             // place a zero here is not a kernel-chosen port.
@@ -418,6 +435,30 @@ impl SendChannelEndpoint {
     /// The channel-status counter a client reads.
     pub const fn channel_status_counter_id(&self) -> i32 {
         self.channel_status_counter_id
+    }
+
+    /// The counter that says what this endpoint's transport has received (type
+    /// 76), or [`layout::NULL_COUNTER_ID`] when the media publishes none.
+    pub const fn transport_counter_id(&self) -> i32 {
+        self.transport_counter_id
+    }
+
+    /// Count the datagrams one pass read off this endpoint's transport, which
+    /// on this side are the status messages and NAKs the receivers send back.
+    ///
+    /// The sender is the thread that read them (design §4.10, type 76).
+    pub fn count_received_packets(
+        &self,
+        counters: &CounterManager,
+        regions: &CounterRegions<'_>,
+        received: usize,
+    ) {
+        super::userspace::dpdk_counters::count_received_packets(
+            counters,
+            regions,
+            self.transport_counter_id,
+            received,
+        );
     }
 
     /// A status message arrived for one of this endpoint's publications, which
@@ -530,7 +571,9 @@ impl SendChannelEndpoint {
     /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:250-269`,
     /// which frees the channel status, the local sockaddr and the destination
     /// count, in that order). The answer is the channel status's, which is the
-    /// one callers act on.
+    /// one callers act on. The transport counter this media added goes back
+    /// beside them, for the same reason: a counter left behind is one nobody
+    /// owns.
     pub fn free_counter(
         &self,
         counters: &mut CounterManager,
@@ -539,6 +582,11 @@ impl SendChannelEndpoint {
     ) -> bool {
         let channel_status = counters.free(regions, self.channel_status_counter_id, now_ms);
         counters.free(regions, self.local_sockaddr_counter_id, now_ms);
+
+        if self.transport_counter_id != layout::NULL_COUNTER_ID {
+            counters.free(regions, self.transport_counter_id, now_ms);
+        }
+
         channel_status
     }
 
@@ -1093,6 +1141,97 @@ mod tests {
             "ten seconds after a status message is five seconds after one"
         );
         assert!(unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS + 1));
+    }
+
+    /// Every counter of type 76 in the regions, as a client reads them.
+    fn transport_counters(regions: &CounterRegions<'_>) -> Vec<deepmsg_cnc::CounterDescriptor> {
+        let mut found = Vec::new();
+
+        regions
+            .reader()
+            .for_each(|descriptor: &deepmsg_cnc::CounterDescriptor| {
+                if descriptor.type_id == crate::media::userspace::dpdk_counters::type_id::TRANSPORT
+                {
+                    found.push(descriptor.clone());
+                }
+            });
+
+        found
+    }
+
+    /// A send endpoint's transport is a transport like any other, and gets a
+    /// counter like any other: allocated where the socket is, labelled with
+    /// both ends, and given back where the endpoint's own counters go (design
+    /// §4.10, type 76).
+    ///
+    /// The value moves where the datagrams are read — on this side, the status
+    /// messages and NAKs the receivers answer with — and the counter is the
+    /// total rather than the last pass.
+    #[test]
+    fn a_transport_on_the_media_is_counted_and_given_back_with_the_endpoint() {
+        use crate::media::TransportBindings;
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{Clock, Stack, StackParams};
+        use std::net::Ipv4Addr;
+
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let wire = Wire::new();
+        let stack = Stack::over_a_fake_wire(
+            &wire,
+            Side::A,
+            StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+            Clock::Monotonic,
+        );
+        let bindings = TransportBindings::Userspace(stack);
+
+        let endpoint = SendChannelEndpoint::create(
+            channel("aeron:udp?endpoint=10.10.0.2:40500"),
+            &mut ports(),
+            &bindings,
+            &TransportParams::default(),
+            &mut counters,
+            &regions,
+            7,
+            true,
+            1_000,
+            TIMEOUT_START_NS,
+        )
+        .expect("an endpoint");
+
+        let counter_id = endpoint.transport_counter_id();
+        assert_ne!(
+            layout::NULL_COUNTER_ID,
+            counter_id,
+            "the media the driver is configured for publishes one"
+        );
+
+        let published = transport_counters(&regions);
+        assert_eq!(1, published.len(), "one per transport");
+
+        let label = &published[0].label;
+        assert!(
+            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:40500"),
+            "the label names the wildcard the endpoint bound and the peer it \
+             was connected to: {label}"
+        );
+
+        endpoint.count_received_packets(&counters, &regions, 2);
+        endpoint.count_received_packets(&counters, &regions, 3);
+        assert_eq!(
+            Some(5),
+            counters.value(&regions, counter_id),
+            "the counter is the total, one batch at a time"
+        );
+
+        // And it goes back with the endpoint, where the reference hands its
+        // counters over: a counter left behind is one nobody owns.
+        endpoint.free_counter(&mut counters, &regions, 2_000);
+        assert!(
+            transport_counters(&regions).is_empty(),
+            "the transport counter went back with the rest"
+        );
     }
 
     /// The answer to a re-resolution reaches a **unicast** endpoint by

@@ -34,6 +34,9 @@ use super::poller::{MediaPoller, TransportPoller};
 use super::udp_transport::{OpenError, UdpTransport};
 use super::userspace::stack::{Stack, ThreadQueues};
 use super::userspace::transport::UserspaceTransport;
+use deepmsg_cnc::layout;
+use deepmsg_cnc::{CounterManager, CounterRegions};
+
 use super::{Transport, TransportParams};
 use crate::config::IdleStrategySetting;
 use crate::idle::Strategy;
@@ -333,6 +336,43 @@ impl TransportBindings {
             stack.params().address,
             stack.params().prefix_length
         ))
+    }
+
+    /// The counter that says what one transport has received (design §4.10,
+    /// type 76), or [`layout::NULL_COUNTER_ID`] for a media that publishes none.
+    ///
+    /// The type is the DPDK media's own — 75 to 95 are
+    /// (`aeron-client/src/main/c/aeron_counters.h:155-173`) — and a driver whose
+    /// data paths are the kernel's has no such counter, which is why the answer
+    /// there is the null id rather than a counter nobody would read: what a
+    /// kernel transport has received is already counted by the reference's own
+    /// `rcv-local-sockaddr` and the channel status beside it.
+    ///
+    /// `local` is the address the transport is **bound** to, which is why this
+    /// is asked after the bind: a channel that named port zero has no other
+    /// place to say which port it got. A transport whose address cannot be read
+    /// gets no counter and no complaint — one diagnostic number is not worth
+    /// refusing a channel that is otherwise up.
+    pub fn transport_counter(
+        &self,
+        transport: &dyn Transport,
+        peer: Option<SocketAddr>,
+        manager: &mut CounterManager,
+        regions: &CounterRegions<'_>,
+        now_ms: i64,
+    ) -> i32 {
+        let Self::Userspace(_) = self else {
+            return layout::NULL_COUNTER_ID;
+        };
+
+        let Ok(local) = transport.local_address() else {
+            return layout::NULL_COUNTER_ID;
+        };
+
+        super::userspace::dpdk_counters::allocate_transport_counter(
+            manager, regions, local, peer, now_ms,
+        )
+        .unwrap_or(layout::NULL_COUNTER_ID)
     }
 
     /// The line a driver on this media owes an operator when one of its two

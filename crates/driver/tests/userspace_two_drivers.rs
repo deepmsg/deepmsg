@@ -125,6 +125,24 @@ impl Machine {
     }
 }
 
+/// The media's per-transport counters, as a client reads them out of the CnC
+/// file: one per transport, whose value is what that transport has received
+/// (design §4.10, type 76).
+fn transport_counters(dir: &std::path::Path) -> Vec<deepmsg_cnc::CounterDescriptor> {
+    let reader = CncFile::try_open(dir).expect("the file is published");
+    let counters = reader.counters().expect("the counter regions");
+    let mut found = Vec::new();
+
+    counters.for_each(|descriptor| {
+        if descriptor.type_id == deepmsg_driver::media::userspace::dpdk_counters::type_id::TRANSPORT
+        {
+            found.push(descriptor.clone());
+        }
+    });
+
+    found
+}
+
 /// Subscribe on one machine and publish on the other, and see the message
 /// arrive.
 #[test]
@@ -216,6 +234,12 @@ fn a_message_crosses_from_one_machines_stack_to_the_others() {
     let received = subscriber.join().expect("the subscriber's thread");
     let offered = publisher.join().expect("the publisher's thread");
 
+    // What each machine's transport received, read the way a client reads it —
+    // before the drivers are closed, because the counters belong to the CnC
+    // file they are written in.
+    let alice_transports = transport_counters(&alice_machine.dir.0);
+    let bob_transports = transport_counters(&bob_machine.dir.0);
+
     alice_machine.close();
     bob_machine.close();
 
@@ -230,5 +254,31 @@ fn a_message_crosses_from_one_machines_stack_to_the_others() {
     assert!(
         wire.carried(Side::A) > 0 && wire.carried(Side::B) > 0,
         "both directions were used"
+    );
+
+    // Each machine's transport is a counter of its own, and both of them moved
+    // (design §4.10, type 76). This is the pair the per-port counts cannot
+    // give: the subscriber's socket received the `SETUP` and the data, and the
+    // publisher's received the `SETUP` that told it where to send — which is
+    // what makes the message cross at all.
+    assert_eq!(
+        1,
+        bob_transports.len(),
+        "one transport for the subscription"
+    );
+    assert!(
+        bob_transports[0].value > 0,
+        "the subscriber's socket received frames: {:?}",
+        bob_transports[0].label
+    );
+    assert_eq!(
+        1,
+        alice_transports.len(),
+        "one transport for the publication"
+    );
+    assert!(
+        alice_transports[0].value > 0,
+        "and the publisher heard the other end's setup: {:?}",
+        alice_transports[0].label
     );
 }

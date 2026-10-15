@@ -27,13 +27,15 @@
 //! # The counters this can and cannot check
 //!
 //! The design's T4 asks for the message to arrive *and* for both drivers'
-//! counters 76 and 84 to be non-zero. The second half cannot be met yet and
-//! the test does not pretend otherwise: 76 is one per transport and nothing
-//! allocates it, and 84 is one of the media's own counters, which are built
-//! (`dpdk_counters.rs`) but not yet owned by anything that samples them. What
-//! is asserted instead is what today's driver does publish and what says the
-//! same thing about the frames: the **bytes sent by one driver and received by
-//! the other**, out of the CnC file each of them wrote.
+//! counters 76 and 84 to be non-zero. **76 is asserted here** — one per
+//! transport, written by the thread that reads the socket, so a real port and a
+//! real receive path are the only way to move it — and so are 75, 82, 83 and
+//! 91, out of the CnC file each driver wrote. **84 is not, and that is a
+//! correction to the design rather than a gap**: it is `rte_eth_stats.imissed`,
+//! what the *device* dropped, which is zero in a healthy run and moves only
+//! when a port is overrun. A message crossing cannot make it non-zero, so the
+//! test asserts it is readable and leaves the number to a pressure test (the
+//! D4 record's §「7c 的更正」).
 
 #![cfg(feature = "dpdk")]
 
@@ -237,12 +239,24 @@ impl Drop for TempDir {
 /// reference's own table names (`aeron-client/src/main/c/aeron_counters.h`), and
 /// it is also what tells one of a media's counters from a driver's.
 fn media_counter(cnc: &CncFile, type_id: i32) -> Option<i64> {
-    let mut found = None;
-    cnc.counters()?.for_each(|descriptor| {
-        if descriptor.type_id == type_id {
-            found = Some(descriptor.value);
-        }
-    });
+    media_counters(cnc, type_id)
+        .last()
+        .map(|counter| counter.value)
+}
+
+/// Every counter of a type, which is what a type that is *one per* something
+/// has to be read as: two transports are two counters, and asking for "the"
+/// one of them is asking the wrong question.
+fn media_counters(cnc: &CncFile, type_id: i32) -> Vec<deepmsg_cnc::CounterDescriptor> {
+    let mut found = Vec::new();
+
+    if let Some(counters) = cnc.counters() {
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == type_id {
+                found.push(descriptor.clone());
+            }
+        });
+    }
 
     found
 }
@@ -426,8 +440,8 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
 
     // What the two drivers published about the frames, which is what says the
     // media moved them rather than the message arriving by some other route:
-    // one driver's bytes sent, the other's bytes received. The design's own
-    // 76/84 pair cannot be checked yet — see the module note.
+    // one driver's bytes sent, the other's bytes received. The design's 76 is
+    // asserted below; 84 is not, and the module note says why.
     assert!(
         counter(&alice_cnc, id::BYTES_SENT) > 0,
         "the first driver sent no bytes through its port"
@@ -468,7 +482,41 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
             media_counter(cnc, type_id::MEMPOOL_AVAILABLE).is_some_and(|free| free > 0),
             "{name}'s pool has frames to give"
         );
+
+        // 84 is read, not asserted to be non-zero: it counts what the **device**
+        // dropped, which is zero in a healthy run and moves only when a port is
+        // overrun (the D4 record's correction to the design's T4).
+        assert!(
+            media_counter(cnc, type_id::MISSED_PACKETS).is_some(),
+            "{name}'s missed-packet counter is published"
+        );
     }
+
+    // 76, one per transport, written by the thread that reads the socket: the
+    // receiver's transport took the frames off the port, and the sender's took
+    // the `SETUP` that told it where to send. This is the counter the design
+    // asks for by name — "one per transport, the value is what it received" —
+    // and it is the only one here whose value a *thread* moves rather than a
+    // timer.
+    for (name, cnc) in [("the sender", &alice_cnc), ("the receiver", &bob_cnc)] {
+        assert!(
+            media_counter(cnc, type_id::TRANSPORT).is_some_and(|received| received > 0),
+            "{name}'s transport counted the frames it received"
+        );
+    }
+
+    // And one apiece: a second transport on either side would be a second
+    // counter, which is what the type means.
+    assert_eq!(
+        1,
+        media_counters(&alice_cnc, type_id::TRANSPORT).len(),
+        "one transport for the publication"
+    );
+    assert_eq!(
+        1,
+        media_counters(&bob_cnc, type_id::TRANSPORT).len(),
+        "one transport for the subscription"
+    );
 
     assert!(
         alice.is_running() && bob.is_running(),

@@ -462,6 +462,26 @@ are this repo's own for the same reason. Three differences are load-bearing
 enough to write down, and all three are departures from the reference's
 *behaviour* rather than from its bytes.
 
+**What does not depart is the counter ids, and that is the point of them.** The
+DPDK media's counters are the reference's own type ids — 75 to 95, with **80 and
+81 unassigned** (`aeron-client/src/main/c/aeron_counters.h:155-173`) — because a
+counter is found by its type and a client that knows the reference's catalogue
+has to find these the same way. This build publishes every one of them except
+92 `EXTENDED_STATS`, which is one counter per hardware register and is deferred
+(the design's D6); 76 `DPDK_TRANSPORT` is one per *transport*, which is the one
+counter here that a thread rather than the conductor's timer moves. The
+**labels** are this repo's own, as the setting names are: the reference's are
+Premium's and not visible, so a label is written from what this build knows —
+the port it drives, the address a transport is bound to, both ends of it. A
+reader that needs the counters finds them by type id and reads the labels as
+prose, which is the most that can be promised. Pinned by
+`crates/driver/src/media/userspace/dpdk_counters.rs::a_counter_a_media_allocates_is_a_counter_a_client_reads`
+and `::the_deferred_type_is_not_allocated` (the ids, and the two that are not
+allocated), `::a_transports_counter_names_it_and_counts_into_itself` (the
+per-transport type and its label), and, off a real port, by
+`crates/driver/tests/dpdk_two_drivers.rs::a_message_crosses_between_two_drivers_on_a_dpdk_port`
+(75, 76, 82, 83, 84 and 91 read out of each driver's own CnC file).
+
 **A channel runs on the media that holds its local side, and falls back to the
 kernel when that is not the DPDK port.** The reference has one media, so no
 channel ever had to be assigned to one; this build has two, and the key is the

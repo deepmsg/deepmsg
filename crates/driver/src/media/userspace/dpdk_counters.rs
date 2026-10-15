@@ -43,7 +43,7 @@
 //! reads per queue. It is one per port here, which is the level a drop rate is
 //! read at, and the deviation is in the D4 record.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use deepmsg_cnc::layout;
@@ -172,6 +172,90 @@ impl PortIdentity<'_> {
         let _ = what;
         *b"port"
     }
+}
+
+/// Allocate the counter that says what one transport has received — type 76,
+/// one per transport rather than one per port (design §4.10).
+///
+/// A per-port count cannot answer the question a quiet driver raises: *which*
+/// channel is quiet. The transport is the thing a channel's socket is, so the
+/// label names the address it is bound to and, where there is one, the peer it
+/// was connected to — a wildcard bind keeps its wildcard and its chosen port,
+/// which is the same reason the reference writes a local-address counter at all
+/// (`crate::position`).
+///
+/// **The value is written by the thread that owns the transport**, one datagram
+/// batch at a time ([`count_received_packets`]), and not by the conductor's
+/// timer: it moves every time something arrives, and the thread receiving it is
+/// the one that knows. That is also why this is allocated where the transport is
+/// opened rather than on the timer — the transport's life is the endpoint's, and
+/// so is its counter's.
+///
+/// # Errors
+///
+/// `None` when the manager has no room; nothing is left behind.
+pub fn allocate_transport_counter(
+    manager: &mut CounterManager,
+    regions: &CounterRegions<'_>,
+    local: SocketAddr,
+    peer: Option<SocketAddr>,
+    now_ms: i64,
+) -> Option<i32> {
+    let label = transport_label(local, peer);
+
+    manager.allocate(
+        regions,
+        type_id::TRANSPORT,
+        &transport_key(local, peer),
+        label.as_bytes(),
+        now_ms,
+    )
+}
+
+/// Add the datagrams one pass received to a transport's counter.
+///
+/// The counter **is** the total, read back and written again rather than kept in
+/// a second place that could drift — the same shape this media's own 79 is
+/// counted in, and safe because the thread that reads the transport is the only
+/// writer.
+///
+/// [`layout::NULL_COUNTER_ID`] is not a failure: it is a transport on the
+/// kernel's media, which publishes no 76, and there is nothing to count into.
+pub fn count_received_packets(
+    manager: &CounterManager,
+    regions: &CounterRegions<'_>,
+    counter_id: i32,
+    received: usize,
+) {
+    if counter_id == layout::NULL_COUNTER_ID {
+        return;
+    }
+
+    let total = manager.value(regions, counter_id).unwrap_or(0);
+    let received = i64::try_from(received).unwrap_or(i64::MAX);
+
+    let _ = manager.set_value(regions, counter_id, total.saturating_add(received));
+}
+
+/// What a transport's counter is called: the address it is bound to, and who it
+/// expects to hear from.
+///
+/// A transport that was not connected hears from anyone, and `*` says so rather
+/// than naming a peer it does not have — a subscription is the case, and one
+/// that never connects is the reference's own shape for it.
+fn transport_label(local: SocketAddr, peer: Option<SocketAddr>) -> String {
+    format!("dpdk transport: {local} -> {}", peer_or_any(peer))
+}
+
+/// The key, which is what tells two of these apart: the same two addresses as
+/// text, so a reader that finds a counter by its key is comparing what it knows
+/// against what the media bound.
+fn transport_key(local: SocketAddr, peer: Option<SocketAddr>) -> Vec<u8> {
+    format!("{local}->{}", peer_or_any(peer)).into_bytes()
+}
+
+fn peer_or_any(peer: Option<SocketAddr>) -> String {
+    peer.map_or_else(|| "*".to_owned(), |peer| peer.to_string())
 }
 
 /// What the device answered, in this module's own words.
@@ -682,5 +766,56 @@ mod tests {
             published(&regions, 80).is_empty() && published(&regions, 81).is_empty(),
             "80 and 81 are unassigned in the reference's catalogue"
         );
+    }
+
+    /// A transport's counter says which transport it is, and counts into
+    /// itself.
+    ///
+    /// 76 is the one counter here that belongs to a *transport* rather than to
+    /// the port, and it is the one whose value the media does not write: the
+    /// thread reading the socket adds to it ([`count_received_packets`]), one
+    /// pass at a time. Both halves are here because both are what a reader
+    /// outside the process sees.
+    #[test]
+    fn a_transports_counter_names_it_and_counts_into_itself() {
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+
+        let local = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 40456));
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 2), 40500));
+
+        let connected =
+            allocate_transport_counter(&mut manager, &regions, local, Some(peer), 1).expect("room");
+        let listening =
+            allocate_transport_counter(&mut manager, &regions, local, None, 1).expect("room");
+
+        let counters = published(&regions, type_id::TRANSPORT);
+        assert_eq!(2, counters.len(), "one per transport");
+        assert_eq!(
+            "dpdk transport: 10.10.0.1:40456 -> 10.10.0.2:40500",
+            counters[0].label
+        );
+        assert_eq!(
+            "dpdk transport: 10.10.0.1:40456 -> *", counters[1].label,
+            "a transport that was not connected hears from anyone, and says so"
+        );
+        assert_eq!(0, manager.value(&regions, connected).expect("a value"));
+        count_received_packets(&manager, &regions, connected, 3);
+        count_received_packets(&manager, &regions, connected, 4);
+        assert_eq!(
+            7,
+            manager.value(&regions, connected).expect("a value"),
+            "the counter is the total, not the last pass"
+        );
+        assert_eq!(
+            0,
+            manager.value(&regions, listening).expect("a value"),
+            "and one transport's traffic is not another's"
+        );
+
+        // The kernel's media publishes none, and says so with the null id
+        // rather than with a counter nobody would read.
+        count_received_packets(&manager, &regions, layout::NULL_COUNTER_ID, 5);
+        assert_eq!(2, published(&regions, type_id::TRANSPORT).len());
     }
 }

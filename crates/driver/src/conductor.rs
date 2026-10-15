@@ -1960,6 +1960,12 @@ impl Conductor {
             let _ = self
                 .counters
                 .free(&region, destination.counter_id, self.now_ms);
+
+            if destination.transport_counter_id != deepmsg_cnc::layout::NULL_COUNTER_ID {
+                let _ = self
+                    .counters
+                    .free(&region, destination.transport_counter_id, self.now_ms);
+            }
         }
 
         self.receive_endpoints
@@ -4615,6 +4621,22 @@ mod tests {
         out
     }
 
+    /// The media's per-transport counters (type 76), read the way a client
+    /// reads them — by opening the CnC file a second time.
+    fn transport_counters(dir: &std::path::Path) -> Vec<deepmsg_cnc::CounterDescriptor> {
+        let reader = CncFile::try_open(dir).expect("the file is published");
+        let counters = reader.counters().expect("the counter regions");
+        let mut found = Vec::new();
+
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == crate::media::userspace::dpdk_counters::type_id::TRANSPORT {
+                found.push(descriptor.clone());
+            }
+        });
+
+        found
+    }
+
     /// `ADD_COUNTER`'s wire form: the correlated head, the type id, and a key
     /// and label each with its own length and the key padded to four.
     fn add_counter_payload(
@@ -6898,6 +6920,94 @@ mod tests {
             text.contains("does not serve multicast"),
             "the client is told what the media cannot do: {text}"
         );
+    }
+
+    /// Every transport on the media gets a counter a client can read, and a
+    /// driver on the kernel's sockets gets none (design §4.10, type 76).
+    ///
+    /// This is the wiring the endpoints' own tests cannot reach: the counter is
+    /// allocated while a publication is being opened, on the conductor's
+    /// thread, and read back here the way a client reads it — a second opening
+    /// of the CnC file. What it buys is the one thing the media's per-port
+    /// counters cannot say: *which* channel is quiet.
+    #[test]
+    fn a_transport_on_the_media_is_readable_as_a_counter_of_its_own() {
+        use crate::media::TransportBindings;
+        use crate::media::userspace::fake_port::{Side, Wire};
+        use crate::media::userspace::stack::{Clock, StackParams};
+        use std::net::Ipv4Addr;
+
+        let temp = TempDir::new();
+        let mut config = publication_config(&temp.0);
+
+        let wire = Wire::new();
+        config.transport_bindings =
+            TransportBindings::Userspace(crate::media::userspace::stack::Stack::over_a_fake_wire(
+                &wire,
+                Side::A,
+                StackParams::new(Ipv4Addr::new(10, 10, 0, 1), 24, [0x02, 0, 0, 0, 0, 0x01]),
+                Clock::Monotonic,
+            ));
+
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:40500"),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_PUBLICATION_READY_TYPE_ID,
+        );
+
+        let transports = transport_counters(&temp.0);
+        assert_eq!(1, transports.len(), "one transport, one counter");
+
+        let label = &transports[0].label;
+        assert!(
+            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:40500"),
+            "the label names where the endpoint is bound and who it was \
+             connected to: {label}"
+        );
+        assert_eq!(
+            0, transports[0].value,
+            "a publication that has not been answered has received nothing"
+        );
+
+        // And a driver whose data paths are the kernel's publishes none of
+        // them: the type is the media's, and this is the media that has it.
+        let kernel = TempDir::new();
+        let config = publication_config(&kernel.0);
+        let cnc = create(&kernel.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+
+        send(
+            &conductor,
+            ADD_PUBLICATION_TYPE_ID,
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=localhost:40500"),
+        );
+
+        for _ in 0..8 {
+            conductor.do_work();
+        }
+
+        let reader = CncFile::try_open(&kernel.0).expect("the file is published");
+        let counters = reader.counters().expect("the counter regions");
+        let mut found = 0;
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == crate::media::userspace::dpdk_counters::type_id::TRANSPORT {
+                found += 1;
+            }
+        });
+
+        assert_eq!(0, found, "the kernel's media has no such counter");
     }
 
     /// A publication the media cannot carry is refused where it is opened
