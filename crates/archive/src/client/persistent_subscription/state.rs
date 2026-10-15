@@ -1914,54 +1914,79 @@ impl PersistentSubscription {
             return 0;
         };
 
+        // **The replay is finished with the moment this machine is live**, and
+        // the two things that says are done at the end of this call rather than
+        // here: the replay is stopped and its subscription given back
+        // (`:2123-2131`). The short path does not return early for that reason —
+        // the reference's falls through to the same guard — and the two paths
+        // differ only in what they had to do first.
+        let mut fragments = 0;
+
         if replay_position == live_position {
             self.position = replay_position;
             self.set_join_difference(0);
             self.transition(State::Live);
-            self.on_live_joined();
-
-            return 1;
         }
+        // The live stream ran ahead, and the replay has to be walked up to where
+        // it takes over (`:1996-2058`): find the live position once, read the
+        // replay up to it, and stop there.
+        else {
+            // 1. Where the live stream takes over, once per alignment.
+            if NULL_VALUE == self.next_live_position {
+                let mut probe = LiveCatchup {
+                    replay_position,
+                    found: None,
+                };
 
-        // 1. Where the live stream takes over, once per alignment.
-        if NULL_VALUE == self.next_live_position {
-            let mut probe = LiveCatchup {
-                replay_position,
-                found: None,
+                if let Some(driver) = self.client.client_mut() {
+                    driver.poll_subscription_controlled(
+                        live_registration_id,
+                        fragment_limit,
+                        &mut probe,
+                    );
+                }
+
+                if let Some(next_live_position) = probe.found {
+                    self.next_live_position = next_live_position;
+                }
+            }
+
+            // 2. The replay reads up to it, and stops there.
+            let mut switch = ReplayCatchup {
+                next_live_position: self.next_live_position,
+                arrived: false,
+                handler,
             };
 
-            if let Some(driver) = self.client.client_mut() {
-                driver.poll_subscription_controlled(
-                    live_registration_id,
+            fragments = match self.client.client_mut() {
+                Some(driver) => driver.poll_subscription_controlled(
+                    replay_registration_id,
                     fragment_limit,
-                    &mut probe,
-                );
-            }
+                    &mut switch,
+                ),
+                None => 0,
+            };
 
-            if let Some(next_live_position) = probe.found {
-                self.next_live_position = next_live_position;
+            if switch.arrived {
+                self.position = self.next_live_position;
+                self.transition(State::Live);
             }
         }
 
-        // 2. The replay reads up to it, and stops there.
-        let mut switch = ReplayCatchup {
-            next_live_position: self.next_live_position,
-            arrived: false,
-            handler,
-        };
+        // ★ **`:2123-2131`.** Being live is the end of the replay — so the
+        // archive is told to **stop** it and the subscription it was read
+        // through is **given back**, and the order is the reference's: both
+        // before the application is told it is live.
+        //
+        // Until this was here, a machine that had switched to live was still
+        // holding a subscription against the archive's replay publication and
+        // the archive was still replaying into it, for as long as the
+        // subscription lived — measured: the replay channel's receive endpoint
+        // stayed in the driver's counters from the switch to the end of the run.
+        if self.is_live() {
+            self.clean_up_replay();
+            self.clean_up_replay_subscription();
 
-        let fragments = match self.client.client_mut() {
-            Some(driver) => driver.poll_subscription_controlled(
-                replay_registration_id,
-                fragment_limit,
-                &mut switch,
-            ),
-            None => 0,
-        };
-
-        if switch.arrived {
-            self.position = self.next_live_position;
-            self.transition(State::Live);
             self.on_live_joined();
         }
 
