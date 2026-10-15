@@ -339,18 +339,6 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
         "the catalog is not forced to disk on a level",
     ),
     (
-        settings::CONDUCTOR_CYCLE_THRESHOLD,
-        "the cycle-time counters and their thresholds are P2-9b's",
-    ),
-    (
-        settings::RECORDER_CYCLE_THRESHOLD,
-        "the same, for the recorder's",
-    ),
-    (
-        settings::REPLAYER_CYCLE_THRESHOLD,
-        "the same, for the replayer's",
-    ),
-    (
         settings::IDLE_STRATEGY,
         "P2-9a: this build's archive does not run agents of its own to idle",
     ),
@@ -393,6 +381,10 @@ const MESSAGE_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
 /// `AeronArchive.Configuration.MESSAGE_RETRY_ATTEMPTS_DEFAULT` (`:2692`), which
 /// is what [`crate::server::response_proxy::SEND_ATTEMPTS`] already is.
 const MESSAGE_RETRY_ATTEMPTS_DEFAULT: usize = 3;
+
+/// The reference's default for all three cycle thresholds
+/// (`Archive.java:548`, `:560`, `:572`).
+const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
 
 /// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`:633`).
 const ERROR_BUFFER_LENGTH_DEFAULT: usize = 1024 * 1024;
@@ -535,6 +527,16 @@ pub struct ArchiveConfig {
     pub message_retry_attempts: usize,
     /// The mark file's error buffer (`Archive.java:633`, 1 MiB).
     pub error_buffer_length: usize,
+    /// How long one turn of the conductor's may take before it is counted as
+    /// over the threshold (`Archive.java:548`, 100 ms). What this build's
+    /// archive already is — and now a name a deployment can set.
+    pub conductor_cycle_threshold_ns: i64,
+    /// The recorder's (`Archive.java:560`, 100 ms). Allocated and labelled,
+    /// never measured in this build: the reference measures it only from
+    /// `DedicatedModeArchiveConductor` (`:191`) and this build runs `SHARED`.
+    pub recorder_cycle_threshold_ns: i64,
+    /// The replayer's (`Archive.java:572`, 100 ms), for the same reason.
+    pub replayer_cycle_threshold_ns: i64,
     /// The size a catalog **starts** at (`Archive.java:487`,
     /// `Catalog.DEFAULT_CAPACITY`); it grows as records are added, so this is
     /// where the file begins rather than how large it may become.
@@ -789,6 +791,21 @@ impl ArchiveConfig {
             .unwrap_or(ERROR_BUFFER_LENGTH_DEFAULT),
             catalog_capacity: size(get(settings::CATALOG_CAPACITY), settings::CATALOG_CAPACITY)?
                 .unwrap_or(CATALOG_CAPACITY_DEFAULT),
+            conductor_cycle_threshold_ns: duration(
+                get(settings::CONDUCTOR_CYCLE_THRESHOLD),
+                settings::CONDUCTOR_CYCLE_THRESHOLD,
+            )?
+            .unwrap_or(CYCLE_THRESHOLD_DEFAULT_NS),
+            recorder_cycle_threshold_ns: duration(
+                get(settings::RECORDER_CYCLE_THRESHOLD),
+                settings::RECORDER_CYCLE_THRESHOLD,
+            )?
+            .unwrap_or(CYCLE_THRESHOLD_DEFAULT_NS),
+            replayer_cycle_threshold_ns: duration(
+                get(settings::REPLAYER_CYCLE_THRESHOLD),
+                settings::REPLAYER_CYCLE_THRESHOLD,
+            )?
+            .unwrap_or(CYCLE_THRESHOLD_DEFAULT_NS),
         })
     }
 
@@ -1359,6 +1376,12 @@ mod tests {
             (settings::MESSAGE_RETRY_ATTEMPTS, "5"),
             (settings::ERROR_BUFFER_LENGTH, "2m"),
             (settings::CATALOG_CAPACITY, "2m"),
+            // P2-9b: the three thresholds used to be names this build accepted
+            // and did nothing with; they now set what the 104 counters are
+            // measured against.
+            (settings::CONDUCTOR_CYCLE_THRESHOLD, "5ms"),
+            (settings::RECORDER_CYCLE_THRESHOLD, "7ms"),
+            (settings::REPLAYER_CYCLE_THRESHOLD, "9ms"),
         ];
 
         // (name, a value) — the one the reference has that this build refuses
