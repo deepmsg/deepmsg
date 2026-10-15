@@ -19,9 +19,21 @@
 //! # our driver's binary has to be the one with the media in it
 //! cargo build --bins --features dpdk
 //! sudo -E env PATH="$PATH" RUSTUP_HOME=~/.rustup CARGO_HOME=~/.cargo \
+//!     DEEPMSG_REF_AERONMD=…/aeron-ref-664f58e705/cppbuild/Release/binaries/aeronmd \
+//!     DEEPMSG_REF_BASICSUBSCRIBER=…/cppbuild/Samples/binaries/BasicSubscriber \
+//!     DEEPMSG_REF_BASICPUBLISHER=…/cppbuild/Samples/binaries/BasicPublisher \
+//!     DEEPMSG_REF_RESPONSE_CLIENT=…/cppbuild/Samples/binaries/response_client \
+//!     DEEPMSG_REF_RESPONSE_SERVER=…/cppbuild/Samples/binaries/response_server \
 //!     cargo test -p deepmsg-tests --features interop,dpdk \
-//!     --test dpdk_cross_media -- --ignored --nocapture
+//!     --test dpdk_cross_media -- --ignored --nocapture --test-threads=1
+//! # and back: the address goes with the binding, or the default suite goes red
+//! sudo ip addr del 10.10.0.2/24 dev enp3s0f0 && sudo ip link set enp3s0f0 down
+//! sudo dpdk-devbind.py --bind=ixgbe 0000:01:00.0 0000:01:00.1
 //! ```
+//!
+//! **One case at a time, and not as a preference**: a port bound to a driver is
+//! that driver's alone, so two cases running at once are two drivers wanting one
+//! port. `--test-threads=1` is load-bearing here, not tidiness.
 //!
 //! `0000:01:00.0` is the old X540, whose two functions share an IOMMU group, so
 //! both are bound and one is named to the EAL; `0000:03:00.0` stays on the
@@ -76,6 +88,17 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// between two ports DPDK has just started takes about twenty seconds to come
 /// up (measured for T4), and nothing crosses until both ends are up.
 const CROSSING_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a capture is given, once it says it is listening and once the
+/// traffic is over, before the case goes on.
+///
+/// Both halves are measurements rather than caution, and both were failures
+/// first: traffic that begins within milliseconds of the readiness line is lost,
+/// and a capture stopped 40 ms after its exchange is empty where the same case
+/// stopped 140 ms after it is not. One second sits between what was measured to
+/// fail and what was measured to work; it is paid twice per ARP case, by a file
+/// that is run by hand.
+const CAPTURE_SETTLES: Duration = Duration::from_secs(1);
 
 fn variable(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -155,35 +178,129 @@ fn media_counters(cnc: &CncFile, type_id: i32) -> Vec<i64> {
 /// Text rather than a capture file: what this is evidence *of* is that ARP
 /// crossed in both directions, and `tcpdump -e` writes exactly the sentences
 /// that say so.
+///
+/// # It is a process, and each of its waits was a wrong answer first
+///
+/// Three times this type turned an exchange that crossed into "nothing
+/// crossed", each in a different way. What it does now is what those
+/// measurements leave standing:
+///
+/// * **The output goes to files, not pipes.** The readiness line is on
+///   *stderr*, so a case that waits for it on *stdout* waits for ever — and a
+///   case blocked inside the capture reports nothing at all, not a failure.
+/// * **Readiness is waited for, and then waited out.** The readiness line comes
+///   before the capture filter is installed, so what crosses in that moment is
+///   not the socket's to keep. Measured: with the traffic starting within
+///   milliseconds of that line — every case of two runs — the capture came back
+///   holding nothing, while the same exchanges, in a capture that had been
+///   running for seconds, were in the file.
+/// * **It is given time to catch up before it is read.** The capture drains a
+///   kernel ring; what it has not been scheduled to drain is not in the file
+///   yet, and stopping it there loses evidence rather than collecting it.
+///   Measured: a case stopped 40 ms after its exchange captured nothing where
+///   the same case stopped 140 ms after its had it.
 struct ArpCapture {
     child: std::process::Child,
+    /// Where its capture goes, and where its complaints go.
+    ///
+    /// **Files and not pipes, and that is the whole design of this type.**
+    /// A file can be read at leisure and blocks nobody meanwhile.
+    path: std::path::PathBuf,
 }
 
 impl ArpCapture {
     /// Start watching `interface`, or [`None`] when there is no `tcpdump` to
     /// run — the same "announce and carry on" a missing sample gets.
     fn start(interface: &str) -> Option<Self> {
-        let child = std::process::Command::new("tcpdump")
-            .args(["-i", interface, "-n", "-e", "-l", "arp"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+        let path = std::env::temp_dir().join(format!(
+            "deepmsg-arp-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        let log = std::fs::File::create(&path).ok()?;
+        // **Its complaints go to a file too, and the file is read back.** A
+        // capture whose `stderr` is `/dev/null` cannot be told from a capture
+        // that died on start-up: both hand back an empty file, and an empty file
+        // reads exactly like "nothing crossed" — the same confusion as "no media
+        // selected" reading like "the media carried it".
+        let errors = path.with_extension("err");
+        let log_of_errors = std::fs::File::create(&errors).ok()?;
+
+        let mut child = std::process::Command::new("tcpdump")
+            .args(["-i", interface, "-n", "-e", "-l", "-U", "arp"])
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_of_errors))
             .spawn()
             .ok()?;
 
-        // It has to be listening before the first frame goes out, and `tcpdump`
-        // says so on its stdout — but it says so *unbuffered* only with `-l`,
-        // which is why that flag is there.
-        std::thread::sleep(Duration::from_millis(300));
+        // Readiness is watched for, and then waited out — see the note on this
+        // type for what each half is for.
+        let began = Instant::now();
+        loop {
+            let said = std::fs::read_to_string(&errors).unwrap_or_default();
 
-        Some(Self { child })
+            if said.contains("listening on") {
+                break;
+            }
+
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("tcpdump left before it was listening on {interface} ({status}): {said}");
+            }
+
+            assert!(
+                began.elapsed() < READY_TIMEOUT,
+                "tcpdump never said it was listening on {interface}: {said}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        std::thread::sleep(CAPTURE_SETTLES);
+
+        Some(Self { child, path })
     }
 
-    /// Stop watching and hand back everything it saw.
+    /// Stop watching and hand back everything it saw, with what it said about
+    /// itself appended when there is anything to say.
     fn lines(mut self) -> String {
-        let _ = self.child.kill();
-        let output = self.child.wait_with_output().expect("tcpdump's output");
+        // Let it catch up before it is stopped, and read it while it is still
+        // running: what has been drained is in the file, and stopping it is
+        // teardown — nothing about the evidence should depend on teardown.
+        std::thread::sleep(CAPTURE_SETTLES);
 
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        let seen = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let said = std::fs::read_to_string(self.path.with_extension("err")).unwrap_or_default();
+
+        // **Did it leave on its own?** A capture that exited is not a quiet
+        // wire, and `kill` on a child that is already gone hides that.
+        let fate = match self.child.try_wait() {
+            Ok(Some(status)) => format!("tcpdump left on its own: {status}"),
+            Ok(None) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                String::new()
+            }
+            Err(excuse) => format!("tcpdump's status could not be read: {excuse}"),
+        };
+
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("err"));
+
+        // **A capture that died says so.** A `tcpdump` that never attached and
+        // a quiet wire produce the same empty file, so its complaints are
+        // carried back into whatever the caller asserts — a case that fails on
+        // this says *which* of the two it was.
+        let mut text = seen;
+        if !said.trim().is_empty() {
+            text.push_str(&format!("\n=== and tcpdump itself said:\n{said}"));
+        }
+        if !fate.is_empty() {
+            text.push_str(&format!("\n=== {fate}"));
+        }
+
+        text
     }
 }
 
@@ -196,9 +313,14 @@ impl ArpCapture {
 /// second run of the publishing case captured an empty file for exactly that
 /// reason.
 fn forget_the_kernels_neighbour(address: &str, interface: &str) {
-    let _ = std::process::Command::new("ip")
+    let flushed = std::process::Command::new("ip")
         .args(["neigh", "flush", address, "dev", interface])
         .status();
+
+    assert!(
+        flushed.as_ref().is_ok_and(|status| status.success()),
+        "the kernel's entry for {address} on {interface} could not be forgotten: {flushed:?}"
+    );
 }
 
 /// `address` was asked for on the wire and answered.
@@ -429,10 +551,6 @@ fn our_driver_subscribes_across_a_real_port_from_the_reference() {
         .await_cnc(READY_TIMEOUT)
         .expect("this driver publishes a CnC file");
 
-    let interface = variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT);
-    forget_the_kernels_neighbour(OWN, &interface);
-    let arp = ArpCapture::start(&interface);
-
     // Our subscription binds our own address, which is the port's: nothing on
     // the kernel has it, so the media is the only thing that can serve it. The
     // client lives on the thread, which is the shape every other subscription
@@ -466,6 +584,18 @@ fn our_driver_subscribes_across_a_real_port_from_the_reference() {
     let _reference_cnc = reference
         .await_cnc(READY_TIMEOUT)
         .expect("the reference driver publishes a CnC file");
+
+    // **Forget the kernel's neighbour entry, then watch — in that order and no
+    // other.** A stale entry is a *correct* one here (this driver's address does
+    // not change), so the kernel sends to it without asking anybody, and a case
+    // that captured before the flush would see an empty file and call it a
+    // failure. Measured: it passed alone and failed in the whole file, because a
+    // previous case had already taught the kernel this address. The window
+    // between the two is now nothing but the far end's start-up, which is the
+    // first thing that can make the kernel speak.
+    let interface = variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT);
+    forget_the_kernels_neighbour(OWN, &interface);
+    let arp = ArpCapture::start(&interface);
 
     let publisher = samples::Sample::start(
         &publisher_binary,
@@ -764,7 +894,7 @@ fn a_frame_dropped_here_is_asked_for_again_over_the_port() {
                 client.poll_subscription(subscription, 10, |message| {
                     seen.lock()
                         .expect("the seen list")
-                        .push(String::from_utf8_lossy(&message.payload).into_owned());
+                        .push(String::from_utf8_lossy(message.payload).into_owned());
                 });
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -810,4 +940,212 @@ fn a_frame_dropped_here_is_asked_for_again_over_the_port() {
          receiver-naks-sent={naks:?} over {seen:?}\n=== this driver's log\n{}",
         own.log_tail(25)
     );
+}
+
+/// A **dynamic MDC** channel crosses between the media and the kernel.
+///
+/// The shape that makes this different from every case above: the channel names
+/// `control=` and **no `endpoint=` at all**. The publication binds the control
+/// address and the subscription elicits to it, so the address that decides which
+/// media carries the channel is the *control* one — and here it is a media-side
+/// address on our half and a kernel-side one on the reference's, which is the
+/// half of the rule that keeps MDC on a port this driver drives possible at all.
+/// The other half (a loopback control address falls back to the kernel) is what
+/// the reference's own system tests found and what the fallback rule was
+/// extended for.
+///
+/// It is also the case that would have been refused outright before that
+/// extension: our publication's destination is `0.0.0.0` until its stream tells
+/// it otherwise, which the reachability refusal used to answer `ENETUNREACH`.
+#[test]
+#[ignore = "needs two cabled ports, one bound to vfio-pci, and the kernel's half configured"]
+fn a_dynamic_mdc_channel_crosses_between_the_media_and_the_kernel() {
+    assert!(
+        the_kernel_holds(REFERENCE),
+        "the kernel has to hold {REFERENCE} on {} (see this file's runbook)",
+        variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT)
+    );
+
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+    let Some((mut reference, reference_dir)) = reference_driver("dpc-mdc-reference-subscriber")
+    else {
+        driver::announce_skip();
+        return;
+    };
+
+    let port = 41_100 + (std::process::id() % 100) as u16;
+    // Our half binds the control address — the parse puts it in the *local*
+    // pair for a channel with no endpoint — and the reference's half dials it.
+    let publication_channel =
+        format!("aeron:udp?control={OWN}:{port}|control-mode=dynamic|term-length=64k");
+    let subscription_channel =
+        format!("aeron:udp?endpoint=0.0.0.0:0|control={OWN}:{port}|term-length=64k");
+    let message = b"t5: a dynamic MDC message over the port";
+
+    let mut subscriber = samples::Sample::start(
+        &subscriber_binary,
+        "subscriber",
+        &reference_dir,
+        &["-c", &subscription_channel, "-s", &STREAM_ID.to_string()],
+    );
+    subscriber.await_output(READY_TIMEOUT, "its channel", |output| {
+        output.contains("Subscribing to channel")
+    });
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver publishes a CnC file");
+
+    let Some(mut own) = own_driver_on_the_media("dpc-our-mdc-publisher") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver publishes a CnC file");
+    await_the_media_link(&own_cnc);
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication = client
+        .add_publication(&publication_channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver confirms the MDC publication");
+
+    let deadline = Instant::now() + CROSSING_TIMEOUT;
+    let mut offered = false;
+    while Instant::now() < deadline {
+        offered |= client.offer(publication, message).is_some();
+        client.poll();
+        std::thread::sleep(Duration::from_millis(10));
+
+        if subscriber.output().contains("t5: a dynamic MDC") {
+            break;
+        }
+    }
+
+    assert!(offered, "the publication was offered at least once");
+    assert!(
+        subscriber.output().contains("t5: a dynamic MDC"),
+        "the reference's subscriber never saw the MDC message:\n{}",
+        subscriber.output()
+    );
+
+    assert_the_media_carried_it(&own_cnc);
+
+    // **The sample goes before the drivers do.** A `BasicSubscriber` left
+    // running polls a driver directory that the next case's `stop` deletes —
+    // and it was the thing that made the case *after* this one hang rather than
+    // fail (measured: this case's subscriber left behind, and the publishing
+    // case never finished).
+    let _ = subscriber.terminate(Duration::from_secs(5));
+    let _ = own.stop();
+    let _ = reference.stop();
+}
+
+/// A **response channel** crosses between the media and the kernel.
+///
+/// The reference's own two response samples, one per driver: the requester on
+/// ours (so its response subscription takes an ephemeral port on the media) and
+/// the responder on the reference's (so its publication binds the control
+/// address on the kernel). The nine-step handshake — the client's offer, the
+/// server's image, the session it answers on, the elicit by name, the server's
+/// publication learning where it may send — therefore crosses the cable.
+///
+/// The address discipline is the reference's, from `samples_configuration.h`:
+/// the response channel is `aeron:udp?control=<addr>` and nothing else, which is
+/// what gives the requester somewhere to elicit and the responder nowhere to
+/// send until it is asked. Our half's subscription names **no local address**, so
+/// this is the case that pins the other half of the fallback rule end to end: a
+/// control address that is routable — the kernel's address on the other end of
+/// the cable — keeps the channel on the media.
+#[test]
+#[ignore = "needs two cabled ports, one bound to vfio-pci, and the kernel's half configured"]
+fn a_response_channel_crosses_between_the_media_and_the_kernel() {
+    assert!(
+        the_kernel_holds(REFERENCE),
+        "the kernel has to hold {REFERENCE} on {} (see this file's runbook)",
+        variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT)
+    );
+
+    let Some(client_binary) = samples::locate("response_client") else {
+        driver::announce_tool_skip("response_client");
+        return;
+    };
+    let Some(server_binary) = samples::locate("response_server") else {
+        driver::announce_tool_skip("response_server");
+        return;
+    };
+    let Some((mut reference, reference_dir)) = reference_driver("dpc-response-server") else {
+        driver::announce_skip();
+        return;
+    };
+
+    // The two channels, at ports this process owns rather than the samples'
+    // defaults, and both on the **kernel's** side of the cable: the request
+    // channel is the server's subscription's endpoint, and the response channel
+    // is the server's publication's control address. Our half reaches both
+    // through the wire, which is the point.
+    let request = format!(
+        "aeron:udp?endpoint={REFERENCE}:{}",
+        41_200 + (std::process::id() % 100) as u16
+    );
+    let response = format!(
+        "aeron:udp?control={REFERENCE}:{}",
+        41_300 + (std::process::id() % 100) as u16
+    );
+
+    // The server first: its subscription has to be up before the client offers,
+    // because an offer to a publication with no reader is not connected. Its
+    // readiness cannot be read — the samples' `printf` is fully buffered to a
+    // file and this one never exits — so the client's own first `yay!` is what
+    // says the pair is up.
+    let mut server = samples::Sample::start(
+        &server_binary,
+        "response-server",
+        &reference_dir,
+        &["-c", &request, "-d", &response],
+    );
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver publishes a CnC file");
+
+    let Some(mut own) = own_driver_on_the_media("dpc-our-response-client") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver publishes a CnC file");
+    await_the_media_link(&own_cnc);
+
+    let mut client = samples::Sample::start(
+        &client_binary,
+        "response-client",
+        own.aeron_dir(),
+        &["-c", &request, "-d", &response, "-m", "5"],
+    );
+
+    // The assertion, and the only one that covers the whole handshake: the
+    // client has no image on its response subscription until the server's image
+    // has said which session it answers on, the client has elicited by name, and
+    // the server's publication has learned from that ask where it may send. Any
+    // of the nine steps missing and this line never prints.
+    let output = client.await_output(CROSSING_TIMEOUT, "a response", |output| {
+        output.contains("Response to stream")
+    });
+
+    assert!(
+        output.contains("yay!"),
+        "the client's offers were answered:\n{output}"
+    );
+
+    assert_the_media_carried_it(&own_cnc);
+
+    let _ = client.terminate(Duration::from_secs(5));
+    let _ = server.terminate(Duration::from_secs(5));
+    let _ = own.stop();
+    let _ = reference.stop();
 }
