@@ -513,6 +513,21 @@ pub struct PersistentSubscription {
     replay_channel_type: ReplayChannelType,
     /// The subscription's registration id once the driver has made it.
     replay_subscription: Option<i64>,
+    /// Whether the replay subscription has been seen **with an image on it**.
+    ///
+    /// The reference holds the image itself and asks it whether it is closed
+    /// (`aeron_image_is_closed`, `aeron_image.c:732-745`), which is what tells
+    /// "the image I was reading has been taken away" apart from "no image has
+    /// appeared yet". A subscription here is a registration id and its images are
+    /// looked up per turn, so what is kept is the one thing that lookup cannot
+    /// answer: **that there was one**. With it, "no image now" means closed —
+    /// the same reading `live()` already does for the live subscription, and the
+    /// reference's own reason for holding the pointer at all.
+    ///
+    /// Cleared with the subscription it belongs to
+    /// ([`Self::clean_up_replay_subscription`]), as the reference clears
+    /// `replay_image` in its own cleanup (`:745-752`).
+    replay_image_seen: bool,
     /// The `ADD_SUBSCRIPTION` in flight, whose registration id the driver will
     /// answer under (`:1494`).
     replay_subscription_add: Option<i64>,
@@ -672,6 +687,7 @@ impl PersistentSubscription {
             close_enough_threshold: 0,
             max_recorded_position: MaxRecordedPosition::Idle,
             next_live_position: NULL_VALUE,
+            replay_image_seen: false,
             live_subscription: None,
             live_subscription_add: None,
             live_image_deadline: None,
@@ -1559,6 +1575,25 @@ impl PersistentSubscription {
             .map(deepmsg_client::image::Image::position);
 
         let Some(image_position) = image_position else {
+            // `:1909-1916`: **the image that was being read has been closed** —
+            // it was there, and the driver has taken it away. The replay is over
+            // and the recording has to be read again, because what was being
+            // replayed may have grown or gone while it was being read. Where it
+            // got to is what is kept: `self.position` was set from that image on
+            // the turn before this one.
+            //
+            // The reference tells the two apart by asking the image it holds
+            // whether it is closed; here it is [`Self::replay_image_seen`], which
+            // is the same question asked of what this build keeps.
+            if self.replay_image_seen {
+                self.clean_up_live_subscription();
+                self.clean_up_replay();
+                self.clean_up_replay_subscription();
+                self.refresh_recording_descriptor();
+
+                return 1;
+            }
+
             // The image has not appeared. The reference waits for it until the
             // deadline and then starts the replay over (`:1880-1903`).
             if self.deadline_passed() {
@@ -1575,6 +1610,10 @@ impl PersistentSubscription {
 
             return 0;
         };
+
+        // The image is there, and that is what makes "no image" mean *closed* on
+        // a later turn rather than *not yet*.
+        self.replay_image_seen = true;
 
         let fragments = {
             let Some(driver) = self.client.client_mut() else {
@@ -1928,8 +1967,37 @@ impl PersistentSubscription {
         };
 
         let (Some(replay_position), Some(live_position)) = (replay_position, live_position) else {
+            // `:2076-2087`: the replay image that was being read has been
+            // **closed** while the live stream was being caught up with. The
+            // replay is over, and what was being replayed has to be read again —
+            // it may have grown or gone while it was being read.
+            //
+            // ★ What this build cannot do the reference's way: the reference asks
+            // the closed image where it got to (`aeron_image_position`), and an
+            // image looked up by registration id is simply not there. The
+            // position used is therefore the last one this machine set from it
+            // (`self.position`, from the turn before the image went) rather than
+            // the image's own final one.
+            if replay_position.is_none() && self.replay_image_seen {
+                if let Some(live_position) = live_position {
+                    self.advance_last_observed_live_position(live_position);
+                }
+
+                self.clean_up_live_subscription();
+                self.clean_up_replay();
+                self.clean_up_replay_subscription();
+                self.refresh_recording_descriptor();
+
+                return 1;
+            }
+
             return 0;
         };
+
+        // Both images are there, which is what makes "no image" mean *closed* on
+        // a later turn rather than *not yet* — for the live half as well, whose
+        // own closed branch (`:2089-2096`) this build does not have.
+        self.replay_image_seen = true;
 
         // **The replay is finished with the moment this machine is live**, and
         // the two things that says are done at the end of this call rather than
@@ -2291,6 +2359,10 @@ impl PersistentSubscription {
     /// one that arrived removed. See [`Self::clean_up_live_subscription`] for
     /// why the difference is worth the branch.
     fn clean_up_replay_subscription(&mut self) {
+        // `:745-752`: the reference nulls its `replay_image` here, and this is
+        // that same fact in the shape this build can keep.
+        self.replay_image_seen = false;
+
         if let Some(registration_id) = self.replay_subscription_add.take() {
             if let Some(driver) = self.client.client_mut() {
                 let _ = driver.async_add_cancel(AsyncAdd::subscription(registration_id));
