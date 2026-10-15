@@ -373,10 +373,30 @@ struct MaxPosition {
 
 /// One `list_recording` request and the descriptor it was answered with
 /// (`list_recording_request_t`, `…_persistent_subscription.h:107-119`).
+///
+/// **Answered two ways, and only one of them is a descriptor.** The request goes
+/// out with `remaining = 1` (`:1145`); the descriptor handler is the only thing
+/// that counts it down (`:877-879`); a *control response* sets the answer flag
+/// without touching the count (`:845-848`). The archive sends one whenever it
+/// refuses the request because a listing of its own is already in flight
+/// (`ACTIVE_LISTING`) — a normal outcome of asking faster than an answer comes
+/// back — and `validate_descriptor` then reads the count, not the flag, and
+/// finds a reply that is not a descriptor (`:1202`, `:1292-1306`).
+///
+/// The reference's shared op also carries `code`, `relevant_id` and
+/// `error_message` through that same dispatcher, and **reads none of them for
+/// this op**: nothing in `…_persistent_subscription.c` reads them off a
+/// `list_recording_request`. This build does not carry write-only fields.
 #[derive(Debug, Default)]
 struct ListRecording {
     correlation_id: i64,
+    /// **An answer**, of either kind — not necessarily a descriptor. What it
+    /// was is [`Self::remaining`]'s business.
     received: bool,
+    /// What the request is still waiting for: `1` from the send until the
+    /// descriptor arrives (`:1145`, `:877-879`). The reference leaves this
+    /// unset until the send, and this is what an unset one reads as.
+    remaining: i32,
     start_position: i64,
     stop_position: i64,
     term_buffer_length: i32,
@@ -457,13 +477,37 @@ impl Listener for ArchiveListener {
             ops.max_recorded_position.code = Some(response.code);
             ops.max_recorded_position.max_recorded_position = response.relevant_id;
         }
+
+        // ★ The **fourth** dispatcher the reference has and this build did not
+        // (`:845-848`). Without it an archive that refuses a `list_recording`
+        // request — `ACTIVE_LISTING`, which is what asking faster than an answer
+        // comes back produces — has its answer dropped on the floor, and the
+        // subscription waits out a whole message timeout for a reply it is
+        // already holding.
+        //
+        // `received` only: what the answer was is `remaining`'s to say
+        // (`:877-879`), and it is not counted down for this one.
+        if response.correlation_id == ops.list_recording.correlation_id
+            && NULL_VALUE != response.correlation_id
+        {
+            ops.list_recording.received = true;
+        }
     }
 
     fn on_recording_descriptor(&mut self, descriptor: &RecordingDescriptor) {
         let mut ops = self.ops.borrow_mut();
 
         if descriptor.correlation_id == ops.list_recording.correlation_id {
-            ops.list_recording.received = true;
+            // The descriptor is what `remaining` was counting (`:877-879`): it
+            // is counted down here and the answer is only in once it reaches
+            // zero. The numbers underneath are copied either way, as the
+            // reference copies them.
+            ops.list_recording.remaining -= 1;
+
+            if 0 == ops.list_recording.remaining {
+                ops.list_recording.received = true;
+            }
+
             ops.list_recording.start_position = descriptor.start_position;
             ops.list_recording.stop_position = descriptor.stop_position;
             ops.list_recording.term_buffer_length = descriptor.term_buffer_length;
@@ -856,6 +900,9 @@ impl PersistentSubscription {
 
         self.ops.borrow_mut().list_recording = ListRecording {
             correlation_id,
+            // `:1145`: what this counts is the descriptor, and the send is what
+            // starts the count.
+            remaining: 1,
             ..ListRecording::default()
         };
         self.deadline = Some(Instant::now() + self.message_timeout);
@@ -904,17 +951,50 @@ impl PersistentSubscription {
         1
     }
 
+    /// The question `validate_descriptor` asks before any of the numbers
+    /// (`:1202`, `:1292-1306`): **an answer that is not a descriptor is not a
+    /// descriptor**, whatever it says.
+    ///
+    /// A value rather than a branch, so that it can be judged without a
+    /// subscription — which is what the criterion beside it needs. The shape
+    /// this build used to have (any answer made the numbers usable) is what
+    /// turned an `ACTIVE_LISTING` refusal into a ten-second wait: the refusal
+    /// set the answer flag while the numbers under it had never been written.
+    ///
+    /// The message is the reference's, wrong as it reads here: what reaches it
+    /// is the refusal, and the reference calls that "unknown recording id".
+    fn missing_descriptor(remaining: i32, recording_id: i64) -> Result<(), SubscriptionError> {
+        if 0 == remaining {
+            return Ok(());
+        }
+
+        Err(SubscriptionError::Descriptor(format!(
+            "unknown recording id: {recording_id}"
+        )))
+    }
+
     /// `validate_descriptor` (`:1197-1310`): the recording has to be the one
     /// this subscription was configured for, and the position has to be one the
     /// recording has.
     ///
     /// Answers whether the descriptor is usable; every refusal is terminal.
     fn validate_descriptor(&mut self) -> bool {
-        let (start_position, stop_position, stream_id) = {
+        let (remaining, start_position, stop_position, stream_id) = {
             let list = &self.ops.borrow().list_recording;
 
-            (list.start_position, list.stop_position, list.stream_id)
+            (
+                list.remaining,
+                list.start_position,
+                list.stop_position,
+                list.stream_id,
+            )
         };
+
+        if let Err(error) = Self::missing_descriptor(remaining, self.context.recording_id) {
+            self.fail(error);
+
+            return false;
+        }
 
         let live_stream_id = self.context.live_stream_id;
 
@@ -2456,5 +2536,119 @@ mod tests {
         // Media and endpoint survive; a control request channel that is not a
         // channel at all is the one failure the reference can have here too.
         assert!(request_publication_channel("not-a-channel", 65536, 33).is_err());
+    }
+
+    fn listener(ops: Rc<RefCell<Ops>>) -> ArchiveListener {
+        ArchiveListener {
+            ops,
+            disconnected: Rc::new(Cell::new(false)),
+            failure: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn descriptor(correlation_id: i64) -> RecordingDescriptor {
+        RecordingDescriptor {
+            control_session_id: 3,
+            correlation_id,
+            recording_id: 42,
+            start_timestamp: 1,
+            stop_timestamp: 2,
+            start_position: 0,
+            stop_position: 1024,
+            initial_term_id: 1,
+            segment_file_length: 1024 * 1024,
+            term_buffer_length: 64 * 1024,
+            mtu_length: 1408,
+            session_id: 11,
+            stream_id: 1001,
+            stripped_channel: "aeron:ipc".to_owned(),
+            original_channel: "aeron:ipc".to_owned(),
+            source_identity: String::new(),
+        }
+    }
+
+    /// One request in flight, counted as a send counts it (`:1145`).
+    fn asked(correlation_id: i64) -> Rc<RefCell<Ops>> {
+        let ops = Rc::new(RefCell::new(Ops::default()));
+        ops.borrow_mut().list_recording = ListRecording {
+            correlation_id,
+            remaining: 1,
+            ..ListRecording::default()
+        };
+
+        ops
+    }
+
+    /// ★ The **fourth** dispatcher (`:845-848`). A `list_recording` request can
+    /// be answered with a control response — the archive refuses it with
+    /// `ACTIVE_LISTING` whenever a listing of its own is already in flight, which
+    /// is what asking faster than an answer comes back produces — and that
+    /// answer has to be **seen** without being mistaken for the descriptor the
+    /// numbers underneath it need.
+    ///
+    /// The shape this build had before: the answer was dropped here, and the
+    /// subscription then waited out a whole message timeout for a reply it was
+    /// already holding.
+    #[test]
+    fn a_refused_list_recording_is_an_answer_that_is_not_a_descriptor() {
+        let ops = asked(7);
+        let mut listener = listener(Rc::clone(&ops));
+
+        listener.on_control_response(&ControlResponse {
+            correlation_id: 7,
+            relevant_id: 0,
+            code: ControlResponseCode::ERROR,
+            error_message: "active listing already in progress",
+        });
+
+        assert!(
+            ops.borrow().list_recording.received,
+            "a control response answering the request in flight was dropped on the floor"
+        );
+        assert_eq!(
+            1,
+            ops.borrow().list_recording.remaining,
+            "an answer that is not a descriptor was counted as one"
+        );
+        assert!(
+            PersistentSubscription::missing_descriptor(
+                ops.borrow().list_recording.remaining,
+                ops.borrow().list_recording.correlation_id
+            )
+            .is_err(),
+            "a refused request must not pass the descriptor check"
+        );
+    }
+
+    /// The other half of the same split: the descriptor **is** what counts the
+    /// answer in (`:877-879`), so the count has to move with it — an answer flag
+    /// set without it would let the four numbers be read out of a struct that
+    /// never received any.
+    #[test]
+    fn the_descriptor_is_what_counts_the_answer_in() {
+        let ops = asked(7);
+        let mut listener = listener(Rc::clone(&ops));
+
+        listener.on_recording_descriptor(&descriptor(7));
+
+        assert_eq!(
+            0,
+            ops.borrow().list_recording.remaining,
+            "the descriptor is what the count was for"
+        );
+        assert!(ops.borrow().list_recording.received);
+        assert!(PersistentSubscription::missing_descriptor(0, 42).is_ok());
+    }
+
+    /// The message is the reference's own (`:1292-1306`), wrong as it reads for
+    /// the refusal that reaches it — the same `ACTIVE_LISTING` answer the
+    /// archive sends, reported as an unknown recording id. Copied on purpose.
+    #[test]
+    fn a_request_with_no_descriptor_fails_the_reference_way() {
+        let error = PersistentSubscription::missing_descriptor(1, 42)
+            .expect_err("a request whose descriptor never came is not usable");
+
+        assert_eq!("unknown recording id: 42", format!("{error}"));
+        assert!(PersistentSubscription::missing_descriptor(0, 42).is_ok());
     }
 }

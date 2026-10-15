@@ -37,15 +37,36 @@
 //! [`State::SendListRecordingRequest`] a second time. Once means the answer
 //! arrived and the branch was never taken; twice or more means it was.
 //!
-//! # One thing measured and not explained
+//! # The ten seconds, explained (it used to be "measured and not explained")
 //!
-//! Run alone this case takes about a tenth of a second. Under a **loaded**
-//! machine — the full `cargo test --workspace`, a hundred binary's worth of
-//! processes — it has been seen to take ten, which is the deadline that is
-//! restored at the end. It passes either way, and it is written down because a
-//! future reader who meets the slow run should know it was seen, not guess it:
-//! the retry loop makes a hundred requests in a burst, and what that does to the
-//! archive under contention is not something this case has tried to bound.
+//! Run alone this case used to take about a tenth of a second, and under a
+//! loaded machine — the full `cargo test --workspace` — ten, which is the
+//! deadline that is restored at the end. It passed either way.
+//!
+//! **That was a defect, and this is where it was.** Asking faster than an answer
+//! comes back makes the archive refuse a `list_recording` request whenever a
+//! listing of its own is in flight (`ACTIVE_LISTING` — a normal answer, not a
+//! fault), and the burst here asks about eighty times faster than the round
+//! trip. The refusal lands on the request being waited on, and this build's
+//! client had **no dispatcher for it**: the answer was dropped and the machine
+//! waited out a whole message timeout for a reply it was already holding.
+//! Measured, with a trace on both sides: the last ask of the burst comes back
+//! `ERROR` with `list_match = true`, ten seconds pass, and the re-ask after the
+//! deadline is answered in about a millisecond.
+//!
+//! So the case now takes **whichever of two endings the race gives** — live, or
+//! failed with the reference's own words for a refused ask — and asserts the
+//! thing that was wrong: that the machine decides rather than waits. The
+//! deterministic pin on the refusal itself is the unit test beside it
+//! (`crates/archive/src/client/persistent_subscription/state.rs`,
+//! `a_refused_list_recording_is_an_answer_that_is_not_a_descriptor`); the race
+//! lands on the current ask perhaps one run in five, so this half is the weaker
+//! of the two on purpose.
+//!
+//! The sibling case in this file is the other half of the same fact: an answer
+//! that is **withheld** (the receive-side loss injection, not a refusal) leaves
+//! the deadline to expire with nothing to read, and that is still a retry and
+//! not a failure.
 //!
 //! # What this build does not have
 //!
@@ -99,6 +120,14 @@ const INSTANT: i64 = 1;
 /// The archive's own default, restored once the machine has been watched
 /// (`:4157`, `:4176`).
 const TEN_SECONDS_NS: i64 = 10_000_000_000;
+
+/// How long the machine has to **decide** once the deadline is a deadline again.
+///
+/// Deliberately a fraction of one message timeout (`TEN_SECONDS_NS`): what is
+/// being judged is that no answer the machine is already holding is waited out,
+/// so a decision that took a message timeout would be the defect itself. The
+/// honest path — become live, or fail on the refusal — is milliseconds.
+const DECIDED_WITHIN: Duration = Duration::from_secs(3);
 
 /// How many turns the instant deadline is given.
 ///
@@ -290,11 +319,15 @@ fn a_list_recording_request_that_times_out_is_asked_again() {
 
         subscription.controlled_poll(&mut collector, 10);
 
-        assert!(
-            !subscription.has_failed(),
-            "an expired deadline must not fail the subscription{}",
-            reason(&subscription, &joins),
-        );
+        // ★ Asking faster than an answer comes back has a second ending, and it
+        // is not a fault of the retry: the archive refuses a `list_recording`
+        // request while a listing of its own is in flight (`ACTIVE_LISTING`),
+        // and an answer that is not a descriptor is terminal — the reference's
+        // rule (`:1202`, `:1292-1306`) and this build's (`missing_descriptor`).
+        // See the ending below for what is judged.
+        if subscription.has_failed() {
+            break;
+        }
     }
 
     assert!(
@@ -313,15 +346,35 @@ fn a_list_recording_request_that_times_out_is_asked_again() {
     // Let it go, and a deadline again: the machine completes — the connection
     // was never given up, so this is the same connection the retries were made
     // on rather than a new one.
+    //
+    // ★ **Two endings, and the test takes whichever the race gives.** This loop
+    // asks faster than an answer comes back, and the archive refuses a request
+    // whenever a listing of its own is already in flight, so the ask being
+    // waited on can come back refused: then the machine fails — with the
+    // reference's own words for it — and that is a decision, not a stall.
+    // Otherwise the answer that landed on the current request is a descriptor
+    // and the machine completes.
+    //
+    // What **is** this test's to assert is the thing that used to be wrong: the
+    // machine decides **without waiting out a message timeout**, in either
+    // ending. One message timeout is ten seconds, and the decision is asked for
+    // in three (`DECIDED_WITHIN`) — the shape this case had before the fourth
+    // dispatcher was wired up sat on the refusal for the whole ten.
+    //
+    // The rate at which the refusal lands on the *current* ask is the machine's
+    // own (measured at about one run in five against our archive), so this
+    // ending is the weaker half of the criterion: the deterministic pin on the
+    // refusal is the unit test beside it (`state.rs`,
+    // `a_refused_list_recording_is_an_answer_that_is_not_a_descriptor`).
+    let decided_by = Instant::now() + DECIDED_WITHIN;
+
     subscription.set_message_timeout_ns_for_testing(TEN_SECONDS_NS);
 
-    let deadline = Instant::now() + archive::DEADLINE;
-
-    while !subscription.is_live() {
+    while !subscription.is_live() && !subscription.has_failed() {
         assert!(
-            Instant::now() < deadline,
-            "the subscription never became live after the deadline was restored: \
-             state {:?}{}",
+            Instant::now() < decided_by,
+            "the subscription neither became live nor failed within {DECIDED_WITHIN:?} \
+             of the deadline being restored — state {:?}{}",
             subscription.state(),
             reason(&subscription, &joins),
         );
@@ -331,9 +384,22 @@ fn a_list_recording_request_that_times_out_is_asked_again() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    if subscription.has_failed() {
+        assert_eq!(
+            format!("unknown recording id: {}", source.recording_id),
+            subscription.failure_reason().unwrap_or_default(),
+            "the machine failed for something other than the refused ask{}",
+            reason(&subscription, &joins),
+        );
+
+        return;
+    }
+
     let expected: Vec<Vec<u8>> = (0..MESSAGES)
         .map(|index| format!("message {index:04}").into_bytes())
         .collect();
+
+    let deadline = Instant::now() + archive::DEADLINE;
 
     while collector.messages.len() < expected.len() {
         assert!(
