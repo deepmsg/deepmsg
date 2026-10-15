@@ -452,6 +452,7 @@ mod tests {
                 socket_sndbuf: 1 << 20,
                 multicast_if_index: 0,
                 ttl: 4,
+                control: None,
             },
         )
         .expect("a socket");

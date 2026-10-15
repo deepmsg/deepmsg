@@ -277,6 +277,24 @@ impl From<UriError> for UdpChannelError {
 }
 
 impl UdpChannel {
+    /// The control address this channel **names**, from whichever of the two
+    /// the parse put it in, or [`None`] when it names none. Not
+    /// [`Self::control_address`], which answers a different question: where an
+    /// *arriving* datagram's answer goes.
+    ///
+    /// One control address, two fields: a plain `endpoint=host:port` channel
+    /// carries it in [`Self::remote_control`] (the far end) and leaves
+    /// [`Self::local_control`] at zero, while `control=host:port` on a channel
+    /// with no endpoint — every dynamic MDC channel — carries it in
+    /// `local_control` (the address its own half binds) and leaves the remote
+    /// pair at zero. Both are "the address this channel will do its talking
+    /// to", which is what the userspace media's selection needs
+    /// ([`crate::media::TransportParams::control`]).
+    pub fn named_control_address(&self) -> Option<SocketAddr> {
+        [self.local_control, self.remote_control]
+            .into_iter()
+            .find(|address| !address.ip().is_unspecified())
+    }
     /// Whether this is a multi-destination channel
     /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
     pub const fn is_multi_destination(&self) -> bool {
@@ -1790,6 +1808,38 @@ mod tests {
     use super::*;
 
     use deepmsg_core::buffer::AtomicBuffer;
+    /// The address a dynamic MDC channel names is its **control** address, and
+    /// it lands in the *local* pair — the pair a plain `endpoint=` channel
+    /// leaves at zero — so a reader that looked only at the remote one would
+    /// find nothing where the channel had said everything it had to say. This
+    /// is the sentence the userspace media's selection rests on (the D5
+    /// record's 第 6 笔).
+    ///
+    /// Both shapes are here because both are one sentence in two spellings: a
+    /// channel names one control address, and which field carries it is the
+    /// parse's business.
+    #[test]
+    fn the_control_address_a_channel_names_is_found_wherever_the_parse_put_it() {
+        for (uri, expected) in [
+            ("aeron:udp?endpoint=127.0.0.1:9999", Some("127.0.0.1:9999")),
+            (
+                "aeron:udp?endpoint=10.10.0.2:40500",
+                Some("10.10.0.2:40500"),
+            ),
+            (
+                "aeron:udp?term-length=64k|control-mode=dynamic|control=localhost:8338|fc=max",
+                Some("127.0.0.1:8338"),
+            ),
+            ("aeron:udp?control-mode=manual", None),
+        ] {
+            let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
+            let channel = UdpChannel::resolve(uri.as_bytes(), &parsed).expect("a channel");
+            let expected =
+                expected.map(|address| address.parse::<SocketAddr>().expect("an address"));
+
+            assert_eq!(expected, channel.named_control_address(), "{uri}");
+        }
+    }
 
     /// An aligned counter region.
     #[repr(align(64))]
