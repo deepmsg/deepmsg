@@ -318,6 +318,39 @@ fn a_rate_rule_with_no_stream_takes_from_any_stream() {
     );
 }
 
+/// ★ A **window** has two ends, and this is the one `pass.first` could not
+/// name: a blackout that opens *later* leaves alone everything that came before
+/// it. The reference's response-dropping cases need exactly that — its handshake
+/// and its listing go through and one response is held back — and counting
+/// frames cannot express it, because the handshake's frame count is not a
+/// constant here (measured at three *and* four).
+///
+/// The window named here opens far beyond the run, so the exchange that finishes
+/// in milliseconds is untouched: the same reading as the case with no rule at
+/// all, from a rule that is configured. Where the window's *middle* and its
+/// `until` fall is the generator's own tests' business, because those need real
+/// time (`crates/driver/src/media/receive_loss.rs`).
+#[test]
+fn a_window_that_opens_later_leaves_what_came_before_it_alone() {
+    let Some(run) = run(
+        "receive-loss-window",
+        50,
+        &[
+            "-Ddeepmsg.debug.receive.data.loss.stream.id=5101",
+            "-Ddeepmsg.debug.receive.data.loss.from.millis=20000",
+            "-Ddeepmsg.debug.receive.data.loss.until.millis=25000",
+        ],
+    ) else {
+        return;
+    };
+
+    assert_eq!(expected(), run.messages);
+    assert_eq!(
+        0, run.naks_sent,
+        "a window that had not opened yet dropped something",
+    );
+}
+
 /// Two rules at once are refused where the settings are read: which of them
 /// would win is not something a reader of the settings could tell.
 #[test]
