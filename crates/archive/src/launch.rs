@@ -115,10 +115,19 @@ pub enum DriverHalf<'a> {
 }
 
 impl DriverHalf<'_> {
-    /// One turn of the driver, where this process is the one that owes it.
-    fn turn(&mut self) {
-        if let Self::Owned(driver) = self {
-            driver.do_work();
+    /// One turn of the driver, where this process is the one that owes it, and
+    /// how much work it did.
+    ///
+    /// The count is what the idle strategy is given, and it is the reference's
+    /// own arrangement: an archive that owns its driver drives it from inside
+    /// `ArchiveConductor.doWork` (`invokeDriverConductor`, `:426`, which
+    /// `SharedModeArchiveConductor.doWork:57-64` calls and adds in), so the
+    /// driver's work is part of the turn's work and a turn that drove the driver
+    /// is not a turn that idles.
+    fn turn(&mut self) -> usize {
+        match self {
+            Self::Owned(driver) => driver.do_work(),
+            Self::Attached => 0,
         }
     }
 
@@ -470,6 +479,19 @@ pub fn run(
         std::process::id()
     );
 
+    // The reference's `ctx.idleStrategy()` (`Archive.java:1397-1399`), made once
+    // for the conductor's own loop — `AgentRunner.run` asks its context for one
+    // strategy per runner and idles with it after every pass
+    // (`org.agrona.concurrent.AgentRunner`), which is what this is.
+    //
+    // ★ It is no longer hardcoded to `yield`. That was the suite's own setting
+    // written into the code (`TestArchive.h:47` passes
+    // `aeron.archive.idle.strategy=yield`), so nothing could tell the two apart
+    // and a deployment that asked for anything else was told nothing. The
+    // reference's default is a `BackoffIdleStrategy` (`:420`), and so is this
+    // one's.
+    let mut idle = archive_config.idle_strategy.strategy();
+
     loop {
         if let Some(signal) = sys::stop_signal() {
             conductor.signal_terminated();
@@ -481,14 +503,15 @@ pub fn run(
 
         // The driver first, so that everything the archive's turn hears is
         // already in the term buffers, then the archive. Under
-        // [`DriverHalf::Attached`] the first of those is another process's.
-        half.turn();
-        conductor
+        // [`DriverHalf::Attached`] the first of those is another process's, and
+        // contributes no work — but the pass is still a pass.
+        let driven = half.turn();
+
+        let archived = conductor
             .do_work(&mut client, clock::epoch_millis())
             .map_err(|error| format!("the control plane stopped: {error}"))?;
 
-        // The reference's `ctx.idleStrategy()`, which the suite sets to `yield`.
-        std::thread::yield_now();
+        idle.idle(driven + archived);
     }
 }
 

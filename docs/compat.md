@@ -1150,11 +1150,11 @@ them without the list moving.
 
 | | How many | What it means |
 |---|---|---|
-| Honoured | 30 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
-| Accepted, not honoured | 14 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
+| Honoured | 31 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
+| Accepted, not honoured | 13 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
 | Refused by name | 1 | `aeron.archive.recording.events.enabled`, which this build refuses rather than accepting with nothing behind it |
 
-The fourteen are the deviations worth naming. **Two of them are the reference's
+The thirteen are the deviations worth naming. **Two of them are the reference's
 own doing**, which is why they are not defects here:
 `aeron.archive.max.catalog.entries` has **no reader in the reference either** —
 `Archive.maxCatalogEntries()` is defined (`:849`, `:3337`) and never called, and
@@ -1162,12 +1162,25 @@ its `Catalog` is constructed without it (`Archive.java:1504-1511`) — and
 `aeron.archive.client.name` is read by the **client** (`AeronArchive.java:3025`),
 where this build takes the name from `AERON_ARCHIVE_CLIENT_NAME` instead (a
 recorded deviation on that side, `crates/archive/src/client/context.rs`). The
-other twelve are work this build has not done: the recording and replay
+other eleven are work this build has not done: the recording and replay
 checksums, the catalog's file sync level, the replay publication's linger, the
-three cycle thresholds (P2-9b) and the three idle strategies (P2-9a, including
-the archive's own).
+three cycle thresholds (P2-9b) and the recorder's and replayer's idle strategies
+(P2-9a, whose agents have no threads of their own here yet).
 
-★ Three of the thirty were **hardcoded to the reference's defaults** until
+★ **The archive's own idle strategy was one of the thirteen until P2-9a**, and
+the shape of that gap is worth keeping: `aeron.archive.idle.strategy` was a name
+this build accepted and did nothing with, because the loop hardcoded the `yield`
+that the reference's own suite asks for by name (`TestArchive.h:47`,
+`TestStandaloneArchive.h:122`). So the suite could not tell the two apart, and a
+deployment that asked for anything else was told nothing. It now resolves
+through the reference's own table and **refuses** a name it has no strategy for
+(`io.aeron.driver.Configuration.agentIdleStrategy`, `:2098-2143`). One class of
+name the reference resolves and this does not is recorded in
+`crates/archive/src/server/idle.rs`: the switch's `default ->` arm loads a class
+by reflection, so a deployment's own `IdleStrategy` on the classpath works there
+and is refused here.
+
+★ Three of those were **hardcoded to the reference's defaults** until
 P2-9c, so only a deployment that *changed* one was affected and it could not
 tell: `aeron.archive.message.timeout` (10 s, now the sessions' own timeout),
 `aeron.archive.message.retry.attempts` (3, now the response proxy's attempts) and

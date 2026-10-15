@@ -140,6 +140,16 @@ impl Sleeping {
     /// `aeron_agent.c:56-59`, whose `NULL == init_args` arm is this).
     pub const DEFAULT_DURATION_NS: u64 = 1;
 
+    /// What the **Java** table's `SleepingIdleStrategy()` sleeps for when
+    /// nothing named a duration: 1000 ns, its `DEFAULT_SLEEP_PERIOD_NS`.
+    ///
+    /// Three orders of magnitude away from [`Sleeping::DEFAULT_DURATION_NS`],
+    /// and that is the difference between the two tables rather than a slip: the
+    /// C loader hands the strategy no arguments at all
+    /// (`aeron_idle_strategy_sleeping_init_args`, `aeron_agent.c:47-66`) while
+    /// Agrona's no-argument constructor carries its own default.
+    pub const JAVA_DEFAULT_DURATION_NS: u64 = 1_000;
+
     /// A strategy that sleeps for `duration_ns` after a pass with no work.
     pub const fn new(duration_ns: u64) -> Self {
         Self { duration_ns }
@@ -155,6 +165,42 @@ impl Sleeping {
     }
 }
 
+/// `sleep-ms`: sleep for a fixed period measured in **milliseconds** when there
+/// was no work (`org.agrona.concurrent.SleepingMillisIdleStrategy`).
+///
+/// The one strategy that has a name in the Java table and none in the C one:
+/// `aeron_idle_strategy_load` has no `sleep-ms`
+/// (`aeron-client/src/main/c/aeron_agent.c:286-294`), and the Java side has both
+/// spellings (`io.aeron.driver.Configuration:2114-2120`). It is here rather than
+/// in the crate that names it because it is one of the six, and a caller
+/// resolving a Java-side name gets the same [`Strategy`] the C-side loader
+/// gives.
+#[derive(Debug)]
+pub struct SleepingMillis {
+    period_ms: u64,
+}
+
+impl SleepingMillis {
+    /// What the strategy sleeps for when nothing named a period: **one
+    /// millisecond** (`SleepingMillisIdleStrategy.DEFAULT_SLEEP_PERIOD_MS`,
+    /// which is the no-argument constructor `agentIdleStrategy` calls).
+    pub const DEFAULT_PERIOD_MS: u64 = 1;
+
+    /// A strategy that sleeps for `period_ms` after a pass with no work.
+    pub const fn new(period_ms: u64) -> Self {
+        Self { period_ms }
+    }
+
+    /// Idle after a cycle that did `work_count` units of work.
+    pub fn idle(&mut self, work_count: usize) {
+        if 0 != work_count {
+            return;
+        }
+
+        std::thread::sleep(Duration::from_millis(self.period_ms));
+    }
+}
+
 /// Every strategy the reference can be configured with, by the names its own
 /// table answers to (`aeron_agent.c:286-294`).
 ///
@@ -163,9 +209,22 @@ impl Sleeping {
 /// its error arm when the loader returns null
 /// (`aeron_driver_context.c:1152-1158`), so a typo is not a strategy that
 /// quietly becomes backoff.
+///
+/// # Two tables, and this type is in both
+///
+/// The C driver loads a name through `aeron_idle_strategy_load` and the Java
+/// side resolves one through `io.aeron.driver.Configuration.agentIdleStrategy`
+/// (`:2098-2143`), and the two lists are **not** the same list: the Java one has
+/// aliases the C one has no spelling for (`sleep-ms`), accepts the six
+/// strategies' full class names as well, and falls back to loading an arbitrary
+/// class by reflection. [`Strategy::by_name`] is the C table and
+/// [`Strategy::by_agrona_name`] is the Java one; a caller uses the table its own
+/// reference reads, which for the media driver is the C one
+/// (`docs/CLAUDE.md`: the C implementation is the authority where one exists)
+/// and for the archive — which the C tree does not ship — the Java one.
 #[derive(Debug)]
 pub enum Strategy {
-    /// `sleeping`, `sleep-ns`.
+    /// `sleeping`, `sleep-ns`; Java calls the same one `SleepingIdleStrategy`.
     Sleeping(Sleeping),
     /// `yield`.
     Yielding,
@@ -175,6 +234,8 @@ pub enum Strategy {
     Noop,
     /// `backoff`.
     Backoff(Backoff),
+    /// `sleep-ms`, which only the Java table names.
+    SleepingMillis(SleepingMillis),
 }
 
 impl Strategy {
@@ -205,10 +266,57 @@ impl Strategy {
         }
     }
 
+    /// The strategy a **Java-side** configuration names
+    /// (`io.aeron.driver.Configuration.agentIdleStrategy`, `:2098-2143`).
+    ///
+    /// Two things about it differ from [`Strategy::by_name`], and both are the
+    /// Java table's own doing rather than this build's:
+    ///
+    /// * they are the **Agrona aliases** — `sleep-ms` and `controllable` are
+    ///   names the C loader has no arm for, and `sleep-ns` means something else
+    ///   here. `SleepingIdleStrategy()` with no constructor arguments sleeps for
+    ///   a **microsecond's worth of nanoseconds** (`DEFAULT_SLEEP_PERIOD_NS` is
+    ///   1000), where the C strategy's `NULL == init_args` arm sleeps for one
+    ///   nanosecond (`aeron_agent.c:56-59`);
+    /// * the six strategies are also spelled by their full class names, which
+    ///   the switch accepts beside the alias.
+    ///
+    /// The `default ->` arm there loads the named class by reflection, which a
+    /// Rust build cannot do; a custom Java `IdleStrategy` is therefore `None`
+    /// rather than a strategy this build does not have.
+    ///
+    /// `controllable` is `None` too, and for a subtler reason: its arm requires
+    /// a `StatusIndicator`, and the archive's supplier is built with `null` for
+    /// one (`Archive.java:1399` passes null into
+    /// `Configuration.idleStrategySupplier`, which forwards it at `:781`), so a
+    /// deployment that names it does not get a controllable strategy there — it
+    /// gets a `NullPointerException` out of `conclude`.
+    pub fn by_agrona_name(name: &str) -> Option<Self> {
+        match name {
+            "noop" | "org.agrona.concurrent.NoOpIdleStrategy" => Some(Self::Noop),
+            "spin" | "org.agrona.concurrent.BusySpinIdleStrategy" => Some(Self::BusySpinning),
+            "yield" | "org.agrona.concurrent.YieldingIdleStrategy" => Some(Self::Yielding),
+            "sleep-ns" | "org.agrona.concurrent.SleepingIdleStrategy" => Some(Self::Sleeping(
+                Sleeping::new(Sleeping::JAVA_DEFAULT_DURATION_NS),
+            )),
+            "sleep-ms" | "org.agrona.concurrent.SleepingMillisIdleStrategy" => Some(
+                Self::SleepingMillis(SleepingMillis::new(SleepingMillis::DEFAULT_PERIOD_MS)),
+            ),
+            // The Java driver's four numbers (`Configuration.java:487-504`),
+            // which are the same four the C strategy defaults to — so the two
+            // tables agree here by value even though they are different lists.
+            "backoff" | "org.agrona.concurrent.BackoffIdleStrategy" => {
+                Some(Self::Backoff(Backoff::new()))
+            }
+            _ => None,
+        }
+    }
+
     /// Idle after a cycle that did `work_count` units of work.
     pub fn idle(&mut self, work_count: usize) {
         match self {
             Self::Sleeping(strategy) => strategy.idle(work_count),
+            Self::SleepingMillis(strategy) => strategy.idle(work_count),
             // `sched_yield` (`aeron_idle_strategy_yielding_idle`,
             // `aeron_agent.c:68-76`).
             Self::Yielding => {
@@ -344,6 +452,118 @@ mod tests {
         }
 
         assert!(Strategy::by_name("sleep-ns", Some("1 fortnight")).is_none());
+    }
+
+    /// The Java table (`Configuration.java:2098-2143`), which is a *different*
+    /// list from the C one above — and the difference is the point of having it:
+    /// a name resolution that used the wrong table would accept `sleeping` on a
+    /// Java-side setting and refuse `sleep-ms`.
+    #[test]
+    fn the_java_table_is_a_different_list_with_the_same_six_strategies() {
+        for (name, expected) in [
+            ("noop", "Noop"),
+            ("spin", "BusySpinning"),
+            ("yield", "Yielding"),
+            ("sleep-ns", "Sleeping(1000ns)"),
+            ("sleep-ms", "SleepingMillis(1ms)"),
+            ("backoff", "Backoff(10,20,1000ns,1ms)"),
+        ] {
+            let strategy = Strategy::by_agrona_name(name).unwrap_or_else(|| {
+                panic!("{name} is one of the aliases the Java switch answers to")
+            });
+
+            assert_eq!(expected, describe(&strategy), "{name}");
+        }
+
+        // The six are also spelled by their full class names, which the switch
+        // accepts beside the aliases.
+        for (class_name, alias) in [
+            ("org.agrona.concurrent.NoOpIdleStrategy", "noop"),
+            ("org.agrona.concurrent.BusySpinIdleStrategy", "spin"),
+            ("org.agrona.concurrent.YieldingIdleStrategy", "yield"),
+            ("org.agrona.concurrent.SleepingIdleStrategy", "sleep-ns"),
+            (
+                "org.agrona.concurrent.SleepingMillisIdleStrategy",
+                "sleep-ms",
+            ),
+            ("org.agrona.concurrent.BackoffIdleStrategy", "backoff"),
+        ] {
+            assert_eq!(
+                describe(&Strategy::by_agrona_name(alias).expect("the alias")),
+                describe(&Strategy::by_agrona_name(class_name).expect("the class name")),
+                "{class_name} is {alias}"
+            );
+        }
+
+        // `sleeping` is the C loader's spelling and not an Agrona alias, and
+        // `controllable` is refused because its arm wants a `StatusIndicator`
+        // the archive does not give it.
+        for name in [
+            "sleeping",
+            "controllable",
+            "org.agrona.concurrent.ControllableIdleStrategy",
+        ] {
+            assert!(
+                Strategy::by_agrona_name(name).is_none(),
+                "{name} is not a name this table gives a strategy to"
+            );
+        }
+    }
+
+    /// `sleep-ns` means 1000 ns in the Java table and 1 ns in the C one, and the
+    /// two are read side by side: a caller that resolved a Java-side name
+    /// through the C loader would idle for a thousandth of what it asked for.
+    #[test]
+    fn the_two_tables_disagree_about_what_sleep_ns_defaults_to() {
+        let java = match Strategy::by_agrona_name("sleep-ns") {
+            Some(Strategy::Sleeping(sleeping)) => sleeping.duration_ns,
+            other => panic!("sleep-ns is a sleeping strategy: {other:?}"),
+        };
+
+        let c = match Strategy::by_name("sleep-ns", None) {
+            Some(Strategy::Sleeping(sleeping)) => sleeping.duration_ns,
+            other => panic!("sleep-ns is a sleeping strategy: {other:?}"),
+        };
+
+        assert_eq!(Sleeping::JAVA_DEFAULT_DURATION_NS, java);
+        assert_eq!(Sleeping::DEFAULT_DURATION_NS, c);
+        assert_ne!(java, c);
+    }
+
+    /// `work_count` is the whole of the condition for the added strategy too:
+    /// a pass that did work does not sleep (`SleepingMillisIdleStrategy.idle`).
+    #[test]
+    fn sleeping_millis_does_not_sleep_after_work() {
+        let mut idle = SleepingMillis::new(50);
+
+        let began = std::time::Instant::now();
+        idle.idle(1);
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "a pass with work does not idle at all"
+        );
+
+        let began = std::time::Instant::now();
+        idle.idle(0);
+        assert!(began.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// One strategy per line, for the table tests above.
+    fn describe(strategy: &Strategy) -> String {
+        match strategy {
+            Strategy::Noop => "Noop".to_owned(),
+            Strategy::BusySpinning => "BusySpinning".to_owned(),
+            Strategy::Yielding => "Yielding".to_owned(),
+            Strategy::Sleeping(sleeping) => format!("Sleeping({}ns)", sleeping.duration_ns),
+            Strategy::SleepingMillis(millis) => format!("SleepingMillis({}ms)", millis.period_ms),
+            Strategy::Backoff(backoff) => format!(
+                "Backoff({},{},{}ns,{}ms)",
+                backoff.max_spins,
+                backoff.max_yields,
+                backoff.min_park_ns,
+                backoff.max_park_ns / 1_000_000
+            ),
+        }
     }
 
     /// The three that take no arguments ignore theirs rather than refuse them,

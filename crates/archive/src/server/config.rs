@@ -34,6 +34,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::server::idle::IdleStrategy;
+
 /// How the archive's agents are run (`ArchiveThreadingMode.java:28-38`).
 ///
 /// The default is `Dedicated` (`Archive.java:394-397`), and this slice
@@ -137,6 +139,12 @@ pub enum ConfigError {
     /// A thread naming mode that is neither `classic` nor `new`
     /// (`CommonContext.java:563-565`).
     UnknownThreadNaming { value: String },
+    /// An idle strategy name this build has no strategy for
+    /// (`io.aeron.driver.Configuration.agentIdleStrategy:2098-2143`). The
+    /// reference refuses the same way for a name nothing answers to; see
+    /// [`crate::server::idle`] for the one class of name it accepts and this
+    /// build does not.
+    UnknownIdleStrategy { value: String },
     /// `aeron.archive.segment.file.length` is not a power of two
     /// (`Archive.java:1482-1485`).
     SegmentFileLengthNotPowerOfTwo { length: usize },
@@ -200,6 +208,11 @@ impl fmt::Display for ConfigError {
                     "aeron.archive.threading.mode={value} is not one of DEDICATED, SHARED, INVOKER"
                 )
             }
+            Self::UnknownIdleStrategy { value } => write!(
+                f,
+                "aeron.archive.idle.strategy={value} is not an idle strategy this build can \
+                 give an archive agent"
+            ),
             Self::UnknownThreadNaming { value } => {
                 write!(f, "aeron.thread.naming={value} is not one of classic, new")
             }
@@ -320,10 +333,14 @@ mod settings {
     /// `Archive.java:640`, default off, read at `:1017`. The recording side of
     /// the same choice.
     pub const RECORD_CHECKSUM: &str = "aeron.archive.record.checksum";
-    /// `Archive.java:376`, default the archive's own idle strategy (`:422`).
+    /// `Archive.java:400`; the default is `DEFAULT_IDLE_STRATEGY` at `:420`,
+    /// read by the conductor's supplier at `:776-784`.
+    ///
+    /// ★ **Honoured since P2-9a**, after being a name this build accepted and
+    /// ignored — see [`crate::server::idle`].
     pub const IDLE_STRATEGY: &str = "aeron.archive.idle.strategy";
 
-    /// ★ The four below belong to other slices, and this build **refuses them by
+    /// ★ The five below belong to other slices, and this build **refuses them by
     /// name** rather than accepting them silently: the cycle thresholds are
     /// P2-9b's counters, and the two idle strategies are P2-9a's threading work.
     /// A name that is accepted and does nothing would make those slices look
@@ -386,12 +403,10 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
         "the catalog is not forced to disk on a level",
     ),
     (
-        settings::IDLE_STRATEGY,
-        "P2-9a: this build's archive does not run agents of its own to idle",
-    ),
-    (
         settings::RECORDER_IDLE_STRATEGY,
-        "the same, for the recorder's",
+        "P2-9a: under `SHARED` the recorder is an invoker driven inside the conductor's turn \
+         and never idles on its own; the thread that would idle arrives with the recorder's \
+         own thread",
     ),
     (
         settings::REPLAYER_IDLE_STRATEGY,
@@ -539,6 +554,23 @@ pub struct ArchiveConfig {
     /// (`CommonContext.java:557-566`). Read only when there are threads to name
     /// — see [`crate::server::threading`].
     pub thread_naming: ThreadNaming,
+    /// How the conductor waits when it has nothing to do
+    /// (`Archive.java:400`, default `BackoffIdleStrategy` at `:420`).
+    ///
+    /// ★ **This is the conductor's, and it used to be hardcoded.** The loop
+    /// yielded (`launch::run`'s own `yield_now`), which is what the reference's
+    /// own C suite asks for by name (`TestArchive.h:47`,
+    /// `TestStandaloneArchive.h:122` both pass `aeron.archive.idle.strategy=yield`)
+    /// — so the suite could not tell the difference and a deployment that asked
+    /// for anything else was told nothing.
+    ///
+    /// The **recorder's and replayer's** names are a different question and are
+    /// still not honoured. Under `SHARED` neither agent has a runner of its own:
+    /// `SharedModeArchiveConductor.onStart` drives each through an
+    /// `AgentInvoker` (`:40-44`), which has no idle strategy at all, and the
+    /// conductor's `doWork` invokes both inside its own turn (`:57-64`). The
+    /// threads that would idle arrive with the agents' own threads (P2-9a).
+    pub idle_strategy: IdleStrategy,
     /// The authenticator to build (`Archive.java:590-597`).
     pub authenticator_supplier: String,
     /// The authorisation service to build (`Archive.java:603-610`).
@@ -688,6 +720,21 @@ impl ArchiveConfig {
             }
         };
 
+        // The reference's default is written as the **class name**
+        // (`Archive.java:420`), and a name it cannot resolve is a failure to
+        // start rather than a fall back — the supplier throws out of `conclude`
+        // (`:2134-2142`'s `default ->` arm rethrows the `ClassNotFoundException`).
+        // See [`crate::server::idle`] for the two names the reference resolves
+        // and this build refuses instead.
+        let idle_strategy = match get(settings::IDLE_STRATEGY) {
+            None => IdleStrategy::DEFAULT,
+            Some(value) => {
+                IdleStrategy::parse(value).ok_or_else(|| ConfigError::UnknownIdleStrategy {
+                    value: value.to_owned(),
+                })?
+            }
+        };
+
         let archive_id = match get(settings::ARCHIVE_ID) {
             // Absent is "not told", which the archive runs as
             // [`ARCHIVE_ID_DEFAULT`]. **A configured id is an id whatever its
@@ -801,6 +848,7 @@ impl ArchiveConfig {
             .unwrap_or(SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS),
             threading_mode,
             thread_naming,
+            idle_strategy,
             authenticator_supplier: non_empty(get(settings::AUTHENTICATOR_SUPPLIER))
                 .unwrap_or(AUTHENTICATOR_SUPPLIER_DEFAULT)
                 .to_owned(),
@@ -1238,6 +1286,12 @@ mod tests {
         assert_eq!(config.mark_file_dir, None);
         assert_eq!(config.threading_mode, ThreadingMode::Dedicated);
         assert_eq!(
+            config.idle_strategy,
+            IdleStrategy::Backoff,
+            "`aeron.archive.idle.strategy` is not one `TestArchive.h` sets, so its default is \
+             the one that shows (`Archive.java:420`)"
+        );
+        assert_eq!(
             config.archive_id, None,
             "-1, or nothing, is the client's own id"
         );
@@ -1274,6 +1328,51 @@ mod tests {
             ),
             "a value that is neither spelling is refused by name"
         );
+    }
+
+    /// `aeron.archive.idle.strategy` — the conductor's idle strategy, and the
+    /// **first** of the three names P2-9a owns to be honoured: the loop used to
+    /// hardcode the `yield` the reference's own suite asks for, so the name was
+    /// accepted and ignored and nothing could tell.
+    ///
+    /// The default is the reference's, written there as a class name
+    /// (`Archive.java:420`), and a name it cannot resolve is a refusal rather
+    /// than a fall back to it.
+    #[test]
+    fn the_idle_strategy_is_the_references_and_a_name_it_has_none_for_is_refused() {
+        // `archive_defaults` carries the suite's own `yield` (it mirrors
+        // `TestArchive.h:47`), so the default is asked of a list without it.
+        let mut unset = archive_defaults();
+        unset.retain(|(property, _)| property != settings::IDLE_STRATEGY);
+
+        let config = ArchiveConfig::resolve(&unset).expect("the defaults resolve");
+        assert_eq!(
+            config.idle_strategy,
+            IdleStrategy::Backoff,
+            "`DEFAULT_IDLE_STRATEGY` is `org.agrona.concurrent.BackoffIdleStrategy` (`:420`)"
+        );
+
+        // The suite's own setting, and the shape a deployment is most likely to
+        // write.
+        for name in ["yield", "org.agrona.concurrent.YieldingIdleStrategy"] {
+            let config = resolve_with(&archive_defaults(), settings::IDLE_STRATEGY, name)
+                .unwrap_or_else(|error| panic!("{name} is a name the reference resolves: {error}"));
+            assert_eq!(config.idle_strategy, IdleStrategy::Yielding, "{name}");
+        }
+
+        // `controllable` wants a `StatusIndicator` the archive does not give it,
+        // and the reference's own `default ->` arm loads a class by reflection —
+        // neither is a strategy this build can hand an agent, so both are
+        // refused by name rather than idled as something else.
+        for name in ["controllable", "com.example.MyIdleStrategy"] {
+            assert!(
+                matches!(
+                    resolve_with(&archive_defaults(), settings::IDLE_STRATEGY, name),
+                    Err(ConfigError::UnknownIdleStrategy { value }) if value == name
+                ),
+                "{name} is refused by name"
+            );
+        }
     }
 
     #[test]
@@ -1473,6 +1572,14 @@ mod tests {
             (settings::CONDUCTOR_CYCLE_THRESHOLD, "5ms"),
             (settings::RECORDER_CYCLE_THRESHOLD, "7ms"),
             (settings::REPLAYER_CYCLE_THRESHOLD, "9ms"),
+            // P2-9a: the conductor's idle strategy, which used to be a name this
+            // build accepted and did nothing with — the loop yielded whatever it
+            // was told. Given as the **class name**, which is how the
+            // reference's own default is written (`Archive.java:420`).
+            (
+                settings::IDLE_STRATEGY,
+                "org.agrona.concurrent.SleepingIdleStrategy",
+            ),
         ];
 
         // (name, a value) — the one the reference has that this build refuses
