@@ -287,6 +287,67 @@ pub struct DutyCycleCounters {
     last_update_ns: i64,
 }
 
+/// The six registrations an archive's duty-cycle counters were **asked** for
+/// with (`ArchiveCounters.allocate`, `ArchiveCounters.java:52-69`).
+///
+/// Asking and taking up are two steps for the reason
+/// [`DutyCycles::claim`] gives, and the registration ids are what carries
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DutyCycleRequests {
+    /// The six registrations, in the order they were asked for: a maximum and
+    /// its threshold, per actor.
+    registrations: [i64; 6],
+    /// What each pair is measured against, which the 104 labels already spell.
+    thresholds_ns: [i64; 3],
+}
+
+impl DutyCycleRequests {
+    /// Ask for all six, in the reference's order, and do not wait for the
+    /// answers.
+    ///
+    /// # Errors
+    ///
+    /// [`CounterError`] if a command could not be sent.
+    pub fn request<C: Counters>(
+        client: &mut C,
+        archive_id: i64,
+        mode: &str,
+        thresholds_ns: [i64; 3],
+        timeout: Duration,
+    ) -> Result<Self, CounterError> {
+        let key = archive_id_key(archive_id);
+        let mut registrations = [0_i64; 6];
+
+        for (index, (actor, threshold_ns)) in DutyCycleActor::ALL
+            .into_iter()
+            .zip(thresholds_ns)
+            .enumerate()
+        {
+            let max_label = max_cycle_time_label(actor, mode, archive_id);
+            registrations[index * 2] = client.async_add_counter(
+                ARCHIVE_MAX_CYCLE_TIME_TYPE_ID,
+                &key,
+                &max_label,
+                timeout,
+            )?;
+
+            let exceeded_label = threshold_exceeded_label(actor, mode, threshold_ns, archive_id);
+            registrations[index * 2 + 1] = client.async_add_counter(
+                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
+                &key,
+                &exceeded_label,
+                timeout,
+            )?;
+        }
+
+        Ok(Self {
+            registrations,
+            thresholds_ns,
+        })
+    }
+}
+
 /// **The three agents' counters, allocated together** (`Archive.java:1402-1480`).
 ///
 /// Six counters, and in `SHARED` — the only mode this build runs — **one of the
@@ -300,58 +361,78 @@ pub struct DutyCycles {
 }
 
 impl DutyCycles {
-    /// Allocate all six (`Archive.java:1402-1480`, through
-    /// `ArchiveCounters.allocate`).
+    /// Take up the six counters [`DutyCycleRequests::request`] asked for, once
+    /// the driver has allocated them.
+    ///
+    /// `Ok(None)` means "not yet" rather than "no", exactly as
+    /// [`claim_control_sessions_counter`] does — and this is the shape the
+    /// archive's counters all take here, because a conductor is driven inside
+    /// the turn that drives the driver: a blocking `add_counter` would wait for
+    /// a driver nobody is driving, which is not hypothetical — the
+    /// archiving-media-driver binary is exactly that process, and a blocking
+    /// allocation there times out against the driver's own heartbeat.
     ///
     /// # Errors
     ///
-    /// [`CounterError`] if a counter was refused, or if what came back is not the
-    /// type id it was asked for — the check the reference makes at `:1479`, and
-    /// the reason an archive whose counters no tool can find does not start.
-    pub fn allocate<C: Counters, Access>(
+    /// [`CounterError`] if the driver refused one, or if what came back is not
+    /// the type id it was asked for.
+    pub fn claim<C: Counters, Access>(
         client: &mut C,
         counters: &CountersReader<'_, Access>,
-        archive_id: i64,
-        mode: &str,
-        thresholds_ns: [i64; 3],
+        requests: &DutyCycleRequests,
         now_ns: i64,
-        timeout: Duration,
-    ) -> Result<Self, CounterError> {
-        let key = archive_id_key(archive_id);
-        let mut allocated = Vec::with_capacity(3);
+    ) -> Result<Option<Self>, CounterError> {
+        let mut ids = [0_i32; 6];
 
-        for (actor, threshold_ns) in DutyCycleActor::ALL.into_iter().zip(thresholds_ns) {
-            let max_label = max_cycle_time_label(actor, mode, archive_id);
-            let max_cycle_time_id =
-                client.add_counter(ARCHIVE_MAX_CYCLE_TIME_TYPE_ID, &key, &max_label, timeout)?;
-            check_type_id(counters, max_cycle_time_id, ARCHIVE_MAX_CYCLE_TIME_TYPE_ID)?;
+        for (index, registration_id) in requests.registrations.iter().enumerate() {
+            let type_id = if index % 2 == 0 {
+                ARCHIVE_MAX_CYCLE_TIME_TYPE_ID
+            } else {
+                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID
+            };
 
-            let exceeded_label = threshold_exceeded_label(actor, mode, threshold_ns, archive_id);
-            let threshold_exceeded_id = client.add_counter(
-                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
-                &key,
-                &exceeded_label,
-                timeout,
-            )?;
-            check_type_id(
-                counters,
-                threshold_exceeded_id,
-                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
-            )?;
+            // ★ **The client is asked first.** A reply that has been read is one
+            // the client has already adopted (`Client::poll` registers the
+            // counter and takes the pending entry with it), so `poll_counter`
+            // answers `Unknown` for a counter that is right there — measured:
+            // `known=Some(49) poll=Unknown`, and this order is what makes the
+            // difference between taking the counters up and asking forever.
+            let counter_id = if let Some(counter_id) = client.counter_id(*registration_id) {
+                counter_id
+            } else {
+                match client.poll_counter(*registration_id) {
+                    AsyncAddPoll::Ready => {
+                        let Some(counter_id) = client.counter_id(*registration_id) else {
+                            return Ok(None);
+                        };
 
-            allocated.push(DutyCycleCounters {
-                max_cycle_time_id,
-                threshold_exceeded_id,
+                        counter_id
+                    }
+                    AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+                    AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
+                }
+            };
+
+            check_type_id(counters, counter_id, type_id)?;
+            ids[index] = counter_id;
+        }
+
+        let mut counters_out = Vec::with_capacity(3);
+
+        for (index, threshold_ns) in requests.thresholds_ns.into_iter().enumerate() {
+            counters_out.push(DutyCycleCounters {
+                max_cycle_time_id: ids[index * 2],
+                threshold_exceeded_id: ids[index * 2 + 1],
                 threshold_ns,
                 last_update_ns: now_ns,
             });
         }
 
-        Ok(Self {
-            counters: allocated
+        Ok(Some(Self {
+            counters: counters_out
                 .try_into()
-                .unwrap_or_else(|_| unreachable!("three actors, three counters")),
-        })
+                .unwrap_or_else(|_| unreachable!("three actors, three pairs")),
+        }))
     }
 
     /// The pair one actor's cycles are measured into.
@@ -716,15 +797,25 @@ pub fn claim_control_sessions_counter<C: Counters, Access>(
     counters: &CountersReader<'_, Access>,
     registration_id: i64,
 ) -> Result<Option<ControlSessionsCounter>, CounterError> {
-    let counter_id = match client.poll_counter(registration_id) {
-        AsyncAddPoll::Ready => {
-            let Some(counter_id) = client.counter_id(registration_id) else {
-                return Ok(None);
-            };
-            counter_id
+    // ★ **The client is asked first**, and this was a defect until it was: a
+    // reply the client has already read is one it has adopted, and it takes the
+    // pending entry with it — so polling first answered `Unknown` for a counter
+    // that was right there, and the archive never took up its session count (the
+    // 102 stayed at zero for the life of the process). Measured on the duty-cycle
+    // pair the same way: `known=Some(49) poll=Unknown`.
+    let counter_id = if let Some(counter_id) = client.counter_id(registration_id) {
+        counter_id
+    } else {
+        match client.poll_counter(registration_id) {
+            AsyncAddPoll::Ready => {
+                let Some(counter_id) = client.counter_id(registration_id) else {
+                    return Ok(None);
+                };
+                counter_id
+            }
+            AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+            AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
         }
-        AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
-        AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
     };
 
     check_type_id(counters, counter_id, ARCHIVE_CONTROL_SESSIONS_TYPE_ID)?;
