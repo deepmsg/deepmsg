@@ -170,6 +170,7 @@ jobs:
             archive-suite.tsv.d/
             archive-suite/shim.log
             suite-exit.txt
+            archive-suite-table.md
           if-no-files-found: ignore
 
       # ★ The baseline, pinned. The four are the reference's own drop-wait races
@@ -213,10 +214,14 @@ jobs:
 
       # The acceptance for this job is the table itself, on the pull request, so
       # it is rendered whether or not the run above passed.
+      # Written to a file, appended to the summary and printed: the summary is
+      # what a reader of the pull request sees, and the other two are what makes
+      # it checkable from the log and from the artifact.
       - name: The table
         if: always()
         run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' > archive-suite-table.md
+
           from collections import Counter
           from pathlib import Path
 
@@ -257,3 +262,4 @@ jobs:
               print(f"| `{case}` | `{binary}` | {status} |")
           print("\n</details>")
           PY
+          cat archive-suite-table.md | tee -a "$GITHUB_STEP_SUMMARY"
