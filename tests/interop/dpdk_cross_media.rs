@@ -143,6 +143,94 @@ fn media_counters(cnc: &CncFile, type_id: i32) -> Vec<i64> {
     found
 }
 
+/// A `tcpdump` on the kernel's side of the cable, for the length of one
+/// crossing.
+///
+/// **The kernel's side is the only place a capture can be taken**, and that is
+/// not a preference: the port this driver drives is bound to `vfio-pci`, so the
+/// kernel has no interface for it and no `tcpdump` can see it. The other end of
+/// the cable is an ordinary `ixgbe` interface, and everything that crosses —
+/// our frames and the reference's — passes through it.
+///
+/// Text rather than a capture file: what this is evidence *of* is that ARP
+/// crossed in both directions, and `tcpdump -e` writes exactly the sentences
+/// that say so.
+struct ArpCapture {
+    child: std::process::Child,
+}
+
+impl ArpCapture {
+    /// Start watching `interface`, or [`None`] when there is no `tcpdump` to
+    /// run — the same "announce and carry on" a missing sample gets.
+    fn start(interface: &str) -> Option<Self> {
+        let child = std::process::Command::new("tcpdump")
+            .args(["-i", interface, "-n", "-e", "-l", "arp"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+
+        // It has to be listening before the first frame goes out, and `tcpdump`
+        // says so on its stdout — but it says so *unbuffered* only with `-l`,
+        // which is why that flag is there.
+        std::thread::sleep(Duration::from_millis(300));
+
+        Some(Self { child })
+    }
+
+    /// Stop watching and hand back everything it saw.
+    fn lines(mut self) -> String {
+        let _ = self.child.kill();
+        let output = self.child.wait_with_output().expect("tcpdump's output");
+
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+}
+
+/// Forget what this machine's kernel knows about `address`, so the next frame
+/// for it has to be asked about.
+///
+/// The kernel caches what it learns — including from the *requests* it hears,
+/// which is how it learns this driver's address in the first case — so a second
+/// case that needs the kernel to ask would see no request at all. Measured: the
+/// second run of the publishing case captured an empty file for exactly that
+/// reason.
+fn forget_the_kernels_neighbour(address: &str, interface: &str) {
+    let _ = std::process::Command::new("ip")
+        .args(["neigh", "flush", address, "dev", interface])
+        .status();
+}
+
+/// `address` was asked for on the wire and answered.
+///
+/// A frame cannot leave without this: the peer's MAC is unknown to both stacks,
+/// and neither has a kernel to ask for the other's. What is asserted per case is
+/// the exchange **that case's traffic needed** — the initiator resolves the
+/// address it is about to send to, and the responder's reply is the other
+/// half:
+///
+/// * our driver publishing to the reference's address asks the **kernel** for
+///   it, and this driver's answer is not "proved" here — the kernel answering
+///   is the foreign implementation's half;
+/// * the reference publishing to ours asks **us**, and our stack's reply is
+///   what the capture shows.
+///
+/// Together the two cases cover both directions, which is what the plan asks
+/// for; neither covers both alone, because in each one only the sender has a
+/// reason to ask. (The other direction's *frames* still flow — the receiving
+/// side learns the sender's hardware address from the request itself, which is
+/// why one exchange is enough for a stream that goes both ways.)
+fn assert_arp_crossed(capture: &str, address: &str) {
+    assert!(
+        capture.contains(&format!("Request who-has {address}")),
+        "nobody asked for {address}'s hardware address on the wire:\n{capture}"
+    );
+    assert!(
+        capture.contains(&format!("Reply {address} is-at")),
+        "{address} was asked for and never answered:\n{capture}"
+    );
+}
+
 /// Wait until this driver's port is on the wire.
 ///
 /// **Nothing may be sent before this**, and that is a measurement rather than a
@@ -266,6 +354,10 @@ fn our_driver_publishes_across_a_real_port_to_the_reference() {
 
     await_the_media_link(&own_cnc);
 
+    // From here the wire is watched: both stacks have to find each other's
+    // hardware address before a frame can go anywhere.
+    let arp = ArpCapture::start(&variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT));
+
     let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
     let publication = client
         .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
@@ -291,6 +383,14 @@ fn our_driver_publishes_across_a_real_port_to_the_reference() {
         "the reference's subscriber never saw the message:\n{}",
         subscriber.output()
     );
+
+    // Both stacks had to find each other's hardware address before any of this
+    // could happen, and the kernel's side of the cable is where that is
+    // visible. This case's sender is this driver, so the address resolved here
+    // is the reference's — by the kernel, from the other end of the cable.
+    if let Some(arp) = arp {
+        assert_arp_crossed(&arp.lines(), REFERENCE);
+    }
 
     // And it crossed *here*, which is the assertion this file exists for.
     assert_the_media_carried_it(&own_cnc);
@@ -328,6 +428,10 @@ fn our_driver_subscribes_across_a_real_port_from_the_reference() {
     let own_cnc = own
         .await_cnc(READY_TIMEOUT)
         .expect("this driver publishes a CnC file");
+
+    let interface = variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT);
+    forget_the_kernels_neighbour(OWN, &interface);
+    let arp = ArpCapture::start(&interface);
 
     // Our subscription binds our own address, which is the port's: nothing on
     // the kernel has it, so the media is the only thing that can serve it. The
@@ -395,8 +499,154 @@ fn our_driver_subscribes_across_a_real_port_from_the_reference() {
         publisher.output()
     );
 
+    // And here the sender is the reference, so what the capture shows is the
+    // kernel asking *this* driver for its hardware address — the media's own
+    // ARP answering a foreign stack.
+    if let Some(arp) = arp {
+        assert_arp_crossed(&arp.lines(), OWN);
+    }
+
     assert_the_media_carried_it(&own_cnc);
 
     let _ = own.stop();
     let _ = reference.stop();
+}
+
+/// A frame this driver withholds on the way out is asked for again, over the
+/// port it drives.
+///
+/// `deepmsg.debug.send.data.loss.drop.every` is this build's own injection
+/// point — it holds a frame back while recording it as sent, so a real hole
+/// appears on the wire — and what fills it is the *reference's* NAK coming back
+/// to a driver whose receive path is a port it drives itself. That is the
+/// pairing worth having: the sender of the NAK is a foreign implementation.
+///
+/// **What this can and cannot assert**: the interceptor's generator is
+/// per-channel here where the reference's is process-wide (recorded in
+/// `docs/compat.md`), so "the third frame was the one dropped" is not a claim
+/// either side can make. What is asserted is that the stream arrives whole and
+/// that *this* driver counted a retransmission — a hole, and the answer to it.
+#[test]
+#[ignore = "needs two cabled ports, one bound to vfio-pci, and the kernel's half configured"]
+fn a_withheld_frame_is_asked_for_again_over_the_port() {
+    assert!(
+        the_kernel_holds(REFERENCE),
+        "the kernel has to hold {REFERENCE} on {} (see this file's runbook)",
+        variable(REFERENCE_INTERFACE, REFERENCE_INTERFACE_DEFAULT)
+    );
+
+    let Some(subscriber_binary) = samples::locate("BasicSubscriber") else {
+        driver::announce_tool_skip("BasicSubscriber");
+        return;
+    };
+    let Some((mut reference, reference_dir)) = reference_driver("dpc-reference-lossy") else {
+        driver::announce_skip();
+        return;
+    };
+
+    let port = 40_900 + (std::process::id() % 100) as u16;
+    let channel = format!("aeron:udp?endpoint={REFERENCE}:{port}");
+
+    let mut subscriber = samples::Sample::start(
+        &subscriber_binary,
+        "subscriber",
+        &reference_dir,
+        &["-c", &channel, "-s", &STREAM_ID.to_string()],
+    );
+    subscriber.await_output(READY_TIMEOUT, "its channel", |output| {
+        output.contains("Subscribing to channel")
+    });
+
+    let _reference_cnc = reference
+        .await_cnc(READY_TIMEOUT)
+        .expect("the reference driver publishes a CnC file");
+
+    // One frame in four, counted over frames: the `SETUP` and the status
+    // messages that share the slot are counted with the data.
+    let port_number = variable(OWN_PCI, OWN_PCI_DEFAULT);
+    let address = format!("{OWN}/{PREFIX}");
+    let Some(mut own) = OwnDriver::start_with_env(
+        "dpc-our-lossy-publisher",
+        &[
+            &format!("-Ddeepmsg.dpdk.port={port_number}"),
+            &format!("-Ddeepmsg.dpdk.ipv4.address={address}"),
+            "-Daeron.threading.mode=SHARED",
+            "-Ddeepmsg.debug.send.data.loss.drop.every=4",
+        ],
+        &[("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk")],
+    ) else {
+        driver::announce_own_skip();
+        return;
+    };
+    let own_cnc = own
+        .await_cnc(READY_TIMEOUT)
+        .expect("this driver publishes a CnC file");
+    await_the_media_link(&own_cnc);
+
+    let mut client = Client::connect(own.aeron_dir()).expect("connect our client");
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("our driver confirms the publication");
+
+    // Twenty messages, so that several are withheld: the count is per frame and
+    // a stream of one could slip between two drops.
+    const MESSAGES: usize = 20;
+    let payloads: Vec<String> = (0..MESSAGES).map(|i| format!("t5-loss-{i:03}")).collect();
+
+    // **One message is offered until the far end has it, and only then the
+    // next.** Offering the batch as fast as the publication accepts it is what
+    // the first version of this case did, and it does not work: a publication
+    // with no image yet accepts everything into its term and sends none of it,
+    // so the subscriber's image — which forms from the `SETUP` that follows —
+    // joins behind data that was never put on the wire. Waiting for each
+    // message to be *seen* is also what makes the injection mean something:
+    // a withheld frame is a message that does not appear until the NAK comes
+    // back and the retransmission lands.
+    let deadline = Instant::now() + CROSSING_TIMEOUT;
+    let mut index = 0usize;
+
+    while index < MESSAGES && Instant::now() < deadline {
+        let _ = client.offer(publication, payloads[index].as_bytes());
+        client.poll();
+        std::thread::sleep(Duration::from_millis(2));
+
+        if subscriber.output().contains(&payloads[index]) {
+            index += 1;
+        }
+    }
+
+    let offered = index;
+
+    let last = payloads.last().cloned().expect("a last payload");
+    let output = subscriber.await_output(Duration::from_secs(30), "every message", |output| {
+        output.contains(&last)
+    });
+
+    let retransmits = counter_value_of(
+        &own_cnc,
+        deepmsg_driver::system_counters::id::RETRANSMITS_SENT,
+    );
+
+    let _ = subscriber.terminate(Duration::from_secs(5));
+    let _ = own.stop();
+    let _ = reference.stop();
+
+    assert!(offered > 0, "the publication was offered nothing");
+    for payload in &payloads {
+        assert!(
+            output.contains(payload),
+            "the reference's subscriber never saw {payload}, so a withheld \
+             frame was not recovered:\n{output}"
+        );
+    }
+    assert!(
+        retransmits.is_some_and(|value| value > 0),
+        "a withheld frame is one a receiver has to ask for, and this driver \
+         counted no retransmission: {retransmits:?}\n{output}"
+    );
+}
+
+/// The value of one system counter, by id, out of a driver's CnC file.
+fn counter_value_of(cnc: &CncFile, counter_id: i32) -> Option<i64> {
+    cnc.counters()?.value(counter_id)
 }
