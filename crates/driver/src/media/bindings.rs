@@ -131,29 +131,33 @@ impl PartialEq for TransportBindings {
 
 impl Eq for TransportBindings {}
 
-/// Whether the kernel is the thing that holds `address`: loopback, or an
-/// address one of its interfaces has.
+/// Whether a frame for `address` can **only** be delivered by the kernel:
+/// loopback, and nothing else.
 ///
-/// A media that drives a port itself cannot reach either. Its frames go out of
-/// that port and nowhere else, so a channel whose peer is an address the kernel
-/// holds belongs to the kernel even when the channel named no local address of
-/// its own (design §4.9, Q1a) — which is every publication in the reference's
-/// system tests and this build's interop tests, all of which name `localhost`.
+/// A media that drives a port itself puts its frames on that port and nowhere
+/// else, so a channel whose peer is loopback is one the media cannot serve: a
+/// datagram for `127.0.0.1` never reaches a wire. That is the whole of the
+/// fallback for a channel that named no local address of its own, and it is
+/// what keeps every publication in the reference's system tests and this
+/// build's interop tests — all of which name `localhost` — working on a driver
+/// whose data paths are on a port it drives (design §4.9, Q1a).
 ///
-/// A lookup that could not be made is **not** an answer that the address is the
-/// kernel's: the media is the one the driver was configured for, and a channel
-/// the media cannot reach says so there — `ENETUNREACH`, off this link — rather
-/// than being moved to a socket the configuration did not ask for.
-fn the_kernel_holds(address: Ipv4Addr) -> bool {
-    crate::sys::interface_for_address(
-        crate::sys::AddressFamily::Inet,
-        IpAddr::V4(address),
-        // The whole address, so the match is the address and not the net it
-        // sits in: `127.0.0.2` is not held by a machine whose loopback is
-        // `127.0.0.1`, and a publication to it is not the kernel's to serve.
-        32,
-    )
-    .is_ok_and(|held| held.is_some())
+/// **It is deliberately not "an address one of the machine's interfaces
+/// has".** That was the first reading, and it makes the answer depend on what
+/// the machine happens to have configured: a peer that is a *routable* address
+/// the kernel also holds — the reference driver's own address, when both ends
+/// are ports of one machine, which is exactly the shape a cross-media test has
+/// — would be handed to the kernel, and the frames a publication puts on a
+/// wire would never reach the media at all. A routable address is one the
+/// media must carry, because carrying it is what putting frames on a wire
+/// means. The kernel is the fallback for what the wire cannot do.
+///
+/// Nothing is asked of the interface list, so the answer is the same on every
+/// machine — and a channel naming an address the media cannot reach says so
+/// there, as `ENETUNREACH`, rather than being moved to a socket the
+/// configuration did not ask for.
+fn only_the_kernel_can_reach(address: Ipv4Addr) -> bool {
+    address.is_loopback()
 }
 
 /// Whether an agent configured with this strategy stays on its core.
@@ -450,10 +454,12 @@ impl TransportBindings {
     ///   publication — binds the wildcard, and a wildcard is not an address
     ///   anybody holds. It is the **media's**, because the media is the thing
     ///   that assigns it a port and its own address, **unless the channel is
-    ///   talking to an address the kernel holds** (loopback, another local
-    ///   interface), which only the kernel can reach. The destination is
-    ///   consulted for that one case and no other; the design's "the key is the
-    ///   local side, not the peer" holds everywhere the local side was written.
+    ///   talking to loopback**, which a frame on a wire can never reach. The
+    ///   destination is consulted for that one case and no other; the design's
+    ///   "the key is the local side, not the peer" holds everywhere the local
+    ///   side was written
+    ///   ([`only_the_kernel_can_reach`] has why the fallback is loopback and
+    ///   not "any address this machine has").
     ///
     /// Multi-destination and multicast channels reach here too and are answered
     /// by the same rule: a group address is refused before a transport is
@@ -481,7 +487,7 @@ impl TransportBindings {
         }
 
         match connect.map(|peer| peer.ip()) {
-            Some(IpAddr::V4(peer)) if the_kernel_holds(peer) => None,
+            Some(IpAddr::V4(peer)) if only_the_kernel_can_reach(peer) => None,
             _ => Some(stack),
         }
     }
@@ -661,8 +667,8 @@ mod tests {
         );
 
         // No local address named: a send endpoint binds the wildcard, which is
-        // the media's — the peer decides only when the kernel is the only one
-        // that can reach it.
+        // the media's — the peer decides only when a frame on a wire could not
+        // reach it at all, which is loopback and nothing else.
         assert!(
             serves("0.0.0.0:0", Some("10.10.0.2:40500")),
             "a publication to the port's own net is the media's"
@@ -671,6 +677,12 @@ mod tests {
             serves("0.0.0.0:0", Some("192.0.2.5:40456")),
             "and so is one to an address nobody holds at all — off this link, \
              which the media is then the one to refuse (`ENETUNREACH`)"
+        );
+        assert!(
+            serves("0.0.0.0:0", Some("10.10.1.7:40456")),
+            "and one to a routable address this machine may hold itself, which \
+             is what a cross-media test's peer is: the answer does not depend \
+             on what the machine has configured"
         );
         assert!(
             !serves("0.0.0.0:0", Some("127.0.0.1:40456")),
@@ -811,16 +823,40 @@ mod tests {
         );
     }
 
-    /// The predicate itself, pinned against the kernel's own answer rather than
-    /// by naming an interface: loopback is held by every machine, and an
-    /// address from the range reserved for documentation
-    /// (`192.0.2.0/24`, RFC 5737) is held by none — which is the pair that
-    /// matters, because "another interface's address" is not portable between
-    /// machines and is the same lookup answering yes.
+    /// The fallback predicate: loopback is the kernel's and nothing else is,
+    /// and the test says so without asking any machine anything — which is the
+    /// point of the rule rather than a property of this test.
+    ///
+    /// An address from the range reserved for documentation (`192.0.2.0/24`,
+    /// RFC 5737) is the one that says "a routable address is the media's"
+    /// without depending on what this machine has configured: whether the
+    /// kernel *also* holds it is no longer the question, and the third address
+    /// here — a port's own address on a machine that has one — is the case
+    /// that made the difference (a cross-media test's peer is the other end of
+    /// the same machine).
     #[test]
-    fn the_kernel_holds_loopback_and_not_a_reserved_address() {
-        assert!(the_kernel_holds(Ipv4Addr::LOCALHOST));
-        assert!(!the_kernel_holds(Ipv4Addr::new(192, 0, 2, 5)));
+    fn only_loopback_cannot_be_reached_over_a_wire() {
+        assert!(only_the_kernel_can_reach(Ipv4Addr::LOCALHOST));
+        assert!(
+            only_the_kernel_can_reach(Ipv4Addr::new(127, 0, 0, 2)),
+            "the whole of 127/8 is loopback, and a frame for any of it stays \
+             inside the machine"
+        );
+
+        for routable in [
+            // Reserved for documentation: no machine holds it, and it is still
+            // the media's — a channel naming it says the media is what could
+            // reach it, or `ENETUNREACH` if it cannot.
+            Ipv4Addr::new(192, 0, 2, 5),
+            // And one a machine may well hold itself, which is what the rule
+            // had to stop asking about.
+            Ipv4Addr::new(10, 10, 0, 2),
+        ] {
+            assert!(
+                !only_the_kernel_can_reach(routable),
+                "{routable} is a frame on a wire's to carry"
+            );
+        }
     }
 
     /// The kernel's own bindings carry everything, which is what makes the
