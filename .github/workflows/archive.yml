@@ -134,13 +134,29 @@ jobs:
       - name: Run the suite, case by case
         run: |
           set +e
+          mkdir -p archive-suite
           .github/scripts/archive-suite.py ../aeron/cppbuild/archive-suite archive-suite.tsv \
             --mode deepmsg \
             --driver "${{ github.workspace }}/target/debug/deepmsg-driver" \
             --archiving-media-driver "${{ github.workspace }}/target/debug/deepmsg-archiving-media-driver" \
             --archive "${{ github.workspace }}/target/debug/deepmsg-archive" \
+            --log "${{ github.workspace }}/archive-suite/shim.log" \
             --binary-timeout 2400
           echo "the suite exited $?" | tee suite-exit.txt
+
+      # The table and the shim's log are the two things a red run is diagnosed
+      # from, and neither is in the job's log: the runner writes the first to a
+      # file, and the archive's own output goes through the shim into the second.
+      - name: Keep the table and the shim's log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-suite
+          path: |
+            archive-suite.tsv
+            archive-suite/shim.log
+            suite-exit.txt
+          if-no-files-found: ignore
 
       # ★ The baseline, pinned. The four are the reference's own drop-wait races
       # (the header names them and `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`
