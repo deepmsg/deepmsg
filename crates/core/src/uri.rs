@@ -820,6 +820,12 @@ pub fn parse_size(text: &str) -> Option<i32> {
 /// and microseconds: `1000000ns` is `1ms`, `1000ns` is `1us`, and `1001ns`
 /// stays in nanoseconds. Nothing coarser than a second is ever written —
 /// an hour is `3600s`.
+///
+/// ★ The unit is the **largest one that divides it exactly**, which
+/// `aeron_format_duration_ns` (`aeron-client/src/main/c/util/aeron_parse_util.c:270-333`)
+/// spells out as "divisible by a second, else by a millisecond, else by a
+/// microsecond, else nanoseconds" — so a second and a half is `1500ms` and not
+/// `1500000000ns`, and 1500 nanoseconds is `1500ns`.
 pub fn format_duration_ns(value_ns: i64) -> String {
     for (unit, suffix) in [(1_000_000_000, "s"), (1_000_000, "ms"), (1_000, "us")] {
         if value_ns >= unit && value_ns % unit == 0 {

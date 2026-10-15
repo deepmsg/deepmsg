@@ -47,6 +47,8 @@ use deepmsg_archive::client::RecordingDescriptor;
 use deepmsg_archive::server::conductor::{ARCHIVE_ID_DEFAULT, NULL_POSITION};
 use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_client::client::Client;
+use deepmsg_cnc::counters::CountersReader;
+use deepmsg_core::buffer::ReadOnly;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
@@ -403,4 +405,157 @@ fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64)
         .expect("the slot is not poisoned")
         .take()
         .expect("the archive offered a descriptor")
+}
+
+/// ★ **P2-9b: the six duty-cycle counters** (`Archive.java:1402-1480`).
+///
+/// Three pairs — the conductor's, the recorder's and the replayer's — with the
+/// labels `AeronStat` reads. The acceptance for this slice is that a reader sees
+/// what the archive was told, so what is asserted is that all six are **there**,
+/// with the reference's labels, on a running archive.
+///
+/// ★ And that in `SHARED` exactly **one** pair is measured: the conductor's
+/// maximum cycle time has moved by the time the archive has served, because the
+/// reference measures it on every turn (`ArchiveConductor.doWork:374`), while
+/// the other two stay at zero — the reference only measures those from
+/// `DedicatedModeArchiveConductor` (`:191`, `:346`), which this build does not
+/// have.
+#[test]
+fn the_archive_allocates_the_duty_cycle_counters() {
+    let archive_dir = TempDir::new("archive-cycle-counters");
+
+    // ★ The archive's own threading mode, said out loud: its default is
+    // `DEDICATED` (`Archive.java:393`) while this build runs `SHARED` and only
+    // `SHARED` — so a deployment that says nothing gets 103/104 labels naming a
+    // mode it is not running. That is recorded in the plan rather than papered
+    // over here; what it means for this case is that the mode has to be given for
+    // the labels to be the ones this archive's behaviour deserves.
+    let mut properties = PROPERTIES.to_vec();
+    properties.push("-Daeron.archive.threading.mode=SHARED");
+
+    let Some(mut media_driver) =
+        OwnArchivingMediaDriver::start("archive-cycle-counters", archive_dir.path(), &properties)
+    else {
+        archiving_driver::announce_skip();
+        return;
+    };
+
+    media_driver
+        .await_ready(DEADLINE)
+        .expect("the archiving media driver must come up and signal its mark file");
+
+    let aeron_dir = media_driver.aeron_dir().to_path_buf();
+    let client = Client::connect(&aeron_dir).expect("connect to the driver");
+
+    // The archive's own turns are what moves these, so the wait is for the first
+    // turn that had a cycle to report.
+    let deadline = Instant::now() + DEADLINE;
+
+    loop {
+        let counters = client.counters_reader().expect("a counters region");
+
+        if counter_of(&counters, 103, "archive-conductor").is_some_and(|value| value > 0) {
+            break;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the archive never measured a conductor cycle; the 103s it holds are {:?} ({})",
+            counters_of(&counters, 103, "archive-"),
+            media_driver.log_tail(20),
+        );
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let counters = client.counters_reader().expect("a counters region");
+
+    // ★ **Six counters, and the labels are the reference's** (`Archive.java:1407`
+    // and `:1412-1415`): the mode this build runs, and the default threshold in
+    // `SystemUtil.formatDuration`'s spelling.
+    for actor in ["conductor", "recorder", "replayer"] {
+        let max = counters_of(&counters, 103, &format!("archive-{actor} max cycle time"));
+        assert_eq!(1, max.len(), "{actor}'s 103, found {max:?}");
+        assert!(
+            max[0].0.starts_with(&format!(
+                "archive-{actor} max cycle time in ns: SHARED - archiveId="
+            )),
+            "the 103 label is {}",
+            max[0].0
+        );
+
+        let exceeded = counters_of(&counters, 104, &format!("archive-{actor} work cycle time"));
+        assert_eq!(1, exceeded.len(), "{actor}'s 104, found {exceeded:?}");
+        assert!(
+            exceeded[0].0.starts_with(&format!(
+                "archive-{actor} work cycle time exceeded count: threshold=100ms SHARED - archiveId="
+            )),
+            "the 104 label is {}",
+            exceeded[0].0
+        );
+    }
+
+    // ★ One pair measured, two not: the conductor has run turns since the wait
+    // above, and the other two are only measured in `DEDICATED`.
+    for actor in ["recorder", "replayer"] {
+        let max = counters_of(&counters, 103, &format!("archive-{actor} max cycle time"));
+
+        assert_eq!(
+            0, max[0].1,
+            "the {actor}'s maximum cycle time is measured in SHARED, and the reference does not"
+        );
+    }
+}
+
+/// Every counter of `type_id` whose label starts with `prefix`: its label and its
+/// value.
+fn counters_of(
+    counters: &CountersReader<'_, ReadOnly>,
+    type_id: i32,
+    prefix: &str,
+) -> Vec<(String, i64)> {
+    let mut found = Vec::new();
+
+    counters.for_each(|descriptor| {
+        if descriptor.type_id == type_id && descriptor.label.starts_with(prefix) {
+            found.push((descriptor.label.clone(), descriptor.value));
+        }
+    });
+
+    found
+}
+/// The value of the counter of `type_id` whose label starts with `prefix`.
+fn counter_of(
+    counters: &deepmsg_cnc::counters::CountersReader<'_, deepmsg_core::buffer::ReadOnly>,
+    type_id: i32,
+    prefix: &str,
+) -> Option<i64> {
+    label_of(counters, type_id, prefix).and_then(|_| {
+        let mut found = None;
+        counters.for_each(|descriptor| {
+            if found.is_none()
+                && descriptor.type_id == type_id
+                && descriptor.label.starts_with(prefix)
+            {
+                found = Some(descriptor.value);
+            }
+        });
+        found
+    })
+}
+
+/// The label of the counter of `type_id` whose label starts with `prefix`.
+fn label_of(
+    counters: &deepmsg_cnc::counters::CountersReader<'_, deepmsg_core::buffer::ReadOnly>,
+    type_id: i32,
+    prefix: &str,
+) -> Option<String> {
+    let mut found = None;
+    counters.for_each(|descriptor| {
+        if found.is_none() && descriptor.type_id == type_id && descriptor.label.starts_with(prefix)
+        {
+            found = Some(descriptor.label.clone());
+        }
+    });
+    found
 }

@@ -445,22 +445,14 @@ pub fn increment(
     Some(value)
 }
 
-/// A duration as the reference writes one into a label
-/// (`aeron_format_duration_ns`,
-/// `aeron-client/src/main/c/util/aeron_parse_util.c:270-333`): the largest
-/// unit that divides it **exactly**, and nanoseconds when none does.
+/// A duration as the reference writes one into a label — the **one**
+/// implementation, in `deepmsg-core` (`uri.rs`), where the archive can reach it
+/// too: `crates/archive/Cargo.toml` says the library does not use this crate, and
+/// a label is a contract with Java's `SystemUtil.formatDuration`, so it gets one
+/// home rather than two that must never drift.
 ///
-/// Exact is the whole of it: five seconds is `5s` and 1500 milliseconds is
-/// `1500000000ns`, not `1.5s`.
-pub fn format_duration_ns(duration_ns: i64) -> String {
-    for (unit_ns, suffix) in [(1_000_000_000, "s"), (1_000_000, "ms"), (1_000, "us")] {
-        if duration_ns >= unit_ns && duration_ns % unit_ns == 0 {
-            return format!("{}{suffix}", duration_ns / unit_ns);
-        }
-    }
-
-    format!("{duration_ns}ns")
-}
+/// (`aeron_format_duration_ns`, `aeron-client/src/main/c/util/aeron_parse_util.c:270-333`.)
+pub use deepmsg_core::uri::format_duration_ns;
 
 /// Store `candidate` if it is greater than what is there
 /// (`aeron_counter_propose_max_release`, `concurrent/aeron_counters_manager.h:244-258`).

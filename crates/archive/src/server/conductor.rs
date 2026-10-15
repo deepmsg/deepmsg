@@ -114,6 +114,7 @@ use deepmsg_cnc::file::CncFile;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::source_location::SourceLocation;
 use deepmsg_core::buffer::ReadWrite;
+use deepmsg_core::clock;
 use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use deepmsg_core::logbuffer::position::bits_to_shift;
 use deepmsg_core::pal::usable_space;
@@ -141,9 +142,9 @@ use crate::server::control_session::{
 };
 use crate::server::counters::{
     ARCHIVE_RECORDING_POSITION_TYPE_ID, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID, ArchiveIdCounter,
-    ControlSessionCounter, ControlSessionsCounter, ErrorCounter, RECORDING_SESSIONS_NAME,
-    claim_archive_id_counter, claim_control_sessions_counter, request_archive_id_counter,
-    request_control_sessions_counter,
+    ControlSessionCounter, ControlSessionsCounter, DutyCycleActor, DutyCycleRequests, DutyCycles,
+    ErrorCounter, RECORDING_SESSIONS_NAME, claim_archive_id_counter,
+    claim_control_sessions_counter, request_archive_id_counter, request_control_sessions_counter,
 };
 use crate::server::create_replay_publication::{
     CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
@@ -7326,6 +7327,13 @@ pub struct ArchiveConductor {
     /// Where `logWarning` and this build's own complaints go
     /// (`ArchiveConductor.java:443-446`, via the error handler).
     error_counter: ErrorCounter,
+    /// ★ The six duty-cycle counters, of which a `SHARED` archive measures the
+    /// conductor's pair on every turn (`ArchiveConductor.doWork:374`) and leaves
+    /// the other four at zero, as the reference does — see [`DutyCycles`].
+    duty_cycles: Option<DutyCycles>,
+    /// The six counters this archive asked for and has not taken up yet
+    /// (`DutyCycleRequests`), cleared once they are claimed or refused.
+    duty_cycle_requests: Option<DutyCycleRequests>,
     cnc: CncFile,
     /// The recordings the archive holds (`ArchiveConductor.java:196` and its
     /// `ctx.catalog()`).
@@ -7360,12 +7368,14 @@ impl ArchiveConductor {
     /// `error_counter_id` is the driver's `ERRORS` counter
     /// (`ArchivingMediaDriver.java:87-89`), which the archive writes its
     /// errors into rather than keeping one of its own.
+    #[allow(clippy::too_many_arguments)] // one per thing the archive was built with
     pub fn new(
         config: &ArchiveConfig,
         cnc: CncFile,
         mark_file: ArchiveMarkFile,
         catalog: Catalog,
         error_counter_id: i32,
+        duty_cycle_requests: DutyCycleRequests,
         remote_subscription_id: Option<i64>,
         local_subscription_id: i64,
     ) -> Result<Self, AuthError> {
@@ -7425,6 +7435,8 @@ impl ArchiveConductor {
             mark_file_update_deadline_ms: 0,
             cached_epoch_ms: i64::MIN,
             error_counter: ErrorCounter::new(error_counter_id),
+            duty_cycle_requests: Some(duty_cycle_requests),
+            duty_cycles: None,
             cnc,
             catalog,
             recorder: Recorder::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
@@ -7474,6 +7486,8 @@ impl ArchiveConductor {
             catalog,
             recorder,
             error_counter,
+            duty_cycles,
+            duty_cycle_requests,
             command_timeout,
             ..
         } = self;
@@ -7485,6 +7499,43 @@ impl ArchiveConductor {
             // turn that did no work rather than a session that half-ran.
             return Ok(work);
         };
+
+        // The six duty-cycle counters were asked for before anything was driven
+        // and are taken up here, on the first turn the driver has answered
+        // (`DutyCycles::claim`: a blocking allocation before the driver is
+        // driven is a wait for a heartbeat that will not move).
+        if duty_cycles.is_none() {
+            if let Some(requests) = duty_cycle_requests.as_ref() {
+                match DutyCycles::claim(client, &counters, requests, clock::monotonic_nano_time()) {
+                    Ok(Some(claimed)) => {
+                        *duty_cycles = Some(claimed);
+                        *duty_cycle_requests = None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Refused: never a counter, so the archive runs without
+                        // one rather than asking forever.
+                        *duty_cycle_requests = None;
+                        sessions.warnings.push(format!(
+                            "could not take up the archive's duty cycle counters: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // `ArchiveConductor.doWork:374`: the first thing a turn does is measure
+        // the turn that just ended — the gap since the last one, into the 103
+        // high-water mark and the 104 threshold count. The clock is the
+        // monotonic one, as the driver's own duty cycle is measured
+        // (`crates/driver/src/conductor.rs::track_cycle`).
+        if let Some(cycles) = duty_cycles.as_mut() {
+            cycles.measure(
+                DutyCycleActor::Conductor,
+                &counters,
+                clock::monotonic_nano_time(),
+            );
+        }
 
         work += adapter.poll(client, sessions, now_ms)?;
 

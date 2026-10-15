@@ -80,6 +80,7 @@ use crate::catalog::Catalog;
 use crate::mark_file::{ArchiveMarkFile, Header};
 use crate::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
 use crate::server::config::ArchiveConfig;
+use crate::server::counters::DutyCycleRequests;
 use crate::server::counters::{
     ARCHIVE_ERROR_COUNT_TYPE_ID, ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, archive_id_key,
     archive_id_label, find_archive_id_counter,
@@ -356,6 +357,16 @@ pub fn run(
     let cnc = CncFile::open_writable(&aeron_dir, COMMAND_TIMEOUT)
         .map_err(|error| format!("could not open the counter region: {error}"))?;
 
+    // ★ P2-9b: the three agents' duty-cycle counters, allocated where the
+    // reference allocates them (`Archive.Context.conclude`, `Archive.java:1402-1480`)
+    // — at start-up, before the conductor has a turn to be measured by. Six
+    // counters, of which a `SHARED` archive measures one pair (see [`DutyCycles`]).
+    //
+    // The region is read through the CnC file rather than the client, because the
+    // allocation below needs the client mutably and a reader taken from it would
+    // hold it.
+    let duty_cycle_requests = request_duty_cycles(&mut client, archive_config, archive_id)?;
+
     // An archive id that is already being recorded by is one this archive
     // refuses to serve (`Archive.java:1589-1595`): the reference looks for a
     // 105 — the recorder's max write time, the one counter a second archive
@@ -445,6 +456,7 @@ pub fn run(
         mark_file,
         catalog,
         error_counter_id,
+        duty_cycle_requests,
         remote_subscription_id,
         local_subscription_id,
     )
@@ -504,6 +516,37 @@ fn ensure_directory(path: &Path, name: &str) -> Result<(), String> {
 }
 
 /// Create the archive's mark file, sized and ready to be written.
+/// Ask for the six duty-cycle counters (`Archive.java:1402-1480`).
+///
+/// **Asked for, not allocated**: this runs before anything is driven, and in the
+/// process where the archive and the driver are one binary nobody is driving the
+/// driver yet — a blocking `add_counter` there waits for a heartbeat that will
+/// not move. The conductor takes them up on its first turns
+/// ([`DutyCycles::claim`]), which is the same shape the control-sessions counter
+/// takes.
+///
+/// The labels carry the threading mode's own name and the threshold's
+/// `formatDuration` spelling, so a reader sees what the archive was told rather
+/// than what it assumed.
+fn request_duty_cycles(
+    client: &mut Client,
+    config: &ArchiveConfig,
+    archive_id: i64,
+) -> Result<DutyCycleRequests, String> {
+    DutyCycleRequests::request(
+        client,
+        archive_id,
+        &config.threading_mode.to_string(),
+        [
+            config.conductor_cycle_threshold_ns,
+            config.recorder_cycle_threshold_ns,
+            config.replayer_cycle_threshold_ns,
+        ],
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|error| format!("could not ask for the archive's duty cycle counters: {error}"))
+}
+
 fn create_mark_file(
     archive_config: &ArchiveConfig,
     control_channel: Option<&str>,

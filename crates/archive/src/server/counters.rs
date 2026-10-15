@@ -78,6 +78,18 @@ pub const ARCHIVE_CONTROL_SESSIONS_TYPE_ID: i32 = 102;
 /// `AeronCounters.ARCHIVE_CONTROL_SESSION_TYPE_ID` (`AeronCounters.java:826`).
 pub const ARCHIVE_CONTROL_SESSION_TYPE_ID: i32 = 113;
 
+/// `AeronCounters.ARCHIVE_MAX_CYCLE_TIME_TYPE_ID` (`AeronCounters.java:749`).
+///
+/// The longest duty cycle an agent has taken, in nanoseconds — a high-water mark
+/// (`DutyCycleStallTracker.reportMeasurement`, which proposes the maximum).
+pub const ARCHIVE_MAX_CYCLE_TIME_TYPE_ID: i32 = 103;
+
+/// `AeronCounters.ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID` (`:750`).
+///
+/// How many duty cycles went over the threshold, which is the count
+/// `aeron.archive.{conductor,recorder,replayer}.cycle.threshold` sets.
+pub const ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID: i32 = 104;
+
 /// `AeronCounters.ARCHIVE_RECORDING_POSITION_TYPE_ID`
 /// (`AeronCounters.java:739`).
 ///
@@ -229,6 +241,289 @@ pub fn control_session_label(client_info: &str, archive_id: i64) -> String {
 }
 
 /// What can go wrong asking for a counter, or finding one again.
+/// Which agent a duty cycle is measured for (`Archive.java:1402-1480`): the
+/// conductor's, the recorder's and the replayer's, each with a pair of counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DutyCycleActor {
+    /// The archive's own loop, which every deployment runs.
+    Conductor,
+    /// The recorder's, which only `DEDICATED` drives on its own thread.
+    Recorder,
+    /// The replayer's, likewise.
+    Replayer,
+}
+
+impl DutyCycleActor {
+    /// All three, in the order the reference allocates them.
+    pub const ALL: [Self; 3] = [Self::Conductor, Self::Recorder, Self::Replayer];
+
+    /// The prefix both of this actor's labels carry
+    /// (`Archive.java:1407`, `:1446`, `:1465`).
+    pub const fn label_name(self) -> &'static str {
+        match self {
+            Self::Conductor => "archive-conductor",
+            Self::Recorder => "archive-recorder",
+            Self::Replayer => "archive-replayer",
+        }
+    }
+
+    /// The index [`DutyCycles`] keeps it at.
+    const fn index(self) -> usize {
+        match self {
+            Self::Conductor => 0,
+            Self::Recorder => 1,
+            Self::Replayer => 2,
+        }
+    }
+}
+
+/// One actor's pair of duty-cycle counters (`DutyCycleStallTracker`).
+pub struct DutyCycleCounters {
+    max_cycle_time_id: i32,
+    threshold_exceeded_id: i32,
+    threshold_ns: i64,
+    /// When the last cycle was measured, which is what the next one is the
+    /// difference from (`DutyCycleTracker.measureAndUpdate`).
+    last_update_ns: i64,
+}
+
+/// The six registrations an archive's duty-cycle counters were **asked** for
+/// with (`ArchiveCounters.allocate`, `ArchiveCounters.java:52-69`).
+///
+/// Asking and taking up are two steps for the reason
+/// [`DutyCycles::claim`] gives, and the registration ids are what carries
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DutyCycleRequests {
+    /// The six registrations, in the order they were asked for: a maximum and
+    /// its threshold, per actor.
+    registrations: [i64; 6],
+    /// What each pair is measured against, which the 104 labels already spell.
+    thresholds_ns: [i64; 3],
+}
+
+impl DutyCycleRequests {
+    /// Ask for all six, in the reference's order, and do not wait for the
+    /// answers.
+    ///
+    /// # Errors
+    ///
+    /// [`CounterError`] if a command could not be sent.
+    pub fn request<C: Counters>(
+        client: &mut C,
+        archive_id: i64,
+        mode: &str,
+        thresholds_ns: [i64; 3],
+        timeout: Duration,
+    ) -> Result<Self, CounterError> {
+        let key = archive_id_key(archive_id);
+        let mut registrations = [0_i64; 6];
+
+        for (index, (actor, threshold_ns)) in DutyCycleActor::ALL
+            .into_iter()
+            .zip(thresholds_ns)
+            .enumerate()
+        {
+            let max_label = max_cycle_time_label(actor, mode, archive_id);
+            registrations[index * 2] = client.async_add_counter(
+                ARCHIVE_MAX_CYCLE_TIME_TYPE_ID,
+                &key,
+                &max_label,
+                timeout,
+            )?;
+
+            let exceeded_label = threshold_exceeded_label(actor, mode, threshold_ns, archive_id);
+            registrations[index * 2 + 1] = client.async_add_counter(
+                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
+                &key,
+                &exceeded_label,
+                timeout,
+            )?;
+        }
+
+        Ok(Self {
+            registrations,
+            thresholds_ns,
+        })
+    }
+}
+
+/// **The three agents' counters, allocated together** (`Archive.java:1402-1480`).
+///
+/// Six counters, and in `SHARED` — the only mode this build runs — **one of the
+/// three pairs is ever measured**: the reference measures the conductor's on
+/// every turn (`ArchiveConductor.doWork:374`) and the recorder's and replayer's
+/// only from `DedicatedModeArchiveConductor` (`:191`, `:346`), which has no
+/// `SHARED` counterpart. So the other four are allocated, labelled and left at
+/// zero, exactly as they are there.
+pub struct DutyCycles {
+    counters: [DutyCycleCounters; 3],
+}
+
+impl DutyCycles {
+    /// Take up the six counters [`DutyCycleRequests::request`] asked for, once
+    /// the driver has allocated them.
+    ///
+    /// `Ok(None)` means "not yet" rather than "no", exactly as
+    /// [`claim_control_sessions_counter`] does — and this is the shape the
+    /// archive's counters all take here, because a conductor is driven inside
+    /// the turn that drives the driver: a blocking `add_counter` would wait for
+    /// a driver nobody is driving, which is not hypothetical — the
+    /// archiving-media-driver binary is exactly that process, and a blocking
+    /// allocation there times out against the driver's own heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// [`CounterError`] if the driver refused one, or if what came back is not
+    /// the type id it was asked for.
+    pub fn claim<C: Counters, Access>(
+        client: &mut C,
+        counters: &CountersReader<'_, Access>,
+        requests: &DutyCycleRequests,
+        now_ns: i64,
+    ) -> Result<Option<Self>, CounterError> {
+        let mut ids = [0_i32; 6];
+
+        for (index, registration_id) in requests.registrations.iter().enumerate() {
+            let type_id = if index % 2 == 0 {
+                ARCHIVE_MAX_CYCLE_TIME_TYPE_ID
+            } else {
+                ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID
+            };
+
+            // ★ **The client is asked first.** A reply that has been read is one
+            // the client has already adopted (`Client::poll` registers the
+            // counter and takes the pending entry with it), so `poll_counter`
+            // answers `Unknown` for a counter that is right there — measured:
+            // `known=Some(49) poll=Unknown`, and this order is what makes the
+            // difference between taking the counters up and asking forever.
+            let counter_id = if let Some(counter_id) = client.counter_id(*registration_id) {
+                counter_id
+            } else {
+                match client.poll_counter(*registration_id) {
+                    AsyncAddPoll::Ready => {
+                        let Some(counter_id) = client.counter_id(*registration_id) else {
+                            return Ok(None);
+                        };
+
+                        counter_id
+                    }
+                    AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+                    AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
+                }
+            };
+
+            check_type_id(counters, counter_id, type_id)?;
+            ids[index] = counter_id;
+        }
+
+        let mut counters_out = Vec::with_capacity(3);
+
+        for (index, threshold_ns) in requests.thresholds_ns.into_iter().enumerate() {
+            counters_out.push(DutyCycleCounters {
+                max_cycle_time_id: ids[index * 2],
+                threshold_exceeded_id: ids[index * 2 + 1],
+                threshold_ns,
+                last_update_ns: now_ns,
+            });
+        }
+
+        Ok(Some(Self {
+            counters: counters_out
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("three actors, three pairs")),
+        }))
+    }
+
+    /// The pair one actor's cycles are measured into.
+    pub fn for_actor(&self, actor: DutyCycleActor) -> &DutyCycleCounters {
+        &self.counters[actor.index()]
+    }
+
+    /// One actor's cycle, measured (`DutyCycleStallTracker.reportMeasurement`
+    /// over `DutyCycleTracker.measureAndUpdate`): the cycle that has just ended
+    /// is the time since the last measurement, the longest one seen is kept, and
+    /// a cycle over the threshold is counted.
+    ///
+    /// **The order is the reference's**: the maximum is proposed before the
+    /// threshold is looked at, so a cycle that is both the longest and over the
+    /// threshold moves both counters.
+    pub fn measure(
+        &mut self,
+        actor: DutyCycleActor,
+        counters: &CountersReader<'_, ReadWrite>,
+        now_ns: i64,
+    ) {
+        self.counters[actor.index()].measure(counters, now_ns);
+    }
+}
+
+impl DutyCycleCounters {
+    /// The 103 this pair holds.
+    pub const fn max_cycle_time_id(&self) -> i32 {
+        self.max_cycle_time_id
+    }
+
+    /// The 104 this pair holds.
+    pub const fn threshold_exceeded_id(&self) -> i32 {
+        self.threshold_exceeded_id
+    }
+
+    /// The threshold it was allocated with, which its 104 label spells.
+    pub const fn threshold_ns(&self) -> i64 {
+        self.threshold_ns
+    }
+
+    fn measure(&mut self, counters: &CountersReader<'_, ReadWrite>, now_ns: i64) {
+        let duration_ns = now_ns.saturating_sub(self.last_update_ns);
+        self.last_update_ns = now_ns;
+
+        // `proposeMaxRelease`: the high-water mark moves only upwards, and a
+        // caller that cannot read the slot does nothing rather than guess.
+        let Some(current) = counters.value(self.max_cycle_time_id) else {
+            return;
+        };
+
+        if duration_ns > current {
+            let _ = counters.set_value(self.max_cycle_time_id, duration_ns);
+        }
+
+        if duration_ns > self.threshold_ns {
+            let _ = counters.set_value(
+                self.threshold_exceeded_id,
+                counters.value(self.threshold_exceeded_id).unwrap_or(0) + 1,
+            );
+        }
+    }
+}
+
+/// `"archive-{actor} max cycle time in ns: {MODE}"` (`Archive.java:1407`).
+fn max_cycle_time_label(actor: DutyCycleActor, mode: &str, archive_id: i64) -> String {
+    archive_id_label(
+        &format!("{} max cycle time in ns: {mode}", actor.label_name()),
+        archive_id,
+    )
+}
+
+/// `"archive-{actor} work cycle time exceeded count: threshold={duration} {MODE}"`
+/// (`Archive.java:1412-1415`, where the duration is
+/// `SystemUtil.formatDuration`'s spelling of the threshold).
+fn threshold_exceeded_label(
+    actor: DutyCycleActor,
+    mode: &str,
+    threshold_ns: i64,
+    archive_id: i64,
+) -> String {
+    archive_id_label(
+        &format!(
+            "{} work cycle time exceeded count: threshold={} {mode}",
+            actor.label_name(),
+            deepmsg_core::uri::format_duration_ns(threshold_ns)
+        ),
+        archive_id,
+    )
+}
+
 #[derive(Debug)]
 pub enum CounterError {
     /// The client could not send the command, or the driver refused it.
@@ -502,15 +797,25 @@ pub fn claim_control_sessions_counter<C: Counters, Access>(
     counters: &CountersReader<'_, Access>,
     registration_id: i64,
 ) -> Result<Option<ControlSessionsCounter>, CounterError> {
-    let counter_id = match client.poll_counter(registration_id) {
-        AsyncAddPoll::Ready => {
-            let Some(counter_id) = client.counter_id(registration_id) else {
-                return Ok(None);
-            };
-            counter_id
+    // ★ **The client is asked first**, and this was a defect until it was: a
+    // reply the client has already read is one it has adopted, and it takes the
+    // pending entry with it — so polling first answered `Unknown` for a counter
+    // that was right there, and the archive never took up its session count (the
+    // 102 stayed at zero for the life of the process). Measured on the duty-cycle
+    // pair the same way: `known=Some(49) poll=Unknown`.
+    let counter_id = if let Some(counter_id) = client.counter_id(registration_id) {
+        counter_id
+    } else {
+        match client.poll_counter(registration_id) {
+            AsyncAddPoll::Ready => {
+                let Some(counter_id) = client.counter_id(registration_id) else {
+                    return Ok(None);
+                };
+                counter_id
+            }
+            AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
+            AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
         }
-        AsyncAddPoll::Awaiting | AsyncAddPoll::Unknown => return Ok(None),
-        AsyncAddPoll::Failed(error) => return Err(CounterError::Command(error)),
     };
 
     check_type_id(counters, counter_id, ARCHIVE_CONTROL_SESSIONS_TYPE_ID)?;
@@ -1166,6 +1471,97 @@ mod tests {
         assert_eq!(ARCHIVE_ID.to_le_bytes().to_vec(), *key);
         assert_eq!("Archive Control Sessions - archiveId=42", label);
         assert_eq!(0, counter.counter_id());
+    }
+
+    /// ★ **The six labels, byte for byte** (`Archive.java:1407-1476`).
+    ///
+    /// This is what `AeronStat` reads, and it is a contract with Java rather
+    /// than a description: the threading mode is `ThreadingMode.name()` and the
+    /// threshold is `SystemUtil.formatDuration`'s spelling — which is
+    /// `deepmsg_core::uri::format_duration_ns`, **the same function the driver's
+    /// own duty-cycle labels are built with**, so the two cannot drift.
+    #[test]
+    fn the_duty_cycle_labels_are_the_references() {
+        assert_eq!(
+            "archive-conductor max cycle time in ns: SHARED - archiveId=42",
+            max_cycle_time_label(DutyCycleActor::Conductor, "SHARED", ARCHIVE_ID)
+        );
+        assert_eq!(
+            "archive-conductor work cycle time exceeded count: threshold=100ms SHARED \
+             - archiveId=42",
+            threshold_exceeded_label(DutyCycleActor::Conductor, "SHARED", 100_000_000, ARCHIVE_ID)
+        );
+        // The other two agents carry their own names, and a threshold that is
+        // not a round number keeps `formatDuration`'s "largest exact unit"
+        // spelling: a second and a half is `1500ms`, and 1500 nanoseconds stays
+        // in nanoseconds because nothing divides it exactly.
+        assert_eq!(
+            "archive-recorder work cycle time exceeded count: threshold=1500ms SHARED \
+             - archiveId=7",
+            threshold_exceeded_label(DutyCycleActor::Recorder, "SHARED", 1_500_000_000, 7)
+        );
+        assert_eq!(
+            "archive-replayer work cycle time exceeded count: threshold=1500ns SHARED \
+             - archiveId=7",
+            threshold_exceeded_label(DutyCycleActor::Replayer, "SHARED", 1_500, 7)
+        );
+        assert_eq!(
+            "archive-replayer max cycle time in ns: DEDICATED - archiveId=7",
+            max_cycle_time_label(DutyCycleActor::Replayer, "DEDICATED", 7)
+        );
+    }
+
+    /// ★ **What the pair counts** (`DutyCycleStallTracker.reportMeasurement` over
+    /// `DutyCycleTracker.measureAndUpdate`): the cycle that just ended is the gap
+    /// since the last measurement, the longest one seen is kept and never falls,
+    /// and a cycle is over the threshold only when it is **strictly** over.
+    #[test]
+    fn a_measured_cycle_moves_the_maximum_and_the_threshold_count() {
+        // Both slots, because a pair is two counters and the reader answers
+        // about as many ids as the metadata region reaches.
+        let mut meta = metadata(104, ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID);
+        let base = 103 * layout::COUNTER_METADATA_LENGTH;
+        meta.0[base + layout::COUNTER_TYPE_ID_OFFSET..base + layout::COUNTER_TYPE_ID_OFFSET + 4]
+            .copy_from_slice(&ARCHIVE_MAX_CYCLE_TIME_TYPE_ID.to_le_bytes());
+        meta.0[base + layout::COUNTER_STATE_OFFSET..base + layout::COUNTER_STATE_OFFSET + 4]
+            .copy_from_slice(&layout::COUNTER_STATE_ALLOCATED.to_le_bytes());
+
+        // `values(n)` holds ids `0..n`, so the region has to reach past the
+        // higher of the two.
+        let mut vals = values(105);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        let pair = || DutyCycleCounters {
+            max_cycle_time_id: 103,
+            threshold_exceeded_id: 104,
+            threshold_ns: 1_000,
+            last_update_ns: 0,
+        };
+
+        let mut cycles = DutyCycles {
+            counters: [pair(), pair(), pair()],
+        };
+
+        // A cycle under the threshold: the maximum moves, the count does not.
+        cycles.measure(DutyCycleActor::Conductor, &counters, 500);
+        assert_eq!(Some(500), counters.value(103));
+        assert_eq!(Some(0), counters.value(104));
+
+        // Over it: both move.
+        cycles.measure(DutyCycleActor::Conductor, &counters, 2_000);
+        assert_eq!(Some(1_500), counters.value(103));
+        assert_eq!(Some(1), counters.value(104));
+
+        // ★ Exactly on it is **not** over it (`durationNs > cycleTimeThresholdNs`),
+        // and the maximum never falls: 1000 is not larger than 1500.
+        cycles.measure(DutyCycleActor::Conductor, &counters, 3_000);
+        assert_eq!(Some(1_500), counters.value(103));
+        assert_eq!(Some(1), counters.value(104));
+
+        // And a short cycle afterwards leaves both alone.
+        cycles.measure(DutyCycleActor::Conductor, &counters, 3_100);
+        assert_eq!(Some(1_500), counters.value(103));
+        assert_eq!(Some(1), counters.value(104));
     }
 
     /// The reference throws here rather than start an archive whose session
