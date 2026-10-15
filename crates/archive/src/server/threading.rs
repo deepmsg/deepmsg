@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     /// The table, cell by cell — including the one cell that is deliberately
-    /// the conductor's name and the four that are not.
+    /// another role's name, under `classic`.
     #[test]
     fn every_role_has_the_references_name_under_both_namings() {
         for (role, classic, new) in [
