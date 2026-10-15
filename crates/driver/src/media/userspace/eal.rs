@@ -13,6 +13,11 @@
 //!   is why the list is read from the kernel here and not from a setting.
 //! * **`--no-telemetry`, always.** EAL's telemetry endpoint is a thread and a
 //!   socket this driver has no use for.
+//! * **`--log-level=1`, always.** The EAL and the PMDs write their own
+//!   diagnostics to **stderr**, which the reference's test harness asserts is
+//!   empty after every test method — so a driver process that lets them
+//!   through fails those tests for a reason that is not theirs. [`LOG_LEVEL`]
+//!   has the measurement and what it costs.
 //! * **One of `--in-memory` / `--no-shconf`.** Both keep EAL from leaving
 //!   runtime state on the machine, and they cannot both be given: `--no-huge`
 //!   implies the legacy memory layout, which `--in-memory` refuses
@@ -22,10 +27,11 @@
 //!
 //! The operator's arguments are carried through untouched and in order, after
 //! `argv[0]`. A setting that names code the driver must set itself — an lcore
-//! argument, or one of the three above — is refused where the configuration is
+//! argument, or one of the four above — is refused where the configuration is
 //! read rather than merged here ([`crate::config::ConfigError::DpdkEalArgument`]),
 //! because a silent override of the cpuset arithmetic is exactly the failure
-//! the first bullet is about.
+//! the first bullet is about, and a silent override of the log level is a
+//! driver that fails the reference's harness with no way to tell why.
 //!
 //! Nothing here needs DPDK to compile, and that is deliberate: it is the half
 //! of the media's startup that can be judged without an EAL, a port or a
@@ -51,6 +57,28 @@ pub const NO_SHCONF: &str = "--no-shconf";
 
 /// Keep EAL's runtime state in memory. What pairs with huge pages.
 pub const IN_MEMORY: &str = "--in-memory";
+
+/// Quiet the EAL and the PMDs. What makes a driver's **stderr** empty, which
+/// is a contract rather than a preference: the reference's own test harness
+/// asserts the driver process's stderr is zero bytes after **every** test
+/// method (`aeron-test-support/src/main/java/io/aeron/test/MediaDriverTestUtil.java:128-131`,
+/// reached from `:95-99`), and the C harness this driver is launched by is the
+/// reference's own. A DPDK driver that printed EAL's five startup lines would
+/// fail every one of those tests for a reason that has nothing to do with them.
+///
+/// **Level 1, measured**: a driver started on `--no-huge --vdev=net_null0`
+/// writes **257 bytes** of `EAL: Detected CPU lcores: …` and five lines like
+/// it at the default level, and none at this one. `lib.eal:1` also writes
+/// none, and is not enough — a PMD reports at INFO and ERR too, and a PMD's
+/// stderr is really what this is about. **0 is not a level**: the EAL answers
+/// `Invalid log level: 0` and that line goes to stderr as well.
+///
+/// What it costs is the PMD's own error lines, and nothing this build needed:
+/// the shim never reports through logs — it answers a return code and
+/// `rte_errno`, which `deepmsg_dpdk::Error` carries
+/// (`crates/dpdk/src/lib.rs`) — so a line lost here is a line that was never
+/// read.
+pub const LOG_LEVEL: &str = "--log-level=1";
 
 /// Why the EAL's arguments could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,10 +116,11 @@ pub fn arguments(settings: &DpdkSettings, cpus: &[i32]) -> Result<Vec<String>, E
 
     let operator: Vec<&str> = settings.eal_args.split_whitespace().collect();
 
-    let mut arguments = Vec::with_capacity(operator.len() + 4);
+    let mut arguments = Vec::with_capacity(operator.len() + 5);
     arguments.push(PROGRAM.to_owned());
     arguments.extend(operator.iter().map(|argument| (*argument).to_owned()));
     arguments.push(NO_TELEMETRY.to_owned());
+    arguments.push(LOG_LEVEL.to_owned());
     arguments.push(format!("--lcores=0@({})", cpu_list(cpus)));
     arguments.push(
         if operator.contains(&NO_HUGE) {
@@ -178,6 +207,35 @@ mod tests {
         let built = arguments(&settings(""), &[0]).expect("a cpuset");
 
         assert!(built.contains(&NO_TELEMETRY.to_owned()));
+    }
+
+    /// And the log level is always level 1, because what it buys is an empty
+    /// **stderr** — which the reference's own harness asserts after every test
+    /// method, so a driver that lets EAL's five startup lines through fails
+    /// tests that have nothing to do with it.
+    ///
+    /// Whatever the operator asked for, which is the half that matters: the
+    /// configuration refuses a `--log-level` in `deepmsg.dpdk.eal.args`, and
+    /// this is the other door — the level the driver appends is not decided by
+    /// anything the operator wrote.
+    #[test]
+    fn the_eal_is_always_told_to_keep_quiet() {
+        for args in ["", "--no-huge -m 512", "-a 0000:03:00.0 --in-memory"] {
+            let built = arguments(&settings(args), &[0]).expect("a cpuset");
+
+            assert!(
+                built.contains(&LOG_LEVEL.to_owned()),
+                "level 1, whatever the operator asked for: {built:?}"
+            );
+            assert_eq!(
+                1,
+                built
+                    .iter()
+                    .filter(|argument| argument.starts_with("--log-level"))
+                    .count(),
+                "and exactly one of them: {built:?}"
+            );
+        }
     }
 
     /// Three settings, two arguments: which memory flag is added is decided by
