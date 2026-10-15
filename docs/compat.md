@@ -11,6 +11,9 @@ covers it.
 | Archive protocol SBE | schema id / version | 101 / 14 (semanticVersion 5.2) | `schemas/aeron-archive-codecs.xml` |
 | Archive mark SBE | schema id / version | 100 / 2 (semanticVersion 5.2) | `schemas/aeron-archive-mark-codecs.xml` |
 | Archive mark **file** | `ArchiveMarkFile.SEMANTIC_VERSION` | **3.1.0**; only the **major** is compared, so a minor ahead is read | `aeron-archive/src/main/java/io/aeron/archive/ArchiveMarkFile.java:55-72` |
+| Archive catalog **file** | `Catalog.CATALOG_FILE_NAME` | **`archive.catalog`** | `aeron-archive/src/main/java/io/aeron/archive/Archive.java:284` |
+| Archive catalog record | `Catalog.DEFAULT_ALIGNMENT` | records are **variable length**, aligned to the header's `alignment` (1024 by default); `DEFAULT_RECORD_LENGTH = 1024` is `@Deprecated` | `aeron-archive/src/main/java/io/aeron/archive/Catalog.java:57-95`, `:113-119` |
+| Archive protocol version | `AeronArchive.Configuration.PROTOCOL_SEMANTIC_VERSION` | **1.12.0** (major 1, minor 12, patch 0); `1.11.0` is the archive-id **threshold**, not this value | `aeron-archive/src/main/java/io/aeron/archive/client/AeronArchive.java:2648-2668`, `:3839` |
 | Cluster protocol SBE | schema id / version | 111 / 17 (semanticVersion 5.4) | `schemas/aeron-cluster-codecs.xml` |
 | Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
 | Cluster node-state SBE | schema id / version | 112 / 10 | `schemas/aeron-cluster-node-state-codecs.xml` |
@@ -47,6 +50,22 @@ and its both-ways reading by the reference's own `ArchiveTool` is
 `tests/fixtures/mark-file/`, written by the reference's `ArchiveMarkFile`; its
 README is where the file's layout facts and the one field that cannot be fixed
 across runs (the pid) are recorded.
+
+The archive **catalog** rows are covered the same way, by a golden the reference
+wrote: `tests/fixtures/catalog/archive.catalog` comes from the reference's own
+`Catalog` (`tests/fixtures/catalog/GenerateCatalog.java`, which names it through
+`Archive.Configuration.CATALOG_FILE_NAME`), and `crates/archive/tests/catalog.rs`
+compares this build's reading against the reference's own reading of it
+(`catalog.tsv`: every header field, every record's location and length, every
+descriptor field) — which is what pins the file name and that the records are
+variable length rather than 1024 each.
+
+The **protocol version** cannot be covered that way and is not: the reference
+compares the major alone, so a wrong minor would pass every case in
+`tests/interop` *and* every case of its own C suite. It is pinned instead by
+`crates/archive/src/server/response_proxy.rs::the_protocol_version_is_the_references_own`,
+the way the CnC version's rules are pinned by unit tests — a version constant is
+the one thing no case can reach.
 
 ## Counters
 
