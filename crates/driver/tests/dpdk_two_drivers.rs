@@ -50,9 +50,73 @@ use deepmsg_cnc::CncFile;
 use deepmsg_driver::media::userspace::dpdk_counters::type_id;
 use deepmsg_driver::system_counters::id;
 
-/// The two ends of the pair, named by whoever made it.
+/// The two ends of the pair, named by whoever made it: a veth pair's
+/// interfaces, or two hardware ports' PCI addresses.
 const VETH_A: &str = "DEEPMSG_DPDK_T4_VETH_A";
 const VETH_B: &str = "DEEPMSG_DPDK_T4_VETH_B";
+const PCI_A: &str = "DEEPMSG_DPDK_T4_PCI_A";
+const PCI_B: &str = "DEEPMSG_DPDK_T4_PCI_B";
+
+/// Where one driver's data paths run.
+///
+/// Two shapes because the case has two: a `net_af_packet` port over a veth end,
+/// which any machine with root can make, and a hardware port bound to
+/// `vfio-pci`, which is what the media exists for. What differs between them is
+/// what the EAL is told and whether the memory is huge pages: a device that
+/// DMAs needs the pages the machine has reserved, where a veth is a software
+/// queue and `--no-huge` keeps it out of them.
+#[derive(Clone, Debug)]
+enum Device {
+    /// A virtual device, by the interface its frames go through.
+    Veth(String),
+    /// A hardware port, by the PCI address the EAL finds it at.
+    Pci(String),
+}
+
+impl Device {
+    /// What the EAL is given to find it.
+    fn eal_args(&self) -> String {
+        match self {
+            Self::Veth(interface) => format!("--no-huge --vdev=net_af_packet0,iface={interface}"),
+            Self::Pci(address) => format!("-a {address}"),
+        }
+    }
+
+    /// What `deepmsg.dpdk.port` names, which is how the driver finds its port
+    /// once the EAL has probed it: a vdev's name, or the PCI address EAL knows
+    /// the device by.
+    fn port(&self) -> &str {
+        match self {
+            Self::Veth(_) => "net_af_packet0",
+            Self::Pci(address) => address,
+        }
+    }
+}
+
+/// The two devices this run was given, in the order they are used.
+///
+/// # Panics
+///
+/// When neither pair of variables is set: which devices to use is the one thing
+/// this case cannot decide for itself.
+fn the_two_devices() -> (Device, Device) {
+    match (
+        std::env::var(VETH_A),
+        std::env::var(VETH_B),
+        std::env::var(PCI_A),
+        std::env::var(PCI_B),
+    ) {
+        (Ok(a), Ok(b), _, _) => (Device::Veth(a), Device::Veth(b)),
+        (_, _, Ok(a), Ok(b)) => (Device::Pci(a), Device::Pci(b)),
+        _ => panic!(
+            "set either {VETH_A} and {VETH_B} (a veth pair), or {PCI_A} and \
+             {PCI_B} (two ports bound to vfio-pci):\n  \
+             sudo ip link add deepmsg-a type veth peer name deepmsg-b\n  \
+             sudo ip link set deepmsg-a up\n  sudo ip link set deepmsg-b up\n\
+             sudo dpdk-devbind.py --bind=vfio-pci 0000:01:00.0 0000:01:00.1 0000:03:00.0"
+        ),
+    }
+}
 
 /// The stream the message travels on.
 const STREAM_ID: i32 = 2002;
@@ -69,7 +133,15 @@ const PAYLOAD: &[u8] = b"t4: a frame this build put on a wire";
 /// `userspace_two_drivers.rs` is: two driver processes, two EALs, two clients
 /// and an ARP exchange before any of it, on a machine that may be running the
 /// rest of a suite.
-const TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// **And a real cable makes it a measurement rather than a guess**: a
+/// 10GBASE-T link between two ports that a driver has just started takes about
+/// **twenty seconds** to come up, measured on the X540 pair with testpmd
+/// holding both ends (the kernel's carrier a moment earlier says nothing — `ip
+/// link set down` before the bind starts the PHY's negotiation over). Until
+/// both ends are up nothing crosses, so this is the window the exchange has to
+/// happen inside, not the exchange itself.
+const TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long a freshly spawned driver is given to publish its CnC file.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -82,14 +154,16 @@ struct Driver {
 }
 
 impl Driver {
-    /// Start a driver whose data paths are on `interface`, holding `address`.
+    /// Start a driver whose data paths are on `device`, holding `address`.
     ///
     /// `SHARED` and not the default `DEDICATED`: a threading mode is a map of
-    /// queues to threads, `DEDICATED` wants three queue pairs, and `net_af_packet`
-    /// has one of each — the same wall every virtual device in this build has
-    /// met (the D4 record's "虚拟设备只有一条队列"). One thread runs both
-    /// agents here, which is all a message crossing needs.
-    fn start(dir: &Path, interface: &str, address: &str) -> Self {
+    /// queues to threads, `DEDICATED` wants three queue pairs, and a virtual
+    /// device has one of each — the same wall every vdev in this build has met
+    /// (the D4 record's "虚拟设备只有一条队列"). The hardware port would take
+    /// three, but the mode is not what this case is about: what it is about is
+    /// whether a message crosses, and one thread running both agents is the
+    /// smallest thing that can answer.
+    fn start(dir: &Path, device: &Device, address: &str) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_deepmsg-driver"))
             .arg(format!("-Ddeepmsg.dir={}", dir.display()))
             .arg("-Daeron.threading.mode=SHARED")
@@ -100,10 +174,8 @@ impl Driver {
             // setting is read either way — and the channel goes to the kernel,
             // where 10.10.0.2 is an address it does not have.
             .env("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk")
-            .arg(format!(
-                "-Ddeepmsg.dpdk.eal.args=--no-huge --vdev=net_af_packet0,iface={interface}"
-            ))
-            .arg("-Ddeepmsg.dpdk.port=net_af_packet0")
+            .arg(format!("-Ddeepmsg.dpdk.eal.args={}", device.eal_args()))
+            .arg(format!("-Ddeepmsg.dpdk.port={}", device.port()))
             .arg(format!("-Ddeepmsg.dpdk.ipv4.address={address}"))
             // Both streams kept: the media's own line ("dpdk media on …") goes
             // to stdout and a refusal to stderr, and a case that fails without
@@ -278,7 +350,8 @@ fn counter(cnc: &CncFile, counter_id: i32) -> i64 {
 /// A message crosses from one machine's driver to the other's, over frames the
 /// two of them put on a wire themselves.
 ///
-/// Needs a veth pair and root, so it is `#[ignore]`d; run it by hand:
+/// Needs either a veth pair or two hardware ports, and root either way, so it
+/// is `#[ignore]`d; run it by hand:
 ///
 /// ```text
 /// sudo ip link add deepmsg-a type veth peer name deepmsg-b
@@ -288,19 +361,25 @@ fn counter(cnc: &CncFile, counter_id: i32) -> i64 {
 ///     cargo test -p deepmsg-driver --features dpdk -- --ignored --nocapture dpdk_two_drivers
 /// ```
 ///
+/// …or, for two hardware ports with a cable between them, one per driver
+/// (`-a` is an allow-list, so a second function bound to `vfio-pci` beside the
+/// one named is not probed):
+///
+/// ```text
+/// sudo dpdk-devbind.py --bind=vfio-pci 0000:01:00.0 0000:01:00.1 0000:03:00.0
+/// sudo -E env PATH="$PATH" RUSTUP_HOME=~/.rustup CARGO_HOME=~/.cargo \
+///     DEEPMSG_DPDK_T4_PCI_A=0000:01:00.0 DEEPMSG_DPDK_T4_PCI_B=0000:03:00.0 \
+///     cargo test -p deepmsg-driver --features dpdk -- --ignored --nocapture dpdk_two_drivers
+/// ```
+///
 /// **No addresses on either end**: the kernels must not be the ones answering
-/// ARP, or the message would prove nothing about the two stacks.
+/// ARP, or the message would prove nothing about the two stacks. A bound
+/// hardware port has none by construction — that is what binding it takes away
+/// — and a veth end is simply left unaddressed.
 #[test]
-#[ignore = "needs a veth pair and CAP_NET_RAW: set DEEPMSG_DPDK_T4_VETH_A/_B and run under sudo"]
+#[ignore = "needs two devices and root: set DEEPMSG_DPDK_T4_VETH_A/_B (veth) or DEEPMSG_DPDK_T4_PCI_A/_B (vfio) and run under sudo"]
 fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
-    let (interface_a, interface_b) = match (std::env::var(VETH_A), std::env::var(VETH_B)) {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => panic!(
-            "set {VETH_A} and {VETH_B} to the two ends of a veth pair:\n  \
-             sudo ip link add deepmsg-a type veth peer name deepmsg-b\n  \
-             sudo ip link set deepmsg-a up\n  sudo ip link set deepmsg-b up"
-        ),
-    };
+    let (device_a, device_b) = the_two_devices();
 
     let alice_dir = TempDir::new("alice");
     let bob_dir = TempDir::new("bob");
@@ -312,9 +391,9 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
     // either driver has done anything (the D4 record has the diagnosis). The
     // second driver waits for the first to publish its CnC file, which is
     // after its port is up.
-    let mut alice = Driver::start(&alice_dir.0, &interface_a, ALICE);
+    let mut alice = Driver::start(&alice_dir.0, &device_a, ALICE);
     let alice_cnc = alice.await_cnc();
-    let mut bob = Driver::start(&bob_dir.0, &interface_b, BOB);
+    let mut bob = Driver::start(&bob_dir.0, &device_b, BOB);
     let bob_cnc = bob.await_cnc();
 
     // Bob subscribes first: his subscription is what binds the endpoint Alice
