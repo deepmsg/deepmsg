@@ -31,10 +31,10 @@ use std::sync::{Arc, Mutex};
 
 use deepmsg_dpdk::{
     Checksum as DpdkChecksum, Disposition as DpdkDisposition, Mempool, QueuePair,
-    RxFrame as DpdkFrame,
+    RxFrame as DpdkFrame, TxOffloads as DpdkOffloads,
 };
 
-use super::frame::ETHERNET_HEADER_LENGTH;
+use super::frame::{ETHERNET_HEADER_LENGTH, L4Checksum, TxOffloads};
 use super::packet_io::{Disposition, Offloads, ReadyFrame, RxFrame, RxPort, TxPort, Verdict};
 use super::ports::Binding;
 
@@ -226,6 +226,21 @@ pub struct DpdkTxPort {
     pool: &'static Mempool,
     mac: [u8; 6],
     mtu: usize,
+    /// Whether this port's NIC computes the two checksums a frame carries
+    /// ([`L4Checksum`]), read when the port was built.
+    ///
+    /// **The started port's answer, not the device's wish**: the media asks for
+    /// exactly the checksum offloads the port says it has
+    /// (`PortSettings::asking_for_checksum_offloads`), and DPDK refuses a bit
+    /// the device has not got — so "the port can" and "the queue was configured
+    /// for it" are one fact here, the same way they are for the receive side
+    /// (`DpdkRxPort::of`).
+    ///
+    /// Both halves are required together, which is the other half of the rule:
+    /// a frame's mode decides the IPv4 header's field **and** the datagram's,
+    /// so a port that computes one of them and not the other is asked for
+    /// neither and its frames are written out in full.
+    computes_checksums: bool,
 }
 
 impl DpdkTxPort {
@@ -242,20 +257,62 @@ impl DpdkTxPort {
 
     fn of(pair: Pair, pool: &'static Mempool) -> Self {
         let (mac, mtu) = describe(&pair.port());
+        let computes_checksums = pair.port().info().can_compute_both_checksums();
 
         Self {
             pair,
             pool,
             mac,
             mtu,
+            computes_checksums,
         }
     }
 }
 
 impl TxPort for DpdkTxPort {
-    fn tx_burst(&mut self, count: usize, fill: &mut dyn FnMut(&mut [u8]) -> usize) -> usize {
+    fn tx_burst(
+        &mut self,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> (usize, TxOffloads),
+    ) -> usize {
         let pool = self.pool;
-        self.pair.with(|pair| pair.tx_burst(pool, count, fill))
+        let computes = self.computes_checksums;
+
+        // **The one place the stack's vocabulary becomes DPDK's**, and the one
+        // place a frame's ask can be refused. A frame whose author wrote the
+        // pseudo-header sum for a NIC that is not going to compute it carries a
+        // wrong checksum on the wire and nothing this side would ever read
+        // back, so the disagreement stops here rather than being sent: it is a
+        // programming error, not a transient condition, and a burst that
+        // reported success for it would be a burst that lied.
+        self.pair.with(|pair| {
+            pair.tx_burst(pool, count, &mut |buffer| {
+                let (written, offloads) = fill(buffer);
+                let (computes_here, l2_len, l3_len) = offloads.asked();
+
+                assert!(
+                    !computes_here || computes,
+                    "a frame asks the NIC for a checksum this port was not \
+                     configured to compute (`tx_checksums` says software)"
+                );
+
+                let offloads = if computes_here {
+                    DpdkOffloads::ipv4_and_udp_checksums(l2_len, l3_len)
+                } else {
+                    DpdkOffloads::NONE
+                };
+
+                (written, offloads)
+            })
+        })
+    }
+
+    fn checksums(&self) -> L4Checksum {
+        if self.computes_checksums {
+            L4Checksum::ByTheNic
+        } else {
+            L4Checksum::Software
+        }
     }
 
     fn mac(&self) -> [u8; 6] {

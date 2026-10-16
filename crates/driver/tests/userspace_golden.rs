@@ -120,7 +120,7 @@ impl Machine {
     fn deliver_udp(&self, to: u16, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + payload.len()];
         bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(payload);
-        let written = frame::write_ipv4_udp(
+        let written = frame::write_ipv4_udp_here(
             &mut bytes,
             &frame::UdpWrite {
                 ipv4: frame::Ipv4Write {
@@ -287,7 +287,7 @@ fn g5_a_connected_transport_hears_only_its_peer() {
     // The same port, the same host, a different source port: somebody else's.
     let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + 4];
     bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(b"nope");
-    let written = frame::write_ipv4_udp(
+    let written = frame::write_ipv4_udp_here(
         &mut bytes,
         &frame::UdpWrite {
             ipv4: frame::Ipv4Write {
@@ -397,7 +397,7 @@ fn g10_a_reconnect_moves_the_peer_it_hears() {
     // And the new one is.
     let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + 2];
     bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(b"hi");
-    let written = frame::write_ipv4_udp(
+    let written = frame::write_ipv4_udp_here(
         &mut bytes,
         &frame::UdpWrite {
             ipv4: frame::Ipv4Write {

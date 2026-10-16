@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_dpdk::{
     Checksum, Disposition, Eal, FrameRing, Mempool, MempoolSettings, ParkedFrame, Port,
-    PortSettings, QueuePair, RegisteredThread, restore_affinity, save_affinity,
+    PortSettings, QueuePair, RegisteredThread, TxOffloads, restore_affinity, save_affinity,
 };
 
 /// The EAL arguments every case here starts with.
@@ -602,7 +602,9 @@ fn a_transmitted_frame_leaves_through_the_pmd_in_the_child() {
 
     let sent = port.pairs[0].tx_burst(&port.pool, 1, &mut |room| {
         room[..expected.len()].copy_from_slice(&expected);
-        expected.len()
+
+        // The frame is written here in full, so it asks the NIC for nothing.
+        (expected.len(), TxOffloads::NONE)
     });
 
     assert_eq!(sent, 1, "the frame left");
@@ -680,7 +682,8 @@ fn af_packet_carries_a_frame_through_a_veth() {
 
     let sent = sending.pairs[0].tx_burst(&sending.pool, 1, &mut |room| {
         room[..expected.len()].copy_from_slice(&expected);
-        expected.len()
+
+        (expected.len(), TxOffloads::NONE)
     });
     assert_eq!(sent, 1, "the frame left the first interface");
 

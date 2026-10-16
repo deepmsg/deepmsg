@@ -48,7 +48,7 @@ use super::arp;
 use super::demux;
 use super::dpdk_counters::{Device, PortIdentity};
 use super::fake_port::{Side, Wire};
-use super::frame::{self, ArpPacket, EthernetHeader};
+use super::frame::{self, ArpPacket, EthernetHeader, TxOffloads};
 use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
 use super::packet_io::{ReadyFrame, RxPort, SlotId, TxPort};
 use super::ports::{Binding, EPHEMERAL_PORTS, PortTable, SLOT_CAPACITY};
@@ -888,8 +888,16 @@ impl Stack {
         let params = &self.params;
         let mut port = self.transmit(affinity).lock().expect("the transmit port");
 
+        // **A control frame asks the NIC for nothing**, and it can say so where
+        // it is written: an ARP request has no checksum a hardware engine
+        // computes, and a port that applied the UDP offload to it would write a
+        // UDP checksum into the middle of it. This is the call site that makes
+        // the offload per frame rather than per burst (`TxPort::tx_burst`).
         port.tx_burst(1, &mut |buffer| {
-            arp::write_request(buffer, params, address).unwrap_or(0)
+            (
+                arp::write_request(buffer, params, address).unwrap_or(0),
+                TxOffloads::NONE,
+            )
         });
     }
 
@@ -900,17 +908,23 @@ impl Stack {
         match deferred {
             Deferred::ArpReply { ethernet, packet } => {
                 port.tx_burst(1, &mut |buffer| {
-                    frame::write_arp(buffer, &ethernet, &packet).unwrap_or(0)
+                    (
+                        frame::write_arp(buffer, &ethernet, &packet).unwrap_or(0),
+                        TxOffloads::NONE,
+                    )
                 });
             }
             Deferred::IcmpReply(bytes) => {
                 port.tx_burst(1, &mut |buffer| {
                     if buffer.len() < bytes.len() {
-                        return 0;
+                        return (0, TxOffloads::NONE);
                     }
                     buffer[..bytes.len()].copy_from_slice(&bytes);
 
-                    bytes.len()
+                    // The reply's checksum was computed where it was built
+                    // (`frame::write_icmp_echo_reply`), and an ICMP checksum is
+                    // not one this build asks hardware for.
+                    (bytes.len(), TxOffloads::NONE)
                 });
             }
         }
@@ -1020,7 +1034,7 @@ mod tests {
 
         let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + payload.len()];
         bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&payload);
-        let written = frame::write_ipv4_udp(
+        let written = frame::write_ipv4_udp_here(
             &mut bytes,
             &frame::UdpWrite {
                 ipv4: frame::Ipv4Write {
@@ -1052,7 +1066,7 @@ mod tests {
     fn send_udp(port: &mut FakePort, destination: Ipv4Addr, to: u16, payload: &[u8]) {
         let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + payload.len()];
         bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(payload);
-        let written = frame::write_ipv4_udp(
+        let written = frame::write_ipv4_udp_here(
             &mut bytes,
             &frame::UdpWrite {
                 ipv4: frame::Ipv4Write {
@@ -1073,7 +1087,8 @@ mod tests {
             1,
             port.tx_burst(1, &mut |buffer| {
                 buffer[..written].copy_from_slice(&bytes[..written]);
-                written
+
+                (written, TxOffloads::NONE)
             })
         );
     }
@@ -1377,7 +1392,7 @@ mod tests {
         let (_, ring) = bind(&stack, 40464);
 
         let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH];
-        let written = frame::write_ipv4_udp(
+        let written = frame::write_ipv4_udp_here(
             &mut bytes,
             &frame::UdpWrite {
                 ipv4: frame::Ipv4Write {
@@ -1396,7 +1411,7 @@ mod tests {
 
         far_end(&wire).tx_burst(1, &mut |buffer| {
             buffer[..written].copy_from_slice(&bytes[..written]);
-            written
+            (written, TxOffloads::NONE)
         });
 
         stack.pump();

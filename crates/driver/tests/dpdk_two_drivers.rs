@@ -597,9 +597,55 @@ fn a_message_crosses_between_two_drivers_on_a_dpdk_port() {
         "one transport for the subscription"
     );
 
+    // **And the receiver's checksum verdicts are clean.** 89 is read rather
+    // than asserted non-zero, and read as `Some(0)` rather than as a
+    // possibility: the counter must be there (the media publishes it), and a
+    // healthy run of a media that computes its checksums has none of them.
+    //
+    // This is also where a wrong convention lands. A pseudo-header sum written
+    // the other way round — complemented, the easy mistake — is a frame whose
+    // checksum does not hold once the NIC has finished it; the receiving side
+    // finds that out (its port judges the checksum, and the transport re-reads
+    // it with software arithmetic) and counts it here.
+    for (name, cnc) in [("the sender", &alice_cnc), ("the receiver", &bob_cnc)] {
+        assert_eq!(
+            Some(0),
+            media_counter(cnc, type_id::CHECKSUM_FAILURE),
+            "{name} read a frame whose checksum did not hold"
+        );
+    }
+
     assert!(
         alice.is_running() && bob.is_running(),
         "both drivers are still running; a media that took a process with it \
          would have shown up here"
     );
+
+    // **Whose checksums these frames carry**, which is the one fact about this
+    // media that no counter shows and no local reading can: the startup line
+    // says it. A port that computes them takes the pseudo-header sum and
+    // finishes it in hardware; one that does not takes both checksums written
+    // out in full. The two produce frames that *look* alike from here and
+    // differ on the wire, which is the whole reason this case exists — a
+    // `net_pcap` port in the gate says `software` (see `dpdk_port.rs`), and a
+    // real NIC says `nic` only if it was asked for what it can do.
+    //
+    // **Read after stopping them, and after the assertion above**: a pipe stays
+    // open while its writer lives, so reading one on a running driver blocks
+    // instead of answering — which is what made this case hang rather than fail
+    // the first time it was written (`Driver::stop`'s note says the same thing
+    // from the other side, and the order of these two blocks is the whole of
+    // what keeps a failure a failure).
+    alice.stop();
+    bob.stop();
+
+    for (name, out) in [
+        ("the sender", alice.stdout()),
+        ("the receiver", bob.stdout()),
+    ] {
+        assert!(
+            out.contains("tx checksums nic"),
+            "{name}'s port computes checksums, and its startup line says so; it said: {out}"
+        );
+    }
 }

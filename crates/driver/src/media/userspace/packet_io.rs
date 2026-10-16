@@ -24,7 +24,7 @@
 //! travels with the frame rather than beside it, since two lists that have to
 //! stay in step are one list too many (§3.3 of the plan).
 
-use super::frame::Checksums;
+use super::frame::{Checksums, L4Checksum, TxOffloads};
 use super::ports::Binding;
 
 /// Which of the stack's slots a kept frame belongs to.
@@ -224,7 +224,27 @@ pub trait TxPort: Send {
     /// past the port's own capacity, or longer than it will carry — is not
     /// counted, and the caller's count of what was taken is the truth about
     /// what left (G7).
-    fn tx_burst(&mut self, count: usize, fill: &mut dyn FnMut(&mut [u8]) -> usize) -> usize;
+    fn tx_burst(
+        &mut self,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> (usize, TxOffloads),
+    ) -> usize;
+
+    /// **Which checksums a frame this port sends should carry, and who writes
+    /// them.**
+    ///
+    /// Asked by the transport before it fills a frame, because the answer
+    /// changes what goes in the frame's bytes: a port whose NIC computes the
+    /// checksums wants the pseudo-header sum in the datagram's field and zero
+    /// in the header's, and one whose NIC does not wants both written out
+    /// ([`L4Checksum`]).
+    ///
+    /// A capability of the *started* port rather than of the device, which is
+    /// the distinction that matters: DPDK computes nothing for a frame unless
+    /// the queue was configured for it, so a port that answers `ByTheNic` is
+    /// one that was asked — and one that was not answers `Software` even if the
+    /// hardware could have.
+    fn checksums(&self) -> L4Checksum;
 
     /// This port's MAC address, which every frame it sends carries.
     fn mac(&self) -> [u8; 6];
