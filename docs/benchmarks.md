@@ -534,10 +534,37 @@ themselves on the media (`dpdk media on 0000:03:00.x (net_ixgbe)`), and
 timeout` — the handshake never crosses. The same call, `rte_eth_rx_burst` asking
 for one frame, is what testpmd's receiving side collapses on in the same way
 when it is given `--burst=1`: 1,023 packets received against 154,012,398 the NIC
-dropped, with `RX-nombuf: 0`. Two independent implementations, one phenomenon,
-and the mechanism is not established — so this is recorded as a floor on the
-setting (8 is known to work, 2 to 7 are unmeasured) rather than as a finding
-about the port.
+dropped, with `RX-nombuf: 0`. Two independent implementations, one phenomenon —
+and **the mechanism is ixgbe's vector receive path, which states its own floor.**
+Asked for fewer than `RTE_IXGBE_DESCS_PER_LOOP` frames it returns no packet *and
+advances no descriptor*: `nb_pkts < RTE_IXGBE_DESCS_PER_LOOP, just return no
+packet`, then `nb_pkts = RTE_ALIGN_FLOOR(nb_pkts, RTE_IXGBE_DESCS_PER_LOOP)`,
+with the constant at 4 (`drivers/net/ixgbe/ixgbe_rxtx_vec_sse.c:326-379` and
+`ixgbe_rxtx.h:34` in DPDK 23.11; that driver has no AVX2 or AVX512 receive file
+to floor differently). The PMD says it where it installs the path, asked through
+testpmd — which accepts a `--log-level` that this build's own driver
+deliberately does not:
+
+    Vector rx enabled, please make sure RX burst size no less than 4 (port=0).
+
+**The floor is 4, and the cell that failed caught the mechanism.** Four cells at
+501K on the media arm — 8, 2, 4, 8, one session, the default at both ends so the
+drift is the floor (`analysis/dpdk/d8-rx-burst-floor.md` is the pre-registration,
+written before the run) — have **2 failing and 4 completing**. The failing cell
+is not merely a cell that failed: the port's own counter says the NIC put **62**
+frames into the ring and dropped **none**, the driver made **433,735,800** passes
+in the same window, and the application received nothing, with
+`rx-receiver-discard` and `error` both zero. The frames were accepted, held, and
+never handed over.
+
+So the setting's range is `4..=64` rather than `1..=64`: the three values no port
+answers with anything are out of it, and the floor is not written down here but
+taken from the port (`SHIM_BURST_MIN`, held equal to the driver's
+`DPDK_RX_BURST_MIN` by an assertion, the way the cap above it already is). What
+the two working settings do *not* decide is which to run: 4 against both 8s moves
+p50 by 40 ns, inside the disagreement between the session's own two ends
+(`analysis/dpdk/deepmsg-dpdk-d8-record.md` §6), so the knob has no resolution
+above its floor — the same thing the sweep above found from the other direction.
 
 **So 77's zero is evidence, and 84's now is too:**
 

@@ -595,21 +595,45 @@ pub const DPDK_TX_DESCRIPTORS_DEFAULT: u16 = 1024;
 pub const DPDK_MEMPOOL_CACHE_DEFAULT: u32 = 256;
 /// `design.md` §4.5's burst: one pass takes up to this many frames.
 pub const DPDK_RX_BURST_DEFAULT: usize = 32;
+/// The smallest burst a receive path answers with frames at all, which is the
+/// port's own floor rather than a number this file chose.
+///
+/// A DPDK receive path may floor-align the count it is handed and answer
+/// nothing below the alignment, and ixgbe's vector path does exactly that:
+/// asked for fewer than `RTE_IXGBE_DESCS_PER_LOOP` frames it returns no packet
+/// **and advances no descriptor**, so the frames the NIC has already accepted
+/// stay in the ring and the caller sees a port that receives nothing. Measured
+/// before it was written down — `rx.burst=2` cannot complete a handshake while
+/// the port's own counter says 62 frames were accepted and none were dropped
+/// (`analysis/dpdk/deepmsg-dpdk-d8-record.md` §6; the PMD states the floor
+/// itself where it installs the path).
+///
+/// It is the port's property and not a law of DPDK — a scalar receive path
+/// answers a count of one — which is why it is held equal to the port's own
+/// constant rather than written down here as well.
+pub const DPDK_RX_BURST_MIN: usize = 4;
 /// The largest burst, which is the port's own limit rather than a number this
 /// file chose: a DPDK port takes at most `SHIM_BURST_MAX` frames in one call
 /// and clamps anything larger, so a setting above it would be a value that is
 /// accepted, recorded and half-used.
 ///
-/// The two are the same number by construction where the media is built in —
-/// see the assertion below.
+/// Each of the two is the same number as the port's by construction where the
+/// media is built in — see the assertions below.
 pub const DPDK_RX_BURST_MAX: usize = 64;
 
-/// The setting's cap and the port's own limit, held equal rather than merely
-/// agreeing today: the port clamps what it is handed
-/// (`min(SHIM_BURST_MAX)`, `crates/dpdk/src/port.rs`), so a setting above its
-/// limit is a value that is accepted, recorded and then half-used — the shape
-/// this file spent a whole release getting wrong (`deepmsg.dpdk.rx.burst`
-/// itself: parsed, validated, documented, read by nobody).
+/// The setting's range and the port's own two limits, held equal rather than
+/// merely agreeing today.
+///
+/// The port clamps what it is handed (`min(SHIM_BURST_MAX)`,
+/// `crates/dpdk/src/port.rs`) and answers nothing below its floor, so a setting
+/// outside the pair is a value that is accepted, recorded and then half-used —
+/// the shape this file spent a whole release getting wrong at the top of the
+/// range (`deepmsg.dpdk.rx.burst` itself: parsed, validated, documented, read
+/// by nobody; then a cap sixteen times the port's) and a slice getting wrong at
+/// the bottom of it (a range that accepted 1, 2 and 3, each of which a real
+/// port receives nothing at).
+#[cfg(feature = "dpdk")]
+const _: () = assert!(DPDK_RX_BURST_MIN == deepmsg_dpdk::SHIM_BURST_MIN);
 #[cfg(feature = "dpdk")]
 const _: () = assert!(DPDK_RX_BURST_MAX == deepmsg_dpdk::SHIM_BURST_MAX);
 /// The design's ARP ageing.
@@ -2206,7 +2230,8 @@ impl Setting {
         env: "DEEPMSG_DPDK_MEMPOOL_CACHE",
     };
     /// `deepmsg.dpdk.rx.burst` (`DEEPMSG_DPDK_RX_BURST`): how many frames one
-    /// pass takes off the port, up to [`DPDK_RX_BURST_MAX`].
+    /// pass takes off the port, between [`DPDK_RX_BURST_MIN`] and
+    /// [`DPDK_RX_BURST_MAX`].
     ///
     /// It lands in [`StackParams::rx_burst`] and is read by `Stack::pump`,
     /// which is the one pass over the receive port a userspace stack has. What
@@ -3387,7 +3412,7 @@ fn parse_dpdk(
     }
     if let Some(value) = get(&Setting::DPDK_RX_BURST) {
         let burst = parse_count(&Setting::DPDK_RX_BURST, &value)?;
-        if !(1..=DPDK_RX_BURST_MAX as i64).contains(&burst) {
+        if !(DPDK_RX_BURST_MIN as i64..=DPDK_RX_BURST_MAX as i64).contains(&burst) {
             return Err(ConfigError::OutOfRange {
                 name: Setting::DPDK_RX_BURST.property,
                 value,
@@ -5459,7 +5484,13 @@ mod tests {
             ),
             ("deepmsg.dpdk.ephemeral.ports", "40000"),
             ("deepmsg.dpdk.ephemeral.ports", "40100-40000"),
+            // Below the port's floor. **These are the interesting ones**: a
+            // setting in here is one the driver used to accept and start on,
+            // and the port it built then answered nothing — the failure showed
+            // up forty seconds later as a handshake that timed out, which is
+            // the shape a range is supposed to keep out of a deployment.
             ("deepmsg.dpdk.rx.burst", "0"),
+            ("deepmsg.dpdk.rx.burst", "3"),
             // One past what a port will take in one call: accepted-and-clamped
             // is the shape this setting's own history is made of.
             ("deepmsg.dpdk.rx.burst", "65"),
@@ -5475,6 +5506,32 @@ mod tests {
                 other => panic!("{property}={value} must be refused, got {other:?}"),
             }
         }
+    }
+
+    /// **The floor of the range is a value the driver holds, and one below it
+    /// is not.** Both directions, because the boundary is the whole question: a
+    /// range that refused four would be as wrong as the one that accepted
+    /// three, and four is a number the port supplied rather than one this file
+    /// picked — which is why neither side of this test spells it.
+    #[test]
+    fn the_burst_has_a_floor_and_the_floor_itself_is_held() {
+        let floor = DPDK_RX_BURST_MIN.to_string();
+        let held = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.rx.burst", floor.as_str()),
+        ])
+        .expect("the floor is a value the driver holds");
+        assert_eq!(DPDK_RX_BURST_MIN, held.dpdk.rx_burst);
+
+        let below = (DPDK_RX_BURST_MIN - 1).to_string();
+        assert!(
+            resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.rx.burst", below.as_str()),
+            ])
+            .is_err(),
+            "one below the floor is the count a port answers nothing at"
+        );
     }
 
     /// **A list of ports makes the allow-list the driver's, and one port does

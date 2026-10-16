@@ -113,6 +113,17 @@ pub const SHIM_XSTAT_NAME_MAX: usize = 64;
 /// One burst carries at most this many frames (`SHIM_BURST_MAX` in the shim).
 pub const SHIM_BURST_MAX: usize = 64;
 
+/// The fewest frames a receive path can be asked for and still answer with
+/// any (`SHIM_BURST_MIN` in the shim).
+///
+/// Unlike the bound above, this one is not this crate's choice: it is what the
+/// PMD does with a small count. ixgbe's vector receive path floor-aligns the
+/// count to `RTE_IXGBE_DESCS_PER_LOOP` and answers nothing below it, leaving
+/// the frames the NIC accepted sitting in the ring. A caller that takes the
+/// port's word for it is what this constant is for; the pass itself is still
+/// handed whatever count it asks for.
+pub const SHIM_BURST_MIN: usize = 4;
+
 unsafe extern "C" {
     // The EAL: one `init` per process, and a `cleanup` that does not undo it.
     pub fn shim_eal_init(argc: c_int, argv: *mut *mut c_char) -> c_int;

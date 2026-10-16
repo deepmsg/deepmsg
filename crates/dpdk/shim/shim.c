@@ -122,6 +122,27 @@ typedef struct {
 /* The batch bound: one call carries at most this many frames. */
 #define SHIM_BURST_MAX 64
 
+/*
+ * ...and the other end of the same range: the fewest frames a receive path can
+ * be asked for and still answer with any.
+ *
+ * This one is not a number this file chose, the way the bound above is. It is
+ * what the PMD under `rte_eth_rx_burst` does with a small count: ixgbe's vector
+ * receive path floor-aligns the count to `RTE_IXGBE_DESCS_PER_LOOP` and, asked
+ * for fewer, returns no packet and advances no descriptor — the frames the NIC
+ * has already accepted stay in the ring and the caller sees an idle port. Four
+ * is that constant, and the PMD says so itself where it installs the path
+ * ("please make sure RX burst size no less than 4", `ixgbe_rxtx.c` in DPDK
+ * 23.11; `analysis/dpdk/deepmsg-dpdk-d8-record.md` §6 measured it).
+ *
+ * **It is the port's floor rather than a law of DPDK**, and it is not a check
+ * this file makes: the count is passed through to the PMD as given, and a
+ * scalar receive path answers a count of one quite happily. A media built for a
+ * different port changes this number and nothing else, which is why it is here,
+ * beside the bound, and not in the driver's configuration.
+ */
+#define SHIM_BURST_MIN 4
+
 /* ---- EAL, once per process ------------------------------------------- */
 
 int shim_eal_init(int argc, char **argv) { return rte_eal_init(argc, argv); }
