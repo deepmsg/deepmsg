@@ -1088,6 +1088,39 @@ impl Client {
             .take_image(publication_registration_id)
     }
 
+    /// Hand an exclusive publication over to a writer of its own, out of this
+    /// client.
+    ///
+    /// The counterpart of [`Client::take_image`], for the same reason: an
+    /// [`ExclusivePublication`] carries its own mapped log, so an archive that
+    /// publishes a replay on a thread of its own cannot keep it inside a client
+    /// another thread polls. The reference has no such move to make, because its
+    /// `ExclusivePublication` is an object many things reference at once.
+    ///
+    /// **It is simpler than [`Client::take_image`] in the one place that one is
+    /// delicate.** An image is taken out of a *subscription* the driver can still
+    /// speak about — `ON_UNAVAILABLE_IMAGE` announces its withdrawal — so the
+    /// subscription has to keep a record of what it gave away to pass that on
+    /// ([`Subscription::close_handed_out`](crate::subscription::Subscription::close_handed_out)).
+    /// A replay publication is the archive's own: nothing but the archive ever
+    /// tears it down, and it does that **by registration id** through
+    /// `revoke_publication_on_close`/`async_remove_publication`, which need no
+    /// object at all. So there is nothing to remember.
+    ///
+    /// `None` when this client holds no such publication — an id that was never
+    /// here, or one already handed over.
+    pub fn take_exclusive_publication(
+        &mut self,
+        registration_id: i64,
+    ) -> Option<ExclusivePublication> {
+        let index = self
+            .exclusive_publications
+            .iter()
+            .position(|publication| publication.registration_id() == registration_id)?;
+
+        Some(self.exclusive_publications.remove(index))
+    }
+
     /// A publication by registration id.
     pub fn publication(&self, registration_id: i64) -> Option<&Publication> {
         self.publications

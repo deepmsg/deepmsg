@@ -157,7 +157,7 @@ use crate::server::recorder::RecorderHalf;
 use crate::server::recording_pos::RecordingPos;
 use crate::server::recording_session::{RecordingImage, RecordingSession};
 use crate::server::replay_session::{
-    Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
+    Progress as ReplayProgress, Publication, ReplaySession, close_publication, revoke_publication,
 };
 use crate::server::replayer::Replayer;
 use crate::server::replication_session::{
@@ -2373,6 +2373,22 @@ struct ReplayEntry {
     /// The publication the frames go out on, which the conductor gives back when
     /// the replay ends.
     registration_id: i64,
+    /// ★ **The publication itself, taken out of the client** (P2-9a).
+    ///
+    /// It used to stay in the client and be reached by `registration_id` every
+    /// turn through a wrapper ([`Published`]). That is the same thing only while
+    /// the session and the client are on one thread, which is what
+    /// `aeron.archive.threading.mode=DEDICATED` is not: a session that runs
+    /// beside the conductor has to hold what it writes to. Taking it out is what
+    /// [`Client::take_exclusive_publication`] is for, and the counterpart of
+    /// ③-1's `take_image`.
+    ///
+    /// **`registration_id` is still what gives it back.** `revoke` and `close`
+    /// are client commands addressed by id and there is no object in them, which
+    /// is the one place this is simpler than the image side: an image's
+    /// subscription has to be told what it gave away, and a replay publication
+    /// has nobody but this archive to hear from.
+    publication: Box<dyn Publication>,
     /// Whether the OK has gone out.
     ///
     /// It goes out **once**, on the turn the segment opens and its header checks
@@ -4597,8 +4613,16 @@ impl Sessions {
         now_ms: i64,
     ) -> Option<ReplayEntry> {
         let recording = catalog.recording(replay.recording_id).ok()?;
-        let facts = ReplayPublications::facts(client, registration_id)?;
-        let replay_session_id = self.mint_replay_session_id(facts.session_id);
+
+        // ★ **The publication is taken out of the client here** (P2-9a), which
+        // is the one moment it can be: the session is about to own it, and from
+        // then on it is asked for nothing by registration id — a replay's ids
+        // are settled when it is created (`Published`'s own note, which is why
+        // the four facts used to be read once too). The conductor keeps the id
+        // beside the session, because giving the publication back **is** a
+        // client command and the client is the conductor's.
+        let publication = client.take_exclusive_publication(registration_id)?;
+        let replay_session_id = self.mint_replay_session_id(publication.session_id());
 
         // `ArchiveConductor.newReplaySession` (`:956-966`): the request's block
         // size when it named one **and it is smaller than the archive's**, and
@@ -4654,6 +4678,7 @@ impl Sessions {
             control_session_id: replay.control_session_id,
             correlation_id: replay.correlation_id,
             registration_id,
+            publication: Box::new(publication),
             limit: replay.limit,
             start_position: replay.start_position,
             started: false,
@@ -4713,13 +4738,9 @@ impl Sessions {
                 }
             }
 
-            let Some(mut published) = Published::new(client, entry.registration_id) else {
-                // The publication is gone; there is nowhere to write.
-                finished.push(*replay_session_id);
-                continue;
-            };
-
-            let progress = entry.session.do_work(&mut published, now_ns);
+            let progress = entry
+                .session
+                .do_work(entry.publication.as_mut(), counters, now_ns);
 
             // `replayer.bytesRead(bytesRead)` and `replayer.readTimeNs(…)`
             // (`:431-434`), which the reference does inside the session because
@@ -4778,12 +4799,10 @@ impl Sessions {
             // caller, because the client a teardown needs is the conductor's.
             // A publication the client no longer holds is one the driver has
             // already taken back, so there is nothing to give it.
-            if let Some(mut published) = Published::new(client, entry.registration_id) {
-                if entry.session.is_revoking() {
-                    published.revoke();
-                } else {
-                    published.close();
-                }
+            if entry.session.is_revoking() {
+                revoke_publication(client, entry.registration_id);
+            } else {
+                close_publication(client, entry.registration_id);
             }
 
             // `closeReplaySession`'s `ctx.replaySessionCounter().decrementRelease()`

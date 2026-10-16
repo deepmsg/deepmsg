@@ -45,6 +45,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use deepmsg_client::client::Client;
+use deepmsg_client::publication::ExclusivePublication;
+use deepmsg_cnc::counters::CountersReader;
+use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::clock::monotonic_nano_time;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::{FRAME_ALIGNMENT, TERM_MAX_LENGTH};
@@ -83,7 +87,7 @@ pub enum State {
 /// is, and none of it is reachable from a test unless the publication can be
 /// stood in for. The thing it stands in for is the reference's
 /// `Publication`/`ExclusivePublication` (`Publication.java:326`, `:462`, `:509`).
-pub trait Publication {
+pub trait Publication: Send {
     /// `publication.isConnected()`.
     fn is_connected(&self) -> bool;
     /// Its Aeron session id — the low half of a `replaySessionId`.
@@ -95,13 +99,101 @@ pub trait Publication {
     /// Its `initialTermId()`, for the same reason.
     fn initial_term_id(&self) -> i32;
     /// `publication.availableWindow()`; the whole read block is gated on it.
-    fn available_window(&self) -> i64;
+    ///
+    /// ★ **The counters region is a parameter** (P2-9a), for the reason
+    /// [`RecordingImage::block_poll`](super::recording_session::RecordingImage::block_poll)
+    /// gives: the window's upper bound is not on the publication, it is the
+    /// driver's `position_limit` counter, and a session that no longer reaches
+    /// its publication through a client has no other way to read one.
+    fn available_window(&self, counters: &CountersReader<'_, ReadWrite>) -> i64;
     /// One block of whole frames, whose headers are already final.
     ///
     /// `None` is `Publication.CLOSED` — there is no such publication any more.
-    fn offer_block(&mut self, block: &[u8]) -> Option<Appended>;
+    fn offer_block(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        block: &[u8],
+    ) -> Option<Appended>;
     /// `publication.appendPadding(length)`.
-    fn append_padding(&mut self, length: usize) -> Option<Appended>;
+    fn append_padding(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        length: usize,
+    ) -> Option<Appended>;
+}
+
+/// The publication a replay actually writes to, now that a session **owns** it
+/// rather than reaching it through the client every turn (P2-9a).
+///
+/// The counterpart of `impl RecordingImage for Image`, and the same move: the
+/// object carries its own mapped log (`ExclusivePublication`'s `LogBuffer`), so
+/// the owner of the session can be the owner of the publication, and a replay
+/// can run on a thread the client is not on. What the client used to do beside
+/// the object — read the driver's `position_limit` counter and pass it to
+/// `offer_block` — is what the `counters` parameter above now carries.
+impl Publication for ExclusivePublication {
+    fn is_connected(&self) -> bool {
+        ExclusivePublication::is_connected(self).unwrap_or(false)
+    }
+
+    fn session_id(&self) -> i32 {
+        ExclusivePublication::session_id(self)
+    }
+
+    fn stream_id(&self) -> i32 {
+        ExclusivePublication::stream_id(self)
+    }
+
+    fn position_bits_to_shift(&self) -> u32 {
+        ExclusivePublication::position_bits_to_shift(self)
+    }
+
+    fn initial_term_id(&self) -> i32 {
+        ExclusivePublication::initial_term_id(self)
+    }
+
+    fn available_window(&self, counters: &CountersReader<'_, ReadWrite>) -> i64 {
+        ExclusivePublication::available_window(self, position_limit(self, counters)).unwrap_or(0)
+    }
+
+    fn offer_block(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        block: &[u8],
+    ) -> Option<Appended> {
+        Some(ExclusivePublication::offer_block(
+            self,
+            position_limit(self, counters),
+            block,
+        ))
+    }
+
+    fn append_padding(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        length: usize,
+    ) -> Option<Appended> {
+        Some(ExclusivePublication::append_padding(
+            self,
+            position_limit(self, counters),
+            length,
+        ))
+    }
+}
+
+/// The driver's `position_limit` counter, which is what every offer is judged
+/// against (`Client::position_limit`, which this is the other side of).
+///
+/// Zero when the slot cannot be read, which is what the client answers too: a
+/// window of zero offers nothing, and a replay that cannot see its window
+/// retries rather than writing somewhere the driver has not made room for.
+fn position_limit(
+    publication: &ExclusivePublication,
+    counters: &CountersReader<'_, ReadWrite>,
+) -> i64 {
+    counters
+        .value(publication.position_limit_counter_id())
+        .unwrap_or(0)
 }
 
 /// What one turn did, in the terms the conductor has to act on.
@@ -320,7 +412,12 @@ impl ReplaySession {
     }
 
     /// One turn: `ReplaySession.doWork` (`:209-243`).
-    pub fn do_work(&mut self, publication: &mut dyn Publication, now_ns: u64) -> Progress {
+    pub fn do_work(
+        &mut self,
+        publication: &mut dyn Publication,
+        counters: &CountersReader<'_, ReadWrite>,
+        now_ns: u64,
+    ) -> Progress {
         // This turn's read, which the conductor reads back after this call —
         // so it starts from nothing rather than from the last turn's.
         self.read_bytes = 0;
@@ -337,7 +434,7 @@ impl ReplaySession {
 
         let progress = match self.state {
             State::Init => self.init(publication, now_ns),
-            State::Replay => self.replay(publication),
+            State::Replay => self.replay(publication, counters),
             State::Inactive | State::Done => Progress::Idle,
         };
 
@@ -421,7 +518,11 @@ impl ReplaySession {
     }
 
     /// `ReplaySession.replay` (`:358-461`).
-    fn replay(&mut self, publication: &mut dyn Publication) -> Progress {
+    fn replay(
+        &mut self,
+        publication: &mut dyn Publication,
+        counters: &CountersReader<'_, ReadWrite>,
+    ) -> Progress {
         if !publication.is_connected() {
             self.revoke = true;
             self.state = State::Inactive;
@@ -458,7 +559,7 @@ impl ReplaySession {
             }
         }
 
-        if publication.available_window() <= 0 {
+        if publication.available_window(counters) <= 0 {
             return Progress::Idle;
         }
 
@@ -560,7 +661,9 @@ impl ReplaySession {
             // nothing, so `commit` may still take `&mut self`.
             let block = self.buffer.get(..batch_offset).unwrap_or_default();
 
-            if !self.commit(publication.offer_block(block), batch_offset) {
+            let appended = publication.offer_block(counters, block);
+
+            if !self.commit(appended, batch_offset) {
                 // A padding frame on its own is a term boundary the stream never
                 // had, so it goes the way of the batch that did not go out.
                 padding_frame_length = 0;
@@ -575,7 +678,9 @@ impl ReplaySession {
             .unwrap_or(usize::MAX);
             let length = padding_frame_length.saturating_sub(DATA_HEADER_LENGTH);
 
-            self.commit(publication.append_padding(length), aligned);
+            let appended = publication.append_padding(counters, length);
+
+            self.commit(appended, aligned);
         }
 
         Progress::Worked
@@ -789,152 +894,38 @@ fn put_i32(bytes: &mut [u8], offset: usize, value: i32) {
     }
 }
 
-/// The four things a replay stamps into every frame's header, and reads every
-/// time it builds one (`ReplaySession.java:391-392`, `:320-321`).
+/// Give a replay's publication back to the driver **without** its linger: what
+/// a replay that failed or was cancelled gets (`ReplaySession.java:175-194`).
 ///
-/// Gathered into one call rather than four trait methods because they are
-/// always wanted together and each would be a one-line delegation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PublicationFacts {
-    /// The Aeron session id the frames go out under — the low half of a
-    /// `replaySessionId` (`AC:956`).
-    pub session_id: i32,
-    /// The stream id the frames go out under.
-    pub stream_id: i32,
-    /// `positionBitsToShift`, which names the term a position falls in.
-    pub position_bits_to_shift: u32,
-    /// `initialTermId`, for the same reason.
-    pub initial_term_id: i32,
-}
-
-/// The archive's client, as far as a replay's publication goes.
+/// The **conductor's** call, not the session's. The reference's session closes
+/// its own publication (`:184-192`) because its conductor is the object that
+/// holds the `Aeron`; here the session writes through the publication and the
+/// client is the conductor's, so the teardown goes by registration id — which is
+/// why a [`ReplayEntry`](super::conductor) keeps one beside the session.
 ///
-/// Deliberately **not** `control_session::Publications`, which is the seam the
-/// control session's egress uses. Past the registration id the two have nothing
-/// in common — that one offers an encoded `Response` through `offer`, this one
-/// offers blocks of recorded frames through `offer_block` — and keeping them
-/// apart is also what keeps the control session's test doubles from having to
-/// stub out calls they can never make.
-pub trait ReplayPublications {
-    /// `publication.isConnected()`.
-    fn is_connected(&self, registration_id: i64) -> bool;
-
-    /// The four header words. `None` when this client holds no such
-    /// publication, which is where the reference's `CLOSED` lands.
-    fn facts(&self, registration_id: i64) -> Option<PublicationFacts>;
-
-    /// `Publication.availableWindow` (`:409-413`); a replay's whole read is
-    /// gated on it (`:385`). `None` for no such publication.
-    fn available_window(&self, registration_id: i64) -> Option<i64>;
-
-    /// `Publication.offerBlock` (`:509`).
-    fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended>;
-
-    /// `ExclusivePublication.appendPadding` (`:462`).
-    fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended>;
-
-    /// `publication.revoke()`: torn down now, with no linger — what a replay
-    /// that failed or was cancelled gets (`:175-194`).
-    fn release_publication(&mut self, registration_id: i64, timeout: Duration);
-
-    /// `CloseHelper.close(publication)`: **the linger applies**, which is the
-    /// whole point of it for a replay that ran to its end — the driver keeps
-    /// the publication long enough to retransmit the tail.
-    ///
-    /// Named for the publication rather than `close` because `Client` has a
-    /// `close` of its own, and a name that means two things where one of them is
-    /// a whole client is a name that gets read wrong.
-    fn close_publication(&mut self, registration_id: i64, timeout: Duration);
-}
-
-/// The replay publication as it actually is: a registration id at the driver,
-/// reached through the client that holds it.
+/// # Why `revoke_publication_on_close` and not `revoke_publication`
 ///
-/// The four facts are read **once**, when the publication is first reached, and
-/// served from then on. The reference reads them off a live object every time;
-/// here the object is a registration id, and asking the client for four numbers
-/// on every frame's header would be four lookups into a list for values that
-/// cannot have changed — a publication's ids are settled when it is created.
-pub struct Published<'a, P: ReplayPublications + ?Sized> {
-    publications: &'a mut P,
-    registration_id: i64,
-    facts: PublicationFacts,
+/// Because the latter **waits for the driver**, and the archive's conductor and
+/// the driver share a thread in `deepmsg-archiving-media-driver`: a command that
+/// waits for the driver is a command that waits for the turn that would answer
+/// it. That stall is not merely slow — the driver's clock jumps by the wait,
+/// every network publication's receivers expire together, and the maintenance
+/// pass then writes `is_connected = 0` into a publication whose subscriber is
+/// still there. It is what killed the control session that asked for a replay's
+/// stop, and it was found on the way to this function's first home.
+///
+/// So the pair is the reference's two steps done asynchronously: mark it, then
+/// ask for its removal, with the driver's answer left for a later poll.
+pub fn revoke_publication(client: &mut Client, registration_id: i64) {
+    client.revoke_publication_on_close(registration_id);
+    let _ = client.async_remove_publication(registration_id, DEFAULT_CLOSE_TIMEOUT);
 }
 
-impl<'a, P: ReplayPublications + ?Sized> Published<'a, P> {
-    /// Reach the publication this registration id names.
-    ///
-    /// `None` when the client holds none, which the conductor only reaches by
-    /// holding a registration id it was never given.
-    pub fn new(publications: &'a mut P, registration_id: i64) -> Option<Self> {
-        let facts = publications.facts(registration_id)?;
-
-        Some(Self {
-            publications,
-            registration_id,
-            facts,
-        })
-    }
-}
-
-impl<P: ReplayPublications + ?Sized> Publication for Published<'_, P> {
-    fn is_connected(&self) -> bool {
-        self.publications.is_connected(self.registration_id)
-    }
-
-    fn session_id(&self) -> i32 {
-        self.facts.session_id
-    }
-
-    fn stream_id(&self) -> i32 {
-        self.facts.stream_id
-    }
-
-    fn position_bits_to_shift(&self) -> u32 {
-        self.facts.position_bits_to_shift
-    }
-
-    fn initial_term_id(&self) -> i32 {
-        self.facts.initial_term_id
-    }
-
-    fn available_window(&self) -> i64 {
-        self.publications
-            .available_window(self.registration_id)
-            .unwrap_or(0)
-    }
-
-    fn offer_block(&mut self, block: &[u8]) -> Option<Appended> {
-        self.publications.offer_block(self.registration_id, block)
-    }
-
-    fn append_padding(&mut self, length: usize) -> Option<Appended> {
-        self.publications
-            .append_padding(self.registration_id, length)
-    }
-}
-
-impl<P: ReplayPublications + ?Sized> Published<'_, P> {
-    /// `publication.revoke()`: torn down now, with no linger — what a replay
-    /// that **failed or was cancelled** gets (`ReplaySession.java:175-194`).
-    ///
-    /// The pair below is the wrapper's own, and the **conductor** is what calls
-    /// it. The reference's session closes its own publication (`:184-192`),
-    /// because its conductor is the object that holds the Aeron client; here
-    /// the session has no client at all, so the teardown is the conductor's and
-    /// what it tears down through is this — the wrapper, which is what holds
-    /// the registration id.
-    pub fn revoke(&mut self) {
-        self.publications
-            .release_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
-    }
-
-    /// `publication.close()`, which honours the linger: what a replay that ran
-    /// to its **end** gets, so the driver can retransmit its tail.
-    pub fn close(&mut self) {
-        self.publications
-            .close_publication(self.registration_id, DEFAULT_CLOSE_TIMEOUT);
-    }
+/// Give a replay's publication back **with** its linger, which is the whole
+/// point of it for a replay that ran to its end: the driver keeps the
+/// publication long enough to retransmit the tail.
+pub fn close_publication(client: &mut Client, registration_id: i64) {
+    let _ = client.async_remove_publication(registration_id, DEFAULT_CLOSE_TIMEOUT);
 }
 
 /// How long the client is given to get a publication's removal to the driver.
@@ -1127,21 +1118,52 @@ mod tests {
             INITIAL_TERM_ID
         }
 
-        fn available_window(&self) -> i64 {
+        fn available_window(&self, _counters: &CountersReader<'_, ReadWrite>) -> i64 {
             self.window
         }
 
-        fn offer_block(&mut self, block: &[u8]) -> Option<Appended> {
+        fn offer_block(
+            &mut self,
+            _counters: &CountersReader<'_, ReadWrite>,
+            block: &[u8],
+        ) -> Option<Appended> {
             self.offers.push(block.to_vec());
 
             self.outcome()
         }
 
-        fn append_padding(&mut self, length: usize) -> Option<Appended> {
+        fn append_padding(
+            &mut self,
+            _counters: &CountersReader<'_, ReadWrite>,
+            length: usize,
+        ) -> Option<Appended> {
             self.paddings.push(length);
 
             self.outcome()
         }
+    }
+
+    /// A counters region for a session's turn.
+    ///
+    /// Every fake publication ignores it — a replay's window is the driver's
+    /// `position_limit` counter, and none of these tests has a driver — but the
+    /// parameter is not optional, which is the point of it: it is what lets a
+    /// session run where the client is not.
+    #[repr(align(64))]
+    struct Region([u8; 64 * 64]);
+
+    fn counters() -> CountersReader<'static, ReadWrite> {
+        // Leaked on purpose: the reader borrows its two regions for as long as a
+        // test needs it, and a test is a process that is about to end.
+        let metadata: &'static mut Region = Box::leak(Box::new(Region([0; 64 * 64])));
+        let values: &'static mut Region = Box::leak(Box::new(Region([0; 64 * 64])));
+
+        CountersReader::new(
+            deepmsg_core::buffer::AtomicBuffer::from_slice_mut(&mut metadata.0)
+                .expect("aligned metadata"),
+            deepmsg_core::buffer::AtomicBuffer::from_slice_mut(&mut values.0)
+                .expect("aligned values"),
+        )
     }
 
     /// Drive until the session ends, answering every turn.
@@ -1149,7 +1171,7 @@ mod tests {
         let mut seen = Vec::new();
 
         for _ in 0..32 {
-            let progress = session.do_work(publication, 0);
+            let progress = session.do_work(publication, &counters(), 0);
             let done = matches!(progress, Progress::Finished | Progress::Failed { .. });
 
             seen.push(progress);
@@ -1175,7 +1197,10 @@ mod tests {
 
         let mut session = reader(&dir, summary, 0, stop, stop, None);
 
-        assert_eq!(Progress::Started, session.do_work(&mut publication, 0));
+        assert_eq!(
+            Progress::Started,
+            session.do_work(&mut publication, &counters(), 0)
+        );
         assert!(!publication.is_connected());
         assert_eq!(
             State::Init,
@@ -1185,7 +1210,10 @@ mod tests {
 
         // The connection turn is what moves it on.
         publication.connected = true;
-        assert_eq!(Progress::Worked, session.do_work(&mut publication, 0));
+        assert_eq!(
+            Progress::Worked,
+            session.do_work(&mut publication, &counters(), 0)
+        );
         assert_eq!(State::Replay, session.state());
     }
 
@@ -1501,174 +1529,5 @@ mod tests {
             }
             other => panic!("expected a checksum failure, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod published_tests {
-    use super::*;
-    use deepmsg_core::logbuffer::position::Position;
-
-    const REGISTRATION_ID: i64 = 0x5EED;
-
-    const FACTS: PublicationFacts = PublicationFacts {
-        session_id: 99,
-        stream_id: 55,
-        position_bits_to_shift: 16,
-        initial_term_id: 7,
-    };
-
-    #[derive(Default)]
-    struct Fake {
-        connected: bool,
-        window: Option<i64>,
-        outcome: Option<Appended>,
-        counts: Vec<(i64, usize)>,
-        released: Vec<i64>,
-        closed: Vec<i64>,
-    }
-
-    impl ReplayPublications for Fake {
-        fn is_connected(&self, _registration_id: i64) -> bool {
-            self.connected
-        }
-
-        fn facts(&self, registration_id: i64) -> Option<PublicationFacts> {
-            (registration_id == REGISTRATION_ID).then_some(FACTS)
-        }
-
-        fn available_window(&self, _registration_id: i64) -> Option<i64> {
-            self.window
-        }
-
-        fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended> {
-            self.counts.push((registration_id, block.len()));
-
-            self.outcome
-        }
-
-        fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended> {
-            self.counts.push((registration_id, length));
-
-            self.outcome
-        }
-
-        fn release_publication(&mut self, registration_id: i64, _timeout: Duration) {
-            self.released.push(registration_id);
-        }
-
-        fn close_publication(&mut self, registration_id: i64, _timeout: Duration) {
-            self.closed.push(registration_id);
-        }
-    }
-
-    fn ok() -> Appended {
-        Appended::Ok {
-            position: Position::from_term_count(0, 0, FACTS.position_bits_to_shift),
-            term_offset: 0,
-        }
-    }
-
-    /// A registration id the client does not hold is not a publication, and
-    /// saying so is the adapter's whole job at construction.
-    #[test]
-    fn a_registration_the_client_does_not_hold_is_not_a_publication() {
-        let mut fake = Fake::default();
-
-        assert!(Published::new(&mut fake, REGISTRATION_ID + 1).is_none());
-        assert!(Published::new(&mut fake, REGISTRATION_ID).is_some());
-    }
-
-    /// The four header words come off the publication, not out of thin air.
-    #[test]
-    fn the_four_header_words_are_the_publications() {
-        let mut fake = Fake::default();
-        let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
-
-        assert_eq!(99, published.session_id());
-        assert_eq!(55, published.stream_id());
-        assert_eq!(16, published.position_bits_to_shift());
-        assert_eq!(7, published.initial_term_id());
-    }
-
-    /// Offers and paddings go out under the registration id, and a client that
-    /// no longer holds the publication answers `None` — which the session reads
-    /// as `CLOSED`.
-    #[test]
-    fn offers_go_out_under_the_registration_id() {
-        let mut fake = Fake {
-            outcome: Some(ok()),
-            ..Fake::default()
-        };
-        {
-            let mut published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
-
-            assert!(matches!(
-                published.offer_block(b"frames"),
-                Some(Appended::Ok { .. })
-            ));
-            assert!(matches!(
-                published.append_padding(32),
-                Some(Appended::Ok { .. })
-            ));
-        }
-
-        assert_eq!(
-            vec![(REGISTRATION_ID, 6), (REGISTRATION_ID, 32)],
-            fake.counts
-        );
-
-        // And a publication the client has let go of says so.
-        fake.outcome = None;
-
-        let mut published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
-
-        assert!(published.offer_block(b"frames").is_none());
-    }
-
-    /// A window the client cannot answer for is no window at all, so the next
-    /// turn reads nothing rather than reading into a full one.
-    #[test]
-    fn a_window_the_client_cannot_answer_for_is_zero() {
-        let mut fake = Fake::default();
-
-        {
-            let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
-
-            assert_eq!(0, published.available_window());
-        }
-
-        fake.window = Some(4096);
-
-        let published = Published::new(&mut fake, REGISTRATION_ID).expect("a publication");
-
-        assert_eq!(4096, published.available_window());
-    }
-
-    /// **Closing is not revoking**, and the difference is the linger: a replay
-    /// that ran to its end is closed so the driver can retransmit its tail, and
-    /// one that failed or was cancelled is torn down at once
-    /// (`ReplaySession.java:175-194`).
-    #[test]
-    fn closing_is_not_revoking() {
-        let mut fake = Fake::default();
-
-        Published::new(&mut fake, REGISTRATION_ID)
-            .expect("a publication")
-            .close();
-
-        assert_eq!(vec![REGISTRATION_ID], fake.closed);
-        assert!(fake.released.is_empty(), "a clean end does not revoke");
-
-        Published::new(&mut fake, REGISTRATION_ID)
-            .expect("a publication")
-            .revoke();
-
-        assert_eq!(vec![REGISTRATION_ID], fake.released);
-        assert_eq!(
-            vec![REGISTRATION_ID],
-            fake.closed,
-            "and the close is not repeated"
-        );
     }
 }
