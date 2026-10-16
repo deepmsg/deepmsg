@@ -161,6 +161,10 @@ pub enum ConfigError {
     /// a client waiting for events that will never come is the silent kind of
     /// wrong.
     RecordingEventsNotImplemented,
+    /// `aeron.archive.catalog.file.sync.level` is below
+    /// `aeron.archive.file.sync.level` (`Archive.java:1202-1205`), which the
+    /// reference refuses with these words.
+    CatalogSyncLevelBelowFileSyncLevel { catalog: i32, file: i32 },
 }
 
 impl fmt::Display for ConfigError {
@@ -203,6 +207,11 @@ impl fmt::Display for ConfigError {
                 "aeron.archive.recording.events.enabled is not supported by this build \
                  (see the P2-S2 plan, which defers the events publication)"
             ),
+            // The reference's own composition, character for character
+            // (`Archive.java:1204-1205`).
+            Self::CatalogSyncLevelBelowFileSyncLevel { catalog, file } => {
+                write!(f, "catalogFileSyncLevel {catalog} < fileSyncLevel {file}")
+            }
             Self::UnknownThreadingMode { value } => {
                 write!(
                     f,
@@ -401,10 +410,6 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
         "the replay publication is not given a linger",
     ),
     (
-        settings::CATALOG_FILE_SYNC_LEVEL,
-        "the catalog is not forced to disk on a level",
-    ),
-    (
         settings::MAX_CATALOG_ENTRIES,
         "★ the reference has no reader for it either: `Archive.maxCatalogEntries()` is \
          defined and never called, and its `Catalog` is constructed without it \
@@ -594,6 +599,11 @@ pub struct ArchiveConfig {
     /// Above zero every recorded block is forced to disk, above one the
     /// metadata as well (`RecordingWriter.java:88-89`).
     pub file_sync_level: i32,
+    /// The same two meanings, for the **catalog** (`Catalog.java:161-162`), and
+    /// the archive-directory entry that goes with a newly created catalog
+    /// (`:226`). Default 0 — see the refusal in [`ArchiveConfig::from_args`]
+    /// for why it is not the file level.
+    pub catalog_file_sync_level: i32,
     /// Whether the archive publishes recording events
     /// (`AeronArchive.java:2797`). This build refuses it — see
     /// [`ConfigError::RecordingEventsNotImplemented`].
@@ -820,6 +830,34 @@ impl ArchiveConfig {
             return Err(ConfigError::RecordingEventsNotImplemented);
         }
 
+        // The two sync levels, and the order the reference puts them in: a
+        // catalog below the recording files' is **refused**
+        // (`Archive.java:1202-1205`). A catalog that may be lost while the
+        // data it describes survives is a catalog that cannot find that data
+        // again, which is why the reference makes it an error rather than a
+        // warning. Equal is allowed.
+        //
+        // ★ **The catalog's default is the static `0`, not the file level that
+        // was configured** (`CATALOG_FILE_SYNC_LEVEL_DEFAULT` is
+        // `FILE_SYNC_LEVEL_DEFAULT`, `Archive.java:388`, `:369`), so
+        // `file.sync.level=2` on its own is *refused* rather than quietly
+        // syncing the catalog at 2 as well. That is the reference's own trap
+        // and this build keeps it.
+        let file_sync_level: i32 =
+            integer(get(settings::FILE_SYNC_LEVEL), settings::FILE_SYNC_LEVEL)?.unwrap_or(0);
+        let catalog_file_sync_level: i32 = integer(
+            get(settings::CATALOG_FILE_SYNC_LEVEL),
+            settings::CATALOG_FILE_SYNC_LEVEL,
+        )?
+        .unwrap_or(0);
+
+        if catalog_file_sync_level < file_sync_level {
+            return Err(ConfigError::CatalogSyncLevelBelowFileSyncLevel {
+                catalog: catalog_file_sync_level,
+                file: file_sync_level,
+            });
+        }
+
         Ok(Self {
             aeron_dir: PathBuf::from(aeron_dir),
             archive_dir: PathBuf::from(
@@ -904,8 +942,8 @@ impl ArchiveConfig {
                 settings::LOW_STORAGE_SPACE_THRESHOLD,
             )?
             .unwrap_or(SEGMENT_FILE_LENGTH_DEFAULT) as u64,
-            file_sync_level: integer(get(settings::FILE_SYNC_LEVEL), settings::FILE_SYNC_LEVEL)?
-                .unwrap_or(0),
+            file_sync_level,
+            catalog_file_sync_level,
             recording_events_enabled,
             // The three names this slice wires. Each is read the way its
             // neighbours are — through the same helpers — so that a value that
@@ -1631,6 +1669,10 @@ mod tests {
             (settings::FILE_IO_MAX_LENGTH, "262144"),
             (settings::LOW_STORAGE_SPACE_THRESHOLD, "512k"),
             (settings::FILE_SYNC_LEVEL, "1"),
+            // P2-12: the catalog's own level, which used to be a name this build
+            // accepted and did nothing with. Given as `1` so that it differs
+            // from its default of `0` without needing the file level moved.
+            (settings::CATALOG_FILE_SYNC_LEVEL, "1"),
             // The three this slice wired, each of which was hardcoded to the
             // reference's default before it.
             (settings::MESSAGE_TIMEOUT, "5s"),
@@ -1666,7 +1708,11 @@ mod tests {
         let baseline = ArchiveConfig::resolve(&archive_defaults()).expect("the defaults resolve");
 
         for (name, value) in HONOURED {
-            let config = resolve_with(&archive_defaults(), name, value)
+            let mut properties = archive_defaults();
+            properties.push((name.to_string(), value.to_string()));
+            properties.extend(companions(name, value));
+
+            let config = ArchiveConfig::resolve(&properties)
                 .unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
 
             assert_ne!(
@@ -1706,6 +1752,78 @@ mod tests {
 
     /// The defaults with one name set to `value`, spelled the way a deployment
     /// would.
+    /// The order the reference puts the two levels in, in its own words
+    /// (`Archive.java:1202-1205`).
+    #[test]
+    fn a_catalog_below_the_recording_files_is_refused_with_the_references_words() {
+        let refused = resolve_with(&archive_defaults(), settings::FILE_SYNC_LEVEL, "1")
+            .expect_err("the file level above the catalog's default is refused");
+
+        assert_eq!(
+            "catalogFileSyncLevel 0 < fileSyncLevel 1",
+            refused.to_string()
+        );
+    }
+
+    /// The boundary: **equal is not below**, so it is accepted — and the level
+    /// has to arrive at the catalog, or the refusal above would be the only
+    /// thing this pair ever does.
+    #[test]
+    fn the_two_sync_levels_may_be_equal_and_both_arrive() {
+        let mut properties = archive_defaults();
+        properties.push((settings::FILE_SYNC_LEVEL.to_owned(), "2".to_owned()));
+        properties.push((settings::CATALOG_FILE_SYNC_LEVEL.to_owned(), "2".to_owned()));
+
+        let config = ArchiveConfig::resolve(&properties).expect("equal levels are accepted");
+
+        assert_eq!(2, config.file_sync_level);
+        assert_eq!(2, config.catalog_file_sync_level);
+    }
+
+    /// ★ The reference's trap, kept: the catalog's default is the **static** `0`
+    /// rather than the file level that was configured
+    /// (`Archive.java:369`, `:388`, `:756`), so raising the file level on its
+    /// own is refused instead of quietly syncing the catalog at the same level.
+    ///
+    /// The other side of the same rule is that the catalog **may** be raised
+    /// alone: only one direction is a contradiction.
+    #[test]
+    fn the_catalogs_default_is_not_the_file_level() {
+        assert!(
+            resolve_with(&archive_defaults(), settings::FILE_SYNC_LEVEL, "1").is_err(),
+            "file level 1 with no catalog level is refused"
+        );
+
+        let lifted = resolve_with(&archive_defaults(), settings::CATALOG_FILE_SYNC_LEVEL, "1")
+            .expect("a catalog level above the file's is accepted");
+        assert_eq!(0, lifted.file_sync_level);
+        assert_eq!(1, lifted.catalog_file_sync_level);
+    }
+
+    /// The names that cannot be probed on their own, and what has to come with
+    /// them.
+    ///
+    /// ★ **One name here is not independently settable.**
+    /// `aeron.archive.file.sync.level` is refused when the catalog's level is
+    /// **below** it (`Archive.java:1202-1205`), and the catalog's default is the
+    /// static `0` — so raising the file level by itself is an *error*, not a
+    /// change, and a table that probed one name at a time would read the
+    /// reference's own contract as a broken build.
+    ///
+    /// It belongs here rather than in the table because it is a property of the
+    /// **pair**, not of either name: the catalog's level is settable alone
+    /// (upwards) and is probed alone above.
+    fn companions(name: &str, value: &str) -> Vec<(String, String)> {
+        if name == settings::FILE_SYNC_LEVEL {
+            vec![(
+                settings::CATALOG_FILE_SYNC_LEVEL.to_owned(),
+                value.to_owned(),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn resolve_with(
         defaults: &[(String, String)],
         name: &str,
