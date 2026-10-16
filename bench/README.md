@@ -1,7 +1,7 @@
 # The run batches
 
-Two batches live here. Both measure this build against the reference's, both
-drive the reference's own benchmark harness (`aeron-io/benchmarks`), and both
+Three batches live here. All of them measure this build against the reference's,
+all drive the reference's own benchmark harness (`aeron-io/benchmarks`), and all
 write their results into `bench/out/` — which is ignored, because what belongs in
 the tree is the table and the command that produced it, not the histogram files.
 
@@ -9,6 +9,7 @@ the tree is the table and the command that produced it, not the histogram files.
 |---|---|---|
 | `upstream-c-drivers/` | what are the C driver changes in this tree's upstream work worth? | yes — one layer is swapped, three times over |
 | `rust-vs-java/` | two whole stacks: how far apart are they? | **no** — nothing is swapped inside either arm |
+| `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
 
 That distinction is the whole reason the two are separate, and it is the one
 thing to hold on to when reading either: a number from `rust-vs-java` is a
