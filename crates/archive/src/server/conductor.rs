@@ -154,6 +154,7 @@ use crate::server::delete_segments::{
     min_segment_position,
 };
 use crate::server::recorder::RecorderHalf;
+use crate::server::recording_events::EventsError;
 use crate::server::recording_pos::RecordingPos;
 use crate::server::recording_session::{RecordingImage, RecordingSession};
 use crate::server::replay_session::{ReplaySession, close_publication, revoke_publication};
@@ -163,6 +164,60 @@ use crate::server::replication_session::{
 };
 use crate::server::response_proxy::{ControlResponseProxy, PROTOCOL_SEMANTIC_VERSION};
 use deepmsg_codec::archive::recording_state::RecordingState;
+
+/// Why the archive stopped (`ArchiveConductor.doWork`).
+///
+/// Two things can end a turn, and they are of two different kinds: a control
+/// message that cannot be read at all, and a recording events publication that
+/// is **finished** — `RecordingEventsProxy.checkResult`'s one throw. The second
+/// is not a control-plane fault, which is why it does not go into
+/// [`ControlError`]; the reference reaches it from a recording session, three
+/// levels below the adapter, and lets the throw out of the agent that was
+/// driving them.
+///
+/// # What happens to it, and where this build differs
+///
+/// The reference's agent is the one that dies: under `SHARED` that is the
+/// conductor's own thread, and under `DEDICATED` — where the recorder is a
+/// thread of its own — it is only the recorder's, and the conductor runs on with
+/// nothing recording and the error counted (`AgentRunner.run` hands the throw to
+/// the archive's error handler and stops). **This build stops the archive either
+/// way**, because a recorder that cannot report is a recorder the conductor will
+/// never hear from again and an archive that goes on accepting recordings it
+/// cannot make is worse than one that stops. It is a deviation, and it is the
+/// only one on this path: the events themselves, their contents and the point at
+/// which they are sent are the reference's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveError {
+    /// A control message the adapter could not read (`ControlError`).
+    Control(ControlError),
+    /// The recording events publication is at its maximum position
+    /// ([`EventsError::Exhausted`]).
+    Events(EventsError),
+}
+
+impl From<ControlError> for ArchiveError {
+    fn from(error: ControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl From<EventsError> for ArchiveError {
+    fn from(error: EventsError) -> Self {
+        Self::Events(error)
+    }
+}
+
+impl std::fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(f),
+            Self::Events(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ArchiveError {}
 
 /// `AeronArchive.Configuration.CONTROL_MODE_RESPONSE` — the `control-mode` a
 /// client writes when it wants a channel of its own to be answered on
@@ -1382,6 +1437,14 @@ struct PendingRecording {
     /// The **image's** session id, which is what an extension writes into the
     /// row (`:2120`: `image.sessionId()`, not the archive's).
     image_session_id: i32,
+    /// The **subscription's** stream id and the channel the client asked for,
+    /// with the image's source identity: the other three fields the recording
+    /// events carry and that only this moment has. See
+    /// [`crate::server::recording_session`]'s module note for why they travel
+    /// with the session rather than being asked of its image.
+    stream_id: i32,
+    original_channel: String,
+    source_identity: String,
     segment_file_length: usize,
     subscription_id: i64,
     /// The image the session will read, **taken out of the client** when the
@@ -2777,6 +2840,9 @@ impl Sessions {
                     segment_file_length,
                     request: subscription.request,
                     image_session_id: facts.session_id,
+                    stream_id: facts.stream_id,
+                    original_channel: subscription.original_channel.clone(),
+                    source_identity: facts.source_identity.clone(),
                     subscription_id: subscription_registration_id,
                     image: Box::new(image),
                     is_auto_stop: subscription.is_auto_stop,
@@ -2855,6 +2921,9 @@ impl Sessions {
             segment_file_length,
             request,
             image_session_id,
+            stream_id,
+            original_channel,
+            source_identity,
             subscription_id,
             image,
             is_auto_stop,
@@ -2881,6 +2950,21 @@ impl Sessions {
             segment_file_length,
             subscription_id,
             image,
+            // ★ The four the recording events carry, read **here** because this
+            // is the last place the image is still the client's and the
+            // subscription that carried it is still in hand. The reference's
+            // session asks its image for all four at each landing point
+            // (`RecordingSession.java:218-220`); this one cannot — its image is
+            // a `RecordingImage`, which answers about reading and not about
+            // identity (`recording_session.rs`, the module note).
+            //
+            // `image_session_id` is the **image's** session id and `stream_id`
+            // the **subscription's** — both are what the catalog row was given
+            // above, from the same two places.
+            image_session_id,
+            stream_id,
+            original_channel,
+            source_identity,
             self.recording.file_io_max_length,
             self.recording.file_sync_level,
             is_auto_stop,
@@ -7529,7 +7613,14 @@ impl ArchiveConductor {
     /// polled and the mark file kept alive when the millisecond clock moves,
     /// then the adapter reads the control subscriptions, then the sessions are
     /// driven.
-    pub fn do_work(&mut self, client: &mut Client, now_ms: i64) -> Result<usize, ControlError> {
+    ///
+    /// # Errors
+    ///
+    /// [`ArchiveError::Control`] for a control message that cannot be read, and
+    /// [`ArchiveError::Events`] for a recording events publication that is
+    /// finished — see [`ArchiveError`] for why the second one stops this build's
+    /// archive where the reference's conductor runs on.
+    pub fn do_work(&mut self, client: &mut Client, now_ms: i64) -> Result<usize, ArchiveError> {
         let mut work = 0;
 
         if self.cached_epoch_ms != now_ms {
@@ -7624,7 +7715,9 @@ impl ArchiveConductor {
         // steps every counter here takes.
         recorder.allocate(client, &counters, *command_timeout);
 
-        work += recorder.drive(&counters);
+        // ★ The `?` is the whole of the events publication's failure path: the
+        // turn stops, and so does the archive. See [`ArchiveError`].
+        work += recorder.drive(&counters)?;
 
         for session in recorder.take_finished() {
             sessions.close_recording_session(client, catalog, &counters, recorder, session, now_ms);

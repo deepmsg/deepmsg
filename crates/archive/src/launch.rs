@@ -86,6 +86,7 @@ use crate::server::counters::{
     archive_id_label, find_archive_id_counter,
 };
 use crate::server::recorder::{RecorderHalf, RecorderThread};
+use crate::server::recording_events::RecordingEventsProxy;
 use crate::server::replayer::{ReplayerHalf, ReplayerThread};
 use crate::server::threading::{self, Role};
 
@@ -219,6 +220,76 @@ impl DriverHalf<'_> {
                 ));
             }
         }
+    }
+
+    /// Ask for an exclusive publication and wait for the driver to make it,
+    /// then **take it out of the client**.
+    ///
+    /// Owned: the asynchronous path, polled with a driver turn in between, for
+    /// the reason [`DriverHalf::add_subscription`] takes it. Attached: the
+    /// blocking call, which is what the reference does.
+    ///
+    /// The taking-out is where this build differs from the reference rather than
+    /// where it chooses to: the object that writes to the publication must own
+    /// it, and the recorder it goes to is one this loop hands things to.
+    fn claim_events_publication(
+        &mut self,
+        client: &mut Client,
+        channel: &str,
+        stream_id: i32,
+    ) -> Result<RecordingEventsProxy, String> {
+        let registration_id = match self {
+            Self::Attached => client
+                .add_exclusive_publication(channel, stream_id, COMMAND_TIMEOUT)
+                .map_err(|error| {
+                    format!("the driver refused a publication on {channel}: {error}")
+                })?,
+            Self::Owned(driver) => {
+                let deadline = Instant::now() + COMMAND_TIMEOUT;
+                // The same two-sided loop as a subscription: the driver reads
+                // its command ring only when it is driven, and the answer only
+                // arrives when the client polls (`:193-198`).
+                let add = client
+                    .async_add_exclusive_publication(channel, stream_id, COMMAND_TIMEOUT)
+                    .map_err(|error| {
+                        format!("could not ask for a publication on {channel}: {error}")
+                    })?;
+
+                loop {
+                    driver.do_work();
+                    client.poll();
+
+                    match client.async_add_poll(add) {
+                        AsyncAddPoll::Ready => break add.registration_id(),
+                        AsyncAddPoll::Awaiting => {}
+                        AsyncAddPoll::Failed(error) => {
+                            return Err(format!(
+                                "the driver refused a publication on {channel}: {error}"
+                            ));
+                        }
+                        AsyncAddPoll::Unknown => {
+                            return Err(format!(
+                                "the answer about a publication on {channel} was already taken"
+                            ));
+                        }
+                    }
+
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "the driver did not answer about a publication on {channel} in time"
+                        ));
+                    }
+                }
+            }
+        };
+
+        let publication = client
+            .take_exclusive_publication(registration_id)
+            .ok_or_else(|| {
+                format!("the driver's answer about a publication on {channel} named no log")
+            })?;
+
+        Ok(RecordingEventsProxy::new(publication))
     }
 
     /// The counter this archive's errors are counted in.
@@ -482,7 +553,7 @@ pub fn run(
     // The workers are built here and started below, once the conductor that will
     // talk to them exists: a worker whose conductor was never built is a thread
     // nothing can stop.
-    let (recorder, recorder_worker) = if dedicated {
+    let (mut recorder, recorder_worker) = if dedicated {
         let (thread, worker) = RecorderThread::pair(
             archive_id,
             &aeron_dir,
@@ -498,6 +569,26 @@ pub fn run(
     } else {
         (RecorderHalf::new(archive_id), None)
     };
+
+    // `ArchiveConductor.java:224-225`, in the one place this build can put it:
+    // the reference builds the publication on its conductor because its
+    // conductor owns the `Aeron`; here the client is the launcher's, so the
+    // publication is asked for and taken here and handed to whatever runs the
+    // sessions. One publication for the whole archive, and every recording
+    // session writes to it.
+    if archive_config.recording_events_enabled {
+        let channel = archive_config
+            .recording_events_channel
+            .as_deref()
+            .expect("the configuration refuses recording events with no channel");
+        let events = half.claim_events_publication(
+            &mut client,
+            channel,
+            archive_config.recording_events_stream_id,
+        )?;
+
+        recorder.set_events(events);
+    }
 
     let (replayer, replayer_worker) = if dedicated {
         let (thread, worker) = ReplayerThread::pair(

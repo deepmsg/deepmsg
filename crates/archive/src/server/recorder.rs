@@ -38,6 +38,8 @@ use deepmsg_client::client::Client;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
+use crate::server::recording_events::{EventsError, RecordingEvents, RecordingEventsProxy};
+
 use crate::recording_writer::WriteStats;
 use crate::server::counters::{
     ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
@@ -170,6 +172,16 @@ pub struct Recorder {
     /// command the driver answers on a later turn, which is the loop
     /// [`CounterAllocator`] runs.
     request: RecorderCountersRequest,
+    /// The recording events publication, if the deployment turned them on.
+    ///
+    /// Held **here** rather than by each session, which is the reference's
+    /// arrangement too: its `ArchiveConductor` builds one
+    /// (`ArchiveConductor.java:224-225`) and hands the same object to every
+    /// session. It cannot be held by a session because a session does not own
+    /// the thread it runs on and this build's client will not let two threads
+    /// write one publication — so it lives with whatever runs the sessions, and
+    /// a session borrows it for a turn.
+    events: Option<RecordingEventsProxy>,
 }
 
 /// The three counters between the ask and the hand-over
@@ -331,11 +343,39 @@ impl RecorderHalf {
     ///
     /// The threaded arm does no work here and says so: its recorder is driven by
     /// its own thread, and what the conductor owes that turn is collecting what
-    /// finished, which is [`RecorderHalf::take_finished`].
-    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
+    /// finished, which is [`RecorderHalf::take_finished`]. What it *can* do is
+    /// hear that the thread is gone — see [`RecorderThread::failure`].
+    ///
+    /// # Errors
+    ///
+    /// [`EventsError`], from the sessions this turn or from the worker's own
+    /// thread. Both mean the same thing and the reference ends both the same
+    /// way: the agent driving the sessions is finished.
+    pub fn drive(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+    ) -> Result<usize, EventsError> {
         match self {
             Self::Inline(recorder) => recorder.drive(counters),
-            Self::Threaded(_) => 0,
+            Self::Threaded(thread) => match thread.failure() {
+                Some(error) => Err(error),
+                None => Ok(0),
+            },
+        }
+    }
+
+    /// Hand the recording events publication over
+    /// (`ArchiveConductor.java:224-225`).
+    ///
+    /// The inline arm keeps it, because its recorder is this object; the
+    /// threaded arm sends it, for the reason [`RecorderCommand::SetCounters`]
+    /// exists: the publication is built where the client is — a client command
+    /// the driver answers on a turn — and this is how it reaches the thread that
+    /// will write to it.
+    pub fn set_events(&mut self, events: RecordingEventsProxy) {
+        match self {
+            Self::Inline(recorder) => recorder.set_events(events),
+            Self::Threaded(thread) => thread.send(RecorderCommand::SetEvents(Box::new(events))),
         }
     }
 
@@ -377,6 +417,12 @@ pub enum RecorderCommand {
     },
     /// The three counters, once the driver has answered about all three.
     SetCounters(RecorderCounters),
+    /// The recording events publication, once the conductor has built one.
+    ///
+    /// Boxed for the same reason [`RecorderCommand::Add`] is, if less sharply:
+    /// it carries a mapped log buffer, where every other arm but `Add` is a few
+    /// machine words.
+    SetEvents(Box<RecordingEventsProxy>),
 }
 
 /// The conductor's end of a recorder that is on a thread of its own.
@@ -393,6 +439,13 @@ pub enum RecorderCommand {
 pub struct RecorderThread {
     commands: std::sync::mpsc::Sender<RecorderCommand>,
     finished: std::sync::mpsc::Receiver<RecordingSession>,
+    /// Why the recorder's thread ended, if it ended badly. See
+    /// [`RecorderThread::failure`].
+    failure: std::sync::mpsc::Receiver<EventsError>,
+    /// The one it reported, kept so that every later turn answers the same
+    /// thing: a thread that has ended does not come back, and the channel
+    /// answers `Disconnected` once its sender is gone.
+    failed: Option<EventsError>,
     request: RecorderCountersRequest,
     /// Whether the three have been handed over, so that a later turn does not
     /// ask again — the reference allocates them once (`Archive.java:1587-1626`).
@@ -414,11 +467,18 @@ impl RecorderThread {
     ) -> Result<(Self, RecorderWorker), String> {
         let (commands, from_conductor) = std::sync::mpsc::channel();
         let (to_conductor, finished) = std::sync::mpsc::channel();
+        // A third channel, which the reference does not have: its `AgentRunner`
+        // hands the throw to the archive's error handler and the conductor is
+        // never told. Here the conductor is what stops the archive, so it has to
+        // hear — see `RecorderWorker::run`.
+        let (failures, failure) = std::sync::mpsc::channel();
 
         Ok((
             Self {
                 commands,
                 finished,
+                failure,
+                failed: None,
                 request: RecorderCountersRequest::new(archive_id),
                 allocated: false,
             },
@@ -429,8 +489,22 @@ impl RecorderThread {
                 timeout,
                 from_conductor,
                 to_conductor,
+                failures,
             )?,
         ))
+    }
+
+    /// Why the recorder's thread ended, if it ended badly.
+    ///
+    /// `Some` once and for ever after: the worker reports one failure and then
+    /// returns, so a conductor that asks again must not be told `None` — that
+    /// would read as a recorder that is merely idle.
+    fn failure(&mut self) -> Option<EventsError> {
+        if self.failed.is_none() {
+            self.failed = self.failure.try_iter().next();
+        }
+
+        self.failed
     }
 
     /// Tell the recorder something. A send that fails is a recorder thread that
@@ -487,6 +561,8 @@ pub struct RecorderWorker {
     commands: std::sync::mpsc::Receiver<RecorderCommand>,
     /// What it has finished with, back to the conductor.
     finished: std::sync::mpsc::Sender<RecordingSession>,
+    /// Why it is giving up, back to the conductor, if it ever does.
+    failures: std::sync::mpsc::Sender<EventsError>,
 }
 
 impl RecorderWorker {
@@ -504,6 +580,7 @@ impl RecorderWorker {
         timeout: std::time::Duration,
         commands: std::sync::mpsc::Receiver<RecorderCommand>,
         finished: std::sync::mpsc::Sender<RecordingSession>,
+        failures: std::sync::mpsc::Sender<EventsError>,
     ) -> Result<Self, String> {
         let cnc = deepmsg_cnc::CncFile::open_writable(aeron_dir, timeout)
             .map_err(|error| format!("the recorder could not open the counter region: {error}"))?;
@@ -514,6 +591,7 @@ impl RecorderWorker {
             idle,
             commands,
             finished,
+            failures,
         })
     }
 
@@ -527,6 +605,15 @@ impl RecorderWorker {
     /// stop the same way (`AgentRunner.run` ends when `isRunning` is cleared by
     /// the runner's close, which the conductor does on its way down,
     /// `DedicatedModeArchiveConductor.closeSessionWorkers:70-71`).
+    ///
+    /// ★ **And it ends the other way too**: a turn whose events publication is
+    /// finished stops the loop and reports. The reference's throw out of
+    /// `RecordingSession.doWork` leaves `AgentRunner.run`, which hands it to the
+    /// archive's error handler and lets the thread die — so "the recorder agent
+    /// is over" is the reference's own answer, and this is what that answer is
+    /// here. What follows it differs, and
+    /// [`ArchiveConductor::do_work`](crate::server::conductor::ArchiveConductor)
+    /// is where that is written down.
     pub fn run(mut self) {
         loop {
             let mut work = 0;
@@ -555,6 +642,10 @@ impl RecorderWorker {
                         self.recorder.set_counters(counters);
                         work += 1;
                     }
+                    Ok(RecorderCommand::SetEvents(events)) => {
+                        self.recorder.set_events(*events);
+                        work += 1;
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                 }
@@ -569,7 +660,19 @@ impl RecorderWorker {
                 continue;
             };
 
-            work += self.recorder.drive(&counters);
+            match self.recorder.drive(&counters) {
+                Ok(worked) => work += worked,
+                Err(error) => {
+                    // The whole of what an events failure does here: the turn
+                    // stops, the thread ends, and the conductor is told so that
+                    // it can stop the archive. A send that fails is a publication
+                    // that will never take another event, so there is nothing to
+                    // carry on for.
+                    let _ = self.failures.send(error);
+
+                    return;
+                }
+            }
 
             for session in self.recorder.take_finished() {
                 // The conductor is gone: nothing will close this session, and
@@ -602,7 +705,14 @@ impl Recorder {
             },
             counters: None,
             request: RecorderCountersRequest::new(archive_id),
+            events: None,
         }
+    }
+
+    /// The recording events publication, handed over once the conductor has one
+    /// (`aeron.archive.recording.events.enabled`).
+    pub fn set_events(&mut self, events: RecordingEventsProxy) {
+        self.events = Some(events);
     }
 
     /// Ask for the three counters, one at a time, and take each up when the
@@ -703,12 +813,34 @@ impl Recorder {
     /// answers from it, so this is the same call the reference's recorder makes
     /// — `SessionWorker.doWork`, with nothing of the `Aeron` client in it —
     /// which is what lets this run on a thread of its own.
-    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`EventsError`] from the first session that has one, and the turn **stops
+    /// there**: the reference's throw leaves `SessionWorker.doWork` at once, so
+    /// the sessions after it get no turn either. See [`RecorderWorker::run`] and
+    /// [`ArchiveConductor::do_work`](crate::server::conductor::ArchiveConductor)
+    /// for what becomes of it — the events publication is finished and no
+    /// recording will ever report again.
+    pub fn drive(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+    ) -> Result<usize, EventsError> {
         let mut work = 0;
-        let totals = &mut self.totals;
 
-        for session in &mut self.sessions {
-            work += session.do_work(counters, totals);
+        {
+            let totals = &mut self.totals;
+            let events = &mut self.events;
+
+            for session in &mut self.sessions {
+                work += session.do_work(
+                    counters,
+                    totals,
+                    events
+                        .as_mut()
+                        .map(|events| events as &mut dyn RecordingEvents),
+                )?;
+            }
         }
 
         let mut index = 0;
@@ -722,7 +854,7 @@ impl Recorder {
 
         self.publish_if(counters, work);
 
-        work
+        Ok(work)
     }
 
     /// The sessions that finished, for the conductor to close
@@ -919,6 +1051,10 @@ mod tests {
             128 * 1024,
             subscription_id,
             Box::new(crate::server::recording_session::FakeImage::new()),
+            12,
+            1001,
+            "aeron:ipc".to_owned(),
+            "aeron:ipc".to_owned(),
             1024 * 1024,
             0,
             false,
@@ -1002,5 +1138,85 @@ mod tests {
         assert_eq!(0, recorder.session_count());
         assert!(recorder.take_finished().is_empty());
         assert_eq!(RecorderTotals::default(), recorder.totals());
+    }
+
+    /// ★ A recorder whose thread has reported a failure reports it on **every**
+    /// turn afterwards, not just the one it arrived on.
+    ///
+    /// The mutation this pins is `try_recv().ok()`: the worker's sender is gone
+    /// by the time a conductor asks a second time, so the channel answers
+    /// `Disconnected` and the failure would read as a recorder that is merely
+    /// idle. What that would cost is the archive running on for ever with
+    /// nothing recording.
+    #[test]
+    fn a_recorder_thread_reports_its_failure_once_and_for_ever() {
+        let (commands, _from_conductor) = std::sync::mpsc::channel();
+        let (_to_conductor, finished) = std::sync::mpsc::channel();
+        let (failures, failure) = std::sync::mpsc::channel();
+
+        let mut thread = RecorderThread {
+            commands,
+            finished,
+            failure,
+            failed: None,
+            request: RecorderCountersRequest::new(42),
+            allocated: false,
+        };
+
+        assert_eq!(None, thread.failure(), "nothing has gone wrong yet");
+
+        failures.send(exhausted()).expect("the report is sent");
+        drop(failures);
+
+        assert_eq!(Some(exhausted()), thread.failure());
+        assert_eq!(
+            Some(exhausted()),
+            thread.failure(),
+            "and the same answer after the channel itself has gone"
+        );
+    }
+
+    /// The conductor's end of a threaded recorder: no failure is no work, and a
+    /// failure is the turn's error — which is what stops the archive.
+    ///
+    /// The inline arm is a [`Recorder`]'s own `drive`, whose `?` over
+    /// [`RecordingSession::do_work`] is pinned where the session is
+    /// (`recording_session.rs`): the failure can only come from an events
+    /// publication, and a publication is not something a test can make without a
+    /// mapped log.
+    #[test]
+    fn a_threaded_half_answers_with_its_workers_failure() {
+        let (commands, _from_conductor) = std::sync::mpsc::channel();
+        let (_to_conductor, finished) = std::sync::mpsc::channel();
+        let (failures, failure) = std::sync::mpsc::channel();
+
+        let mut half = RecorderHalf::Threaded(RecorderThread {
+            commands,
+            finished,
+            failure,
+            failed: None,
+            request: RecorderCountersRequest::new(42),
+            allocated: false,
+        });
+
+        assert_eq!(Ok(0), half.drive(&values_region()));
+        assert_eq!(
+            Ok(0),
+            half.drive(&values_region()),
+            "a worker that is idle is 0"
+        );
+        assert_eq!(0, half.take_finished().len());
+
+        failures.send(exhausted()).expect("the report is sent");
+
+        assert_eq!(Err(exhausted()), half.drive(&values_region()));
+    }
+
+    /// The one error an events publication can answer with
+    /// (`RecordingEventsProxy:139-142`).
+    fn exhausted() -> EventsError {
+        EventsError::Exhausted {
+            term_length: 64 * 1024,
+        }
     }
 }

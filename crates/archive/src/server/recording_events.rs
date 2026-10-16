@@ -194,7 +194,7 @@ pub fn encode_stopped(
 /// `io.aeron.archive.RecordingEventsProxy` (`:28-128`).
 ///
 /// See the module note for why this is a trait. [`RecordingEventsProxy`] is the
-/// real answer; a test's is its own.
+/// real answer and [`FakeEvents`] a test's.
 pub trait RecordingEvents {
     /// `RecordingEventsProxy.started` (`:53-73`).
     ///
@@ -328,6 +328,33 @@ impl RecordingEventsProxy {
             publication.term_buffer_length(),
         )
     }
+
+    /// What one attempt's answer means to `progress` (`:81-92`).
+    ///
+    /// ★ **Only a write is a `true`.** The reference's `progress` answers `false`
+    /// both for a window that was used up and for a publication nobody is
+    /// subscribed to, and the session's `progressEventPosition` is what that
+    /// `false` protects: it stays where it was, and the next turn offers the same
+    /// event again. A `true` here for an event that did not go out loses that
+    /// position for good — nothing after it names it again.
+    ///
+    /// A function of its own, and not a line inside `progress`, because it is the
+    /// half of that method which can be wrong: the other half needs a mapped log
+    /// to reach at all.
+    fn progress_answer(offered: Offered) -> bool {
+        matches!(offered, Offered::Sent)
+    }
+}
+
+/// The publication, and how big the buffer is rather than its contents: the
+/// buffer is a kilobyte of the last event and nothing a reader wants.
+impl fmt::Debug for RecordingEventsProxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingEventsProxy")
+            .field("publication", &self.publication)
+            .field("buffer_length", &self.buffer.len())
+            .finish()
+    }
 }
 
 impl RecordingEvents for RecordingEventsProxy {
@@ -374,15 +401,13 @@ impl RecordingEvents for RecordingEventsProxy {
         let length = encode_progress(&mut self.buffer, recording_id, start_position, position);
 
         // ★ **One attempt, and the answer is the caller's.** The reference's
-        // `progress` has no `SEND_ATTEMPTS` loop (`:79-92`): a claim that did
-        // not land answers `false`, the session leaves its
-        // `progressEventPosition` where it was, and the next turn offers the
-        // same event again. Answering `true` for a dropped event would lose it
-        // for good — the position it named has already gone by.
-        Ok(matches!(
-            Self::attempt(&self.publication, &self.buffer[..length], counters)?,
-            Offered::Sent
-        ))
+        // `progress` has no `SEND_ATTEMPTS` loop (`:79-92`), unlike the two
+        // below it: a claim that did not land is a `false` the session acts on.
+        Ok(Self::progress_answer(Self::attempt(
+            &self.publication,
+            &self.buffer[..length],
+            counters,
+        )?))
     }
 
     fn stopped(
@@ -583,6 +608,27 @@ mod tests {
         );
     }
 
+    /// ★ `progress` says the event went out for a write and for nothing else.
+    ///
+    /// The mutation this pins is `Ok(true)`: it is what the first cut of this
+    /// file did, it compiles, it reads plausibly, and it quietly loses every
+    /// progress event a slow reader caused to be dropped — the session advances
+    /// its mark past a position nobody was told about
+    /// (`RecordingSession.java:249-254`).
+    #[test]
+    fn progress_answers_yes_only_for_a_write() {
+        assert!(RecordingEventsProxy::progress_answer(Offered::Sent));
+
+        assert!(
+            !RecordingEventsProxy::progress_answer(Offered::NotConnected),
+            "an archive with no reader is not an archive that reported"
+        );
+        assert!(
+            !RecordingEventsProxy::progress_answer(Offered::TryAgain),
+            "a window that is used up now is one to offer into again"
+        );
+    }
+
     /// The message the archive dies with is the reference's, character for
     /// character (`RecordingEventsProxy:140-142`) — term length and all.
     #[test]
@@ -594,5 +640,133 @@ mod tests {
             }
             .to_string()
         );
+    }
+}
+/// A [`RecordingEvents`] a test drives: it answers what it is told to, and
+/// counts what it was asked.
+///
+/// The twin of [`FakeImage`](super::recording_session::FakeImage), and there for
+/// the same reason — a session's three landing points are about *when* an event
+/// goes out and what the answer does to the session's own state, and neither
+/// question needs a mapped log to answer.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FakeEvents {
+    /// What `progress` answers: `true` is a write, `false` is a dropped event
+    /// the session has to send again.
+    pub(crate) sent: bool,
+    /// What all three answer when it is set: the publication is finished.
+    pub(crate) exhausted: bool,
+    /// What the session asked for, in order.
+    pub(crate) calls: Vec<EventCall>,
+}
+
+/// One of the three sends, with the fields a test asserts on.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EventCall {
+    Started {
+        recording_id: i64,
+        start_position: i64,
+        session_id: i32,
+        stream_id: i32,
+        channel: String,
+        source_identity: String,
+    },
+    Progress {
+        recording_id: i64,
+        position: i64,
+    },
+    Stopped {
+        recording_id: i64,
+        stop_position: i64,
+    },
+}
+
+#[cfg(test)]
+impl FakeEvents {
+    pub(crate) fn new() -> Self {
+        Self {
+            sent: true,
+            exhausted: false,
+            calls: Vec::new(),
+        }
+    }
+
+    /// The publication is finished, which is the answer the reference throws on
+    /// (`:134-143`).
+    fn exhaust(&mut self) -> EventsError {
+        self.exhausted = true;
+
+        EventsError::Exhausted {
+            term_length: 64 * 1024,
+        }
+    }
+}
+
+#[cfg(test)]
+impl RecordingEvents for FakeEvents {
+    fn started(
+        &mut self,
+        _counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        start_position: i64,
+        session_id: i32,
+        stream_id: i32,
+        channel: &str,
+        source_identity: &str,
+    ) -> Result<(), EventsError> {
+        if self.exhausted {
+            return Err(self.exhaust());
+        }
+
+        self.calls.push(EventCall::Started {
+            recording_id,
+            start_position,
+            session_id,
+            stream_id,
+            channel: channel.to_owned(),
+            source_identity: source_identity.to_owned(),
+        });
+
+        Ok(())
+    }
+
+    fn progress(
+        &mut self,
+        _counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        _start_position: i64,
+        position: i64,
+    ) -> Result<bool, EventsError> {
+        if self.exhausted {
+            return Err(self.exhaust());
+        }
+
+        self.calls.push(EventCall::Progress {
+            recording_id,
+            position,
+        });
+
+        Ok(self.sent)
+    }
+
+    fn stopped(
+        &mut self,
+        _counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        _start_position: i64,
+        stop_position: i64,
+    ) -> Result<(), EventsError> {
+        if self.exhausted {
+            return Err(self.exhaust());
+        }
+
+        self.calls.push(EventCall::Stopped {
+            recording_id,
+            stop_position,
+        });
+
+        Ok(())
     }
 }
