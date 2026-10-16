@@ -16,7 +16,7 @@
 //! itself on a timer would be a second scheduler inside the first one.
 
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch.
 ///
@@ -32,7 +32,7 @@ pub fn epoch_nano_time() -> i64 {
 }
 
 /// The reading [`monotonic_nano_time`] counts from.
-static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
+static MONOTONIC_BASE: OnceLock<i64> = OnceLock::new();
 
 /// Nanoseconds from a clock that only goes forwards, for measuring elapsed time
 /// inside the driver.
@@ -56,11 +56,23 @@ static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
 /// duration and not a date: it is meaningless to anything outside this process,
 /// and nothing here writes it to shared memory.
 ///
+/// **The reading itself is taken through the platform seam, without `std`'s
+/// wrapper around it.** `Instant` costs a base plus a checked subtraction on
+/// top of the same `clock_gettime` every caller ends up making, and this clock
+/// is read once a pass by three threads of the driver — a pass is what a frame
+/// waits for, and its length is on the round trip's critical path at about
+/// three times its own size (`analysis/dpdk/deepmsg-dpdk-d8-record.md` §7.6).
+/// Measured on this machine, hot cache, 2×10⁷ reads: `Instant` base + elapsed
+/// **19.13 ns**, the same vDSO call with no wrapper **12.91 ns**.
+///
 /// Saturates rather than panicking, like [`epoch_nano_time`].
 pub fn monotonic_nano_time() -> i64 {
-    let base = MONOTONIC_BASE.get_or_init(Instant::now);
+    let base = *MONOTONIC_BASE.get_or_init(crate::pal::monotonic_nanos);
 
-    i64::try_from(base.elapsed().as_nanos()).unwrap_or(i64::MAX)
+    // A reading that fails saturates inside the seam, so the difference can be
+    // enormous but never negative and never a panic — the same contract the
+    // `Instant` base had.
+    crate::pal::monotonic_nanos().saturating_sub(base)
 }
 
 /// Milliseconds since the Unix epoch.
