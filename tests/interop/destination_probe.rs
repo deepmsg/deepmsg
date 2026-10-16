@@ -19,6 +19,7 @@ use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::Command;
 
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT};
 
 /// The stream the probe publishes on.
@@ -55,7 +56,7 @@ fn build_probe() -> Option<PathBuf> {
 /// The compile itself, which [`build_probe`] runs once.
 fn compile_probe() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("fixtures/destination_probe.c");
+    let source = aeron_tests::probe("destination_probe.c")?;
     let include = manifest.join(REFERENCE_INCLUDE);
     let lib = manifest.join(REFERENCE_LIB);
     let output = manifest.join("../target/destination_probe");
@@ -99,6 +100,10 @@ fn manual_channel(port: u16) -> String {
 
 #[test]
 fn a_reference_client_adds_a_destination_to_our_driver() {
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(probe) = build_probe() else {
         driver::announce_tool_skip("the reference client library");
         return;
@@ -155,6 +160,10 @@ fn a_reference_client_adds_a_destination_to_our_driver() {
 /// refused everything would pass the test above by never being reached.
 #[test]
 fn the_probe_refuses_arguments_that_leave_it_nothing_to_do() {
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(probe) = build_probe() else {
         driver::announce_tool_skip("the reference client library");
         return;
@@ -195,6 +204,10 @@ fn three_free_ports() -> (u16, u16, u16) {
 /// open the conversation (and keep opening it).
 #[test]
 fn a_reference_client_adds_a_source_to_our_subscription() {
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(probe) = build_probe() else {
         driver::announce_tool_skip("the reference client library");
         return;

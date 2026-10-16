@@ -1,5 +1,24 @@
 # Test fixtures
 
+## The programs that make these are elsewhere
+
+Four of the directories below are made by **Java programs**, and those programs are
+not in this repository: they are C and Java, and this is a Rust workspace that
+compiles neither. They live in the fork of the reference,
+**`deepmsg/aeron`, branch `deepmsg-tests`**, under `deepmsg-tests/generators/`, and
+`tests/src/aeron_tests.rs` is where this build looks for a checkout of it
+(`DEEPMSG_AERON_TESTS`).
+
+**What is here is what the tests read.** The `.bin`, `.catalog`, `.dat` and `.tsv`
+files are committed, the tests take them by path or by `include_bytes!`, and moving a
+generator changed no criterion — only the answer to "which program do I run to make
+this again", which each directory's own README now gives.
+
+The three C probes and three Java probes that *are* run by the interop suite
+(`destination_probe.c`, `spy_probe.c`, `ipc_response_probe.c`, `ArchiveConnectProbe.java`,
+`RecordingEventsProbe.java`, `ReferenceArchiveClientProbe.java`) live on that same
+branch, under `deepmsg-tests/probes/` and `deepmsg-tests/java/`.
+
 ## `cnc-header.bin`
 
 The first 512 bytes of a `cnc.dat` written by a **default-configured

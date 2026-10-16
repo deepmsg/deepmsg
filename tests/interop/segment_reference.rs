@@ -28,6 +28,7 @@ use deepmsg_archive::segment::{
 use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use deepmsg_core::logbuffer::frame::{DATA_HEADER_LENGTH, FRAME_LENGTH_OFFSET, TYPE_OFFSET};
 use deepmsg_core::logbuffer::position::align_up;
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver;
 use deepmsg_tests::java;
 use deepmsg_tests::temp::TempDir;
@@ -141,8 +142,8 @@ fn probe_directory(dir: &TempDir) -> PathBuf {
     classes
 }
 
-fn fixture_probe() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/catalog/RecoverCatalog.java")
+fn fixture_probe() -> Option<PathBuf> {
+    aeron_tests::generator("catalog/RecoverCatalog.java")
 }
 
 /// The reference's own `ArchiveTool checksum` **stamping** a recording this
@@ -225,7 +226,12 @@ fn both_readers_recover_the_same_stop_position() {
     let (catalog, id, written) = a_died_mid_write_recording(&dir, None);
     let classes = probe_directory(&dir);
 
-    if java::compile_probe(&fixture_probe(), &classes).is_none() {
+    let Some(probe) = fixture_probe() else {
+        aeron_tests::announce_skip();
+        return;
+    };
+
+    if java::compile_probe(&probe, &classes).is_none() {
         driver::announce_tool_skip("javac");
         return;
     }

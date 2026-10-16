@@ -6,6 +6,39 @@
 |---|---|---|
 | `../aeron` | Aeron 1.53.2 (C client + driver sources, Java archive + cluster) | source of truth for every byte-level decision |
 | `../aeron-rs` | UnitedTraders pure-Rust client (CnC 0.0.16 era, compat ceiling ~1.44) | prior art; also a catalogue of pitfalls to avoid |
+| `../aeron-deepmsg` | our fork of the same Aeron (`github.com/deepmsg/aeron`), branch `deepmsg-tests` | the C and Java *this* suite runs — see below |
+
+`../aeron` is **frozen** at `664f58e705`: it is the tree things are *built* against, and
+the headers, `libaeron` and `aeron-all-1.53.2.jar` come from it. The two **test-side
+holds** the archive suite is run with are a local modification of it rather than a fork
+of it, and their authoritative copy is the fork's branch
+`fix/the-drop-wait-races-the-flood` — which is what `deepmsg-tests` is based on.
+
+## The C and Java this suite runs: `../aeron-deepmsg/deepmsg-tests`
+
+Three of the probes the interop suite runs are **C** programs linked against the
+reference's own `libaeron`, three are **Java** programs compiled against
+`aeron-all-1.53.2.jar`, and four are the generators that produce the committed
+fixtures under `tests/fixtures/`. None of them is in this repository: this is a Rust
+workspace, and a `.c` or `.java` file in it would be a file no gate here compiles.
+
+They live in our fork of the reference instead, on the branch **`deepmsg-tests`**,
+under `deepmsg-tests/{probes,java,generators}/`; that directory's README lists each
+one and what it measures. `tests/src/aeron_tests.rs` is how this build finds a
+checkout:
+
+    DEEPMSG_AERON_TESTS    default: ../../aeron-deepmsg/deepmsg-tests
+
+**A missing checkout is a skip, not a failure**, as a missing reference build is: a
+machine that has not cloned the fork prints `SKIPPED` and passes.
+
+★ **The C probes still compile against `../aeron`, never the fork.** Their `-I` and
+`-L` are the reference's build, and CI clones the pristine upstream by tag — a probe
+built against a modified tree would be measuring that tree.
+
+Two things that look like they belong in that directory and do not:
+`crates/dpdk/shim/shim.c` is product FFI rather than a test, and `bench/tools/HdrQuantiles.java`
+is a bench read-out which belongs beside the scripts that call it.
 
 ## The reference driver, for interop tests
 

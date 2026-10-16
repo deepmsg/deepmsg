@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 
 /// Where the reference checkout keeps what compiling against its client needs
@@ -45,7 +46,7 @@ fn build_probe() -> Option<PathBuf> {
 
 fn compile_probe() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("fixtures/ipc_response_probe.c");
+    let source = aeron_tests::probe("ipc_response_probe.c")?;
     let include = manifest.join(REFERENCE_INCLUDE);
     let lib = manifest.join(REFERENCE_LIB);
     let output = manifest.join("../target/ipc_response_probe");
@@ -126,6 +127,10 @@ const PLAIN: usize = 0;
 
 #[test]
 fn both_drivers_agree_on_what_a_response_channel_reaches() {
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(probe) = build_probe() else {
         driver::announce_tool_skip("the reference client library");
         return;
