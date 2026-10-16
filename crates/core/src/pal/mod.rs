@@ -34,8 +34,42 @@
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod tsc;
+
 #[cfg(target_os = "linux")]
 pub use linux::{MappedFile, error_string, monotonic_nanos, usable_space};
+
+/// The rawest monotonic reading this platform has, with no re-basing and no
+/// promise about its origin.
+///
+/// **The choice is a `cfg` on a name and not on a body**, deliberately: an
+/// architecture-gated *body* is code this machine never compiles, and a
+/// fallback nobody builds is a fallback nobody has checked. Here the only thing
+/// selected is which function [`process_monotonic_nanos`] reads, and the one it
+/// reads on x86-64 is the only one that has to be new.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use tsc::nanos as raw_monotonic_nanos;
+
+/// See the x86-64 [`raw_monotonic_nanos`].
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub use linux::monotonic_nanos as raw_monotonic_nanos;
+
+/// Nanoseconds from a clock that only goes forwards, counted from this process's
+/// first reading — what a duty cycle is timed with.
+///
+/// One body for every platform, so that the re-basing and its saturation are
+/// compiled, exercised and reviewable wherever this crate is built. On x86-64
+/// the reading underneath is the timestamp counter, which already counts from
+/// this process, and subtracting its own first reading is a no-op there; on a
+/// platform without one it is `CLOCK_MONOTONIC`, which counts from boot, and the
+/// subtraction is what makes the value mean what the contract says.
+pub fn process_monotonic_nanos() -> i64 {
+    static BASE: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+    let base = *BASE.get_or_init(raw_monotonic_nanos);
+    raw_monotonic_nanos().saturating_sub(base)
+}
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(

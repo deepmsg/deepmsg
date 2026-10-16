@@ -15,7 +15,6 @@
 //! refresh: the caller knows its own duty cycle, and a clock that refreshed
 //! itself on a timer would be a second scheduler inside the first one.
 
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch.
@@ -30,9 +29,6 @@ pub fn epoch_nano_time() -> i64 {
         .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
         .unwrap_or(i64::MAX)
 }
-
-/// The reading [`monotonic_nano_time`] counts from.
-static MONOTONIC_BASE: OnceLock<i64> = OnceLock::new();
 
 /// Nanoseconds from a clock that only goes forwards, for measuring elapsed time
 /// inside the driver.
@@ -67,12 +63,7 @@ static MONOTONIC_BASE: OnceLock<i64> = OnceLock::new();
 ///
 /// Saturates rather than panicking, like [`epoch_nano_time`].
 pub fn monotonic_nano_time() -> i64 {
-    let base = *MONOTONIC_BASE.get_or_init(crate::pal::monotonic_nanos);
-
-    // A reading that fails saturates inside the seam, so the difference can be
-    // enormous but never negative and never a panic — the same contract the
-    // `Instant` base had.
-    crate::pal::monotonic_nanos().saturating_sub(base)
+    crate::pal::process_monotonic_nanos()
 }
 
 /// Milliseconds since the Unix epoch.
