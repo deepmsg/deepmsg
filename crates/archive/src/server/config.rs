@@ -385,12 +385,18 @@ mod settings {
 ///
 /// It is here, and not only in the test below, because it is the thing a reader
 /// of this module needs: the reference's 45 names all change its behaviour, and
-/// nine of them do not change this build's — these eight, which are accepted and
-/// ignored, and `recording.events.enabled`, which is refused. Two of the eight
+/// eight of them do not change this build's — **these seven**, which are
+/// accepted and ignored, and `recording.events.enabled`, which is refused. Two
 /// are the reference's own doing — `max.catalog.entries` has no reader there
 /// either, and `client.name` is read by the *client* — two are read there only
-/// where the events publication is enabled, and the rest are work this build has
-/// not done.
+/// where the events publication is enabled, and the remaining **three** are work
+/// this build has not done: the recording and replay checksums, and the replay
+/// publication's linger.
+///
+/// ★ The counts in that paragraph are the **list's**, not a previous reading's:
+/// P2-12 took the catalog's sync level out of it (it is honoured now) and the
+/// numbers here had to be recounted rather than decremented — which is the same
+/// mistake P2-9a made in `docs/compat.md`, one table over.
 ///
 /// Every name here is **accepted**, which is the reference's own behaviour for a
 /// name it does not know (`System.getProperty` per name, no validation): a

@@ -1484,6 +1484,11 @@ impl fmt::Debug for Catalog {
             .field("alignment", &self.alignment)
             .field("next_recording_id", &self.next_recording_id)
             .field("entries", &self.index.len())
+            // The reference's own summary carries these two (`Catalog.toString`,
+            // `:1398-1399`), and they are the first thing a person asks when a
+            // catalog is not being forced: what level did it get?
+            .field("force_writes", &self.force_writes)
+            .field("force_metadata", &self.force_metadata)
             .finish()
     }
 }
