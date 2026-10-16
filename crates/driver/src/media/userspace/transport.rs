@@ -31,6 +31,7 @@ use crate::media::udp_transport::OpenError;
 use crate::media::{Affinity, Transport};
 use crate::sys::socket::{Datagram, Datagrams, MAX_BATCH};
 
+use super::demux;
 use super::frame::{self, IPV4_UDP_HEADER_LENGTH, Ipv4Write, Received, UdpWrite};
 use super::neighbour::NextHop;
 use super::ports::Binding;
@@ -265,14 +266,31 @@ impl Transport for UserspaceTransport {
                 break;
             };
 
-            let Ok(Received::Udp { ipv4, datagram }) =
-                frame::read(frame.as_bytes(), frame::Checksums::Software)
-            else {
-                // Only UDP frames are ever filed, so this is a bug in the
-                // routing rather than a frame to hand up; it is dropped rather
-                // than panicked on, because a driver that stops is worse than
-                // one that loses a datagram it should not have had.
-                continue;
+            // **A frame this transport will not hand up, and it is counted**,
+            // which is what this branch did not do until D6 went looking for
+            // one. The routing files only UDP frames, so anything but one here
+            // is a bug in the routing rather than a frame to hand up — but a
+            // frame dropped with no counter is the one thing this media's
+            // counters exist to prevent (the module note in `demux.rs` says
+            // so), and finding one cost an hour of reading zeroes: a frame the
+            // *port* judged good whose software re-read does not hold arrives
+            // exactly here, which is what a zero UDP checksum does when
+            // hardware reads it as "not computed" and this stack's sum does
+            // not.
+            //
+            // The kind decides the counter: a `Discard` goes where the demux
+            // would have put it, and anything else is a frame no transport can
+            // place.
+            let (ipv4, datagram) = match frame::read(frame.as_bytes(), frame::Checksums::Software) {
+                Ok(Received::Udp { ipv4, datagram }) => (ipv4, datagram),
+                Err(discard) => {
+                    demux::count_a_discard(&self.stack, discard);
+                    continue;
+                }
+                Ok(_) => {
+                    demux::count_a_frame_nobody_has(&self.stack, frame.as_bytes());
+                    continue;
+                }
             };
 
             let buffer = &mut buffers[received];
@@ -362,7 +380,7 @@ mod tests {
         ARP_REPLY, ARP_REQUEST, ArpPacket, BROADCAST, ETHERNET_TYPE_ARP, EthernetHeader,
         IPV4_UDP_HEADER_LENGTH, Ipv4Write, UdpWrite,
     };
-    use crate::media::userspace::packet_io::{Disposition, RxPort, TxPort};
+    use crate::media::userspace::packet_io::{Disposition, ReadyFrame, RxPort, TxPort};
     use crate::media::userspace::stack::StackParams;
 
     const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
@@ -388,7 +406,8 @@ mod tests {
         .expect("a transport")
     }
 
-    fn send_udp(port: &mut FakePort, to: u16, payload: &[u8]) {
+    /// A whole frame from the far end, carrying `payload` to `to`.
+    fn udp_frame(to: u16, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0u8; IPV4_UDP_HEADER_LENGTH + payload.len()];
         bytes[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(payload);
         let written = crate::media::userspace::frame::write_ipv4_udp(
@@ -407,11 +426,31 @@ mod tests {
             },
         )
         .expect("a frame");
+        bytes.truncate(written);
+
+        bytes
+    }
+
+    fn send_udp(port: &mut FakePort, to: u16, payload: &[u8]) {
+        let bytes = udp_frame(to, payload);
+        let written = bytes.len();
 
         port.tx_burst(1, &mut |buffer| {
             buffer[..written].copy_from_slice(&bytes[..written]);
             written
         });
+    }
+
+    /// The same frame with one byte flipped: what its UDP checksum covers is no
+    /// longer what is there, which is a frame a reader that checks checksums
+    /// must drop — and one no hardware has to notice (a zero checksum is the
+    /// same shape, and is what the D6 flood carried).
+    fn corrupt(mut frame: Vec<u8>) -> Box<[u8]> {
+        if let Some(last) = frame.last_mut() {
+            *last ^= 0xff;
+        }
+
+        frame.into_boxed_slice()
     }
 
     fn receive(transport: &mut UserspaceTransport) -> Vec<(SocketAddr, Vec<u8>)> {
@@ -431,6 +470,70 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// **A frame this transport will not hand up is counted.**
+    ///
+    /// This is the branch D6 found empty, and the shape that found it: the port
+    /// judged the frame's checksums — or did not judge them — and the demux
+    /// took that word, so a frame it was told is good is not re-read there.
+    /// This transport *does* re-read every frame with `Checksums::Software`
+    /// before it copies a payload out, and a **zero UDP checksum** is what makes
+    /// the two disagree: hardware reads it as "not computed" and calls it good,
+    /// while the sum computed here does not hold. A frame that landed between
+    /// them was dropped with nothing written down anywhere, which is what cost
+    /// D6 an hour of reading zeroes that meant "nobody counted this".
+    #[test]
+    fn a_frame_the_transport_will_not_take_is_counted() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let mut transport = open(&stack, 40_500);
+
+        stack
+            .ring(transport.binding.slot)
+            .expect("the slot the transport bound")
+            .push(
+                transport.binding.generation,
+                ReadyFrame::Bytes(corrupt(udp_frame(40_500, b"hello"))),
+            );
+
+        assert!(
+            receive(&mut transport).is_empty(),
+            "a frame whose checksum does not hold is not handed up"
+        );
+        assert_eq!(
+            1,
+            stack.counters().checksum_failure.load(Ordering::Relaxed),
+            "and it is counted, on the counter the demux would have used for it"
+        );
+    }
+
+    /// The control for that one: **a frame the transport does take moves
+    /// nothing.**
+    ///
+    /// Without this, a counter that moved for every frame would pass the test
+    /// above — which is the failure mode of a criterion that only ever sees one
+    /// side of a branch.
+    #[test]
+    fn a_frame_the_transport_takes_moves_nothing() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let mut transport = open(&stack, 40_501);
+
+        stack
+            .ring(transport.binding.slot)
+            .expect("the slot the transport bound")
+            .push(
+                transport.binding.generation,
+                ReadyFrame::Bytes(udp_frame(40_501, b"hello").into_boxed_slice()),
+            );
+
+        assert_eq!(1, receive(&mut transport).len(), "the frame is handed up");
+        assert_eq!(
+            0,
+            stack.counters().checksum_failure.load(Ordering::Relaxed),
+            "and a frame that was taken is not a checksum failure"
+        );
     }
 
     /// G11: what a channel's socket-buffer parameters mean here — accepted, and

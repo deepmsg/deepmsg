@@ -1689,7 +1689,16 @@ impl ReceiverThread {
         events: &Outbox<ReceiverEvent>,
         now_ns: i64,
     ) {
+        // **A datagram too short to hold a header is an invalid frame, not a
+        // datagram to drop in silence.** The reference counts it on the same
+        // counter this line counts the other invalid shapes on: its validity
+        // check begins `packet_length >= AERON_FRAME_HEADER_LENGTH`
+        // (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:229-231`), so
+        // a short one is `false` and the caller increments
+        // `invalid_frames_counter` — while here the read failing first meant the
+        // check was never reached and nothing was counted at all.
         let Some(header) = FrameHeader::read(packet) else {
+            system.increment(system_counters::id::INVALID_PACKETS);
             return;
         };
 

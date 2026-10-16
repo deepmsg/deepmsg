@@ -588,3 +588,10 @@ workspace = true
 [[test]]
 name = "archive_replay_merge"
 path = "integration/archive_replay_merge.rs"
+
+# A datagram the receiver cannot read as a frame is an invalid packet: the
+# reference counts one too short to hold a header, and this build dropped it
+# without a counter.
+[[test]]
+name = "short_datagram"
+path = "integration/short_datagram.rs"
