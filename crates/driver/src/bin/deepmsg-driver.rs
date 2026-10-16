@@ -232,8 +232,23 @@ fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
             .map_err(|error| format!("the dpdk media would not open: {error}"))?;
 
             let info = media.info().clone();
+            // **The driver's receive window, and it has to come from here.**
+            // The stack sizes its ready ring from this — and reports that ring
+            // as what it can hold, which is the number a channel's own window
+            // is checked against — so a media sized by anything else answers
+            // for a window this driver does not use: with the module's old
+            // constant, a driver configured above 128 KiB had every
+            // subscription refused while the kernel path took the same setting
+            // (the D6 negative-arm work found it). Read where the rest of the
+            // configuration is, because it is the driver's setting and not one
+            // of the media's.
+            #[allow(clippy::cast_sign_loss)] // a window length is not negative
+            let receive_window = config.receiver_window_length.max(0) as usize;
             let stack = media
-                .into_stack(deepmsg_driver::media::userspace::stack::Clock::Monotonic)
+                .into_stack(
+                    deepmsg_driver::media::userspace::stack::Clock::Monotonic,
+                    receive_window,
+                )
                 .map_err(|error| format!("the dpdk media could not build its stack: {error}"))?;
 
             // stdout: this line is written on every healthy start, and stderr

@@ -834,6 +834,7 @@ impl Conductor {
                         &mut counters,
                         &regions,
                         &identity,
+                        stack.extended_stat_names(),
                         now_ms,
                     )
                 })
@@ -7130,6 +7131,12 @@ mod tests {
             transmitted: 22,
             missed: 7,
             mempool_available: 99,
+            // A port's own extended statistics — the names this device
+            // reports, and a reading of them in that order. Two of the four
+            // are about loss or faults and two are not, so the set the counters
+            // are allocated for is a *selection* of this list, which is the
+            // whole of what 92 is here.
+            extended: vec![41, 2_000_000, 13, 5],
             ..Device::default()
         };
 
@@ -7144,7 +7151,16 @@ mod tests {
             Some(DeviceParts {
                 name: "0000:03:00.1".to_owned(),
                 driver: "a-pmd".to_owned(),
-                read: Box::new(move || Ok(reading)),
+                // Cloned rather than copied: a device's answer carries its
+                // extended statistics, which are a list, so a reading is a
+                // value to hand out rather than a `Copy` one.
+                read: Box::new(move || Ok(reading.clone())),
+                extended_names: vec![
+                    "rx_errors".to_owned(),
+                    "rx_bytes".to_owned(),
+                    "rx_total_missed_packets".to_owned(),
+                    "rx_priority0_dropped".to_owned(),
+                ],
             }),
         );
 
@@ -7187,6 +7203,35 @@ mod tests {
             "the first of the two packet counts"
         );
         assert_eq!(3, value(type_id::ARP_MISS), "and one the stack counted");
+
+        // 92, which is one counter per extended statistic **that counts a loss
+        // or a fault**: two of the port's four names are those, and each
+        // counter holds its own statistic's number — the third of the reading
+        // is the one the second counter is about, not the second.
+        let extended: Vec<_> = published
+            .iter()
+            .filter(|descriptor| descriptor.type_id == type_id::EXTENDED_STATS)
+            .collect();
+        assert_eq!(
+            vec![
+                (
+                    "dpdk port: 0000:03:00.1 mac=02:00:00:00:00:01 ip=10.10.0.1/24 \
+                     driver=a-pmd rx_errors",
+                    41
+                ),
+                (
+                    "dpdk port: 0000:03:00.1 mac=02:00:00:00:00:01 ip=10.10.0.1/24 \
+                     driver=a-pmd rx_total_missed_packets",
+                    13
+                ),
+            ],
+            extended
+                .iter()
+                .map(|descriptor| (descriptor.label.as_str(), descriptor.value))
+                .collect::<Vec<_>>(),
+            "the statistics about loss or faults, under their own names and with \
+             their own numbers"
+        );
 
         // The label, which is what makes a set of these readable as a set: a
         // reader that has found one has found the port they all belong to.

@@ -72,9 +72,7 @@ use super::dpdk_port::{DpdkRxPort, DpdkTxPort};
 use super::eal::{self, EalArgumentError};
 use super::packet_io::{Offloads, RxPort};
 use super::stack::{Clock, Stack, StackParams, TransmitQueues};
-use crate::config::{
-    DpdkSettings, MTU_LENGTH_DEFAULT, RCV_INITIAL_WINDOW_LENGTH_DEFAULT, ThreadingMode,
-};
+use crate::config::{DpdkSettings, MTU_LENGTH_DEFAULT, ThreadingMode};
 use crate::sys;
 
 /// The process's frame pool, made once.
@@ -82,6 +80,24 @@ static POOL: OnceLock<Mempool> = OnceLock::new();
 
 /// Set by the first media that finishes opening.
 static OPENED: OnceLock<()> = OnceLock::new();
+
+/// How many timer ticks go by between two readings of a port's extended
+/// statistics — **sixty, so once a minute on a one-second timer**.
+///
+/// **A measured cadence, not a guess.** A port's extended statistics are ~150
+/// hardware registers on the X540 (`rte_eth_xstats_get_by_id`), they are read on
+/// the conductor's timer, and in `SHARED` mode that timer is the driver's *only*
+/// thread — the one receiving. Read once a second it moved the 501K round trip's
+/// **p99** by 0.22 µs against a same-session floor of 0.10–0.49%, while leaving
+/// p50, p90 and `E[X|X<p99]` inside theirs (the ABBA is in
+/// `analysis/dpdk/d6-92-cost.md`, and the second run that chose this cadence in
+/// `deepmsg-dpdk-d6-record.md` §8). The rest of the device read — `rte_eth_stats`
+/// and the link — is cheap and is taken every tick.
+///
+/// What a minute of staleness costs is nothing the counters are for: 92 says how
+/// many frames this port has lost, cumulatively, and an operator reads that on a
+/// scale of minutes.
+const EXTENDED_STATS_EVERY: u64 = 60;
 
 /// Why a DPDK media could not be opened.
 #[derive(Debug)]
@@ -115,6 +131,9 @@ pub enum DpdkError {
     Pool(PortError),
     /// The port would not start.
     Port(PortError),
+    /// The port would not report its extended statistics — its list of them, at
+    /// open, or their values, on the timer.
+    Extended(String),
     /// A media is already open in this process.
     AlreadyOpen,
 }
@@ -145,6 +164,12 @@ impl std::fmt::Display for DpdkError {
             ),
             Self::Pool(error) => write!(f, "the frame pool could not be made: {error}"),
             Self::Port(error) => write!(f, "the port would not start: {error}"),
+            Self::Extended(error) => {
+                write!(
+                    f,
+                    "the port would not report its extended statistics: {error}"
+                )
+            }
             Self::AlreadyOpen => f.write_str(
                 "a dpdk media is already open in this process: the EAL and the pool are \
                  process-wide, and neither can be made twice",
@@ -384,12 +409,30 @@ impl DpdkMedia {
     /// the stack is what stops the port — the close order §4.13 asks for, held
     /// by the types rather than by a call sequence.
     ///
+    /// `receive_window` is the window this driver's receivers advertise when a
+    /// channel names none — `aeron.rcv.initial.window.length`, the driver's own
+    /// setting, which the caller reads because the media is opened with the
+    /// media's settings and this one is not among them.
+    ///
+    /// **It is a parameter rather than the default constant, and that is a
+    /// measured correction.** The stack sizes its ready ring from this window
+    /// ([`StackParams::ring_capacity`]) and reports that ring, in bytes, as
+    /// what it can hold ([`crate::media::Transport::receive_buffer_size`]) —
+    /// which is the number the channel check compares a channel's window
+    /// against, exactly as the kernel's `SO_RCVBUF` is compared. With the
+    /// constant in place the ring was always the one a 128 KiB window asks for,
+    /// whatever the driver was configured with, so a driver set to a window
+    /// **larger** than that had every subscription on the media refused
+    /// (`Initial window greater than SO_RCVBUF`) while the kernel path took the
+    /// same setting, and a window smaller than it left the ring needing a
+    /// capacity no operator could ask for.
+    ///
     /// # Errors
     ///
     /// [`DpdkError::Missing`] for a setting the stack has to have — the port's
     /// own address and prefix length, which nothing else can supply — and
     /// whatever [`DpdkMedia::into_ports`] answers.
-    pub fn into_stack(self, now: Clock) -> Result<Arc<Stack>, DpdkError> {
+    pub fn into_stack(self, now: Clock, receive_window: usize) -> Result<Arc<Stack>, DpdkError> {
         let mac = match self.pairs.first() {
             Some(pair) => pair.port().mac(),
             None => {
@@ -399,7 +442,7 @@ impl DpdkMedia {
                 });
             }
         };
-        let params = stack_params(&self.settings, mac)?;
+        let params = stack_params(&self.settings, mac, receive_window)?;
 
         // What the counters will be labelled with, and how the timer reads the
         // numbers only the device has (design §4.10) — taken **before** the
@@ -413,24 +456,74 @@ impl DpdkMedia {
         // nothing else does.
         let device_port = self.pairs.first().map(|pair| Arc::clone(pair.port()));
         let pool = self.pool();
-        let device = device_port.map(|port| crate::media::userspace::stack::DeviceParts {
-            name: self.info.name.clone(),
-            driver: self.info.driver.clone(),
-            read: Box::new(move || {
-                let stats = port.stats().map_err(|error| error.to_string())?;
-                let link = port.link().map_err(|error| error.to_string())?;
 
-                Ok(crate::media::userspace::dpdk_counters::Device {
-                    up: link.up,
-                    no_buffers: stats.no_buffers,
-                    received: stats.received,
-                    transmitted: stats.transmitted,
-                    received_bytes: stats.received_bytes,
-                    transmitted_bytes: stats.transmitted_bytes,
-                    missed: stats.missed,
-                    mempool_available: pool.available(),
-                })
-            }),
+        // The port's extended statistics, by name — **once**, here, because a
+        // PMD's set of them is a property of the driver and does not change
+        // (D6 measured 148 of them on the X540). A device that reports none —
+        // a device DPDK will not report any for — answers an empty list rather
+        // than failing, and then the reading below passes an empty array and
+        // the counters allocate nothing of type 92. (Not a path this build's
+        // tests take: the virtual devices report thirteen each.)
+        let extended_names = match device_port.as_ref() {
+            Some(port) => port
+                .extended_stat_names()
+                .map_err(|error| DpdkError::Extended(error.to_string()))?,
+            None => Vec::new(),
+        };
+
+        let extended_count = extended_names.len();
+
+        let device = device_port.map(|port| {
+            // The array the extended statistics are read into, kept by the
+            // reader: this is read on the conductor's timer, and a buffer that
+            // is held is a buffer that is not built again every second. Behind
+            // a lock because a reading is a `Fn` and the array is written — and
+            // the lock holds the tick as well, because the two are read and
+            // written together.
+            let values = std::sync::Mutex::new((0_u64, vec![0_u64; extended_count]));
+
+            crate::media::userspace::stack::DeviceParts {
+                name: self.info.name.clone(),
+                driver: self.info.driver.clone(),
+                extended_names,
+                read: Box::new(move || {
+                    let stats = port.stats().map_err(|error| error.to_string())?;
+                    let link = port.link().map_err(|error| error.to_string())?;
+
+                    let mut values = values.lock().expect("the extended-statistics array");
+                    let (tick, values) = &mut *values;
+
+                    // **The register read is the expensive half, and it is not
+                    // taken every tick.** `rte_eth_stats` and the link are cheap
+                    // and are read every second; a port's extended statistics
+                    // are ~150 hardware registers on the X540, read on the
+                    // conductor's timer — which in `SHARED` mode is the driver's
+                    // only thread, the one receiving. At once a second that read
+                    // moved the 501K round trip's **p99** by 0.22 µs against a
+                    // floor of 0.1–0.5% (p50 and `E[X|X<p99]` did not move at
+                    // all), so it is taken once a minute instead: a loss counter
+                    // a minute stale is still a loss counter, and the counters
+                    // are republished every tick with the values of the last
+                    // reading either way.
+                    if *tick % EXTENDED_STATS_EVERY == 0 {
+                        port.extended_stats(values.as_mut_slice())
+                            .map_err(|error| error.to_string())?;
+                    }
+                    *tick = tick.wrapping_add(1);
+
+                    Ok(crate::media::userspace::dpdk_counters::Device {
+                        up: link.up,
+                        no_buffers: stats.no_buffers,
+                        received: stats.received,
+                        transmitted: stats.transmitted,
+                        received_bytes: stats.received_bytes,
+                        transmitted_bytes: stats.transmitted_bytes,
+                        missed: stats.missed,
+                        mempool_available: pool.available(),
+                        extended: values.clone(),
+                    })
+                }),
+            }
         });
 
         let ports = self.into_ports()?;
@@ -530,13 +623,20 @@ fn pool_frames(settings: &DpdkSettings, pairs: u16) -> u32 {
 /// The MTU and the receive window are the driver's, not the NIC's: they are the
 /// Aeron MTU the channels are configured with and the window a subscription's
 /// terms come from, and the media's own MTU is the frame size the port carries
-/// ([`RxPort::mtu`]).
+/// ([`RxPort::mtu`]). The window arrives as an argument because the driver's
+/// setting is not one of the media's ([`DpdkMedia::into_stack`]); the MTU is
+/// not a setting this build reads at all, so it is the constant the channels
+/// default to.
 ///
 /// The static neighbours are the media's too, and they are **parameters**
 /// rather than a call after the stack is built: the table a stack starts with
 /// is part of what it was configured with, and a stack built from these
 /// parameters — a fake wire's included — seeds the same entries.
-fn stack_params(settings: &DpdkSettings, mac: [u8; 6]) -> Result<StackParams, DpdkError> {
+fn stack_params(
+    settings: &DpdkSettings,
+    mac: [u8; 6],
+    receive_window: usize,
+) -> Result<StackParams, DpdkError> {
     let (address, prefix_length) = settings.address.ok_or(DpdkError::Missing {
         setting: "deepmsg.dpdk.ipv4.address",
     })?;
@@ -547,7 +647,7 @@ fn stack_params(settings: &DpdkSettings, mac: [u8; 6]) -> Result<StackParams, Dp
         mac,
         gateway: settings.gateway,
         mtu: MTU_LENGTH_DEFAULT as usize,
-        receive_window: RCV_INITIAL_WINDOW_LENGTH_DEFAULT as usize,
+        receive_window,
         ephemeral_ports: settings.ephemeral_ports.clone(),
         arp_interval: settings.arp_retry,
         arp_timeout: settings.arp_timeout,
@@ -725,14 +825,40 @@ mod tests {
             ..settings()
         };
 
-        let params =
-            stack_params(&settings, [0x02, 0, 0, 0, 0, 0x01]).expect("a stack's parameters");
+        let params = stack_params(&settings, [0x02, 0, 0, 0, 0, 0x01], 32 * 1024)
+            .expect("a stack's parameters");
 
         assert_eq!(configured, params.static_neighbours);
         assert_eq!(
             Some((std::net::Ipv4Addr::new(10, 10, 0, 1), 24)),
             Some((params.address, params.prefix_length)),
             "and the rest of the parameters are still the media's"
+        );
+    }
+
+    /// The receive window is the caller's, not this module's.
+    ///
+    /// It used to be `RCV_INITIAL_WINDOW_LENGTH_DEFAULT` here, which made the
+    /// ready ring — and so what the transport reports it can hold — the one a
+    /// 128 KiB window asks for whatever the driver was configured with. The
+    /// window now arrives from `aeron.rcv.initial.window.length`
+    /// ([`DpdkMedia::into_stack`]), and this holds the seam: the number given
+    /// is the number the stack is built with, and the ring follows it.
+    ///
+    /// A window that is not the default, because a default compared against a
+    /// default is a test that cannot fail.
+    #[test]
+    fn the_receive_window_is_the_callers_and_the_ring_follows_it() {
+        let window = 1024 * 1024;
+        let params = stack_params(&settings(), [0x02, 0, 0, 0, 0, 0x01], window)
+            .expect("a stack's parameters");
+
+        assert_eq!(window, params.receive_window);
+        assert!(
+            params.ring_capacity() * params.mtu >= window,
+            "and the ring the window is held in is at least the window: {} bytes \
+             of ring against a window of {window}",
+            params.ring_capacity() * params.mtu
         );
     }
 }

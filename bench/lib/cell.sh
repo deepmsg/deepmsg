@@ -57,11 +57,26 @@ driver_kill() {
 }
 
 # Nothing left over, and nothing else eating the machine.
+#
+# **The two clients are matched by name, not by command line**, and that is a
+# measured difference rather than a preference. `pgrep -f 'loadtest-rig|echo-node'`
+# also matches any shell whose command line merely *mentions* those words — and
+# the shell a batch is launched from is alive for as long as the batch is, so a
+# launcher that names the clients (a leftover check, a `grep`, a `for` loop over
+# the three names) makes every cell wait out the whole thirty-minute loop and
+# then report "the machine never went idle". Measured on the D6 A/B: one run sat
+# in its first cell for 89 minutes for exactly this reason, and a second never
+# started at all. Both clients are binaries started directly (`taskset -c N
+# "$BENCH_RIG"`, which execs), so their process names are exactly these two.
+# The Java driver below is still matched by command line, because the reference
+# starts it through a script; a command line that mentions *that* pattern will
+# likewise hold a cell off, so avoid writing one while a batch runs.
 wait_idle() {
     for _ in $(seq 1 900); do
         if ! pgrep -x aeronmd >/dev/null 2>&1 &&
            ! pgrep -f 'io.aeron.driver.MediaDriver' >/dev/null 2>&1 &&
-           ! pgrep -f 'loadtest-rig|echo-node' >/dev/null 2>&1 &&
+           ! pgrep -x loadtest-rig >/dev/null 2>&1 &&
+           ! pgrep -x echo-node >/dev/null 2>&1 &&
            ! ps -eo pcpu= | awk '$1 > 20 { found = 1 } END { exit !found }'; then
             return 0
         fi
@@ -101,9 +116,23 @@ driver_start_c() {
 
 # This build's driver, through the shim that turns the reference's positional
 # properties files into `-D` arguments.
+# `BENCH_DRIVER_TASKSET` is an optional CPU list for the driver's *process*, and
+# it exists for the same reason the rig and the node are placed with `taskset`:
+# a driver that pins its own agents out of a properties file still has threads
+# of its own outside that list — a media driver has the EAL's lcore among them —
+# and a batch that reserves two cores per driver has to be able to say so.
+# `BENCH_DRIVER_NETNS` is an optional network namespace to start the driver in,
+# and it exists because **one host cannot send to itself over a wire**: if both
+# ends of a cable are addresses of this machine's kernel, the kernel takes its
+# local shortcut and the cable carries nothing — measured, on the D6 A/B's first
+# cell, as 58 packets on the wire against 1.5 million messages offered. A batch
+# that means to measure a cable puts one end in a namespace of its own, where the
+# only way to the other end is the wire.
 driver_start_deepmsg() {
     local log=$1; shift
     DEEPMSG_DRIVER="$BENCH_DRIVER" \
+        ${BENCH_DRIVER_NETNS:+ip netns exec "$BENCH_DRIVER_NETNS"} \
+        ${BENCH_DRIVER_TASKSET:+taskset -c "$BENCH_DRIVER_TASKSET"} \
         "$BENCH_LIB/shims/aeronmd" \
         "$BENCHMARKS_SCRIPTS_DIR/low-latency-driver.properties" \
         "$BENCH_DIR/lib/conf/benchmark.properties" "$@" >"$log" 2>&1 &
@@ -134,11 +163,21 @@ node_start_java() {
 }
 
 # This build's node, out of the same tree as the rig.
+#
+# `BENCH_CLIENT_PROPERTIES` is a file of extra settings for the far end and the
+# rig, read after the `-D` arguments beside it — a later file wins over an
+# earlier one, and a `-D` wins over all of them, which is the order the rig's own
+# argument parsing states (`crates/bench/src/bin/loadtest-rig.rs`). It exists for
+# a batch whose two ends are not on one machine's loopback: the channels a run
+# measures are settings (`io.aeron.benchmarks.aeron.{destination,source}.channel`,
+# defaulting to `localhost`), and a run over a cable has to name the addresses on
+# it without every such batch editing this file.
 node_start_rust() {
     local cell=$1 log=$2
     taskset -c "$BENCH_NODE_CPU" "$BENCH_NODE" \
         "-Daeron.dir=$BENCH_AERON_DIR" \
-        "-Dio.aeron.benchmarks.output.directory=$cell" >"$log" 2>&1 &
+        "-Dio.aeron.benchmarks.output.directory=$cell" \
+        ${BENCH_CLIENT_PROPERTIES:+"$BENCH_CLIENT_PROPERTIES"} >"$log" 2>&1 &
     echo $!
 }
 
@@ -168,9 +207,20 @@ run_client_java() {
 
 # The rig takes the same properties as `-D` arguments, which is what makes the
 # two clients' numbers comparable at all.
+#
+# `BENCH_CLIENT_TIMEOUT` is an optional deadline in seconds, and it lives here
+# rather than around the call because **`timeout` cannot run a shell function** —
+# `timeout 600 run_client_rust …` fails with `failed to run command`: 127, which a
+# batch reports as the rig exiting and never as a deadline. Measured, on the D6
+# A/B's first cell after a deadline was put in front of the call. The deadline
+# wraps the client itself, and `taskset` execs, so the signal reaches the rig.
+# A batch that bounds nothing — a rig that cannot reach its rate does not stop on
+# its own, and the kernel arm of that A/B ran nine minutes on a cell the media arm
+# finishes in seventy seconds — sets it; `0` is `timeout`'s own "no deadline".
 run_client_rust() {
     local cell=$1 log=$2 rate=$3 length=$4 run=$5 prefix=$6
-    taskset -c "$BENCH_RIG_CPU" "$BENCH_RIG" \
+    timeout --signal=KILL "${BENCH_CLIENT_TIMEOUT:-0}" \
+        taskset -c "$BENCH_RIG_CPU" "$BENCH_RIG" \
         -Dio.aeron.benchmarks.message.transceiver=echo \
         "-Daeron.dir=$BENCH_AERON_DIR" \
         -Dio.aeron.benchmarks.aeron.embedded.media.driver=false \
@@ -183,7 +233,8 @@ run_client_rust() {
         "-Dio.aeron.benchmarks.message.length=$length" \
         -Dio.aeron.benchmarks.batch.size=1 \
         -Dio.aeron.benchmarks.aeron.use.try.claim=true \
-        -Dio.aeron.benchmarks.output.time.unit=MICROSECONDS >"$log" 2>&1
+        -Dio.aeron.benchmarks.output.time.unit=MICROSECONDS \
+        ${BENCH_CLIENT_PROPERTIES:+"$BENCH_CLIENT_PROPERTIES"} >"$log" 2>&1
 }
 
 # --- the check ---------------------------------------------------------------

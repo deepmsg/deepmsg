@@ -52,6 +52,13 @@ use common::pcap::{Capture, in_a_child};
 /// Where a child is told to find the capture it receives.
 const RX_PCAP: &str = "DEEPMSG_DRIVER_DPDK_MEDIA_RX_PCAP";
 
+/// The receive window a child is told to build its stack with — deliberately
+/// **not** `RCV_INITIAL_WINDOW_LENGTH_DEFAULT`, because a window the driver's
+/// own setting is compared against a window it is not has to be able to fail.
+/// (The driver passes `aeron.rcv.initial.window.length` here; see
+/// `bin/deepmsg-driver.rs`.)
+const WINDOW: &str = "DEEPMSG_DRIVER_DPDK_MEDIA_WINDOW";
+
 /// The stack's own address, which the frames in a capture are addressed to.
 const OWN: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
 
@@ -524,25 +531,38 @@ fn a_second_media_is_refused_in_the_child() {
 }
 
 /// The stack the media builds carries the media's address, gateway and MAC —
-/// and it is what holds the ports, so dropping it is what stops the port.
+/// and it is what holds the ports, so dropping it is what stops the port. The
+/// **window** comes with them, and it is the driver's rather than the media's:
+/// it is what the ring is sized from, so a stack built with the module's own
+/// default is a driver whose subscriptions are checked against a window it does
+/// not use.
 #[test]
 fn the_media_hands_the_stack_its_own_settings() {
     let capture = capture_of("params", 0);
     in_a_child(
         "the_media_hands_the_stack_its_own_settings_in_the_child",
-        &[(RX_PCAP, capture.path())],
+        &[(RX_PCAP, capture.path()), (WINDOW, WINDOW_BYTES)],
     );
 }
+
+/// The window the parent above asks for: 1 MiB, which is a window the ring
+/// built from the module's old constant could not have held (352 KiB of ring
+/// against a 1 MiB window), so this case is the defect's own shape.
+const WINDOW_BYTES: &str = "1048576";
 
 #[test]
 #[ignore = "runs as a child of `the_media_hands_the_stack_its_own_settings`"]
 fn the_media_hands_the_stack_its_own_settings_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
+    let window: usize = std::env::var(WINDOW)
+        .expect("the parent passes the receive window")
+        .parse()
+        .expect("a window in bytes");
     let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
     let pool = media.pool();
     let whole = media.pool_size();
 
-    let stack = media.into_stack(Clock::Monotonic).expect("a stack");
+    let stack = media.into_stack(Clock::Monotonic, window).expect("a stack");
     let params = stack.params();
 
     assert_eq!(OWN, params.address);
@@ -559,8 +579,16 @@ fn the_media_hands_the_stack_its_own_settings_in_the_child() {
          frame size the port carries (that one is `RxPort::mtu`)"
     );
     assert_eq!(
-        deepmsg_driver::config::RCV_INITIAL_WINDOW_LENGTH_DEFAULT as usize,
-        params.receive_window
+        window, params.receive_window,
+        "the receive window is the driver's setting, handed to the stack as an \
+         argument — not a constant this module chose"
+    );
+    assert!(
+        params.ring_capacity() * params.mtu >= window,
+        "and what the transport will report it can hold is at least that \
+         window, which is the check a channel's own window is put through: \
+         {} bytes of ring",
+        params.ring_capacity() * params.mtu
     );
 
     drop(stack);

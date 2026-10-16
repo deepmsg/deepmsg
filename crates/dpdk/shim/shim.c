@@ -23,6 +23,7 @@
  *     theirs.
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
@@ -314,6 +315,81 @@ int shim_port_stats(unsigned port, shim_port_stats_t *out)
     out->rx_nombuf = stats.rx_nombuf;
 
     return 0;
+}
+
+/*
+ * A port's extended statistics, which are whatever its PMD chooses to expose —
+ * 148 of them on the X540, by hardware register name (measured through
+ * `show port xstats` on that card, D6). Two callers' facts are in the shape:
+ *
+ *   - **The names come back once**, at startup, because they do not change: a
+ *     device's set of statistics is a property of the PMD. The values are read
+ *     against that list, by index, on the timer.
+ *   - **The read is by id and into the caller's array** —
+ *     `rte_eth_xstats_get_by_id` with a null id list, which is DPDK's own
+ *     "give me all of them, in name order" — so no `rte_eth_xstat` array is
+ *     ever built here and nothing is allocated on a path a timer runs.
+ *
+ * Which of them are kept is not decided here: a name is a policy, is judged
+ * without a port, and lives on the Rust side (`dpdk_counters.rs`).
+ */
+#define SHIM_XSTAT_NAME_MAX 64
+
+typedef struct {
+    char name[SHIM_XSTAT_NAME_MAX];
+} shim_xstat_name_t;
+
+/*
+ * **Equality, not `<=`.** The caller's array is handed straight to DPDK, so the
+ * only shape that is safe to hand over is one the two agree on exactly; a
+ * DPDK that changed its name length fails this build rather than writing past
+ * a buffer of ours.
+ */
+_Static_assert(RTE_ETH_XSTATS_NAME_SIZE == SHIM_XSTAT_NAME_MAX,
+    "the shim's xstat-name buffer is not the length DPDK's names are");
+
+/*
+ * **A device that has none answers zero, not an error.** `-ENOTSUP` is DPDK's
+ * way of saying "this PMD does not do extended statistics", and a media that
+ * refused to open over it would be a media that could not run on a device with
+ * no registers to report. The two cases are merged here, where DPDK's
+ * convention is known, and Rust sees only a count.
+ *
+ * A **guard rather than a path**, and that is measured: the virtual devices this
+ * build tests on do not take it. `net_pcap` and `net_null` each report the same
+ * thirteen statistics (`show port xstats` on both, and the child case in
+ * `crates/driver/tests/dpdk_port.rs` reads them back through this shim) —
+ * DPDK hands a PMD that implements none of its own the basic set.
+ */
+int shim_port_xstats_count(unsigned port)
+{
+    int count;
+
+    rte_errno = 0;
+    count = rte_eth_xstats_get_names((uint16_t)port, NULL, 0);
+    if (-ENOTSUP == count)
+    {
+        return 0;
+    }
+
+    return count;
+}
+
+/*
+ * The names, in the order the values come back in. DPDK's answer when the array
+ * is too small is the count it needed rather than a failure, which is what the
+ * caller's `n` is checked against.
+ */
+int shim_port_xstats_names(unsigned port, shim_xstat_name_t *out, unsigned n)
+{
+    rte_errno = 0;
+    return rte_eth_xstats_get_names((uint16_t)port, (struct rte_eth_xstat_name *)out, n);
+}
+
+int shim_port_xstats_values(unsigned port, uint64_t *out, unsigned n)
+{
+    rte_errno = 0;
+    return rte_eth_xstats_get_by_id((uint16_t)port, NULL, out, n);
 }
 
 /*

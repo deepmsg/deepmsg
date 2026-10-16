@@ -260,6 +260,33 @@ fn a_port_describes_itself_from_the_device_in_the_child() {
         port.mtu(),
         "the largest frame is the device's MTU with the Ethernet header counted"
     );
+
+    // **And its extended statistics**, both halves of the seam: pcap reports
+    // thirteen of them — DPDK hands a PMD that implements none of its own the
+    // basic set — and a reading of all thirteen comes back. That is what makes
+    // this the criterion for the read path rather than for a hardware card: 148
+    // on the X540 is the same two calls with a longer list (D6's record), and
+    // a device that truly has none answers an empty list rather than an error,
+    // which is `-ENOTSUP` merged into a count in the shim.
+    let names = started
+        .port
+        .extended_stat_names()
+        .expect("a port reports the statistics it has");
+    assert!(
+        names.iter().any(|name| name == "rx_errors"),
+        "the statistics a PMD gets for free: {names:?}"
+    );
+
+    let mut values = vec![0u64; names.len()];
+    started
+        .port
+        .extended_stats(&mut values)
+        .expect("and every one of them can be read");
+    assert_eq!(
+        names.len(),
+        values.len(),
+        "a reading answers one value per name, in the same order"
+    );
 }
 
 // ---- the pieces the cases above share -----------------------------------

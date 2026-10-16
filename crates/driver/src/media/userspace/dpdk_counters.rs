@@ -13,9 +13,11 @@
 //!
 //! * **What only the device knows** — the link's state, the frames the NIC
 //!   dropped for want of room, the frames it could not receive because the pool
-//!   had no buffer, and the four sent/received packet-and-byte counts
-//!   (`rte_eth_stats`). Read by whoever runs on a timer
-//!   ([`DpdkCounters::sample`]), because they are a call into the PMD.
+//!   had no buffer, the four sent/received packet-and-byte counts
+//!   (`rte_eth_stats`), and the port's **extended statistics** (92), which are
+//!   the PMD's own list of hardware registers, cut to the ones that count a
+//!   loss or a fault ([`is_a_loss_or_error_statistic`]). Read by whoever runs on
+//!   a timer ([`DpdkCounters::sample`]), because they are a call into the PMD.
 //! * **What the stack counts** — the frames it discarded and why
 //!   ([`StackCounters`], whose atomics the receiving thread bumps as it works).
 //!   Forwarded, not re-counted ([`DpdkCounters::publish`]): the stack has
@@ -104,9 +106,10 @@ pub mod type_id {
     /// 91 `AERON_COUNTER_DPDK_MEMPOOL_AVAILABLE_TYPE_ID` — frames the pool has
     /// free.
     pub const MEMPOOL_AVAILABLE: i32 = 91;
-    /// 92 `AERON_COUNTER_DPDK_EXTENDED_STATS_TYPE_ID` — **not allocated**: one
-    /// counter per extended statistic is a counter per hardware register, and
-    /// the design defers the set to D6.
+    /// 92 `AERON_COUNTER_DPDK_EXTENDED_STATS_TYPE_ID` — one counter per
+    /// extended statistic that counts a loss or a fault
+    /// ([`is_a_loss_or_error_statistic`]), which is a subset of the port's own
+    /// list rather than all of it.
     pub const EXTENDED_STATS: i32 = 92;
     /// 93 `AERON_COUNTER_DPDK_RX_UNSUPPORTED_ETHERNET_TYPE_TYPE_ID` —
     /// ethertypes that are neither IPv4 nor ARP.
@@ -258,11 +261,48 @@ fn peer_or_any(peer: Option<SocketAddr>) -> String {
     peer.map_or_else(|| "*".to_owned(), |peer| peer.to_string())
 }
 
+/// Whether a port's extended statistic is one this media publishes — **92's
+/// membership rule**, and the one policy in this module that a port cannot
+/// answer.
+///
+/// The reference gives 92 one counter per extended statistic, which on a
+/// hardware PMD is one counter per hardware register: **148** of them on the
+/// X540, measured through `show port xstats` (D6), and the design's own reason
+/// for deferring the set is that "one counter per xstat is too many counters".
+/// So the set is cut to the statistics that are about **frames lost or
+/// faults** — the ones an operator reads a media's health from, and the reason
+/// this build wanted the set at all — and the rest stay where they are: in
+/// `ethtool`/`testpmd`, which is where someone with a register question is
+/// already looking.
+///
+/// Three families are left out although their names match, because what they
+/// count is not this media's traffic:
+///
+/// * `fcoe` — Fibre Channel over Ethernet, which this stack does not carry.
+/// * `flow_director` — the filter table's own errors, which nothing here
+///   programs.
+/// * `priority` — eight priorities × two counters, and this media does not set
+///   a priority on anything.
+///
+/// **The rule is by name and not by the two-value `id`**, because the ids are a
+/// property of the PMD and the names are what a reader sees. A PMD that renames
+/// a statistic moves it out of the set, which is the direction the rule should
+/// fail in: a counter that appears is a counter someone asks about.
+pub fn is_a_loss_or_error_statistic(name: &str) -> bool {
+    const NOT_THIS_MEDIAS_TRAFFIC: [&str; 3] = ["fcoe", "flow_director", "priority"];
+    const LOSS_OR_FAULT: [&str; 3] = ["error", "dropped", "missed"];
+
+    !NOT_THIS_MEDIAS_TRAFFIC
+        .iter()
+        .any(|excluded| name.contains(excluded))
+        && LOSS_OR_FAULT.iter().any(|kept| name.contains(kept))
+}
+
 /// What the device answered, in this module's own words.
 ///
 /// The crate's `PortStats` and `Link` in one value: what only a port can
 /// answer, and what the counters above are filled from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Device {
     /// Whether the link is up — counter 75's value.
     pub up: bool,
@@ -278,6 +318,13 @@ pub struct Device {
     pub missed: u64,
     /// Frames the pool has free.
     pub mempool_available: u32,
+    /// **All** of the port's extended statistics, in the port's own order —
+    /// not only the ones published. What the device answered is the device's
+    /// answer; which of them a counter is allocated for is the name rule
+    /// ([`is_a_loss_or_error_statistic`]), and this module keeps the indices it
+    /// kept so that the two cannot drift apart into publishing one statistic's
+    /// number under another's name.
+    pub extended: Vec<u64>,
 }
 
 /// A DPDK media's counters, allocated and ready to be written.
@@ -307,6 +354,23 @@ pub struct DpdkCounters {
     /// The rest: what the stack has already counted, published under the type
     /// the reference gives it.
     forwarded: Vec<Forwarded>,
+    /// 92 — one per extended statistic that counts a loss or a fault, each
+    /// holding **where in the port's list** its number is read from.
+    ///
+    /// The index and not the name, because the read comes back positional: the
+    /// port answers its statistics in one order and this is where each kept one
+    /// sits in it. Keeping the name as well would be a second thing to compare
+    /// against the same list.
+    extended: Vec<KeptStatistic>,
+}
+
+/// One extended statistic this media publishes.
+struct KeptStatistic {
+    /// Its position in the port's own list, which is the position of its value
+    /// in a reading.
+    at: usize,
+    /// The counter it is published as.
+    counter_id: i32,
 }
 
 /// One of the stack's own counters, and the counter it is published as.
@@ -330,10 +394,16 @@ impl DpdkCounters {
     /// `None` when the manager has no room — the caller's `CounterManager`
     /// answers the same way for every allocation, and a driver that cannot
     /// publish its counters should say so where it allocated them.
+    /// `extended_names` is the port's own list of extended statistics, in the
+    /// order the port reports their values ([`crate::media::userspace::stack::Stack::extended_stat_names`]).
+    /// Empty for a port that has none — not a path this build's virtual
+    /// devices take, since DPDK gives them the basic set — and empty
+    /// is why nothing below has to ask whether there is a device at all.
     pub fn allocate(
         manager: &mut CounterManager,
         regions: &CounterRegions<'_>,
         identity: &PortIdentity<'_>,
+        extended_names: &[String],
         now_ms: i64,
     ) -> Option<Self> {
         let mut allocate = |what: &str, type_id: i32| -> Option<i32> {
@@ -404,6 +474,30 @@ impl DpdkCounters {
             forwarded.push(Forwarded { counter_id, source });
         }
 
+        // 92, one per extended statistic that counts a loss or a fault. The
+        // counter's **key is the statistic's own name** rather than the port's:
+        // the port is already in the label, and the name is what tells two of
+        // these apart — the key is what a reader looks one up by.
+        let mut extended = Vec::new();
+        for (at, name) in extended_names.iter().enumerate() {
+            if !is_a_loss_or_error_statistic(name) {
+                continue;
+            }
+
+            let counter_id = manager.allocate(
+                regions,
+                type_id::EXTENDED_STATS,
+                name.as_bytes(),
+                identity.label(name).as_bytes(),
+                now_ms,
+            )?;
+            manager
+                .set_registration_id(regions, counter_id, NO_CLIENT)
+                .and_then(|()| manager.set_owner_id(regions, counter_id, layout::NULL_VALUE))?;
+
+            extended.push(KeptStatistic { at, counter_id });
+        }
+
         Some(Self {
             link,
             no_buffers,
@@ -416,6 +510,7 @@ impl DpdkCounters {
             poller,
             errors,
             forwarded,
+            extended,
         })
     }
 
@@ -487,8 +582,43 @@ impl DpdkCounters {
         let device = reading?;
 
         let _ = self.publish_device(manager, regions, &device);
+        let _ = self.publish_extended(manager, regions, &device.extended);
 
         Ok(())
+    }
+
+    /// Publish the extended statistics that were kept, out of a full reading.
+    ///
+    /// `values` is every statistic the port answered, in the port's order — the
+    /// same list the allocation was given the names of. A reading that is not
+    /// that long is one whose port changed under the counters, and it publishes
+    /// **nothing** rather than the statistics it happens to have: half a set of
+    /// numbers under their own names is worse than a set that stopped moving,
+    /// and a reader can see the latter.
+    ///
+    /// # Errors
+    ///
+    /// `None` if the reading is short of what was allocated, or if any of the
+    /// counters cannot be written.
+    pub fn publish_extended(
+        &self,
+        manager: &CounterManager,
+        regions: &CounterRegions<'_>,
+        values: &[u64],
+    ) -> Option<()> {
+        if self
+            .extended
+            .last()
+            .is_some_and(|kept| kept.at >= values.len())
+        {
+            return None;
+        }
+
+        for kept in &self.extended {
+            manager.set_value(regions, kept.counter_id, values[kept.at] as i64)?;
+        }
+
+        Some(())
     }
 
     /// Count a read of the device that failed.
@@ -554,6 +684,7 @@ impl std::fmt::Debug for DpdkCounters {
             .field("mempool", &self.mempool)
             .field("errors", &self.errors)
             .field("forwarded", &self.forwarded.len())
+            .field("extended", &self.extended.len())
             .finish()
     }
 }
@@ -633,7 +764,7 @@ mod tests {
     fn a_counter_a_media_allocates_is_a_counter_a_client_reads() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        DpdkCounters::allocate(&mut manager, &regions, &identity(), 1).expect("room");
+        DpdkCounters::allocate(&mut manager, &regions, &identity(), &[], 1).expect("room");
 
         // 75, one per port, and the label is the design's own shape.
         let port_info = published(&regions, type_id::PORT_INFO);
@@ -674,7 +805,7 @@ mod tests {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
         let counters =
-            DpdkCounters::allocate(&mut manager, &regions, &identity(), 1).expect("room");
+            DpdkCounters::allocate(&mut manager, &regions, &identity(), &[], 1).expect("room");
 
         let stack = StackCounters::default();
         counters
@@ -716,7 +847,8 @@ mod tests {
     fn the_devices_numbers_are_filed_under_their_own_counters() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        let media = DpdkCounters::allocate(&mut manager, &regions, &identity(), 1).expect("room");
+        let media =
+            DpdkCounters::allocate(&mut manager, &regions, &identity(), &[], 1).expect("room");
 
         media
             .publish_device(
@@ -731,6 +863,7 @@ mod tests {
                     transmitted_bytes: 55,
                     missed: 66,
                     mempool_available: 777,
+                    extended: Vec::new(),
                 },
             )
             .expect("a writable file");
@@ -753,18 +886,139 @@ mod tests {
         assert_eq!(777, read(type_id::MEMPOOL_AVAILABLE, "mempool-available"));
     }
 
-    /// 92 is not allocated: the design defers the per-xstat set to D6, and a
-    /// counter per hardware register is not a set to publish by accident.
+    /// 80 and 81 are unassigned in the reference's catalogue, and nothing may
+    /// be allocated under them; a device with no extended statistics gets no
+    /// 92 either.
     #[test]
-    fn the_deferred_type_is_not_allocated() {
+    fn the_unassigned_types_and_an_empty_set_are_not_allocated() {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
-        DpdkCounters::allocate(&mut manager, &regions, &identity(), 1).expect("room");
+        DpdkCounters::allocate(&mut manager, &regions, &identity(), &[], 1).expect("room");
 
         assert!(published(&regions, type_id::EXTENDED_STATS).is_empty());
         assert!(
             published(&regions, 80).is_empty() && published(&regions, 81).is_empty(),
             "80 and 81 are unassigned in the reference's catalogue"
+        );
+    }
+
+    /// The membership rule, on the names the X540 actually reports: the
+    /// statistics about frames lost or faults are in, and the three families
+    /// whose names would otherwise match — FCoE, the flow director, and the
+    /// eight priorities — are out.
+    ///
+    /// The list is the card's own, read through `show port xstats` (D6).
+    #[test]
+    fn the_extended_statistics_that_are_kept_are_the_ones_about_losses() {
+        for kept in [
+            "rx_errors",
+            "tx_errors",
+            "rx_missed_errors",
+            "rx_total_missed_packets",
+            "rx_mbuf_allocation_errors",
+            "rx_crc_errors",
+            "rx_l3_l4_xsum_error",
+            "rx_error_bytes",
+            "mac_local_errors",
+            "rx_q0_errors",
+            "rx_mac_short_packet_dropped",
+            "rx_management_dropped",
+        ] {
+            assert!(is_a_loss_or_error_statistic(kept), "{kept} counts a loss");
+        }
+
+        for left_out in [
+            "rx_bytes",
+            "rx_q0_packets",
+            "rx_q0_bytes",
+            "tx_q0_packets",
+            // Names that match a loss word and are still not this media's
+            // traffic: Fibre Channel, the filter table, and the priorities.
+            "rx_fcoe_dropped",
+            "rx_fcoe_mbuf_allocation_errors",
+            "flow_director_missed_filters",
+            "flow_director_filter_add_errors",
+            "rx_priority0_dropped",
+            "rx_priority7_mbuf_allocation_errors",
+        ] {
+            assert!(
+                !is_a_loss_or_error_statistic(left_out),
+                "{left_out} is not this media's traffic"
+            );
+        }
+    }
+
+    /// 92: one counter per kept statistic, each holding **its own** number.
+    ///
+    /// The reading is the port's whole list, so the counters are a selection of
+    /// it and their values are at the kept positions rather than at the front —
+    /// which is the mistake this case exists for: two of these four numbers
+    /// would still be plausible under the wrong name. The third value (13) is
+    /// the one `rx_total_missed_packets` must have, and it is deliberately not
+    /// the second (2,000,000).
+    #[test]
+    fn the_kept_statistics_are_published_under_their_own_names() {
+        let names: Vec<String> = [
+            "rx_errors",
+            "rx_bytes",
+            "rx_total_missed_packets",
+            "rx_priority0_dropped",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+
+        let mut fixture = Fixture::new();
+        let (mut manager, regions) = fixture.open();
+        let media =
+            DpdkCounters::allocate(&mut manager, &regions, &identity(), &names, 1).expect("room");
+
+        let counters = published(&regions, type_id::EXTENDED_STATS);
+        assert_eq!(
+            vec!["rx_errors", "rx_total_missed_packets"],
+            counters
+                .iter()
+                .map(|descriptor| descriptor.label.rsplit(' ').next().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            "the two about loss, and only those: {counters:?}"
+        );
+        assert_eq!(
+            "dpdk port: 0000:03:00.1 mac=02:00:00:00:00:01 ip=10.10.0.1/24 driver=net_ixgbe \
+             rx_total_missed_packets",
+            counters[1].label,
+            "and the label names the register, which is the whole of what 92 \
+             says a reader gets"
+        );
+
+        media
+            .publish_extended(&manager, &regions, &[41, 2_000_000, 13, 5])
+            .expect("a writable file");
+
+        // Read again rather than through `counters` above: those descriptors
+        // carry the value each counter had **when they were read**, which was
+        // before anything was published.
+        let after = published(&regions, type_id::EXTENDED_STATS);
+        assert_eq!(41, after[0].value, "rx_errors");
+        assert_eq!(13, after[1].value, "rx_total_missed_packets");
+
+        // A reading that stops **before a kept statistic** is not a set to
+        // publish half of: a counter that stopped moving is readable, and one
+        // whose statistic was never in the reading is not. Two values is short
+        // of the third, which is the one `rx_total_missed_packets` is read
+        // from — while three is enough, because the kept indices are 0 and 2
+        // and a reading of three has both.
+        assert_eq!(
+            None,
+            media.publish_extended(&manager, &regions, &[41, 2_000_000])
+        );
+        assert_eq!(
+            Some(()),
+            media.publish_extended(&manager, &regions, &[41, 2_000_000, 13])
+        );
+        assert_eq!(
+            13,
+            published(&regions, type_id::EXTENDED_STATS)[1].value,
+            "and what was there before is still there"
         );
     }
 

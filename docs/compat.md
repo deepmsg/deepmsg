@@ -485,18 +485,31 @@ enough to write down, and all three are departures from the reference's
 DPDK media's counters are the reference's own type ids — 75 to 95, with **80 and
 81 unassigned** (`aeron-client/src/main/c/aeron_counters.h:155-173`) — because a
 counter is found by its type and a client that knows the reference's catalogue
-has to find these the same way. This build publishes every one of them except
-92 `EXTENDED_STATS`, which is one counter per hardware register and is deferred
-(the design's D6); 76 `DPDK_TRANSPORT` is one per *transport*, which is the one
-counter here that a thread rather than the conductor's timer moves. The
+has to find these the same way. This build publishes all of them, and **one is a
+subset of what its name means**: 92 `EXTENDED_STATS` is one counter per
+extended statistic **that counts a loss or a fault**, where the reference's is
+one per extended statistic — on the X540 that is 22 counters against **148** of
+them, measured through `show port xstats` (D6). One counter per hardware
+register is the set the design deferred, and a reader with a register question
+is already looking at `ethtool` or `testpmd`; what a media's counters are for is
+the health of the traffic, which is what is left. The membership rule is by name
+rather than by the PMD's index — a PMD that renames a statistic moves it out of
+the set — and lives in one function of its own
+(`dpdk_counters.rs::is_a_loss_or_error_statistic`). 76 `DPDK_TRANSPORT` is one
+per *transport*, which is the one counter here that a thread rather than the
+conductor's timer moves. The
 **labels** are this repo's own, as the setting names are: the reference's are
 Premium's and not visible, so a label is written from what this build knows —
 the port it drives, the address a transport is bound to, both ends of it. A
 reader that needs the counters finds them by type id and reads the labels as
 prose, which is the most that can be promised. Pinned by
 `crates/driver/src/media/userspace/dpdk_counters.rs::a_counter_a_media_allocates_is_a_counter_a_client_reads`
-and `::the_deferred_type_is_not_allocated` (the ids, and the two that are not
-allocated), `::a_transports_counter_names_it_and_counts_into_itself` (the
+and `::the_unassigned_types_and_an_empty_set_are_not_allocated` (the ids, the two
+that are unassigned, and a device that has no extended statistics at all),
+`::the_extended_statistics_that_are_kept_are_the_ones_about_losses` (92's
+membership, both ways, on the names the X540 reports),
+`::the_kept_statistics_are_published_under_their_own_names` (each statistic
+under its own name and its own number), `::a_transports_counter_names_it_and_counts_into_itself` (the
 per-transport type and its label), and, off a real port, by
 `crates/driver/tests/dpdk_two_drivers.rs::a_message_crosses_between_two_drivers_on_a_dpdk_port`
 (75, 76, 82, 83, 84 and 91 read out of each driver's own CnC file).

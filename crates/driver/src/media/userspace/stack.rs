@@ -438,6 +438,18 @@ pub struct DeviceParts {
     pub driver: String,
     /// Reads what only the device and its pool can answer.
     pub read: DeviceReader,
+    /// **Every** extended statistic this port reports, in the order the port
+    /// reports their values — its own list, unfiltered.
+    ///
+    /// Read once, when the port was started, because a PMD's set of statistics
+    /// is a property of the driver and does not change; the values are read
+    /// against it ([`Device::extended`], and the counter work that picks from
+    /// it). Which of them a counter is allocated for is a policy, judged
+    /// without a port, and lives with the counters
+    /// ([`crate::media::userspace::dpdk_counters::is_a_loss_or_error_statistic`]).
+    ///
+    /// Empty on a device that has none.
+    pub extended_names: Vec<String>,
 }
 
 /// How a stack reads its device — see [`DeviceParts`].
@@ -568,6 +580,18 @@ impl Stack {
     /// this stack keeps.
     pub fn device_reading(&self) -> Option<Result<Device, String>> {
         Some((self.device.as_ref()?.read)())
+    }
+
+    /// The port's extended statistics, by name, in the order a reading answers
+    /// them in.
+    ///
+    /// Empty on a stack with no device behind it and on a device that reports
+    /// none, which are the same answer to the only question a caller has: which
+    /// of these is there a counter for.
+    pub fn extended_stat_names(&self) -> &[String] {
+        self.device
+            .as_ref()
+            .map_or(&[], |device| device.extended_names.as_slice())
     }
 
     /// A stack whose three ports are all on one side of a [`Wire`] — the shape
