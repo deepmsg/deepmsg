@@ -17,6 +17,7 @@ pub mod create_replay_publication;
 pub mod delete_segments;
 pub mod idle;
 pub mod recorder;
+pub mod recording_events;
 pub mod recording_pos;
 pub mod recording_session;
 pub mod replay_session;

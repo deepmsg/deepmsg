@@ -187,7 +187,7 @@ impl Publication for ExclusivePublication {
 /// Zero when the slot cannot be read, which is what the client answers too: a
 /// window of zero offers nothing, and a replay that cannot see its window
 /// retries rather than writing somewhere the driver has not made room for.
-fn position_limit(
+pub(crate) fn position_limit(
     publication: &ExclusivePublication,
     counters: &CountersReader<'_, ReadWrite>,
 ) -> i64 {

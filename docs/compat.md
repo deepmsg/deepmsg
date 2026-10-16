@@ -1181,23 +1181,31 @@ them without the list moving.
 
 | | How many | What it means |
 |---|---|---|
-| Honoured | 37 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
-| Accepted, not honoured | 7 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
-| Refused by name | 1 | `aeron.archive.recording.events.enabled`, which this build refuses rather than accepting with nothing behind it |
+| Honoured | 40 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
+| Accepted, not honoured | 5 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
+| Refused by name | 0 | — |
 
-The eight are the deviations worth naming. **Two of them are the reference's
+The five are the deviations worth naming. **Two of them are the reference's
 own doing**, which is why they are not defects here:
 `aeron.archive.max.catalog.entries` has **no reader in the reference either** —
 `Archive.maxCatalogEntries()` is defined (`:849`, `:3337`) and never called, and
 its `Catalog` is constructed without it (`Archive.java:1504-1511`) — and
 `aeron.archive.client.name` is read by the **client** (`AeronArchive.java:3025`),
 where this build takes the name from `AERON_ARCHIVE_CLIENT_NAME` instead (a
-recorded deviation on that side, `crates/archive/src/client/context.rs`). Two
-more are read by the reference only where the recording-events publication is
-enabled, and this build refuses that name rather than pretending
-(`aeron.archive.recording.events.enabled`, the one row of "refused by name").
-The remaining three are work this build has not done: the recording and replay
+recorded deviation on that side, `crates/archive/src/client/context.rs`). The
+other three are work this build has not done: the recording and replay
 checksums, and the replay publication's linger.
+
+★ **The third row is gone as of P2-13**, and that is a statement rather than a
+tidy-up. "Refused by name" meant a name this build could not honour *and would
+not accept silently* — a client waiting for events that never come — and the one
+name in it, `aeron.archive.recording.events.enabled`, is honoured now. It took
+its two companions with it: `…recording.events.channel` and
+`…recording.events.stream.id` were "accepted, not honoured" only because the
+switch that reads them was refused. The refusal that remains is the reference's
+own and is narrower: publishing events without naming a channel
+(`Archive.java:1240-1245`), pinned by
+`crates/archive/src/server/config.rs::events_without_a_channel_are_refused_with_the_references_words`.
 
 ★ **The catalog's file sync level left that list in P2-12**, and it left behind a
 rule worth naming here because it is the reference's own trap:
