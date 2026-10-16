@@ -74,7 +74,6 @@ use crate::server::control_session::{
     Egress, Offered, Publications, RESPONSE_NOT_CONNECTED_MSG, RESPONSE_PUBLICATION_CLOSED_MSG,
     RESPONSE_PUBLICATION_MAX_POSITION_MSG, Response, ResponseError,
 };
-use crate::server::replay_session::{PublicationFacts, ReplayPublications};
 
 /// How many times one response is offered before the turn gives up on it
 /// (`ControlResponseProxy.java:36`).
@@ -558,69 +557,6 @@ impl Publications for Client {
     }
 
     fn async_remove_publication(&mut self, registration_id: i64, timeout: Duration) {
-        let _ = Client::async_remove_publication(self, registration_id, timeout);
-    }
-}
-
-/// The same client, seen by a replay.
-///
-/// Separate from the `Publications` impl above for the reason the trait is
-/// separate: past the registration id the two have nothing in common — a
-/// control session offers an encoded `Response`, a replay offers a block of
-/// recorded frames — and a replay reads four header words the control session
-/// never asks for.
-impl ReplayPublications for Client {
-    fn is_connected(&self, registration_id: i64) -> bool {
-        self.exclusive_publication(registration_id)
-            .and_then(|publication| publication.is_connected())
-            .unwrap_or(false)
-    }
-
-    fn facts(&self, registration_id: i64) -> Option<PublicationFacts> {
-        let publication = self.exclusive_publication(registration_id)?;
-
-        Some(PublicationFacts {
-            session_id: publication.session_id(),
-            stream_id: publication.stream_id(),
-            position_bits_to_shift: publication.position_bits_to_shift(),
-            initial_term_id: publication.initial_term_id(),
-        })
-    }
-
-    fn available_window(&self, registration_id: i64) -> Option<i64> {
-        Client::available_window(self, registration_id)
-    }
-
-    fn offer_block(&mut self, registration_id: i64, block: &[u8]) -> Option<Appended> {
-        Client::offer_block_exclusive(self, registration_id, block)
-    }
-
-    fn append_padding(&mut self, registration_id: i64, length: usize) -> Option<Appended> {
-        Client::append_padding_exclusive(self, registration_id, length)
-    }
-
-    fn release_publication(&mut self, registration_id: i64, timeout: Duration) {
-        // `revokeOnClose()` then an **asynchronous** removal, which is the same
-        // command [`Publications::release_exclusive`] sends and the same one the
-        // reference sends — marked, then closed, with the driver's answer left
-        // for a later poll.
-        //
-        // It must not be `Client::revoke_publication`, which waits for the
-        // driver: the archive's conductor and the driver share a thread in
-        // `deepmsg-archiving-media-driver`, so a command that waits for the
-        // driver is a command that waits for the turn that would answer it. The
-        // stall is not merely slow — the driver's clock jumps by the wait, every
-        // network publication's receivers expire together, and the maintenance
-        // pass then writes `is_connected = 0` into a publication whose subscriber
-        // is still there. That is what killed the control session that asked for
-        // the replay's stop.
-        self.revoke_publication_on_close(registration_id);
-        let _ = Client::async_remove_publication(self, registration_id, timeout);
-    }
-
-    fn close_publication(&mut self, registration_id: i64, timeout: Duration) {
-        // A plain removal, with no revoke flag: the driver's linger is what
-        // keeps the publication alive long enough to retransmit its tail.
         let _ = Client::async_remove_publication(self, registration_id, timeout);
     }
 }

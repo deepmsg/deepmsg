@@ -3,7 +3,7 @@
 //!
 //! `ArchiveConductor.Recorder` is a `SessionWorker` of its own
 //! (`ArchiveConductor.java:2699-2744`), driven on its own turn by the
-//! conductor that owns it (`SharedModeArchiveConductor.java:56-63` — the
+//! conductor that owns it (`SharedModeArchiveConductor.java:57-66` — the
 //! recorder runs *after* the conductor's own sessions). What it holds is the
 //! recording sessions and three running totals; what it does not hold is
 //! anything the *conductor* does when a session ends, which in the reference is
@@ -169,7 +169,419 @@ pub struct Recorder {
     /// (`:1587-1626`), because its archive drives the driver; here each is a
     /// command the driver answers on a later turn, which is the loop
     /// [`CounterAllocator`] runs.
+    request: RecorderCountersRequest,
+}
+
+/// The three counters between the ask and the hand-over
+/// (`Archive.java:1587-1626`).
+///
+/// It is its own type, and not simply a field of [`Recorder`], because of *where*
+/// the ask can be made: naming the strategy and reading the answer is a client
+/// operation, and when the recorder is on a thread of its own the client is not
+/// there — a driver answers a command only on a turn, and the turn is the
+/// conductor's. So the ask stays with whoever holds the client
+/// ([`RecorderHalf::allocate`]) and only the result crosses, which is the
+/// reference's own split: its `Recorder` is constructed inside
+/// `Archive.Context.conclude` (`:1587-1626`), on the thread that owns the
+/// `Aeron`, and handed to a runner afterwards.
+#[derive(Debug)]
+pub struct RecorderCountersRequest {
     allocator: CounterAllocator<RecorderCounter>,
+}
+
+impl RecorderCountersRequest {
+    /// A request that has asked for nothing yet, for an archive with this id.
+    #[must_use]
+    pub const fn new(archive_id: i64) -> Self {
+        Self {
+            allocator: CounterAllocator::new(archive_id),
+        }
+    }
+
+    /// One turn of the ask: send what has not been sent, read what has been
+    /// answered, and give back all three the turn they are all in hand.
+    ///
+    /// A refusal is not retried — a counter the driver will not make can never
+    /// become one, and a recorder with no counters still records — which is
+    /// [`CounterAllocator`]'s own rule.
+    pub fn drive(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        timeout: std::time::Duration,
+    ) -> Option<RecorderCounters> {
+        self.allocator.drive(client, counters, timeout);
+
+        if !self.allocator.is_complete() {
+            return None;
+        }
+
+        let take = |kind| self.allocator.counter(kind).expect("all three are in hand");
+
+        Some(RecorderCounters {
+            max_write_time: take(RecorderCounter::MaxWriteTime),
+            total_write_bytes: take(RecorderCounter::TotalWriteBytes),
+            total_write_time: take(RecorderCounter::TotalWriteTime),
+        })
+    }
+}
+
+/// The recorder as the conductor holds it (P2-9a).
+///
+/// Under `SHARED` the conductor drives every session inside its own turn
+/// (`SharedModeArchiveConductor.java:57-66`) and so holds the [`Recorder`]
+/// itself. Under `DEDICATED` the recorder is an agent on a thread of its own
+/// (`DedicatedModeArchiveConductor.java:54-55`) and what the conductor holds is
+/// a **channel** to it. The conductor asks the same six questions either way —
+/// the four a request asks of the recorder, the turn, and the sessions that
+/// finished — so it asks them of this.
+///
+/// # Why a seam rather than two conductors
+///
+/// `SHARED` has to stay exactly what it was. It is the mode the reference's own
+/// C suite runs (306 criteria), so a queue placed in front of the recorder there
+/// would change the thing being accepted rather than add a second thing beside
+/// it. Everything the threaded arm does differently is therefore decided here,
+/// in one place, and the inline arm is the reference's own call sequence.
+///
+/// # What a command cannot carry
+///
+/// Two of the six hand the recorder something it cannot be told about without
+/// the *client*: [`Recorder::allocate`] sends the three `add_counter` commands
+/// that become 105/106/107, and a driver answers a command only on a turn. So
+/// allocation stays where the client is — the conductor — and what crosses to a
+/// worker is the three counters it ends up with ([`Recorder::set_counters`]).
+/// That is the reference's own split too: its recorder is constructed inside
+/// `Archive.Context.conclude` (`:1587-1626`), on the thread that owns the
+/// `Aeron`, and only afterwards handed to a runner.
+pub enum RecorderHalf {
+    /// `SHARED`: the conductor's turn drives every session.
+    Inline(Recorder),
+    /// `DEDICATED`: the recorder is on a thread of its own, and this is the
+    /// conductor's end of the two channels to it.
+    Threaded(RecorderThread),
+}
+
+impl RecorderHalf {
+    /// A recorder for an archive with this id, in the conductor's own turn.
+    #[must_use]
+    pub const fn new(archive_id: i64) -> Self {
+        Self::Inline(Recorder::new(archive_id))
+    }
+
+    /// A recorder for this archive running on `worker`'s thread, with this end
+    /// kept for the conductor.
+    #[must_use]
+    pub const fn threaded(thread: RecorderThread) -> Self {
+        Self::Threaded(thread)
+    }
+
+    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    pub fn add_session(&mut self, session: RecordingSession) {
+        match self {
+            Self::Inline(recorder) => recorder.add_session(session),
+            Self::Threaded(thread) => thread.send(RecorderCommand::Add(Box::new(session))),
+        }
+    }
+
+    /// Abort every session reading this subscription
+    /// (`ArchiveConductor.abortRecordingSessionAndCloseSubscription`, `:1766-1772`).
+    pub fn abort_sessions_for(&mut self, subscription_id: i64, reason: &str) {
+        match self {
+            Self::Inline(recorder) => recorder.abort_sessions_for(subscription_id, reason),
+            Self::Threaded(thread) => thread.send(RecorderCommand::AbortSessionsFor {
+                subscription_id,
+                reason: reason.to_owned(),
+            }),
+        }
+    }
+
+    /// Abort **one** session, by the recording it is making
+    /// (`ArchiveConductor.stopRecordingByIdentity`, `:1306-1310`).
+    pub fn abort_session(&mut self, recording_id: i64, reason: &str) {
+        match self {
+            Self::Inline(recorder) => recorder.abort_session(recording_id, reason),
+            Self::Threaded(thread) => thread.send(RecorderCommand::AbortSession {
+                recording_id,
+                reason: reason.to_owned(),
+            }),
+        }
+    }
+
+    /// Ask for the three counters and take each up when the driver answers
+    /// (`Archive.java:1587-1626`).
+    ///
+    /// The ask is made **here** whichever arm this is: it is a client operation,
+    /// and the client is the conductor's. The threaded arm sends what the three
+    /// turn out to be; see [`RecorderCountersRequest`].
+    pub fn allocate(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        timeout: std::time::Duration,
+    ) {
+        match self {
+            Self::Inline(recorder) => recorder.allocate(client, counters, timeout),
+            Self::Threaded(thread) => thread.allocate(client, counters, timeout),
+        }
+    }
+
+    /// One turn of every session (`SessionWorker.doWork` over
+    /// `RecordingSession.doWork`).
+    ///
+    /// The threaded arm does no work here and says so: its recorder is driven by
+    /// its own thread, and what the conductor owes that turn is collecting what
+    /// finished, which is [`RecorderHalf::take_finished`].
+    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
+        match self {
+            Self::Inline(recorder) => recorder.drive(counters),
+            Self::Threaded(_) => 0,
+        }
+    }
+
+    /// The sessions that finished, for the conductor to close.
+    pub fn take_finished(&mut self) -> Vec<RecordingSession> {
+        match self {
+            Self::Inline(recorder) => recorder.take_finished(),
+            Self::Threaded(thread) => thread.take_finished(),
+        }
+    }
+}
+
+/// What the conductor tells a recorder that is on a thread of its own.
+///
+/// The two `abort*` arms carry a `String` rather than a `&str` because the
+/// reason has to outlive the call: the conductor writes it and the worker reads
+/// it, on another thread, an unspecified time later.
+#[derive(Debug)]
+pub enum RecorderCommand {
+    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    ///
+    /// Boxed because a session is by far the largest thing on this channel —
+    /// every other arm is two machine words and a `String` — and the conductor's
+    /// turn would otherwise carry the biggest variant's size on every send.
+    Add(Box<RecordingSession>),
+    /// `recorder.abortSession` (`:1306-1310`), by the recording being made.
+    AbortSession {
+        /// The recording whose session is to stop.
+        recording_id: i64,
+        /// Why, in the reference's words.
+        reason: String,
+    },
+    /// `recorder.abortSessionsFor` (`:1766-1772`), by the subscription read.
+    AbortSessionsFor {
+        /// The subscription whose sessions are to stop.
+        subscription_id: i64,
+        /// Why, in the reference's words.
+        reason: String,
+    },
+    /// The three counters, once the driver has answered about all three.
+    SetCounters(RecorderCounters),
+}
+
+/// The conductor's end of a recorder that is on a thread of its own.
+///
+/// Two channels, which is the reference's shape: its `DedicatedModeArchiveConductor`
+/// holds a `ManyToOneConcurrentLinkedQueue<Session> closeQueue` for what the
+/// workers hand back (`:35`) and each worker reads its own commands off the same
+/// queue its sessions arrived on (`ArchiveConductor.java:371-378`). What is
+/// here instead is [`std::sync::mpsc`] in both directions, which ADR-0003 leaves
+/// open: it forbids an async runtime, not a channel with a lock in it, and the
+/// reference's own queue is lock-free for a throughput this loop does not have —
+/// it carries one message per recording, not one per frame.
+#[derive(Debug)]
+pub struct RecorderThread {
+    commands: std::sync::mpsc::Sender<RecorderCommand>,
+    finished: std::sync::mpsc::Receiver<RecordingSession>,
+    request: RecorderCountersRequest,
+    /// Whether the three have been handed over, so that a later turn does not
+    /// ask again — the reference allocates them once (`Archive.java:1587-1626`).
+    allocated: bool,
+}
+
+impl RecorderThread {
+    /// The two ends: what the conductor keeps, and the body to run on the
+    /// recorder's own thread.
+    ///
+    /// # Errors
+    ///
+    /// [`RecorderWorker::new`]'s, when the counter region will not open.
+    pub fn pair(
+        archive_id: i64,
+        aeron_dir: &std::path::Path,
+        idle: deepmsg_driver::idle::Strategy,
+        timeout: std::time::Duration,
+    ) -> Result<(Self, RecorderWorker), String> {
+        let (commands, from_conductor) = std::sync::mpsc::channel();
+        let (to_conductor, finished) = std::sync::mpsc::channel();
+
+        Ok((
+            Self {
+                commands,
+                finished,
+                request: RecorderCountersRequest::new(archive_id),
+                allocated: false,
+            },
+            RecorderWorker::new(
+                archive_id,
+                aeron_dir,
+                idle,
+                timeout,
+                from_conductor,
+                to_conductor,
+            )?,
+        ))
+    }
+
+    /// Tell the recorder something. A send that fails is a recorder thread that
+    /// has stopped, which is not something a control request can do anything
+    /// about: the archive is on its way down.
+    fn send(&mut self, command: RecorderCommand) {
+        let _ = self.commands.send(command);
+    }
+
+    /// The ask for the three counters, made where the client is, and handed over
+    /// the turn they are all in hand.
+    fn allocate(
+        &mut self,
+        client: &mut Client,
+        counters: &CountersReader<'_, ReadWrite>,
+        timeout: std::time::Duration,
+    ) {
+        if self.allocated {
+            return;
+        }
+
+        let Some(counters) = self.request.drive(client, counters, timeout) else {
+            return;
+        };
+
+        self.allocated = true;
+        self.send(RecorderCommand::SetCounters(counters));
+    }
+
+    /// What the recorder has finished with since the last turn.
+    fn take_finished(&mut self) -> Vec<RecordingSession> {
+        self.finished.try_iter().collect()
+    }
+}
+
+/// The body a recorder runs when it is on a thread of its own.
+///
+/// # What it owns, and what it therefore may touch
+///
+/// The [`Recorder`] — so every [`RecordingSession`], and through it every
+/// session's own image, writer and position counter (P2-9a's ③-1). It does
+/// **not** own the client, and must not: the reference's rule is that one
+/// `Aeron` has one thread driving it (`ArchiveConductor.doWork` calls
+/// `invokeAeronInvoker`, `:380`, and a worker's `doWork` does not). What it
+/// needs from the region instead it opens for itself — a second mapping of the
+/// same files, which is what the reference's `CountersReader` makes from
+/// `aeronDir` in each agent's constructor.
+#[derive(Debug)]
+pub struct RecorderWorker {
+    recorder: Recorder,
+    cnc: deepmsg_cnc::CncFile,
+    idle: deepmsg_driver::idle::Strategy,
+    /// What the conductor has told it, until the conductor is gone.
+    commands: std::sync::mpsc::Receiver<RecorderCommand>,
+    /// What it has finished with, back to the conductor.
+    finished: std::sync::mpsc::Sender<RecordingSession>,
+}
+
+impl RecorderWorker {
+    /// A worker with a recorder of its own, over a counter region it opens
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// The message from [`deepmsg_cnc::CncFile::open_writable`] when the region
+    /// will not open — the same reason the conductor cannot run without one.
+    pub fn new(
+        archive_id: i64,
+        aeron_dir: &std::path::Path,
+        idle: deepmsg_driver::idle::Strategy,
+        timeout: std::time::Duration,
+        commands: std::sync::mpsc::Receiver<RecorderCommand>,
+        finished: std::sync::mpsc::Sender<RecordingSession>,
+    ) -> Result<Self, String> {
+        let cnc = deepmsg_cnc::CncFile::open_writable(aeron_dir, timeout)
+            .map_err(|error| format!("the recorder could not open the counter region: {error}"))?;
+
+        Ok(Self {
+            recorder: Recorder::new(archive_id),
+            cnc,
+            idle,
+            commands,
+            finished,
+        })
+    }
+
+    /// The recorder's own loop: what the conductor said, then a turn of every
+    /// session, then what finished back to the conductor.
+    ///
+    /// It ends when the conductor's end of the command channel is **gone** —
+    /// when the archive's conductor has been dropped, which is the archive
+    /// stopping. That is the whole of the stop condition: a flag would be a
+    /// second thing to keep in step with the first, and the reference's workers
+    /// stop the same way (`AgentRunner.run` ends when `isRunning` is cleared by
+    /// the runner's close, which the conductor does on its way down,
+    /// `DedicatedModeArchiveConductor.closeSessionWorkers:70-71`).
+    pub fn run(mut self) {
+        loop {
+            let mut work = 0;
+
+            loop {
+                match self.commands.try_recv() {
+                    Ok(RecorderCommand::Add(session)) => {
+                        self.recorder.add_session(*session);
+                        work += 1;
+                    }
+                    Ok(RecorderCommand::AbortSession {
+                        recording_id,
+                        reason,
+                    }) => {
+                        self.recorder.abort_session(recording_id, &reason);
+                        work += 1;
+                    }
+                    Ok(RecorderCommand::AbortSessionsFor {
+                        subscription_id,
+                        reason,
+                    }) => {
+                        self.recorder.abort_sessions_for(subscription_id, &reason);
+                        work += 1;
+                    }
+                    Ok(RecorderCommand::SetCounters(counters)) => {
+                        self.recorder.set_counters(counters);
+                        work += 1;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+
+            // Read-only or not-yet-published CnC is not a reason to stop: the
+            // region is opened when this thread starts and the conductor may
+            // still be the one publishing it. What the sessions need is the
+            // three write counters, which arrive as a command.
+            let Some(counters) = self.cnc.counters_writable() else {
+                self.idle.idle(work);
+                continue;
+            };
+
+            work += self.recorder.drive(&counters);
+
+            for session in self.recorder.take_finished() {
+                // The conductor is gone: nothing will close this session, and
+                // there is no one left to tell.
+                if self.finished.send(session).is_err() {
+                    return;
+                }
+            }
+
+            self.idle.idle(work);
+        }
+    }
 }
 
 impl Recorder {
@@ -189,7 +601,7 @@ impl Recorder {
                 max_write_time_ns: 0,
             },
             counters: None,
-            allocator: CounterAllocator::new(archive_id),
+            request: RecorderCountersRequest::new(archive_id),
         }
     }
 
@@ -216,19 +628,7 @@ impl Recorder {
             return;
         }
 
-        self.allocator.drive(client, counters, timeout);
-
-        if !self.allocator.is_complete() {
-            return;
-        }
-
-        let take = |kind| self.allocator.counter(kind).expect("all three are in hand");
-
-        self.counters = Some(RecorderCounters {
-            max_write_time: take(RecorderCounter::MaxWriteTime),
-            total_write_bytes: take(RecorderCounter::TotalWriteBytes),
-            total_write_time: take(RecorderCounter::TotalWriteTime),
-        });
+        self.counters = self.request.drive(client, counters, timeout);
     }
 
     /// `recorder.addSession` (`ArchiveConductor.java:2055`).
@@ -298,16 +698,17 @@ impl Recorder {
     /// The sessions are driven first and removed afterwards, which is the
     /// worker's own order (`SessionWorker.java:56-81`) — and the reason a
     /// session that finished this turn still gets its turn.
-    pub fn drive(
-        &mut self,
-        client: &mut Client,
-        counters: &CountersReader<'_, ReadWrite>,
-    ) -> usize {
+    ///
+    /// **No client** (P2-9a): a session holds its own image and takes its
+    /// answers from it, so this is the same call the reference's recorder makes
+    /// — `SessionWorker.doWork`, with nothing of the `Aeron` client in it —
+    /// which is what lets this run on a thread of its own.
+    pub fn drive(&mut self, counters: &CountersReader<'_, ReadWrite>) -> usize {
         let mut work = 0;
         let totals = &mut self.totals;
 
         for session in &mut self.sessions {
-            work += session.do_work(client, counters, totals);
+            work += session.do_work(counters, totals);
         }
 
         let mut index = 0;
@@ -517,8 +918,7 @@ mod tests {
             recording_id * 1024,
             128 * 1024,
             subscription_id,
-            11,
-            64 * 1024,
+            Box::new(crate::server::recording_session::FakeImage::new()),
             1024 * 1024,
             0,
             false,

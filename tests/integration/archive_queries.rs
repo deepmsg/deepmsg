@@ -112,9 +112,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// `spies.simulate.connection` is what makes a **spy** reader count as a
 /// subscriber, which is the shape `ArchiveConductor.java:562-565` creates; the C
 /// harness sets it for the same reason (`TestArchive.h:53`).
-const PROPERTIES: [&str; 3] = [
+const PROPERTIES: [&str; 4] = [
     archive::PROPERTIES[0],
     archive::PROPERTIES[1],
+    archive::PROPERTIES[2],
     "-Daeron.spies.simulate.connection=true",
 ];
 

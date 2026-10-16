@@ -153,13 +153,11 @@ use crate::server::delete_segments::{
     DeleteSegmentsSession, Progress as DeleteProgress, find_detached_segments, list_segment_files,
     min_segment_position,
 };
-use crate::server::recorder::Recorder;
+use crate::server::recorder::RecorderHalf;
 use crate::server::recording_pos::RecordingPos;
-use crate::server::recording_session::RecordingSession;
-use crate::server::replay_session::{
-    Progress as ReplayProgress, Published, ReplayPublications, ReplaySession,
-};
-use crate::server::replayer::Replayer;
+use crate::server::recording_session::{RecordingImage, RecordingSession};
+use crate::server::replay_session::{ReplaySession, close_publication, revoke_publication};
+use crate::server::replayer::{LimitUpdate, ReplayNotice, Replayer, ReplayerHalf, RunningReplay};
 use crate::server::replication_session::{
     ReplicationNotice, ReplicationProgress, ReplicationSession,
 };
@@ -1386,8 +1384,15 @@ struct PendingRecording {
     image_session_id: i32,
     segment_file_length: usize,
     subscription_id: i64,
-    image_id: i64,
-    term_buffer_length: i32,
+    /// The image the session will read, **taken out of the client** when the
+    /// driver announced it (`Client::take_image`) and held here until the
+    /// position counter has been claimed and the session can be built.
+    ///
+    /// It is taken early because the announcement is where it exists: the
+    /// `Available` event is drained in the same turn as the poll that produced
+    /// it, and the session that reads it is made once the counter the driver
+    /// answers with is in hand — a turn or more later.
+    image: Box<dyn RecordingImage>,
     is_auto_stop: bool,
     position: RecordingPos,
 }
@@ -1926,7 +1931,17 @@ pub struct Sessions {
     num_active_replays: usize,
     /// `replaySessionByIdMap` (`:146`): the replays in flight, by the id the
     /// client's OK carried.
-    replay_sessions: HashMap<i64, ReplayEntry>,
+    ///
+    /// ★ **The handles, not the sessions** (P2-9a). In the reference this map
+    /// holds the session objects and the conductor reads their fields directly,
+    /// because Java hands out references; here a session lives with whatever
+    /// drives it — the conductor under `SHARED`, a thread of its own under
+    /// `DEDICATED` — and what the conductor needs to answer its own questions
+    /// travels back as a notice. See [`ReplayHandle`].
+    replay_sessions: HashMap<i64, ReplayHandle>,
+    /// ★ The replayer, wherever it is (P2-9a): the conductor's own object under
+    /// `SHARED`, a channel to a thread under `DEDICATED`. See [`ReplayerHalf`].
+    replayer_half: ReplayerHalf,
     /// `deleteSegmentsSessionByIdMap` (`:147`): the deletes in flight, by the
     /// recording they are removing.
     ///
@@ -2065,21 +2080,6 @@ fn erase_remaining_segment(
         segment_length,
     )
     .map_err(|error| error.to_string())
-}
-
-/// What a turn reads about a replay's limit, per replay in flight.
-///
-/// The two arms are `ReplaySession.notExtended`'s (`ReplaySession.java:561-577`),
-/// and the difference between them is the whole of how a bounded replay ends:
-/// [`LimitUpdate::ExtendTo`] moves the stop position forward and nothing else,
-/// and [`LimitUpdate::Gone`] clamps what the replay may still send to where it
-/// has already got to — which is what takes it to `INACTIVE`.
-enum LimitUpdate {
-    /// The counter, or the live recording, says this.
-    ExtendTo(i64),
-    /// There is nothing left to read: the counter was closed, or its slot has
-    /// been taken by another counter.
-    Gone,
 }
 
 /// `new Counter(aeron.countersReader(), limitCounterId)`
@@ -2358,14 +2358,27 @@ fn random_i64() -> i64 {
 /// under what correlation id — because a replay's OK and its errors are sent to
 /// the client that asked, several turns after it asked, and the session knows
 /// nothing about the control plane.
-struct ReplayEntry {
+struct ReplayHandle {
     /// The control session that asked for it.
     control_session_id: i64,
     /// The request being answered.
     correlation_id: i64,
     /// The publication the frames go out on, which the conductor gives back when
-    /// the replay ends.
+    /// the replay ends — **by id**, which is why this is here and the publication
+    /// is not.
+    ///
+    /// ★ The publication itself was handed over by
+    /// [`Client::take_exclusive_publication`] and lives with the session (P2-9a).
+    /// It used to stay in the client and be reached by this id every turn through
+    /// a wrapper, which is the same thing only while the session and the client
+    /// are on one thread. Giving it back stays here because `revoke` and `close`
+    /// are client commands addressed by id with no object in them — the one place
+    /// this is simpler than the image side, where the subscription has to be told
+    /// what it gave away.
     registration_id: i64,
+    /// `ReplaySession.recordingId()`, which `abortReplaysOf` is asked by and
+    /// which two segment requests are answered from.
+    recording_id: i64,
     /// Whether the OK has gone out.
     ///
     /// It goes out **once**, on the turn the segment opens and its header checks
@@ -2380,15 +2393,15 @@ struct ReplayEntry {
     /// Where the recording began, which the live-position fallback needs and a
     /// session does not keep.
     start_position: i64,
-    /// The replay itself.
-    session: ReplaySession,
-}
-
-impl ReplayEntry {
-    /// The id the client's OK carried, which is the map's key too.
-    fn session_id(&self) -> i64 {
-        self.session.replay_session_id()
-    }
+    /// **Where the replay has read up to**, as of its last turn.
+    ///
+    /// ★ The session's own number, mirrored here because two of the six segment
+    /// requests answer from it (`isValidDetach`, `:2322-2332`) and the session is
+    /// not always on this thread. It arrives on every turn the replay did
+    /// anything (`ReplayNotice::Worked`) and a stale one is the **safe**
+    /// direction: the position only moves forward, and the question it answers is
+    /// whether a segment may be given away.
+    replay_position: i64,
 }
 
 /// `ArchiveConductor.SessionForReplay` (`:2793-2805`): what a replay token
@@ -2423,6 +2436,7 @@ impl Sessions {
         replay: ReplaySettings,
         replication: ReplicationSettings,
         subscription_ids: Vec<i64>,
+        replayer_half: ReplayerHalf,
     ) -> Self {
         Self {
             archive_id,
@@ -2458,6 +2472,7 @@ impl Sessions {
             next_replay_id: 1,
             num_active_replays: 0,
             replay_sessions: HashMap::new(),
+            replayer_half,
             delete_sessions: Vec::new(),
             creating_replays: Vec::new(),
             replayer: Replayer::new(archive_id),
@@ -2517,7 +2532,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
         catalog: &mut Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         self.allocate_session_counter(client, counters);
@@ -2637,26 +2652,33 @@ impl Sessions {
                 continue;
             };
 
+            // ★ The image **leaves the client here** (P2-9a): the session that
+            // reads it is made a turn or more later, once the position counter
+            // the driver answers with is in hand, and it reads on a thread the
+            // client is not on. The reference moves the same object the same
+            // way — its `AvailableImageHandler` hands the session its `Image`
+            // (`ArchiveConductor.java:562`, `:1991`) — and the difference is
+            // only that Rust has one owner to move.
+            //
+            // Everything the row needs is read off it first, because after the
+            // hand-over the subscription no longer has it and only the session
+            // that gets it can be asked.
+            let Some(image) =
+                client.take_image(subscription_registration_id, publication_registration_id)
+            else {
+                continue;
+            };
+
             // The image itself, for the five things only it knows: the catalog
             // row keeps every one of them (`:1999-2019`).
-            // Everything the image says about itself, read out **before**
-            // anything below needs the client mutably: an image is borrowed
-            // from the client it came out of, and the decisions this method
-            // makes are about to call it.
-            let facts = match client
-                .subscription(subscription_registration_id)
-                .and_then(|subscription| subscription.image(publication_registration_id))
-            {
-                Some(image) => ImageFacts {
-                    session_id: image.session_id(),
-                    stream_id: image.stream_id(),
-                    join_position: image.join_position(),
-                    initial_term_id: image.initial_term_id(),
-                    term_buffer_length: image.term_buffer_length(),
-                    mtu_length: image.mtu_length().unwrap_or(0),
-                    source_identity: image.source_identity().to_owned(),
-                },
-                None => continue,
+            let facts = ImageFacts {
+                session_id: image.session_id(),
+                stream_id: image.stream_id(),
+                join_position: image.join_position(),
+                initial_term_id: image.initial_term_id(),
+                term_buffer_length: image.term_buffer_length(),
+                mtu_length: image.mtu_length().unwrap_or(0),
+                source_identity: image.source_identity().to_owned(),
             };
 
             let start_position = facts.join_position;
@@ -2756,8 +2778,7 @@ impl Sessions {
                     request: subscription.request,
                     image_session_id: facts.session_id,
                     subscription_id: subscription_registration_id,
-                    image_id: publication_registration_id,
-                    term_buffer_length,
+                    image: Box::new(image),
                     is_auto_stop: subscription.is_auto_stop,
                     position,
                 }),
@@ -2788,7 +2809,7 @@ impl Sessions {
         client: &mut Client,
         catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         let mut index = 0;
@@ -2835,8 +2856,7 @@ impl Sessions {
             request,
             image_session_id,
             subscription_id,
-            image_id,
-            term_buffer_length,
+            image,
             is_auto_stop,
             position,
         } = pending;
@@ -2860,8 +2880,7 @@ impl Sessions {
             start_position,
             segment_file_length,
             subscription_id,
-            image_id,
-            term_buffer_length,
+            image,
             self.recording.file_io_max_length,
             self.recording.file_sync_level,
             is_auto_stop,
@@ -2947,7 +2966,7 @@ impl Sessions {
         client: &mut Client,
         catalog: &mut Catalog,
         counters: &CountersReader<'_, ReadWrite>,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         mut session: RecordingSession,
         now_ms: i64,
     ) {
@@ -3031,7 +3050,7 @@ impl Sessions {
     fn close_and_remove_recording_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         subscription_id: i64,
         reason: &str,
     ) {
@@ -3389,9 +3408,7 @@ impl Sessions {
     /// one unconditionally and lets the abort be asynchronous, so a client that
     /// stops a replay twice is told OK twice.
     fn stop_replay(&mut self, replay_session_id: i64, session_id: i64, correlation_id: i64) {
-        if let Some(entry) = self.replay_sessions.get_mut(&replay_session_id) {
-            entry.session.abort();
-        }
+        self.replayer_half.abort(replay_session_id);
 
         self.pending.push(Deferred::Ok {
             session_id,
@@ -3417,11 +3434,7 @@ impl Sessions {
     /// reference aborts them without answering anybody
     /// (`ArchiveConductor.java:1240`).
     fn abort_replays_of(&mut self, recording_id: i64) {
-        for entry in self.replay_sessions.values_mut() {
-            if recording_id == NULL_VALUE || entry.session.recording_id() == recording_id {
-                entry.session.abort();
-            }
-        }
+        self.replayer_half.abort_recording(recording_id);
     }
 
     /// One of the six segment requests (`ArchiveConductor.java:1199-1660`).
@@ -4128,7 +4141,7 @@ impl Sessions {
         if self
             .replay_sessions
             .values()
-            .any(|entry| entry.session.recording_id() == recording_id)
+            .any(|entry| entry.recording_id == recording_id)
         {
             return Some((
                 ACTIVE_RECORDING,
@@ -4218,11 +4231,11 @@ impl Sessions {
         let replay_base = self
             .replay_sessions
             .values()
-            .filter(|entry| entry.session.recording_id() == recording_id)
+            .filter(|entry| entry.recording_id == recording_id)
             .map(|entry| {
                 segment_file_base_position(
                     start_position,
-                    entry.session.replay_position(),
+                    entry.replay_position,
                     term_length,
                     segment_length,
                 )
@@ -4362,7 +4375,7 @@ impl Sessions {
         let busy: Vec<i64> = self
             .replay_sessions
             .values()
-            .map(|entry| entry.session.recording_id())
+            .map(|entry| entry.recording_id)
             .collect();
 
         let mut finished: Vec<i64> = Vec::new();
@@ -4532,7 +4545,7 @@ impl Sessions {
                     let control_session_id = replay.control_session_id;
 
                     match self.open_replay(client, catalog, &replay, registration_id, now_ms) {
-                        Some(entry) => {
+                        Some((handle, running)) => {
                             // **After** the handover succeeds, not before it:
                             // see [`CreateReplayPublicationSession::hand_over`]
                             // for what clearing it any earlier strands.
@@ -4541,7 +4554,12 @@ impl Sessions {
                             // `ctx.replaySessionCounter().incrementRelease()`
                             // (`:993`).
                             self.replayer.session_opened(counters);
-                            self.replay_sessions.insert(entry.session_id(), entry);
+                            self.replay_sessions
+                                .insert(running.replay_session_id, handle);
+                            // ★ And the session goes wherever the replayer is:
+                            // the conductor's own turn under `SHARED`, a thread
+                            // of its own under `DEDICATED`.
+                            self.replayer_half.add(running);
                         }
                         None => {
                             // The recording went away between the check and the
@@ -4584,10 +4602,18 @@ impl Sessions {
         replay: &Replay,
         registration_id: i64,
         now_ms: i64,
-    ) -> Option<ReplayEntry> {
+    ) -> Option<(ReplayHandle, RunningReplay)> {
         let recording = catalog.recording(replay.recording_id).ok()?;
-        let facts = ReplayPublications::facts(client, registration_id)?;
-        let replay_session_id = self.mint_replay_session_id(facts.session_id);
+
+        // ★ **The publication is taken out of the client here** (P2-9a), which
+        // is the one moment it can be: the session is about to own it, and from
+        // then on it is asked for nothing by registration id — a replay's ids
+        // are settled when it is created (`Published`'s own note, which is why
+        // the four facts used to be read once too). The conductor keeps the id
+        // beside the session, because giving the publication back **is** a
+        // client command and the client is the conductor's.
+        let publication = client.take_exclusive_publication(registration_id)?;
+        let replay_session_id = self.mint_replay_session_id(publication.session_id());
 
         // `ArchiveConductor.newReplaySession` (`:956-966`): the request's block
         // size when it named one **and it is smaller than the archive's**, and
@@ -4639,15 +4665,24 @@ impl Sessions {
         )
         .ok()?;
 
-        Some(ReplayEntry {
-            control_session_id: replay.control_session_id,
-            correlation_id: replay.correlation_id,
-            registration_id,
-            limit: replay.limit,
-            start_position: replay.start_position,
-            started: false,
-            session,
-        })
+        Some((
+            ReplayHandle {
+                control_session_id: replay.control_session_id,
+                correlation_id: replay.correlation_id,
+                registration_id,
+                recording_id: replay.recording_id,
+                limit: replay.limit,
+                start_position: replay.start_position,
+                started: false,
+                replay_position: replay.replay_position,
+            },
+            RunningReplay {
+                replay_session_id,
+                recording_id: replay.recording_id,
+                publication: Box::new(publication),
+                session,
+            },
+        ))
     }
 
     /// One turn of every replay in flight.
@@ -4659,21 +4694,25 @@ impl Sessions {
     ) {
         let now_ns = u64::try_from(now_ms.saturating_mul(1_000_000)).unwrap_or(u64::MAX);
         let mut owed: Vec<Deferred> = Vec::new();
-        let mut finished: Vec<i64> = Vec::new();
         // `Replayer.doWork`'s `workCount` (`ArchiveConductor.java:2779-2790`):
         // what decides whether the three read statistics are published this
         // turn. A session that did something and a session that was closed both
         // count, which is what the reference's `SessionWorker` counts too.
         let mut work = 0;
 
-        // `notExtended` (`ReplaySession.java:544-578`), read out before the
-        // sessions are walked because it is the conductor that can see a
-        // recording's position and a session cannot.
+        // `notExtended` (`ReplaySession.java:544-578`), read out before anything
+        // is driven because it is the **conductor** that can see a recording's
+        // position and a session cannot: the number is either a counter in the
+        // driver's region or the conductor's own `recordingSessionByIdMap`.
+        //
+        // ★ Under `DEDICATED` this is also the whole of what crosses to the
+        // replayer's thread besides the sessions themselves — one update per
+        // live replay, and never one for a recording that has not moved.
         let limits: Vec<(i64, LimitUpdate)> = self
             .replay_sessions
             .iter()
-            .filter_map(|(replay_session_id, entry)| {
-                let update = match entry.limit {
+            .filter_map(|(replay_session_id, handle)| {
+                let update = match handle.limit {
                     Some(limit) => match read_limit_counter(counters, limit) {
                         Some(position) => LimitUpdate::ExtendTo(position),
                         // Closed, or its slot taken by another counter — this
@@ -4683,8 +4722,8 @@ impl Sessions {
                     },
                     None => LimitUpdate::ExtendTo(self.live_recording_position(
                         counters,
-                        entry.session.recording_id(),
-                        entry.start_position,
+                        handle.recording_id,
+                        handle.start_position,
                     )?),
                 };
 
@@ -4692,96 +4731,95 @@ impl Sessions {
             })
             .collect();
 
-        for (replay_session_id, entry) in &mut self.replay_sessions {
-            if let Some((_, update)) = limits.iter().find(|(id, _)| id == replay_session_id) {
-                match update {
-                    LimitUpdate::ExtendTo(position) => {
-                        entry.session.extend_stop_position(*position)
-                    }
-                    LimitUpdate::Gone => entry.session.limit_counter_gone(),
-                }
-            }
+        for (replay_session_id, update) in &limits {
+            self.replayer_half.extend(*replay_session_id, *update);
+        }
 
-            let Some(mut published) = Published::new(client, entry.registration_id) else {
-                // The publication is gone; there is nowhere to write.
-                finished.push(*replay_session_id);
-                continue;
-            };
+        let notices = self.replayer_half.drive(counters, now_ns);
 
-            let progress = entry.session.do_work(&mut published, now_ns);
+        for notice in notices {
+            match notice {
+                ReplayNotice::Started {
+                    replay_session_id,
+                    replay_position,
+                } => {
+                    let Some(handle) = self.replay_sessions.get_mut(&replay_session_id) else {
+                        continue;
+                    };
 
-            // `replayer.bytesRead(bytesRead)` and `replayer.readTimeNs(…)`
-            // (`:431-434`), which the reference does inside the session because
-            // the session holds the replayer. Here the session has worked the
-            // two numbers out for this turn and the replayer is the
-            // conductor's, so they are handed over.
-            self.replayer.read(
-                u64::try_from(entry.session.read_bytes()).unwrap_or(u64::MAX),
-                entry.session.read_time_ns(),
-            );
+                    handle.replay_position = replay_position;
+                    work += 1;
 
-            if !matches!(progress, ReplayProgress::Idle) {
-                work += 1;
-            }
-
-            match progress {
-                ReplayProgress::Started => {
-                    if !entry.started {
-                        entry.started = true;
+                    if !handle.started {
+                        handle.started = true;
 
                         // The OK carries the `replaySessionId`
                         // (`ReplaySession.java:338`), which is what a later
                         // `stopReplay` names.
                         owed.push(Deferred::Ok {
-                            session_id: entry.control_session_id,
-                            correlation_id: entry.correlation_id,
-                            relevant_id: *replay_session_id,
+                            session_id: handle.control_session_id,
+                            correlation_id: handle.correlation_id,
+                            relevant_id: replay_session_id,
                         });
                     }
                 }
-                ReplayProgress::Finished => finished.push(*replay_session_id),
-                ReplayProgress::Failed { code, message } => {
-                    owed.push(Deferred::Error {
-                        session_id: entry.control_session_id,
-                        correlation_id: entry.correlation_id,
-                        relevant_id: i64::from(code),
-                        message,
-                    });
-                    finished.push(*replay_session_id);
+                ReplayNotice::Worked {
+                    replay_session_id,
+                    replay_position,
+                } => {
+                    if let Some(handle) = self.replay_sessions.get_mut(&replay_session_id) {
+                        handle.replay_position = replay_position;
+                    }
+
+                    work += 1;
                 }
-                ReplayProgress::Idle | ReplayProgress::Worked => {}
-            }
-        }
+                ReplayNotice::Ended {
+                    replay_session_id,
+                    revoke,
+                    error,
+                } => {
+                    let Some(handle) = self.replay_sessions.remove(&replay_session_id) else {
+                        continue;
+                    };
 
-        for replay_session_id in finished {
-            let Some(entry) = self.replay_sessions.remove(&replay_session_id) else {
-                continue;
-            };
+                    // A replay that ran to its end is **closed**, so the driver's
+                    // linger can retransmit its tail; one that failed or was
+                    // cancelled is **revoked** (`ReplaySession.java:175-194`).
+                    // The pair lives in [`revoke_publication`]/
+                    // [`close_publication`], which is where their reasoning is.
+                    if revoke {
+                        revoke_publication(client, handle.registration_id);
+                    } else {
+                        close_publication(client, handle.registration_id);
+                    }
 
-            // A replay that ran to its end is **closed**, so the driver's linger
-            // can retransmit its tail; one that failed or was cancelled is
-            // **revoked** (`ReplaySession.java:175-194`).
-            //
-            // Through [`Published`], which is where that pair lives and where
-            // its test is: the session's own `close`/`revoke` cannot be the
-            // caller, because the client a teardown needs is the conductor's.
-            // A publication the client no longer holds is one the driver has
-            // already taken back, so there is nothing to give it.
-            if let Some(mut published) = Published::new(client, entry.registration_id) {
-                if entry.session.is_revoking() {
-                    published.revoke();
-                } else {
-                    published.close();
+                    // `closeReplaySession`'s
+                    // `ctx.replaySessionCounter().decrementRelease()`
+                    // (`:1382`), which is what makes 112 the count of replays
+                    // that are **open** rather than the count that have ever run.
+                    self.replayer.session_closed(counters);
+                    work += 1;
+
+                    if let Some((code, message)) = error {
+                        owed.push(Deferred::Error {
+                            session_id: handle.control_session_id,
+                            correlation_id: handle.correlation_id,
+                            relevant_id: i64::from(code),
+                            message,
+                        });
+                    }
+
+                    self.on_replay_end();
+                }
+                ReplayNotice::Read { bytes, time_ns } => {
+                    // `replayer.bytesRead(bytesRead)` and `replayer.readTimeNs(…)`
+                    // (`:431-434`), which the reference does inside the session
+                    // because the session holds the replayer. Here the session
+                    // works the two numbers out for its turn and the replayer is
+                    // the conductor's, so they are handed over.
+                    self.replayer.read(bytes, time_ns);
                 }
             }
-
-            // `closeReplaySession`'s `ctx.replaySessionCounter().decrementRelease()`
-            // (`:1382`), which is what makes 112 the count of replays that are
-            // **open** rather than the count that have ever run.
-            self.replayer.session_closed(counters);
-            work += 1;
-
-            self.on_replay_end();
         }
 
         // `Replayer.doWork`'s tail (`:2779-2790`): the three statistics go out
@@ -5136,7 +5174,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         catalog: &mut Catalog,
         action: Action,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         match action {
@@ -5503,7 +5541,7 @@ impl Sessions {
     fn stop_recording_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         subscription_id: i64,
@@ -5565,7 +5603,7 @@ impl Sessions {
     fn stop_recording(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         stream_id: i32,
@@ -5969,7 +6007,7 @@ impl Sessions {
         &mut self,
         client: &mut Client,
         catalog: &Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         session_id: i64,
         correlation_id: i64,
         recording_id: i64,
@@ -6062,7 +6100,7 @@ impl Sessions {
     fn abort_recording_session_and_close_subscription(
         &mut self,
         client: &mut Client,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         subscription_id: i64,
     ) {
         recorder.abort_sessions_for(subscription_id, "stop recording");
@@ -6573,7 +6611,7 @@ impl Sessions {
         counters: &CountersReader<'_, ReadWrite>,
         authenticator: &mut dyn Authenticator,
         catalog: &mut Catalog,
-        recorder: &mut Recorder,
+        recorder: &mut RecorderHalf,
         now_ms: i64,
     ) {
         for intent in std::mem::take(&mut self.pending) {
@@ -7348,12 +7386,12 @@ pub struct ArchiveConductor {
     ///
     /// Held here rather than by the sessions because that is where the reference
     /// holds it: its conductor owns the recorder and drives it on its own turn,
-    /// **after** its own sessions (`SharedModeArchiveConductor.java:56-63`). The
+    /// **after** its own sessions (`SharedModeArchiveConductor.java:57-66`). The
     /// cost of the split is one parameter: two of the things a control session
     /// can ask for are things the recorder has to be told about
     /// (`:1766-1772`, `:1356-1359`), so [`Sessions::drive`] is lent it for the
     /// length of a turn.
-    recorder: Recorder,
+    recorder: RecorderHalf,
     command_timeout: Duration,
 }
 
@@ -7368,6 +7406,13 @@ impl ArchiveConductor {
     /// `error_counter_id` is the driver's `ERRORS` counter
     /// (`ArchivingMediaDriver.java:87-89`), which the archive writes its
     /// errors into rather than keeping one of its own.
+    ///
+    /// `recorder` is likewise the launcher's to choose, and for a reason of its
+    /// own: whether the recorder is this conductor's object or a thread of its
+    /// own is `aeron.archive.threading.mode`, which the launcher reads to decide
+    /// what to start — so it is handed the one it decided on
+    /// ([`RecorderHalf`]) rather than making one here and finding out
+    /// afterwards.
     #[allow(clippy::too_many_arguments)] // one per thing the archive was built with
     pub fn new(
         config: &ArchiveConfig,
@@ -7378,6 +7423,8 @@ impl ArchiveConductor {
         duty_cycle_requests: DutyCycleRequests,
         remote_subscription_id: Option<i64>,
         local_subscription_id: i64,
+        recorder: RecorderHalf,
+        replayer: ReplayerHalf,
     ) -> Result<Self, AuthError> {
         let authenticator = authenticator(&config.authenticator_supplier)?;
         let authorisation = authorisation_service(&config.authorisation_service_supplier)?;
@@ -7421,6 +7468,7 @@ impl ArchiveConductor {
                 client_context: replication_client_context(config),
             },
             subscription_ids,
+            replayer,
         );
 
         Ok(Self {
@@ -7439,7 +7487,7 @@ impl ArchiveConductor {
             duty_cycles: None,
             cnc,
             catalog,
-            recorder: Recorder::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
+            recorder,
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -7549,7 +7597,7 @@ impl ArchiveConductor {
         );
 
         // The recorder gets its own turn, and it is the turn **after** the
-        // sessions (`SharedModeArchiveConductor.java:56-63`). What a session
+        // sessions (`SharedModeArchiveConductor.java:57-66`). What a session
         // that ended this turn owes is collected here, where the catalog and
         // the control sessions are.
         //
@@ -7560,7 +7608,7 @@ impl ArchiveConductor {
         // steps every counter here takes.
         recorder.allocate(client, &counters, *command_timeout);
 
-        work += recorder.drive(client, &counters);
+        work += recorder.drive(&counters);
 
         for session in recorder.take_finished() {
             sessions.close_recording_session(client, catalog, &counters, recorder, session, now_ms);
@@ -9286,6 +9334,7 @@ mod tests {
                 client_context: ArchiveContext::new(),
             },
             Vec::new(),
+            ReplayerHalf::new(),
         )
     }
 
@@ -9817,5 +9866,23 @@ mod tests {
         assert_eq!(Some(2), sessions.replay_session_by_token(new, 7, 100));
 
         assert_eq!(0, sessions.check_replay_tokens(100), "and nothing else is");
+    }
+
+    /// ★ Under `DEDICATED` the conductor is an agent on a thread of its own
+    /// (`AgentRunner.startOnThread`, `Archive.java:262`), so everything it holds
+    /// has to be movable there. This is that claim, made where the compiler can
+    /// check it rather than where a thread would fail to start.
+    ///
+    /// It is not free: the two collaborator traits are `dyn` objects, and a
+    /// `Box<dyn Authenticator>` that is not `Send` is exactly what would make
+    /// this fail — which is why
+    /// [`crate::server::auth::Authenticator`] and its sibling carry `Send` as a
+    /// supertrait.
+    #[test]
+    fn the_conductor_can_be_moved_to_a_thread_of_its_own() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<ArchiveConductor>();
+        assert_send::<Sessions>();
     }
 }

@@ -1056,6 +1056,71 @@ impl Client {
             .find(|subscription| subscription.registration_id() == registration_id)
     }
 
+    /// Hand an image over to a reader of its own, out of the subscription that
+    /// was announced it.
+    ///
+    /// # Why a client hands an image away at all
+    ///
+    /// An [`Image`] owns its log buffer and can be read by any thread, so an
+    /// application that reads one on a thread of its own — which is what the
+    /// archive does for a recording, and what the reference does with every
+    /// image — cannot keep it inside a client that another thread polls. The
+    /// reference does not have to make this move because its `Image` is an
+    /// object many things reference at once; in Rust the image has one owner,
+    /// so the owner has to be the reader.
+    ///
+    /// What the client keeps is [`HandedOut`](crate::subscription::HandedOut):
+    /// enough to answer `ON_UNAVAILABLE_IMAGE` by flipping
+    /// [`Image::is_closed`] on the image it gave away
+    /// ([`Subscription::close_handed_out`](crate::subscription::Subscription::close_handed_out)),
+    /// which is the only notice a holder that polls no client can get.
+    ///
+    /// `None` when the subscription holds no such image — an id that was never
+    /// here, one already handed over, or one the driver has withdrawn.
+    pub fn take_image(
+        &mut self,
+        subscription_registration_id: i64,
+        publication_registration_id: i64,
+    ) -> Option<Image> {
+        self.subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.registration_id() == subscription_registration_id)?
+            .take_image(publication_registration_id)
+    }
+
+    /// Hand an exclusive publication over to a writer of its own, out of this
+    /// client.
+    ///
+    /// The counterpart of [`Client::take_image`], for the same reason: an
+    /// [`ExclusivePublication`] carries its own mapped log, so an archive that
+    /// publishes a replay on a thread of its own cannot keep it inside a client
+    /// another thread polls. The reference has no such move to make, because its
+    /// `ExclusivePublication` is an object many things reference at once.
+    ///
+    /// **It is simpler than [`Client::take_image`] in the one place that one is
+    /// delicate.** An image is taken out of a *subscription* the driver can still
+    /// speak about — `ON_UNAVAILABLE_IMAGE` announces its withdrawal — so the
+    /// subscription has to keep a record of what it gave away to pass that on
+    /// ([`Subscription::close_handed_out`](crate::subscription::Subscription::close_handed_out)).
+    /// A replay publication is the archive's own: nothing but the archive ever
+    /// tears it down, and it does that **by registration id** through
+    /// `revoke_publication_on_close`/`async_remove_publication`, which need no
+    /// object at all. So there is nothing to remember.
+    ///
+    /// `None` when this client holds no such publication — an id that was never
+    /// here, or one already handed over.
+    pub fn take_exclusive_publication(
+        &mut self,
+        registration_id: i64,
+    ) -> Option<ExclusivePublication> {
+        let index = self
+            .exclusive_publications
+            .iter()
+            .position(|publication| publication.registration_id() == registration_id)?;
+
+        Some(self.exclusive_publications.remove(index))
+    }
+
     /// A publication by registration id.
     pub fn publication(&self, registration_id: i64) -> Option<&Publication> {
         self.publications
@@ -2659,7 +2724,16 @@ impl Client {
             return false;
         };
 
-        let _ = self.subscriptions.swap_remove(index);
+        // ★ The images this subscription handed over go with it, and their
+        // holders have to hear that — this is the one place a subscription
+        // leaves a live client, and a handed-out image is not in the
+        // subscription to be dropped with it. Without this, an application that
+        // took an image out and reads it on a thread of its own (`Client::
+        // take_image`) would keep reading a subscription that no longer exists:
+        // every other reader of that subscription ends here, because the image
+        // it was looking up is gone.
+        let mut subscription = self.subscriptions.swap_remove(index);
+        subscription.close_handed_out_images();
 
         true
     }
@@ -3653,10 +3727,19 @@ impl Client {
                                 position: image.position(),
                             });
 
-                        subscription
-                            .remove_image(publication_registration_id)
-                            .then_some(event)
-                            .flatten()
+                        if subscription.remove_image(publication_registration_id) {
+                            return event;
+                        }
+
+                        // No image here to remove: it is one this client handed
+                        // over ([`Client::take_image`]), and the holder reads a
+                        // log buffer rather than this client's queue — so what
+                        // it gets is the flag, not an event. A withdrawal for an
+                        // id that was never here changes nothing and says
+                        // nothing, as before.
+                        subscription.close_handed_out(publication_registration_id);
+
+                        None
                     });
 
                 if let Some(event) = event {

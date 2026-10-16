@@ -1917,6 +1917,29 @@ fn a_stopped_recording(archive: &mut Archive, client: &mut Client) -> RecordingD
 
     let source = source.expect("the loop ends with a row");
 
+    // ★ **And that the row has data in it, which is not the same as having a
+    // row.** The row is written when the `startRecording` *request* is answered,
+    // before any image exists (`ArchiveConductor.java:570` against `:2046-2051`),
+    // so a caller that stops a recording the moment its row appears can stop one
+    // that never read a byte — and an empty recording is exactly what a
+    // replication's descriptor calls "already in sync" (`:393-398`) and never
+    // copies.
+    //
+    // Under `SHARED` the recorder is driven inside the conductor's own turn, so
+    // the read has happened by the time the stop arrives and this wait is a
+    // formality. Under `DEDICATED` it is a thread of its own and the window is
+    // real: **found here**, as a `DEDICATED` source failing the criterion below
+    // about one run in six with "the extend's signal never happened" — the
+    // destination had taken the in-sync shortcut over a recording with no bytes
+    // in it.
+    until(client, "the source's recording position", |client| {
+        let _ = client.offer_exclusive(publication, b"a message to copy");
+
+        archive
+            .get_recording_position(client, source.recording_id)
+            .is_ok_and(|position| position > source.start_position)
+    });
+
     archive
         .stop_recording_subscription(client, subscription_id)
         .expect("the archive stops the subscription it opened");
@@ -2347,6 +2370,15 @@ fn a_replication_reaches_an_archive_in_another_process() {
     let [source_control_port] = free_udp_ports::<1>();
     let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
     let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
+    // The driver's mode, said out loud because the archiving media driver
+    // refuses the `DEDICATED` its own default would be. **The archive's is
+    // deliberately left unsaid**, so that this source takes the default — the
+    // mode with threads of its own (P2-9a) — and the criterion below is a
+    // replication over an archive that is not `SHARED` as well as over this
+    // destination, which [`rig`] pins. It is the one place in this file where
+    // the two archives run different modes, and it earned its keep: it is what
+    // caught [`a_stopped_recording`] stopping a recording that had read
+    // nothing.
     let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
     let source_archive_dir = TempDir::new("archive-client-api-replication-source");
 

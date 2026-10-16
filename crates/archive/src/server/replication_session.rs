@@ -53,7 +53,7 @@ use std::time::Duration;
 use deepmsg_client::client::{
     AsyncDestination, AsyncDestinationPoll, AsyncNextSessionId, AsyncNextSessionIdPoll, Client,
 };
-use deepmsg_client::image::Image;
+use deepmsg_client::image::ImageView;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::source_location::SourceLocation;
 
@@ -1592,12 +1592,20 @@ impl ReplicationSession {
     /// closed (`:781`, `:826`, `:884`); this looks the image up each turn, so
     /// **an image that is no longer there is the closed one**. The two readings
     /// agree on what every caller does about it: nothing arrives any more.
-    fn subscription_image<'c>(&self, client: &'c Client) -> Option<&'c Image> {
+    ///
+    /// ★ **The lookup answers for an image the recorder has taken as well as one
+    /// the subscription still holds** (P2-9a). This session and the recording
+    /// session read the *same* image — the reference's one object, referenced
+    /// twice — and this build's two are the subscription's copy and the
+    /// recorder's, which is why what is asked for here is a view rather than the
+    /// image itself: the archive's recorder owns the image, publishes where it
+    /// has read to, and this reads that.
+    fn image_view(&self, client: &Client) -> Option<ImageView> {
         let registration_id = self.recording_subscription?;
 
         client
             .subscription(registration_id)?
-            .image_by_session_id(self.replay_image_session_id())
+            .image_view_by_session_id(self.replay_image_session_id())
     }
 
     /// `ReplicationSession.awaitImage` (`:753-776`): wait for the destination's
@@ -1617,7 +1625,7 @@ impl ReplicationSession {
             return Err("no destination subscription: EXTEND did not finish".to_owned());
         };
 
-        if self.subscription_image(client).is_some() {
+        if self.image_view(client).is_some() {
             self.go_to(if self.live_destination.is_none() {
                 State::Replicate
             } else {
@@ -1667,7 +1675,7 @@ impl ReplicationSession {
             return Err("no destination subscription: EXTEND did not finish".to_owned());
         };
 
-        let (position, is_end_of_stream) = match self.subscription_image(client) {
+        let (position, is_end_of_stream) = match self.image_view(client) {
             Some(image) => (image.position(), image.is_end_of_stream().unwrap_or(false)),
             None => (NULL_POSITION, true),
         };
@@ -1747,7 +1755,7 @@ impl ReplicationSession {
     /// before `EXTEND` (`:509`), when the state that asks it ran for the
     /// reason this one needs it.
     fn catchup(&mut self, client: &mut Client) -> Result<(), String> {
-        let Some(position) = self.subscription_image(client).map(Image::position) else {
+        let Some(position) = self.image_view(client).map(|image| image.position()) else {
             return Err("replication image closed unexpectedly".to_owned());
         };
 
@@ -1833,7 +1841,7 @@ impl ReplicationSession {
         };
 
         let Some(position) = answer else {
-            if self.subscription_image(client).is_none() {
+            if self.image_view(client).is_none() {
                 return Err("replication image closed unexpectedly".to_owned());
             }
 
@@ -1858,7 +1866,7 @@ impl ReplicationSession {
             return Err("cannot live merge without active source recording".to_owned());
         }
 
-        let Some(image) = self.subscription_image(client) else {
+        let Some(image) = self.image_view(client) else {
             return Err("replication image closed unexpectedly".to_owned());
         };
 

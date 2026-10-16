@@ -31,6 +31,8 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
 use deepmsg_core::logbuffer::frame::Frame;
@@ -261,9 +263,139 @@ pub struct Image {
     /// It arrives in `ON_AVAILABLE_IMAGE`, whose tail carries it after the log
     /// path (`on_available_image`, `aeron_driver_conductor.c:1327-1336`).
     source_identity: String,
-    log: LogBuffer,
+    /// The mapping, **shared**: an image can leave the client that made it
+    /// ([`Client::take_image`](crate::client::Client::take_image)) and be read
+    /// by somebody else, while the log facts a second reader asks for —
+    /// `isEndOfStream`, `activeTransportCount` — are the same log's. What is
+    /// shared is the mapping, not a copy of it: mapping a term buffer twice
+    /// would be two windows onto one file, and the cheaper of the two is the
+    /// one the reference makes (one object, many readers).
+    log: Arc<LogBuffer>,
     /// How far this reader has consumed.
     position: Position,
+    /// The part of this image that outlives the reader holding it — where the
+    /// reader has got to, and whether the client has been told the image is
+    /// gone. See [`ImageShared`].
+    shared: Arc<ImageShared>,
+}
+
+/// What an image's holder publishes for the readers that do not hold it.
+///
+/// The reference has one `Image` **object** and as many references to it as it
+/// likes, so a second reader of the same image — the archive's replication
+/// session watching the image its recorder is reading is the one that exists —
+/// simply reads the fields off it. Rust gives the image one owner, so what the
+/// second reader gets is this: the two facts that move
+/// ([`ImageShared::position`], `Image.isClosed`'s flag) shared, and the log
+/// behind an `Arc` so everything that does **not** move can still be read live.
+#[derive(Debug)]
+pub(crate) struct ImageShared {
+    /// Where the holder has read to, published after every poll
+    /// (`ImageShared::position` is the reference's `Image.position()`, which a
+    /// second reader of the same image reads the same way).
+    position: AtomicI64,
+    /// `Image.isClosed()` (`Image.java:204-207`): the client that made this
+    /// image has been told the driver withdrew it.
+    closed: AtomicBool,
+}
+
+/// An image **read by somebody else**, as a second reader sees it.
+///
+/// What [`Client::take_image`](crate::client::Client::take_image) leaves
+/// behind, and what
+/// [`Subscription::image_view_by_session_id`](crate::subscription::Subscription::image_view_by_session_id)
+/// answers with for an image that has been handed over: everything an image
+/// says about itself that is not the reader's own business, plus the two facts
+/// the holder publishes.
+///
+/// It is **not** a reader: it cannot poll, and it has no position of its own —
+/// the position it reports is the holder's.
+#[derive(Debug, Clone)]
+pub struct ImageView {
+    registration_id: i64,
+    session_id: i32,
+    stream_id: i32,
+    source_identity: String,
+    subscriber_position_id: i32,
+    join_position: i64,
+    log: Arc<LogBuffer>,
+    shared: Arc<ImageShared>,
+}
+
+impl ImageView {
+    /// The **publication's** registration id (`Image.correlationId()`,
+    /// `Image.java:184`) — the same id [`Image::registration_id`] answers.
+    pub const fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+
+    /// The publication's session id.
+    pub const fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
+    /// The publication's stream id.
+    pub const fn stream_id(&self) -> i32 {
+        self.stream_id
+    }
+
+    /// The counter the holder advances as it reads.
+    pub const fn subscriber_position_id(&self) -> i32 {
+        self.subscriber_position_id
+    }
+
+    /// Where the holder started reading (`Image.joinPosition()`, `:214`).
+    pub const fn join_position(&self) -> i64 {
+        self.join_position
+    }
+
+    /// Where the holder has read to (`Image.position()`, `:241`).
+    pub fn position(&self) -> i64 {
+        self.shared.position.load(Ordering::Acquire)
+    }
+
+    /// Whether the driver has withdrawn this image (`Image.isClosed()`,
+    /// `:204-207`).
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// Say that the image is over, for the two things that can say it: the
+    /// driver withdrawing it, and the subscription it was under going away.
+    pub(crate) fn close(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+    }
+
+    /// How many bytes one term of this image's log buffer is
+    /// (`Image.termBufferLength()`, `:138`).
+    pub fn term_buffer_length(&self) -> i32 {
+        self.log.geometry().term_length
+    }
+
+    /// How many transports the driver has seen active
+    /// (`Image.activeTransportCount()`, `:283`).
+    pub fn active_transport_count(&self) -> Option<i32> {
+        self.log
+            .metadata()?
+            .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
+    }
+
+    /// Whether the holder has reached the end of the stream
+    /// (`Image.isEndOfStream()`, `:249`) — the holder's position against the
+    /// same end-of-stream marker [`Image::is_end_of_stream`] compares against.
+    pub fn is_end_of_stream(&self) -> Option<bool> {
+        let end_of_stream = self
+            .log
+            .metadata()?
+            .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)?;
+
+        Some(self.position() >= end_of_stream)
+    }
+
+    /// Where the stream comes from, as the driver described it.
+    pub fn source_identity(&self) -> &str {
+        &self.source_identity
+    }
 }
 
 impl Image {
@@ -296,9 +428,55 @@ impl Image {
             subscriber_position_id,
             join_position,
             source_identity,
-            log: LogBuffer::open(path, false)?,
+            log: Arc::new(LogBuffer::open(path, false)?),
             position: Position::from_raw(join_position),
+            shared: Arc::new(ImageShared {
+                position: AtomicI64::new(join_position),
+                closed: AtomicBool::new(false),
+            }),
         })
+    }
+
+    /// Whether the driver has withdrawn this image
+    /// (`Image.isClosed()`, `Image.java:204-207`).
+    ///
+    /// Distinct from [`Image::is_end_of_stream`], and the reference tests both:
+    /// an end of stream is a publisher that finished writing, where this is the
+    /// driver taking the image away — a revoked publication, or a driver that
+    /// stopped. A reader that polls a withdrawn image reads a log buffer whose
+    /// publisher is gone, which is why the reference ends a session on either
+    /// (`RecordingSession.java:242`).
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// How a second reader of this image sees it, for the client to keep after
+    /// the image itself has been handed over ([`crate::subscription::HandedOut`]).
+    pub(crate) fn view(&self) -> ImageView {
+        ImageView {
+            registration_id: self.registration_id,
+            session_id: self.session_id,
+            stream_id: self.stream_id,
+            source_identity: self.source_identity.clone(),
+            subscriber_position_id: self.subscriber_position_id,
+            join_position: self.join_position,
+            log: Arc::clone(&self.log),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Move the reader, and publish where it now is.
+    ///
+    /// The publish is what a second reader of this image reads
+    /// ([`ImageView::position`]): the reference's one object is this build's one
+    /// owner plus this store. Relaxed is enough — the store orders nothing, and
+    /// what a reader of it wants is the number, not a happens-before with the
+    /// bytes, which the log's own tail ordering already gives.
+    fn advance(&mut self, position: Position) {
+        self.position = position;
+        self.shared
+            .position
+            .store(position.raw(), Ordering::Relaxed);
     }
 
     /// The term this stream began at.
@@ -352,7 +530,7 @@ impl Image {
     }
 
     /// The mapped log.
-    pub const fn log(&self) -> &LogBuffer {
+    pub fn log(&self) -> &LogBuffer {
         &self.log
     }
 
@@ -370,8 +548,8 @@ impl Image {
 
     /// Set the reader position without reading anything — how a subscriber
     /// joins a stream that is already running.
-    pub const fn set_position(&mut self, position: i64) {
-        self.position = Position::from_raw(position);
+    pub fn set_position(&mut self, position: i64) {
+        self.advance(Position::from_raw(position));
     }
 
     /// Where this subscriber joined the stream
@@ -538,7 +716,7 @@ impl Image {
             return fragments;
         }
 
-        self.position = next;
+        self.advance(next);
 
         fragments
     }
@@ -645,7 +823,8 @@ impl Image {
             }
         }
 
-        self.position = Position::from_raw(self.position.raw() + length as i64);
+        let advanced = Position::from_raw(self.position.raw() + length as i64);
+        self.advance(advanced);
 
         length
     }
@@ -745,7 +924,7 @@ impl Image {
         }
 
         if ledger.committed.raw() > self.position.raw() {
-            self.position = ledger.committed;
+            self.advance(ledger.committed);
         }
 
         fragments

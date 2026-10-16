@@ -68,6 +68,15 @@ const ARCHIVE_ID: i64 = ARCHIVE_ID_DEFAULT;
 /// and these by `cargo test`, and two drivers on one host must not pick the same
 /// one.
 const RECORDING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33433";
+
+/// The same, for the `DEDICATED` criterion: two tests in one binary run at
+/// once, and a UDP endpoint is one process's at a time.
+const RECORDING_CHANNEL_DEDICATED: &str = "aeron:udp?endpoint=localhost:33434";
+
+/// The two archives' `TempDir` names, which are also the two `test_name`s the
+/// harness logs under.
+const SHARED_ARCHIVE: &str = "archive-recording";
+const DEDICATED_ARCHIVE: &str = "archive-recording-dedicated";
 /// See [`RECORDING_CHANNEL`].
 const RECORDING_STREAM_ID: i32 = 33;
 
@@ -83,18 +92,25 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// `spies.simulate.connection` is what makes a **spy** reader count as a
 /// subscriber, which is the shape `ArchiveConductor.java:562-565` creates; the C
 /// harness sets it for the same reason (`TestArchive.h:53`).
-const PROPERTIES: [&str; 3] = [
+const PROPERTIES: [&str; 4] = [
     archive::PROPERTIES[0],
     archive::PROPERTIES[1],
+    archive::PROPERTIES[2],
     "-Daeron.spies.simulate.connection=true",
 ];
 
-#[test]
-fn a_recording_is_made_and_stops_where_the_publication_did() {
-    let archive_dir = TempDir::new("archive-recording-archive");
+/// One recording round trip, under whichever archive `properties` names: made,
+/// followed, stopped where the publication did, and read back out of the
+/// catalog.
+///
+/// `channel` is a parameter rather than [`RECORDING_CHANNEL`] because the two
+/// criteria below run at once in one binary and a UDP endpoint belongs to one
+/// process at a time.
+fn a_recording_round_trip(test_name: &str, channel: &str, properties: &[&str]) {
+    let archive_dir = TempDir::new(test_name);
 
     let Some(mut media_driver) =
-        OwnArchivingMediaDriver::start("archive-recording", archive_dir.path(), &PROPERTIES)
+        OwnArchivingMediaDriver::start(test_name, archive_dir.path(), properties)
     else {
         archiving_driver::announce_skip();
         return;
@@ -118,10 +134,10 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
     // The publication whose bytes are to be recorded, and a reader for it: a UDP
     // publication with no subscriber is one the driver does not send on.
     let publication = client
-        .add_exclusive_publication(RECORDING_CHANNEL, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
+        .add_exclusive_publication(channel, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
         .expect("the driver must accept the publication");
     let reader = client
-        .add_subscription(RECORDING_CHANNEL, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
+        .add_subscription(channel, RECORDING_STREAM_ID, COMMAND_TIMEOUT)
         .expect("the driver must accept a reader");
 
     let publisher_session = client
@@ -142,13 +158,7 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
     // back before any image does.
     let subscription_id = session
         .archive_mut()
-        .start_recording(
-            &mut client,
-            RECORDING_CHANNEL,
-            RECORDING_STREAM_ID,
-            true,
-            false,
-        )
+        .start_recording(&mut client, channel, RECORDING_STREAM_ID, true, false)
         .expect("the archive answers a start");
 
     assert!(
@@ -205,6 +215,28 @@ fn a_recording_is_made_and_stops_where_the_publication_did() {
     wait_for_the_counter_to_go(&mut client, &aeron_dir, publisher_session);
 
     let _ = media_driver.stop();
+}
+
+#[test]
+fn a_recording_is_made_and_stops_where_the_publication_did() {
+    a_recording_round_trip(SHARED_ARCHIVE, RECORDING_CHANNEL, &PROPERTIES);
+}
+
+/// ★ P2-9a: the same round trip with the archive's **`DEDICATED`** mode, where
+/// the conductor and the recorder are agents on threads of their own and the
+/// session this makes is driven by the recorder's thread rather than inside the
+/// conductor's turn.
+///
+/// It is the claim the rest of this slice rests on: a recording made by a
+/// recorder that is not on the conductor's thread is still a recording, and
+/// still stops where its publication did. The thread names are
+/// `archive_threading.rs`'s; what this adds is that the threads **work**.
+#[test]
+fn a_recording_is_made_with_the_recorder_on_its_own_thread() {
+    let mut properties: Vec<&str> = PROPERTIES.to_vec();
+    properties.push("-Daeron.archive.threading.mode=DEDICATED");
+
+    a_recording_round_trip(DEDICATED_ARCHIVE, RECORDING_CHANNEL_DEDICATED, &properties);
 }
 
 /// Publish every message and read them back, answering with where the
@@ -418,18 +450,18 @@ fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64)
 /// maximum cycle time has moved by the time the archive has served, because the
 /// reference measures it on every turn (`ArchiveConductor.doWork:374`), while
 /// the other two stay at zero — the reference only measures those from
-/// `DedicatedModeArchiveConductor` (`:191`, `:346`), which this build does not
-/// have.
+/// `DedicatedModeArchiveConductor` (`:191`, `:346`), and a `SHARED` archive has
+/// no agent of its own for either.
+///
+/// ★ Since P2-9a the mode is said out loud for the second reason as well as the
+/// first. The labels carry the mode the archive was **configured** with, so a
+/// deployment that says nothing gets 103/104 labelled `DEDICATED` — and until
+/// P2-9a that was a label over a `SHARED` archive. It no longer is: `DEDICATED`
+/// is served, and this criterion is the `SHARED` one.
 #[test]
 fn the_archive_allocates_the_duty_cycle_counters() {
     let archive_dir = TempDir::new("archive-cycle-counters");
 
-    // ★ The archive's own threading mode, said out loud: its default is
-    // `DEDICATED` (`Archive.java:393`) while this build runs `SHARED` and only
-    // `SHARED` — so a deployment that says nothing gets 103/104 labels naming a
-    // mode it is not running. That is recorded in the plan rather than papered
-    // over here; what it means for this case is that the mode has to be given for
-    // the labels to be the ones this archive's behaviour deserves.
     let mut properties = PROPERTIES.to_vec();
     properties.push("-Daeron.archive.threading.mode=SHARED");
 

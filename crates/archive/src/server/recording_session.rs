@@ -20,21 +20,23 @@
 //! the speed the acceptance test measures — a position that lags a turn behind
 //! the publisher is a position `waitUntilCaughtUp` waits for.
 //!
-//! # The image is not held, and `isClosed` is not a flag
+//! # The image is held, and `isClosed` is a flag
 //!
 //! The reference's session holds the `Image` object (`:60`) and asks it
 //! `isEndOfStream()` and `isClosed()` (`:242`), where `isClosed` is a field its
 //! client conductor sets when the driver says the image is unavailable
-//! (`Image.java:204-207`).
+//! (`Image.java:204-207`). This session does the same (P2-9a), through the
+//! [`RecordingImage`] seam — and it has to, because a session that is not on the
+//! client's thread cannot ask the client anything.
 //!
-//! This build's client **removes** an unavailable image from its subscription
-//! and queues an event about it (`crates/client/src/client.rs`, the
-//! `UnavailableImage` arm) — there is no closed-but-present image, so there is
-//! no flag to read. What there is instead is the lookup: the session names its
-//! image by the two ids this client knows it by, and an image that is gone is
-//! one [`Client::block_poll_image`] answers `None` for. That `None` **is**
-//! `image.isClosed()` here, and it is why the reference's `||` has one arm
-//! rather than two.
+//! Until P2-9a it did the opposite: the session held two ids and asked
+//! [`Client::block_poll_image`] for the image every turn, and an image the
+//! client had removed answered `None` — which is what stood in for
+//! `image.isClosed()`. That works only while the two share a thread. What
+//! replaced it is the flag the client flips on the image **it handed over**
+//! ([`Client::take_image`]): an image that has left the subscription is
+//! otherwise unreachable by the `UnavailableImage` arm that removes it, which
+//! is why the subscription keeps a [`HandedOut`] record.
 //!
 //! # What is not the reference's shape
 //!
@@ -56,11 +58,104 @@
 use std::path::Path;
 
 use deepmsg_client::client::Client;
+use deepmsg_client::image::{Block, Image};
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
 use crate::recording_writer::{RecordingWriter, WriteStats};
 use crate::server::recording_pos::RecordingPos;
+
+/// The image a recording reads, as far as a session is concerned.
+///
+/// The twin of [`crate::server::replay_session::Publication`], and for the same
+/// reason: what the session needs is four questions, and the *client's* `Image`
+/// is one answer to them while a unit test's is another. A test that made a
+/// session would otherwise have to build a mapped log buffer — the client's own
+/// tests keep a sixty-line `TempLog` for that — when all it is testing is which
+/// state a session moves to.
+///
+/// It is also the seam P2-9a needs: the session **holds** its image rather than
+/// naming it to the client every turn, which is the reference's shape
+/// (`RecordingSession.java:45`) and the thing that lets a recorder run on a
+/// thread of its own while the client stays on the conductor's. `Send` because
+/// that is where the session goes.
+pub trait RecordingImage: Send {
+    /// `image.termBufferLength()` (`Image.java:138`) — how many bytes a term is,
+    /// which bounds what one turn may read (`:81`).
+    fn term_buffer_length(&self) -> i32;
+
+    /// The **publication's** registration id, which is what tells one image of
+    /// a subscription from another (`Image.correlationId()`, `:184`).
+    fn registration_id(&self) -> i64;
+
+    /// `image.blockPoll(...)` (`:237`): one run of contiguous frames, handed
+    /// over as a single block, and how many bytes it was.
+    ///
+    /// ★ **And the reader's own position counter, which has to travel with the
+    /// read.** `Image.block_poll` advances the image's reader and nothing else;
+    /// it was the *client* that published where the reader had got to, right
+    /// after the poll (`crate::client::Client::block_poll_image`, the
+    /// `if position > position_before` store). That counter is what the driver
+    /// takes `min_sub_pos` from to raise the publisher's window
+    /// (`aeron_ipc_publication.c:296-313`), so a reader that stops publishing
+    /// it **blocks the publisher**: the archive would sit on a stream that had
+    /// gone quiet, which is exactly what moving the image out of the client
+    /// does if this step does not come with it.
+    ///
+    /// The counters region is a parameter because the image no longer lives
+    /// inside the client that owns the mapping.
+    fn block_poll(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        block_length_limit: usize,
+        handler: &mut dyn FnMut(&Block<'_>),
+    ) -> usize;
+
+    /// `image.isEndOfStream()` (`:249`).
+    fn is_end_of_stream(&self) -> Option<bool>;
+
+    /// `image.isClosed()` (`:204-207`) — the driver withdrew the image. See the
+    /// module note for why this build has a flag here at all.
+    fn is_closed(&self) -> bool;
+}
+
+impl RecordingImage for Image {
+    fn term_buffer_length(&self) -> i32 {
+        Image::term_buffer_length(self)
+    }
+
+    fn registration_id(&self) -> i64 {
+        Image::registration_id(self)
+    }
+
+    fn block_poll(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        block_length_limit: usize,
+        handler: &mut dyn FnMut(&Block<'_>),
+    ) -> usize {
+        let before = Image::position(self);
+        let read = Image::block_poll(self, block_length_limit, handler);
+        let position = Image::position(self);
+
+        // The store the client used to make, with the same guard: a turn that
+        // read nothing has not moved the position, and a store that says so
+        // would be one the driver reads for nothing.
+        if position > before {
+            counters.set_value(self.subscriber_position_id(), position);
+        }
+
+        read
+    }
+
+    fn is_end_of_stream(&self) -> Option<bool> {
+        Image::is_end_of_stream(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Image::is_closed(self)
+    }
+}
 
 /// Where a recording is (`RecordingSession.java:33-36`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,19 +191,22 @@ enum Step {
 
 /// Which of the three a turn is (`RecordingSession.record`).
 ///
-/// `read` is `None` when the client no longer holds the image, which is this
-/// build's `image.isClosed()` — see the module note.
-///
-/// The order matters and it is the reference's: `workCount > 0` is tested
-/// **first**, so a turn that read the last bytes of a stream records them and
-/// leaves the ending to the next turn.
-fn step(read: Option<usize>, is_end_of_stream: Option<bool>) -> Step {
-    match read {
-        None => Step::Ended,
-        Some(0) if is_end_of_stream == Some(true) => Step::Ended,
-        Some(0) => Step::Idle,
-        Some(read) => Step::Recorded(read),
+/// `read` is how many bytes the poll moved, and it is tested **first** because
+/// that is the reference's order: a turn that read the last bytes of a stream
+/// records them and leaves the ending to the next turn. `is_closed` and
+/// `is_end_of_stream` are the two arms of the reference's `else if` (`:242`).
+fn step(read: usize, is_end_of_stream: Option<bool>, is_closed: bool) -> Step {
+    if read > 0 {
+        return Step::Recorded(read);
     }
+
+    // Nothing was read: either the image is finished — the stream ended, or the
+    // driver took it away — or the stream simply has nothing new yet.
+    if is_closed || is_end_of_stream == Some(true) {
+        return Step::Ended;
+    }
+
+    Step::Idle
 }
 
 /// One recording, from its first segment to its last.
@@ -133,10 +231,17 @@ pub struct RecordingSession {
     /// The catalog's id for this recording, which is also the session's own
     /// (`RecordingSession.sessionId()`, `:85-89`).
     recording_id: i64,
-    /// The subscription the image arrived on, and the image itself, named the
-    /// way this client names them.
+    /// The subscription the image arrived on, which is what a stop names it by
+    /// and what the registry holds.
     subscription_id: i64,
-    image_id: i64,
+    /// The image itself.
+    ///
+    /// ★ **Held, not named** (P2-9a). The reference's session holds the `Image`
+    /// object (`:45`) and this build used to hold the two ids the client knew
+    /// it by and ask the client for it every turn — the same thing only while
+    /// the session and the client are on one thread, which is exactly what
+    /// `DEDICATED` is not.
+    image: Box<dyn RecordingImage>,
     /// `min(image.termBufferLength(), ctx.fileIoMaxLength())` (`:81`) — how many
     /// bytes one turn may read, which is not the same as how many fit in a
     /// segment.
@@ -185,8 +290,7 @@ impl RecordingSession {
         join_position: i64,
         segment_file_length: usize,
         subscription_id: i64,
-        image_id: i64,
-        term_buffer_length: i32,
+        image: Box<dyn RecordingImage>,
         file_io_max_length: usize,
         file_sync_level: i32,
         is_auto_stop: bool,
@@ -196,7 +300,9 @@ impl RecordingSession {
     ) -> Self {
         // `min(image.termBufferLength(), ctx.fileIoMaxLength())` (`:81`): a turn
         // reads at most a term, and at most what the archive was told a file
-        // write may be.
+        // write may be. The term length is the **image's**, read here once
+        // rather than passed in, because the image is what has it.
+        let term_buffer_length = image.term_buffer_length();
         let file_io_max_length = i32::try_from(file_io_max_length).unwrap_or(i32::MAX);
         let block_length_limit =
             usize::try_from(term_buffer_length.min(file_io_max_length)).unwrap_or(0);
@@ -206,7 +312,7 @@ impl RecordingSession {
             correlation_id,
             recording_id,
             subscription_id,
-            image_id,
+            image,
             block_length_limit,
             position,
             writer: RecordingWriter::new(
@@ -326,7 +432,6 @@ impl RecordingSession {
     /// reference has: see the module note for what that buys.
     pub fn do_work<S: WriteStats>(
         &mut self,
-        client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         stats: &mut S,
     ) -> usize {
@@ -341,7 +446,7 @@ impl RecordingSession {
         }
 
         if self.state == State::Recording {
-            work += self.record(client, counters, stats);
+            work += self.record(counters, stats);
         }
 
         if self.state == State::Inactive {
@@ -377,18 +482,16 @@ impl RecordingSession {
     /// (`RecordingSession.record`, `:233-278`).
     ///
     /// The whole turn is here rather than in a helper because the poll borrows
-    /// the client, the writer and the scratch buffer at once, and splitting it
+    /// the image, the writer and the scratch buffer at once, and splitting it
     /// would mean handing three borrows across a call for no gain.
     fn record<S: WriteStats>(
         &mut self,
-        client: &mut Client,
         counters: &CountersReader<'_, ReadWrite>,
         stats: &mut S,
     ) -> usize {
         let (read, failure) = {
             let Self {
-                subscription_id,
-                image_id,
+                image,
                 block_length_limit,
                 writer,
                 scratch,
@@ -397,44 +500,39 @@ impl RecordingSession {
 
             let mut failure = None;
 
-            let read = client.block_poll_image(
-                *subscription_id,
-                *image_id,
-                *block_length_limit,
-                |block| {
-                    // Once a block has failed there is nothing to write the rest
-                    // of the run with: the reference throws out of its handler on
-                    // the first exception and the poll stops there
-                    // (`RecordingSession.java:262-275`, whose `catch` moves the
-                    // session to `INACTIVE`). A Rust handler cannot throw, so the
-                    // rest of the run is dropped instead — which is also what
-                    // keeps a **half-rolled** writer from being used: a failed
-                    // roll-over leaves the segment writer with its offset reset
-                    // and its file still the old one, and writing into it would
-                    // overwrite the bytes already recorded.
-                    if failure.is_some() {
-                        return;
-                    }
+            let read = image.block_poll(counters, *block_length_limit, &mut |block| {
+                // Once a block has failed there is nothing to write the rest
+                // of the run with: the reference throws out of its handler on
+                // the first exception and the poll stops there
+                // (`RecordingSession.java:262-275`, whose `catch` moves the
+                // session to `INACTIVE`). A Rust handler cannot throw, so the
+                // rest of the run is dropped instead — which is also what
+                // keeps a **half-rolled** writer from being used: a failed
+                // roll-over leaves the segment writer with its offset reset
+                // and its file still the old one, and writing into it would
+                // overwrite the bytes already recorded.
+                if failure.is_some() {
+                    return;
+                }
 
-                    let length = block.length();
+                let length = block.length();
 
-                    let copied = match scratch.get_mut(..length) {
-                        Some(bytes) => block.copy_out(bytes).is_some(),
-                        // Unreachable: the buffer is sized to the limit and a
-                        // run is never longer than it. A run that somehow is
-                        // would be a block lost, not a block half-written.
-                        None => false,
-                    };
+                let copied = match scratch.get_mut(..length) {
+                    Some(bytes) => block.copy_out(bytes).is_some(),
+                    // Unreachable: the buffer is sized to the limit and a
+                    // run is never longer than it. A run that somehow is
+                    // would be a block lost, not a block half-written.
+                    None => false,
+                };
 
-                    if !copied {
-                        return;
-                    }
+                if !copied {
+                    return;
+                }
 
-                    if let Err(error) = writer.write_block(&scratch[..length], stats) {
-                        failure = Some(error);
-                    }
-                },
-            );
+                if let Err(error) = writer.write_block(&scratch[..length], stats) {
+                    failure = Some(error);
+                }
+            });
 
             (read, failure)
         };
@@ -446,19 +544,22 @@ impl RecordingSession {
             return 1;
         }
 
-        // Asked only when nothing was read, which is where the reference asks
-        // it too (`:242`) — and of the client, because the session does not hold
-        // the image.
-        let is_end_of_stream = if read == Some(0) {
-            client
-                .subscription(self.subscription_id)
-                .and_then(|subscription| subscription.image(self.image_id))
-                .and_then(deepmsg_client::image::Image::is_end_of_stream)
+        // Asked only when nothing was read, which is where the reference asks it
+        // too (`:242`) — and of its own image, which is now where the answer
+        // lives.
+        let is_end_of_stream = if 0 == read {
+            self.image.is_end_of_stream()
         } else {
             None
         };
 
-        match step(read, is_end_of_stream) {
+        // The reference's other arm of the same `if` (`:242`): an image the
+        // driver has withdrawn ends the session whether or not the stream said
+        // it was over. See the module note on why this build has a flag where
+        // the reference reads a field its client conductor set.
+        let is_closed = self.image.is_closed();
+
+        match step(read, is_end_of_stream, is_closed) {
             Step::Recorded(read) => {
                 self.position.set_position(counters, self.writer.position());
 
@@ -481,11 +582,65 @@ impl std::fmt::Debug for RecordingSession {
             .field("session_id", &self.session_id)
             .field("correlation_id", &self.correlation_id)
             .field("subscription_id", &self.subscription_id)
-            .field("image_id", &self.image_id)
+            .field("image_id", &self.image.registration_id())
             .field("state", &self.state)
             .field("position", &self.writer.position())
             .field("abort_reason", &self.abort_reason)
             .finish()
+    }
+}
+
+/// An image for a session a test makes: the five questions answered from
+/// fields, and no log buffer anywhere.
+///
+/// `pub(crate)` under `#[cfg(test)]` because two modules' tests build sessions —
+/// this one's and the recorder's — and neither is testing the client's mapping.
+#[cfg(test)]
+pub(crate) struct FakeImage {
+    pub(crate) registration_id: i64,
+    pub(crate) term_buffer_length: i32,
+    pub(crate) closed: bool,
+    /// What a poll moves, so a test can drive a session through `RECORDING`.
+    pub(crate) read: usize,
+}
+
+#[cfg(test)]
+impl FakeImage {
+    pub(crate) fn new() -> Self {
+        Self {
+            registration_id: 11,
+            term_buffer_length: 64 * 1024,
+            closed: false,
+            read: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl RecordingImage for FakeImage {
+    fn term_buffer_length(&self) -> i32 {
+        self.term_buffer_length
+    }
+
+    fn registration_id(&self) -> i64 {
+        self.registration_id
+    }
+
+    fn block_poll(
+        &mut self,
+        _counters: &CountersReader<'_, ReadWrite>,
+        _block_length_limit: usize,
+        _handler: &mut dyn FnMut(&Block<'_>),
+    ) -> usize {
+        self.read
+    }
+
+    fn is_end_of_stream(&self) -> Option<bool> {
+        None
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
     }
 }
 
@@ -497,25 +652,31 @@ mod tests {
     /// turn that read the last bytes of a stream records them (`:238-246`).
     #[test]
     fn a_turn_ends_the_recording_only_when_nothing_was_read() {
-        assert_eq!(Step::Recorded(64), step(Some(64), None));
+        assert_eq!(Step::Recorded(64), step(64, None, false));
         assert_eq!(
             Step::Recorded(64),
-            step(Some(64), Some(true)),
+            step(64, Some(true), false),
             "the read is tested first, so its bytes are not thrown away"
         );
+        assert_eq!(
+            Step::Recorded(64),
+            step(64, Some(true), true),
+            "and a *closed* image's bytes are no different: `workCount > 0` is \
+             the reference's first branch, whatever the flags say"
+        );
 
-        assert_eq!(Step::Idle, step(Some(0), Some(false)));
+        assert_eq!(Step::Idle, step(0, Some(false), false));
         assert_eq!(
             Step::Idle,
-            step(Some(0), None),
+            step(0, None, false),
             "an image whose metadata cannot be read is not one that ended"
         );
 
-        assert_eq!(Step::Ended, step(Some(0), Some(true)));
+        assert_eq!(Step::Ended, step(0, Some(true), false));
         assert_eq!(
             Step::Ended,
-            step(None, None),
-            "an image the client no longer holds is this build's `isClosed`"
+            step(0, None, true),
+            "an image the driver has withdrawn is this build's `isClosed`"
         );
     }
 
@@ -564,8 +725,8 @@ mod tests {
         assert!(session.error_message().is_none());
     }
 
-    /// A session with the ids the tests use, a segment directory, and nothing
-    /// else: the pieces that need a client are what `do_work` is for.
+    /// A session with the ids the tests use, a segment directory, an image that
+    /// answers without a file, and nothing else.
     fn a_session(directory: &Path, recording_id: i64) -> RecordingSession {
         RecordingSession::new(
             5,
@@ -575,8 +736,7 @@ mod tests {
             0,
             128 * 1024,
             9,
-            11,
-            64 * 1024,
+            Box::new(FakeImage::new()),
             1024 * 1024,
             0,
             false,

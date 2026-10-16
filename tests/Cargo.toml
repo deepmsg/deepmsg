@@ -239,6 +239,14 @@ path = "integration/next_session_id.rs"
 name = "archive_connect"
 path = "integration/archive_connect.rs"
 
+# P2-9a: what `aeron.archive.threading.mode` puts on the process — the
+# reference's agent names, read out of `/proc/<pid>/task` rather than reported
+# by the process itself. Our own binaries only, so it runs in CI for the same
+# reason the entry above does.
+[[test]]
+name = "archive_threading"
+path = "integration/archive_threading.rs"
+
 # P2-S7's acceptance in Rust, and the same criterion as the entry above: our two
 # binaries and our client, with the one thing this slice adds — the archive is a
 # process of its own, attached to a driver it does not own. The C suite's

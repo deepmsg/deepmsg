@@ -79,12 +79,15 @@ use deepmsg_driver::sys;
 use crate::catalog::Catalog;
 use crate::mark_file::{ArchiveMarkFile, Header};
 use crate::server::conductor::{ARCHIVE_ID_DEFAULT, ArchiveConductor};
-use crate::server::config::ArchiveConfig;
+use crate::server::config::{ArchiveConfig, ThreadingMode};
 use crate::server::counters::DutyCycleRequests;
 use crate::server::counters::{
     ARCHIVE_ERROR_COUNT_TYPE_ID, ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, archive_id_key,
     archive_id_label, find_archive_id_counter,
 };
+use crate::server::recorder::{RecorderHalf, RecorderThread};
+use crate::server::replayer::{ReplayerHalf, ReplayerThread};
+use crate::server::threading::{self, Role};
 
 /// `SystemCounterDescriptor.ERRORS.id()` (`ArchivingMediaDriver.java:87`) —
 /// the driver's error counter, which the archive writes its own errors into
@@ -115,10 +118,19 @@ pub enum DriverHalf<'a> {
 }
 
 impl DriverHalf<'_> {
-    /// One turn of the driver, where this process is the one that owes it.
-    fn turn(&mut self) {
-        if let Self::Owned(driver) = self {
-            driver.do_work();
+    /// One turn of the driver, where this process is the one that owes it, and
+    /// how much work it did.
+    ///
+    /// The count is what the idle strategy is given, and it is the reference's
+    /// own arrangement: an archive that owns its driver drives it from inside
+    /// `ArchiveConductor.doWork` (`invokeDriverConductor`, `:426`, which
+    /// `SharedModeArchiveConductor.doWork:57-64` calls and adds in), so the
+    /// driver's work is part of the turn's work and a turn that drove the driver
+    /// is not a turn that idles.
+    fn turn(&mut self) -> usize {
+        match self {
+            Self::Owned(driver) => driver.do_work(),
+            Self::Attached => 0,
         }
     }
 
@@ -450,6 +462,48 @@ pub fn run(
         .signal_ready(clock::epoch_millis())
         .map_err(|error| format!("could not signal the archive ready: {error}"))?;
 
+    // ★ P2-9a, and the whole of what `aeron.archive.threading.mode` decides:
+    // under `DEDICATED` the recorder and the replayer are agents on threads of
+    // their own (`DedicatedModeArchiveConductor.java:54-55`), so what the
+    // conductor holds is a channel to each; under `SHARED` both are the
+    // conductor's own objects, driven inside the conductor's turn
+    // (`SharedModeArchiveConductor.java:57-66`). The **conductor** is on a thread
+    // of its own either way when there is more than one agent — see below.
+    let dedicated = matches!(archive_config.threading_mode, ThreadingMode::Dedicated);
+
+    // The workers are built here and started below, once the conductor that will
+    // talk to them exists: a worker whose conductor was never built is a thread
+    // nothing can stop.
+    let (recorder, recorder_worker) = if dedicated {
+        let (thread, worker) = RecorderThread::pair(
+            archive_id,
+            &aeron_dir,
+            // `ctx.recorderIdleStrategy()`, which is the recorder's own name or
+            // — when that names nothing — the archive's (`Archive.java:1423-1431`);
+            // the fallback is resolved in the configuration, where both names can
+            // be refused in the same words.
+            archive_config.recorder_idle_strategy.strategy(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        (RecorderHalf::threaded(thread), Some(worker))
+    } else {
+        (RecorderHalf::new(archive_id), None)
+    };
+
+    let (replayer, replayer_worker) = if dedicated {
+        let (thread, worker) = ReplayerThread::pair(
+            &aeron_dir,
+            // `ctx.replayerIdleStrategy()`, the same rule (`:1433-1440`).
+            archive_config.replayer_idle_strategy.strategy(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        (ReplayerHalf::threaded(thread), Some(worker))
+    } else {
+        (ReplayerHalf::new(), None)
+    };
+
     let mut conductor = ArchiveConductor::new(
         archive_config,
         cnc,
@@ -459,6 +513,8 @@ pub fn run(
         duty_cycle_requests,
         remote_subscription_id,
         local_subscription_id,
+        recorder,
+        replayer,
     )
     .map_err(|error| format!("could not build the archive's conductor: {error}"))?;
 
@@ -470,6 +526,95 @@ pub fn run(
         std::process::id()
     );
 
+    // The reference's `ctx.idleStrategy()` (`Archive.java:1397-1399`), made once
+    // for the conductor's own loop — `AgentRunner.run` asks its context for one
+    // strategy per runner and idles with it after every pass
+    // (`org.agrona.concurrent.AgentRunner`), which is what this is.
+    //
+    // ★ It is no longer hardcoded to `yield`. That was the suite's own setting
+    // written into the code (`TestArchive.h:47` passes
+    // `aeron.archive.idle.strategy=yield`), so nothing could tell the two apart
+    // and a deployment that asked for anything else was told nothing. The
+    // reference's default is a `BackoffIdleStrategy` (`:420`), and so is this
+    // one's.
+    let idle = archive_config.idle_strategy.strategy();
+
+    // One agent, one thread: without a recorder of its own there is nothing for
+    // the conductor's thread to be apart *from*, and the archive runs where it
+    // always has — on the caller's.
+    let Some(recorder_worker) = recorder_worker else {
+        return run_conductor(name, &mut conductor, &mut client, half, idle);
+    };
+
+    let recorder_handle =
+        threading::spawn(Role::Recorder, archive_config.thread_naming, move || {
+            recorder_worker.run()
+        })
+        .map_err(|error| format!("could not start the recorder's thread: {error}"))?;
+
+    // ★ The replayer's thread, and there is one whenever there is a recorder's:
+    // both are what the same mode asks for.
+    let replayer_handle = match replayer_worker {
+        Some(worker) => Some(
+            threading::spawn(Role::Replayer, archive_config.thread_naming, move || {
+                worker.run()
+            })
+            .map_err(|error| format!("could not start the replayer's thread: {error}"))?,
+        ),
+        None => None,
+    };
+
+    // ★ The conductor is an agent on a thread of its own in **both** the
+    // reference's running modes — `DEDICATED` and `SHARED` alike are
+    // `AgentRunner.startOnThread(archive.conductorRunner, ctx.threadFactory())`
+    // (`Archive.java:262`) — and the process's own thread only waits
+    // (`barrier.await()`, `:201`). This build puts it there when there is more
+    // than one agent, which is where the two would otherwise be on one thread.
+    //
+    // What it costs is a scope: an archive that owns its media driver drives it
+    // from this same loop, so the thread borrows `&mut Driver` rather than
+    // owning it.
+    let outcome = std::thread::scope(|scope| {
+        let conductor_thread = threading::spawn_scoped(
+            scope,
+            Role::Conductor,
+            archive_config.thread_naming,
+            move || run_conductor(name, &mut conductor, &mut client, half, idle),
+        )
+        .map_err(|error| format!("could not start the conductor's thread: {error}"))?;
+
+        conductor_thread
+            .join()
+            .unwrap_or_else(|_| Err("the archive's conductor thread panicked".to_owned()))
+    });
+
+    // The conductor's end of both channels went with it, so the recorder's loop
+    // has ended or is about to — [`RecorderWorker::run`] returns when the
+    // commands channel is gone. Joining it here is what makes the stop a
+    // shutdown rather than an exit: a session still writing its segment is read
+    // to the end of its turn rather than abandoned mid-write.
+    let _ = recorder_handle.join();
+
+    if let Some(handle) = replayer_handle {
+        let _ = handle.join();
+    }
+
+    outcome
+}
+
+/// The archive's turn loop, on whichever thread runs it
+/// (`ArchiveConductor.doWork` and the runner around it,
+/// `org.agrona.concurrent.AgentRunner.run`).
+///
+/// `idle` is a strategy rather than a reference to one because
+/// `AgentRunner.run` owns the one its context gave it, and so does this.
+fn run_conductor(
+    name: &str,
+    conductor: &mut ArchiveConductor,
+    client: &mut Client,
+    half: &mut DriverHalf<'_>,
+    mut idle: deepmsg_driver::idle::Strategy,
+) -> Result<(), String> {
     loop {
         if let Some(signal) = sys::stop_signal() {
             conductor.signal_terminated();
@@ -481,14 +626,15 @@ pub fn run(
 
         // The driver first, so that everything the archive's turn hears is
         // already in the term buffers, then the archive. Under
-        // [`DriverHalf::Attached`] the first of those is another process's.
-        half.turn();
-        conductor
-            .do_work(&mut client, clock::epoch_millis())
+        // [`DriverHalf::Attached`] the first of those is another process's, and
+        // contributes no work — but the pass is still a pass.
+        let driven = half.turn();
+
+        let archived = conductor
+            .do_work(client, clock::epoch_millis())
             .map_err(|error| format!("the control plane stopped: {error}"))?;
 
-        // The reference's `ctx.idleStrategy()`, which the suite sets to `yield`.
-        std::thread::yield_now();
+        idle.idle(driven + archived);
     }
 }
 
