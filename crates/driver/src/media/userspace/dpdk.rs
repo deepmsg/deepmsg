@@ -134,6 +134,16 @@ pub enum DpdkError {
     /// The port would not report its extended statistics — its list of them, at
     /// open, or their values, on the timer.
     Extended(String),
+    /// A list of candidate ports arrived with no claim on any of them.
+    ///
+    /// Refused rather than resolved here because the claim has to happen
+    /// **before** the EAL ([`DpdkMedia::open`]'s note): a caller that hands over
+    /// a list without claiming from it is a caller whose driver would allow-list
+    /// every candidate and take them all.
+    Unclaimed {
+        /// What the configuration offered.
+        candidates: Vec<String>,
+    },
     /// A media is already open in this process.
     AlreadyOpen,
 }
@@ -170,6 +180,12 @@ impl std::fmt::Display for DpdkError {
                     "the port would not report its extended statistics: {error}"
                 )
             }
+            Self::Unclaimed { candidates } => write!(
+                f,
+                "a list of candidate ports has to be claimed before the media \
+                 opens, and this one was not: {} (`deepmsg.dpdk.ports`)",
+                candidates.join(", ")
+            ),
             Self::AlreadyOpen => f.write_str(
                 "a dpdk media is already open in this process: the EAL and the pool are \
                  process-wide, and neither can be made twice",
@@ -240,7 +256,11 @@ impl DpdkMedia {
     /// [`DpdkError`], whose variants name the step that answered: a missing
     /// setting, an EAL that would not start, a port that is not there, a port
     /// that cannot carry `pairs` queues, or a pool that could not be made.
-    pub fn open(settings: &DpdkSettings, mode: ThreadingMode) -> Result<Self, DpdkError> {
+    pub fn open(
+        settings: &DpdkSettings,
+        mode: ThreadingMode,
+        claimed: Option<&crate::media::userspace::port_claim::Claim>,
+    ) -> Result<Self, DpdkError> {
         if OPENED.get().is_some() {
             return Err(DpdkError::AlreadyOpen);
         }
@@ -253,13 +273,30 @@ impl DpdkMedia {
         // The CPUs the process has *now*, before the EAL moves anything: what
         // it is told is a set it may not exceed (§4.7).
         let cpus = sys::current_thread_affinity().map_err(DpdkError::Affinity)?;
-        let arguments = eal::arguments(settings, &cpus).map_err(DpdkError::Arguments)?;
+        // **The list is claimed before the EAL, by the caller**, and that order
+        // is the whole of what makes a list of ports work: the EAL holds every
+        // device it probes until the process ends, so a media that allowed
+        // several and picked one afterwards would have taken them all. A list
+        // with no claim is therefore refused rather than resolved here.
+        let picked = claimed.map(crate::media::userspace::port_claim::Claim::port);
+        if !settings.ports.is_empty() && picked.is_none() {
+            return Err(DpdkError::Unclaimed {
+                candidates: settings.ports.clone(),
+            });
+        }
+
+        let arguments = eal::arguments(settings, &cpus, picked).map_err(DpdkError::Arguments)?;
         Eal::init(&arguments).map_err(DpdkError::Eal)?;
 
         let found = Port::names();
-        let name = match &settings.port {
-            Some(name) => name.clone(),
-            None => found.first().cloned().ok_or(DpdkError::NoPort {
+        let name = match (&settings.port, picked) {
+            (Some(name), _) => name.clone(),
+            // The port this process claimed, which is also the only one the EAL
+            // was allowed to probe — read from the claim rather than from what
+            // the EAL found, so that a port that came up but cannot be
+            // described is reported as that instead of as "no port".
+            (None, Some(name)) => name.to_owned(),
+            (None, None) => found.first().cloned().ok_or(DpdkError::NoPort {
                 name: None,
                 found: found.clone(),
             })?,

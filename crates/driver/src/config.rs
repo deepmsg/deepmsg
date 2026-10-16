@@ -535,6 +535,10 @@ pub struct DpdkSettings {
     /// The port, by PCI address or virtual-device name; `None` takes the first
     /// one the EAL found.
     pub port: Option<String>,
+    /// The ports to choose from, in the order they are preferred. Empty when
+    /// the configuration named one port or none; [`Self::port`] is the same
+    /// thing with a list of one, and the two are refused together.
+    pub ports: Vec<String>,
     /// This port's own address and prefix length, which the media has no way
     /// to guess.
     pub address: Option<(Ipv4Addr, u8)>,
@@ -568,6 +572,7 @@ impl Default for DpdkSettings {
         Self {
             eal_args: String::new(),
             port: None,
+            ports: Vec::new(),
             address: None,
             gateway: None,
             static_neighbours: Vec::new(),
@@ -2125,6 +2130,22 @@ impl Setting {
         property: "dpdk.port",
         env: "DEEPMSG_DPDK_PORT",
     };
+    /// `deepmsg.dpdk.ports` (`DEEPMSG_DPDK_PORTS`): several ports to choose
+    /// from, comma separated, in the order they are preferred.
+    ///
+    /// **Why a list belongs in a driver**: a kernel-bypass port is exclusive,
+    /// and a test harness that starts one driver per case — each told the same
+    /// settings — has no way to give them different ports. Every driver takes
+    /// the first candidate nothing else is driving, so giving them all the same
+    /// list spreads them out.
+    ///
+    /// **What "one port" means here is the IOMMU group**: two functions of one
+    /// card can share a group, and a group belongs to one process at a time, so
+    /// those two addresses are one candidate between them.
+    const DPDK_PORTS: Self = Self {
+        property: "dpdk.ports",
+        env: "DEEPMSG_DPDK_PORTS",
+    };
     /// `deepmsg.dpdk.ipv4.address` (`DEEPMSG_DPDK_IPV4_ADDRESS`): this port's
     /// own address and prefix length, as `10.10.0.1/24`. Mandatory when the
     /// media is `dpdk` — it is what the stack answers ARP for and what decides
@@ -3245,12 +3266,51 @@ fn parse_dpdk(
     get: &impl Fn(&Setting) -> Option<String>,
     dpdk: &mut DpdkSettings,
 ) -> Result<(), ConfigError> {
+    // The list is read first: what it means for `eal.args` below is that the
+    // driver picks the port, so `-a` stops being the operator's to give — the
+    // same relationship `--lcores` has, one setting up.
+    if let Some(value) = get(&Setting::DPDK_PORTS) {
+        for candidate in value.split(',') {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                // An empty candidate — `a,,b`, or a trailing comma — is a
+                // list with a hole in it, and a driver that skipped the hole
+                // would be one that took a port it was not offered.
+                return Err(ConfigError::MalformedValue {
+                    name: Setting::DPDK_PORTS.property,
+                    value: value.clone(),
+                });
+            }
+
+            dpdk.ports.push(candidate.to_owned());
+        }
+    }
+
+    if let Some(value) = get(&Setting::DPDK_PORT) {
+        if !dpdk.ports.is_empty() {
+            return Err(ConfigError::ConflictingSettings {
+                first: Setting::DPDK_PORT.property,
+                second: Setting::DPDK_PORTS.property,
+            });
+        }
+
+        dpdk.port = Some(value);
+    }
+
     if let Some(value) = get(&Setting::DPDK_EAL_ARGS) {
         for argument in value.split_whitespace() {
             // The flag alone, or the flag with a value: `-l 2-3` and `-l2-3`
             // are both the EAL's, and both are refused.
             let flag = argument.split('=').next().unwrap_or(argument);
-            if matches!(
+            // **`-a` is the driver's once it has a list to choose from.** With
+            // one port named (`dpdk.port`) the allow-list is the operator's and
+            // has to be — that is how the EAL is told about the port at all.
+            // With several, the driver picks one and has to be the one that
+            // says which: an operator's `-a` would either re-admit every
+            // candidate (which is how a driver ends up holding all of them) or
+            // allow-list one the driver did not take.
+            let picks_the_port = !dpdk.ports.is_empty();
+            let owned = matches!(
                 flag,
                 "-l" | "-c"
                     | "--lcores"
@@ -3261,7 +3321,10 @@ fn parse_dpdk(
                     | "--log-level"
             ) || argument.starts_with("-l")
                 || argument.starts_with("-c")
-            {
+                || (picks_the_port && matches!(flag, "-a" | "--allow" | "-b" | "--block"))
+                || (picks_the_port && argument.starts_with("-a"));
+
+            if owned {
                 return Err(ConfigError::DpdkEalArgument {
                     name: Setting::DPDK_EAL_ARGS.property,
                     argument: argument.to_owned(),
@@ -3273,9 +3336,6 @@ fn parse_dpdk(
         dpdk.eal_args = value;
     }
 
-    if let Some(value) = get(&Setting::DPDK_PORT) {
-        dpdk.port = Some(value);
-    }
     if let Some(value) = get(&Setting::DPDK_IPV4_ADDRESS) {
         dpdk.address = Some(parse_ipv4_prefix(&Setting::DPDK_IPV4_ADDRESS, &value)?);
     }
@@ -5409,6 +5469,86 @@ mod tests {
                 ) => {}
                 other => panic!("{property}={value} must be refused, got {other:?}"),
             }
+        }
+    }
+
+    /// **A list of ports makes the allow-list the driver's, and one port does
+    /// not.** Both directions, because the difference is the rule: with
+    /// `dpdk.port` the operator has to be the one who tells the EAL about the
+    /// port they named, and with `dpdk.ports` the driver picks and therefore
+    /// says which — an operator's `-a` beside a list would either re-admit every
+    /// candidate (the driver then holds them all, which is the failure the list
+    /// exists to avoid) or allow-list one the driver did not take.
+    #[test]
+    fn a_list_of_ports_makes_the_allow_list_the_drivers_and_a_named_port_does_not() {
+        // Named one port: the operator's `-a` is how the EAL hears about it.
+        let one = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.port", "0000:03:00.0"),
+            ("deepmsg.dpdk.eal.args", "-a 0000:03:00.0"),
+        ])
+        .expect("a config");
+        assert_eq!(Some("0000:03:00.0".to_owned()), one.dpdk.port);
+        assert!(one.dpdk.ports.is_empty());
+
+        // A list: the driver picks, so the allow-list is its own.
+        for argument in ["-a 0000:03:00.0", "--allow=0000:03:00.0", "-a0000:03:00.0"] {
+            let value = format!("--vdev=net_null0 {argument}");
+            match resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.ports", "0000:03:00.0,0000:03:00.1"),
+                ("deepmsg.dpdk.eal.args", &value),
+            ]) {
+                Err(ConfigError::DpdkEalArgument {
+                    argument: refused, ..
+                }) => {
+                    assert!(value.contains(&refused), "{refused} was in {value}");
+                }
+                other => panic!("{value} beside a list must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The list itself: read in order, and a hole in it is refused rather than
+    /// skipped — a driver that skipped one would be a driver that took a port
+    /// it was not offered.
+    #[test]
+    fn a_list_of_ports_is_read_in_order_and_a_hole_in_it_is_refused() {
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.ports", " 0000:03:00.0 , 0000:03:00.1 "),
+        ])
+        .expect("a config");
+        assert_eq!(
+            vec!["0000:03:00.0".to_owned(), "0000:03:00.1".to_owned()],
+            config.dpdk.ports,
+            "trimmed, and in the order the configuration gave them"
+        );
+
+        for value in ["0000:03:00.0,,0000:03:00.1", "0000:03:00.0,", ","] {
+            match resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.ports", value),
+            ]) {
+                Err(ConfigError::MalformedValue { name, .. }) => assert_eq!("dpdk.ports", name),
+                other => panic!("{value:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// Naming one port *and* offering a list is two answers to one question.
+    #[test]
+    fn a_list_and_a_named_port_are_refused_together() {
+        match resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.port", "0000:03:00.0"),
+            ("deepmsg.dpdk.ports", "0000:03:00.1,0000:03:00.0"),
+        ]) {
+            Err(ConfigError::ConflictingSettings { first, second }) => {
+                assert_eq!("dpdk.port", first);
+                assert_eq!("dpdk.ports", second);
+            }
+            other => panic!("naming one port and a list must be refused, got {other:?}"),
         }
     }
 

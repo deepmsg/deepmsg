@@ -58,6 +58,7 @@ pub mod fake_port;
 pub mod frame;
 pub mod neighbour;
 pub mod packet_io;
+pub mod port_claim;
 pub mod ports;
 pub mod stack;
 pub mod transport;
