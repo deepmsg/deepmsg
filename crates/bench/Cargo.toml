@@ -10,6 +10,12 @@ publish = false
 [dependencies]
 deepmsg-core = { path = "../core" }
 deepmsg-client = { path = "../client" }
+# The archive node is a port of the reference's `ArchiveNode`, so it is a client of
+# the archive: it starts a recording and reads the recording-position counter the
+# archive allocates. `deepmsg-tests` already depends on this crate, so the wall
+# between "the product" and "the instruments" is unchanged — nothing here is
+# linked into a driver or a client.
+deepmsg-archive = { path = "../archive" }
 # The instrument the latency numbers come out of, and the shape of them: both
 # are what this crate *is*, not a test-only convenience.
 hdrhistogram = "7.5.4"

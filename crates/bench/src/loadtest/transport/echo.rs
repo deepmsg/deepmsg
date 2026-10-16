@@ -32,15 +32,11 @@ use std::path::{Path, PathBuf};
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_client::fragment_assembler::FragmentAssembler;
 use deepmsg_client::image::Fragment;
-use deepmsg_client::publication::ExclusivePublication;
-use deepmsg_core::buffer::ReadWrite;
-use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_core::logbuffer::frame::{DATA_HEADER_LENGTH, Frame};
 
 use crate::loadtest::config::{Configuration, IdleStrategy};
 use crate::loadtest::recorder::Recorder;
 use crate::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock, TransceiverError};
-use crate::loadtest::transport::sender::{Kind, MessageSender, Outbound, Published};
+use crate::loadtest::transport::sender::{Kind, MessageSender, PublicationOutbound};
 use crate::loadtest::transport::util::{
     ChannelSettings, MIN_MESSAGE_LENGTH, TIMESTAMP_OFFSET, await_connected,
 };
@@ -461,7 +457,7 @@ fn poll_messages<C: Clock>(
 ///
 /// `None` for a frame too short to be one of this run's messages, which is the
 /// check the message door made against the assembled payload.
-fn fragment_fields(fragment: &Fragment<'_>) -> Option<(i64, i64)> {
+pub(crate) fn fragment_fields(fragment: &Fragment<'_>) -> Option<(i64, i64)> {
     let length = fragment.payload_length();
 
     if length < MIN_MESSAGE_LENGTH {
@@ -475,7 +471,7 @@ fn fragment_fields(fragment: &Fragment<'_>) -> Option<(i64, i64)> {
 }
 
 /// The same two fields, out of an assembled message's payload.
-fn payload_fields(payload: &[u8]) -> Option<(i64, i64)> {
+pub(crate) fn payload_fields(payload: &[u8]) -> Option<(i64, i64)> {
     if payload.len() < MIN_MESSAGE_LENGTH {
         return None;
     }
@@ -540,83 +536,4 @@ fn window_limit(client: &Client, publication: i64) -> i64 {
         .counters_reader()
         .and_then(|counters| counters.value(counter_id))
         .unwrap_or(0)
-}
-
-/// The publication a sender writes into.
-struct PublicationOutbound<'a> {
-    client: &'a Client,
-    /// The publication this batch writes into, resolved **once for the batch**.
-    ///
-    /// The reference's sender holds the `ExclusivePublication` object itself
-    /// (`MessageSender.java:52`), so nothing on its per-message path looks one
-    /// up. This could not hold one either until the client let it: the
-    /// registration id was the only handle, and every message paid the linear
-    /// scan of `Client::exclusive_publication` to turn it back into a
-    /// publication. `None` when the client no longer holds it, which is what
-    /// each message answered for itself before — and it cannot appear or vanish
-    /// inside a batch, because the duty cycle that would move it is not run
-    /// while this is sending.
-    publication: Option<&'a ExclusivePublication>,
-    /// What the **offer** path needs and the claim path no longer does: it hands
-    /// the id back to `Client::offer_exclusive`, which resolves the publication
-    /// and reads its limit itself. A run that claims does not come through here
-    /// at all (`use.try.claim`), and a run that offers is measuring the offer.
-    registration_id: i64,
-    /// The window, held by the transceiver so that it outlives one batch.
-    window: &'a mut i64,
-}
-
-/// Read a publication's window limit from the driver's counter.
-fn read_window(client: &Client, publication: &ExclusivePublication) -> i64 {
-    client
-        .counters_reader()
-        .and_then(|counters| counters.value(publication.position_limit_counter_id()))
-        .unwrap_or(0)
-}
-
-impl Outbound for PublicationOutbound<'_> {
-    fn claim<W: FnMut(&Frame<'_, ReadWrite>)>(&mut self, length: usize, mut write: W) -> Published {
-        // A claim takes the limit as an argument and there is no client-level
-        // one that would read it, so the limit is kept here and re-read only
-        // when the log says the window it describes is used up — which is what
-        // the reference's client does inside its own append. Reporting that
-        // first answer as back pressure would spend one of the sender's three
-        // attempts on a window that had merely moved.
-        let Some(publication) = self.publication else {
-            // The publication is gone from under the client.
-            return Err(Appended::Malformed);
-        };
-
-        let mut outcome = publication.try_claim(*self.window, length);
-
-        if matches!(
-            outcome,
-            Err(Appended::BackPressured | Appended::NotConnected)
-        ) {
-            *self.window = read_window(self.client, publication);
-            outcome = publication.try_claim(*self.window, length);
-        }
-
-        // Bound rather than inlined: a frame borrows the claim it came from.
-        let claim = outcome?;
-        let frame = claim.frame();
-        write(&frame);
-
-        let frame_length = i32::try_from(length + DATA_HEADER_LENGTH).unwrap_or(i32::MAX);
-
-        match frame.publish(frame_length) {
-            Some(()) => Ok(()),
-            // The frame did not fit where it was claimed, which the appender
-            // only finds out on publishing it.
-            None => Err(Appended::Malformed),
-        }
-    }
-
-    fn offer(&mut self, payload: &[u8]) -> Published {
-        match self.client.offer_exclusive(self.registration_id, payload) {
-            Some(Appended::Ok { .. }) => Ok(()),
-            Some(other) => Err(other),
-            None => Err(Appended::Malformed),
-        }
-    }
 }

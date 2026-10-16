@@ -20,14 +20,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_client::fragment_assembler::FragmentAssembler;
-use deepmsg_core::logbuffer::append::Appended;
 
 use crate::loadtest::config::IdleStrategy;
 use crate::loadtest::transceiver::{Idle, SystemClock, TransceiverError};
 use crate::loadtest::transport::echo::i32_at;
 use crate::loadtest::transport::util::{
-    ChannelSettings, MIN_MESSAGE_LENGTH, RECEIVER_INDEX_OFFSET, await_connected,
-    check_publication_result,
+    ChannelSettings, MIN_MESSAGE_LENGTH, RECEIVER_INDEX_OFFSET, await_connected, images,
+    offer_until_accepted, window_limit,
 };
 
 /// A node that echoes, until it is told to stop or the client goes away.
@@ -215,7 +214,7 @@ impl EchoNode {
                             // log, and the reply does not wait for the rest of the
                             // batch the way it did when this node collected a poll
                             // and answered it afterwards.
-                            echo(&mut idle, || writer.offer(fragment));
+                            offer_until_accepted(&mut idle, || writer.offer(fragment));
                             arrived += 1;
 
                             return;
@@ -237,7 +236,7 @@ impl EchoNode {
                                 return;
                             }
 
-                            echo(&mut idle, || writer.offer_bytes(payload));
+                            offer_until_accepted(&mut idle, || writer.offer_bytes(payload));
                             arrived += 1;
                         });
                     },
@@ -270,49 +269,6 @@ impl EchoNode {
     pub fn close(&mut self) {
         self.client.close();
     }
-}
-
-/// Send one message back, waiting as long as it takes.
-///
-/// The reference's node loops on a negative offer without a bound — it is the
-/// only thing this process has to do, and giving up would drop a message the
-/// client is timing.
-fn echo(idle: &mut IdleStrategy, offer: impl Fn() -> Appended) {
-    idle.reset();
-
-    loop {
-        match offer() {
-            Appended::Ok { .. } => return,
-            other => match check_publication_result(other, idle) {
-                Ok(_) => {}
-                Err(error) => panic!("{error}"),
-            },
-        }
-    }
-}
-
-/// How many images the subscription has, which is how many publishers it hears.
-fn images(client: &Client, subscription: i64) -> usize {
-    client
-        .subscription(subscription)
-        .map_or(0, |subscription| subscription.images().len())
-}
-
-/// The publication's position limit — see `echo::window_limit`, which this
-/// repeats because a node and a client are separate connections to the same
-/// driver.
-fn window_limit(client: &Client, publication: i64) -> i64 {
-    let Some(counter_id) = client
-        .exclusive_publication(publication)
-        .map(|publication| publication.position_limit_counter_id())
-    else {
-        return 0;
-    };
-
-    client
-        .counters_reader()
-        .and_then(|counters| counters.value(counter_id))
-        .unwrap_or(0)
 }
 
 /// The fields the node reads, re-exported so that a test can check it read the

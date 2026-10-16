@@ -27,7 +27,10 @@ use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
 use deepmsg_bench::loadtest::transceiver::{MessageTransceiver, SystemClock};
 use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
+use deepmsg_bench::loadtest::transport::live_recording::LiveRecordingTransceiver;
+use deepmsg_bench::loadtest::transport::live_replay::LiveReplayTransceiver;
 use deepmsg_bench::loadtest::transport::util::ChannelSettings;
+use deepmsg_bench::loadtest::transport::util::archive_context;
 
 /// What this program accepts.
 const USAGE: &str = "\
@@ -147,6 +150,26 @@ fn run() -> Result<(), String> {
 
     match kind {
         Transceiver::InMemory => measure(configuration, InMemoryTransceiver::new())?,
+        Transceiver::LiveReplay => {
+            let channels =
+                ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
+            let context = archive_context(&settings, &channels.directory);
+
+            let transceiver = LiveReplayTransceiver::new(channels, idle, &context)
+                .map_err(|error| error.to_string())?;
+
+            measure(configuration, transceiver)?;
+        }
+        Transceiver::LiveRecording => {
+            let channels =
+                ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
+            let context = archive_context(&settings, &channels.directory);
+
+            let transceiver = LiveRecordingTransceiver::new(channels, idle, &context)
+                .map_err(|error| error.to_string())?;
+
+            measure(configuration, transceiver)?;
+        }
         Transceiver::Echo => {
             let channels =
                 ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;

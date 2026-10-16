@@ -9,9 +9,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use deepmsg_archive::client::ArchiveContext;
+use deepmsg_archive::client::context::{
+    AERON_DIR_ENV, CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV,
+};
+use deepmsg_client::client::Client;
 use deepmsg_core::logbuffer::append::Appended;
 
-use crate::loadtest::config::{ConfigError, Properties};
+use crate::loadtest::config::{ConfigError, IdleStrategy, Properties};
 use crate::loadtest::transceiver::{Clock, Idle};
 
 /// `AeronUtil.TIMESTAMP_OFFSET`: the message's timestamp is at its front.
@@ -48,6 +53,18 @@ pub const DEFAULT_SOURCE_CHANNEL: &str = "aeron:udp?endpoint=localhost:13334|mtu
 /// The stream a client reads replies from.
 pub const DEFAULT_SOURCE_STREAM: i32 = 55555;
 
+/// The channel an `ArchiveNode` publishes what it forwards **into**, which is
+/// the one an archive records (`AeronUtil.RECORD_CHANNEL_PROP_NAME`, whose
+/// default is `AeronUtil.IPC_CHANNEL`, `:103` and `:208-216`).
+///
+/// ★ **IPC, where the other two are UDP.** That is the reference's default and
+/// not this build's choice, and it is the reason the archive-vs-Java batch is a
+/// single-machine one: an IPC channel does not cross a network, so a cell that
+/// leaves this default cannot be run between two hosts.
+pub const DEFAULT_RECORD_CHANNEL: &str = "aeron:ipc";
+/// The stream an `ArchiveNode`'s recording carries (`AeronUtil:224-226`).
+pub const DEFAULT_RECORD_STREAM: i32 = 99999;
+
 /// How long to wait for a publication and a subscription to find each other.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -61,6 +78,10 @@ pub mod property {
     pub const SOURCE_CHANNEL: &str = "io.aeron.benchmarks.aeron.source.channel";
     /// `AeronUtil.SOURCE_STREAM_PROP_NAME`.
     pub const SOURCE_STREAM: &str = "io.aeron.benchmarks.aeron.source.stream";
+    /// `AeronUtil.RECORD_CHANNEL_PROP_NAME` — the channel an archive records.
+    pub const RECORD_CHANNEL: &str = "io.aeron.benchmarks.aeron.record.channel";
+    /// `AeronUtil.RECORD_STREAM_PROP_NAME`.
+    pub const RECORD_STREAM: &str = "io.aeron.benchmarks.aeron.record.stream";
     /// `AeronUtil.NUMBER_OF_RECEIVERS_PROP_NAME`.
     pub const RECEIVER_COUNT: &str = "io.aeron.benchmarks.aeron.receiver.count";
     /// `AeronUtil.RECEIVER_INDEX_PROP_NAME`.
@@ -100,6 +121,11 @@ pub struct ChannelSettings {
     pub source_channel: String,
     /// The stream it reads replies on.
     pub source_stream: i32,
+    /// The channel an [`ArchiveNode`](crate::loadtest::transport::archive_node::ArchiveNode)
+    /// forwards into, and which an archive records.
+    pub record_channel: String,
+    /// The stream that recording carries.
+    pub record_stream: i32,
     /// How many receivers the far end has, which is how many replies one message
     /// earns.
     pub receiver_count: i32,
@@ -134,6 +160,9 @@ impl ChannelSettings {
             source_channel: text(properties, property::SOURCE_CHANNEL)
                 .unwrap_or_else(|| DEFAULT_SOURCE_CHANNEL.to_owned()),
             source_stream: properties.integer_or(property::SOURCE_STREAM, DEFAULT_SOURCE_STREAM)?,
+            record_channel: text(properties, property::RECORD_CHANNEL)
+                .unwrap_or_else(|| DEFAULT_RECORD_CHANNEL.to_owned()),
+            record_stream: properties.integer_or(property::RECORD_STREAM, DEFAULT_RECORD_STREAM)?,
             receiver_count: properties.integer_or(property::RECEIVER_COUNT, 1)?,
             receiver_index: properties.integer_or(property::RECEIVER_INDEX, 0)?,
             // `Boolean.parseBoolean(System.getProperty(name, "true"))`: only a
@@ -265,6 +294,96 @@ pub fn check_publication_result(
     }
 }
 
+/// Offer until the message is in the log, however long that takes.
+///
+/// The reference's node loops on a negative offer **without a bound** — it is the
+/// only thing that process has to do, and giving up would drop a message the client
+/// is timing — and so does this. A result that is neither "written" nor "try again"
+/// is a broken publication rather than a slow one, and panics for the reason
+/// [`check_publication_result`] gives.
+///
+/// # Panics
+///
+/// When the publication is not merely slow.
+pub fn offer_until_accepted(idle: &mut IdleStrategy, offer: impl Fn() -> Appended) {
+    idle.reset();
+
+    loop {
+        match offer() {
+            Appended::Ok { .. } => return,
+            other => match check_publication_result(other, idle) {
+                Ok(_) => {}
+                Err(error) => panic!("{error}"),
+            },
+        }
+    }
+}
+
+/// How many images a subscription has, which is how many publishers it hears.
+#[must_use]
+pub fn images(client: &Client, subscription: i64) -> usize {
+    client
+        .subscription(subscription)
+        .map_or(0, |subscription| subscription.images().len())
+}
+
+/// The publication's position limit, which is how far it may write.
+///
+/// Read from the counter rather than asked of the publication: the window is the
+/// driver's number, and a publication that has not been written to yet has none of
+/// its own (`echo::window_limit`, repeated here because a node and a client are
+/// separate connections to the same driver).
+#[must_use]
+pub fn window_limit(client: &Client, publication: i64) -> i64 {
+    let Some(counter_id) = client
+        .exclusive_publication(publication)
+        .map(|publication| publication.position_limit_counter_id())
+    else {
+        return 0;
+    };
+
+    client
+        .counters_reader()
+        .and_then(|counters| counters.value(counter_id))
+        .unwrap_or(0)
+}
+
+/// `AeronArchive.Configuration.CONTROL_CHANNEL_PROP_NAME` (`:2698`) — the channel
+/// an archive is reached on, under the **reference client's** name.
+pub const ARCHIVE_CONTROL_CHANNEL: &str = "aeron.archive.control.channel";
+/// `AeronArchive.Configuration.CONTROL_RESPONSE_CHANNEL_PROP_NAME` (`:2752`).
+pub const ARCHIVE_CONTROL_RESPONSE_CHANNEL: &str = "aeron.archive.control.response.channel";
+
+/// The archive a run reaches, out of the same properties the channels come from.
+///
+/// ★ **The reference client's spelling, mapped onto this client's context.** A cell
+/// describes its archive the same way whichever archive that cell ran — that is what
+/// makes two cells comparable — and this build's client is configured through
+/// `AERON_ARCHIVE_*` environment names instead. The mapping is here, in one place,
+/// precisely because it is the seam: the *cell* is the thing that must look the same
+/// on both sides, and the client's own spelling is an implementation detail of one of
+/// the two.
+#[must_use]
+pub fn archive_context(properties: &Properties, directory: &std::path::Path) -> ArchiveContext {
+    ArchiveContext::resolve(&[
+        (AERON_DIR_ENV.to_owned(), directory.display().to_string()),
+        (
+            CONTROL_CHANNEL_ENV.to_owned(),
+            properties
+                .get(ARCHIVE_CONTROL_CHANNEL)
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV.to_owned(),
+            properties
+                .get(ARCHIVE_CONTROL_RESPONSE_CHANNEL)
+                .unwrap_or("")
+                .to_owned(),
+        ),
+    ])
+}
+
 /// Wait until something is true, or give up.
 ///
 /// `AeronUtil.awaitConnected`: an idle yield in a loop against a deadline, so
@@ -328,6 +447,13 @@ mod tests {
         assert_eq!(settings.destination_stream, 77777);
         assert_eq!(settings.source_channel, DEFAULT_SOURCE_CHANNEL);
         assert_eq!(settings.source_stream, 55555);
+        assert_eq!(
+            settings.record_channel, DEFAULT_RECORD_CHANNEL,
+            "★ and this one is IPC, where the other two are UDP — the reference's \
+             default, and the reason a cell that leaves it cannot be run between \
+             two hosts"
+        );
+        assert_eq!(settings.record_stream, 99999);
         assert_eq!(settings.receiver_count, 1);
         assert_eq!(settings.receiver_index, 0);
         assert!(

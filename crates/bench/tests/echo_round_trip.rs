@@ -21,7 +21,9 @@ use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock};
 use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
 use deepmsg_bench::loadtest::transport::node::EchoNode;
-use deepmsg_bench::loadtest::transport::util::{ChannelSettings, MIN_MESSAGE_LENGTH};
+use deepmsg_bench::loadtest::transport::util::{
+    ChannelSettings, DEFAULT_RECORD_CHANNEL, DEFAULT_RECORD_STREAM, MIN_MESSAGE_LENGTH,
+};
 use deepmsg_tests::driver::{self, OwnDriver};
 
 /// Both channels are shared memory: this is a test of the two halves agreeing,
@@ -81,6 +83,8 @@ fn settings(directory: &std::path::Path, use_try_claim: bool) -> ChannelSettings
         source_stream: NODE_TO_CLIENT_STREAM,
         receiver_count: 1,
         receiver_index: 0,
+        record_channel: DEFAULT_RECORD_CHANNEL.to_owned(),
+        record_stream: DEFAULT_RECORD_STREAM,
         // The default a run uses, so this exercises the claim path: the client
         // claims, writes its three fields where the message will lie, publishes.
         use_try_claim,

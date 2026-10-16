@@ -26,7 +26,9 @@ use deepmsg_bench::loadtest::result::Status;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
 use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
 use deepmsg_bench::loadtest::transport::node::EchoNode;
-use deepmsg_bench::loadtest::transport::util::ChannelSettings;
+use deepmsg_bench::loadtest::transport::util::{
+    ChannelSettings, DEFAULT_RECORD_CHANNEL, DEFAULT_RECORD_STREAM,
+};
 use deepmsg_tests::driver::{self, OwnDriver};
 
 /// The reference's two destinations.
@@ -56,6 +58,8 @@ fn settings(directory: &std::path::Path, receiver_index: i32) -> ChannelSettings
         source_stream: SOURCE_STREAM,
         receiver_count: NUM_DESTINATIONS,
         receiver_index,
+        record_channel: DEFAULT_RECORD_CHANNEL.to_owned(),
+        record_stream: DEFAULT_RECORD_STREAM,
         use_try_claim: true,
         fragment_limit: 10,
         connection_timeout: Duration::from_secs(20),

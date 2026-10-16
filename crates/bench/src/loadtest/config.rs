@@ -447,11 +447,31 @@ pub enum Transceiver {
     /// Publish to a node and read what comes back
     /// (`EchoMessageTransceiver`), over whatever channel the settings name.
     Echo,
+    /// Publish to an archive node and read back **the recording it made**
+    /// (`LiveReplayMessageTransceiver`): the reply is a byte the archive wrote to
+    /// disk and replayed, which is what makes this the client of a *recording*
+    /// measurement rather than of a round trip.
+    ///
+    /// It needs more than the channels: the archive has to be named
+    /// (`aeron.archive.control.channel`, `.control.response.channel`), and the
+    /// node of the run has to be running before the client looks for its
+    /// recording.
+    LiveReplay,
+    /// Record the stream it sends into and read back what the archive has
+    /// recorded so far (`LiveRecordingMessageTransceiver`): the read is paced by
+    /// the archive's **recording events**, so a run measures the recording path up
+    /// to the client rather than the network.
+    ///
+    /// It needs everything `LiveReplay` does plus the events channel
+    /// (`aeron.archive.recording.events.channel`), which is what the pacing is
+    /// told by.
+    LiveRecording,
 }
 
 impl Transceiver {
     /// The names this accepts.
-    pub const NAMES: &'static [&'static str] = &["in-memory", "echo"];
+    pub const NAMES: &'static [&'static str] =
+        &["in-memory", "echo", "live-replay", "live-recording"];
 
     /// The name a properties file holds.
     #[must_use]
@@ -459,6 +479,8 @@ impl Transceiver {
         match self {
             Self::InMemory => "in-memory",
             Self::Echo => "echo",
+            Self::LiveReplay => "live-replay",
+            Self::LiveRecording => "live-recording",
         }
     }
 
@@ -467,6 +489,8 @@ impl Transceiver {
         match text {
             "in-memory" => Ok(Self::InMemory),
             "echo" => Ok(Self::Echo),
+            "live-replay" => Ok(Self::LiveReplay),
+            "live-recording" => Ok(Self::LiveRecording),
             other => Err(ConfigError::UnknownTransceiver {
                 value: other.to_owned(),
             }),
@@ -1575,7 +1599,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "no message transceiver named 'echo-udp'; known: in-memory, echo"
+            "no message transceiver named 'echo-udp'; known: in-memory, echo, live-replay, live-recording"
         );
     }
 
