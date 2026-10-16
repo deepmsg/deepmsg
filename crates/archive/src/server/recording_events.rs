@@ -26,9 +26,20 @@
 //! [`encode_started`], [`encode_progress`] and [`encode_stopped`] are free
 //! functions over a buffer: the bytes are the contract — the client's own
 //! `RecordingEventsAdapter` reads them — and a contract that can only be reached
-//! through a live publication is a contract nobody tests. [`RecordingEvents`] is
-//! then the thin part: offer what was built, and answer the two ways that can go
+//! through a live publication is a contract nobody tests. [`RecordingEventsProxy`]
+//! is then the thin part: offer what was built, and answer the ways that can go
 //! (`RecordingEventsProxy.checkResult`).
+//!
+//! # Three sends, and a seam in front of them
+//!
+//! [`RecordingEvents`] is a **trait**, the twin of
+//! [`RecordingImage`](super::recording_session::RecordingImage) and of
+//! [`crate::server::replay_session::Publication`], and for the same reason: what
+//! the session needs is three sends, and the publication is one answer to them
+//! while a unit test's is another. The three decisions that can be wrong —
+//! whether a progress event is sent again, whether a dropped one is retried,
+//! what a fatal answer does to the session — are then testable without a mapped
+//! log, which is the whole of what a driver would otherwise be needed for.
 //!
 //! # What is not the reference's, and says so
 //!
@@ -36,12 +47,20 @@
 //!   and `stopped` (`tryClaim`) and encodes in place; this encodes into the
 //!   proxy's own buffer and offers it. The frame on the wire is the same; the
 //!   difference is one copy per event.
-//! - ★ **`Publication.CLOSED` has no counterpart here.** The reference's
-//!   `checkResult` throws on it as well as on `MAX_POSITION_EXCEEDED`, but this
-//!   build's client cannot report it: a publication whose log is gone offers
-//!   `Appended::Malformed` (`crates/client/src/publication.rs:565-567`), and the
-//!   replay path has the same gap. [`EventsError`] therefore names only what can
-//!   actually happen, rather than a variant nothing can produce.
+//! - ★ **`Publication.CLOSED` is a state this build's client cannot reach**, and
+//!   that is a difference between the two ownership models rather than a missing
+//!   case. The reference's `checkResult` throws on it as well as on
+//!   `MAX_POSITION_EXCEEDED`, because its `Publication` is **reference-counted**:
+//!   `Client.close()` can close one while a caller still holds it. Here a
+//!   publication leaves the client by **move** — `take_exclusive_publication`
+//!   removes it from the list (`crates/client/src/client.rs:1205`) and
+//!   `forget_exclusive_publication` drops what is left (`:2776`) — so there is no
+//!   moment at which a caller holds a publication the client has closed. What a
+//!   publication with no usable log can still answer is
+//!   `Appended::Malformed` (`crates/client/src/publication.rs:565-567`), and for
+//!   a publication that cannot be closed that is the right answer.
+//!   [`EventsError`] therefore names only what can actually happen, rather than a
+//!   variant nothing can produce.
 
 use std::fmt;
 
@@ -171,18 +190,110 @@ pub fn encode_stopped(
     HEADER_LENGTH + encoder.encoded_length()
 }
 
+/// The recording events, as a recording session sees them — the three sends of
+/// `io.aeron.archive.RecordingEventsProxy` (`:28-128`).
+///
+/// See the module note for why this is a trait. [`RecordingEventsProxy`] is the
+/// real answer; a test's is its own.
+pub trait RecordingEvents {
+    /// `RecordingEventsProxy.started` (`:53-73`).
+    ///
+    /// # Errors
+    ///
+    /// [`EventsError::Exhausted`] when the position is finished, which the
+    /// reference throws rather than swallowing (`:139-142`).
+    #[allow(clippy::too_many_arguments)] // one per field of the message, as the reference's own signature has
+    fn started(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        start_position: i64,
+        session_id: i32,
+        stream_id: i32,
+        channel: &str,
+        source_identity: &str,
+    ) -> Result<(), EventsError>;
+
+    /// `RecordingEventsProxy.progress` (`:75-95`), which answers whether the
+    /// event went out.
+    ///
+    /// ★ **The caller is what makes that answer matter**: the reference only
+    /// advances `progressEventPosition` when this returns true
+    /// (`RecordingSession.java:249-254`), so a progress event that was dropped is
+    /// sent again rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`EventsError`] as [`RecordingEvents::started`].
+    fn progress(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        start_position: i64,
+        position: i64,
+    ) -> Result<bool, EventsError>;
+
+    /// `RecordingEventsProxy.stopped` (`:97-127`).
+    ///
+    /// # Errors
+    ///
+    /// [`EventsError`] as [`RecordingEvents::started`].
+    fn stopped(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        recording_id: i64,
+        start_position: i64,
+        stop_position: i64,
+    ) -> Result<(), EventsError>;
+}
+
+/// What one offer answered, in the three shapes a caller acts on
+/// (`RecordingEventsProxy`'s `started` and `progress`).
+///
+/// The reference branches on the answer three different ways: `started` and
+/// `stopped` break on a write **or** on `NOT_CONNECTED` and retry otherwise
+/// (`:64-71`, `:100-113`), while `progress` sends **once** and answers `true`
+/// only for a write (`:81-92`). Naming the three shapes is what keeps the two
+/// from being written as one loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    /// The bytes are in the term.
+    Sent,
+    /// Nobody is subscribed, which the reference does **not** retry: an archive
+    /// with no reader is not an archive in trouble (`:68`, `:107`).
+    NotConnected,
+    /// The window is used up or the log is mid-rotation: worth another attempt
+    /// (`Appended::EndOfLog`, `crates/core/src/logbuffer/append.rs:47-56`).
+    TryAgain,
+}
+
+/// `RecordingEventsProxy.checkResult` (`:129-144`) over one offer's answer, and
+/// the two answers it does not act on.
+///
+/// The fatal one is [`EventsError::Exhausted`], and it is fatal **immediately**:
+/// the reference calls `checkResult` inside its two attempt loops and lets the
+/// throw out, so a publication at its maximum is not retried three times.
+fn classify(appended: Appended, term_length: i32) -> Result<Offered, EventsError> {
+    match appended {
+        Appended::Ok { .. } => Ok(Offered::Sent),
+        Appended::NotConnected => Ok(Offered::NotConnected),
+        Appended::MaxPositionExceeded => Err(EventsError::Exhausted { term_length }),
+        _ => Ok(Offered::TryAgain),
+    }
+}
+
 /// The events publication, and the buffer one event is built in.
 ///
 /// Held by whatever runs the sessions — see the module note. Every method takes
 /// the counters region, because the window a publication may write to is the
 /// driver's `position_limit` counter and not something the publication knows
 /// ([`position_limit`], the same helper the replay path uses).
-pub struct RecordingEvents {
+pub struct RecordingEventsProxy {
     publication: ExclusivePublication,
     buffer: Vec<u8>,
 }
 
-impl RecordingEvents {
+impl RecordingEventsProxy {
     /// The publication the conductor has already built and taken out of its
     /// client.
     #[must_use]
@@ -200,14 +311,27 @@ impl RecordingEvents {
         self.publication.session_id()
     }
 
-    /// `RecordingEventsProxy.started` (`:53-73`).
+    /// One offer, its answer classified.
     ///
-    /// # Errors
-    ///
-    /// [`EventsError`] when the position is exhausted, which the reference
-    /// throws rather than swallowing (`:139-142`).
-    #[allow(clippy::too_many_arguments)] // one per field of the message, as the reference's own signature has
-    pub fn started(
+    /// An **associated** function rather than a method: the payload is a slice
+    /// of `self.buffer` while the publication is written to, and the two fields
+    /// have to be borrowed apart for that to be possible at all.
+    fn attempt(
+        publication: &ExclusivePublication,
+        payload: &[u8],
+        counters: &CountersReader<'_, ReadWrite>,
+    ) -> Result<Offered, EventsError> {
+        let limit = position_limit(publication, counters);
+
+        classify(
+            publication.offer(limit, payload),
+            publication.term_buffer_length(),
+        )
+    }
+}
+
+impl RecordingEvents for RecordingEventsProxy {
+    fn started(
         &mut self,
         counters: &CountersReader<'_, ReadWrite>,
         recording_id: i64,
@@ -227,21 +351,20 @@ impl RecordingEvents {
             source_identity,
         );
 
-        Self::offer(&self.publication, &self.buffer[..length], counters)
+        // The reference's `do`/`while (--attempts > 0)` (`:63-72`): a write or
+        // `NOT_CONNECTED` ends it, anything else is tried again, and a
+        // publication at its maximum is thrown out of on the first attempt.
+        for _ in 0..SEND_ATTEMPTS {
+            match Self::attempt(&self.publication, &self.buffer[..length], counters)? {
+                Offered::Sent | Offered::NotConnected => break,
+                Offered::TryAgain => {}
+            }
+        }
+
+        Ok(())
     }
 
-    /// `RecordingEventsProxy.progress` (`:75-95`), which answers whether the
-    /// event went out.
-    ///
-    /// ★ **The caller is what makes that answer matter**: the reference only
-    /// advances `progressEventPosition` when this returns true
-    /// (`RecordingSession.java:249-254`), so a progress event that was dropped is
-    /// sent again rather than skipped.
-    ///
-    /// # Errors
-    ///
-    /// [`EventsError`] as [`RecordingEvents::started`].
-    pub fn progress(
+    fn progress(
         &mut self,
         counters: &CountersReader<'_, ReadWrite>,
         recording_id: i64,
@@ -249,17 +372,20 @@ impl RecordingEvents {
         position: i64,
     ) -> Result<bool, EventsError> {
         let length = encode_progress(&mut self.buffer, recording_id, start_position, position);
-        Self::offer(&self.publication, &self.buffer[..length], counters)?;
 
-        Ok(true)
+        // ★ **One attempt, and the answer is the caller's.** The reference's
+        // `progress` has no `SEND_ATTEMPTS` loop (`:79-92`): a claim that did
+        // not land answers `false`, the session leaves its
+        // `progressEventPosition` where it was, and the next turn offers the
+        // same event again. Answering `true` for a dropped event would lose it
+        // for good — the position it named has already gone by.
+        Ok(matches!(
+            Self::attempt(&self.publication, &self.buffer[..length], counters)?,
+            Offered::Sent
+        ))
     }
 
-    /// `RecordingEventsProxy.stopped` (`:97-127`).
-    ///
-    /// # Errors
-    ///
-    /// [`EventsError`] as [`RecordingEvents::started`].
-    pub fn stopped(
+    fn stopped(
         &mut self,
         counters: &CountersReader<'_, ReadWrite>,
         recording_id: i64,
@@ -272,37 +398,11 @@ impl RecordingEvents {
             start_position,
             stop_position,
         );
-        Self::offer(&self.publication, &self.buffer[..length], counters)
-    }
-
-    /// The offer every event makes, with the reference's attempt count and its
-    /// two "stop" answers.
-    ///
-    /// `Ok(())` covers both a sent event and `NOT_CONNECTED`: the reference stops
-    /// trying on the latter rather than counting it as a failure (`:66-69`),
-    /// because an archive with no reader is not an archive in trouble.
-    /// `BackPressured` and the two rotation answers are the ones worth another
-    /// attempt.
-    ///
-    /// An **associated** function rather than a method: the buffer an event was
-    /// built in is borrowed from `self` while the offer happens, and the two
-    /// fields have to be borrowed apart for that to be possible at all.
-    fn offer(
-        publication: &ExclusivePublication,
-        payload: &[u8],
-        counters: &CountersReader<'_, ReadWrite>,
-    ) -> Result<(), EventsError> {
-        let limit = position_limit(publication, counters);
 
         for _ in 0..SEND_ATTEMPTS {
-            match publication.offer(limit, payload) {
-                Appended::Ok { .. } | Appended::NotConnected => return Ok(()),
-                Appended::MaxPositionExceeded => {
-                    return Err(EventsError::Exhausted {
-                        term_length: publication.term_buffer_length(),
-                    });
-                }
-                _ => {}
+            match Self::attempt(&self.publication, &self.buffer[..length], counters)? {
+                Offered::Sent | Offered::NotConnected => break,
+                Offered::TryAgain => {}
             }
         }
 
@@ -313,6 +413,7 @@ impl RecordingEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use deepmsg_codec::archive::ReadBuf;
     use deepmsg_codec::archive::message_header_codec::MessageHeaderDecoder;
     use deepmsg_codec::archive::recording_progress_codec::{
@@ -324,6 +425,7 @@ mod tests {
     use deepmsg_codec::archive::recording_stopped_codec::{
         self as stopped, RecordingStoppedDecoder,
     };
+    use deepmsg_core::logbuffer::position::Position;
 
     /// The body, decoded. The generated `wrap` takes the acting block length and
     /// version rather than reading them, which is what SBE means by them: a
@@ -440,5 +542,57 @@ mod tests {
         assert_eq!(101, started::SBE_TEMPLATE_ID, "RecordingStarted");
         assert_eq!(102, progress::SBE_TEMPLATE_ID, "RecordingProgress");
         assert_eq!(103, stopped::SBE_TEMPLATE_ID, "RecordingStopped");
+    }
+
+    /// Every answer an offer can give, in the shape the caller acts on.
+    ///
+    /// ★ The two that matter are the ones a single loop would get wrong:
+    /// `NotConnected` **ends** `started`'s attempts (`:66-69`, no reader is not
+    /// trouble) while a used-up window is retried, and the maximum is neither —
+    /// it is the throw (`:134-143`) and it happens on the first attempt.
+    #[test]
+    fn an_offers_answer_classifies_into_the_three_shapes() {
+        let term_length = 64 * 1024;
+
+        let sent = Appended::Ok {
+            position: Position::from_raw(1024),
+            term_offset: 0,
+        };
+        assert_eq!(Ok(Offered::Sent), classify(sent, term_length));
+        assert_eq!(
+            Ok(Offered::NotConnected),
+            classify(Appended::NotConnected, term_length)
+        );
+
+        for try_again in [
+            Appended::BackPressured,
+            Appended::EndOfLog,
+            Appended::MidRotation,
+        ] {
+            assert_eq!(
+                Ok(Offered::TryAgain),
+                classify(try_again, term_length),
+                "{try_again:?} is a window that will open again"
+            );
+        }
+
+        assert_eq!(
+            Err(EventsError::Exhausted { term_length }),
+            classify(Appended::MaxPositionExceeded, term_length),
+            "the one answer that is not an attempt at all"
+        );
+    }
+
+    /// The message the archive dies with is the reference's, character for
+    /// character (`RecordingEventsProxy:140-142`) — term length and all.
+    #[test]
+    fn the_exhausted_message_is_the_references() {
+        assert_eq!(
+            "recording events publication at max position, term-length=65536",
+            EventsError::Exhausted {
+                term_length: 64 * 1024
+            }
+            .to_string()
+        );
     }
 }
