@@ -488,35 +488,56 @@ written by the thread that reads the datagrams.
 **A zero is worth something only if the counter can move**, so each of the three
 was attacked on purpose before being quoted (one cell at 501K each;
 `analysis/dpdk/d6-negative-arms.md` holds the predictions, written before the
-runs, and the two that were wrong):
+runs, and the three that were wrong):
 
 | arm | what it did | predicted | what happened |
 |---|---|---|---|
 | `mempool.size=2048` | a pool a quarter of the 8,192 frames the descriptors ask for | 77 > 0 | **77 = 262,624** (node side), and 91 fell from ~6,200 free frames to 38 |
-| `rx.burst=1` | one frame per pass off the port | 84 > 0 | 84 = 0 — the arm carried the whole load (30.4M datagrams, no rate complaint) |
-| `rx.burst=1024` | a pass that could take 1024 frames | 88 > 0 | 88 = 0 — a burst is what the port happens to hold, and it is drained every pass |
+| `rx.burst=1` | one frame per pass off the port | 84 > 0 | 84 = 0 — **and the arm never ran at one frame per pass**: the setting had no reader (below), so this cell ran the same 32 frames every other cell ran |
+| `rx.burst=1024` | a pass that could take 1024 frames | 88 > 0 | 88 = 0 — **and it could not have been otherwise**: the cell ran 32 frames per pass against a 256-slot ring, and a live setting of 1024 would have reached the port as 64 (the port's own clamp), still short of the ring |
 | a busy loop on the driver's core | the driver's own thread losing half its CPU | 84 > 0 | 84 = 88 = 0 — the rig still completed all 30.06M round trips (p40 19.1 µs, max 5.08 ms) |
 
-**The one knob the design itself pointed at has since been swept across its whole
-range, in one session.** `deepmsg.dpdk.rx.burst` is what one pass may take off
+**The one knob the design itself pointed at has been swept twice, and the first
+sweep measured nothing.** `deepmsg.dpdk.rx.burst` is what one pass may take off
 the port, and the plan called the receive path's selectivity the most likely of
 its tuning items to have something in it — 32 frames can arrive at once while
 each pass consumes one datagram (`DATAGRAMS_PER_POLL = 1`, `receiver.rs:66`).
-Six cells at 501K on the media arm, only the knob differing, with the two ends of
-the session given the same setting so the drift is the floor
-(`analysis/dpdk/d6-abba/sweep-run.sh`, the table in `sweep-analyse.sh`):
+The first sweep ran six cells at 501K with the setting at 1, 8, 32, 128 and
+1024, and a thousandfold change moved nothing. **The reason was not that the
+knob is inert: it had no reader.** `Stack::pump` handed the port a constant of
+32, so all six cells ran the same code and the differences between them were
+what a session produces against itself. The setting now reaches the pass that
+uses it, and its range is the port's own limit rather than sixteen times it (a DPDK
+port clamps anything above 64 in one call, so 128 and 1024 were accepted,
+recorded and half-used).
 
-| `rx.burst` | 1 | 8 | 32 | 128 | 1024 |
+The sweep was re-run with the knob live — five cells, one session, the default
+(32) at both ends so the session's own drift is the floor
+(`analysis/dpdk/d8-rx-burst-sweep.md` is the pre-registration, written before the
+run; `analysis/dpdk/d8-abba/sweep-analyse.sh` prints this table):
+
+| `rx.burst` | 1 | 8 | 32 | 64 | 32 |
 |---|---|---|---|---|---|
-| p50 (µs) | 18.18 | 18.18 | 18.22 / 18.13 | 18.16 | 18.14 |
-| `E[X\|X<p99]` (µs) | 18.35 | 18.36 | 18.41 / 18.26 | 18.34 | 18.24 |
+| p50 (µs) | — | 18.40 | 18.37 | 18.37 | 18.40 |
+| `E[X\|X<p99]` (µs) | — | 18.49 | 18.46 | 18.45 | 18.49 |
 
-The floor is 0.53% on p50 and 0.78% on `E[X|X<p99]`; burst 8 against 128 moves
-them by **0.09%** and **0.10%**, so the criterion is not met and the selectivity
-is not built. A thousandfold change in what a pass may take, and the media arm
-sits at 18.1–18.2 µs throughout — which is the negative arms' mechanism read
-from the other side: a burst is what the port happens to hold, not a batch it
-waits to accumulate.
+The floor is 0.17% on p50 and 0.16% on `E[X|X<p99]`; burst 8 against 64 moves
+them by **0.17%** and **0.22%**, under the pre-registered bar of twice the floor,
+so the criterion is not met and the selectivity is not built — this time with a
+knob that was shown to be live (a value outside the range is refused at startup,
+and 64 reaches the pass).
+
+**The bottom of that range is not a slower setting but a broken one.** At
+`rx.burst=1` the cell cannot complete: both drivers come up and report
+themselves on the media (`dpdk media on 0000:03:00.x (net_ixgbe)`), and
+`loadtest-rig` and `echo-node` both fail with `Failed to connect within
+timeout` — the handshake never crosses. The same call, `rte_eth_rx_burst` asking
+for one frame, is what testpmd's receiving side collapses on in the same way
+when it is given `--burst=1`: 1,023 packets received against 154,012,398 the NIC
+dropped, with `RX-nombuf: 0`. Two independent implementations, one phenomenon,
+and the mechanism is not established — so this is recorded as a floor on the
+setting (8 is known to work, 2 to 7 are unmeasured) rather than as a finding
+about the port.
 
 **So 77's zero is evidence, and 84's now is too:**
 
