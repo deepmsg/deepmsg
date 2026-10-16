@@ -248,15 +248,58 @@ mod tests {
         }
     }
 
-    /// The clock starts at zero and moves in the same units the rest of the
-    /// crate's timing uses, so a caller cannot tell which clock it was handed.
+    /// **Every caller but one arrives after the calibration**, and reads the
+    /// time since it ended rather than since the process began. That is what CI
+    /// found — a parallel test read 99 ms — so it is asserted here instead of
+    /// left to the scheduler: this test calibrates from another thread, waits,
+    /// and checks that a caller arriving afterwards reads that wait, and not
+    /// zero and not hours.
     #[test]
-    fn the_first_reading_is_near_zero_and_time_moves_forward() {
+    fn a_caller_that_arrives_after_the_calibration_reads_the_time_since_it() {
+        std::thread::spawn(|| {
+            let _ = super::nanos();
+        })
+        .join()
+        .expect("the thread that pays for the calibration");
+
+        let waited = Duration::from_millis(150);
+        std::thread::sleep(waited);
+        let late = super::nanos();
+
+        assert!(
+            late >= waited.as_nanos() as i64,
+            "a caller that arrived after the calibration read {late} ns, which is \
+             less than the {waited:?} that passed after it"
+        );
+        assert!(
+            late < 60_000_000_000,
+            "and it read {late} ns, which is not this process's own calibration"
+        );
+    }
+
+    /// The clock counts from somewhere in this process and moves in the units
+    /// the rest of the crate's timing uses, so a caller cannot tell which clock
+    /// it was handed.
+    ///
+    /// **Not "the first reading is zero", which is what this test asserted until
+    /// CI said otherwise**, and which no version of this clock has promised
+    /// under a parallel run — the `Instant` base before it no more than this
+    /// one. The calibration is a `OnceLock`: whichever thread reaches it first
+    /// spends the span and anchors the clock at the end of it, so a thread that
+    /// arrives later — including one the test runner happens to schedule beside
+    /// it — reads the time elapsed since then. On CI that was 99 ms, which is a
+    /// fact about the scheduling and not about the clock.
+    ///
+    /// What *is* worth asserting is the thing a wrong anchor would break: a
+    /// reading counted from boot (or from an epoch) would be hours, not
+    /// milliseconds, into the process.
+    #[test]
+    fn the_first_reading_counts_from_this_process_and_time_moves_forward() {
         let start = super::nanos();
         assert!(
-            start < 1_000_000,
+            start < 60_000_000_000,
             "the first reading is {start} ns into the process — the clock is \
-             counting from the wrong place"
+             counting from somewhere other than this process's own calibration"
         );
 
         // A sanity band and not a precision one: this machine may be running the
