@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use super::frame::Checksums;
+use super::frame::{Checksums, L4Checksum, TxOffloads};
 use super::packet_io::{Disposition, Offloads, ReadyFrame, RxFrame, RxPort, TxPort};
 use super::ports::Binding;
 
@@ -298,12 +298,28 @@ impl RxPort for FakePort {
 }
 
 impl TxPort for FakePort {
-    fn tx_burst(&mut self, count: usize, fill: &mut dyn FnMut(&mut [u8]) -> usize) -> usize {
+    fn tx_burst(
+        &mut self,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> (usize, TxOffloads),
+    ) -> usize {
         let mut scratch = vec![0u8; self.mtu];
         let mut taken = 0;
 
         for _ in 0..count {
-            let length = fill(&mut scratch);
+            let (length, offloads) = fill(&mut scratch);
+
+            // A wire has no hardware to compute anything, so a frame that asks
+            // it for a checksum is a frame whose author and whose port
+            // disagree — which is the one thing the per-frame offload exists to
+            // make impossible. Asserted rather than ignored: silently sending
+            // the pseudo-header sum as if it were a checksum is exactly the
+            // failure this build would then be unable to see.
+            assert!(
+                !offloads.asked().0,
+                "the in-memory wire computes no checksums, and this frame asks \
+                 for one"
+            );
 
             // A frame builder that answers more than the buffer holds gets
             // nothing transmitted: truncating it would put a frame on the wire
@@ -319,6 +335,13 @@ impl TxPort for FakePort {
         }
 
         taken
+    }
+
+    fn checksums(&self) -> L4Checksum {
+        // Every frame this port carries has its checksums written by whoever
+        // built it — which is what the assertion in `tx_burst` above holds the
+        // callers to.
+        L4Checksum::Software
     }
 
     fn mac(&self) -> [u8; 6] {
@@ -347,7 +370,8 @@ mod tests {
     fn send(port: &mut FakePort, byte: u8, length: usize) -> usize {
         port.tx_burst(1, &mut |buffer| {
             buffer[..length].fill(byte);
-            length
+
+            (length, TxOffloads::NONE)
         })
     }
 
@@ -588,12 +612,53 @@ mod tests {
 
     /// A frame the builder could not fit gets nothing transmitted rather than
     /// a truncated frame the caller believes it sent.
+    /// **A frame that asks the wire for a checksum is refused**, and that
+    /// assertion is what every test that sends through a fake port leans on.
+    ///
+    /// A wire has no hardware to compute anything, so a frame asking it for one
+    /// is a frame whose author and whose port disagree about who writes the
+    /// checksums — and in a build with a NIC on the other end of that
+    /// disagreement, the frame goes out carrying the pseudo-header sum as if it
+    /// were a checksum. Nothing here can read a sent frame back, so the only
+    /// place it can be caught is before it leaves.
+    ///
+    /// The ask comes from a frame builder, which is the only thing that can
+    /// make one (`frame::TxOffloads`), and not from a value written out by
+    /// hand: that is the same rule seen from the other side.
+    #[test]
+    #[should_panic(expected = "computes no checksums")]
+    fn a_frame_that_asks_the_wire_for_a_checksum_is_refused() {
+        let wire = Wire::new();
+        let mut port = port(&wire, Side::A);
+        let write = crate::media::userspace::frame::UdpWrite {
+            ipv4: crate::media::userspace::frame::Ipv4Write {
+                destination_hardware: [0x02, 0, 0, 0, 0, 0x02],
+                source_hardware: [0x02, 0, 0, 0, 0, 0x01],
+                source: std::net::Ipv4Addr::new(10, 10, 0, 1),
+                destination: std::net::Ipv4Addr::new(10, 10, 0, 2),
+                identification: 1,
+            },
+            source_port: 40_000,
+            destination_port: 40_001,
+            payload_length: 8,
+        };
+
+        port.tx_burst(1, &mut |room| {
+            crate::media::userspace::frame::write_ipv4_udp(
+                room,
+                &write,
+                crate::media::userspace::frame::L4Checksum::ByTheNic,
+            )
+            .expect("a frame")
+        });
+    }
+
     #[test]
     fn a_frame_longer_than_the_port_carries_is_not_sent() {
         let wire = Wire::new();
         let mut a = wire.port(Side::A, [0x02, 0, 0, 0, 0, 0x01], 16);
 
-        let taken = a.tx_burst(1, &mut |buffer| buffer.len() + 1);
+        let taken = a.tx_burst(1, &mut |buffer| (buffer.len() + 1, TxOffloads::NONE));
 
         assert_eq!(0, taken);
         assert_eq!(0, wire.queued(Side::A));

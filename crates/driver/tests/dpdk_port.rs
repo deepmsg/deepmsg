@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use deepmsg_dpdk::{Eal, Mempool, MempoolSettings, Port, PortSettings, QueuePair};
 use deepmsg_driver::media::userspace::dpdk_port::{DpdkRxPort, DpdkTxPort};
-use deepmsg_driver::media::userspace::frame::{Checksums, ETHERNET_HEADER_LENGTH};
+use deepmsg_driver::media::userspace::frame::{
+    Checksums, ETHERNET_HEADER_LENGTH, L4Checksum, TxOffloads,
+};
 use deepmsg_driver::media::userspace::packet_io::{
     Disposition, Offloads, ReadyFrame, RxPort, TxPort,
 };
@@ -205,7 +207,34 @@ fn a_frame_leaves_through_the_port_it_was_built_into_in_the_child() {
 
     let mut started = Started::net_pcap_tx("net_pcap0", &capture);
     let before = started.pool.available();
+
+    // **A device that computes nothing asks for nothing, and its frames are
+    // written out in full.** `net_pcap` is what every virtual device in this
+    // build's tests is (D0), and the three answers below are the whole of the
+    // fallback: the capability is absent, the settings built from what the port
+    // says ask for no transmit offload, and the port that carries the frames
+    // tells its sender to write the checksums itself. The hardware half of this
+    // — a NIC that *does* compute them — is `dpdk_two_drivers.rs`'s ignored
+    // case, which needs two real ports.
+    assert!(
+        !started.port.info().can_compute_ipv4_checksum()
+            && !started.port.info().can_compute_udp_checksum(),
+        "net_pcap computes no checksums for the frames it sends"
+    );
+    assert_eq!(
+        0,
+        PortSettings::default()
+            .asking_for_checksum_offloads(started.port.info())
+            .tx_offloads,
+        "so a port started from what it says is asked for none"
+    );
+
     let mut port = DpdkTxPort::new(started.pair(), started.pool);
+    assert_eq!(
+        L4Checksum::Software,
+        port.checksums(),
+        "and the port tells its sender to write both checksums"
+    );
 
     // The room the port hands the sender is the frame's own headroom — the
     // buffer the stack writes its headers and payload straight into, which is
@@ -218,7 +247,9 @@ fn a_frame_leaves_through_the_port_it_was_built_into_in_the_child() {
             expected.len()
         );
         room[..expected.len()].copy_from_slice(&expected);
-        expected.len()
+
+        // Written here in full, so the NIC is asked for nothing.
+        (expected.len(), TxOffloads::NONE)
     });
 
     assert_eq!(1, sent, "the frame left");

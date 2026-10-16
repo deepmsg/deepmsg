@@ -241,6 +241,7 @@ fn is_data_plane(payload: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Side, Wire};
+    use crate::media::userspace::frame::TxOffloads;
     use crate::media::userspace::frame::{
         ARP_REPLY, ARP_REQUEST, ArpPacket, BROADCAST, Checksums, ETHERNET_TYPE_ARP,
         ETHERNET_TYPE_VLAN, EthernetHeader, ICMP_ECHO_REQUEST, IPV4_UDP_HEADER_LENGTH, IcmpEcho,
@@ -277,7 +278,8 @@ mod tests {
             1,
             port.tx_burst(1, &mut |buffer| {
                 buffer[..written].copy_from_slice(bytes);
-                written
+
+                (written, TxOffloads::NONE)
             })
         );
     }
@@ -290,7 +292,7 @@ mod tests {
 
         let mut bytes = vec![0u8; IPV4_UDP_HEADER_LENGTH + aeron.len()];
         bytes[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&aeron);
-        let written = frame::write_ipv4_udp(
+        let written = frame::write_ipv4_udp_here(
             &mut bytes,
             &UdpWrite {
                 ipv4: Ipv4Write {

@@ -255,8 +255,21 @@ fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
             // is the one stream the reference's harness asserts is empty (the
             // module notes say why).
             let params = stack.params();
+            // **Who computes the checksums of this media's frames**, printed
+            // because it is the one fact about the media that no counter and no
+            // local reading can show: a frame written for a NIC that is not
+            // going to compute its checksums carries the pseudo-header sum as if
+            // it were one, and that is a wrong checksum on the wire with nothing
+            // on this side to read back (`TxOffloads`). One word here is what
+            // tells an operator which of the two they are looking at.
+            let tx_checksums = if info.can_compute_both_checksums() {
+                "nic"
+            } else {
+                "software"
+            };
             println!(
-                "deepmsg-driver: dpdk media on {} ({}), address {}/{} on {}",
+                "deepmsg-driver: dpdk media on {} ({}), address {}/{} on {}, \
+                 tx checksums {tx_checksums}",
                 info.name,
                 info.driver,
                 params.address,

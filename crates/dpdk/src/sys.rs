@@ -39,6 +39,10 @@ pub struct ShimTxSlot {
     pub room: u16,
     pub len: u16,
     pub ol_flags: u64,
+    /// Read only when `ol_flags` asks for a checksum the NIC computes: the two
+    /// header lengths DPDK's offload contract wants in the mbuf.
+    pub l2_len: u16,
+    pub l3_len: u16,
 }
 
 impl ShimTxSlot {
@@ -49,6 +53,8 @@ impl ShimTxSlot {
         room: 0,
         len: 0,
         ol_flags: 0,
+        l2_len: 0,
+        l3_len: 0,
     };
 }
 
@@ -142,6 +148,11 @@ unsafe extern "C" {
     pub fn shim_port_info(port: c_uint, out: *mut ShimPortInfo) -> c_int;
     pub fn shim_rx_offload_ipv4_checksum() -> u64;
     pub fn shim_rx_offload_udp_checksum() -> u64;
+    pub fn shim_tx_offload_ipv4_checksum() -> u64;
+    pub fn shim_tx_offload_udp_checksum() -> u64;
+    pub fn shim_mbuf_tx_ipv4() -> u64;
+    pub fn shim_mbuf_tx_ip_checksum() -> u64;
+    pub fn shim_mbuf_tx_udp_checksum() -> u64;
     pub fn shim_port_configure(
         port: c_uint,
         nb_rx: c_uint,

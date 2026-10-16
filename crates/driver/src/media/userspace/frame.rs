@@ -130,6 +130,65 @@ pub enum Checksums {
     Software,
 }
 
+/// Who writes a frame's checksums — the writing twin of [`Checksums`], which
+/// says who *judged* a frame that arrived.
+///
+/// A frame's author has to know which of the two it is before it writes a byte:
+/// the two modes put **different values in the same two fields**, and a frame
+/// that mixes them is one whose checksums are wrong on the wire and nowhere
+/// else — nothing on this side reads them back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L4Checksum {
+    /// This stack computes both, and what it writes is what the receiver will
+    /// find.
+    Software,
+    /// The NIC computes both, which changes what goes in the fields: the IPv4
+    /// header's is left zero, and the datagram's holds the **pseudo-header**
+    /// sum, non-complemented, because that is what the hardware adds the rest
+    /// of the datagram to (`/usr/include/dpdk/rte_ip.h:313-328`, "the
+    /// non-complemented checksum to set in the L4 header").
+    ByTheNic,
+}
+
+/// What a frame asks the NIC to compute.
+///
+/// **Only a frame builder makes one of these**, which is the whole point: the
+/// flags a frame travels with and the bytes it carries are two halves of one
+/// decision, and a value that could be made up anywhere would be a way to get
+/// them apart. The failure that buys is silent and ugly — a frame with the
+/// pseudo-header sum in it and no offload behind it is a frame with a wrong
+/// checksum, and an ARP frame with a UDP offload on it is a frame nobody
+/// resolves.
+///
+/// A port translates this into what DPDK's own crate wants
+/// (`media/userspace/dpdk_port.rs`), which is where the flags and the header
+/// lengths become an `ol_flags` and two mbuf fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxOffloads {
+    /// Whether the NIC is to compute both checksums of this frame.
+    compute: bool,
+    /// The Ethernet header's length, read only when `compute` is set.
+    l2_len: u16,
+    /// The IPv4 header's length, likewise.
+    l3_len: u16,
+}
+
+impl TxOffloads {
+    /// A frame the NIC computes nothing for: every checksum in it was written
+    /// here, and is the one the receiver will find.
+    pub const NONE: Self = Self {
+        compute: false,
+        l2_len: 0,
+        l3_len: 0,
+    };
+
+    /// What a port needs to translate this into its own vocabulary: whether
+    /// anything is asked for, and the two header lengths that go with the ask.
+    pub(crate) const fn asked(self) -> (bool, u16, u16) {
+        (self.compute, self.l2_len, self.l3_len)
+    }
+}
+
 /// An Ethernet II header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EthernetHeader {
@@ -490,7 +549,24 @@ pub fn read(frame: &[u8], checksums: Checksums) -> Result<Received<'_>, Discard>
 /// path that copies its payload once, into the buffer the port hands the NIC.
 ///
 /// Answers the frame's total length, or `None` when `buffer` cannot hold it.
-pub fn write_ipv4_udp(buffer: &mut [u8], frame: &UdpWrite) -> Option<usize> {
+/// [`write_ipv4_udp`] with this stack writing both checksums, for every caller
+/// that is not a port whose NIC computes them.
+///
+/// **Not a way to choose the mode**: it cannot ask for the offload, so the one
+/// direction that is dangerous — a frame whose author wrote the pseudo-header
+/// sum and whose port then computes nothing — is still reachable only through a
+/// port's own answer ([`L4Checksum`]). What it is for is the case a test and a
+/// frame builder both have: a frame whose checksums are all written here, and a
+/// length to hand back rather than a length and an ask.
+pub fn write_ipv4_udp_here(buffer: &mut [u8], frame: &UdpWrite) -> Option<usize> {
+    write_ipv4_udp(buffer, frame, L4Checksum::Software).map(|(written, _)| written)
+}
+
+pub fn write_ipv4_udp(
+    buffer: &mut [u8],
+    frame: &UdpWrite,
+    checksums: L4Checksum,
+) -> Option<(usize, TxOffloads)> {
     let total = IPV4_UDP_HEADER_LENGTH.checked_add(frame.payload_length)?;
     if buffer.len() < total {
         return None;
@@ -501,6 +577,7 @@ pub fn write_ipv4_udp(buffer: &mut [u8], frame: &UdpWrite) -> Option<usize> {
         &frame.ipv4,
         IP_PROTOCOL_UDP,
         total - ETHERNET_HEADER_LENGTH,
+        checksums,
     )?;
 
     let datagram = buffer.get_mut(ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH..total)?;
@@ -511,11 +588,32 @@ pub fn write_ipv4_udp(buffer: &mut [u8], frame: &UdpWrite) -> Option<usize> {
             .ok()?
             .to_be_bytes(),
     );
-    datagram[6..8].copy_from_slice(&[0, 0]);
-    let checksum = udp_checksum(frame.ipv4.source, frame.ipv4.destination, datagram);
-    datagram[6..8].copy_from_slice(&checksum.to_be_bytes());
 
-    Some(total)
+    // **The two modes write different values into the same field**, and this is
+    // the only place that decides which: the whole checksum when this stack
+    // computes it, and the pseudo-header sum — non-complemented, so the
+    // hardware can add the rest — when the NIC is to.
+    let offloads = match checksums {
+        L4Checksum::Software => {
+            datagram[6..8].copy_from_slice(&[0, 0]);
+            let checksum = udp_checksum(frame.ipv4.source, frame.ipv4.destination, datagram);
+            datagram[6..8].copy_from_slice(&checksum.to_be_bytes());
+
+            TxOffloads::NONE
+        }
+        L4Checksum::ByTheNic => {
+            let pseudo = pseudo_header_sum(frame.ipv4.source, frame.ipv4.destination, datagram);
+            datagram[6..8].copy_from_slice(&folded(pseudo).to_be_bytes());
+
+            TxOffloads {
+                compute: true,
+                l2_len: u16::try_from(ETHERNET_HEADER_LENGTH).ok()?,
+                l3_len: u16::try_from(IPV4_HEADER_LENGTH).ok()?,
+            }
+        }
+    };
+
+    Some((total, offloads))
 }
 
 /// Write a whole ARP frame — a request or a reply, whichever `packet` says.
@@ -627,6 +725,7 @@ fn write_ipv4_header(
     frame: &Ipv4Write,
     protocol: u8,
     total_length: usize,
+    checksums: L4Checksum,
 ) -> Option<()> {
     write_ethernet_header(
         buffer,
@@ -651,7 +750,13 @@ fn write_ipv4_header(
     ipv4[10..12].copy_from_slice(&[0, 0]);
     ipv4[12..16].copy_from_slice(&frame.source.octets());
     ipv4[16..20].copy_from_slice(&frame.destination.octets());
-    let checksum = internet_checksum(ipv4);
+    // The header's own checksum is the second field the mode decides: left zero
+    // when the NIC computes it, which is what `RTE_MBUF_F_TX_IP_CKSUM` promises
+    // it will do.
+    let checksum = match checksums {
+        L4Checksum::Software => internet_checksum(ipv4),
+        L4Checksum::ByTheNic => 0,
+    };
     ipv4[10..12].copy_from_slice(&checksum.to_be_bytes());
 
     Some(())
@@ -676,7 +781,17 @@ pub(crate) fn write_icmp_echo(
         return None;
     }
 
-    write_ipv4_header(buffer, frame, IP_PROTOCOL_ICMP, total_length)?;
+    // ICMP is not one of the two checksums a NIC is asked to compute here: the
+    // offload this build asks about is IPv4's header and UDP's datagram, so an
+    // ICMP reply's checksum is always this stack's (`L4Checksum::Software`
+    // names that, and not a mode this builder has).
+    write_ipv4_header(
+        buffer,
+        frame,
+        IP_PROTOCOL_ICMP,
+        total_length,
+        L4Checksum::Software,
+    )?;
 
     let message = buffer.get_mut(ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH..total)?;
     message[0] = echo_type;
@@ -725,12 +840,22 @@ fn partial_sum(bytes: &[u8]) -> u64 {
 }
 
 /// Fold a sixty-four-bit sum down to sixteen bits and complement it.
-fn fold(mut sum: u64) -> u16 {
+/// The carries of a one's-complement sum folded down, and left **as they are**.
+///
+/// This is the half that a NIC wants to find: a hardware checksum engine adds
+/// the datagram to the value in the field, so the field holds the folded sum
+/// and not its complement (`/usr/include/dpdk/rte_ip.h:328`, "the
+/// non-complemented checksum to set in the L4 header").
+fn folded(mut sum: u64) -> u16 {
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }
 
-    !(sum as u16)
+    sum as u16
+}
+
+fn fold(sum: u64) -> u16 {
+    !folded(sum)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -773,6 +898,97 @@ mod tests {
         }
     }
 
+    /// **The two modes write different values into the same two fields**, and
+    /// the difference is the whole reason a frame's author has to know which one
+    /// it is writing: nothing on this side reads a sent frame back, so a frame
+    /// that mixed them would be a wrong checksum on the wire and nowhere else.
+    ///
+    /// The second half of this is the convention itself, and it is checked by
+    /// **playing the NIC**: hardware computes `~folded(field + the rest of the
+    /// datagram)` (`/usr/include/dpdk/rte_ip.h:313-328`, "the
+    /// non-complemented checksum to set in the L4 header"), so a frame written
+    /// for it becomes a frame that verifies *if and only if* the field it was
+    /// given holds that non-complemented pseudo-header sum. Getting the
+    /// complement backwards — the easy mistake — makes this the assertion that
+    /// fails.
+    #[test]
+    fn a_frame_written_for_the_nic_becomes_a_frame_that_verifies() {
+        let payload = b"the nic computes what is in this field";
+        let write = golden_udp_write(payload.len(), 7);
+        let of = |frame: &[u8], written: usize| {
+            frame[ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH..written].to_vec()
+        };
+
+        // What this stack writes: a checksum, and nothing asked of anybody.
+        let mut here = vec![0u8; IPV4_UDP_HEADER_LENGTH + payload.len()];
+        let (written, offloads) =
+            write_ipv4_udp(&mut here, &write, L4Checksum::Software).expect("a frame");
+        assert_eq!(
+            TxOffloads::NONE.asked(),
+            offloads.asked(),
+            "a frame this stack wrote asks the NIC for nothing"
+        );
+        assert!(
+            udp_checksum_is_valid(
+                write.ipv4.source,
+                write.ipv4.destination,
+                &of(&here, written)
+            ),
+            "and it verifies as it stands"
+        );
+        assert!(
+            ipv4_checksum_is_valid(
+                &here[ETHERNET_HEADER_LENGTH..ETHERNET_HEADER_LENGTH + IPV4_HEADER_LENGTH]
+            ),
+            "its header's checksum too"
+        );
+
+        // What it writes for a NIC: the pseudo-header sum, and the ask.
+        let mut by_the_nic = vec![0u8; IPV4_UDP_HEADER_LENGTH + payload.len()];
+        let (written, offloads) =
+            write_ipv4_udp(&mut by_the_nic, &write, L4Checksum::ByTheNic).expect("a frame");
+        let (asks, l2_len, l3_len) = offloads.asked();
+        assert!(
+            asks,
+            "a frame written for the NIC asks it for the checksums"
+        );
+        assert_eq!(
+            (ETHERNET_HEADER_LENGTH as u16, IPV4_HEADER_LENGTH as u16),
+            (l2_len, l3_len),
+            "and carries the header lengths the offload's contract wants"
+        );
+
+        let for_the_nic = of(&by_the_nic, written);
+        assert!(
+            !udp_checksum_is_valid(write.ipv4.source, write.ipv4.destination, &for_the_nic),
+            "the field is not a finished checksum, so it does not verify as one"
+        );
+        assert_ne!(
+            of(&here, here.len()),
+            for_the_nic,
+            "and the two modes really do write different bytes"
+        );
+        assert_eq!(
+            [0, 0],
+            by_the_nic[ETHERNET_HEADER_LENGTH + 10..ETHERNET_HEADER_LENGTH + 12],
+            "the IPv4 header's checksum is the NIC's to write, and is left zero"
+        );
+
+        // Now the NIC does what DPDK says it does, and the frame verifies.
+        let field = u16::from_be_bytes([for_the_nic[6], for_the_nic[7]]);
+        let mut rest = for_the_nic.clone();
+        rest[6..8].fill(0);
+        let computed = fold(u64::from(field) + partial_sum(&rest));
+
+        let mut done = for_the_nic.clone();
+        done[6..8].copy_from_slice(&computed.to_be_bytes());
+        assert!(
+            udp_checksum_is_valid(write.ipv4.source, write.ipv4.destination, &done),
+            "what the NIC computes from the pseudo-header sum is the checksum the \
+             receiver wants: the convention is the non-complemented sum"
+        );
+    }
+
     #[test]
     fn the_goldens_are_whole_frames() {
         assert_eq!(
@@ -804,7 +1020,7 @@ mod tests {
         let mut rebuilt = vec![0u8; GOLDEN_IPV4_UDP.len()];
         rebuilt[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(datagram.payload);
 
-        let written = write_ipv4_udp(
+        let written = write_ipv4_udp_here(
             &mut rebuilt,
             &UdpWrite {
                 ipv4: Ipv4Write {
@@ -1007,7 +1223,7 @@ mod tests {
         frame[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&aeron);
 
         let written =
-            write_ipv4_udp(&mut frame, &golden_udp_write(aeron.len(), 1)).expect("a frame");
+            write_ipv4_udp_here(&mut frame, &golden_udp_write(aeron.len(), 1)).expect("a frame");
 
         let Received::Udp { datagram, .. } =
             read(&frame[..written], Checksums::Software).expect("a UDP frame")

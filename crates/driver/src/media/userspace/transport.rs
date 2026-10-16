@@ -32,7 +32,9 @@ use crate::media::{Affinity, Transport};
 use crate::sys::socket::{Datagram, Datagrams, MAX_BATCH};
 
 use super::demux;
-use super::frame::{self, IPV4_UDP_HEADER_LENGTH, Ipv4Write, Received, UdpWrite};
+use super::frame::{
+    self, IPV4_UDP_HEADER_LENGTH, Ipv4Write, L4Checksum, Received, TxOffloads, UdpWrite,
+};
 use super::neighbour::NextHop;
 use super::ports::Binding;
 use super::stack::{ReadyRing, Stack};
@@ -138,23 +140,28 @@ impl UserspaceTransport {
         self.peer.or(address)
     }
 
-    /// Write one frame in front of a payload, headers and checksums included.
+    /// Write one frame in front of a payload, headers and checksums included —
+    /// **by this stack or by the NIC**, which is what `checksums` says.
     ///
-    /// Answers the frame's length, or `None` when it does not fit the port — a
-    /// datagram longer than the MTU, which the channel validation refuses
-    /// before a channel is opened at all (§4.8). It is refused here rather
-    /// than truncated: a short frame on the wire is one the peer counts, and
-    /// reports as corruption.
+    /// Answers the frame's length and what the NIC is to compute for it, or
+    /// `None` when it does not fit the port — a datagram longer than the MTU,
+    /// which the channel validation refuses before a channel is opened at all
+    /// (§4.8). It is refused here rather than truncated: a short frame on the
+    /// wire is one the peer counts, and reports as corruption.
+    ///
+    /// The mode comes from the port ([`TxPort::checksums`]) and is read once
+    /// per send rather than per frame, because it cannot change between the
+    /// frames of one burst — and **it must be the port's answer and not this
+    /// transport's guess**: a frame written for a NIC that will not compute its
+    /// checksums carries the pseudo-header sum as if it were one, which is a
+    /// wrong checksum on the wire and nothing this side would ever see.
     fn build(
         &self,
         buffer: &mut [u8],
         payload: &[u8],
-        destination: Ipv4Addr,
-        destination_port: u16,
-        hardware: [u8; 6],
-        identification: u16,
-    ) -> Option<usize> {
-        let params = self.stack.params();
+        write: &UdpWrite,
+        checksums: L4Checksum,
+    ) -> Option<(usize, TxOffloads)> {
         let end = IPV4_UDP_HEADER_LENGTH.checked_add(payload.len())?;
         if buffer.len() < end {
             return None;
@@ -162,21 +169,32 @@ impl UserspaceTransport {
 
         buffer[IPV4_UDP_HEADER_LENGTH..end].copy_from_slice(payload);
 
-        frame::write_ipv4_udp(
-            buffer,
-            &UdpWrite {
-                ipv4: Ipv4Write {
-                    destination_hardware: hardware,
-                    source_hardware: params.mac,
-                    source: params.address,
-                    destination,
-                    identification,
-                },
-                source_port: self.local.port(),
-                destination_port,
-                payload_length: payload.len(),
+        frame::write_ipv4_udp(buffer, write, checksums)
+    }
+
+    /// What one frame of this transport's looks like, given where it is going.
+    fn write_to(
+        &self,
+        destination: Ipv4Addr,
+        destination_port: u16,
+        hardware: [u8; 6],
+        identification: u16,
+        payload_length: usize,
+    ) -> UdpWrite {
+        let params = self.stack.params();
+
+        UdpWrite {
+            ipv4: Ipv4Write {
+                destination_hardware: hardware,
+                source_hardware: params.mac,
+                source: params.address,
+                destination,
+                identification,
             },
-        )
+            source_port: self.local.port(),
+            destination_port,
+            payload_length,
+        }
     }
 }
 
@@ -223,21 +241,27 @@ impl Transport for UserspaceTransport {
                 .lock()
                 .expect("the transmit port");
 
+            // **Asked of the port, once per send**, because every frame in this
+            // burst is written by the same builder and the port is what decides
+            // who computes their checksums (`TxPort::checksums`).
+            let checksums = port.checksums();
+
             port.tx_burst(count, &mut |buffer| {
                 let Some(payload) = buffers.get(next) else {
-                    return 0;
+                    return (0, TxOffloads::NONE);
                 };
                 next += 1;
 
-                self.build(
-                    buffer,
-                    payload,
+                let write = self.write_to(
                     destination_address,
                     destination.port(),
                     hardware,
                     identification,
-                )
-                .unwrap_or(0)
+                    payload.len(),
+                );
+
+                self.build(buffer, payload, &write, checksums)
+                    .unwrap_or((0, TxOffloads::NONE))
             })
         };
 
@@ -410,7 +434,7 @@ mod tests {
     fn udp_frame(to: u16, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0u8; IPV4_UDP_HEADER_LENGTH + payload.len()];
         bytes[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(payload);
-        let written = crate::media::userspace::frame::write_ipv4_udp(
+        let written = crate::media::userspace::frame::write_ipv4_udp_here(
             &mut bytes,
             &UdpWrite {
                 ipv4: Ipv4Write {
@@ -437,7 +461,7 @@ mod tests {
 
         port.tx_burst(1, &mut |buffer| {
             buffer[..written].copy_from_slice(&bytes[..written]);
-            written
+            (written, TxOffloads::NONE)
         });
     }
 
@@ -882,7 +906,7 @@ mod tests {
         .expect("a frame");
         wire.port(Side::B, asker, 1500).tx_burst(1, &mut |buffer| {
             buffer[..written].copy_from_slice(&bytes[..written]);
-            written
+            (written, TxOffloads::NONE)
         });
 
         assert_eq!(1, stack.pump(), "the request was read");
@@ -940,7 +964,7 @@ mod tests {
         wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500)
             .tx_burst(1, &mut |buffer| {
                 buffer[..written].copy_from_slice(&bytes[..written]);
-                written
+                (written, TxOffloads::NONE)
             });
 
         stack.pump();

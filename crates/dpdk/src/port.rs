@@ -65,6 +65,22 @@ impl PortSettings {
             self.rx_offloads |= udp;
         }
 
+        // **And the same question about the transmit side**, which is where the
+        // two directions stop being one decision: a frame this stack hands over
+        // carries checksums somebody wrote, and a port that can compute them is
+        // a port this stack may stop writing the ones it has no reason to
+        // compute. Only what the port says it can do is asked for — the same
+        // rule as the receive bits above, and `rte_eth_dev_configure` refuses a
+        // bit the device has not got.
+        let (ipv4, udp) = checksum_offload_bits_tx();
+
+        if port.can_compute_ipv4_checksum() {
+            self.tx_offloads |= ipv4;
+        }
+        if port.can_compute_udp_checksum() {
+            self.tx_offloads |= udp;
+        }
+
         self
     }
 }
@@ -119,6 +135,109 @@ impl PortInfo {
     pub fn can_judge_udp_checksum(&self) -> bool {
         let (_, udp) = checksum_offload_bits();
         self.rx_offloads & udp != 0
+    }
+
+    /// Whether this port can **compute** an IPv4 header's checksum for the
+    /// frames it sends — the transmit side's twin of
+    /// [`can_judge_ipv4_checksum`](Self::can_judge_ipv4_checksum), and a
+    /// different capability: a port that computes on the way out and one that
+    /// judges on the way in are two bits, and a device may have either, both
+    /// or neither.
+    ///
+    /// **A capability, not a promise**, for the same reason as the two above:
+    /// the hardware computes for the frames it sends only if it was asked to
+    /// ([`PortSettings::tx_offloads`]), and a caller that asks for what it read
+    /// back is the one that can take this answer at face value.
+    pub fn can_compute_ipv4_checksum(&self) -> bool {
+        let (ipv4, _) = checksum_offload_bits_tx();
+        self.tx_offloads & ipv4 != 0
+    }
+
+    /// Whether it computes the UDP checksum; see
+    /// [`can_compute_ipv4_checksum`](Self::can_compute_ipv4_checksum).
+    pub fn can_compute_udp_checksum(&self) -> bool {
+        let (_, udp) = checksum_offload_bits_tx();
+        self.tx_offloads & udp != 0
+    }
+
+    /// Whether asking this port for everything it can do about checksums would
+    /// get both directions.
+    pub fn can_compute_both_checksums(&self) -> bool {
+        self.can_compute_ipv4_checksum() && self.can_compute_udp_checksum()
+    }
+}
+
+/// The two transmit offloads this build asks about, as DPDK numbers them.
+fn checksum_offload_bits_tx() -> (u64, u64) {
+    // SAFETY: as in `checksum_offload_bits`.
+    unsafe {
+        (
+            sys::shim_tx_offload_ipv4_checksum(),
+            sys::shim_tx_offload_udp_checksum(),
+        )
+    }
+}
+
+/// **What one frame asks the NIC to compute**, which is the transmit side's
+/// answer to [`PortInfo::can_judge_ipv4_checksum`]'s question.
+///
+/// A frame whose checksums a NIC is to compute is not the frame a stack writes
+/// on its own: DPDK's contract is that the L4 checksum field holds the
+/// **pseudo-header** sum and that the mbuf carries the two header lengths
+/// (`rte_mbuf_core.h:283-296`, `rte_net.h:89-96`). Both of those are the
+/// caller's to get right, and this type is how it says which ones it did —
+/// so it is built by the code that wrote the bytes, never passed in beside
+/// them.
+///
+/// [`Self::NONE`] is the whole of what a port with no such offload ever sees,
+/// and what every frame that carries no IPv4/UDP header asks for (an ARP
+/// request, an ICMP reply): a frame's flags are **its own**, which is why this
+/// travels with the frame and not with the burst
+/// (`rte_eth_tx_burst`'s mbufs each carry their own `ol_flags`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TxOffloads {
+    /// The bits the mbuf carries, or zero for "the NIC computes nothing".
+    flags: u64,
+    /// The Ethernet header's length, read only when `flags` is not zero.
+    l2_len: u16,
+    /// The IPv4 header's length, likewise.
+    l3_len: u16,
+}
+
+impl TxOffloads {
+    /// A frame the NIC computes nothing for: every checksum in it was written
+    /// by the sender, and is the one the receiver will find.
+    pub const NONE: Self = Self {
+        flags: 0,
+        l2_len: 0,
+        l3_len: 0,
+    };
+
+    /// A frame whose IPv4 header checksum and whose UDP checksum the NIC is to
+    /// compute, over headers `l2_len` and `l3_len` bytes long.
+    ///
+    /// The caller has written the **pseudo-header** sum into the UDP checksum
+    /// field, which is what the hardware adds the rest of the datagram to.
+    #[must_use]
+    pub fn ipv4_and_udp_checksums(l2_len: u16, l3_len: u16) -> Self {
+        // SAFETY: header constants, wrapped as functions by the shim; they read
+        // nothing and cannot fail.
+        let flags = unsafe {
+            sys::shim_mbuf_tx_ipv4()
+                | sys::shim_mbuf_tx_ip_checksum()
+                | sys::shim_mbuf_tx_udp_checksum()
+        };
+
+        Self {
+            flags,
+            l2_len,
+            l3_len,
+        }
+    }
+
+    /// What this frame asks the NIC for, as the shim's slot holds it.
+    const fn parts(self) -> (u64, u16, u16) {
+        (self.flags, self.l2_len, self.l3_len)
     }
 }
 
@@ -586,13 +705,25 @@ impl QueuePair {
     /// the NIC. Answers how many left.
     ///
     /// `fill` is given the frame's room — headers and payload both, because
-    /// this is the whole frame — and answers how many bytes it wrote; more than
-    /// the room is refused by an assertion rather than truncated silently. The
-    /// frames the NIC did not take are freed **inside the burst**, so the
-    /// number this answers is exactly what left the machine, which is what a
-    /// sender's position advances by. A `fill` that panics leaks the frames the
-    /// burst had not reached; as on the receive side, a panic here is already
-    /// the end of the process's media.
+    /// this is the whole frame — and answers **how many bytes it wrote and what
+    /// the NIC is to compute for them** ([`TxOffloads`]); more than the room is
+    /// refused by an assertion rather than truncated silently. The frames the
+    /// NIC did not take are freed **inside the burst**, so the number this
+    /// answers is exactly what left the machine, which is what a sender's
+    /// position advances by. A `fill` that panics leaks the frames the burst
+    /// had not reached; as on the receive side, a panic here is already the
+    /// end of the process's media.
+    ///
+    /// **The offload is per frame, and it comes back from `fill` rather than
+    /// going in beside it** — one call's frames are not one kind of frame. The
+    /// port this queue belongs to carries ARP requests and ICMP replies as well
+    /// as UDP datagrams, and a port asked to compute a UDP checksum for an ARP
+    /// frame would write one into the middle of it: the sender would see a
+    /// burst that left, and the peer would see a frame that resolves nothing.
+    /// DPDK's own shape is the same one (`rte_eth_tx_burst`'s mbufs each carry
+    /// their own `ol_flags`), and it is why the answer comes from the code that
+    /// wrote the bytes: the flags for a frame can only be produced by a
+    /// constructor that knows what the frame is.
     ///
     /// Zero frames come back when the pool has none: that is back pressure, and
     /// the caller tries again next pass.
@@ -600,7 +731,7 @@ impl QueuePair {
         &mut self,
         pool: &Mempool,
         count: usize,
-        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> (usize, TxOffloads),
     ) -> usize {
         let count = count.min(SHIM_BURST_MAX);
         if count == 0 {
@@ -622,17 +753,21 @@ impl QueuePair {
             // SAFETY: the shim allocated this frame and wrote down the bytes
             // this side may fill; the borrow of the room ends before the frame
             // is handed over, so nothing is aliased when it goes.
-            let written = unsafe {
+            let (written, offloads) = unsafe {
                 let room = std::slice::from_raw_parts_mut(slot.data, usize::from(slot.room));
-                let written = fill(room);
+                let (written, offloads) = fill(room);
                 assert!(
                     written <= room.len(),
                     "a frame cannot be longer than the room it was given: {written} > {}",
                     room.len()
                 );
-                written
+                (written, offloads)
             };
             slot.len = written as u16;
+            let (flags, l2_len, l3_len) = offloads.parts();
+            slot.ol_flags = flags;
+            slot.l2_len = l2_len;
+            slot.l3_len = l3_len;
         }
 
         // SAFETY: the first `allocated` slots hold live frames this code owns,

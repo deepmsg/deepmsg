@@ -48,6 +48,7 @@ pub use error::Error;
 pub use mempool::{Mempool, MempoolSettings, ParkedFrame};
 pub use port::{
     Checksum, Disposition, Link, Port, PortInfo, PortSettings, PortStats, QueuePair, RxFrame,
+    TxOffloads,
 };
 pub use ring::{Consumer, FrameRing, Producer};
 

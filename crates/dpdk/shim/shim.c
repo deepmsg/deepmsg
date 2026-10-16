@@ -102,6 +102,12 @@ typedef struct {
  * in one burst. `room` is what Rust may write, `len` is what it wrote, and
  * `ol_flags` is the offload it wants for this frame (zero when the port has
  * none, which is what the virtual devices have).
+ *
+ * `l2_len` and `l3_len` are read only when `ol_flags` asks for a checksum the
+ * NIC is to compute: DPDK's contract is that the mbuf carries the two header
+ * lengths for an offloaded frame (`rte_mbuf_core.h:283-296`, "fill l2_len and
+ * l3_len in mbuf"), and they are **mbuf bitfields**, so they are set here like
+ * every other DPDK layout detail and never on the Rust side.
  */
 typedef struct {
     void *mbuf;
@@ -109,6 +115,8 @@ typedef struct {
     uint16_t room;
     uint16_t len;
     uint64_t ol_flags;
+    uint16_t l2_len;
+    uint16_t l3_len;
 } shim_tx_slot;
 
 /* The batch bound: one call carries at most this many frames. */
@@ -239,6 +247,28 @@ int shim_port_info(unsigned port, shim_port_info_t *out)
 uint64_t shim_rx_offload_ipv4_checksum(void) { return RTE_ETH_RX_OFFLOAD_IPV4_CKSUM; }
 
 uint64_t shim_rx_offload_udp_checksum(void) { return RTE_ETH_RX_OFFLOAD_UDP_CKSUM; }
+
+/* The same two questions about the transmit side, which are different bits. */
+uint64_t shim_tx_offload_ipv4_checksum(void) { return RTE_ETH_TX_OFFLOAD_IPV4_CKSUM; }
+
+uint64_t shim_tx_offload_udp_checksum(void) { return RTE_ETH_TX_OFFLOAD_UDP_CKSUM; }
+
+/*
+ * The per-frame flags, which are mbuf flags rather than queue offload bits,
+ * and which say what the NIC is to do with *this* frame:
+ *
+ *   - `RTE_MBUF_F_TX_IPV4` tells it the packet is IPv4 at all — a PMD checks
+ *     this one before it looks at the others;
+ *   - `RTE_MBUF_F_TX_IP_CKSUM` is the IPv4 header's own checksum;
+ *   - `RTE_MBUF_F_TX_UDP_CKSUM` is the L4 one, and setting it is a promise
+ *     that the L4 checksum field holds the *pseudo-header* sum
+ *     (`rte_net.h:89-96`), which is what the caller wrote there.
+ */
+uint64_t shim_mbuf_tx_ipv4(void) { return RTE_MBUF_F_TX_IPV4; }
+
+uint64_t shim_mbuf_tx_ip_checksum(void) { return RTE_MBUF_F_TX_IP_CKSUM; }
+
+uint64_t shim_mbuf_tx_udp_checksum(void) { return RTE_MBUF_F_TX_UDP_CKSUM; }
 
 int shim_port_configure(unsigned port, unsigned nb_rx, unsigned nb_tx, uint64_t rx_offloads, uint64_t tx_offloads)
 {
@@ -533,6 +563,13 @@ unsigned shim_tx_burst(unsigned port, unsigned queue, shim_tx_slot *slots, unsig
 
         mbuf->data_len = slots[i].len;
         mbuf->pkt_len = slots[i].len;
+        if (0 != slots[i].ol_flags)
+        {
+            /* The lengths are part of the offload's contract, and a frame
+             * that asks for none carries nothing for them to describe. */
+            mbuf->l2_len = slots[i].l2_len;
+            mbuf->l3_len = slots[i].l3_len;
+        }
         mbuf->ol_flags |= slots[i].ol_flags;
         mbufs[i] = mbuf;
     }
@@ -548,6 +585,9 @@ unsigned shim_tx_burst(unsigned port, unsigned queue, shim_tx_slot *slots, unsig
         slots[i].data = NULL;
         slots[i].room = 0;
         slots[i].len = 0;
+        slots[i].ol_flags = 0;
+        slots[i].l2_len = 0;
+        slots[i].l3_len = 0;
     }
 
     return sent;

@@ -39,7 +39,7 @@ use deepmsg_driver::config::{DpdkSettings, ThreadingMode};
 use deepmsg_driver::media::userspace::dpdk::{DpdkError, DpdkMedia};
 use deepmsg_driver::media::userspace::frame;
 use deepmsg_driver::media::userspace::frame::{
-    BROADCAST, IPV4_UDP_HEADER_LENGTH, Ipv4Write, UdpWrite,
+    BROADCAST, IPV4_UDP_HEADER_LENGTH, Ipv4Write, TxOffloads, UdpWrite,
 };
 use deepmsg_driver::media::userspace::packet_io::{Disposition, Offloads};
 use deepmsg_driver::media::userspace::ports::Binding;
@@ -114,7 +114,7 @@ fn a_datagram(index: u8) -> Vec<u8> {
 
     let mut bytes = vec![0u8; IPV4_UDP_HEADER_LENGTH + aeron.len()];
     bytes[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&aeron);
-    let written = frame::write_ipv4_udp(
+    let written = frame::write_ipv4_udp_here(
         &mut bytes,
         &UdpWrite {
             ipv4: Ipv4Write {
@@ -274,7 +274,8 @@ fn a_shared_pair_carries_frames_both_ways_in_the_child() {
         1,
         tx.tx_burst(1, &mut |room| {
             room[..expected.len()].copy_from_slice(&expected);
-            expected.len()
+
+            (expected.len(), TxOffloads::NONE)
         }),
         "the frame left through the pair the receive port came from"
     );
