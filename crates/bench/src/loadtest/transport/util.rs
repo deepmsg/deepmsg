@@ -9,6 +9,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use deepmsg_archive::client::ArchiveContext;
+use deepmsg_archive::client::context::{
+    AERON_DIR_ENV, CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV,
+};
 use deepmsg_client::client::Client;
 use deepmsg_core::logbuffer::append::Appended;
 
@@ -342,6 +346,42 @@ pub fn window_limit(client: &Client, publication: i64) -> i64 {
         .counters_reader()
         .and_then(|counters| counters.value(counter_id))
         .unwrap_or(0)
+}
+
+/// `AeronArchive.Configuration.CONTROL_CHANNEL_PROP_NAME` (`:2698`) — the channel
+/// an archive is reached on, under the **reference client's** name.
+pub const ARCHIVE_CONTROL_CHANNEL: &str = "aeron.archive.control.channel";
+/// `AeronArchive.Configuration.CONTROL_RESPONSE_CHANNEL_PROP_NAME` (`:2752`).
+pub const ARCHIVE_CONTROL_RESPONSE_CHANNEL: &str = "aeron.archive.control.response.channel";
+
+/// The archive a run reaches, out of the same properties the channels come from.
+///
+/// ★ **The reference client's spelling, mapped onto this client's context.** A cell
+/// describes its archive the same way whichever archive that cell ran — that is what
+/// makes two cells comparable — and this build's client is configured through
+/// `AERON_ARCHIVE_*` environment names instead. The mapping is here, in one place,
+/// precisely because it is the seam: the *cell* is the thing that must look the same
+/// on both sides, and the client's own spelling is an implementation detail of one of
+/// the two.
+#[must_use]
+pub fn archive_context(properties: &Properties, directory: &std::path::Path) -> ArchiveContext {
+    ArchiveContext::resolve(&[
+        (AERON_DIR_ENV.to_owned(), directory.display().to_string()),
+        (
+            CONTROL_CHANNEL_ENV.to_owned(),
+            properties
+                .get(ARCHIVE_CONTROL_CHANNEL)
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        (
+            CONTROL_RESPONSE_CHANNEL_ENV.to_owned(),
+            properties
+                .get(ARCHIVE_CONTROL_RESPONSE_CHANNEL)
+                .unwrap_or("")
+                .to_owned(),
+        ),
+    ])
 }
 
 /// Wait until something is true, or give up.

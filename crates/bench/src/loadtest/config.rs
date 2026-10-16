@@ -447,11 +447,21 @@ pub enum Transceiver {
     /// Publish to a node and read what comes back
     /// (`EchoMessageTransceiver`), over whatever channel the settings name.
     Echo,
+    /// Publish to an archive node and read back **the recording it made**
+    /// (`LiveReplayMessageTransceiver`): the reply is a byte the archive wrote to
+    /// disk and replayed, which is what makes this the client of a *recording*
+    /// measurement rather than of a round trip.
+    ///
+    /// It needs more than the channels: the archive has to be named
+    /// (`aeron.archive.control.channel`, `.control.response.channel`), and the
+    /// node of the run has to be running before the client looks for its
+    /// recording.
+    LiveReplay,
 }
 
 impl Transceiver {
     /// The names this accepts.
-    pub const NAMES: &'static [&'static str] = &["in-memory", "echo"];
+    pub const NAMES: &'static [&'static str] = &["in-memory", "echo", "live-replay"];
 
     /// The name a properties file holds.
     #[must_use]
@@ -459,6 +469,7 @@ impl Transceiver {
         match self {
             Self::InMemory => "in-memory",
             Self::Echo => "echo",
+            Self::LiveReplay => "live-replay",
         }
     }
 
@@ -467,6 +478,7 @@ impl Transceiver {
         match text {
             "in-memory" => Ok(Self::InMemory),
             "echo" => Ok(Self::Echo),
+            "live-replay" => Ok(Self::LiveReplay),
             other => Err(ConfigError::UnknownTransceiver {
                 value: other.to_owned(),
             }),
@@ -1575,7 +1587,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "no message transceiver named 'echo-udp'; known: in-memory, echo"
+            "no message transceiver named 'echo-udp'; known: in-memory, echo, live-replay"
         );
     }
 

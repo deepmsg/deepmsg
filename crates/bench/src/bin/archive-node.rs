@@ -24,13 +24,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use deepmsg_archive::client::ArchiveContext;
-use deepmsg_archive::client::context::{
-    AERON_DIR_ENV, CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV,
-};
 use deepmsg_bench::loadtest::config::{IdleStrategy, Properties};
 use deepmsg_bench::loadtest::transport::archive_node::ArchiveNode;
-use deepmsg_bench::loadtest::transport::util::{ChannelSettings, property};
+use deepmsg_bench::loadtest::transport::util::{ChannelSettings, archive_context, property};
 
 /// What this program accepts.
 const USAGE: &str = "\
@@ -43,11 +39,6 @@ usage: archive-node [-Dname=value ...] [file.properties ...]
   archive's own control channel and response channel, under the reference's
   client's names (aeron.archive.control.channel, .control.response.channel).
 ";
-
-/// `AeronArchive.Configuration.CONTROL_CHANNEL_PROP_NAME` (`:2698`).
-const CONTROL_CHANNEL: &str = "aeron.archive.control.channel";
-/// `AeronArchive.Configuration.CONTROL_RESPONSE_CHANNEL_PROP_NAME` (`:2752`).
-const CONTROL_RESPONSE_CHANNEL: &str = "aeron.archive.control.response.channel";
 
 fn main() -> ExitCode {
     match run() {
@@ -94,23 +85,7 @@ fn run() -> Result<(), String> {
         None => IdleStrategy::default(),
     };
 
-    let context = ArchiveContext::resolve(&[
-        (
-            AERON_DIR_ENV.to_owned(),
-            settings.directory.display().to_string(),
-        ),
-        (
-            CONTROL_CHANNEL_ENV.to_owned(),
-            command_line.get(CONTROL_CHANNEL).unwrap_or("").to_owned(),
-        ),
-        (
-            CONTROL_RESPONSE_CHANNEL_ENV.to_owned(),
-            command_line
-                .get(CONTROL_RESPONSE_CHANNEL)
-                .unwrap_or("")
-                .to_owned(),
-        ),
-    ]);
+    let context = archive_context(&command_line, &settings.directory);
 
     let mut node = ArchiveNode::new(settings, idle, &context).map_err(|error| error.to_string())?;
 

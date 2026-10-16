@@ -11,6 +11,7 @@
 
 pub mod archive_node;
 pub mod echo;
+pub mod live_replay;
 pub mod node;
 pub mod sender;
 pub mod util;

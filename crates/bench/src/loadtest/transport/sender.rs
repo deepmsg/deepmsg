@@ -14,9 +14,11 @@
 //! Which one a run uses is `io.aeron.benchmarks.aeron.use.try.claim`, and the
 //! reference's default is to claim.
 
+use deepmsg_client::client::Client;
+use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_core::buffer::ReadWrite;
 use deepmsg_core::logbuffer::append::Appended;
-use deepmsg_core::logbuffer::frame::Frame;
+use deepmsg_core::logbuffer::frame::{DATA_HEADER_LENGTH, Frame};
 
 use crate::loadtest::config::IdleStrategy;
 use crate::loadtest::transport::util::{
@@ -255,6 +257,89 @@ impl MessageSender {
         );
 
         outbound.offer(&self.scratch)
+    }
+}
+
+/// The publication a sender writes into.
+///
+/// Shared with the archive battery's live-replay transceiver, which sends into a
+/// publication exactly as this one does — the offer/claim pair and the window held
+/// across a batch are the sender's business rather than either client's.
+pub struct PublicationOutbound<'a> {
+    pub client: &'a Client,
+    /// The publication this batch writes into, resolved **once for the batch**.
+    ///
+    /// The reference's sender holds the `ExclusivePublication` object itself
+    /// (`MessageSender.java:52`), so nothing on its per-message path looks one
+    /// up. This could not hold one either until the client let it: the
+    /// registration id was the only handle, and every message paid the linear
+    /// scan of `Client::exclusive_publication` to turn it back into a
+    /// publication. `None` when the client no longer holds it, which is what
+    /// each message answered for itself before — and it cannot appear or vanish
+    /// inside a batch, because the duty cycle that would move it is not run
+    /// while this is sending.
+    pub publication: Option<&'a ExclusivePublication>,
+    /// What the **offer** path needs and the claim path no longer does: it hands
+    /// the id back to `Client::offer_exclusive`, which resolves the publication
+    /// and reads its limit itself. A run that claims does not come through here
+    /// at all (`use.try.claim`), and a run that offers is measuring the offer.
+    pub registration_id: i64,
+    /// The window, held by the transceiver so that it outlives one batch.
+    pub window: &'a mut i64,
+}
+
+/// Read a publication's window limit from the driver's counter.
+pub(crate) fn read_window(client: &Client, publication: &ExclusivePublication) -> i64 {
+    client
+        .counters_reader()
+        .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+        .unwrap_or(0)
+}
+
+impl Outbound for PublicationOutbound<'_> {
+    fn claim<W: FnMut(&Frame<'_, ReadWrite>)>(&mut self, length: usize, mut write: W) -> Published {
+        // A claim takes the limit as an argument and there is no client-level
+        // one that would read it, so the limit is kept here and re-read only
+        // when the log says the window it describes is used up — which is what
+        // the reference's client does inside its own append. Reporting that
+        // first answer as back pressure would spend one of the sender's three
+        // attempts on a window that had merely moved.
+        let Some(publication) = self.publication else {
+            // The publication is gone from under the client.
+            return Err(Appended::Malformed);
+        };
+
+        let mut outcome = publication.try_claim(*self.window, length);
+
+        if matches!(
+            outcome,
+            Err(Appended::BackPressured | Appended::NotConnected)
+        ) {
+            *self.window = read_window(self.client, publication);
+            outcome = publication.try_claim(*self.window, length);
+        }
+
+        // Bound rather than inlined: a frame borrows the claim it came from.
+        let claim = outcome?;
+        let frame = claim.frame();
+        write(&frame);
+
+        let frame_length = i32::try_from(length + DATA_HEADER_LENGTH).unwrap_or(i32::MAX);
+
+        match frame.publish(frame_length) {
+            Some(()) => Ok(()),
+            // The frame did not fit where it was claimed, which the appender
+            // only finds out on publishing it.
+            None => Err(Appended::Malformed),
+        }
+    }
+
+    fn offer(&mut self, payload: &[u8]) -> Published {
+        match self.client.offer_exclusive(self.registration_id, payload) {
+            Some(Appended::Ok { .. }) => Ok(()),
+            Some(other) => Err(other),
+            None => Err(Appended::Malformed),
+        }
     }
 }
 
