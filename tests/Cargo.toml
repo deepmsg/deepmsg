@@ -66,6 +66,14 @@ name = "replication_reference_archive"
 path = "interop/replication_reference_archive.rs"
 required-features = ["interop"]
 
+# The three recording events, decoded by the reference's own
+# `RecordingEventsAdapter` — the reader they exist for, and the only one that
+# can say the bytes are the schema's rather than ours.
+[[test]]
+name = "recording_events_reference"
+path = "interop/recording_events_reference.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]
