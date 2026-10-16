@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
 use deepmsg_core::logbuffer::append::Appended;
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::driver;
@@ -249,10 +250,7 @@ fn build_probe() -> Option<PathBuf> {
             let into = manifest.join("../target/recording-events-probe-classes");
             let _ = std::fs::create_dir_all(&into);
 
-            java::compile_probe(
-                &manifest.join("fixtures/recording-events-probe/RecordingEventsProbe.java"),
-                &into,
-            )?;
+            java::compile_probe(&aeron_tests::java("RecordingEventsProbe.java")?, &into)?;
 
             Some(into)
         })

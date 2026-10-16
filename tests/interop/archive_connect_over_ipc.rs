@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver::{self, AGRONA_JVM_ARGS, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 use deepmsg_tests::java;
 use deepmsg_tests::temp::TempDir;
@@ -30,7 +31,7 @@ fn build_probe() -> Option<PathBuf> {
     BUILT
         .get_or_init(|| {
             let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let source = manifest.join("fixtures/archive-connect-probe/ArchiveConnectProbe.java");
+            let source = aeron_tests::java("ArchiveConnectProbe.java")?;
             let into = manifest.join("../target/archive-connect-probe");
 
             std::fs::create_dir_all(&into).ok()?;
@@ -73,6 +74,10 @@ fn the_connect_comes_back_on_both_drivers() {
         return;
     };
 
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(classes) = build_probe() else {
         driver::announce_tool_skip("javac");
         return;

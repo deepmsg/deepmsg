@@ -13,7 +13,7 @@ header *is* the framing. Those facts only exist in a whole file.
 
 | | |
 |---|---|
-| Written by | `GenerateCatalog.java`, from `aeron-all-1.53.2.jar` |
+| Written by | `GenerateCatalog.java` (in the fork `aeron-deepmsg`, branch `deepmsg-tests`), from `aeron-all-1.53.2.jar` |
 | Fixtures | `archive.catalog` (1 MiB, 3 recordings), `catalog.tsv` (66 readings) |
 | Captured | 2026-10-06 |
 | Read by | `crates/archive/tests/catalog.rs` (no reference needed) and, next, `tests/interop/catalog_reference.rs` |
@@ -33,7 +33,8 @@ Two of the numbers are the ones a reader cannot compute: each record's
 ## Regenerating
 
     JAR=../../aeron/aeron-all/build/libs/aeron-all-1.53.2.jar
-    javac -proc:none -cp "$JAR" -d /tmp/catgen GenerateCatalog.java
+    javac -proc:none -cp "$JAR" -d /tmp/catgen \
+         "$AERON_DEEPMSG/deepmsg-tests/generators/catalog/GenerateCatalog.java"
     java --add-exports java.base/jdk.internal.misc=ALL-UNNAMED \
          --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
          -cp "$JAR:/tmp/catgen" io.aeron.archive.GenerateCatalog .

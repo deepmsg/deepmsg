@@ -60,6 +60,7 @@ use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_k
 use deepmsg_client::client::Client;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadOnly;
+use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver;
 use deepmsg_tests::java;
 use deepmsg_tests::java_driver::{self, JavaMediaDriver};
@@ -116,9 +117,7 @@ fn build_probe() -> Option<PathBuf> {
             let _ = std::fs::create_dir_all(&into);
 
             java::compile_probe(
-                &manifest.join(
-                    "fixtures/reference-archive-client-probe/ReferenceArchiveClientProbe.java",
-                ),
+                &aeron_tests::java("ReferenceArchiveClientProbe.java")?,
                 &into,
             )?;
 
@@ -267,6 +266,10 @@ fn field(line: &str, at: usize) -> i64 {
 /// ★★ The gate: the reference's driver, our archive, the reference's client.
 #[test]
 fn our_archive_serves_the_references_client_on_the_references_driver() {
+    if aeron_tests::locate().is_none() {
+        aeron_tests::announce_skip();
+        return;
+    }
     let Some(classes) = build_probe() else {
         java_driver::announce_skip();
         return;

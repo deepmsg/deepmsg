@@ -53,7 +53,8 @@ across runs (the pid) are recorded.
 
 The archive **catalog** rows are covered the same way, by a golden the reference
 wrote: `tests/fixtures/catalog/archive.catalog` comes from the reference's own
-`Catalog` (`tests/fixtures/catalog/GenerateCatalog.java`, which names it through
+`Catalog` (the generator lives in the fork's `deepmsg-tests/generators/catalog/GenerateCatalog.java`,
+which names it through
 `Archive.Configuration.CATALOG_FILE_NAME`), and `crates/archive/tests/catalog.rs`
 compares this build's reading against the reference's own reading of it
 (`catalog.tsv`: every header field, every record's location and length, every
