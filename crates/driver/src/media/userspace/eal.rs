@@ -44,8 +44,12 @@ use crate::config::DpdkSettings;
 /// diagnostics and for the default `file-prefix`.
 pub const PROGRAM: &str = "deepmsg-driver";
 
+/// `-a`: the devices the EAL is allowed to probe. The driver adds it when it
+/// picked a port out of a list (`deepmsg.dpdk.ports`).
+const ALLOW: &str = "-a";
+
 /// Keep EAL's telemetry thread and endpoint out of the process.
-pub const NO_TELEMETRY: &str = "--no-telemetry";
+const NO_TELEMETRY: &str = "--no-telemetry";
 
 /// Reserve memory with `mmap` instead of huge pages, for a machine without
 /// them or a device that does no DMA.
@@ -109,15 +113,32 @@ impl std::error::Error for EalArgumentError {}
 ///
 /// [`EalArgumentError::NoCpus`] when the process may run nowhere, which would
 /// otherwise be an EAL started with an empty lcore set.
-pub fn arguments(settings: &DpdkSettings, cpus: &[i32]) -> Result<Vec<String>, EalArgumentError> {
+pub fn arguments(
+    settings: &DpdkSettings,
+    cpus: &[i32],
+    picked: Option<&str>,
+) -> Result<Vec<String>, EalArgumentError> {
     if cpus.is_empty() {
         return Err(EalArgumentError::NoCpus);
     }
 
     let operator: Vec<&str> = settings.eal_args.split_whitespace().collect();
 
-    let mut arguments = Vec::with_capacity(operator.len() + 5);
+    let mut arguments = Vec::with_capacity(operator.len() + 7);
     arguments.push(PROGRAM.to_owned());
+
+    // **The port the driver picked, when it picked one.** The EAL probes every
+    // device it is allowed to and holds each of them until the process ends, so
+    // a driver that allow-listed its whole list of candidates would take all of
+    // them — and the next driver would find none. The allow-list therefore
+    // names the one this process claimed, and it is the driver's own argument:
+    // the configuration refuses an operator's `-a` when a list is given, for
+    // the same reason it refuses their `--lcores`.
+    if let Some(port) = picked {
+        arguments.push(ALLOW.to_owned());
+        arguments.push(port.to_owned());
+    }
+
     arguments.extend(operator.iter().map(|argument| (*argument).to_owned()));
     arguments.push(NO_TELEMETRY.to_owned());
     arguments.push(LOG_LEVEL.to_owned());
@@ -185,7 +206,7 @@ mod tests {
     #[test]
     fn the_eal_is_always_told_which_lcores_it_may_use() {
         for args in ["", "--no-huge -m 512", "--vdev=net_pcap0,rx_pcap=/tmp/x"] {
-            let built = arguments(&settings(args), &[2, 3, 4, 5]).expect("a cpuset");
+            let built = arguments(&settings(args), &[2, 3, 4, 5], None).expect("a cpuset");
             let lcores: Vec<&String> = built
                 .iter()
                 .filter(|argument| argument.starts_with("--lcores="))
@@ -204,7 +225,7 @@ mod tests {
     /// and the configuration refuses the attempt before it gets here.
     #[test]
     fn telemetry_is_never_started() {
-        let built = arguments(&settings(""), &[0]).expect("a cpuset");
+        let built = arguments(&settings(""), &[0], None).expect("a cpuset");
 
         assert!(built.contains(&NO_TELEMETRY.to_owned()));
     }
@@ -221,7 +242,7 @@ mod tests {
     #[test]
     fn the_eal_is_always_told_to_keep_quiet() {
         for args in ["", "--no-huge -m 512", "-a 0000:03:00.0 --in-memory"] {
-            let built = arguments(&settings(args), &[0]).expect("a cpuset");
+            let built = arguments(&settings(args), &[0], None).expect("a cpuset");
 
             assert!(
                 built.contains(&LOG_LEVEL.to_owned()),
@@ -242,16 +263,55 @@ mod tests {
     /// whether the operator asked for huge pages, and both are never there.
     #[test]
     fn the_two_memory_flags_are_never_given_together() {
-        let with_huge_pages = arguments(&settings("-a 0000:03:00.0"), &[0]).expect("a cpuset");
+        let with_huge_pages =
+            arguments(&settings("-a 0000:03:00.0"), &[0], None).expect("a cpuset");
         assert!(with_huge_pages.contains(&IN_MEMORY.to_owned()));
         assert!(!with_huge_pages.contains(&NO_SHCONF.to_owned()));
 
-        let without = arguments(&settings("--no-huge -m 512"), &[0]).expect("a cpuset");
+        let without = arguments(&settings("--no-huge -m 512"), &[0], None).expect("a cpuset");
         assert!(without.contains(&NO_SHCONF.to_owned()));
         assert!(
             !without.contains(&IN_MEMORY.to_owned()),
             "`--no-huge` implies legacy memory, which `--in-memory` refuses: {without:?}"
         );
+    }
+
+    /// **The port the driver picked is the only one the EAL is allowed to
+    /// probe**, and the rule is one `-a` rather than one per candidate.
+    ///
+    /// It has to be exactly one: the EAL takes every device it probes and holds
+    /// it until the process ends, so a driver that allowed its whole list would
+    /// take every port on it and the next driver would find none — which is the
+    /// failure this whole slice is about. `deepmsg.dpdk.ports` is a list of
+    /// candidates to *choose* from, and the choosing is done before this.
+    #[test]
+    fn the_port_the_driver_picked_is_the_only_one_it_allows() {
+        let many = DpdkSettings {
+            ports: vec![
+                "0000:03:00.0".to_owned(),
+                "0000:03:00.1".to_owned(),
+                "0000:01:00.0".to_owned(),
+            ],
+            ..settings("")
+        };
+
+        let built = arguments(&many, &[0], Some("0000:03:00.1")).expect("a cpuset");
+
+        assert_eq!(
+            1,
+            built.iter().filter(|argument| *argument == "-a").count(),
+            "one allow, whatever the list held: {built:?}"
+        );
+        assert!(
+            built.windows(2).any(|pair| pair == ["-a", "0000:03:00.1"]),
+            "and it names the port that was picked, not the first candidate: {built:?}"
+        );
+        for candidate in ["0000:03:00.0", "0000:01:00.0"] {
+            assert!(
+                !built.contains(&candidate.to_owned()),
+                "{candidate} was not picked and must not be allowed: {built:?}"
+            );
+        }
     }
 
     /// The operator's arguments arrive as they were written, in order, after
@@ -262,6 +322,7 @@ mod tests {
         let built = arguments(
             &settings("--vdev=net_pcap0,rx_pcap=/tmp/cap -a 0000:03:00.0 --file-prefix=dp"),
             &[0],
+            None,
         )
         .expect("a cpuset");
 
@@ -282,7 +343,10 @@ mod tests {
     /// answer for.
     #[test]
     fn a_process_with_no_cpus_has_no_lcore_set() {
-        assert_eq!(Err(EalArgumentError::NoCpus), arguments(&settings(""), &[]));
+        assert_eq!(
+            Err(EalArgumentError::NoCpus),
+            arguments(&settings(""), &[], None)
+        );
     }
 
     /// The list a `--lcores` argument carries is the kernel's own spelling.
@@ -304,7 +368,7 @@ mod tests {
     #[test]
     fn the_lcore_set_is_the_one_the_process_already_has() {
         let mine = crate::sys::current_thread_affinity().expect("this thread's mask");
-        let built = arguments(&settings(""), &mine).expect("a cpuset");
+        let built = arguments(&settings(""), &mine, None).expect("a cpuset");
 
         assert!(
             built.contains(&format!("--lcores=0@({})", cpu_list(&mine))),

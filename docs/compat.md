@@ -1120,8 +1120,8 @@ configuration.
 group of settings that is **not** the reference's, and the only one where the
 prefix is a different prefix rather than the same name under both. The
 reference's DPDK media is Premium and closed (ADR-0006), so its names for the
-port, the address, the gateway, the neighbours, the descriptors and the ARP
-timers are not visible to be matched, and inventing names that might collide
+port (one, or a list to choose one from), the address, the gateway, the
+neighbours, the descriptors and the ARP timers are not visible to be matched, and inventing names that might collide
 with Premium's would be worse than owning them. They are derived from one
 property name — `deepmsg.dpdk.rx.descriptors` and `DEEPMSG_DPDK_RX_DESCRIPTORS`
 — and read through the same chain every other setting is read through
@@ -1136,14 +1136,32 @@ kernel without saying so — the price of owning the names, and the reason the
 media's start line names the port and the address it bound. Pinned by
 `crates/driver/src/config.rs::the_dpdk_settings_come_from_their_own_names`.
 
-Two of those settings are refused rather than served, and both are about
-keeping the driver's own arithmetic authoritative: an EAL argument this driver
-sets itself (or one that would move the media onto CPUs of the caller's
-choosing — `-l`, `-c`, `--lcores`, `--main-lcore`) is
-`ConfigError::DpdkEalArgument`, because either one silently changes which cores
-the port runs on and only the driver's cpuset arithmetic knows what it is
-allowed to use (ADR-0006). Refusing beats merging: an argument merged in is a
-port running somewhere nobody chose.
+Settings that contradict each other are refused rather than decided between,
+and all three are about keeping the driver's own arithmetic and its own choice
+of port authoritative:
+
+* **An EAL argument this driver sets itself** — or one that would move the media
+  onto CPUs of the caller's choosing (`-l`, `-c`, `--lcores`, `--main-lcore`) —
+  is `ConfigError::DpdkEalArgument`, because either one silently changes which
+  cores the port runs on and only the driver's cpuset arithmetic knows what it is
+  allowed to use (ADR-0006). The allow-list joins that set **when the
+  configuration offers several ports**: the driver picks one out of the list, and
+  an operator's `-a` beside it would either re-admit every candidate — which is
+  how one driver ends up holding all of them — or allow-list one it did not take.
+  A single named port is unchanged: `-a` is then the operator's, and is how the
+  EAL hears about their port at all. Pinned by
+  `crates/driver/src/config.rs::a_list_of_ports_makes_the_allow_list_the_drivers_and_a_named_port_does_not`
+  (both directions).
+* **A list of ports and a single named one** are two answers to one question:
+  `ConfigError::ConflictingSettings`
+  (`::a_list_and_a_named_port_are_refused_together`).
+* **A hole in the list** — an empty entry — is refused rather than skipped: a
+  driver that skipped one would be a driver that took a port it was not offered
+  (`::a_list_of_ports_is_read_in_order_and_a_hole_in_it_is_refused`).
+
+Refusing beats merging, and refusing beats guessing: an argument merged in is a
+port running somewhere nobody chose, and a list with a hole in it is a port
+somebody did not offer.
 
 ## Archive configuration names
 

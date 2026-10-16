@@ -53,6 +53,7 @@ use deepmsg_core::clock;
 
 /// Datagram sockets and the batching syscalls the data plane moves messages
 /// through.
+pub mod port_lock;
 pub mod socket;
 
 /// No signal has asked this process to stop.

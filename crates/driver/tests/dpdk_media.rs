@@ -162,7 +162,7 @@ fn a_media_gives_its_frames_back_when_it_closes() {
 #[ignore = "runs as a child of `a_media_gives_its_frames_back_when_it_closes`"]
 fn a_media_gives_its_frames_back_when_it_closes_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect("the media opens");
 
     let pool = media.pool();
     let whole = media.pool_size();
@@ -261,6 +261,7 @@ fn a_shared_pair_carries_frames_both_ways_in_the_child() {
             ..settings(&capture)
         },
         ONE_PAIR,
+        None,
     )
     .expect("the media opens");
 
@@ -314,7 +315,7 @@ fn a_frame_the_ring_has_no_room_for_goes_back_to_the_pool() {
 #[ignore = "runs as a child of `a_frame_the_ring_has_no_room_for_goes_back_to_the_pool`"]
 fn a_frame_the_ring_has_no_room_for_goes_back_to_the_pool_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect("the media opens");
     let pool = media.pool();
     let whole = media.pool_size();
 
@@ -404,7 +405,7 @@ fn the_eal_starts_no_workers_of_its_own_in_the_child() {
         "a process with no EAL has nothing to register a thread with"
     );
 
-    let _media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let _media = DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect("the media opens");
 
     assert_eq!(
         1,
@@ -466,7 +467,7 @@ fn a_device_with_too_few_queues_is_refused_by_name() {
 fn a_device_with_too_few_queues_is_refused_by_name_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
 
-    let refused = DpdkMedia::open(&settings(&capture), ThreadingMode::Dedicated)
+    let refused = DpdkMedia::open(&settings(&capture), ThreadingMode::Dedicated, None)
         .expect_err("net_pcap has one queue");
     assert!(matches!(refused, DpdkError::Capability { .. }));
     assert!(
@@ -495,12 +496,12 @@ fn a_second_media_is_refused() {
 #[ignore = "runs as a child of `a_second_media_is_refused`"]
 fn a_second_media_is_refused_in_the_child() {
     let capture = std::env::var(RX_PCAP).expect("the parent passes the capture's path");
-    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the first one opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect("the first one opens");
     let pool = media.pool();
     let whole = media.pool_size();
 
     let refused =
-        DpdkMedia::open(&settings(&capture), ONE_PAIR).expect_err("the second one does not");
+        DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect_err("the second one does not");
     assert!(matches!(refused, DpdkError::AlreadyOpen));
     assert!(
         refused.to_string().contains("already open"),
@@ -531,6 +532,32 @@ fn a_second_media_is_refused_in_the_child() {
     assert_eq!(whole, pool.available());
 }
 
+/// **A list of candidate ports with no claim is refused**, and the refusal
+/// happens before the EAL.
+///
+/// That order is the design: the EAL holds every device it probes, so a media
+/// that allowed a whole list and picked one afterwards would have taken every
+/// port on it — the next driver would find none, which is the failure the
+/// candidate list exists to avoid. A caller that offers a list therefore has to
+/// claim from it first (`DpdkMedia::open`'s note, and `port_claim`'s tests for
+/// the claiming itself), and a caller that does not is told so rather than
+/// quietly given all of them.
+#[test]
+fn a_list_of_ports_with_no_claim_is_refused() {
+    let capture = capture_of("unclaimed", 0);
+    let settings = DpdkSettings {
+        ports: vec!["net_pcap0".to_owned(), "net_pcap1".to_owned()],
+        ..settings(capture.path())
+    };
+
+    let refused = DpdkMedia::open(&settings, ONE_PAIR, None).expect_err("a list needs a claim");
+
+    assert!(
+        matches!(&refused, DpdkError::Unclaimed { candidates } if candidates.len() == 2),
+        "and it names what was offered: {refused}"
+    );
+}
+
 /// The stack the media builds carries the media's address, gateway and MAC —
 /// and it is what holds the ports, so dropping it is what stops the port. The
 /// **window** comes with them, and it is the driver's rather than the media's:
@@ -559,7 +586,7 @@ fn the_media_hands_the_stack_its_own_settings_in_the_child() {
         .expect("the parent passes the receive window")
         .parse()
         .expect("a window in bytes");
-    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR).expect("the media opens");
+    let media = DpdkMedia::open(&settings(&capture), ONE_PAIR, None).expect("the media opens");
     let pool = media.pool();
     let whole = media.pool_size();
 

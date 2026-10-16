@@ -57,6 +57,7 @@ use deepmsg_core::clock;
 use deepmsg_driver::config::{DriverConfig, MediaSelection};
 use deepmsg_driver::driver::Driver;
 use deepmsg_driver::media::TransportBindings;
+use deepmsg_driver::media::userspace::port_claim::Claim;
 use deepmsg_driver::{dir, sys};
 
 fn main() -> ExitCode {
@@ -91,6 +92,11 @@ fn main() -> ExitCode {
     // the reference has to think about it — this is also the only step of
     // startup that can fail for a reason that has nothing to do with this
     // process's own configuration.
+    // The value is the claim on a port when the configuration offered a list of
+    // them: it is what makes this process the one driving that port, and the
+    // only thing that may release it is the end of the process's use of DPDK
+    // (`close_the_media`). A failure from here — no candidate free, or a media
+    // that would not open — is a driver that never touched its directory.
     let media = match bind_the_media(&mut config) {
         Ok(media) => media,
         Err(error) => return fail(&format_args!("{error}")),
@@ -219,15 +225,33 @@ fn main() -> ExitCode {
 /// # Errors
 ///
 /// A message for the operator, naming what would not open.
-fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
+fn bind_the_media(config: &mut DriverConfig) -> Result<Option<Claim>, String> {
     match config.media {
-        MediaSelection::Default => Ok(false),
+        MediaSelection::Default => Ok(None),
 
         #[cfg(feature = "dpdk")]
         MediaSelection::Dpdk => {
+            // **The port is claimed here, before the EAL.** A kernel-bypass
+            // port carries one process at a time, and a harness that starts a
+            // driver per case has no way to give them different ports — so the
+            // configuration may offer a list, and this is where one of them
+            // becomes *this* driver's. It has to happen before the EAL because
+            // the EAL holds every device it probes; and the claim is handed
+            // back rather than kept, because the only thing that may release it
+            // is the end of the process's use of DPDK (`close_the_media`).
+            let claimed = if config.dpdk.ports.is_empty() {
+                None
+            } else {
+                Some(
+                    deepmsg_driver::media::userspace::port_claim::claim(&config.dpdk.ports)
+                        .map_err(|error| error.to_string())?,
+                )
+            };
+
             let media = deepmsg_driver::media::userspace::dpdk::DpdkMedia::open(
                 &config.dpdk,
                 config.threading_mode,
+                claimed.as_ref(),
             )
             .map_err(|error| format!("the dpdk media would not open: {error}"))?;
 
@@ -296,7 +320,7 @@ fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
                 println!("deepmsg-driver: WARNING: {warning}");
             }
 
-            Ok(true)
+            Ok(claimed)
         }
 
         // Unreachable, and it is the parser that makes it so: a build without
@@ -308,21 +332,28 @@ fn bind_the_media(config: &mut DriverConfig) -> Result<bool, String> {
     }
 }
 
-/// Shut the media down, if one was opened.
+/// Shut the media down, if one was opened, and give its port back **last**.
 #[cfg(feature = "dpdk")]
-fn close_the_media(opened: bool) {
-    if opened {
+fn close_the_media(claimed: Option<Claim>) {
+    if claimed.is_some() {
         // D0: this does not collect the threads EAL started and it does not
         // make a second `init` possible, so it is the last thing a process
         // does with DPDK — which is what it is here.
         let _ = deepmsg_dpdk::Eal::cleanup();
     }
+
+    // **The port goes after the EAL, and the order is the point**: a driver
+    // that released its claim first would let the next driver's EAL probe a
+    // device this process still holds, and that driver would take the next
+    // candidate or none. Held to here, the port is given back by a process that
+    // has finished with DPDK.
+    drop(claimed);
 }
 
 /// A build with no media has nothing to shut down.
 #[cfg(not(feature = "dpdk"))]
-fn close_the_media(opened: bool) {
-    let _ = opened;
+fn close_the_media(claimed: Option<Claim>) {
+    let _ = claimed;
 }
 
 /// Stop the driver the way the reference does, and report how it stopped.
