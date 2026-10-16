@@ -129,7 +129,9 @@ harness's own Aeron 1.53.3, while this build targets 1.53.2.
       bench/     the rig, the echo node, the micro-benchmarks and the latency
                  harness
     examples/    ping/pong, pub/sub, record/replay
-    tests/       integration tests + interop suite (feature "interop")
+    tests/       integration tests + interop suite (feature "interop");
+                 the C and Java those tests run are in the fork
+                 `deepmsg/aeron`, branch `deepmsg-tests` (docs/reference.md)
     schemas/     SBE XML schemas forked from the reference tree (single
                  source of truth)
     docs/        ADRs, roadmap, compatibility matrix, protocol notes,
