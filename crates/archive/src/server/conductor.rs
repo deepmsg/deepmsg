@@ -7411,6 +7411,22 @@ impl ArchiveConductor {
     /// own: whether the recorder is this conductor's object or a thread of its
     /// own is `aeron.archive.threading.mode`, which the launcher reads to decide
     /// what to start — so it is handed the one it decided on
+    /// The reference's close-time force on the catalog
+    /// (`Catalog.unmapAndCloseChannel`, `:1253-1259`).
+    ///
+    /// ★ It is the **one** force the sync level does not govern — the reference
+    /// writes `fsync(catalogChannel, true, true)` with both arguments literal —
+    /// and it is here rather than on the archive's own shutdown because the
+    /// catalog is this object's field.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::catalog::CatalogError::Io`] when the force fails, which is the
+    /// reference's own handling: it rethrows.
+    pub fn close_catalog(&self) -> Result<(), crate::catalog::CatalogError> {
+        self.catalog.close()
+    }
+
     /// ([`RecorderHalf`]) rather than making one here and finding out
     /// afterwards.
     #[allow(clippy::too_many_arguments)] // one per thing the archive was built with

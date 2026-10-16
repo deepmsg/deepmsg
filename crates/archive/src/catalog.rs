@@ -344,16 +344,19 @@ pub struct Catalog {
     /// [`crate::segment::SegmentWriter`] sets from the file's own level.
     force_writes: bool,
     force_metadata: bool,
-    /// The descriptor a force goes through, which is **not** the one the
-    /// mapping came from: [`MappedFile`] keeps only the path, because a mapping
-    /// outlives its descriptor. The reference's `catalogChannel` is a
-    /// `FileChannel` opened beside the mapping for this alone
-    /// (`Catalog.java:195`), so the shape is the reference's rather than a
-    /// consequence of ours — and it is why `fsync` here reaches pages this
-    /// process wrote through `mmap`.
+    /// The descriptor every force on the catalog goes through, which is **not**
+    /// the one the mapping came from: [`MappedFile`] keeps only the path,
+    /// because a mapping outlives its descriptor. The reference's
+    /// `catalogChannel` is the channel its mapping came from and stays open for
+    /// as long as the catalog does (`Catalog.java:195`), so the shape is the
+    /// reference's rather than a consequence of ours — and it is why an `fsync`
+    /// here reaches pages this process wrote through `mmap`.
     ///
-    /// `None` at level 0: a descriptor that would never be forced is not opened.
-    catalog_channel: Option<File>,
+    /// ★ **Open at every level**, because the close-time force is not a level's
+    /// business (`:1257`, [`Catalog::close`]). The reference's `null` case is
+    /// its **read-only** constructor (`:254-257`), which this build has no
+    /// counterpart for: every catalog here is opened read-write.
+    catalog_channel: File,
     /// How many forces have been made, which is what a test can see of a promise
     /// that is otherwise between this process and the device.
     ///
@@ -369,8 +372,10 @@ pub struct Catalog {
     forces: std::cell::Cell<usize>,
     /// The archive directory, for the one force the reference makes on it — a
     /// catalog that has just been **created** (`Catalog.java:226`), so that the
-    /// new file's directory entry is durable. Also `None` at level 0, which is
-    /// `channelForDirectorySync`'s own answer (`Archive.java:3917-3931`).
+    /// new file's directory entry is durable. `None` at level 0, which is
+    /// `channelForDirectorySync`'s own answer (`Archive.java:3917-3931`): there
+    /// is a catalog file to force at every level, and a directory entry only
+    /// when something is being forced.
     archive_dir_channel: Option<File>,
 }
 
@@ -495,48 +500,74 @@ impl Catalog {
         }
     }
 
-    /// The two descriptors a force goes through, or neither of them.
+    /// The descriptors a force goes through: the catalog's **always**, the
+    /// archive directory's only above level 0.
     ///
-    /// **Level 0 opens nothing**, which is the reference's rule rather than this
-    /// build's economy: `channelForDirectorySync` returns `null` when the level
-    /// is 0 (`Archive.java:3917-3931`) and the catalog's channel is the
-    /// mapping's own, so a catalog that will never be forced holds no
-    /// descriptor to force through.
+    /// The two answers differ because the reference asks two questions. "Is
+    /// there a catalog file to force?" is answered yes at every level — its
+    /// channel is the mapping's own, and the close-time force uses it whatever
+    /// the level says (`:195`, `:1257`). "Is there a directory entry to force?"
+    /// is answered by the level, because the directory channel is opened for
+    /// that force alone (`channelForDirectorySync`, `Archive.java:3917-3931`).
     ///
-    /// The two failures are handled differently because the reference handles
-    /// them differently: the catalog's channel is opened where the mapping is
-    /// opened and a failure there is the mapping's failure (a `throw`), while
-    /// the directory's is **swallowed** and answered with `null`
-    /// (`:3924-3928`) — a directory that will not open is a directory entry that
-    /// will not be forced, not an archive that will not start.
+    /// Their failures differ for the same reason: the catalog's channel is
+    /// opened where the mapping is opened and a failure there is the mapping's
+    /// failure (a `throw`, `:191-196`), while the directory's is **swallowed**
+    /// and answered with `null` (`:3924-3928`) — a directory that will not open
+    /// is a directory entry that will not be forced, not an archive that will
+    /// not start.
     fn force_channels(
         catalog: &Path,
         archive_dir: &Path,
         file_sync_level: i32,
-    ) -> Result<(Option<File>, Option<File>), CatalogError> {
-        if file_sync_level <= 0 {
-            return Ok((None, None));
-        }
-
+    ) -> Result<(File, Option<File>), CatalogError> {
         let channel = OpenOptions::new()
             .read(true)
             .write(true)
             .open(catalog)
             .map_err(CatalogError::Io)?;
 
-        Ok((Some(channel), File::open(archive_dir).ok()))
+        let directory = if file_sync_level > 0 {
+            File::open(archive_dir).ok()
+        } else {
+            None
+        };
+
+        Ok((channel, directory))
     }
 
     /// Force the catalog after a change that has landed
     /// (`Catalog.forceWrites(catalogChannel)`).
     ///
-    /// Silent when there is nothing to force, which is level 0 — and at level 0
-    /// there is no descriptor either, so the two ways of being off agree.
+    /// Silent at level 0 — which is [`Catalog::force`]'s guard, and the whole of
+    /// the difference between this and [`Catalog::close`].
     fn force_catalog(&self) -> Result<(), CatalogError> {
-        match &self.catalog_channel {
-            Some(channel) => self.force(channel),
-            None => Ok(()),
-        }
+        self.force(&self.catalog_channel)
+    }
+
+    /// Force the catalog one last time, on the way out
+    /// (`Catalog.unmapAndCloseChannel`, `:1253-1259`).
+    ///
+    /// ★ **Both of the reference's arguments here are literal** —
+    /// `fsync(catalogChannel, true, true)` — so this force happens at **every**
+    /// level, including 0, and asks for the metadata whether or not the level
+    /// did. It is the one force the level does not govern, and the reason the
+    /// catalog's channel is opened at all at level 0.
+    ///
+    /// A failure is an error like every other force's (`:1114` rethrows), which
+    /// is why this is a method rather than something `Drop` does: a drop cannot
+    /// say what went wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Io`] when the force fails.
+    pub fn close(&self) -> Result<(), CatalogError> {
+        self.catalog_channel.sync_all().map_err(CatalogError::Io)?;
+
+        #[cfg(test)]
+        self.forces.set(self.forces.get() + 1);
+
+        Ok(())
     }
 
     /// The one force the reference makes on the archive directory, after a
@@ -1631,16 +1662,20 @@ mod tests {
         Catalog::create(dir.path(), CAPACITY, NEXT_ID, file_sync_level).expect("create")
     }
 
-    /// The level picks the two flags and the two descriptors, and `> 1` is not
-    /// `== 2` (`Catalog.java:161-162` reads `> 0` and `> 1`, so a level of three
-    /// is a level of two).
+    /// The level picks the two flags and the **directory** descriptor, and `> 1`
+    /// is not `== 2` (`Catalog.java:161-162` reads `> 0` and `> 1`, so a level of
+    /// three is a level of two).
+    ///
+    /// The catalog's own descriptor is not in this table because it is not a
+    /// level's question: it is open at every level, which is what makes the
+    /// close-time force possible at level 0.
     #[test]
-    fn the_level_picks_the_flags_and_the_descriptors() {
-        for (level, writes, metadata) in [
-            (0, false, false),
-            (1, true, false),
-            (2, true, true),
-            (3, true, true),
+    fn the_level_picks_the_flags_and_the_directory_channel() {
+        for (level, writes, metadata, directory) in [
+            (0, false, false, false),
+            (1, true, false, true),
+            (2, true, true, true),
+            (3, true, true, true),
         ] {
             let dir = TempDir::new();
             let catalog = created_at(&dir, level);
@@ -1648,31 +1683,33 @@ mod tests {
             assert_eq!(writes, catalog.force_writes, "level {level}");
             assert_eq!(metadata, catalog.force_metadata, "level {level}");
             assert_eq!(
-                level > 0,
-                catalog.catalog_channel.is_some(),
-                "level {level}: the catalog's descriptor is opened with the level"
-            );
-            assert_eq!(
-                level > 0,
+                directory,
                 catalog.archive_dir_channel.is_some(),
-                "level {level}: and the directory's, which is `channelForDirectorySync`'s \
+                "level {level}: the directory's descriptor is `channelForDirectorySync`'s \
                  own answer (`Archive.java:3917-3931`)"
             );
         }
     }
 
-    /// ★ **Level 0 is no force at all**, and no descriptor to make one through.
+    /// ★ **Level 0 forces nothing while the catalog is in use, and once when it
+    /// closes** — and the second half is the reference's, not an oversight: the
+    /// close-time force is `fsync(catalogChannel, true, true)` with both
+    /// arguments literal (`Catalog.java:1257`), so it happens whatever the level
+    /// says.
     ///
-    /// This is the criterion that makes "nothing changed by default" an
-    /// assertion rather than an absence of evidence: 0 is the reference's own
-    /// default (`Archive.java:388`, `:369`), so before this slice the whole of
-    /// this behaviour was what a deployment got whether it asked or not.
+    /// The first half is the criterion that makes "nothing changed by default"
+    /// an assertion rather than an absence of evidence: 0 is the reference's own
+    /// default (`Archive.java:388`, `:369`), so before this slice a deployment
+    /// got exactly this whether it asked or not.
+    ///
+    /// ★ Reading the two halves apart is the point of the test: "no force" and
+    /// "no level" are not the same statement, and a build that took the first
+    /// for the second would drop the one force the reference always makes.
     #[test]
-    fn level_zero_forces_nothing() {
+    fn level_zero_forces_nothing_until_it_closes() {
         let dir = TempDir::new();
         let mut catalog = created_at(&dir, 0);
 
-        assert!(catalog.catalog_channel.is_none());
         assert!(catalog.archive_dir_channel.is_none());
 
         let id = catalog.add_recording(&recording(0)).expect("added");
@@ -1684,7 +1721,19 @@ mod tests {
             .change_state(id, RecordingState::DELETED)
             .expect("state");
 
-        assert_eq!(0, catalog.forces(), "level 0 is no force at all");
+        assert_eq!(
+            0,
+            catalog.forces(),
+            "level 0 forces nothing while it is in use"
+        );
+
+        catalog.close().expect("close");
+        assert_eq!(
+            1,
+            catalog.forces(),
+            "★ and exactly one when it closes — the reference's close-time force has both \
+             arguments literal (`Catalog.java:1257`), so it is not the level's business"
+        );
     }
 
     /// ★ **Every change that lands is forced, once, and the force follows the
@@ -1730,6 +1779,13 @@ mod tests {
                 .expect("state")
         );
         assert_eq!(8, catalog.forces(), "a state change (`:791`)");
+
+        catalog.close().expect("close");
+        assert_eq!(
+            9,
+            catalog.forces(),
+            "and the close, which is the one the level does not govern (`:1257`)"
+        );
     }
 
     /// The other half of "the force follows the write": a change that matched

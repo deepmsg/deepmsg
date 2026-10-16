@@ -623,6 +623,38 @@ fn run_conductor(
     half: &mut DriverHalf<'_>,
     mut idle: deepmsg_driver::idle::Strategy,
 ) -> Result<(), String> {
+    let turns = run_turns(name, conductor, client, half, &mut idle);
+
+    // ★ The reference's **close-time force**, which is the one force the sync
+    // level does not govern: `fsync(catalogChannel, true, true)` with both
+    // arguments literal (`Catalog.java:1257`), so a level-0 archive forces the
+    // catalog exactly once and this is it. On the reference's side it is
+    // `ArchiveConductor.close()`, called however the loop ended — which is why
+    // it is here, outside the loop, and not on the signal path only.
+    //
+    // It is a method rather than a `Drop` for the reason the reference rethrows
+    // it (`LangUtil.rethrowUnchecked`, `:1114`): a failure has to be sayable,
+    // and a drop cannot say anything.
+    //
+    // When both the loop and the close have something to report, **the loop
+    // wins** — a control plane that stopped is the more useful thing to be told
+    // about than the force that followed it.
+    let closed = conductor
+        .close_catalog()
+        .map_err(|error| format!("the archive's catalog could not be forced on close: {error}"));
+
+    turns.and(closed)
+}
+
+/// The loop itself, so that [`run_conductor`] can close the catalog whichever
+/// way it ends.
+fn run_turns(
+    name: &str,
+    conductor: &mut ArchiveConductor,
+    client: &mut Client,
+    half: &mut DriverHalf<'_>,
+    idle: &mut deepmsg_driver::idle::Strategy,
+) -> Result<(), String> {
     loop {
         if let Some(signal) = sys::stop_signal() {
             conductor.signal_terminated();
